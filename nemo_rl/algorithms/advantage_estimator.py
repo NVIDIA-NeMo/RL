@@ -61,15 +61,20 @@ class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
 
     # Off by default; disabled, the GRPO advantages are bit-identical to not having this block.
     enabled: bool = False
-    # "rank": weight linear in the length rank among the group's positives;
-    # "inverse_length": weight L ** -alpha.
-    mode: Literal["rank", "inverse_length"] = "rank"
+    # "inverse_length": weight (L / L_min) ** -alpha, floored at 1 / max_ratio;
+    # "rank": weight linear in the length rank among the group's positives. Rank mode is
+    # order-only, so near-tied lengths still get the full 1 + s / 1 - s spread: two positives
+    # of 500 and 501 tokens split their credit 75/25 at s = 0.5.
+    mode: Literal["rank", "inverse_length"] = "inverse_length"
     # Rank mode: the shortest positive gets 1 + s and the longest 1 - s, a per-token ratio of
     # (1 + s) / (1 - s) (3x at 0.5) whatever the number of positives. 0 <= s < 1.
     rank_spread: Annotated[float, Field(ge=0.0, lt=1.0)] = 0.5
     # Inverse-length mode: exponent >= 0. 0 is a no-op; 1 gives every correct response of a
-    # binary-reward group the same total credit.
+    # binary-reward group the same total credit while their lengths are within max_ratio.
     alpha: Annotated[float, Field(ge=0.0)] = 1.0
+    # Inverse-length mode: the largest per-token weight ratio within a group (> 1), which also
+    # bounds every final weight; None leaves the weights unbounded.
+    max_ratio: Optional[Annotated[float, Field(gt=1.0)]] = 3.0
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -213,6 +218,22 @@ def rank_length_weights(lengths: torch.Tensor, rank_spread: float) -> torch.Tens
     return 1.0 + rank_spread * (1.0 - 2.0 * ranks / (k - 1))
 
 
+def inverse_length_weights(
+    lengths: torch.Tensor, alpha: float, max_ratio: Optional[float]
+) -> torch.Tensor:
+    """Raw inverse-length weights ``(L / L_min) ** -alpha``, floored at ``1 / max_ratio``.
+
+    Dividing by the shortest length keeps the weights in ``(0, 1]``, so a large ``alpha`` cannot
+    underflow the renormalization to 0 / 0; the common factor cancels in the renormalization, so
+    the final weights equal those of ``L ** -alpha``. The floor caps the per-token ratio between
+    any two positives at ``max_ratio`` (``None``: unbounded).
+    """
+    raw = (lengths / lengths.min()).pow(-alpha)
+    if max_ratio is not None:
+        raw = raw.clamp(min=1.0 / max_ratio)
+    return raw
+
+
 def reweight_positive_advantages_by_length(
     advantages: torch.Tensor,
     *,
@@ -227,8 +248,9 @@ def reweight_positive_advantages_by_length(
     Per group (rows with equal ``prompt_ids``), with positives
     ``P = {i : A_i > 0, valid_i, L_i > 0}`` and only when ``|P| >= 2``:
 
-    * raw weights: rank mode ``w_i = 1 + s * (1 - 2 r_i / (|P| - 1))`` with ``r_i`` the average
-      length rank within P; inverse-length mode ``w_i = L_i ** -alpha``;
+    * raw weights: inverse-length mode ``w_i = max((L_i / min_P L) ** -alpha, 1 / max_ratio)``;
+      rank mode ``w_i = 1 + s * (1 - 2 r_i / (|P| - 1))`` with ``r_i`` the average length rank
+      within P (order-only: near-tied lengths get the full spread);
     * one common factor per group restores the token-weighted positive mass:
       ``w_i *= sum_P(A_j L_j) / sum_P(A_j L_j w_j)``;
     * ``A_i *= w_i`` for i in P. Every other row is returned unchanged.
@@ -277,7 +299,7 @@ def reweight_positive_advantages_by_length(
             if config.mode == "rank":
                 raw = rank_length_weights(pos_len, config.rank_spread)
             else:
-                raw = pos_len.pow(-config.alpha)
+                raw = inverse_length_weights(pos_len, config.alpha, config.max_ratio)
             pos_mass = pos_adv * pos_len
             weights = raw * (pos_mass.sum() / (pos_mass * raw).sum())
             out[rows[positive], 0] = (pos_adv * weights).to(out.dtype)

@@ -714,9 +714,10 @@ grpo:
     name: grpo
     positive_length_reweight:
       enabled: false
-      mode: rank             # "rank" | "inverse_length"
-      rank_spread: 0.5       # rank mode only, 0 <= s < 1
+      mode: inverse_length   # "inverse_length" | "rank"
       alpha: 1.0             # inverse_length mode only, >= 0 (0 is a no-op)
+      max_ratio: 3.0         # inverse_length mode only, > 1; null = unbounded
+      rank_spread: 0.5       # rank mode only, 0 <= s < 1
 ```
 
 It runs after the leave-one-out baseline and the reward normalization. For each prompt group,
@@ -724,14 +725,24 @@ let $L_i$ be the number of trained response tokens (`mask[:, 1:].sum(-1)`) and
 $P = \{ i : A_i > 0,\ \text{valid}_i,\ L_i > 0 \}$ the group's positives. Groups with
 $|P| < 2$ are left unchanged. Otherwise each $i \in P$ gets a raw weight:
 
+- `inverse_length` (default): $w_i = \max\left( (L_i / L_{\min})^{-\alpha},\ 1/r \right)$, where
+  $L_{\min}$ is the shortest length in $P$ and $r$ is `max_ratio`.
+  - The weights follow the size of the length gaps: two correct answers of 500 and 501 tokens get
+    per-token weights 1.001 and 0.999, so each keeps about half of the credit.
+  - The floor caps the per-token ratio between any two positives at $r$ (3x by default); a 100-
+    and a 1000-token answer get exactly 3x, not 10x. `max_ratio: null` removes the cap.
+  - Dividing by $L_{\min}$ keeps every raw weight in $(0, 1]$, so a large $\alpha$ cannot
+    underflow; the factor cancels in the renormalization below.
+  - At $\alpha = 1$ with binary rewards, correct responses whose lengths are within $r$ of the
+    shortest one end up with the same total credit.
 - `rank`: $w_i = 1 + s \left(1 - \dfrac{2 r_i}{|P| - 1}\right)$, where $r_i$ is the rank of $L_i$
   within $P$ (0 = shortest; tied lengths share the mean of their ranks) and $s$ is `rank_spread`.
   - The weights are linear in the rank, so adjacent ranks are evenly spaced.
   - The shortest positive gets $1 + s$ and the longest $1 - s$. The per-token ratio
     $(1 + s)/(1 - s)$ (3x at $s = 0.5$) does not depend on $|P|$.
-  - Only the length order matters, not the size of the gaps.
-- `inverse_length`: $w_i = L_i^{-\alpha}$. At $\alpha = 1$ with binary rewards every correct
-  response of the group ends up with the same total credit.
+  - Only the length order matters, not the size of the gaps, so near-ties get the full spread.
+    With $G = 16$, two correct answers of 500 and 501 tokens ($A = +3.615$ each) become
+    $+5.425$ and $+1.808$ at $s = 0.5$: their total credits go from an even split to 75/25.
 
 One common factor per group then restores the group's token-weighted positive mass, and the
 positives are rescaled:
@@ -759,13 +770,15 @@ Properties:
 Risks:
 
 - Necessary long reasoning on hard prompts may be under-reinforced.
-- Short lucky guesses get boosted. In `rank` mode every raw weight is at least $1 - s$, so the
-  renormalization factor is at most $1/(1 - s)$ and every final weight is at most
-  $(1 + s)/(1 - s)$, however short the response. `inverse_length` has no such bound: a very
-  short correct response can take most of the group's positive credit.
+- Short lucky guesses get boosted. Every final weight is bounded: in `inverse_length` mode every
+  raw weight is at least $1/r$, so the renormalization factor and every final weight are at most
+  $r$; in `rank` mode the bound is $(1 + s)/(1 - s)$. With `max_ratio: null`, `inverse_length`
+  has no bound and a very short correct response can take most of the group's positive credit.
+- Final weights up to the bound multiply the largest positive advantages (a group's rare correct
+  answers), so `grpo.advantage_clip_high` can be reached at large `max_ratio` or `rank_spread`.
 
-Suggested sweep: `rank` with $s \in \{0.25, 0.5\}$ and `inverse_length` with
-$\alpha \in \{0.5, 1.0\}$.
+Suggested sweep: `inverse_length` with $\alpha \in \{0.5, 1.0\}$ and `max_ratio` $\in \{2, 3\}$,
+and `rank` with $s \in \{0.25, 0.5\}$ for comparison.
 
 Logged metrics (`adv_len_reweight/`): `frac_groups_reweighted` (groups with $|P| \ge 2$ over
 groups with any valid row), `weight_min` / `weight_mean` / `weight_max` (final weights applied),

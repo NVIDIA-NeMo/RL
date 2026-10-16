@@ -44,9 +44,10 @@ grpo:
     subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
     positive_length_reweight:  # GRPO-specific: move positive credit within a group from long to short correct responses
       enabled: false  # off: advantages are unchanged
-      mode: rank  # "rank" (weight linear in length rank) or "inverse_length" (weight L^-alpha)
+      mode: inverse_length  # "inverse_length" (weight (L/L_min)^-alpha, capped) or "rank" (order-only: near-ties get the full spread)
       rank_spread: 0.5  # rank mode: shortest/longest per-token ratio (1+s)/(1-s); 0 <= s < 1
       alpha: 1.0  # inverse_length mode: exponent >= 0 (0 is a no-op)
+      max_ratio: 3.0  # inverse_length mode: largest per-token weight ratio within a group (> 1); null = unbounded
   reward_scaling:
     enabled: false
     source_min: 0.0

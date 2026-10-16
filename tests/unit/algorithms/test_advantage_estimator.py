@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 from pydantic import ValidationError
@@ -396,6 +398,131 @@ def test_length_reweight_inverse_length_alpha_one():
     )
 
 
+# G = 16 with two correct responses: each correct one's leave-one-out peers hold 1 correct out
+# of 15, so A = (14/15) / sqrt(1/15) = +3.6148; each wrong one's hold 2 out of 15, A = -0.3789.
+G16_REWARDS = [1.0, 1.0] + [0.0] * 14
+G16_WRONG = [-0.3789] * 14
+
+
+def _g16(correct_lengths):
+    """The G = 16 group with the two correct responses at ``correct_lengths`` (wrong: 400)."""
+    return [(G16_REWARDS, list(correct_lengths) + [400] * 14)]
+
+
+def test_length_reweight_g16_advantages_before_reweighting():
+    _close(
+        _advantages(_grpo_estimator(), _g16((500, 501))),
+        [3.6148, 3.6148] + G16_WRONG,
+        atol=1e-4,
+    )
+
+
+def test_length_reweight_inverse_length_near_tie_is_near_even():
+    # 500 vs 501 tokens: per-token weights 1.001 / 0.999, so each answer keeps ~half the credit.
+    out = _advantages(_grpo_estimator(**INVERSE), _g16((500, 501)))
+    _close(out, [3.6184, 3.6112] + G16_WRONG, atol=1e-4)
+
+
+def test_length_reweight_inverse_length_max_ratio_caps_the_per_token_ratio():
+    # 100 vs 1000 tokens: the raw 10x ratio is capped at max_ratio = 3.
+    out = _advantages(_grpo_estimator(**INVERSE), _g16((100, 1000)))
+    _close(out, [9.1760, 3.0587] + G16_WRONG, atol=1e-4)
+    assert float(out[0] / out[1]) == pytest.approx(3.0, rel=1e-6)
+
+
+def test_length_reweight_rank_mode_near_tie_gets_the_full_spread():
+    # Rank mode is order-only: 500 vs 501 tokens still get 1 + s / 1 - s, a 75/25 credit split.
+    out = _advantages(_grpo_estimator(**RANK), _g16((500, 501)))
+    _close(out, [5.4249, 1.8083] + G16_WRONG, atol=1e-4)
+    credit = out[:2].double() * torch.tensor([500.0, 501.0], dtype=torch.float64)
+    assert float(credit[0] / credit.sum()) == pytest.approx(0.75, abs=1e-3)
+
+
+def _random_groups(seed, n_groups, size, max_length, min_correct=2):
+    """Binary-reward groups with at least ``min_correct`` correct responses each."""
+    generator = torch.Generator().manual_seed(seed)
+    groups = []
+    for _ in range(n_groups):
+        rewards = (torch.rand(size, generator=generator) < 0.5).float()
+        rewards[:min_correct] = 1.0
+        lengths = torch.randint(1, max_length + 1, (size,), generator=generator)
+        groups.append((rewards.tolist(), lengths.tolist()))
+    return groups
+
+
+@pytest.mark.parametrize("max_ratio", [None, 3.0])
+def test_length_reweight_inverse_length_large_alpha_is_finite(max_ratio):
+    groups = _random_groups(seed=3, n_groups=4, size=16, max_length=32768)
+    for rewards, lengths in groups:  # the extremes of the range among the positives
+        lengths[0], lengths[1] = 1, 32768
+    estimator = _grpo_estimator(
+        enabled=True, mode="inverse_length", alpha=50.0, max_ratio=max_ratio
+    )
+    out = _advantages(estimator, groups)
+    before = _advantages(_grpo_estimator(), groups)
+    assert torch.isfinite(out).all()
+    assert all(math.isfinite(value) for value in estimator.last_metrics.values())
+    positive = before > 0
+    assert torch.equal(out[~positive], before[~positive])
+    if max_ratio is None:
+        # Unbounded, a 32768x longer positive's credit may round to 0, but never flips sign.
+        assert (out[positive] >= 0).all()
+    else:
+        assert (out[positive] > 0).all()
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0, 2.0])
+def test_length_reweight_inverse_length_unbounded_matches_plain_power(alpha):
+    # max_ratio=None reproduces the original w = L ** -alpha (the 1 / L_min factor cancels).
+    groups = _random_groups(seed=11, n_groups=5, size=8, max_length=2000)
+    out = _advantages(
+        _grpo_estimator(
+            enabled=True, mode="inverse_length", alpha=alpha, max_ratio=None
+        ),
+        groups,
+    ).double()
+    before = _advantages(_grpo_estimator(), groups).double()
+    lengths = torch.tensor([n for _, ls in groups for n in ls], dtype=torch.float64)
+    expected = before.clone()
+    for group in range(len(groups)):
+        rows = torch.arange(8 * group, 8 * group + 8)
+        positive = rows[before[rows] > 0]
+        a, n = before[positive], lengths[positive]
+        raw = n.pow(-alpha)
+        expected[positive] = a * raw * (a * n).sum() / (a * n * raw).sum()
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("max_ratio", [1.5, 3.0, 10.0])
+@pytest.mark.parametrize("alpha", [1.0, 2.0])
+def test_length_reweight_inverse_length_weights_are_bounded(max_ratio, alpha):
+    groups = _random_groups(seed=5, n_groups=8, size=16, max_length=4000)
+    estimator = _grpo_estimator(
+        enabled=True, mode="inverse_length", alpha=alpha, max_ratio=max_ratio
+    )
+    out = _advantages(estimator, groups).double()
+    before = _advantages(_grpo_estimator(), groups).double()
+    lengths = torch.tensor([n for _, ls in groups for n in ls], dtype=torch.float64)
+    tolerance = 1 + 1e-5
+    for group in range(len(groups)):
+        rows = torch.arange(16 * group, 16 * group + 16)
+        positive = rows[before[rows] > 0]
+        if positive.numel() < 2:  # all correct: no positive advantage to reweight
+            continue
+        weights = out[positive] / before[positive]
+        assert float(weights.max()) <= max_ratio * tolerance
+        assert float(weights.max() / weights.min()) <= max_ratio * tolerance
+        torch.testing.assert_close(
+            (out[positive] * lengths[positive]).sum(),
+            (before[positive] * lengths[positive]).sum(),
+            rtol=1e-5,
+            atol=0.0,
+        )
+    assert (
+        estimator.last_metrics["adv_len_reweight/weight_max"] <= max_ratio * tolerance
+    )
+
+
 @pytest.mark.parametrize("reweight", [RANK, INVERSE])
 def test_length_reweight_single_positive_is_unchanged(reweight):
     groups = [([1, 0, 0, 0], [100, 300, 200, 400])]
@@ -564,6 +691,8 @@ def test_length_reweight_stats_without_reweighted_groups():
         dict(positive_length_reweight={"rank_spread": 1.0}),
         dict(positive_length_reweight={"rank_spread": -0.1}),
         dict(positive_length_reweight={"alpha": -0.5}),
+        dict(positive_length_reweight={"max_ratio": 1.0}),
+        dict(positive_length_reweight={"max_ratio": 0.5}),
         # Unknown keys are rejected, so a typo cannot silently fall back to the default.
         dict(positive_length_reweight={"enabled": True, "rank_sprad": 0.25}),
     ],
@@ -578,4 +707,15 @@ def test_length_reweight_config_disabled_is_allowed_with_any_estimator():
         name="gdpo", positive_length_reweight={"enabled": False}
     )
     assert not config.positive_length_reweight.enabled
-    assert AdvEstimatorConfig().positive_length_reweight.mode == "rank"
+    default = AdvEstimatorConfig().positive_length_reweight
+    assert (default.mode, default.alpha, default.max_ratio) == (
+        "inverse_length",
+        1.0,
+        3.0,
+    )
+    assert (
+        AdvEstimatorConfig(
+            positive_length_reweight={"max_ratio": None}
+        ).positive_length_reweight.max_ratio
+        is None
+    )
