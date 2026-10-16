@@ -571,6 +571,15 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
+def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
+    """Whether training stores TE blockwise FP8 weights for physical FP8 export."""
+    return bool(
+        fp8_cfg
+        and fp8_cfg.get("fp8_param", False)
+        and fp8_cfg.get("fp8_recipe") == "blockwise"
+    )
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -719,7 +728,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             ):
                 violations.append(
                     f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
-                    "supported by nccl_reshard_refit."
+                    "supported by nccl_reshard_refit (use 'auto', 'bf16'/'bfloat16', "
+                    "'half'/'float16', 'float'/'float32', 'fp8', or leave unset)."
                 )
             # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs. Quantized
             # sources use BF16 on the wire; unquantized sources keep their dtype.
@@ -735,10 +745,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     f"(got {policy.get('precision')!r}); vLLM's MXFP8 quantizer "
                     "rejects FP32 wire buffers."
                 )
-            if (
-                fp8_param
-                and fp8_cfg.get("fp8_recipe") == "blockwise"
-                and (gen_precision != "fp8" or vllm_cfg.get("is_mx", False))
+            if is_blockwise_fp8_param_storage(fp8_cfg) and (
+                gen_precision != "fp8" or vllm_cfg.get("is_mx", False)
             ):
                 # This matches the source's _is_fp8_export condition. Its misc
                 # stream still carries physical FP8 weights and scale_inv;

@@ -304,12 +304,90 @@ def test_quantized_expert_group_decodes_once_with_current_scales(
         member_decode.assert_not_called()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="TE quantization requires CUDA"
+)
+@pytest.mark.parametrize("block_dim", [1, 2])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((96, 128), id="partial-row-block"),
+        pytest.param((128, 96), id="partial-column-block"),
+        pytest.param((1856, 2688), id="nano-expert-shard"),
+    ],
+)
+def test_unaligned_blockwise_experts_preserve_edge_blocks_and_current_scales(
+    block_dim: int, shape: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The optional TE quantizer and kernels are needed only for this GPU test.
+    import transformer_engine_torch as tex
+    from megatron.core import fp8_utils
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
+        Float8BlockQuantizer,
+    )
+
+    quantizer = Float8BlockQuantizer(
+        tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+        block_scaling_dim=block_dim,
+    )
+    rows, columns = shape
+    row_indices = torch.arange(rows, device="cuda").unsqueeze(1)
+    column_indices = torch.arange(columns, device="cuda").unsqueeze(0)
+    # Distinct expert and edge-block scales expose accidental block sharing
+    # when the last partial block of one expert is packed with the next.
+    pattern = (
+        2.0 ** ((row_indices // 128) % 3 + (column_indices // 128) % 3)
+        * (1 + (row_indices % 8 + column_indices % 8).float() / 16)
+    ).to(torch.bfloat16)
+    values = (pattern, pattern * 32)
+    members = tuple(quantizer.quantize(value) for value in values)
+    # Exercise the common logical-export entry point with real TE members;
+    # only discovery of their enclosing GroupedTensor is stubbed.
+    grouped_source = torch.empty(0)
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda tensor: tensor is grouped_source,
+    )
+    member_views = MagicMock(return_value=members)
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
+    previous = None
+    for cycle in (1, 2):
+        with torch.no_grad():
+            for member, value in zip(members, values):
+                quantizer.update_quantized(value * cycle, member)
+        expected = torch.stack(
+            [member.dequantize(dtype=torch.bfloat16) for member in members]
+        )
+        decode = MagicMock(wraps=fp8_utils.dequantize_fp8_tensor)
+        with monkeypatch.context() as hooks:
+            hooks.setattr(fp8_utils, "dequantize_fp8_tensor", decode)
+            actual = worker_module._dequantize_refit_source_group(members)
+            grouped_actual = worker_module._dequantize_refit_source(grouped_source)
+        assert decode.call_count == 2 * len(members)
+        assert all(
+            invocation.args[0] is member
+            for invocation, member in zip(decode.call_args_list, members * 2)
+        )
+        for result in (actual, grouped_actual):
+            assert result.dtype == torch.bfloat16
+            assert result.shape == (len(members), rows, columns)
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        if previous is not None:
+            assert not torch.equal(actual, previous)
+        previous = actual
+        assert member_views.call_count == cycle
+        member_views.assert_called_with(grouped_source, create_if_missing=True)
+
+
 @pytest.mark.parametrize(
     "layout,reason",
     [
         ("columnwise", "rowwise primary-weight storage"),
         ("swizzled", "compact MXFP8 primary-weight scales"),
-        ("unaligned-blockwise", "aligned to 128-element quantization blocks"),
+        ("unaligned-mxfp8", "aligned to 32-element quantization blocks"),
     ],
 )
 def test_quantized_expert_group_requires_primary_weight_layout(
@@ -317,34 +395,22 @@ def test_quantized_expert_group_requires_primary_weight_layout(
 ) -> None:
     # Real TE storage descriptors suffice; rejection runs before CUDA decoding.
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch.tensor.storage.float8_blockwise_tensor_storage import (
-        Float8BlockwiseQTensorStorage,
-    )
     from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
         MXFP8TensorStorage,
     )
 
-    if layout == "unaligned-blockwise":
-        source = Float8BlockwiseQTensorStorage(
-            rowwise_data=torch.zeros((96, 128), dtype=torch.uint8),
-            rowwise_scale_inv=torch.ones((1, 4), dtype=torch.float32),
-            columnwise_data=None,
-            columnwise_scale_inv=None,
-            fp8_dtype=tex.DType.kFloat8E4M3,
-            quantizer=None,
-            is_2D_scaled=True,
-        )
-    else:
-        data = torch.zeros((96, 160), dtype=torch.uint8)
-        source = MXFP8TensorStorage(
-            rowwise_data=None if layout == "columnwise" else data,
-            rowwise_scale_inv=torch.ones((128, 8), dtype=torch.uint8),
-            columnwise_data=data,
-            columnwise_scale_inv=torch.ones((4, 256), dtype=torch.uint8),
-            fp8_dtype=tex.DType.kFloat8E4M3,
-            quantizer=None,
-            with_gemm_swizzled_scales=layout == "swizzled",
-        )
+    data = torch.zeros(
+        (96, 144 if layout == "unaligned-mxfp8" else 160), dtype=torch.uint8
+    )
+    source = MXFP8TensorStorage(
+        rowwise_data=None if layout == "columnwise" else data,
+        rowwise_scale_inv=torch.ones((128, 8), dtype=torch.uint8),
+        columnwise_data=data,
+        columnwise_scale_inv=torch.ones((4, 256), dtype=torch.uint8),
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        quantizer=None,
+        with_gemm_swizzled_scales=layout == "swizzled",
+    )
     with pytest.raises(ValueError, match=reason):
         worker_module._dequantize_refit_source_group((source, source))
 

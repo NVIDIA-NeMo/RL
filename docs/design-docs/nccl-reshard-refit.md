@@ -100,6 +100,10 @@ shard-layout requirements in this document.
   `policy.precision='float32'` with `vllm_cfg.is_mx=true`.
 * Blockwise FP8 training storage with vLLM requires `precision='fp8'`, `is_mx=false`
   because the unchanged misc path exports physical FP8 weights and inverse scales.
+* vLLM blockwise FP8 destinations use the runtime square scale grid. For MoE layers,
+  `quant_method.moe_block_shape` can refine the checkpoint's 128×128 grid to 64×64
+  or 32×32 to fit the local expert shard. Receiver hooks use that refined grid for
+  quantization and fused gate/up scale slicing; rectangular blocks are unsupported.
 * Megatron blockwise FP8 destinations require Transformer Engine layers.
   `inference_optimized` supports MXFP8 with `inference_grouped_gemm_backend` set to
   `torch` or `flashinfer`.
@@ -182,25 +186,32 @@ must agree. The misc path and other refit transports retain their existing behav
 
 `group_expert_params_in_metadata` combines per-expert HF entries into one transfer
 per expert group and projection, adding a leading expert dimension to the HF layout.
-For quantized sources, the hook packs the group's encoded weights and scales,
-dequantizes the group once, then selects gate, up, or down into
+For block-aligned quantized sources, the hook packs the group's encoded weights and
+scales, dequantizes the group once, then selects gate, up, or down into
 `[num_local_experts, ...]`. Gate and up each
 decode the complete fused group independently. Hooks read current weights and scales
 on every refit without a shared source cache.
 
-Grouping reduces dequantization and transfer launches. The vLLM MXFP8 destination
-also quantizes the received expert group together; its blockwise FP8 hook currently
-quantizes each expert within the group. Destination hooks preserve the assembly needed
-for fused weights and commit the corresponding scales.
+Grouping reduces dequantization and transfer launches. Both the vLLM MXFP8 and
+blockwise FP8 destinations quantize the received expert group together. The blockwise
+hook flattens aligned experts for one quantizer call per group, then restores the
+expert dimension on the values and scales. Destination hooks preserve the assembly
+needed for fused weights and commit the corresponding scales.
 
-Grouped quantized source preparation requires rowwise primary model weights and
-compact MXFP8 scales. MXFP8 shard dimensions must align to 32; blockwise FP8
-dimensions must align to 128 for either 1D or 2D scaling. Encoded weights are
-concatenated without padding or shape repair. Only the combined scale metadata
-is padded, after removing unused per-expert scale entries. Scalar FP8 preserves
-each expert's scale. Columnwise-only and swizzled compute layouts are rejected.
-The generic misc and `refit_transport=null` conversion paths keep their existing
-dequantization behavior.
+The grouped decode requires rowwise primary model weights and compact MXFP8 scales.
+MXFP8 shard dimensions must align to 32. Blockwise FP8 uses the grouped decode when
+both dimensions align to 128, for either 1D or 2D scaling. For partial edge blocks,
+the hook decodes each blockwise expert independently using its own scale grid, then
+stacks the BF16 results. This preserves support for shapes such as Nano-v3's
+1856×2688 expert shard without padding weights or introducing a source cache.
+
+In the grouped decode, encoded weights are concatenated without padding or shape
+repair. Only the combined scale metadata is padded, after removing unused
+per-expert scale entries. Scalar FP8 preserves each expert's scale. The grouped
+decode rejects columnwise-only and swizzled compute layouts. Logical exports of
+TE grouped storage, including Megatron generation with `refit_transport=null`,
+use the same preparation helper. Misc payload selection and the other transports
+remain unchanged.
 
 ### Execution Flow: Setup Time
 

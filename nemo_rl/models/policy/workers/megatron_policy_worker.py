@@ -169,6 +169,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _extract_layer_name,
     _extract_layer_prefix,
     build_nccl_reshard_refit_info,
+    is_blockwise_fp8_param_storage,
     is_nccl_reshard_param,
 )
 
@@ -301,7 +302,7 @@ class _RefitSource:
 def _dequantize_refit_source_group(
     tensors: tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
-    """Decode block-aligned primary expert weights once, without a cache.
+    """Decode primary expert weights, grouping block-aligned storage without a cache.
 
     TE primary weights retain rowwise data and compact scales. Pack their
     logical scale entries, including only aggregate metadata padding; never
@@ -352,6 +353,14 @@ def _dequantize_refit_source_group(
     rows, cols = shape.numel() // shape[-1], shape[-1]
     block_size = 32 if is_mxfp8 else 128
     if rows % block_size or cols % block_size:
+        if not is_mxfp8:
+            # Partial blockwise edge blocks must keep each expert's scale grid.
+            # Defer the optional Megatron helper until this fallback is needed.
+            from megatron.core.fp8_utils import dequantize_fp8_tensor
+
+            return torch.stack(
+                [dequantize_fp8_tensor(tensor).to(torch.bfloat16) for tensor in tensors]
+            )
         raise ValueError(
             f"Refit expert shards must be aligned to {block_size}-element quantization blocks."
         )
@@ -3229,12 +3238,7 @@ class MegatronPolicyWorkerImpl(
 
     def _is_fp8_export(self) -> bool:
         """Return True if the train side stores weights as TE blockwise FP8."""
-        if self.fp8_cfg is None:
-            return False
-        return bool(
-            self.fp8_cfg.get("fp8_param", False)
-            and self.fp8_cfg.get("fp8_recipe") == "blockwise"
-        )
+        return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
     def _build_refit_conversion_tasks(self) -> list:
         """Keep the general/misc export format expected by each backend."""

@@ -182,13 +182,24 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
     )
 
 
-def test_megatron_fp8_refit_tasks_preserve_backend_export() -> None:
+@pytest.mark.parametrize(
+    "fp8_cfg,physical_export",
+    [
+        (None, False),
+        ({"fp8_param": False, "fp8_recipe": "blockwise"}, False),
+        ({"fp8_param": True, "fp8_recipe": "mxfp8"}, False),
+        ({"fp8_param": True, "fp8_recipe": "blockwise"}, True),
+    ],
+)
+def test_megatron_fp8_refit_tasks_preserve_backend_export(
+    fp8_cfg: Optional[dict], physical_export: bool
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.fp8_cfg = {"fp8_param": True, "fp8_recipe": "blockwise"}
+    worker.fp8_cfg = fp8_cfg
     worker.model = object()
     physical_tasks = [object()]
     logical_tasks = [None, object()]
@@ -202,8 +213,15 @@ def test_megatron_fp8_refit_tasks_preserve_backend_export() -> None:
     worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
 
     worker.cfg = {"generation": {"backend": "vllm"}}
-    assert worker._build_refit_conversion_tasks() == physical_tasks
-    worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(worker.model)
+    assert worker._build_refit_conversion_tasks() == (
+        physical_tasks if physical_export else logical_tasks[1:]
+    )
+    if physical_export:
+        worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(
+            worker.model
+        )
+    else:
+        worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
     # Bulk refit always starts from standard mappings, even when the general
     # export still needs physical FP8 data and scales.
     assert worker._build_bulk_refit_conversion_tasks() == logical_tasks[1:]

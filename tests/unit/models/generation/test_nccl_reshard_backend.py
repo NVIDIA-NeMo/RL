@@ -1339,7 +1339,12 @@ def test_receiver_quantizes_blockwise_fused_weights(
     }
     ext = _make_ext({param_name: weight, param_name + "_scale_inv": scales})
     ext.model_runner.model.named_modules = lambda: [
-        (param_name.rsplit(".", 1)[0], SimpleNamespace(weight_block_size=(128, 128)))
+        (
+            param_name.rsplit(".", 1)[0],
+            SimpleNamespace(
+                weight_block_size=(128, 128), quant_method=SimpleNamespace()
+            ),
+        )
     ]
     specs = ext.build_hf_to_local_param_map(info)
     for cycle in (1, 2):
@@ -1362,6 +1367,119 @@ def test_receiver_quantizes_blockwise_fused_weights(
         )
         torch.testing.assert_close(restored, expected, rtol=0.07, atol=0)
         assert not torch.any(scales == 9)
+
+
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
+    block_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    monkeypatch.setattr(fp8, "global_fp8_config", fp8.FP8Config())
+    quantize = fp8.cast_tensor_to_fp8_blockwise
+    quantize_spy = MagicMock(wraps=quantize)
+    monkeypatch.setattr(fp8, "cast_tensor_to_fp8_blockwise", quantize_spy)
+
+    # vLLM refines a checkpoint's 128x128 grid for an intermediate shard
+    # aligned to 32 or 64 rows, but not to 128 rows.
+    experts, hidden_size, intermediate_size = 2, 256, 3 * block_size
+    prefix = "model.layers.0.mlp.experts"
+    gate_up = torch.full(
+        (experts, 2 * intermediate_size, hidden_size), -1, dtype=torch.float8_e4m3fn
+    )
+    down = torch.full(
+        (experts, hidden_size, intermediate_size), -1, dtype=torch.float8_e4m3fn
+    )
+    gate_up_scales = torch.full(
+        (experts, 2 * intermediate_size // block_size, hidden_size // block_size),
+        9.0,
+    )
+    down_scales = torch.full(
+        (experts, hidden_size // block_size, intermediate_size // block_size), 9.0
+    )
+    ext = _make_ext(
+        {
+            f"{prefix}.w13_weight": gate_up,
+            f"{prefix}.w13_weight_scale_inv": gate_up_scales,
+            f"{prefix}.w2_weight": down,
+            f"{prefix}.w2_weight_scale_inv": down_scales,
+        }
+    )
+    ext.model_runner.model.named_modules = lambda: [
+        (
+            prefix,
+            SimpleNamespace(
+                weight_block_size=(128, 128),
+                quant_method=SimpleNamespace(
+                    moe_block_shape=(block_size, block_size),
+                    quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+                ),
+            ),
+        )
+    ]
+    projections = ("gate_proj", "up_proj", "down_proj")
+    refit_info = {
+        "gen_tp_size": 1,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": f"{prefix}.{projection}.weight",
+                    "global_shape": list(
+                        down.shape
+                        if projection == "down_proj"
+                        else gate_up[:, :intermediate_size].shape
+                    ),
+                    "dtype": "torch.bfloat16",
+                    "grouped_expert_proj": projection,
+                }
+                for projection in projections
+            ]
+        },
+    }
+    specs = ext.build_hf_to_local_param_map(refit_info)
+    for cycle in (1, 2):
+        for part, projection in enumerate(projections):
+            spec = specs.get(f"{prefix}.{projection}.weight")
+            ctx = spec.materialize()
+            assert spec.wire_dtype == ctx.buf.dtype == torch.bfloat16
+            received = (
+                torch.arange(ctx.buf.numel(), dtype=torch.float32)
+                .reshape(ctx.buf.shape)
+                .remainder(83)
+                .add_(1)
+                .mul_((-1) ** cycle * cycle * (part + 1))
+                .to(torch.bfloat16)
+            )
+            ctx.buf.copy_(received)
+            weight = down if projection == "down_proj" else gate_up
+            scales = down_scales if projection == "down_proj" else gate_up_scales
+            expected_weight, expected_scales = weight.clone(), scales.clone()
+            weight_region = expected_weight
+            scale_region = expected_scales
+            if projection != "down_proj":
+                weight_region = expected_weight.chunk(2, dim=1)[part]
+                scale_region = expected_scales.chunk(2, dim=1)[part]
+            # Independent expert casts are the numerical reference; the receive
+            # hook must produce the same result with a single grouped cast.
+            for expert, expert_weight in enumerate(received.unbind(0)):
+                value, scale = quantize(expert_weight, (block_size, block_size))
+                weight_region[expert].copy_(value)
+                scale_region[expert].copy_(scale.squeeze(-1))
+
+            previous_weight, previous_scales = weight.float(), scales.clone()
+            quantize_spy.reset_mock()
+            spec.post(ctx)
+            quantize_spy.assert_called_once()
+            cast_input, cast_block_size = quantize_spy.call_args.args
+            assert cast_input.shape == (experts * received.shape[1], received.shape[2])
+            assert cast_block_size == (block_size, block_size)
+            torch.testing.assert_close(
+                weight.float(), expected_weight.float(), rtol=0, atol=0
+            )
+            torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+            assert not torch.equal(weight.float(), previous_weight)
+            assert not torch.equal(scales, previous_scales)
 
 
 @pytest.mark.skipif(
