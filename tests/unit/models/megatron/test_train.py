@@ -1633,6 +1633,51 @@ class TestLossPostProcessor:
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
+    )
+    def test_cp_partial_loss_keeps_only_the_schedule_compensation(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """A CP-partial loss is not divided by CP; Megatron's own scaling is undone."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg={"sequence_packing": {"enabled": False}},
+            num_microbatches=4,
+            cp_normalize=False,
+        )
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        loss, _ = processor(data_dict=MagicMock())(torch.randn(2, 10, 100))
+
+        # Only num_microbatches / cp_size = 4 / 2, which cancels the schedule's
+        # cp_size / num_microbatches; summed over CP the partials give the loss.
+        assert torch.isclose(loss, torch.tensor(2.0))
+
+    def test_only_owner_local_csd_returns_a_cp_partial_loss(self):
+        from nemo_rl.algorithms.loss.csd import CSDLossConfig, CSDLossFn
+        from nemo_rl.models.megatron.train import (
+            loss_returns_context_parallel_partial,
+        )
+
+        assert loss_returns_context_parallel_partial(
+            CSDLossFn(CSDLossConfig(student_vocab_size=8, owner_local=True))
+        )
+        assert not loss_returns_context_parallel_partial(
+            CSDLossFn(CSDLossConfig(student_vocab_size=8))
+        )
+        assert not loss_returns_context_parallel_partial(MagicMock())
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
         "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
     )
     @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")

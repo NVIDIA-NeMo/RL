@@ -31,6 +31,7 @@ from nemo_rl.algorithms.loss.utils import (
 )
 from nemo_rl.algorithms.x_token.loss_utils import (
     prepare_csd_cross_tokenizer_loss_input,
+    prepare_csd_owner_local_loss_input,
     prepare_xtoken_cross_tokenizer_loss_input,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -327,7 +328,38 @@ def prepare_loss_input(
         }
 
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        if isinstance(loss_fn, CSDLossFn):
+        if isinstance(loss_fn, CSDLossFn) and loss_fn.owner_local:
+            # Megatron student logits stay in their CP shard; cross-tokenizer
+            # teacher rows are read by the loss from their IPC records.
+            (
+                student_logits_contig,
+                teacher_full_logits_by_idx,
+                teacher_row_payloads_by_idx,
+                aligns_by_idx,
+                tp_group,
+                cp_group,
+                dp_cp_group,
+            ) = prepare_csd_owner_local_loss_input(
+                logits,
+                data,
+                cross_tokenizer_teacher_mask=[
+                    not loss_fn._teacher_is_same_vocab(i)
+                    for i in range(loss_fn.num_teachers)
+                ],
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+            loss_input = {
+                "logits": logits,
+                "student_logits_contig": student_logits_contig,
+                "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+                "teacher_row_payloads_by_idx": teacher_row_payloads_by_idx,
+                "aligns_by_idx": aligns_by_idx,
+                "tp_group": tp_group,
+                "cp_group": cp_group,
+                "dp_cp_group": dp_cp_group,
+            }
+        elif isinstance(loss_fn, CSDLossFn):
             (
                 student_logits_contig,
                 teacher_full_logits_by_idx,
