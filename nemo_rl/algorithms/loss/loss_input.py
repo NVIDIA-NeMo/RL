@@ -391,6 +391,8 @@ def prepare_loss_input(
                 "tp_group": tp_group,
                 "cp_group": cp_group,
                 "dp_cp_group": dp_cp_group,
+                # Megatron (no model-owned CP sharder) divides the loss by CP.
+                "cp_normalized_by_caller": cp_sharder is None,
             }
         else:
             # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
