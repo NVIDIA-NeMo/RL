@@ -700,6 +700,79 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 so a prompt group is kept or dropped together, independently of leave-one-out baseline
 semantics.
 
+### Length-aware reweighting of positive advantages
+
+With `token_level_loss: true` every trained token gets weight $A_i / N_{\text{step}}$, so a
+response's total credit grows with its length. That penalizes long wrong answers in full, but it
+also gives long, verbose correct answers the largest share of the positive credit.
+`grpo.adv_estimator.positive_length_reweight` rescales only the positive advantages inside each
+prompt group, so shorter correct responses get more credit per token and longer ones less:
+
+```yaml
+grpo:
+  adv_estimator:
+    name: grpo
+    positive_length_reweight:
+      enabled: false
+      mode: rank             # "rank" | "inverse_length"
+      rank_spread: 0.5       # rank mode only, 0 <= s < 1
+      alpha: 1.0             # inverse_length mode only, >= 0 (0 is a no-op)
+```
+
+It runs after the leave-one-out baseline and the reward normalization. For each prompt group,
+let $L_i$ be the number of trained response tokens (`mask[:, 1:].sum(-1)`) and
+$P = \{ i : A_i > 0,\ \text{valid}_i,\ L_i > 0 \}$ the group's positives. Groups with
+$|P| < 2$ are left unchanged. Otherwise each $i \in P$ gets a raw weight:
+
+- `rank`: $w_i = 1 + s \left(1 - \dfrac{2 r_i}{|P| - 1}\right)$, where $r_i$ is the rank of $L_i$
+  within $P$ (0 = shortest; tied lengths share the mean of their ranks) and $s$ is `rank_spread`.
+  - The weights are linear in the rank, so adjacent ranks are evenly spaced.
+  - The shortest positive gets $1 + s$ and the longest $1 - s$. The per-token ratio
+    $(1 + s)/(1 - s)$ (3x at $s = 0.5$) does not depend on $|P|$.
+  - Only the length order matters, not the size of the gaps.
+- `inverse_length`: $w_i = L_i^{-\alpha}$. At $\alpha = 1$ with binary rewards every correct
+  response of the group ends up with the same total credit.
+
+One common factor per group then restores the group's token-weighted positive mass, and the
+positives are rescaled:
+
+$$
+w_i \leftarrow w_i \, \frac{\sum_{j \in P} A_j L_j}{\sum_{j \in P} A_j L_j w_j}, \qquad
+A_i \leftarrow A_i \, w_i \quad (i \in P)
+$$
+
+Properties:
+
+- It is a length-aware rescaling of the positive advantages only. Negative advantages are
+  untouched, and no sign ever flips: long correct answers are still reinforced, just less.
+- Each group's $\sum_i |A_i| L_i$ is preserved exactly, so each prompt's share of the
+  optimizer step under token-level loss is identical to the baseline. Credit moves only within a
+  group, from long to short correct responses, never between prompts; easy prompts cannot gain
+  share from it.
+- It only acts on groups with at least 2 correct responses, so a larger
+  `num_generations_per_prompt` strengthens it.
+- It uses within-group statistics only, so the SingleController can shard the advantage stage
+  by prompt group, and it does not depend on the row order within a group.
+- `grpo.advantage_clip_low/high` is applied after the estimator and can cap the boosted
+  advantages of short correct responses.
+
+Risks:
+
+- Necessary long reasoning on hard prompts may be under-reinforced.
+- Short lucky guesses get boosted. In `rank` mode every raw weight is at least $1 - s$, so the
+  renormalization factor is at most $1/(1 - s)$ and every final weight is at most
+  $(1 + s)/(1 - s)$, however short the response. `inverse_length` has no such bound: a very
+  short correct response can take most of the group's positive credit.
+
+Suggested sweep: `rank` with $s \in \{0.25, 0.5\}$ and `inverse_length` with
+$\alpha \in \{0.5, 1.0\}$.
+
+Logged metrics (`adv_len_reweight/`): `frac_groups_reweighted` (groups with $|P| \ge 2$ over
+groups with any valid row), `weight_min` / `weight_mean` / `weight_max` (final weights applied),
+and the step share of $\sum_i |A_i| L_i$ by group pass rate (`share_bucket_le_0.25`,
+`share_bucket_0.25_0.75`, `share_bucket_ge_0.75`), which by construction equals the share before
+reweighting; `share_max_abs_diff` reports the largest difference and should be about 0.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 

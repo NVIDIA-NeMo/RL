@@ -42,6 +42,11 @@ grpo:
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
     proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
     subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
+    positive_length_reweight:  # GRPO-specific: move positive credit within a group from long to short correct responses
+      enabled: false  # off: advantages are unchanged
+      mode: rank  # "rank" (weight linear in length rank) or "inverse_length" (weight L^-alpha)
+      rank_spread: 0.5  # rank mode: shortest/longest per-token ratio (1+s)/(1-s); 0 <= s < 1
+      alpha: 1.0  # inverse_length mode: exponent >= 0 (0 is a no-op)
   reward_scaling:
     enabled: false
     source_min: 0.0

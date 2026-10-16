@@ -3885,6 +3885,9 @@ def _grpo_train_impl(
                         advantages=train_data["advantages"],
                         env_baseline=env_baseline_for_log,
                     )
+                    if isinstance(adv_estimator, GRPOAdvantageEstimator):
+                        # Positive length reweighting metrics; empty while disabled.
+                        metrics.update(adv_estimator.last_metrics)
                     del baseline_for_log, env_baseline_for_log
 
                     penalty_metrics = (

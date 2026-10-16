@@ -46,6 +46,7 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
@@ -1061,6 +1062,9 @@ def grpo_train_sync(
                         advantages=advantages,
                         env_baseline=env_baseline_for_log,
                     )
+                    if isinstance(adv_estimator, GRPOAdvantageEstimator):
+                        # Positive length reweighting metrics; empty while disabled.
+                        metrics.update(adv_estimator.last_metrics)
                     del baseline_for_log, env_baseline_for_log
 
                 # ── Driver delta-write: advantages + (post-masking)

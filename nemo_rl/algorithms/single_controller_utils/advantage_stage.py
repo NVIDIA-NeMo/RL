@@ -38,6 +38,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    PositiveLengthReweightStats,
+)
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     _clip_grpo_advantages,
@@ -289,6 +293,9 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
+    # This call's grpo.adv_estimator.positive_length_reweight statistics, additive so the
+    # controller can merge a step's calls; None when the reweighting is off or did not run.
+    positive_length_reweight_stats: Optional[PositiveLengthReweightStats] = None
 
 
 class AdvantageComputer:
@@ -439,6 +446,7 @@ class AdvantageComputer:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
+        positive_length_reweight_stats: Optional[PositiveLengthReweightStats] = None
         if has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
@@ -455,6 +463,10 @@ class AdvantageComputer:
                 advantages, returns = result
             else:
                 advantages = result
+            if isinstance(self._advantage_estimator, GRPOAdvantageEstimator):
+                positive_length_reweight_stats = (
+                    self._advantage_estimator.last_length_reweight_stats
+                )
         else:
             advantages = torch.zeros_like(mask)
             if cfg.is_ppo:
@@ -574,4 +586,5 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
+            positive_length_reweight_stats=positive_length_reweight_stats,
         )
