@@ -1063,6 +1063,64 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_results = self.worker_group.get_all_worker_results(futures)
         return aggregate_per_sample_handles(worker_results)
 
+    def get_sparse_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        *,
+        k: int,
+        temperature: float,
+        real_vocab_size: int,
+        noise_filter_k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship sparse teacher rows of each CP shard via CUDA IPC (Megatron).
+
+        TP ranks cooperate to form the exact top-k and log Z, but only TP rank
+        0 exports each CP shard, so every sample keeps one sparse record per
+        teacher CP rank. ``data`` must carry ``force_include_token_ids``
+        ``[B, T_t, F]``. Returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`. The worker storage persists across
+        calls and is freed by :meth:`release_ipc_buffer`.
+        """
+        if "megatron_cfg" not in self.cfg or not self.cfg["megatron_cfg"]["enabled"]:
+            raise NotImplementedError(
+                "get_sparse_logits_ipc currently supports only Megatron workers."
+            )
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_sparse_logits_ipc does not support dynamic batching or "
+                "sequence packing."
+            )
+        with timer.time("get_sparse_logits_ipc/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                self.data_parallel_size,
+                batch_size=None,
+            )
+        with timer.time("get_sparse_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_sparse_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                # Keep every CP output; only TP rank 0 on the last pipeline
+                # stage returns records, and empty results drop out in
+                # aggregate_per_sample_handles.
+                common_kwargs={
+                    "k": int(k),
+                    "temperature": float(temperature),
+                    "real_vocab_size": int(real_vocab_size),
+                    "noise_filter_k": int(noise_filter_k),
+                    "micro_batch_size": micro_batch_size,
+                },
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        return aggregate_per_sample_handles(worker_results)
+
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
         futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")

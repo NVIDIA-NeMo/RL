@@ -119,6 +119,87 @@ def test_lockstep_plan_dp_must_match_policy_dp(entrypoint):
             )
 
 
+def _sparse_ipc_policy(cfg: dict) -> Policy:
+    policy = Policy.__new__(Policy)
+    policy.cfg = cfg
+    policy.use_sequence_packing = False
+    policy.use_dynamic_batches = False
+    policy.sharding_annotations = MagicMock()
+    policy.sharding_annotations.get_axis_size.return_value = 2
+    policy.worker_group = MagicMock()
+    return policy
+
+
+def test_sparse_logits_ipc_routes_megatron_workers_and_keeps_cp_shards():
+    policy = _sparse_ipc_policy({"megatron_cfg": {"enabled": True}})
+    record = {"transport": "sparse_topk", "cp_rank": 0}
+    policy.worker_group.get_all_worker_results.return_value = [
+        {"dp_rank": 0, "per_sample_handles": [record]},
+        # TP rank 1 exports nothing; the last CP shard still contributes.
+        {"dp_rank": 0, "per_sample_handles": []},
+        {"dp_rank": 0, "per_sample_handles": [{**record, "cp_rank": 1}]},
+        {"dp_rank": 1, "per_sample_handles": [{**record, "cp_rank": 0}]},
+    ]
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((2, 4), dtype=torch.long),
+            "force_include_token_ids": torch.full((2, 4, 2), -1),
+        }
+    )
+
+    handles = policy.get_sparse_logits_ipc(
+        data,
+        k=128,
+        temperature=0.5,
+        real_vocab_size=1000,
+        noise_filter_k=0,
+        micro_batch_size=1,
+    )
+
+    call = policy.worker_group.run_all_workers_sharded_data.call_args
+    assert call.args == ("get_sparse_logits_ipc",)
+    assert call.kwargs["in_sharded_axes"] == ["data_parallel"]
+    assert call.kwargs["replicate_on_axes"] == [
+        "context_parallel",
+        "tensor_parallel",
+        "pipeline_parallel",
+    ]
+    assert "output_is_replicated" not in call.kwargs
+    assert call.kwargs["common_kwargs"] == {
+        "k": 128,
+        "temperature": 0.5,
+        "real_vocab_size": 1000,
+        "noise_filter_k": 0,
+        "micro_batch_size": 1,
+    }
+    assert [len(entry["teacher_shards"]) for entry in handles] == [2, 1]
+    assert [shard["cp_rank"] for shard in handles[0]["teacher_shards"]] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "cfg,packing,dynamic,match",
+    [
+        ({"automodel_cfg": {"enabled": True}}, False, False, "only Megatron"),
+        ({"megatron_cfg": {"enabled": False}}, False, False, "only Megatron"),
+        ({"megatron_cfg": {"enabled": True}}, True, False, "sequence packing"),
+        ({"megatron_cfg": {"enabled": True}}, False, True, "dynamic batching"),
+    ],
+)
+def test_sparse_logits_ipc_rejects_unsupported_policies(cfg, packing, dynamic, match):
+    policy = _sparse_ipc_policy(cfg)
+    policy.use_sequence_packing = packing
+    policy.use_dynamic_batches = dynamic
+    with pytest.raises(NotImplementedError, match=match):
+        policy.get_sparse_logits_ipc(
+            BatchedDataDict({"input_ids": torch.zeros((2, 4), dtype=torch.long)}),
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+    policy.worker_group.run_all_workers_sharded_data.assert_not_called()
+
+
 def create_automodel_config(
     model_name: str, tp: int, pp: int = 1, cp: int = 1
 ) -> PolicyConfig:

@@ -2305,6 +2305,230 @@ def test_full_logits_ipc_nonlast_pipeline_stage_does_not_allocate(monkeypatch):
     worker._ensure_teacher_ipc_storage.assert_not_called()
 
 
+def _sparse_ipc_worker(monkeypatch, *, tp_rank: int = 0, cp_rank: int = 1):
+    """A worker double whose forward returns fixed sparse rows per microbatch."""
+    from nemo_rl.models.policy import utils as policy_utils
+    from nemo_rl.models.policy.workers import megatron_policy_worker as mpw
+
+    batch_size, local_seq_len, k, force_width = 2, 4, 3, 2
+    num_microbatches = 2
+
+    def fake_get_microbatch_iterator(*_args, **kwargs):
+        assert kwargs["skip_keys"] == {"force_include_token_ids"}
+        return iter([]), num_microbatches, batch_size, 8, 8
+
+    def fake_forward_backward(**kwargs):
+        assert kwargs["forward_only"] is True
+        assert kwargs["sampling_params"] is None
+        processor = kwargs["post_processing_fn"]
+        assert isinstance(processor, mpw.SparseTeacherLogitsPostProcessor)
+        outputs = []
+        for buf_idx in range(num_microbatches):
+            base = float(10 * (buf_idx + 1) + len(calls))
+            outputs.append(
+                {
+                    "sparse_topk_logits": torch.full(
+                        (batch_size, local_seq_len, k), base
+                    ),
+                    "sparse_topk_indices": torch.arange(k, dtype=torch.int32).expand(
+                        batch_size, local_seq_len, k
+                    ),
+                    "sparse_log_z": torch.full((batch_size, local_seq_len), base + 1),
+                    "sparse_natural_tail_indices": torch.full(
+                        (batch_size, local_seq_len, 1), k - 1, dtype=torch.int32
+                    ),
+                    "sparse_forced_logits": torch.full(
+                        (batch_size, local_seq_len, force_width), base + 2
+                    ),
+                    "sparse_forced_indices": torch.full(
+                        (batch_size, local_seq_len, force_width), -1, dtype=torch.int32
+                    ),
+                    "sparse_forced_in_topk": torch.zeros(
+                        (batch_size, local_seq_len, force_width), dtype=torch.bool
+                    ),
+                }
+            )
+        calls.append(processor)
+        return outputs
+
+    calls: list = []
+    exported: list[int] = []
+
+    def fake_handle(storage):
+        exported.append(id(storage))
+        return ("handle", id(storage))
+
+    monkeypatch.setattr(mpw, "get_microbatch_iterator", fake_get_microbatch_iterator)
+    monkeypatch.setattr(mpw, "megatron_forward_backward", fake_forward_backward)
+    monkeypatch.setattr(policy_utils, "get_handle_from_tensor", fake_handle)
+    monkeypatch.setattr(mpw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(mpw.torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(mpw.torch.distributed, "get_rank", lambda: 5)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(mpw.parallel_state, "get_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_context_parallel_rank", lambda: cp_rank
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state, "get_context_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        mpw.parallel_state, "is_pipeline_last_stage", lambda ignore_virtual: True
+    )
+
+    worker = object.__new__(mpw.MegatronPolicyWorkerImpl)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    worker.cfg = {
+        "logprob_batch_size": batch_size,
+        "max_total_sequence_length": 12,
+        "sequence_packing": {"enabled": False},
+    }
+    worker.model = SimpleNamespace(eval=lambda: None)
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.defer_fp32_logits = False
+    worker.final_padded_vocab_size = 64
+    worker._teacher_ipc_storage = None
+    worker._teacher_ipc_handles = []
+    worker._teacher_sparse_ipc_storage = {}
+    worker._teacher_sparse_ipc_handles = {}
+    return mpw, worker, calls, exported
+
+
+def _teacher_sparse_data() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.zeros((4, 8), dtype=torch.long),
+            "force_include_token_ids": torch.full((4, 8, 2), -1),
+        }
+    )
+
+
+def test_sparse_logits_ipc_writes_seven_fields_and_reuses_slabs(monkeypatch):
+    mpw, worker, calls, exported = _sparse_ipc_worker(monkeypatch)
+
+    first = mpw.MegatronPolicyWorkerImpl.get_sparse_logits_ipc(
+        worker,
+        _teacher_sparse_data(),
+        k=3,
+        temperature=0.5,
+        real_vocab_size=50,
+        noise_filter_k=0,
+    )
+
+    processor = calls[0]
+    assert (processor.k, processor.temperature) == (3, 0.5)
+    assert (processor.real_vocab_size, processor.noise_filter_k) == (50, 0)
+    storage = worker._teacher_sparse_ipc_storage
+    assert set(storage) == {
+        "topk_logits",
+        "topk_indices",
+        "log_z",
+        "natural_tail_indices",
+        "forced_logits",
+        "forced_indices",
+        "forced_in_topk",
+    }
+    # Capacity is reserved for max_total_sequence_length=12 over CP=2.
+    assert storage["topk_logits"].shape == (2, 2, 6, 3)
+    assert storage["log_z"].shape == (2, 2, 6, 1)
+    assert storage["forced_indices"].shape == (2, 2, 6, 2)
+    assert storage["forced_in_topk"].dtype == torch.bool
+    assert torch.equal(storage["topk_logits"][1, :, :4], torch.full((2, 4, 3), 20.0))
+    assert torch.equal(storage["log_z"][0, :, :4, 0], torch.full((2, 4), 11.0))
+    assert len(exported) == 7
+
+    records = first["per_sample_handles"]
+    assert first["dp_rank"] == 0
+    assert [(r["buf_idx"], r["sample_index_in_buf"]) for r in records] == [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    ]
+    record = records[0]
+    assert record["transport"] == "sparse_topk"
+    assert (
+        record["topk_logits_ipc"] == worker._teacher_sparse_ipc_handles["topk_logits"]
+    )
+    assert record["sequence_segments"] == [(0, 2, 2), (2, 4, 2)]
+    assert record["full_seq_len"] == 8
+    assert record["topk_shape"] == (4, 3)
+    assert record["forced_shape"] == (4, 2)
+    assert record["scalar_shape"] == (4,)
+    assert (record["k"], record["force_width"], record["forced_in_topk_k"]) == (
+        3,
+        2,
+        3,
+    )
+    assert (record["cp_rank"], record["cp_size"], record["tp_size"]) == (1, 2, 2)
+    assert record["padded_vocab_size"] == 64
+
+    second = mpw.MegatronPolicyWorkerImpl.get_sparse_logits_ipc(
+        worker,
+        _teacher_sparse_data(),
+        k=3,
+        temperature=0.5,
+        real_vocab_size=50,
+        noise_filter_k=0,
+    )
+    assert worker._teacher_sparse_ipc_storage["topk_logits"] is storage["topk_logits"]
+    assert len(exported) == 7, "cached tickets must be reused, not re-exported"
+    assert torch.equal(storage["topk_logits"][0, :, :4], torch.full((2, 4, 3), 11.0))
+    assert (
+        second["per_sample_handles"][0]["log_z_ipc"]
+        == first["per_sample_handles"][0]["log_z_ipc"]
+    )
+
+    monkeypatch.setattr(mpw.gc, "collect", lambda: None)
+    monkeypatch.setattr(mpw.torch.cuda, "empty_cache", lambda: None)
+    mpw.MegatronPolicyWorkerImpl.release_ipc_buffer(worker)
+    assert worker._teacher_sparse_ipc_storage == {}
+    assert worker._teacher_sparse_ipc_handles == {}
+
+
+def test_sparse_logits_ipc_only_tp_rank_zero_exports(monkeypatch):
+    mpw, worker, calls, exported = _sparse_ipc_worker(monkeypatch, tp_rank=1)
+
+    result = mpw.MegatronPolicyWorkerImpl.get_sparse_logits_ipc(
+        worker,
+        _teacher_sparse_data(),
+        k=3,
+        temperature=1.0,
+        real_vocab_size=50,
+        noise_filter_k=4,
+    )
+
+    assert len(calls) == 1, "every TP rank joins the top-k collectives"
+    assert result == {"per_sample_handles": [], "dp_rank": 0}
+    assert worker._teacher_sparse_ipc_storage == {}
+    assert exported == []
+
+
+def test_sparse_logits_ipc_rejects_model_owned_cp_packing(monkeypatch):
+    mpw, worker, calls, _ = _sparse_ipc_worker(monkeypatch)
+    worker.delegate_pack_to_model = True
+
+    with pytest.raises(NotImplementedError, match="context_parallel_size=1"):
+        mpw.MegatronPolicyWorkerImpl.get_sparse_logits_ipc(
+            worker,
+            _teacher_sparse_data(),
+            k=3,
+            temperature=1.0,
+            real_vocab_size=50,
+            noise_filter_k=0,
+        )
+    assert calls == []
+
+
 def test_megatron_prepare_for_training_restores_optimizer():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
