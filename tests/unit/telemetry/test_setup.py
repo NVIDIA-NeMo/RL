@@ -77,12 +77,12 @@ def test_campaign_stage_is_tagged_on_driver_and_worker():
     assert _worker_resource_attributes(None, None)["nv.dl.campaign.stage"] == "RL"
 
 
-def test_build_resource_attributes_dtensor_tp():
+def test_build_resource_attributes_automodel_tp():
     cfg = _FakeMasterConfig(
         policy={
             "model_name": "org/Model-1B",
             "precision": "bfloat16",
-            "dtensor_cfg": {"tensor_parallel_size": 4},
+            "automodel_cfg": {"tensor_parallel_size": 4},
         }
     )
     attrs = _build_resource_attributes(cfg, "grpo")

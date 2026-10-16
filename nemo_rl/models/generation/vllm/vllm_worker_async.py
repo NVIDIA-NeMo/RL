@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -27,12 +28,14 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 import ray
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
     CapturedMediaItem,
     MediaCaptureRejected,
+    MediaColumnSpec,
     capture_processed_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
@@ -45,10 +48,14 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
+)
+from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
+    CapturedChatLogprobsMixin,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
@@ -85,6 +92,44 @@ class CapturedRequest:
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
+
+
+# Paths the bearer-token check protects: the OpenAI-compatible routes this module
+# registers, which NeMo-Gym's model server calls. The sparse-refit routes the
+# receiver registers on the same app carry their own header token
+# (vllm_sparse_refit.setup_api_server) and are not covered.
+HTTP_SERVER_PROTECTED_PATH_PREFIXES = ("/v1/", "/tokenize")
+
+
+def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
+    """Refuse OpenAI-route requests that do not carry ``Authorization: Bearer <api_key>``.
+
+    Registers an HTTP middleware on ``app``. For a request whose path starts with one
+    of ``HTTP_SERVER_PROTECTED_PATH_PREFIXES``, the ``Authorization`` header is
+    compared in constant time with ``Bearer <api_key>``; a missing or different
+    value is answered with HTTP 401 in OpenAI's error envelope and never reaches the
+    route. Requests to other paths pass through unchanged.
+    """
+    expected = f"Bearer {api_key}".encode()
+
+    @app.middleware("http")
+    async def _require_bearer_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path.startswith(HTTP_SERVER_PROTECTED_PATH_PREFIXES):
+            supplied = (request.headers.get("Authorization") or "").encode()
+            if not secrets.compare_digest(supplied, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "missing or invalid bearer token",
+                            "type": "authentication_error",
+                            "code": 401,
+                        }
+                    },
+                )
+        return await call_next(request)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -272,6 +317,27 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the inner TP workers.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        This outer actor deliberately does not call cudaProfilerStart itself, so its
+        own nsys session never opens a capture and writes no report.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the inner TP workers.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker and ends its capture.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
@@ -529,17 +595,18 @@ class VllmAsyncGenerationWorkerImpl(
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> bool:
+    ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
         ``install_capture`` call wiring Gym's engine-blind capture core +
-        vLLM adapter into this worker. Returns whether capture was installed
-        (False on non-model-owner ranks, which serve no HTTP).
+        vLLM adapter into this worker. Returns the media column spec this
+        worker pinned the staging column to (``None`` for text-only capture
+        and on non-model-owner ranks, which serve no HTTP and install nothing).
         """
         if not self.is_model_owner:
-            return False
+            return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -547,7 +614,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
@@ -600,7 +669,11 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
-        return True
+        if not capture_media:
+            return None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype, patch_size=self._capture_patch_size
+        )
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
@@ -785,7 +858,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -818,7 +891,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            start = prev_len - boundary_route_rows(prev_len)
+            message["routed_experts"] = encode_routed_experts(experts[start:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -1238,12 +1312,22 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res = res
                         yield res
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Capture stages the raw arrays below and strips OpenAI logprobs
+                # after the terminal PUT. Skip only their object construction;
+                # changing request.logprobs would also change engine sampling.
+                bypass_logprobs = bool(
+                    not request.stream
+                    and request.logprobs
+                    and return_as_token_id
+                    and id(request) in worker_self._capture_calls
                 )
+                with self._bypass_chat_logprobs(enabled=bypass_logprobs):
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1267,7 +1351,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(
+            NeMoRLOpenAIServingChatMixin,
+            CapturedChatLogprobsMixin,
+            OpenAIServingChat,
+        ):
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
@@ -1433,6 +1521,31 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except ValueError as e:
+                # vLLM's get_max_tokens raises a plain ValueError ("Input length
+                # (N) exceeds model's maximum context length (M).") after
+                # preprocess_chat, e.g. when a token-in splice grows the prompt
+                # past max_model_len on a request with no max_tokens to clamp.
+                # Convert only that overflow to the same 400 as above; any other
+                # ValueError is a server bug and stays a 500. Must follow
+                # MediaCaptureRejected, which is also a ValueError.
+                if "maximum context length" not in str(e):
+                    # Re-raising here bypasses the BaseException handler below.
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
+                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
+                worker_self._abort_request_capture(request, reason="context_length")
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1565,6 +1678,10 @@ class VllmAsyncGenerationWorkerImpl(
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
+        # Present only when the driver generated a key (vllm_cfg.http_server_api_key_required).
+        http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
+        if http_server_api_key:
+            install_http_server_api_key_check(app, http_server_api_key)
 
         ########################################
         # Server spinup

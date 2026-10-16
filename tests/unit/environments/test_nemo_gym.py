@@ -18,6 +18,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -40,9 +41,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.environments.nemo_gym import (
+    ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _wait_for_external_services,
     build_reward_component_columns,
+    extract_external_service_readiness,
     extract_reward_components,
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
@@ -63,6 +67,7 @@ from nemo_rl.environments.nemotron_utils import (
     _expand_nemotron_video_placeholders,
     _flatten_nemotron_video_frame_messages,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     attach_static_multimodal_payload,
@@ -168,6 +173,115 @@ def test_spinup_nemo_gym_rejects_truncation_with_router_replay():
             enable_router_replay=True,
             use_fastokens=False,
         )
+
+
+def _external_health_response(
+    *, status: str, healthy_backends: int, total_backends: int
+) -> MagicMock:
+    response = MagicMock()
+    response.status = 200
+    response.read.return_value = json.dumps(
+        {
+            "status": status,
+            "healthy_backends": healthy_backends,
+            "total_backends": total_backends,
+        }
+    ).encode()
+    response.__enter__.return_value = response
+    return response
+
+
+def test_external_service_readiness_waits_for_every_expected_backend():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=10,
+        poll_interval_seconds=1,
+        request_timeout_seconds=2,
+    )
+
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[
+                _external_health_response(
+                    status="ok", healthy_backends=1, total_backends=2
+                ),
+                _external_health_response(
+                    status="ok", healthy_backends=2, total_backends=2
+                ),
+            ],
+        ) as urlopen,
+        patch("nemo_rl.environments.nemo_gym.sleep") as sleep,
+    ):
+        _wait_for_external_services(config)
+
+    assert urlopen.call_count == 2
+    sleep.assert_called_once_with(1)
+
+
+def test_external_service_readiness_times_out_with_last_observation():
+    config = ExternalServiceReadinessConfig(
+        services=[
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        timeout_seconds=1,
+        poll_interval_seconds=1,
+        request_timeout_seconds=1,
+    )
+
+    now = 0.0
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    # Probes return instantly and only sleep advances the clock, so the last
+    # sleep ends exactly at the deadline, as it does in a real run.
+    with (
+        patch(
+            "nemo_rl.environments.nemo_gym.urllib.request.urlopen",
+            side_effect=[OSError("connection refused")],
+        ),
+        patch("nemo_rl.environments.nemo_gym.monotonic", side_effect=lambda: now),
+        patch("nemo_rl.environments.nemo_gym.sleep", side_effect=advance),
+    ):
+        with pytest.raises(TimeoutError, match="GENRM: request failed"):
+            _wait_for_external_services(config)
+
+
+def test_external_service_readiness_is_not_forwarded_to_gym():
+    nemo_gym_dict = {
+        "external_service_readiness": {
+            "services": [
+                {
+                    "name": "GENRM",
+                    "url": "http://10.0.0.1:9213/health",
+                    "expected_backends": 2,
+                }
+            ],
+            "timeout_seconds": 10,
+            "poll_interval_seconds": 1,
+            "request_timeout_seconds": 2,
+        },
+        "skip_venv_if_present": True,
+    }
+
+    readiness = extract_external_service_readiness(nemo_gym_dict)
+
+    assert readiness is not None
+    assert readiness.services[0].name == "GENRM"
+    assert "external_service_readiness" not in nemo_gym_dict
+    assert nemo_gym_dict == {"skip_venv_if_present": True}
 
 
 def test_extract_static_video_message_resolves_local_file(tmp_path):
@@ -860,7 +974,12 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
                 "attention_mask": torch.ones(1, token_count, dtype=torch.long),
             }
 
+        def convert_tokens_to_ids(self, token):
+            assert token == "<image>"
+            return 0
+
     class NemotronNanoVLV2Processor:
+        image_token = "<image>"
         model_input_names = [
             "input_ids",
             "attention_mask",
@@ -909,10 +1028,38 @@ def test_nemotron_video_datum_uses_dynamic_tubelet_inputs(monkeypatch, tmp_path)
     assert pixel_values.as_tensor(mode="patchify").shape == (1, 240, 768)
     assert user_message["imgs_sizes"].as_tensor().tolist() == [[96, 160]] * 4
     assert user_message["num_frames"].as_tensor().tolist() == [4]
+    assert (
+        user_message["media_token_validity_mask"].shape
+        == user_message["token_ids"].shape
+    )
+    assert user_message["media_token_validity_mask"].sum().item() == 1
     extra_body = json.loads(
         datum["extra_env_info"]["responses_create_params"]["metadata"]["extra_body"]
     )
     assert "mm_processor_kwargs" not in extra_body
+
+    filtered = nemo_gym_example_to_video_datum_spec(
+        example,
+        processor=NemotronNanoVLV2Processor(),
+        max_seq_length=4,
+        idx=3,
+        task_name="nemo_gym",
+        data_config=SimpleNamespace(
+            num_frames=4,
+            video_sampling_style="nemotron_vl",
+            video_temporal_patch_size=2,
+            video_target_num_patches=64,
+            video_maintain_aspect_ratio=True,
+            min_generation_tokens=16,
+        ),
+    )
+    filtered_message = filtered["message_log"][0]
+    assert filtered["loss_multiplier"] == 0.0
+    assert (
+        filtered_message["media_token_validity_mask"].shape
+        == filtered_message["token_ids"].shape
+    )
+    assert not filtered_message["media_token_validity_mask"].any()
 
 
 def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
@@ -1159,6 +1306,13 @@ example_multi_step_simple_agent:
       model_server:
         type: responses_api_models
         name: openai_model
+example_multi_step_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: example_multi_step_simple_agent
 openai_model:
   responses_api_models:
     vllm_model:
@@ -1417,6 +1571,29 @@ def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled(divergent_pro
     assert result["full_result"]["noncontiguous_truncated"] is True
     assert output[0]["generation_str"] == "3"
     assert output[1:] == dropped_tail
+
+
+@pytest.mark.parametrize("first_truncated", [False, True])
+def test_nemo_gym_postprocess_reports_truncation_for_every_result(first_truncated):
+    mock_self = SimpleNamespace(cfg={"truncate_noncontiguous_episodes": True})
+    results = []
+    for should_truncate in (first_truncated, not first_truncated):
+        raw_result = _make_noncontiguous_nemo_gym_result()
+        raw_result["noncontiguous_truncated"] = not should_truncate
+        if not should_truncate:
+            raw_result["response"]["output"][1]["prompt_token_ids"] = [1, 2, 3, 4]
+        result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            mock_self, {}, raw_result, _JoinTokenizer()
+        )
+        assert result["full_result"]["noncontiguous_truncated"] is should_truncate
+        results.append(result["full_result"])
+
+    metrics = calculate_single_metric(
+        [float(result["noncontiguous_truncated"]) for result in results],
+        len(results),
+        "agent/noncontiguous_truncated",
+    )
+    assert metrics["agent/noncontiguous_truncated/mean"] == 0.5
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])
@@ -2130,3 +2307,57 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
             f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
             f"got {null_resp.status_code}: {null_resp.text}"
         )
+
+
+@pytest.mark.nemo_gym
+def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch):
+    """The Gym head server serves the merged global config unredacted and the
+    server commands inline it, so the key must reach Gym's servers as an
+    environment interpolation resolved in each server process, never as a
+    value in the config; without a key the placeholder is sent."""
+    import os
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            # Unresolved, as Gym serializes it: reading the DictConfig directly
+            # would resolve the interpolation from this process's environment.
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+
+    def spin_up(policy_api_key):
+        cfg = {
+            "initial_global_config_dict": {},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+        if policy_api_key is not None:
+            cfg["policy_api_key"] = policy_api_key
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    with_key = spin_up("per-job-key")
+    assert with_key["policy_api_key"] == "${oc.env:NEMO_RL_POLICY_API_KEY}"
+    assert os.environ["NEMO_RL_POLICY_API_KEY"] == "per-job-key"
+
+    monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
+    without_key = spin_up(None)
+    assert without_key["policy_api_key"] == "dummy_key"
+    assert "NEMO_RL_POLICY_API_KEY" not in os.environ

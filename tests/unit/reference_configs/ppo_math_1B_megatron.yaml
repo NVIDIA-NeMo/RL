@@ -86,6 +86,8 @@ loss_fn:
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -115,8 +117,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -171,6 +175,7 @@ policy:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -270,7 +275,6 @@ policy:
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      offload_policy_before_refit: false
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
@@ -316,7 +320,7 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -370,6 +374,7 @@ value:
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -468,13 +473,20 @@ logger:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "ppo-dapo-megatron-dev"
     run_name: "ppo_dapo_megatron_1B"
+    run_id: null
+    tracking_uri: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

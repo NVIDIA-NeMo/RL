@@ -312,10 +312,10 @@ rl.startup                                    (launcher)
     └── rl.value.load_model                   (PPO critic,        separate trace)
 ```
 
-The three worker-side loads carry `rl.backend` — `megatron`, `dtensor` or
-`dtensor_v2` for the trainer, so one query compares the same phase across
-backends — and each is emitted once per worker process, so a slow rank shows up
-as one long span among its peers rather than an average.
+The three worker-side loads carry `rl.backend` — `megatron` or `automodel` for
+the trainer, so one query compares the same phase across backends — and each is
+emitted once per worker process, so a slow rank shows up as one long span among
+its peers rather than an average.
 
 `rl.startup` exists because `init_ray()` and the algorithm's `setup()` are
 separate top-level calls in the launcher; without a span across them their
