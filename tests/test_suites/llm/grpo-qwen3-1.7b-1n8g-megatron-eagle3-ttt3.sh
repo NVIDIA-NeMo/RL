@@ -48,7 +48,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'min(data["train/draft_loss"]) > 0' \
         'data["train/draft_loss"]["50"] < 4' \
-        'mean(data["train/draft_loss_pass_3"], -5, -1) < 0.8 * data["train/draft_loss_pass_3"]["1"]'
+        'mean(data["train/draft_loss_pass_3"], -5, -1) < 0.8 * data["train/draft_loss_pass_3"]["1"]' \
+        'mean(data["train/vllm/spec_acceptance_length"], -5, -1) > 2.05'
 
     rm -rf "$CKPT_DIR"
 fi
