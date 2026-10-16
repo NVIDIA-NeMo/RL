@@ -345,6 +345,16 @@ class TestBegin:
         with pytest.raises(RuntimeError, match="already open"):
             w.begin_train_step(loss_fn=w._test_loss_fn)
 
+    def test_rejects_multi_pass_ttt_draft(self, mock_module_symbols):
+        """DraftStepState holds one loss bin; multi-pass TTT has one per pass."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.cfg["draft"] = Eagle3DraftConfig(enabled=True, ttt_steps=2)
+        with pytest.raises(NotImplementedError, match="ttt_steps > 1"):
+            w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert getattr(w, "_train_step_state", None) is None
+
     def test_uses_cfg_defaults_when_gbs_mbs_omitted(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 

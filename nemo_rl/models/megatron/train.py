@@ -851,21 +851,6 @@ class LossPostProcessor:
                 context_parallel_group=get_context_parallel_group(),
             )
             if "student_logits" in data_dict or "student_logits_by_pass" in data_dict:
-                ttt_steps = self.cfg["draft"].ttt_steps
-                # ttt_steps reaches the forward independently (the
-                # draft_ttt_steps argument threaded into
-                # megatron_forward_backward); a caller omitting it with a
-                # multi-pass config would otherwise surface as a KeyError far
-                # from the cause.
-                multi_pass = "student_logits_by_pass" in data_dict
-                if multi_pass != (ttt_steps > 1):
-                    raise RuntimeError(
-                        f"draft forward produced "
-                        f"{'multi-pass' if multi_pass else 'single-pass'} logits "
-                        f"but policy.draft.ttt_steps={ttt_steps}; the "
-                        "draft_ttt_steps argument threaded into "
-                        "megatron_forward_backward disagrees with the config."
-                    )
                 loss_fn_wrapped = DraftLossWrapper(
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
@@ -883,7 +868,7 @@ class LossPostProcessor:
                         )
                     ),
                     defer_normalization=self.defer_draft_normalization,
-                    ttt_steps=ttt_steps,
+                    ttt_steps=self.cfg["draft"].ttt_steps,
                     ttt_pass_weights=self.cfg["draft"].ttt_pass_weights,
                 )
 

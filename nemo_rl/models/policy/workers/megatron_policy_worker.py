@@ -1720,6 +1720,15 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> None:
+        draft_cfg = self.cfg.get("draft")
+        if draft_cfg is not None and draft_cfg.enabled and draft_cfg.ttt_steps > 1:
+            # DraftStepState, this path's deferred draft normalization, takes a
+            # single loss bin; the multi-pass loss has one bin per pass.
+            raise NotImplementedError(
+                "policy.draft.ttt_steps > 1 is not supported on the split "
+                "train-step path (single controller); use the batched train() "
+                "path."
+            )
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
             raise RuntimeError(
@@ -1937,14 +1946,6 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
-        if draft_enabled and self.cfg["draft"].ttt_steps > 1:
-            # DraftStepState, this path's deferred draft normalization, takes a
-            # single loss bin; the multi-pass loss has one bin per pass.
-            raise NotImplementedError(
-                "policy.draft.ttt_steps > 1 is not supported on the split "
-                "train-step path (single controller); use the batched train() "
-                "path."
-            )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,
