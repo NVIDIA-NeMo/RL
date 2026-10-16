@@ -2205,9 +2205,11 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             still contribute exact maps. Requires ``gold_loss=True``.
         temperature: Softmax temperature applied symmetrically to student
             and teacher logits before KL.
-        vocab_topk: Microbatch-global top-k size used by the P-KL path
-            (``gold_loss=False``). Computed inside the loss fn from full
-            teacher logits. Inert when ``gold_loss=True``.
+        vocab_topk: Microbatch-global top-k size. Used by the P-KL path
+            (``gold_loss=False``) and by every same-tokenizer teacher, whatever
+            ``gold_loss`` is, except the all-same-tokenizer ``averaged_logits``
+            path, which uses the full vocab. Computed inside the loss fn from
+            full teacher logits.
         uncommon_topk: Cap on the L1 uncommon-tail sort in the gold path.
             Defaults to 8192. Inert when ``gold_loss=False``.
         reverse_kl: If True, compute KL(student || teacher) instead of
