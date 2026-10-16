@@ -45,7 +45,7 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.19.0 still ships both registry entries, so the patch remains
+    # Transformers 5.16.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
