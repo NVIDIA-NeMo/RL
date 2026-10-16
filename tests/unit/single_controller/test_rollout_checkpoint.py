@@ -235,6 +235,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
             "control_auth_token": "secret-two",
             "control_timeout_s": 15.0,
             "num_reassembler_workers": 8,
+            "try_reuse_gym_env_for_finalizers": True,
         },
         "async_rl": {
             **base["async_rl"],
