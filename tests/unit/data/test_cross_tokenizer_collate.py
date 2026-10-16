@@ -404,7 +404,8 @@ class TestCollatorTruncation:
 # Captured from the collator before the optional overlength and CE-turn
 # behaviors existed; the default batch must stay bitwise identical. Its first
 # row fills each side's context, so padding to the longest row keeps the
-# full-context width.
+# full-context width. ``alignment_0_pair_valid`` was recaptured when pairs
+# over padding became invalid.
 _TEXT_SNAPSHOT_CHECKSUMS = {
     "input_ids": 3661199532,
     "input_lengths": 868467641,
@@ -414,7 +415,7 @@ _TEXT_SNAPSHOT_CHECKSUMS = {
     "teacher_0_input_ids": 548984487,
     "teacher_0_input_lengths": 137384594,
     "teacher_0_token_mask": 3787835366,
-    "alignment_0_pair_valid": 64817739,
+    "alignment_0_pair_valid": 2277715625,
     "alignment_0_pair_is_correct": 13516310,
     "alignment_0_student_chunk_id": 1888554585,
     "alignment_0_teacher_chunk_id": 1481747482,
@@ -882,6 +883,29 @@ class TestTextPadsToLongestRow:
         assert out["teacher_0_token_mask"].eq(0).all()
         assert out["alignment_0_student_chunk_id"].eq(-1).all()
         assert out["alignment_0_teacher_chunk_id"].eq(-1).all()
+
+    def test_pair_valid_counts_real_chunks(self):
+        """``pair_valid`` counts the pairs holding real tokens, including the
+        student-only start-of-text pair, and none of the pairs over padding.
+        """
+        batch = [_datum(text, idx=i) for i, text in enumerate(self._TEXTS)]
+        out = _text_collator(
+            ctx_length_student=16,
+            ctx_length_teachers=[64, 16],
+            student=_word_tokenizer(bos=True),
+            add_special_tokens_in_text=True,
+        )(batch)
+        real = 0
+        for row in range(len(batch)):
+            student = out["alignment_0_student_chunk_id"][row]
+            teacher = out["alignment_0_teacher_chunk_id"][row]
+            real += len(
+                set(student[student >= 0].tolist())
+                | set(teacher[teacher >= 0].tolist())
+            )
+        # One pair per word plus each row's start-of-text pair.
+        assert real == 8 + 3
+        assert out["alignment_0_pair_valid"].sum().item() == real
 
 
 class TestCollatorPadTokenFallback:
