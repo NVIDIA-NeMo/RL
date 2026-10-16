@@ -1448,7 +1448,7 @@ class TestFactory:
         )
         assert isinstance(sync, SGLangDisaggregatedWeightSynchronizer)
 
-    def test_non_colocated_sglang_rejects_dtensor_at_setup(self):
+    def test_non_colocated_sglang_rejects_automodel_at_setup(self):
         with pytest.raises(
             NotImplementedError, match="Megatron policy backend.*issues/3745"
         ):
