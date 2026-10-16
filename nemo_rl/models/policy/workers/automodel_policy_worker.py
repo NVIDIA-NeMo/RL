@@ -28,7 +28,10 @@ from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_n
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -67,6 +70,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
@@ -86,6 +90,7 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
 
 
@@ -226,6 +231,8 @@ class AutomodelPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the AutomodelPolicyWorker."""
+        if config["automodel_cfg"].get("deterministic"):
+            enable_deterministic_algorithms()
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
@@ -597,6 +604,7 @@ class AutomodelPolicyWorkerImpl(
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
+          "token_mask": only for top-k/top-p filtering; masked out -inf positions.
         """
         self.timer.start("get_logprobs")
         logprob_batch_size = (
@@ -609,6 +617,7 @@ class AutomodelPolicyWorkerImpl(
         sequence_dim, seq_dim_size = check_sequence_dim(data)
 
         all_log_probs = []
+        all_token_masks: list[torch.Tensor] = []
         self.model.eval()
 
         # Create logprobs post-processor
@@ -657,19 +666,21 @@ class AutomodelPolicyWorkerImpl(
                     continue
 
                 all_log_probs.append(token_logprobs)
+                if "token_mask" in _metrics:
+                    all_token_masks.append(_metrics["token_mask"])
 
         # Concatenate all batches
         return_data = BatchedDataDict[LogprobOutputSpec]()
 
-        all_log_probs_padded = []
-        for lp in all_log_probs:
-            padding_needed = seq_dim_size - lp.shape[1]
-            if padding_needed > 0:
-                lp = torch.nn.functional.pad(
-                    lp, (0, padding_needed), mode="constant", value=0.0
-                )
-            all_log_probs_padded.append(lp)
-        return_data["logprobs"] = torch.cat(all_log_probs_padded, dim=0).cpu()
+        return_data["logprobs"] = pad_and_concat(
+            all_log_probs, target_len=seq_dim_size
+        ).cpu()
+        # Taken from config so every DP rank emits the same keys.
+        if need_top_k_or_top_p_filtering(self.sampling_params):
+            # Pad token_mask with 0 so padded positions are excluded from the loss.
+            return_data["token_mask"] = pad_and_concat(
+                all_token_masks, target_len=seq_dim_size
+            ).cpu()
 
         self.timer.stop("get_logprobs")
         return return_data
@@ -820,31 +831,11 @@ class AutomodelPolicyWorkerImpl(
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
-        all_topk_vals_padded = []
-        all_topk_idx_padded = []
-        target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
-            pad_needed = target_seq_len - vals.shape[1]
-            if pad_needed > 0:
-                # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
-                vals = torch.nn.functional.pad(
-                    vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
-                )
-                idx = torch.nn.functional.pad(
-                    idx, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0
-                )
-            all_topk_vals_padded.append(vals)
-            all_topk_idx_padded.append(idx)
-
-        ret["topk_logits"] = (
-            torch.cat(all_topk_vals_padded, dim=0)
-            if len(all_topk_vals_padded) > 1
-            else all_topk_vals_padded[0]
+        ret["topk_logits"] = pad_and_concat(
+            out_topk_vals, target_len=seq_dim_size
         ).cpu()
-        ret["topk_indices"] = (
-            torch.cat(all_topk_idx_padded, dim=0)
-            if len(all_topk_idx_padded) > 1
-            else all_topk_idx_padded[0]
+        ret["topk_indices"] = pad_and_concat(
+            out_topk_idx, target_len=seq_dim_size
         ).cpu()
         return ret
 
@@ -1105,7 +1096,7 @@ class AutomodelPolicyWorkerImpl(
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         self.maybe_init_zmq()
@@ -1134,7 +1125,7 @@ class AutomodelPolicyWorkerImpl(
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
+        """Send Automodel weights to colocated SGLang engines via Ray CUDA IPC.
 
         Synchronous: each chunk is awaited via ``ray.get`` inside
         :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
@@ -1143,7 +1134,7 @@ class AutomodelPolicyWorkerImpl(
         """
         if target_precision != "bf16":
             raise NotImplementedError(
-                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                "The Automodel policy only supports BF16 SGLang refits; "
                 f"got target_precision={target_precision!r}."
             )
         del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
@@ -1215,7 +1206,7 @@ class AutomodelPolicyWorkerImpl(
     ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         # Manually move model to cuda for cpu offload case

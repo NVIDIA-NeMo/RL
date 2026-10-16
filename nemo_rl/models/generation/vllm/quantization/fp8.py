@@ -22,7 +22,7 @@ from unittest.mock import patch
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, DeepseekV3Config, PretrainedConfig
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -239,6 +239,28 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
+def _get_fp8_parameter_names(config: PretrainedConfig) -> list[str]:
+    """Enumerate model parameters without loading pretrained weights."""
+    try:
+        with init_empty_weights():
+            model = AutoModel.from_config(config, trust_remote_code=True)
+    except KeyError as exc:
+        if config.model_type != "deepseek_v3" or exc.args != ("type",):
+            raise
+        # Moonlight's remote _init_rope still expects rope_scaling["type"].
+        # Fall back only for that incompatibility; working remote models keep
+        # their original parameter names, including unfused expert weights.
+        logger.warning(
+            "Remote DeepSeek V3 model construction failed with %r; using the "
+            "native model to enumerate FP8 parameter names.",
+            exc,
+        )
+        native_config = DeepseekV3Config.from_dict(config.to_dict())
+        with init_empty_weights():
+            model = AutoModel.from_config(native_config, trust_remote_code=False)
+    return [name for name, _ in model.named_parameters()]
+
+
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
@@ -362,9 +384,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
-        with init_empty_weights():
-            model = AutoModel.from_config(config, trust_remote_code=True)
-        param_names = [name for name, _ in model.named_parameters()]
+        param_names = _get_fp8_parameter_names(config)
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
@@ -391,13 +411,11 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             stacklevel=2,
         )
     if quantization_ignored_layer_kws:
-        with init_empty_weights():
-            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight").replace(
                 "model.backbone.", "backbone."
             )
-            for name, _ in model.named_parameters()
+            for name in _get_fp8_parameter_names(config)
         ]
         ignored_layers = [
             n

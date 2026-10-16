@@ -52,16 +52,16 @@ Append the driver script path (relative to `tests/test_suites/`) to @tests/test_
 - **algo**: `sft`, `dpo`, `grpo`, etc.
 - **model**: `llama3.1-8b-instruct`, `qwen2.5-7b-instruct`, etc.
 - **nodes/gpus**: `1n8g`, `4n8g`, `8n8g`
-- **strategy-and-params**: `fsdp2tp1`, `tp4pp2`, `megatron`, `dtensor2tp1`
+- **strategy-and-params**: `automodel`, `automodel-ep8`, `megatron`, `megatron-ep16tp2cp2`
 - **modifiers** (optional): `sp`, `actckpt`, `fp8`, `noncolocated`, `quick`
 - **-long** (optional): long-running recipe
 - **.vN** (optional): version suffix for convergence-impacting changes
 
 Examples:
 ```
-sft-llama3.1-8b-1n8g-fsdp2tp1-long.yaml
+sft-llama3.1-8b-1n8g-automodel-long.yaml
 grpo-llama3.1-8b-instruct-1n8g-megatron-fp8.yaml
-grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.yaml
+grpo-qwen2.5-7b-instruct-4n8g-automodel-tp4sp.v3.yaml
 ```
 
 ### VLM Pattern

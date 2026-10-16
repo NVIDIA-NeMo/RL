@@ -59,6 +59,7 @@ from nemo_rl.telemetry.setup import (
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.tensor_ops import pad_and_concat
 
 
 def right_shift_values(values: torch.Tensor) -> torch.Tensor:
@@ -151,7 +152,7 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
             config["reward_model_cfg"]["enabled"]
             and config["reward_model_cfg"]["reward_model_type"] == "regression"
         ), (
-            "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
+            "Automodel value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
         )
 
         print("Initializing AutomodelValueWorker")
@@ -489,15 +490,9 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         # Concatenate all batches
         return_data = BatchedDataDict[ValueOutputSpec]()
 
-        all_values_padded = []
-        for val in all_values:
-            padding_needed = seq_dim_size - val.shape[1]
-            if padding_needed > 0:
-                val = torch.nn.functional.pad(
-                    val, (0, padding_needed), mode="constant", value=0.0
-                )
-            all_values_padded.append(val)
-        return_data["values"] = torch.cat(all_values_padded, dim=0).cpu()
+        return_data["values"] = pad_and_concat(
+            all_values, target_len=seq_dim_size
+        ).cpu()
 
         return return_data
 

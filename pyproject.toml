@@ -71,7 +71,7 @@ dependencies = [
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
   # Worker venvs run a base sync before backend extras, so NIXL must be available here.
-  "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nixl==1.4.1; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
@@ -287,6 +287,7 @@ docs = [
   "sphinx-autodoc2",           # For documenting Python API
   "sphinx-copybutton",         # Adds a copy button for code blocks
   "sphinx-design",             # For design components in docs
+  "sphinx-reredirects",        # Preserves URLs when documentation pages move
   "myst_parser",               # For our markdown docs
   "nvidia-sphinx-theme",       # Our NVIDIA theme
   "gitpython>=3.1.45",         # To git-related information
@@ -438,7 +439,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend>=1.26.0,<1.29.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
@@ -489,6 +490,11 @@ override-dependencies = [
   # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
   # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
   "av; sys_platform == 'never'",
+  # pynvvideocodec (hard dependency of vllm 0.29.0) bundles FFmpeg 8.1.x shared libs and the
+  # FFmpeg source tarball (external/ffmpeg/). Exclude it from the shipped container for the
+  # same reason as av/opencv; vllm's video decoder backends (opencv/torchcodec/pynvvideocodec/
+  # deepstream) are selected at runtime and pynvvideocodec is not needed by default.
+  "pynvvideocodec; sys_platform == 'never'",
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",

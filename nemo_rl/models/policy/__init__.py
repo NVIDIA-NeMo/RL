@@ -38,8 +38,8 @@ def _patch_transformers_tokenizer_class_set():
 
     Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
     per process the first time any policy code is imported -- covers the driver
-    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
-    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron and Automodel
+    both import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
     import transformers
@@ -185,7 +185,7 @@ class MoEParallelizerOptions(TypedDict):
 
 
 class AutomodelCheckpointConfig(TypedDict, total=False):
-    """Automodel checkpoint settings used by DTensor v2."""
+    """Automodel checkpoint settings."""
 
     model_save_format: Literal["torch_save", "safetensors"] | None
     save_consolidated: Literal["false", "final", "every"]
@@ -217,6 +217,9 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):

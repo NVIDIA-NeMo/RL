@@ -19,6 +19,7 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, cast
 
+import numpy as np
 import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
@@ -702,12 +703,17 @@ def vlm_hf_data_processor(
                 user_message["content"].append(content)
                 vllm_value = resolve_to_image(content["image"])
             elif content_type == "audio":
-                user_message["content"].append(content)
+                audio = content["audio"]
+                if task_data_spec.pad_audio_to_hop_length:
+                    # Match vLLM models (e.g. Qwen3-Omni) that pre-pad audio before
+                    # feature extraction, so learner and vLLM count the same frames.
+                    hop_length = processor.feature_extractor.hop_length
+                    audio = np.pad(audio, (0, -len(audio) % hop_length))
+                    user_message["content"].append({**content, "audio": audio})
+                else:
+                    user_message["content"].append(content)
                 # Store as (audio_array, sample_rate) tuple for vLLM
-                vllm_value = (
-                    content["audio"],
-                    processor.feature_extractor.sampling_rate,
-                )
+                vllm_value = (audio, processor.feature_extractor.sampling_rate)
             elif content_type == "video":
                 from transformers.video_utils import load_video
 

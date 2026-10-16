@@ -140,7 +140,7 @@ def test_mpo_rejects_non_pair_grouping_key():
         _validate_pair_safe_packing(policy_config, _cluster_config())
 
 
-def test_mpo_rejects_non_fused_or_dtensor_packed_loss():
+def test_mpo_rejects_non_fused_or_automodel_packed_loss():
     policy_config = _packed_policy_config()
     sequence_packing = cast(dict[str, Any], policy_config["sequence_packing"])
     sequence_packing["fuse_loss"] = False
