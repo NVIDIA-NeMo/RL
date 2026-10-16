@@ -1115,6 +1115,7 @@ class SingleControllerActor:
             await self._buffer_capacity.acquire()
         return restored
 
+
     async def _maybe_restore_rollout_recovery(
         self,
         *,
@@ -5172,7 +5173,8 @@ class SingleControllerActor:
 
         # Flush the previous checkpoint's background finalization first;
         # re-raises a failure from it.
-        await asyncio.to_thread(self._checkpointer.finalize_pending)
+        with self._timer.time("trainer_checkpoint_finalize_wait"):
+            await asyncio.to_thread(self._checkpointer.finalize_pending)
 
         print(f"Saving checkpoint for step {self._train_steps}...")
         replay_metadata: Optional[TQReplayMetadataState] = None
@@ -5185,89 +5187,100 @@ class SingleControllerActor:
         # controller artifact under the exclusive side so the checkpoint cannot
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group.
+        barrier_requested = time.monotonic()
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            dataloader_state = self._dataloader.state_dict()
-            # The spare pool and dataloader advance together under the same mutation
-            # cut in recovery-enabled dispatch, so preserve them in this cut too.
-            reserve_state = list(self._replacement_reserve)
-
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
+            self._timer.record(
+                "trainer_checkpoint_barrier_wait", time.monotonic() - barrier_requested
             )
+            with self._timer.time("trainer_checkpoint_barrier_held"):
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                dataloader_state = self._dataloader.state_dict()
+                # The spare pool and dataloader advance together under the same mutation
+                # cut in recovery-enabled dispatch, so preserve them in this cut too.
+                reserve_state = list(self._replacement_reserve)
 
-            if self._master_config.checkpointing.get("save_data_plane"):
-                training_owned_groups = self._buffer.training_owned_replay_groups()
-                if training_owned_groups:
-                    raise RuntimeError(
-                        "full trainer checkpoint still owns streamed training rows: "
-                        f"groups={[group['group_id'] for group in training_owned_groups]!r}"
+                with self._timer.time("trainer_checkpoint_init_tmp"):
+                    checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                        self._checkpointer.init_tmp_checkpoint,
+                        self._train_steps,
+                        vars(save_state),
+                        self._master_config,
                     )
-                if self._sampler.supports_buffer_checkpoint:
-                    replay_metadata = self._buffer.metadata_state_dict(
-                        saved_capacity=self._async_cfg.max_buffered_rollouts
-                    )
-                if replay_metadata is not None:
-                    await self._validate_replay_inventory(replay_metadata)
 
-                if self._rollout_recovery_enabled:
-                    rollout_recovery_state = build_rollout_recovery_state(
-                        self._rollout_manager.recovery_ledger,
-                        batch_shortfall=self._batch_shortfall,
-                        sampler_stamps_target_steps=(self._sampler_stamps_target_steps),
-                        finalizer_metrics_by_group=self._finalizer_metrics_by_group,
-                        finalizer_rewards_by_group=self._finalizer_rewards_by_group,
-                        reward_settings=self._capture_reward_settings(),
-                        canonical_group_ids={
-                            group["group_id"] for group in replay_metadata["groups"]
-                        }
-                        if replay_metadata is not None
-                        else set(),
-                    )
-                    payload_buffer = io.BytesIO()
-                    await asyncio.to_thread(
-                        torch.save,
-                        rollout_recovery_state,
-                        payload_buffer,
-                    )
-                    rollout_recovery_payload = payload_buffer.getvalue()
-                    rollout_recovery_payload_sha256 = hashlib.sha256(
-                        rollout_recovery_payload
-                    ).hexdigest()
+                if self._master_config.checkpointing.get("save_data_plane"):
+                    training_owned_groups = self._buffer.training_owned_replay_groups()
+                    if training_owned_groups:
+                        raise RuntimeError(
+                            "full trainer checkpoint still owns streamed training rows: "
+                            f"groups={[group['group_id'] for group in training_owned_groups]!r}"
+                        )
+                    if self._sampler.supports_buffer_checkpoint:
+                        replay_metadata = self._buffer.metadata_state_dict(
+                            saved_capacity=self._async_cfg.max_buffered_rollouts
+                        )
+                    if replay_metadata is not None:
+                        with self._timer.time("trainer_checkpoint_replay_validation"):
+                            await self._validate_replay_inventory(replay_metadata)
 
-                if self._master_config.token_capture.enabled:
-                    await self._validate_rollout_recovery_inventory(
-                        cut,
+                    if self._rollout_recovery_enabled:
+                        with self._timer.time("trainer_checkpoint_recovery_serialize"):
+                            rollout_recovery_state = build_rollout_recovery_state(
+                                self._rollout_manager.recovery_ledger,
+                                batch_shortfall=self._batch_shortfall,
+                                sampler_stamps_target_steps=(
+                                    self._sampler_stamps_target_steps
+                                ),
+                                finalizer_metrics_by_group=self._finalizer_metrics_by_group,
+                                finalizer_rewards_by_group=self._finalizer_rewards_by_group,
+                                reward_settings=self._capture_reward_settings(),
+                                canonical_group_ids={
+                                    group["group_id"] for group in replay_metadata["groups"]
+                                }
+                                if replay_metadata is not None
+                                else set(),
+                            )
+                            payload_buffer = io.BytesIO()
+                            await asyncio.to_thread(
+                                torch.save,
+                                rollout_recovery_state,
+                                payload_buffer,
+                            )
+                            rollout_recovery_payload = payload_buffer.getvalue()
+                            rollout_recovery_payload_sha256 = hashlib.sha256(
+                                rollout_recovery_payload
+                            ).hexdigest()
+
+                    if self._master_config.token_capture.enabled:
+                        with self._timer.time("trainer_checkpoint_staging_validation"):
+                            await self._validate_rollout_recovery_inventory(
+                                cut,
+                                replay_metadata=replay_metadata,
+                                clear_unreferenced=False,
+                            )
+
+                    await self._save_data_plane_checkpoint(
+                        checkpoint_path,
+                        train_steps=save_state.current_step,
+                        trainer_version=self._trainer_version,
+                        current_epoch=save_state.current_epoch,
                         replay_metadata=replay_metadata,
-                        clear_unreferenced=False,
+                        rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
+                        rollout_recovery_group_count=(
+                            len(rollout_recovery_state["groups"])
+                            if rollout_recovery_state is not None
+                            else None
+                        ),
                     )
-
-                await self._save_data_plane_checkpoint(
-                    checkpoint_path,
-                    train_steps=save_state.current_step,
-                    trainer_version=self._trainer_version,
-                    current_epoch=save_state.current_epoch,
-                    replay_metadata=replay_metadata,
-                    rollout_recovery_payload_sha256=(rollout_recovery_payload_sha256),
-                    rollout_recovery_group_count=(
-                        len(rollout_recovery_state["groups"])
-                        if rollout_recovery_state is not None
-                        else None
-                    ),
-                )
-                self._last_rollout_snapshot_mutation_version = (
-                    self._data_plane_checkpoint_barrier.mutation_version
-                )
+                    self._last_rollout_snapshot_mutation_version = (
+                        self._data_plane_checkpoint_barrier.mutation_version
+                    )
 
         # Save value model
         if self._is_ppo:
@@ -5296,56 +5309,59 @@ class SingleControllerActor:
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
         # in the background.
-        await asyncio.to_thread(
-            self._trainer.save_checkpoint,
-            weights_path=os.path.join(checkpoint_path, "policy", "weights"),
-            # Always save policy weights so every PPO checkpoint has
-            # the same component layout. Before the first real policy
-            # update, omit optimizer and scheduler state because their
-            # lazily initialized state is not yet safe to checkpoint.
-            optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
-            if self._checkpointer.save_optimizer and is_policy_training_step
-            else None,
-            tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-            is_final_checkpoint=is_final_checkpoint,
-        )
+        with self._timer.time("trainer_checkpoint_policy_save_call"):
+            await asyncio.to_thread(
+                self._trainer.save_checkpoint,
+                weights_path=os.path.join(checkpoint_path, "policy", "weights"),
+                # Always save policy weights so every PPO checkpoint has
+                # the same component layout. Before the first real policy
+                # update, omit optimizer and scheduler state because their
+                # lazily initialized state is not yet safe to checkpoint.
+                optimizer_path=os.path.join(checkpoint_path, "policy", "optimizer")
+                if self._checkpointer.save_optimizer and is_policy_training_step
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
+                is_final_checkpoint=is_final_checkpoint,
+            )
 
-        await asyncio.to_thread(
-            torch.save,
-            dataloader_state,
-            os.path.join(checkpoint_path, "train_dataloader.pt"),
-        )
-        if reserve_state:
+        with self._timer.time("trainer_checkpoint_sidecars"):
             await asyncio.to_thread(
                 torch.save,
-                reserve_state,
-                os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+                dataloader_state,
+                os.path.join(checkpoint_path, "train_dataloader.pt"),
             )
-        if replay_metadata is not None:
-            await asyncio.to_thread(
-                torch.save,
-                replay_metadata,
-                os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
-            )
-        if rollout_recovery_payload is not None:
-            await asyncio.to_thread(
-                Path(
-                    checkpoint_path,
-                    ROLLOUT_RECOVERY_STATE_FILENAME,
-                ).write_bytes,
-                rollout_recovery_payload,
-            )
+            if reserve_state:
+                await asyncio.to_thread(
+                    torch.save,
+                    reserve_state,
+                    os.path.join(checkpoint_path, REPLACEMENT_RESERVE_FILENAME),
+                )
+            if replay_metadata is not None:
+                await asyncio.to_thread(
+                    torch.save,
+                    replay_metadata,
+                    os.path.join(checkpoint_path, REPLAY_BUFFER_METADATA_FILENAME),
+                )
+            if rollout_recovery_payload is not None:
+                await asyncio.to_thread(
+                    Path(
+                        checkpoint_path,
+                        ROLLOUT_RECOVERY_STATE_FILENAME,
+                    ).write_bytes,
+                    rollout_recovery_payload,
+                )
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,
         )
-        await asyncio.to_thread(
-            _write_latest_checkpoint_status,
-            self._checkpointer,
-            last_checkpoint_step=self._train_steps,
-        )
+        with self._timer.time("trainer_checkpoint_status_update"):
+            await asyncio.to_thread(
+                _write_latest_checkpoint_status,
+                self._checkpointer,
+                last_checkpoint_step=self._train_steps,
+            )
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
     # the race against this bound. They need to hit the deadline, abort, unwind, raise,
