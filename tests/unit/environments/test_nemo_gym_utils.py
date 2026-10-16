@@ -160,14 +160,20 @@ def detected_uv_dirs(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("truncate_noncontiguous_episodes", [False, True])
+@pytest.mark.parametrize(
+    "truncate_noncontiguous_episodes",
+    [None, False, True],
+    ids=["absent", "disabled", "enabled"],
+)
 def test_build_nemo_gym_config_splits_nemo_rl_keys(
     detected_uv_dirs, truncate_noncontiguous_episodes
 ):
     """NeMo-RL-only knobs become top-level fields; the rest is Gym's global config."""
-    env_configs = _env_configs(
-        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes
-    )
+    env_configs = _env_configs()
+    if truncate_noncontiguous_episodes is not None:
+        env_configs["nemo_gym"]["truncate_noncontiguous_episodes"] = (
+            truncate_noncontiguous_episodes
+        )
     env_configs_before = copy.deepcopy(env_configs)
 
     cfg = build_nemo_gym_config(
@@ -182,7 +188,9 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(
     assert cfg["base_urls"] == ["http://vllm-0"]
     assert cfg["invalid_tool_call_patterns"] == ["bad_call"]
     assert cfg["thinking_tags"] == ["<think>"]
-    assert cfg["truncate_noncontiguous_episodes"] is truncate_noncontiguous_episodes
+    assert cfg["truncate_noncontiguous_episodes"] is (
+        truncate_noncontiguous_episodes is True
+    )
     assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
     assert cfg["pad_dynamic_image_shapes"] is True
     assert cfg["initial_global_config_dict"] == {
@@ -904,11 +912,20 @@ def test_shards_get_their_own_config_paths_and_log_directories(
 
 
 @pytest.mark.parametrize("guard", ["router_replay", "token_capture"])
-def test_sharded_actor_config_rejects_incompatible_truncation(detected_uv_dirs, guard):
+@pytest.mark.parametrize("override_source", ["common", "shard"])
+def test_sharded_actor_config_rejects_incompatible_truncation(
+    detected_uv_dirs, guard, override_source
+):
     cluster = _FakeGymCluster()
-    env_configs = _shard_env_configs(
-        common_overrides={"truncate_noncontiguous_episodes": True}
-    )
+    env_configs = _shard_env_configs()
+    if override_source == "common":
+        env_configs["nemo_gym"]["common_overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
+    else:
+        env_configs["nemo_gym"]["shards"][0]["overrides"] = {
+            "truncate_noncontiguous_episodes": True
+        }
     original = copy.deepcopy(env_configs)
     with (
         _patched_cluster(cluster),

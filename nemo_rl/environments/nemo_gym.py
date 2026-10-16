@@ -192,37 +192,14 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     )
 
 
-class NemoGymRuntimeOptions(BaseModel):
-    """NeMo-RL-owned options nested under ``env.nemo_gym``."""
+class NemoGymPostprocessConfig(BaseModel):
+    """NeMo-RL postprocessing options nested under ``env.nemo_gym``."""
 
     model_config = ConfigDict(extra="allow")
 
     invalid_tool_call_patterns: list[str] | None = None
     thinking_tags: list[str] | None = None
     truncate_noncontiguous_episodes: bool = False
-
-
-def split_nemo_gym_runtime_options(
-    config: dict[str, Any],
-) -> tuple[NemoGymRuntimeOptions, dict[str, Any]]:
-    """Split NeMo-RL runtime options from the config forwarded to NeMo Gym."""
-    options = NemoGymRuntimeOptions.model_validate(config)
-    gym_global_config = dict(config)
-    for key in NemoGymRuntimeOptions.model_fields:
-        gym_global_config.pop(key, None)
-    return options, gym_global_config
-
-
-def validate_nemo_gym_runtime_options(
-    options: NemoGymRuntimeOptions, *, enable_router_replay: bool
-) -> None:
-    """Reject incompatible NeMo-RL-owned Gym options."""
-    if options.truncate_noncontiguous_episodes and enable_router_replay:
-        raise ValueError(
-            "truncate_noncontiguous_episodes is not compatible with router replay: "
-            "the next contiguous prompt is required to repair the retained prefix's "
-            "final route."
-        )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -371,7 +348,7 @@ class NemoGymConfig(TypedDict):
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
     # Opt-in recovery for token-prefix discontinuities in multi-turn rollouts.
-    # The default is supplied by NemoGymRuntimeOptions.
+    # The default is supplied by NemoGymPostprocessConfig.
     truncate_noncontiguous_episodes: bool
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
@@ -1249,6 +1226,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        nemo_gym_result["noncontiguous_truncated"] = False
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1264,25 +1242,12 @@ Depending on your data shape, you may want to change these values."""
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
             )
             if not is_contiguous and self.cfg["truncate_noncontiguous_episodes"]:
-                retained_prefix_has_routes = any(
-                    message.get("routed_experts") is not None
-                    for message in nemo_rl_message_log
-                )
-                if (
-                    self.cfg.get("require_routed_experts")
-                    or retained_prefix_has_routes
-                    or output_item_dict.get("routed_experts") is not None
-                ):
-                    raise ValueError(
-                        "Cannot truncate a non-contiguous NeMo Gym episode when "
-                        "routed-expert data is enabled: the next contiguous prompt "
-                        "is required to repair the retained prefix's final route."
-                    )
                 print(
                     "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
                     f"at {len(nemo_rl_message_log)} messages "
                     f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
                 )
+                nemo_gym_result["noncontiguous_truncated"] = True
                 break
             assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
@@ -1669,20 +1634,25 @@ def _build_gym_actor_config(
     Shared by the unsharded path and by each shard, so every actor gets the
     same treatment of NeMo-RL-side keys regardless of how it was composed.
     """
-    runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(nemo_gym_dict)
-    validate_nemo_gym_runtime_options(
-        runtime_options, enable_router_replay=enable_router_replay
-    )
-    if (
-        runtime_options.truncate_noncontiguous_episodes
-        and token_capture
-        and token_capture.get("enabled")
-    ):
-        raise ValueError(
-            "truncate_noncontiguous_episodes is not compatible with "
-            "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
-            "check, so it cannot truncate non-contiguous episodes."
-        )
+    postprocess_cfg = NemoGymPostprocessConfig.model_validate(nemo_gym_dict)
+    nemo_gym_dict = {
+        key: value
+        for key, value in nemo_gym_dict.items()
+        if key not in NemoGymPostprocessConfig.model_fields
+    }
+    if postprocess_cfg.truncate_noncontiguous_episodes:
+        if enable_router_replay:
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with router replay: "
+                "the next contiguous prompt is required to repair the retained prefix's "
+                "final route."
+            )
+        if token_capture and token_capture.get("enabled"):
+            raise ValueError(
+                "truncate_noncontiguous_episodes is not compatible with "
+                "token_capture.enabled: receipt mode bypasses the legacy token-prefix "
+                "check, so it cannot truncate non-contiguous episodes."
+            )
 
     # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
     # config is serialized into every Gym child process, and unrecognized
@@ -1725,15 +1695,13 @@ def _build_gym_actor_config(
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
-        invalid_tool_call_patterns=runtime_options.invalid_tool_call_patterns,
-        thinking_tags=runtime_options.thinking_tags,
+        invalid_tool_call_patterns=postprocess_cfg.invalid_tool_call_patterns,
+        thinking_tags=postprocess_cfg.thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
-        truncate_noncontiguous_episodes=(
-            runtime_options.truncate_noncontiguous_episodes
-        ),
+        truncate_noncontiguous_episodes=postprocess_cfg.truncate_noncontiguous_episodes,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,

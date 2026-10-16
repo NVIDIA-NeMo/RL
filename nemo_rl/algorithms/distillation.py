@@ -51,9 +51,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_actors,
     should_use_nemo_gym,
-    split_nemo_gym_runtime_options,
     validate_dataset_agent_coverage,
-    validate_nemo_gym_runtime_options,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
@@ -71,7 +69,6 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -268,14 +265,6 @@ def setup(
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
-    if enable_nemo_gym:
-        runtime_options, _ = split_nemo_gym_runtime_options(
-            dict(env_configs["nemo_gym"])
-        )
-        validate_nemo_gym_runtime_options(
-            runtime_options,
-            enable_router_replay=router_replay_enabled(policy_config),
-        )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
