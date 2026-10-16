@@ -1,3 +1,5 @@
+defaults: ../legacy_environment_servers/super_rlvr.yaml
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/super_v3_prod_stage1"
