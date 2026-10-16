@@ -827,7 +827,9 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "fp8_cfg.fp8_param=True or "
                     "model_overrides.disable_parameter_transpose_cache=True in "
                     "policy.generation.mcore_generation_config for nccl_reshard "
-                    "refit, so inference does not reuse stale cached FP8 weights."
+                    "refit, so inference does not reuse stale cached FP8 weights. "
+                    "A generation-side model_overrides replaces "
+                    "policy.megatron_cfg.model_overrides, so copy those keys into it."
                 )
 
     # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and

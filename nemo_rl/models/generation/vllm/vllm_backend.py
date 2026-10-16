@@ -2013,7 +2013,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         raise ValueError(
                             f"Blockwise FP8 target {vllm_name!r} has no owning module"
                         )
-                    block_size = getattr(module, "weight_block_size", None)
+                    # vLLM MoE layers may refine the scale grid when the per-rank
+                    # intermediate size is not a multiple of weight_block_size.
+                    block_size = getattr(module.quant_method, "moe_block_shape", None)
+                    if block_size is None:
+                        block_size = getattr(module, "weight_block_size", None)
                     if block_size is None:
                         block_size = module.quant_method.quant_config.weight_block_size
                     block_size = tuple(block_size)
