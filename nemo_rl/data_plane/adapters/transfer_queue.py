@@ -60,6 +60,7 @@ from nemo_rl.data_plane.interfaces import (
     storage_unit_placement,
 )
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
+from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase_sync
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1458,6 +1459,7 @@ class TQDataPlaneClient(DataPlaneClient):
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 
+    @checkpoint_phase_sync("tq_save")
     def save_checkpoint(
         self,
         checkpoint_dir: str | Path,
@@ -1470,6 +1472,7 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
         self._read_complete_checkpoint_metadata(checkpoint_dir)
 
+    @checkpoint_phase_sync("tq_load")
     def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ state after initialization and before data operations.
 
