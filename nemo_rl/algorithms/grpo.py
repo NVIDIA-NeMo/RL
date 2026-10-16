@@ -429,9 +429,8 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
-    # adaptive-ppo-clip controller state. Omitted from checkpoints when the
-    # loss has no adaptive state.
-    last_entropy: Optional[float] = None
+    # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
+    # off and on checkpoints that predate it.
     cur_adaptive_ppo_clip_k: Optional[float] = None
 
 
@@ -446,7 +445,6 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         trainer_version=None,
         sampler_name=None,
         sampler_dispatch_index=None,
-        last_entropy=None,
         cur_adaptive_ppo_clip_k=None,
     )
 
@@ -466,16 +464,13 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
-_ADAPTIVE_LOSS_STATE_KEYS = ("last_entropy", "cur_adaptive_ppo_clip_k")
-
-
 def _restore_adaptive_loss_state(
-    loss_fn: LossFunction,
+    loss_fn: ClippedPGLossFn,
     grpo_save_state: GRPOSaveState,
 ) -> None:
-    """Restore adaptive loss state; checkpoints without it keep initial values."""
-    if isinstance(loss_fn, ClippedPGLossFn):
-        loss_fn.load_adaptive_loss_state_dict(vars(grpo_save_state))
+    """Restore adaptive-ppo-clip's k; checkpoints without it start from k=0."""
+    if grpo_save_state.cur_adaptive_ppo_clip_k is not None:
+        loss_fn.set_adaptive_ppo_clip_k(grpo_save_state.cur_adaptive_ppo_clip_k)
 
 
 def _update_adaptive_loss_state(
@@ -485,43 +480,36 @@ def _update_adaptive_loss_state(
     """Advance the adaptive loss controller from a step's aggregated metrics.
 
     Call once per completed training step, after the per-microbatch metrics
-    are reduced, so the controller sees the step's global entropy. The new
-    state is added to ``metrics`` for logging.
+    are reduced, so the controller sees the step's global entropy. Logs the
+    k this step trained with; the updated k is used by the next step.
     """
     if (
         not isinstance(loss_fn, ClippedPGLossFn)
         or not loss_fn.has_adaptive_loss_state()
-        or "approx_entropy" not in metrics
     ):
         return
 
+    # metrics_level="full" always emits approx_entropy, so a missing key means a
+    # broken metrics path. Raise instead of silently freezing k for the run.
+    if "approx_entropy" not in metrics:
+        raise KeyError(
+            "adaptive-ppo-clip needs the step's approx_entropy, but the "
+            "aggregated training metrics do not contain it"
+        )
+    metrics["cur_adaptive_ppo_clip_k"] = loss_fn.cur_adaptive_ppo_clip_k
     loss_fn.update_adaptive_loss_state(float(metrics["approx_entropy"]))
-    metrics.update(
-        {
-            key: value
-            for key, value in loss_fn.adaptive_loss_state_dict().items()
-            if value is not None
-        }
-    )
 
 
 def _save_adaptive_loss_state(
     grpo_save_state: GRPOSaveState,
     loss_fn: LossFunction,
 ) -> None:
-    """Copy adaptive loss state into the save state, omitting unset fields."""
-    state_dict = (
-        loss_fn.adaptive_loss_state_dict()
+    """Copy adaptive-ppo-clip's k into the save state; None when it is off."""
+    grpo_save_state.cur_adaptive_ppo_clip_k = (
+        loss_fn.cur_adaptive_ppo_clip_k
         if isinstance(loss_fn, ClippedPGLossFn)
-        else {}
+        else None
     )
-    save_state_values = vars(grpo_save_state)
-    for key in _ADAPTIVE_LOSS_STATE_KEYS:
-        value = state_dict.get(key)
-        if value is None:
-            save_state_values.pop(key, None)
-        else:
-            save_state_values[key] = float(value)
 
 
 class MasterConfig(BaseModel, extra="allow"):

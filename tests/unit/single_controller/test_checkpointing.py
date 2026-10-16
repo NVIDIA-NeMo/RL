@@ -1198,9 +1198,8 @@ class TestSaveTrigger:
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
         assert "val_reward" not in info_2
-        # No adaptive loss, so its controller state is omitted.
-        assert "last_entropy" not in info_2
-        assert "cur_adaptive_ppo_clip_k" not in info_2
+        # No adaptive loss, so its controller state is None.
+        assert info_2["cur_adaptive_ppo_clip_k"] is None
 
         info_4 = _training_info(ckpt_dir, 4)
         assert info_4["current_step"] == 4
@@ -2708,7 +2707,13 @@ class TestMetricName:
     def test_adaptive_ppo_clip_state_advances_and_lands_in_training_info(
         self, tmp_path
     ):
-        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        # Checkpoint on the logged k to read back the value step 2 logged.
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=2,
+            save_period=2,
+            metric_name="train:cur_adaptive_ppo_clip_k",
+        )
         loss_fn = ClippedPGLossFn(
             ClippedPGLossConfig(
                 use_importance_sampling_correction=True,
@@ -2716,7 +2721,7 @@ class TestMetricName:
                 truncated_importance_sampling_type="adaptive-ppo-clip",
                 truncated_importance_sampling_ratio=1.0,
                 truncated_importance_sampling_ratio_min=0.5,
-                tis_adaptive_ppo_clip_target_entropy=0.3,
+                truncated_importance_sampling_adaptive_target_entropy=0.3,
             )
         )
         # Entropy below target widens the bound by one step per train step.
@@ -2729,7 +2734,9 @@ class TestMetricName:
         assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
         info = _training_info(tmp_path / "checkpoints", 2)
         assert info["cur_adaptive_ppo_clip_k"] == 0.5
-        assert info["last_entropy"] == pytest.approx(0.1)
+        # Step 2 logs the k it trained with; the saved k is the one step 3 uses.
+        assert info["train:cur_adaptive_ppo_clip_k"] == 0.25
+        assert "last_entropy" not in info
 
     def test_train_metric_missing_key_raises(self, tmp_path):
         mc = _actor_master_config(
