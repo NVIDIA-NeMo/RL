@@ -252,7 +252,8 @@ class AlignmentBatch:
     V2 can shard on dim 0 without knowing about cross-tokenizer specifics.
 
     Attributes:
-        pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
+        pair_valid: ``[B, max_pairs]`` bool. False on padding entries and on
+            pairs whose student or teacher tokens are all tokenizer padding.
         pair_is_correct: ``[B, max_pairs]`` bool. True when decoded student
             and teacher span texts are equal, when an NFC-validated native
             repair matches them, or when both spans are their tokenizer's
@@ -547,22 +548,41 @@ class TokenAligner:
         student_attention_mask: torch.Tensor | None,
         teacher_attention_mask: torch.Tensor | None,
     ) -> None:
-        """Strip tokenizer padding out of the chunk-id tensors.
+        """Strip tokenizer padding out of the chunk ids and invalidate padding pairs.
 
         Mutates ``batch`` in place. For every position the attention mask
         marks as padding, reset ``*_chunk_id`` to ``-1``. Gating per position
         (rather than trimming a contiguous span) keeps this correct under either
-        left- or right-padding. A pair whose tokens are entirely padding on
-        one side then has size 0 there and is dropped by
-        :func:`nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`; a pair
-        straddling the real/pad boundary shrinks to its real tokens.
+        left- or right-padding; a pair straddling the real/pad boundary shrinks
+        to its real tokens. When both masks are given, a pair with tokens on
+        both sides whose student or teacher tokens are all padding becomes
+        invalid in ``pair_valid``. A pair with no tokens on one side (one-sided
+        by alignment) keeps its flag.
         """
+        max_pairs = batch.pair_valid.shape[1]
+        two_sided = TokenAligner._pairs_with_tokens(
+            batch.student_chunk_id, max_pairs
+        ) & TokenAligner._pairs_with_tokens(batch.teacher_chunk_id, max_pairs)
         if student_attention_mask is not None:
             s_pad = student_attention_mask == 0
             batch.student_chunk_id[s_pad] = -1
         if teacher_attention_mask is not None:
             t_pad = teacher_attention_mask == 0
             batch.teacher_chunk_id[t_pad] = -1
+        if student_attention_mask is None or teacher_attention_mask is None:
+            return
+        two_sided_real = TokenAligner._pairs_with_tokens(
+            batch.student_chunk_id, max_pairs
+        ) & TokenAligner._pairs_with_tokens(batch.teacher_chunk_id, max_pairs)
+        batch.pair_valid &= two_sided_real | ~two_sided
+
+    @staticmethod
+    def _pairs_with_tokens(chunk_id: torch.Tensor, max_pairs: int) -> torch.Tensor:
+        """``[B, max_pairs]`` bool: True where the pair owns a position of ``chunk_id``."""
+        # Column 0 counts the -1 sentinel; column p + 1 counts pair p.
+        counts = torch.zeros((chunk_id.shape[0], max_pairs + 1), dtype=torch.long)
+        counts.scatter_add_(1, chunk_id + 1, torch.ones_like(chunk_id))
+        return counts[:, 1:] > 0
 
     @staticmethod
     def _pairs_to_batch(
