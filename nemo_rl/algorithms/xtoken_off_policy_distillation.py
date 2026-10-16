@@ -49,7 +49,11 @@ from pydantic import BaseModel, Field, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.csd import CSDLossConfig, CSDLossFn
+from nemo_rl.algorithms.loss.csd import (
+    CSDLossConfig,
+    CSDLossFn,
+    owner_local_config_violations,
+)
 from nemo_rl.algorithms.loss.loss_functions import (
     CrossTokenizerDistillationLossConfig,
     CrossTokenizerDistillationLossFn,
@@ -675,6 +679,23 @@ def _get_teacher_logits_ipc(
             )
         if force_include_token_ids is not None:
             teacher_data["force_include_token_ids"] = force_include_token_ids
+        if loss_fn.cfg.owner_local:
+            # Megatron teachers export the sparse rows of each CP shard, with
+            # every realized label the owner-local loss requests.
+            if force_include_token_ids is None:
+                raise ValueError(
+                    f"Teacher {teacher_idx} sparse rows need forced labels."
+                )
+            handles = teacher_policy.get_sparse_logits_ipc(
+                teacher_data,
+                k=topk_k,
+                temperature=float(loss_fn.cfg.temperature),
+                real_vocab_size=int(loss_fn.teacher_vocab_sizes[teacher_idx]),
+                noise_filter_k=noise_filter_topk,
+                micro_batch_size=micro_batch_size,
+                timer=timer,
+            )
+            return "sparse_logits_ipc", handles
         handles = teacher_policy.get_topk_logits_ipc(
             teacher_data,
             k=topk_k,
@@ -880,6 +901,62 @@ def validate_csd_router_replay_setup(master_config: MasterConfig) -> None:
 def _sequence_packing_enabled(cfg: PolicyConfig) -> bool:
     packing = cfg.get("sequence_packing") or {}
     return bool(packing.get("enabled", False))
+
+
+def _megatron_enabled(cfg: PolicyConfig) -> bool:
+    return "megatron_cfg" in cfg and bool(cfg["megatron_cfg"]["enabled"])
+
+
+def csd_owner_local_ineligibility(
+    master_config: MasterConfig, loss_config: CSDLossConfig
+) -> list[str]:
+    """Reasons a CSD run cannot evaluate cross-tokenizer KD owner-local.
+
+    Owner-local evaluation keeps the student logits in their context-parallel
+    shard and reads only the teacher rows each rank's chunks need. It needs a
+    Megatron student with PP=1 and neither sequence packing nor dynamic
+    batching, loss settings listed by :func:`owner_local_config_violations`,
+    and, with sparse teacher IPC, Megatron cross-tokenizer teachers whose
+    sequence width matches their CP shards. An empty list means eligible.
+    """
+    policy_config = master_config.policy
+    if not _megatron_enabled(policy_config):
+        return ["the student policy is not Megatron"]
+    reasons: list[str] = []
+    _, _, student_pp = _xtoken_entity_parallelism(policy_config, label="policy")
+    if student_pp != 1:
+        reasons.append(f"policy pipeline_model_parallel_size={student_pp} (needs 1)")
+    if _sequence_packing_enabled(policy_config):
+        reasons.append("policy sequence packing is enabled")
+    dynamic_batching = policy_config.get("dynamic_batching") or {}
+    if bool(dynamic_batching.get("enabled", False)):
+        reasons.append("policy dynamic batching is enabled")
+    reasons.extend(owner_local_config_violations(loss_config))
+    if loss_config.teacher_topk_ipc_k > 0:
+        for i, teacher in enumerate(master_config.teachers):
+            if not _teacher_is_cross_tokenizer(master_config, teacher):
+                continue
+            teacher_config = teacher.policy_config()
+            if not _megatron_enabled(teacher_config):
+                reasons.append(
+                    f"teachers[{i}] is not Megatron (sparse teacher rows come "
+                    "from the Megatron sender)"
+                )
+                continue
+            tp, cp, _ = _xtoken_entity_parallelism(
+                teacher_config, label=f"teachers[{i}]"
+            )
+            divisor = 2 * cp if cp > 1 else 1
+            if tp > 1 and bool(teacher_config["megatron_cfg"]["sequence_parallel"]):
+                divisor = math.lcm(divisor, tp)
+            if int(teacher_config["make_sequence_length_divisible_by"]) % divisor:
+                reasons.append(
+                    f"teachers[{i}].make_sequence_length_divisible_by="
+                    f"{teacher_config['make_sequence_length_divisible_by']} is not "
+                    f"a multiple of {divisor} (2 x CP, and TP with sequence "
+                    "parallelism)"
+                )
+    return reasons
 
 
 def _positive_config_int(value: object, *, field: str) -> int:
@@ -1482,17 +1559,48 @@ def setup(
                 "Sparse teacher IPC cannot be combined with "
                 "kd_loss_mode='select_teacher'; teacher selection requires full logits."
             )
-        for i, (teacher, teacher_config) in enumerate(
-            zip(teachers, teacher_configs, strict=True)
-        ):
-            if not _teacher_is_cross_tokenizer(master_config, teacher):
-                continue
-            automodel_cfg = teacher_config["automodel_cfg"]
-            if not (automodel_cfg["enabled"]):
+        if not _megatron_enabled(policy_config):
+            # The replicated loss reads the Automodel sparse format.
+            for i, (teacher, teacher_config) in enumerate(
+                zip(teachers, teacher_configs, strict=True)
+            ):
+                if not _teacher_is_cross_tokenizer(master_config, teacher):
+                    continue
+                if not teacher_config["automodel_cfg"]["enabled"]:
+                    raise ValueError(
+                        "Sparse teacher IPC with an Automodel student requires "
+                        "Automodel cross-tokenizer teachers; teachers[{i}] is not "
+                        "Automodel. Set loss_fn.teacher_topk_ipc_k=0 for dense "
+                        "teacher IPC.".format(i=i)
+                    )
+
+    # Megatron students evaluate cross-tokenizer KD on the context-parallel
+    # rank that owns each chunk whenever the run allows it; otherwise the loss
+    # stays replicated, which only dense teacher IPC can feed.
+    owner_local = False
+    if master_config.algorithm == "csd":
+        owner_local_reasons = csd_owner_local_ineligibility(
+            master_config, CSDLossConfig.model_validate(loss_config)
+        )
+        if _megatron_enabled(policy_config):
+            if teacher_topk_ipc_k > 0 and owner_local_reasons:
                 raise ValueError(
-                    "Sparse teacher IPC currently requires Automodel for each "
-                    f"cross-tokenizer teacher; teachers[{i}] is not Automodel."
+                    "Sparse teacher IPC (loss_fn.teacher_topk_ipc_k > 0) with a "
+                    "Megatron student needs owner-local CSD evaluation, which "
+                    "this run cannot use: "
+                    + "; ".join(owner_local_reasons)
+                    + ". Set loss_fn.teacher_topk_ipc_k=0 for dense teacher IPC."
                 )
+            owner_local = not owner_local_reasons
+            print(
+                "CSD loss evaluation: "
+                + (
+                    "owner-local"
+                    if owner_local
+                    else "replicated (" + "; ".join(owner_local_reasons) + ")"
+                ),
+                flush=True,
+            )
 
     if master_config.algorithm == "csd":
         validate_csd_tokenizer_reuse(
@@ -1797,6 +1905,7 @@ def setup(
         ],
     }
     if master_config.algorithm == "csd":
+        loss_config["owner_local"] = owner_local
         loss_fn = CSDLossFn(loss_config)
     else:
         loss_config["teacher_gold_loss"] = [t.gold_loss for t in teachers]
@@ -2137,15 +2246,18 @@ def export_teacher_logits_and_pack(
             teacher_data["batch_item_id"] = batch["batch_item_id"]
 
         teacher_policy.prepare_for_lp_inference()
-        force_include_token_ids = (
-            None
-            if same_vocab or not isinstance(loss_fn, CSDLossFn)
-            else _build_teacher_force_include_token_ids(
-                batch,
-                teacher_idx=i,
-                loss_config=loss_fn.cfg.model_dump(),
-            )
-        )
+        force_include_token_ids = None
+        if not same_vocab and isinstance(loss_fn, CSDLossFn):
+            if loss_fn.cfg.owner_local and loss_fn.cfg.teacher_topk_ipc_k > 0:
+                force_include_token_ids = _build_teacher_force_include_token_id_slots(
+                    batch, teacher_idx=i, kl_chunk_shift=loss_fn.cfg.kl_chunk_shift
+                )
+            else:
+                force_include_token_ids = _build_teacher_force_include_token_ids(
+                    batch,
+                    teacher_idx=i,
+                    loss_config=loss_fn.cfg.model_dump(),
+                )
         ipc_suffix, handles = _get_teacher_logits_ipc(
             teacher_policy,
             teacher_data,
