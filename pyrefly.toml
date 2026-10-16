@@ -206,6 +206,8 @@ project-includes = [
   "nemo_rl/experience/rollouts.py",
   "nemo_rl/experience/route_assembly.py",
   "nemo_rl/experience/route_plan.py",
+  "nemo_rl/experience/trajectory_logger.py",
+  "nemo_rl/experience/trajectory_logger_actor.py",
   "nemo_rl/modelopt/__init__.py",
   "nemo_rl/modelopt/models/__init__.py",
   "nemo_rl/modelopt/models/generation/__init__.py",

@@ -213,6 +213,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/one/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 120},
+        "trajectory_logger": {"enabled": False, "log_period": 10},
         "cluster": {"num_nodes": 2},
         "logger": LoggerConfig(log_dir="/run/one"),
     }
@@ -242,6 +243,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
         },
         "checkpointing": {"checkpoint_dir": "/run/two/checkpoints"},
         "rollout_checkpointing": {"snapshot_attempt_interval_s": 300},
+        "trajectory_logger": {"enabled": True, "log_period": 20},
         "cluster": {"num_nodes": 8},
         "logger": LoggerConfig(log_dir="/run/two"),
     }

@@ -175,6 +175,7 @@ class SingleControllerActorArgs:
     finalizer_actors: list[Any]
     advantage_actors: list[Any]
     # Defaulted fields must follow the required ones above, so these stay last.
+    trajectory_logger_actor: Optional[ray.actor.ActorHandle] = None
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
@@ -1322,6 +1323,11 @@ def setup_single_controller(
                     "gym_token_capture",
                 )
             )
+    trajectory_logger_cfg = master_config.trajectory_logger
+    if trajectory_logger_cfg.enabled and trajectory_logger_cfg.log_dir is None:
+        trajectory_logger_cfg.log_dir = os.path.abspath(
+            os.path.join(master_config.logger["log_dir"], "trajectories")
+        )
 
     # Resolved once here so the student workers and the teacher worker group
     # (which deep-copies this config) read the same settings. Absent means the
@@ -2101,6 +2107,18 @@ def setup_single_controller(
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 
+    trajectory_logger_actor = None
+    if trajectory_logger_cfg.enabled:
+        # PyArrow is only needed when logging is enabled.
+        from nemo_rl.experience.trajectory_logger_actor import (
+            create_trajectory_logger_actor,
+        )
+
+        assert trajectory_logger_cfg.log_dir is not None
+        trajectory_logger_actor = create_trajectory_logger_actor(
+            dp_config, trajectory_logger_cfg.log_dir
+        )
+
     # Print setup timing metrics
     total_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.total_setup_time_s = total_setup_time
@@ -2129,6 +2147,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        trajectory_logger_actor=trajectory_logger_actor,
         storage_units=storage_units,
         advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,

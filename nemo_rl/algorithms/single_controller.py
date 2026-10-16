@@ -510,6 +510,8 @@ class SingleControllerActor:
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
         self._rollout_recovery_ledger = self._rollout_manager.recovery_ledger
+        self._trajectory_logger = actor_args.trajectory_logger_actor
+        self._trajectory_logger_refs: list[ray.ObjectRef] = []
         self._restored_replay_groups_to_regenerate: list[TQReplayGroupMetadata] = []
 
         # Direct access, deliberately. A getattr default here reads as defensive but
@@ -787,6 +789,11 @@ class SingleControllerActor:
             ):
                 result = await self._run_pumps()
         finally:
+            if self._trajectory_logger is not None:
+                try:
+                    ray.kill(self._trajectory_logger, no_restart=True)
+                except ray.exceptions.RayError as error:
+                    log.warning("trajectory logger termination failed: %s", error)
             # Outside the span so the job span is flushed too, and off the
             # event loop because the exporter's flush blocks. Shielded, and a
             # cancel swallowed, because teardown is exactly when cancellation
@@ -3227,6 +3234,9 @@ class SingleControllerActor:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
+                                train_meta = train_meta.with_fields(
+                                    [self._advantage_cfg.policy_logprobs_field]
+                                )
                             if self._reference_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_reference_policy_logprobs_from_meta,
@@ -3246,6 +3256,7 @@ class SingleControllerActor:
                             train_meta,
                             has_valid_training_tokens,
                         ) = await self._advantage_stage(train_meta)
+                    self._record_trajectories(train_meta, chunk_index=chunks_dispatched)
 
                     step_has_valid_training_tokens |= has_valid_training_tokens
                     if self._is_ppo:
@@ -3569,6 +3580,14 @@ class SingleControllerActor:
                     step_metrics.update(aggregate_step_metrics(policy_result))
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
+                if self._should_log_trajectories(self._train_steps + 1):
+                    assert self._trajectory_logger is not None
+                    with self._timer.time("trajectory_log_wait_time", should_log=False):
+                        await asyncio.gather(*self._trajectory_logger_refs)
+                        self._trajectory_logger_refs.clear()
+                        await self._trajectory_logger.commit_step.remote(
+                            self._train_steps + 1
+                        )
                 async with self._data_plane_checkpoint_barrier.mutation(
                     "sample_clears"
                 ) as cut:
@@ -5609,6 +5628,24 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
         return result
+
+    def _should_log_trajectories(self, step: int) -> bool:
+        if self._trajectory_logger is None:
+            return False
+        period = self._master_config.trajectory_logger.log_period
+        return step == 1 or step % period == 0
+
+    def _record_trajectories(self, meta: KVBatchMeta, *, chunk_index: int) -> None:
+        """Queue one chunk for the trajectory logger."""
+        step = self._train_steps + 1
+        if not self._should_log_trajectories(step):
+            return
+        assert self._trajectory_logger is not None
+        self._trajectory_logger_refs.append(
+            self._trajectory_logger.record.remote(
+                meta, step=step, chunk_index=chunk_index
+            )
+        )
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
