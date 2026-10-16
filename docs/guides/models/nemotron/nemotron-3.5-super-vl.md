@@ -41,11 +41,12 @@ pin registers the same architecture for generation. No custom source checkouts
 or manual builds are needed. For container and worker-venv details, see
 [Dependency Management](../../../design-docs/dependency-management.md).
 
-Both recipes train
+All recipes train
 [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16):
 the text recipe on the DAPO-Math-17K training set with AIME-2024 validation,
-the image recipe on CLEVR-CoGenT (trainA / valA), all from Hugging Face. Set
-`HF_HOME` to a cache visible from every node:
+the image recipe on CLEVR-CoGenT (trainA / valA), and the agentic recipe on the
+NeMo Gym `workplace_assistant` tasks, all from Hugging Face. Set `HF_HOME` to a
+cache visible from every node:
 
 ```bash
 export HF_HOME=<path-to-shared-huggingface-cache>
@@ -57,15 +58,17 @@ configured.
 
 ## Example Recipes
 
-Automodel training with colocated vLLM generation. The recipe YAMLs
-under `examples/configs/recipes/` are the source of truth.
+Automodel training with vLLM generation. The text and image recipes colocate
+generation with training; the agentic recipe runs async GRPO with generation on
+its own node pool. The recipe YAMLs are the source of truth.
 
-| Algo | Data | Seq | Train EP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
+| Algo | Data | Seq | Train EP / CP | vLLM TP/EP | `max_new_tokens` | Nodes | Recipe |
 |---|---|---|---|---|---|---|---|
-| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 4 | 4 / 4 | 8192 | 16 x 4 GPUs | [`dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml) |
-| GRPO (image) | CLEVR-CoGenT | 8192 | 4 | 4 / 4 | 4096 | 16 x 4 GPUs | [`vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml) |
+| DAPO (text) | DAPO-Math-17K / AIME-2024 | 9216 | 4 / 1 | 4 / 4 | 8192 | 16 x 4 GPUs (colocated) | [`dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml) |
+| GRPO (image) | CLEVR-CoGenT | 8192 | 4 / 1 | 4 / 4 | 4096 | 16 x 4 GPUs (colocated) | [`vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml) |
+| Async GRPO (agentic, NeMo Gym) | `workplace_assistant` | 16384 | 4 / 2 | 4 / 4 | 8192 | 8 train + 8 gen x 4 GPUs | [`workplace_assistant_automodel.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml) |
 
-Both recipes are sized for 16 x 4-GPU GB200 nodes: train `expert_parallel_size: 4`
+All three recipes use 16 x 4-GPU GB200 nodes: train `expert_parallel_size: 4`
 and vLLM `tensor_parallel_size: 4` / `expert_parallel_size: 4` (one vLLM engine
 per node). See [Parallelism](#parallelism) for why EP must stay within a node.
 
@@ -73,8 +76,7 @@ The image recipe mirrors the Nano Omni CLEVR recipe
 (`vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml`): image
 placeholder tokens are `bad_words`, `limit_mm_per_prompt.image: 2`,
 `mm_processor_cache_gb: 0`, the Nemotron Omni CLEVR prompt, and
-`train_global_batch_size: 64` (a multiple of the 64-way data parallelism). Launch
-it with `examples/run_vlm_grpo.py`.
+`train_global_batch_size: 64` (a multiple of the 64-way data parallelism).
 
 The text recipe mirrors the Nemotron 3.5 Lightning DAPO recipe: dynamic sampling
 (`batch_multiplier: 3`), Clip-Higher (`ratio_clip_max: 0.28`), overlong
@@ -83,6 +85,9 @@ FusedAdam with FP32 master weights, activation checkpointing, and
 `moe_parallelizer.ignore_router_for_ac: true` (required with activation
 checkpointing on this MoE: the BF16 router top-k is nondeterministic on
 recompute).
+
+The agentic recipe is described in
+[NeMo Gym agentic recipe](#nemo-gym-agentic-recipe) below.
 
 ### Model-specific settings
 
@@ -117,28 +122,7 @@ These are set in the recipes and are required for this model:
   persistent memory per GPU does not depend on EP; EP only changes the
   transient unsharded expert weights and all-to-all traffic.
 
-## Launch
-
-Both recipes default to 16 nodes x 4 GPUs.
-
-```bash
-# Text DAPO (DAPO-Math-17K / AIME-2024)
-uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml
-
-# Image GRPO (CLEVR-CoGenT)
-uv run examples/run_vlm_grpo.py \
-  --config examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml
-```
-
-For launching on a multi-node Slurm or Kubernetes cluster, see the
-[cluster guide](../../../cluster.md); keep `cluster.num_nodes` and
-`cluster.gpus_per_node` in step with the allocation. Interrupted runs resume
-automatically from the latest checkpoint in `checkpointing.checkpoint_dir`.
-See the [GRPO guide](../../grpo.md) for the algorithm and common configuration
-details.
-
-## Agentic RL with NeMo Gym
+### NeMo Gym agentic recipe
 
 `examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml`
 trains the model on the NeMo Gym `workplace_assistant` environment: multi-step
@@ -170,7 +154,7 @@ Settings specific to this recipe, on top of the model-specific settings above:
 | `policy.generation.vllm_kwargs.max_num_batched_tokens` | `16384` | vLLM's default 2,048-token chunked-prefill budget throttles the repeated 4-20K-token prefills of the agent loop. |
 | `env.nemo_gym.policy_model...uses_reasoning_parser` / `enable_thinking` | `true` | The checkpoint thinks before every tool call; Gym needs the reasoning parser on to strip `<think>` blocks from the tool-call messages. |
 
-### Data
+#### Data
 
 The environment's tasks are published as
 [`nvidia/Nemotron-RL-agent-workplace_assistant`](https://huggingface.co/datasets/nvidia/Nemotron-RL-agent-workplace_assistant)
@@ -181,20 +165,37 @@ uvx --from huggingface-hub hf download nvidia/Nemotron-RL-agent-workplace_assist
   --repo-type dataset --local-dir $DATA_DIR/workplace_assistant
 ```
 
-### Launch
+## Launch
 
-The NeMo Gym venvs for the `workplace_assistant` resource server are built on
-first launch (or prebaked into the container, see the
+The text and image recipes default to 16 nodes x 4 GPUs; the agentic recipe to
+8 training + 8 generation nodes (`cluster.num_nodes` is the sum,
+`policy.generation.colocated.resources.num_nodes` the generation share). The NeMo
+Gym venvs for the `workplace_assistant` resource server are built on first launch
+(or prebaked into the container, see the
 [Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container)).
-`cluster.num_nodes` is training plus generation nodes and
-`policy.generation.colocated.resources.num_nodes` is the generation share:
 
 ```bash
+# Text DAPO (DAPO-Math-17K / AIME-2024)
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/dapo-nemotron3.5-super-vl-120BA12B-16n4g-automodel.yaml
+
+# Image GRPO (CLEVR-CoGenT)
+uv run examples/run_vlm_grpo.py \
+  --config examples/configs/recipes/vlm/vlm_grpo-nemotron3.5-super-vl-120BA12B-clevr-16n4g-automodel.yaml
+
+# Agentic GRPO (NeMo Gym workplace_assistant)
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
   --config examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml \
   data.train.data_path=$DATA_DIR/workplace_assistant/train.jsonl \
   data.validation.data_path=$DATA_DIR/workplace_assistant/validation.jsonl
 ```
+
+For launching on a multi-node Slurm or Kubernetes cluster, see the
+[cluster guide](../../../cluster.md); keep `cluster.num_nodes` and
+`cluster.gpus_per_node` in step with the allocation. Interrupted runs resume
+automatically from the latest checkpoint in `checkpointing.checkpoint_dir`.
+See the [GRPO guide](../../grpo.md) for the algorithm and common configuration
+details.
 
 ## Reference Results
 
