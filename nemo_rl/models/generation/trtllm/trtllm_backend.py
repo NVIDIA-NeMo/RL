@@ -107,6 +107,23 @@ class NcclExtension(WorkerExtension):
         self.state_dict_info = state_dict_info
 
     # ------------------------------------------------------------------ #
+    #  Prefix-cache reset without a weight update
+    # ------------------------------------------------------------------ #
+
+    def reset_prefix_cache(self) -> None:
+        """Reset the reusable prefix cache without draining in-flight requests.
+
+        Overrides WorkerExtension.reset_prefix_cache, which drains first. This
+        resets at the next scheduler step boundary instead and leaves in-flight
+        requests on their current KV, as an in-flight refit does
+        (finish_weight_update under ``control_action(drain=False)``). It still
+        goes through control_action because the reset must not race the
+        executor loop's block allocation.
+        """
+        with self.engine.control_action(drain=False):
+            self.engine.reset_prefix_cache()
+
+    # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
 
