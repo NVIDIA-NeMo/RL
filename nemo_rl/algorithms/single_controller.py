@@ -193,9 +193,11 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
     NO_SPAN,
+    RL_ALGORITHM,
     RL_IDLE_POLLS_ATTR,
     efficiency_span,
     is_span_group_enabled,
+    iteration_scope,
     managed_span,
     per_prompt_scope,
     safe_set_span_attributes,
@@ -216,6 +218,7 @@ from nemo_rl.utils.logger import (
     Logger,
     should_log_nemo_gym_full_result_tables,
 )
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -782,7 +785,7 @@ class SingleControllerActor:
                 RLSpanGroup.U_JOB,
                 "rl.sc.job",
                 tracer=self._tracer,
-                **{"rl.algorithm": "ppo" if self._is_ppo else "grpo"},
+                **{RL_ALGORITHM: "ppo" if self._is_ppo else "grpo"},
             ):
                 result = await self._run_pumps()
         finally:
@@ -2923,6 +2926,11 @@ class SingleControllerActor:
         selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
+            if self._gen is not self._trainer and isinstance(
+                self._gen, (VllmGeneration, MegatronGeneration)
+            ):
+                maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
@@ -2950,6 +2958,11 @@ class SingleControllerActor:
             step_finalizer_group_ids: set[str] = set()
 
             with (
+                # Pinned here rather than read per span: _train_steps is
+                # incremented part-way through the step, so a later read would
+                # tag the checkpoint spans with a different value than the
+                # step they belong to.
+                iteration_scope(self._train_steps + 1),
                 self._timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
@@ -2958,10 +2971,7 @@ class SingleControllerActor:
                     # No rl.epoch: the rollout pump advances the epoch on its own
                     # clock, so its value here would describe whichever epoch that
                     # pump had reached, not the one this step's data came from.
-                    **{
-                        "rl.iteration": self._train_steps + 1,
-                        "rl.weight_version": version_during_step,
-                    },
+                    **{"rl.weight_version": version_during_step},
                 ),
             ):
                 # One span per starvation episode, not per 5ms poll.
@@ -3769,7 +3779,6 @@ class SingleControllerActor:
                             RLSpanGroup.CHECKPOINT,
                             "rl.sc.checkpointing",
                             tracer=self._tracer,
-                            **{"rl.step": self._train_steps},
                         ),
                     ):
                         await self._save_checkpoint(

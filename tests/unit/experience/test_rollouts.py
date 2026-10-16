@@ -64,6 +64,7 @@ from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
     async_generate_response_for_sample_turn,
     generate_responses_async,
+    nemo_gym_rollout_hit_max_tokens,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
@@ -2275,6 +2276,131 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     assert rollout_result.final_batch["truncated"].tolist() == is_truncated
 
 
+def _incomplete_response(reason):
+    return {
+        "response": {
+            "status": "incomplete",
+            "incomplete_details": {"reason": reason},
+            "output": [],
+        }
+    }
+
+
+def test_nemo_gym_rollout_hit_max_tokens_token_budget():
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=130, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        {}, total_tokens=127, max_total_tokens_per_sample=128
+    )
+    assert nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=128, max_total_tokens_per_sample=128
+    )
+    assert not nemo_gym_rollout_hit_max_tokens(
+        None, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+@pytest.mark.parametrize("reason", ["max_output_tokens", "length", "max_tokens"])
+def test_nemo_gym_rollout_hit_max_tokens_length_incomplete_response(reason):
+    # A context overflow comes back as an empty length-cut completion, so the
+    # chain stops well short of the token limit.
+    assert nemo_gym_rollout_hit_max_tokens(
+        _incomplete_response(reason), total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+def test_nemo_gym_rollout_hit_max_tokens_per_turn_cap_counts_as_truncated():
+    # A final turn stopped by its per-turn max_output_tokens cap reports the
+    # same reason as a context overflow, but with generated output. The final
+    # generation was length-cut, so it deliberately counts as truncated even
+    # though the context (10 of 128 tokens) was not exhausted.
+    full_result = _incomplete_response("max_output_tokens")
+    full_result["response"]["output"] = [
+        {"type": "message", "role": "assistant", "content": "partial answer"}
+    ]
+    assert nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+@pytest.mark.parametrize(
+    "full_result",
+    [
+        pytest.param(_incomplete_response("content_filter"), id="content_filter"),
+        # An agent can end a rollout as incomplete without a length cut (e.g. an
+        # empty or reasoning-only turn); that is not truncation.
+        pytest.param(
+            {"response": {"status": "incomplete", "incomplete_details": None}},
+            id="incomplete_without_details",
+        ),
+        pytest.param(
+            {"response": {"status": "completed", "incomplete_details": None}},
+            id="completed",
+        ),
+        pytest.param({"response": "not-a-dict"}, id="malformed_response"),
+        pytest.param({"reward": 0.0}, id="no_response"),
+    ],
+)
+def test_nemo_gym_rollout_hit_max_tokens_other_endings(full_result):
+    assert not nemo_gym_rollout_hit_max_tokens(
+        full_result, total_tokens=10, max_total_tokens_per_sample=128
+    )
+
+
+def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():
+    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+    results = []
+    for response in (
+        _incomplete_response("max_output_tokens")["response"],
+        {"status": "completed", "incomplete_details": None, "output": []},
+    ):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1, 2]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([3, 4, 5]),
+                        "generation_logprobs": torch.tensor([-0.1, -0.1, -0.1]),
+                    },
+                ],
+                "full_result": {"reward": 0.0, "response": response},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+    )
+
+    # Both rollouts are 5 tokens, far below the limit: only the length-cut one
+    # counts as truncated.
+    assert rollout_result.final_batch["truncated"].tolist() == [True, False]
+    assert rollout_result.rollout_metrics["truncation_rate"] == 0.5
+    assert rollout_result.rollout_metrics["natural_termination_rate"] == 0.5
+
+
 def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
     monkeypatch,
 ):
@@ -2449,7 +2575,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         {},
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
-    manager._compute_rollout_metrics = lambda completions, agent: {
+    manager._compute_rollout_metrics = lambda completions, agent, **_kwargs: {
         "completion_count": len(completions),
         "agent": agent,
     }
@@ -2642,7 +2768,10 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
-            results[rowidx] = {"input_message_log": [{"token_ids": [1]}]}
+            results[rowidx] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 0.0},
+            }
             shaping_by_rowidx[rowidx] = SimpleNamespace(
                 length_rewards_low=[],
                 rewards_low=[],
@@ -2652,7 +2781,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
 
     manager._stream_rows = fake_stream_rows
     manager._results_to_completions = lambda _results: ([object()], {})
-    manager._compute_rollout_metrics = lambda *_args: {}
+    manager._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
     async def run_group():
@@ -2930,3 +3059,25 @@ def test_run_async_nemo_gym_rollout(
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
     2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
+
+
+def test_mask_sample_flags_read_either_form_of_the_flag():
+    """Either the verify response's first-class ``mask_sample`` field or the
+    ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
+    the first-class field to False on every response, so a nested-only
+    environment carries a false first-class field beside the true nested one
+    and the two reads must be OR-ed, not ordered; unflagged and empty rows stay
+    unmasked."""
+    flags = rollouts_mod._mask_sample_flags(
+        [
+            {"mask_sample": True},
+            {"instance_config": {"mask_sample": True}},
+            # An older-form environment on a Gym that defaults the first-class
+            # field to False: either form flags the sample.
+            {"mask_sample": False, "instance_config": {"mask_sample": True}},
+            {"mask_sample": False, "instance_config": {}},
+            {},
+            None,
+        ]
+    )
+    assert flags.tolist() == [True, True, True, False, False, False]

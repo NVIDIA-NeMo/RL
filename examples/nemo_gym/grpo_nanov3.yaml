@@ -200,6 +200,8 @@ policy:
   scheduler: null
 
   offload_optimizer_for_logprob: False
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
@@ -249,7 +251,6 @@ policy:
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      offload_policy_before_refit: false
       expose_http_server: true
       enable_prefix_caching: true
       prefix_caching_mamba_gb: null
@@ -327,6 +328,49 @@ env:
   # false: ignore env mask_sample flags so the loss trains on every sample.
   should_mask_flagged_samples: true
   nemo_gym:
+    math_with_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: math_with_judge_simple_agent
+    code_gen_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: code_gen_simple_agent
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    mcqa_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: mcqa_simple_agent
+    instruction_following_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: instruction_following_simple_agent
+    structured_outputs_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: structured_outputs_simple_agent
+
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (below the 9000 ephemeral floor on some GB200 nodes) and non-overlapping with NeMo
     # RL (3000-4999) or vLLM (7000-8999). See ray.sub for the full port layout.

@@ -4,10 +4,6 @@ grpo:
   val_period: 0
   val_at_start: false
   val_at_end: false
-policy:
-  generation:
-    mcore_generation_config:
-      kv_cache_management_mode: recompute
 data_plane:
   enabled: true
   simple:
