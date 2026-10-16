@@ -61,6 +61,10 @@ _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
+_RADIO_BIAS_PATCH_FN = "_patch_vllm_radio_projection_bias_order"
+_RADIO_BIAS_MARKER = "NeMo-RL RADIO projection bias parity"
+_RADIO_MLP_BIAS_PATCH_FN = "_patch_vllm_radio_mlp_bias_order"
+_RADIO_MLP_BIAS_MARKER = "NeMo-RL RADIO MLP bias parity"
 _DYNAMIC_IMAGE_SOURCE = "model_executor/models/nano_nemotron_vl.py"
 _DYNAMIC_IMAGE_PATCH_FN = "_patch_vllm_dynamic_image_vision_per_media"
 _DYNAMIC_IMAGE_MARKER = "NeMo-RL patch: preserve each scheduler media item's complete"
@@ -329,6 +333,30 @@ def patched_radio_source(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def patched_radio_bias_source(tmp_path, monkeypatch):
+    """The installed vLLM RADIO attention, with post-reduction bias parity."""
+    copied = write_unpatched_copy(
+        _RADIO_SOURCE, _RADIO_BIAS_PATCH_FN, tmp_path / "radio.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_radio_projection_bias_order(
+        logging.getLogger(__name__)
+    )
+    return copied
+
+
+@pytest.fixture
+def patched_radio_mlp_bias_source(tmp_path, monkeypatch):
+    """The installed vLLM RADIO MLP, with post-reduction fc2 bias parity."""
+    copied = write_unpatched_copy(
+        _RADIO_SOURCE, _RADIO_MLP_BIAS_PATCH_FN, tmp_path / "radio.py"
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    assert patches._patch_vllm_radio_mlp_bias_order(logging.getLogger(__name__))
+    return copied
+
+
+@pytest.fixture
 def patched_dynamic_image_source(tmp_path, monkeypatch):
     """The installed Nano VL model, unpatched then patched in tmp."""
     old_snippet, new_snippet = patch_snippets(_DYNAMIC_IMAGE_PATCH_FN)
@@ -445,6 +473,7 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
     assert 'ls_name.endswith((".ls1", ".ls2"))' in content
     assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "ls_param._nemo_rl_folded_identity = True" in content
     assert "loaded_params.add(ls_name)" in content
 
 
@@ -470,6 +499,45 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
     assert "load_weights tail anchor was not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_radio_projection_bias_runs_after_tp_reduction(patched_radio_bias_source):
+    content = patched_radio_bias_source.read_text()
+    assert _RADIO_BIAS_MARKER in content
+    projection = content.index("out, bias = self.proj(out)")
+    bias_add = content.index("out = out + bias", projection)
+    assert "self.proj.skip_bias_add = True" in content[:projection]
+    assert bias_add > projection
+    ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_radio_projection_bias_patch_is_idempotent(
+    patched_radio_bias_source, monkeypatch
+):
+    before = patched_radio_bias_source.read_text()
+    monkeypatch.setattr(
+        patches, "_get_vllm_file", lambda _relative: str(patched_radio_bias_source)
+    )
+    assert patches._patch_vllm_radio_projection_bias_order(
+        logging.getLogger(__name__)
+    )
+    assert patched_radio_bias_source.read_text() == before
+
+
+@pytest.mark.vllm
+def test_radio_mlp_bias_runs_after_tp_reduction(patched_radio_mlp_bias_source):
+    content = patched_radio_mlp_bias_source.read_text()
+    assert _RADIO_MLP_BIAS_MARKER in content
+    assert "self.mlp.fc2.skip_bias_add = True" in content
+    mlp_call = content.index("mlp_output = self.mlp(self.norm2(hidden_states))")
+    bias_add = content.index("mlp_output = mlp_output + self.mlp.fc2.bias", mlp_call)
+    layer_scale = content.index("mlp_output = mlp_output * self.ls2", bias_add)
+    assert mlp_call < bias_add < layer_scale
+    assert 'getattr(self.ls1, "_nemo_rl_folded_identity", False)' in content
+    assert 'getattr(self.ls2, "_nemo_rl_folded_identity", False)' in content
+    ast.parse(content)
 
 
 @pytest.mark.vllm
@@ -936,6 +1004,8 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_radio_final_layernorm",
+        "_patch_vllm_radio_projection_bias_order",
+        "_patch_vllm_radio_mlp_bias_order",
         "_patch_vllm_dynamic_image_vision_per_media",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):

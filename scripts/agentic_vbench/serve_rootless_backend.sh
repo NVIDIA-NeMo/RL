@@ -51,8 +51,16 @@ runtime=$(mktemp -d "$runtime_parent/avb-backend.XXXXXXXX")
 # point it at Lustre, where rootless Buildah cannot create the mount namespace
 # directories used by `RUN` layers. Keep all Podman/Buildah temporary state on
 # the backend node beside its storage and run roots.
-mkdir -p "$runtime/tmp"
+mkdir -p "$runtime/tmp" "$runtime/config" "$runtime/cache"
 export TMPDIR="$runtime/tmp"
+# Rootless Podman otherwise writes CNI network definitions under
+# ~/.config/cni/net.d even though its storage and run roots are node-local.
+# Agentic rollouts create a fresh compose network per trial, so a full home
+# quota turns a valid episode into a missing-verifier-reward retry loop.  Keep
+# every disposable Podman config/cache artifact with this backend's runtime;
+# cleanup removes the whole directory when the backend exits.
+export XDG_CONFIG_HOME="$runtime/config"
+export XDG_CACHE_HOME="$runtime/cache"
 port=${AVB_BACKEND_PORT:-18443}
 # Certificates must outlive the job: the walltime in days, plus one.
 walltime_seconds=$(squeue -h -j "${SLURM_JOB_ID:-0}" -o %l 2>/dev/null | awk -F'[-:]' '

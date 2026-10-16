@@ -852,6 +852,224 @@ def _patch_vllm_dynamic_image_vision_per_media(logger) -> bool:
     return True
 
 
+def _patch_vllm_vision_parity_dump(logger) -> bool:
+    """Add inert-by-default exact stage dumps to the per-media path."""
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
+    except RuntimeError:
+        logger.warning("Could not locate nano_nemotron_vl.py for vision parity capture.")
+        return False
+
+    old_snippet = """            _, vit_embeds = self.vision_model(image_pixels, imgs_sizes=single_size)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = self.pixel_shuffle_dynamic_res(
+                vit_embeds, imgs_sizes=single_size
+            )
+            image_embeddings.append(self.mlp1(vit_embeds))
+"""
+    v1_snippet = """            _, vit_embeds = self.vision_model(image_pixels, imgs_sizes=single_size)
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = self.pixel_shuffle_dynamic_res(
+                vit_embeds, imgs_sizes=single_size
+            )
+            projected = self.mlp1(vit_embeds)
+            from nemo_rl.models.vision_parity_dump import dump_vision_features
+            dump_vision_features(
+                \"generation\", image_pixels, projected, single_size
+            )
+            image_embeddings.append(projected)
+"""
+    v2_snippet = """            # NeMo-RL vision parity capture v2 (inert unless its output path is set).
+            from nemo_rl.models.vision_parity_dump import dump_vision_features
+            _, vit_embeds = self.vision_model(image_pixels, imgs_sizes=single_size)
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"radio\"
+            )
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"post_norm\"
+            )
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = self.pixel_shuffle_dynamic_res(
+                vit_embeds, imgs_sizes=single_size
+            )
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"shuffle\"
+            )
+            projected = self.mlp1(vit_embeds)
+            dump_vision_features(
+                \"generation\", image_pixels, projected, single_size, stage=\"projected\"
+            )
+            image_embeddings.append(projected)
+"""
+    new_snippet = """            # NeMo-RL vision parity capture v3 (inert unless its output path is set).
+            from nemo_rl.models.vision_parity_dump import (
+                dump_vision_features,
+                vision_parity_layer_hooks,
+            )
+            with vision_parity_layer_hooks(
+                self.vision_model, "generation", image_pixels, single_size
+            ):
+                _, vit_embeds = self.vision_model(image_pixels, imgs_sizes=single_size)
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"radio\"
+            )
+            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"post_norm\"
+            )
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            vit_embeds = self.pixel_shuffle_dynamic_res(
+                vit_embeds, imgs_sizes=single_size
+            )
+            dump_vision_features(
+                \"generation\", image_pixels, vit_embeds, single_size, stage=\"shuffle\"
+            )
+            projected = self.mlp1(vit_embeds)
+            dump_vision_features(
+                \"generation\", image_pixels, projected, single_size, stage=\"projected\"
+            )
+            image_embeddings.append(projected)
+"""
+    marker = "NeMo-RL vision parity capture v3"
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            return True
+        matching_snippets = [
+            snippet
+            for snippet in (v2_snippet, v1_snippet, old_snippet)
+            if content.count(snippet) == 1
+        ]
+        if len(matching_snippets) != 1:
+            logger.warning(
+                "Could not apply vLLM vision parity capture v3: expected exactly one "
+                "supported per-media anchor in %s.",
+                file_to_patch,
+            )
+            return False
+        updated = content.replace(matching_snippets[0], new_snippet, 1)
+        compile(updated, file_to_patch, "exec")
+        write_back(updated)
+    return True
+
+
+def _patch_vllm_radio_projection_bias_order(logger) -> bool:
+    """Match Megatron RADIO's post-reduction attention projection bias add."""
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/radio.py")
+    except RuntimeError:
+        logger.warning("Could not locate radio.py for projection bias parity.")
+        return False
+
+    old_snippet = """        out = self.attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        out, _ = self.proj(out)
+        return out
+"""
+    new_snippet = """        out = self.attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+        # NeMo-RL RADIO projection bias parity: Megatron forms every rank's
+        # no-bias partial, reduces those partials, then adds bias.  vLLM's
+        # RowParallelLinear otherwise fuses bias into rank zero before the
+        # reduction, changing BF16 rounding even with identical operands.
+        self.proj.skip_bias_add = True
+        out, bias = self.proj(out)
+        if bias is not None:
+            out = out + bias
+        return out
+"""
+    marker = "NeMo-RL RADIO projection bias parity"
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            return True
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "Could not apply RADIO projection bias parity: the forward "
+                "anchor was not found exactly once in %s.",
+                file_to_patch,
+            )
+            return False
+        updated = content.replace(old_snippet, new_snippet, 1)
+        compile(updated, file_to_patch, "exec")
+        write_back(updated)
+
+    logger.info("Patched vLLM RADIO projection bias to run after TP reduction.")
+    return True
+
+
+def _patch_vllm_radio_mlp_bias_order(logger) -> bool:
+    """Match Megatron RADIO's post-reduction MLP projection bias add."""
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/radio.py")
+    except RuntimeError:
+        logger.warning("Could not locate radio.py for MLP bias parity.")
+        return False
+
+    old_snippet = """class RadioVisionEncoderLayer(InternVisionEncoderLayer):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        mask_meta: MaskMetadata | None = None,
+    ):
+        hidden_states = (
+            hidden_states
+            + self.attn(self.norm1(hidden_states), mask_meta=mask_meta) * self.ls1
+        )
+
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2
+
+        return hidden_states
+"""
+    new_snippet = """class RadioVisionEncoderLayer(InternVisionEncoderLayer):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, attn_cls=RadioParallelAttention, **kwargs)
+        # NeMo-RL RADIO MLP bias parity: reduce no-bias fc2 partials before
+        # adding the replicated bias, matching Megatron's RowParallelLinear.
+        self.mlp.fc2.skip_bias_add = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        mask_meta: MaskMetadata | None = None,
+    ):
+        attention_output = self.attn(
+            self.norm1(hidden_states), mask_meta=mask_meta
+        )
+        if not getattr(self.ls1, "_nemo_rl_folded_identity", False):
+            attention_output = attention_output * self.ls1
+        hidden_states = hidden_states + attention_output
+
+        mlp_output = self.mlp(self.norm2(hidden_states))
+        if self.mlp.fc2.bias is not None:
+            mlp_output = mlp_output + self.mlp.fc2.bias
+        if not getattr(self.ls2, "_nemo_rl_folded_identity", False):
+            mlp_output = mlp_output * self.ls2
+        hidden_states = hidden_states + mlp_output
+
+        return hidden_states
+"""
+    marker = "NeMo-RL RADIO MLP bias parity"
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            return True
+        if content.count(old_snippet) != 1:
+            logger.warning(
+                "Could not apply RADIO MLP bias parity: the encoder-layer "
+                "anchor was not found exactly once in %s.",
+                file_to_patch,
+            )
+            return False
+        updated = content.replace(old_snippet, new_snippet, 1)
+        compile(updated, file_to_patch, "exec")
+        write_back(updated)
+
+    logger.info("Patched vLLM RADIO MLP bias to run after TP reduction.")
+    return True
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -879,7 +1097,9 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     skip_new = ""
 
     # Required for folded checkpoints: initialize LayerScale parameters the
-    # checkpoint does not contain to RADIO's configured identity factor.
+    # checkpoint does not contain to RADIO's configured identity factor. Mark
+    # identity scales so the layer forward can omit the otherwise redundant
+    # multiply and match Megatron's folded execution order exactly.
     old_snippet = """                loaded_params.add(vllm_key)
 
         return loaded_params
@@ -890,6 +1110,8 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         for ls_name, ls_param in params_dict.items():
             if ls_name.endswith((".ls1", ".ls2")) and ls_name not in loaded_params:
                 ls_param.data.fill_(initializer_factor)
+                if initializer_factor == 1.0:
+                    ls_param._nemo_rl_folded_identity = True
                 loaded_params.add(ls_name)
 
         return loaded_params
@@ -1354,7 +1576,10 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_radio_projection_bias_order(patch_logger)
+    _patch_vllm_radio_mlp_bias_order(patch_logger)
     _patch_vllm_dynamic_image_vision_per_media(patch_logger)
+    _patch_vllm_vision_parity_dump(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1422,7 +1647,10 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
+    _patch_vllm_radio_projection_bias_order(patch_logger)
+    _patch_vllm_radio_mlp_bias_order(patch_logger)
     _patch_vllm_dynamic_image_vision_per_media(patch_logger)
+    _patch_vllm_vision_parity_dump(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger

@@ -77,12 +77,23 @@ policy:
     empty_unused_memory_level: 2
     freeze_vision_model: true
     freeze_vision_projection: true
+    model_overrides:
+      # vLLM computes RADIO norm/QKV with PyTorch and disables cuDNN SDPA.
+      # Match those execution paths locally in the learner; retained-media
+      # parity gates require both controls together.
+      vision_qkv_impl: torch
+      vision_attention_impl: torch_sdpa
+      vision_mlp_impl: torch
   generation:
     vllm_cfg:
       async_engine: true
       fp32_lm_head: true
       reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
     vllm_kwargs:
+      # Pair with policy.megatron_cfg.model_overrides.vision_attention_impl.
+      # vLLM's default FLASH_ATTN vision backend is not bitwise equivalent to
+      # its TORCH_SDPA path on the retained AgenticVBench media fixtures.
+      mm_encoder_attn_backend: TORCH_SDPA
       # OpenCode read calls carry inline frame images. Do not profile a 256k
       # prefill allocation at startup; vLLM uses chunked prefill instead.
       limit_mm_per_prompt:

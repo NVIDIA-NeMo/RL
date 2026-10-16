@@ -114,6 +114,13 @@ policy:
     freeze_vision_projection: true
     freeze_sound_encoder: true
     freeze_sound_projection: true
+    model_overrides:
+      # Match vLLM RADIO's PyTorch norm/QKV and Flash-SDPA math.  These are
+      # execution-parity controls only; model weights and the RL objective are
+      # unchanged.
+      vision_qkv_impl: torch
+      vision_attention_impl: torch_sdpa
+      vision_mlp_impl: torch
     optimizer:
       lr: 3.0e-6
       min_lr: 5.0e-7
@@ -131,6 +138,9 @@ policy:
       max_model_len: ${policy.max_total_sequence_length}
       reasoning_parser_plugin: /opt/nemo-rl/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
     vllm_kwargs:
+      # The learner's torch_sdpa override forces the same Flash-SDPA kernel
+      # selected inside vLLM's TORCH_SDPA vision wrapper.
+      mm_encoder_attn_backend: TORCH_SDPA
       # OpenCode's read tool sends images inline (base64 data URLs). Long video
       # investigations exceeded 64 accumulated frame reads before turn 32.
       limit_mm_per_prompt:
