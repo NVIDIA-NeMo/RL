@@ -3763,4 +3763,16 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
 
+        # Stop NemoGym so its in-flight rollouts stop calling vLLM before vLLM is torn down.
+        # shutdown() sends SIGINT to the Gym servers; fall back to killing the actor.
+        for env in {id(e): e for e in task_to_env.values()}.values():
+            try:
+                ray.get(env.shutdown.remote(), timeout=60)
+            except Exception as e:
+                print(f"NemoGym graceful shutdown failed ({e}); killing actor", flush=True)
+            try:
+                ray.kill(env)
+            except Exception as e:
+                print(f"Error stopping environment: {e}", flush=True)
+
         print("Async GRPO training complete!")
