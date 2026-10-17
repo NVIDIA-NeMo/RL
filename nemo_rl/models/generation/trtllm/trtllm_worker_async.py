@@ -571,9 +571,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            # Raise instead of returning False so the cause (e.g. a poisoned FP8
-            # worker that must be restarted) reaches the caller, not a generic
-            # "NCCL process group" error.
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
             raise RuntimeError(f"TRT-LLM collective weight update failed: {e!r}") from e
 
     async def update_weights_via_ipc_zmq_async(self) -> bool:
@@ -598,9 +597,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            # Raise instead of returning False so the cause (e.g. a poisoned FP8
-            # worker that must be restarted) reaches the caller, not a generic
-            # "NCCL process group" error.
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
             raise RuntimeError(f"TRT-LLM IPC weight update failed: {e!r}") from e
 
     async def report_device_id_async(self) -> list[str]:

@@ -367,15 +367,19 @@ def test_quantization_ignore_patterns_set_the_refit_scope(monkeypatch, patterns)
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
     extension, _, model, model_loader, _ = _extension(backend)
-    # The engine's exclude list holds the configured patterns plus its own.
-    exclude = [
-        "lm_head",
-        "*embed_tokens*",
-        *(patterns or ["model.layers.*.self_attn*"]),
-    ]
     model.model_config = SimpleNamespace(
-        quant_config=SimpleNamespace(exclude_modules=exclude)
+        quant_config=SimpleNamespace(
+            is_module_excluded_from_quantization=lambda _: False
+        )
     )
+    # The built engine holds attention as FP8; it is refit as FP8 only in pattern mode.
+    model.named_modules = lambda: [
+        (
+            "llm.model.layers.0.self_attn.qkv_proj",
+            SimpleNamespace(has_fp8_block_scales=True),
+        ),
+        ("llm.model.layers.0.mlp.gate", SimpleNamespace()),
+    ]
     monkeypatch.setattr(backend.fp8_quantization, "is_fp8_model", lambda _: True)
     quantized = {
         "model.layers.0.mlp.experts.0.down_proj.weight": torch.randn(128, 128),

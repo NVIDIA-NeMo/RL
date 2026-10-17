@@ -803,6 +803,7 @@ class TestCollectiveWeightSynchronizer:
             refit_timeout_s=None,
             buffer_size_bytes=None,
             num_buffers=None,
+            use_legacy_packing=False,
         )
         gen.update_weights_from_collective.assert_called_once()
 
@@ -899,6 +900,7 @@ class TestCollectiveWeightSynchronizer:
             nccl_peer="vllm",
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
         gen.get_inference_world_size.return_value = 8
         sync = CollectiveWeightSynchronizer(
@@ -922,6 +924,7 @@ class TestCollectiveWeightSynchronizer:
             refit_timeout_s=None,
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
 
 

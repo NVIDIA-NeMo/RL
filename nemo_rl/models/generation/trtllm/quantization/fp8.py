@@ -14,10 +14,9 @@
 
 """Routed-expert block-FP8 / MXFP8 refit support for TRT-LLM (MoE models)."""
 
-import fnmatch
 import math
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from typing import Any
 
 import torch
@@ -32,8 +31,17 @@ MXFP8_BLOCK_SIZE = 32
 UE8M0_BIAS = 127
 E4M3_MAX = 448.0
 
-# Never quantized, whatever the user lists.
-ALWAYS_BF16_PATTERNS = ("lm_head", "*embed_tokens*", "*.mlp.gate")
+# Never quantized, whatever the user lists. Specific to the TRT-LLM Qwen3.5 /
+# Qwen3-Next engine modules that stay BF16: routers (Qwen3Gate / Qwen3NextGate),
+# shared_expert_gate (built with quant_config=None) and packed linear_attn in_proj_*.
+# Add entries here for other models.
+ALWAYS_BF16_PATTERNS = (
+    "lm_head",
+    "*embed_tokens*",
+    "*.mlp.gate",
+    "*.mlp.shared_expert_gate",
+    "*.linear_attn.in_proj_*",
+)
 
 # Default scope when ``trtllm_cfg.quantization_ignore_patterns`` is unset: routed
 # experts only. TRT-LLM only has a negative module filter, so everything else
@@ -90,25 +98,6 @@ def build_quant_config(
 
 FP8_BLOCK_QUANT_KWARGS: dict[str, Any] = build_quant_config(is_mx=False)
 MXFP8_BLOCK_QUANT_KWARGS: dict[str, Any] = build_quant_config(is_mx=True)
-
-
-def is_module_ignored(module_name: str, patterns: Sequence[str]) -> bool:
-    """Whether the module or any ancestor matches an ignore pattern.
-
-    Mirrors TRT-LLM's ``exclude_modules`` matching: ``fnmatch`` or ``re:`` regex.
-    """
-    parts = module_name.split(".")
-    for end in range(len(parts), 0, -1):
-        candidate = ".".join(parts[:end])
-        for pattern in patterns:
-            if pattern.startswith("re:"):
-                if re.fullmatch(pattern[3:], candidate):
-                    return True
-            elif fnmatch.fnmatchcase(candidate, pattern):
-                return True
-            elif pattern.endswith(".*") and candidate == pattern[:-2]:
-                return True
-    return False
 
 
 _EXPERT_PREFIX: str = (
@@ -178,39 +167,83 @@ def validate_fused_expert_layout(
             )
 
 
-def _with_always_bf16(patterns: Sequence[str]) -> list[str]:
-    return list(dict.fromkeys([*patterns, *ALWAYS_BF16_PATTERNS]))
+# TODO(TRT-LLM issue): TRT-LLM has no HF-name -> engine-module lookup at this pin.
+# Replace this Qwen3.5 mapping when it does.
+def engine_module_names(hf_module_name: str) -> list[str]:
+    """Candidate TRT-LLM module names (without the ``llm.`` root) for an HF module."""
+    name = re.sub(r"^model\.language_model\.", "model.", hf_module_name)
+    name = re.sub(r"\.in_proj_(?:qkv|q|k|v|z)$", ".in_proj_qkvz", name)
+    name = re.sub(r"\.in_proj_[ab]$", ".in_proj_ba", name)
+    name = re.sub(r"\.(?:q|k|v)_proj$", ".qkv_proj", name)
+    name = re.sub(r"\.(?:gate|up)_proj$", ".gate_up_proj", name)
+    # Dense MLPs sit under an adapter module: layers.N.mlp.mlp.{gate_up,down}_proj.
+    dense = re.sub(
+        r"(\.layers\.\d+)\.mlp\.(gate_up_proj|down_proj)$", r"\1.mlp.mlp.\2", name
+    )
+    return [name, dense] if dense != name else [name]
 
 
-def _is_quantized_weight(name: str, ndim: int, ignore_patterns: Sequence[str]) -> bool:
-    """Whether pattern mode quantizes this weight.
+def resolve_quantized_weights(
+    model: Any, quant_config: Any, state_dict_info: dict[str, Any]
+) -> set[str]:
+    """Names of the refit weights the built engine model holds as FP8.
 
-    True for a fused expert stack or a 2-D ``.weight`` whose module is not ignored.
+    The engine decides what is excluded (its own defaults plus the configured
+    patterns), so refit asks the built model instead of re-matching patterns.
+    Raises if a decoder-layer weight has no engine module, since it would
+    otherwise silently stay BF16.
     """
-    ignore_patterns = _with_always_bf16(ignore_patterns)
-    fused = _FUSED_EXPERT_RE.fullmatch(name)
-    if fused is not None:
-        return not is_module_ignored(fused.group("prefix"), ignore_patterns)
-    if not name.endswith(".weight") or ndim != 2:
-        return False
-    return not is_module_ignored(name.removesuffix(".weight"), ignore_patterns)
+    modules = {n.removeprefix("llm."): m for n, m in model.named_modules()}
+    quantized: set[str] = set()
+    unresolved: list[str] = []
+    for name, (shape, _) in state_dict_info.items():
+        expert = _FUSED_EXPERT_RE.fullmatch(name) or _SPLIT_EXPERT_RE.fullmatch(name)
+        if expert is not None:
+            [engine_name] = engine_module_names(expert.group("prefix"))
+            if not quant_config.is_module_excluded_from_quantization(engine_name):
+                quantized.add(name)
+        elif name.endswith(".weight") and len(shape) == 2:
+            module = next(
+                (
+                    modules[c]
+                    for c in engine_module_names(name.removesuffix(".weight"))
+                    if c in modules
+                ),
+                None,
+            )
+            if module is None:
+                # Vision and MTP weights are not part of the engine's decoder.
+                if ".layers." in name and not name.startswith(
+                    ("model.visual.", "mtp.")
+                ):
+                    unresolved.append(name)
+            elif getattr(module, "has_fp8_block_scales", False) or getattr(
+                module, "has_mxfp8", False
+            ):
+                quantized.add(name)
+    if unresolved:
+        raise ValueError(
+            f"{len(unresolved)} refit weights have no TRT-LLM engine module "
+            f"(e.g. {unresolved[0]}); extend engine_module_names"
+        )
+    return quantized
 
 
 def validate_routed_experts(
-    state_dict_info: dict[str, Any], *, ignore_patterns: Sequence[str] | None = None
+    state_dict_info: dict[str, Any], *, quantized_names: Collection[str] | None = None
 ) -> None:
     """Fail setup unless the FP8 filter will quantize something, correctly.
 
     Routed experts are either fused (``mlp.experts.{gate_up,down}_proj``, Qwen3.5)
     or per-expert (``mlp.experts.{i}.{gate,up,down}_proj.weight``, Qwen3 MoE).
-    With ``ignore_patterns=None`` (default scope) only experts are quantized, so
-    at least one must exist and dense MLP weights are rejected. With patterns,
-    any weight that is not ignored is quantized, so at least one must remain.
+    With ``quantized_names=None`` (default scope) only experts are quantized, so
+    at least one must exist and dense MLP weights are rejected. Otherwise
+    ``quantized_names`` (see ``resolve_quantized_weights``) must not be empty.
     """
     names = [str(name) for name in state_dict_info]
     has_fused = any(_FUSED_EXPERT_RE.fullmatch(name) for name in names)
     has_split = any(_SPLIT_EXPERT_RE.fullmatch(name) for name in names)
-    if ignore_patterns is None:
+    if quantized_names is None:
         if not (has_fused or has_split):
             raise ValueError(
                 "precision='fp8' found no routed-expert weights to quantize; "
@@ -224,10 +257,7 @@ def validate_routed_experts(
                 f"model has dense MLP weights that would stay BF16 (e.g. {dense[0]}); "
                 "set trtllm_cfg.quantization_ignore_patterns to choose the scope"
             )
-    elif not any(
-        _is_quantized_weight(name, len(state_dict_info[name][0]), ignore_patterns)
-        for name in names
-    ):
+    elif not quantized_names:
         raise ValueError(
             "quantization_ignore_patterns ignores every weight; nothing would be "
             "quantized"
@@ -566,13 +596,12 @@ def load_weights(
     weight_list: Iterable[tuple[str, torch.Tensor]],
     *,
     is_mx: bool = False,
-    ignore_patterns: Sequence[str] | None = None,
+    quantized_names: Collection[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convert BF16 weights to block-FP8 or MXFP8 for the TRT-LLM engine.
 
-    With ``ignore_patterns=None`` only routed experts are quantized. With
-    patterns, every 2-D ``.weight`` (and fused expert stack) whose module is not
-    ignored is quantized, matching the engine's ``modules_to_not_convert``.
+    With ``quantized_names=None`` only routed experts are quantized. Otherwise
+    exactly those weights are, as decided by ``resolve_quantized_weights``.
     Fused expert tensors (Qwen3.5) are expanded to per-expert HF names; other
     weights pass through unchanged.
     """
@@ -585,9 +614,7 @@ def load_weights(
         weight_name = str(name)
         fused_match = _FUSED_EXPERT_RE.fullmatch(weight_name)
         is_split_expert = _SPLIT_EXPERT_RE.fullmatch(weight_name) is not None
-        if ignore_patterns is not None and not _is_quantized_weight(
-            weight_name, tensor.dim(), ignore_patterns
-        ):
+        if quantized_names is not None and weight_name not in quantized_names:
             _insert_unique(output, weight_name, tensor)
         elif fused_match is not None:
             _convert_fused_expert_weight(
@@ -598,7 +625,7 @@ def load_weights(
                 projection=fused_match.group("projection"),
                 is_mx=is_mx,
             )
-        elif is_split_expert or ignore_patterns is not None:
+        elif is_split_expert or quantized_names is not None:
             _insert_quantized_projection(output, weight_name, tensor, is_mx=is_mx)
         else:
             _insert_unique(output, weight_name, tensor)

@@ -340,26 +340,6 @@ def test_qwen3_moe_per_expert_weights_are_quantized():
         assert converted[name] is tensor
 
 
-def test_pattern_mode_matches_qwen35_hf_names_and_keeps_router_bf16():
-    prefix = "model.language_model.layers.0"
-    weights = {
-        f"{prefix}.mlp.gate.weight": torch.randn(2, 128),
-        f"{prefix}.linear_attn.in_proj_qkv.weight": torch.randn(128, 128),
-        f"{prefix}.mlp.shared_expert.up_proj.weight": torch.randn(128, 128),
-    }
-
-    converted = load_weights(
-        weights.items(),
-        ignore_patterns=["model.language_model.layers.*.linear_attn*"],
-    )
-
-    assert converted[f"{prefix}.mlp.gate.weight"].dtype == torch.float32
-    assert converted[f"{prefix}.linear_attn.in_proj_qkv.weight"].dtype == torch.float32
-    shared = f"{prefix}.mlp.shared_expert.up_proj.weight"
-    assert converted[shared].dtype == torch.float8_e4m3fn
-    assert shared.removesuffix(".weight") + ".weight_scale_inv" in converted
-
-
 @pytest.mark.parametrize(
     ("names", "match"),
     [

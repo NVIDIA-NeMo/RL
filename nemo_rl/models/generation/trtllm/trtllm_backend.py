@@ -131,22 +131,17 @@ class NcclExtension(WorkerExtension):
         model = self.engine.model_engine.model
         quant_config = model.model_config.quant_config
         if fp8_quantization.is_quantized_expert_refit(quant_config):
-            # None: routed experts only. Otherwise quantize whatever the engine does
-            # not exclude (its exclude_modules also holds TRT-LLM's own defaults).
-            self._fp8_ignore_patterns = (
+            # None: routed experts only. Otherwise quantize what the built engine
+            # model holds as FP8 (it applies its own excludes on top of the patterns).
+            self._fp8_quantized_names = (
                 None
                 if quantization_ignore_patterns is None
-                else list(
-                    dict.fromkeys(
-                        [
-                            *quantization_ignore_patterns,
-                            *(getattr(quant_config, "exclude_modules", None) or []),
-                        ]
-                    )
+                else fp8_quantization.resolve_quantized_weights(
+                    model, quant_config, state_dict_info
                 )
             )
             fp8_quantization.validate_routed_experts(
-                state_dict_info, ignore_patterns=self._fp8_ignore_patterns
+                state_dict_info, quantized_names=self._fp8_quantized_names
             )
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
@@ -190,7 +185,7 @@ class NcclExtension(WorkerExtension):
                     is_mx=fp8_quantization.is_mxfp8_model(
                         model.model_config.quant_config
                     ),
-                    ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
+                    quantized_names=getattr(self, "_fp8_quantized_names", None),
                 )
             else:
                 weights = dict(weight_list)
@@ -303,7 +298,7 @@ class NcclExtension(WorkerExtension):
                         is_mx=fp8_quantization.is_mxfp8_model(
                             model.model_config.quant_config
                         ),
-                        ignore_patterns=getattr(self, "_fp8_ignore_patterns", None),
+                        quantized_names=getattr(self, "_fp8_quantized_names", None),
                     )
                     # The mapper may retain split QKVZ/BA views across IPC chunks;
                     # detach them before ACK lets the trainer reuse the buffer.

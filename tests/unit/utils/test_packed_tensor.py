@@ -329,6 +329,31 @@ def test_packed_broadcast_isolates_large_tensor_after_small_tensor():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_legacy_packing_keeps_oversized_tensor_in_prefix_buffer():
+    """vLLM's own consumer (Dynamo) packs an oversized tensor with its prefix."""
+    params = [
+        ("small_weight", torch.randn(16, dtype=torch.float32).cuda()),
+        ("large_weight", torch.randn(100, dtype=torch.float32).cuda()),
+    ]
+    group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=100
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            use_legacy_packing=True,
+        )
+
+    assert [t.numel() for t in group.broadcasted_tensors] == [
+        sum(t.nbytes for _, t in params)
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_packed_broadcast_multiple_batches():
     """Test that tensors are properly batched when exceeding target size."""
     # Create many small tensors

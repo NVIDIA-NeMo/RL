@@ -110,9 +110,9 @@ Set `quantization_ignore_patterns` under `trtllm_cfg` (the same key as
 `vllm_cfg`) to choose which modules stay BF16. Patterns are matched against
 module names with `fnmatch` or a `re:` regex, and a module is ignored if it or any
 ancestor matches. A list replaces the default scope: every 2-D linear weight and
-routed expert that is not ignored is quantized. `lm_head`, embeddings, and routers
-(`mlp.gate`) always stay BF16. Patterns are HF module names (on Qwen3.5,
-`model.language_model.layers.*`).
+routed expert that is not ignored is quantized. `lm_head`, embeddings, routers
+(`mlp.gate`, `mlp.shared_expert_gate`), and linear-attention `in_proj_*` always stay
+BF16. Patterns are HF module names (on Qwen3.5, `model.language_model.layers.*`).
 
 ```yaml
 policy:
@@ -120,8 +120,11 @@ policy:
     trtllm_cfg:
       precision: fp8
       quantization_ignore_patterns:
-        - model.language_model.layers.*.mlp.gate  # keep the router in BF16
+        - model.language_model.layers.*.linear_attn*  # keep linear attention in BF16
 ```
+
+This quantizes attention, shared experts, and the routed experts of a Qwen3.5 MoE
+model, and keeps linear attention and the always-BF16 modules in BF16.
 
 Unlike `vllm_cfg.quantization_ignore_patterns`, the default scope is routed experts
 only (vLLM quantizes every linear layer and the experts), and a list replaces that
@@ -130,9 +133,8 @@ default instead of being appended to vLLM's ignore set. For example,
 including shared experts, unless they are also listed. The key is accepted for
 both block-FP8 and MXFP8 (vLLM requires MXFP8).
 
-This quantizes attention and the experts of a Qwen3 MoE model. List routers,
-shared experts, linear attention, and vision or MTP modules explicitly for models
-that have them. Setup fails if the patterns ignore every weight.
+List shared experts, vision, or MTP modules explicitly to keep them in BF16 for
+models that have them. Setup fails if the patterns ignore every weight.
 
 Tested models:
 
