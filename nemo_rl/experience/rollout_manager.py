@@ -1470,7 +1470,8 @@ class AsyncNemoGymRolloutImpl:
             # retire under a checkpoint ID of its own.
             async with gate.admission() if gate is not None else nullcontext():
                 await asyncio.wait_for(
-                    nemo_gym_env.checkpoint_retire.remote(
+                    dispatch_with_trace_context(
+                        nemo_gym_env.checkpoint_retire,
                         f"rollout-drop-{uuid.uuid4().hex}",
                         dropped.episodes,
                         deadline_ts=time.time() + _DROPPED_EPISODE_RETIRE_TIMEOUT_S,

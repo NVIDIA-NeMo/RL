@@ -79,10 +79,18 @@ def _reset_rl_telemetry() -> None:
     # every test after it in the session.
     metrics_mod._REGISTRATION_FAILED = False
     metrics_mod._WARNED.clear()
+    import nemo_rl.telemetry.rollout_checkpoint as checkpoint_mod
+
+    checkpoint_mod._REGISTERED = False
+    checkpoint_mod._WARNED = False
     try:
         from nemo.lens.instruments import unregister_metric_group
 
-        unregister_metric_group(metrics_mod.RL_METRIC_GROUP)
+        for group in (metrics_mod.RL_METRIC_GROUP, checkpoint_mod._GROUP):
+            try:
+                unregister_metric_group(group)
+            except (KeyError, ValueError):
+                pass
     except Exception:
         pass
 
@@ -124,3 +132,26 @@ def _reset_telemetry_state():
     _reset_otel_and_lens()
     _reset_rl_telemetry()
     _clear_telemetry_env()
+
+
+@pytest.fixture
+def checkpoint_exporting():
+    """Real Lens providers used by the live-checkpoint instrumentation tests."""
+    from nemo.lens import NemoLensConfig, setup_telemetry
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+
+    import nemo_rl.telemetry.setup as setup_mod
+
+    exporter = InMemorySpanExporter()
+    reader = InMemoryMetricReader()
+    handle = setup_telemetry(
+        NemoLensConfig(enabled=True, span_groups="checkpoint"),
+        span_exporter=exporter,
+        metric_reader=reader,
+        resource_attributes={"nv.dl.rank": 0, "nv.dl.world_size": 1},
+    )
+    setup_mod._TELEMETRY_HANDLE = handle
+    return exporter, reader
