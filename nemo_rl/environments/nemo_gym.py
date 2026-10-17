@@ -104,6 +104,7 @@ from nemo_rl.environments.utils import (
 )
 from nemo_rl.experience.failures import (
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     RolloutDataFailure,
     http_status_is_infra,
@@ -1440,7 +1441,9 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
         per_prompt: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
+    ) -> AsyncGenerator[
+        tuple[int, dict, dict, dict | None] | GymAdmissionClosed | GymRowFailure, None
+    ]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
         A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
@@ -1475,7 +1478,8 @@ Depending on your data shape, you may want to change these values."""
             ``timing_metrics`` is ``None`` on every tuple but the last, which
             carries the batch totals. A row Gym refused because a checkpoint
             had admission closed is yielded as a ``GymAdmissionClosed``
-            naming its ``rowidx`` instead of a tuple.
+            naming its ``rowidx`` instead of a tuple, and a row whose ``/run``
+            failed as a ``GymRowFailure``, so the other rows keep streaming.
         """
         attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
         # Two branches rather than a group variable, so the drift test can read
@@ -1510,7 +1514,9 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
+    ) -> AsyncGenerator[
+        tuple[int, dict, dict, dict | None] | GymAdmissionClosed | GymRowFailure, None
+    ]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -1580,7 +1586,7 @@ Depending on your data shape, you may want to change these values."""
 
         async def await_gym_result(
             task: Awaitable[tuple[dict, dict]],
-        ) -> tuple[dict, dict | GymAdmissionClosed]:
+        ) -> tuple[dict, dict | Exception]:
             try:
                 nemo_gym_row, nemo_gym_result = await task
             except Exception as error:
@@ -1598,12 +1604,9 @@ Depending on your data shape, you may want to change these values."""
                     raise typed from None
                 raise
             failure = _gym_failure_row_error(nemo_gym_row, nemo_gym_result)
-            if isinstance(failure, GymAdmissionClosed):
-                # Returned, not raised: rows Gym admitted before the checkpoint
-                # closed admission keep streaming, and the caller unwinds this
-                # one row before the checkpoint drains.
-                return nemo_gym_row, failure
-            if failure is not None:
+            if failure is None:
+                return nemo_gym_row, nemo_gym_result
+            if not isinstance(failure, GymAdmissionClosed):
                 # A refusal is expected while a checkpoint is open; only a real
                 # failure is worth its body on stderr.
                 print(
@@ -1611,8 +1614,9 @@ Depending on your data shape, you may want to change these values."""
                     nemo_gym_result.get("_ng_failure_response_body"),
                     file=sys.stderr,
                 )
-                raise failure
-            return nemo_gym_row, nemo_gym_result
+            # Returned, not raised: the other rows' /runs keep going in Gym, so
+            # they keep streaming, and the caller unwinds this one row.
+            return nemo_gym_row, failure
 
         capture_mode = self._forest_training or self._token_capture_enabled
         active_postprocessors = 0
@@ -1622,7 +1626,7 @@ Depending on your data shape, you may want to change these values."""
         ) -> tuple[dict, dict]:
             nonlocal active_postprocessors
             row, result = await task
-            if isinstance(result, GymAdmissionClosed):
+            if isinstance(result, Exception):
                 return row, result
             # Measure wall time with any receipt in flight, not the sum of
             # overlapping drain waits (which could exceed the batch duration).
@@ -1655,6 +1659,13 @@ Depending on your data shape, you may want to change these values."""
                     yield GymAdmissionClosed(
                         nemo_rl_result.detail,
                         nemo_rl_result.rowidx,
+                        finish_row(nemo_gym_row["agent_ref"]["name"]),
+                    )
+                    continue
+                if isinstance(nemo_rl_result, Exception):
+                    yield GymRowFailure(
+                        nemo_gym_row["_rowidx"],
+                        nemo_rl_result,
                         finish_row(nemo_gym_row["agent_ref"]["name"]),
                     )
                     continue

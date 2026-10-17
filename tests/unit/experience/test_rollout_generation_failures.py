@@ -40,6 +40,7 @@ from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -1221,6 +1222,29 @@ class _ShortCleanEndGym(_EarlyEndingGym):
         self.run_rollouts._stream = stream
 
 
+class _RowFailingGym(_EarlyEndingGym):
+    """First stream fails row 1 with ``error`` and still returns rows 0 and 2."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.streamed_past_the_failure = False
+
+        async def failed(rowidx):
+            return GymRowFailure(rowidx, error)
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                self.streamed_past_the_failure = True
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
 class TestGymEarlyStreamEnd:
     """Rows still running in Gym when a stream breaks must not overlap their replacements."""
 
@@ -1376,3 +1400,38 @@ class TestGymEarlyStreamEnd:
         asyncio.run(abandon())
         # The prompt retry dispatches fresh attempts next; none may overlap these.
         assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
+    def test_a_failed_row_is_resent_alone_while_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        # Rows 0 and 2 streamed back on the first dispatch; only row 1 goes again.
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_on_the_last_attempt_raises_once_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=1)
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert gym.streamed_past_the_failure
+
+    def test_a_data_failure_ends_the_group_at_once(self):
+        gym = _RowFailingGym(RolloutDataFailure("prompt exceeds max_model_len"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=3)
+
+        with pytest.raises(RolloutDataFailure, match="max_model_len"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert not gym.streamed_past_the_failure
