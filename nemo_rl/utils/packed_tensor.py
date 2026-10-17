@@ -76,11 +76,23 @@ def packed_broadcast_producer(
         torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
     ]
 
+    # The iterator is driven from alternating streams, but the work it enqueues
+    # for one item (e.g. an FSDP2 all-gather whose completion ``full_tensor()``
+    # registers only on the stream that was current at the time) may be read by
+    # the *next* item on the other stream: the state-dict adapter yields several
+    # per-expert views of one gathered tensor, and a multi-GB expert parameter
+    # always straddles a buffer boundary. Carry the previous stream's export
+    # dependencies over to the new stream with an event recorded *before* the
+    # previous broadcast is issued, so packing of buffer k+1 still overlaps the
+    # broadcast of buffer k and no host synchronization is added.
+    export_done: torch.cuda.Event | None = None
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
         # Synchronize the current stream
         streams[buffer_idx].synchronize()
+        if export_done is not None:
+            streams[buffer_idx].wait_event(export_done)
         # Start tasks for the new buffer in a new stream
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             try:
@@ -109,6 +121,8 @@ def packed_broadcast_producer(
                 packed_tensors[buffer_idx] = torch.cat(
                     packing_tensor_list[buffer_idx], dim=0
                 )
+                export_done = torch.cuda.Event()
+                export_done.record(streams[buffer_idx])
                 group.broadcast(packed_tensors[buffer_idx], src=src)
             except StopIteration:
                 # do the last broadcast if there are remaining tensors
