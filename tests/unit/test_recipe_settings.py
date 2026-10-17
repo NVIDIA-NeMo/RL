@@ -61,6 +61,7 @@ def _load_megatron_functional_config(script_name: str) -> tuple[DictConfig, bool
     else:
         assert any(arg.endswith("run_grpo_sliding_puzzle.py") for arg in arguments)
         config_path = str(project_root / "examples/configs/grpo_sliding_puzzle.yaml")
+    config_path = project_root / config_path
     overrides = [
         argument
         for argument in arguments
@@ -84,11 +85,15 @@ def _load_megatron_functional_config(script_name: str) -> tuple[DictConfig, bool
 @pytest.mark.parametrize("script_name", MEGATRON_FUNCTIONAL_SCRIPTS)
 def test_megatron_functional_scripts_keep_kv_settings_consistent(
     script_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     # Load algorithm schemas only for these tests; other recipe tests need no Ray/Torch.
     from nemo_rl.algorithms.grpo import AsyncGRPOConfig
     from nemo_rl.algorithms.single_controller_utils.config import AsyncRLConfig
 
+    # CI runs from tests/, while the launchers resolve paths from the repo root.
+    monkeypatch.chdir(tmp_path)
     config, single_controller = _load_megatron_functional_config(script_name)
     assert config.policy.generation.backend == "megatron"
     async_path = "async_rl" if single_controller else "grpo.async_grpo"
