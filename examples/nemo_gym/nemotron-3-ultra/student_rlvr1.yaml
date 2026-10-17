@@ -13,6 +13,8 @@
 # by https://github.com/NVIDIA-NeMo/RL/issues/1101).
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster — read by ultra_launch.sh to size the SLURM allocation
 # =============================================================================

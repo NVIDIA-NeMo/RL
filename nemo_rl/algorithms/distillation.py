@@ -74,7 +74,9 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -552,6 +554,9 @@ def setup(
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    # The workers enforce this key whenever the recipe asks for
+                    # one, so Gym's model server must send the same key.
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
                 try:
                     validate_dataset_agent_coverage(
@@ -639,9 +644,7 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info(
-            refit_payload_mode=student_generation.get_refit_payload_mode()
-        )
+        state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
@@ -789,12 +792,13 @@ def _distillation_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.distillation.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -970,7 +974,6 @@ def _distillation_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.distillation.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = student_policy.train(
@@ -1291,7 +1294,7 @@ def validate(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("distillation", **{"rl.step": step}),
+        evaluate_span("distillation", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
