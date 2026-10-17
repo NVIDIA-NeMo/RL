@@ -78,6 +78,22 @@ _NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
 _NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
+def get_automodel_policy_worker_cls(config: dict) -> str:
+    """Select the native SpeechLM actor without changing generic actor extras."""
+    if config.get("native_model") is not None:
+        if config.get("quant_cfg") is not None:
+            raise ValueError(
+                "Native SpeechLM policies do not support ModelOpt quantization"
+            )
+        return (
+            "nemo_rl.models.policy.workers.speechlm_policy_worker.SpeechLMPolicyWorker"
+        )
+    return resolve_policy_worker_cls(
+        "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
+        config,
+    )
+
+
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
 

@@ -232,7 +232,7 @@ def rl_collate_fn(
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
     # Preserve vLLM-ready prompt data without interpreting its modality keys.
-    extra_args = {}
+    extra_args: dict[str, Any] = {}
     if any(
         "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
         for datum_spec in data_batch
@@ -303,7 +303,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
     # Preserve vLLM-ready prompt data without interpreting its modality keys.
-    extra_args = {}
+    extra_args: dict[str, Any] = {}
     if any(
         "vllm_content" in datum_spec or "vllm_multi_modal_data" in datum_spec
         for datum_spec in data_batch

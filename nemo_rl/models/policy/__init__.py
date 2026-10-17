@@ -14,7 +14,7 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -45,14 +45,14 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # Transformers 5.12.1 and 5.18.0 still ship both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.19.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against 5.12.1 and 5.18.0 (<5.19). "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -591,6 +591,7 @@ class MegatronConfig(TypedDict):
 
 
 class TokenizerConfig(TypedDict):
+    processor_class: NotRequired[str]
     name: str
     # None selects NeMo-RL's passthrough prompt/response template.
     chat_template: NotRequired[str | None]
@@ -671,7 +672,21 @@ class OnPolicyDistillationFullTransport(TypedDict):
     teacher_index_field: str | None
 
 
+class SpeechLMNativeConfig(BaseModel, extra="allow"):
+    """Native SpeechLM update and audio/logprob contract."""
+
+    trainable_names: tuple[str, ...]
+    expected_trainable_tensors: int
+    expected_trainable_scalars: int
+    max_expanded_sequence_length: int
+    model_config_overrides: dict[str, Any] = Field(default_factory=dict[str, Any])
+    activation_checkpointing_perception: bool = True
+    deterministic_perception: bool = True
+    projection_chunk_size: PositiveInt = 256
+
+
 class PolicyConfig(TypedDict):
+    native_model: NotRequired[SpeechLMNativeConfig]
     model_name: str
     tokenizer: TokenizerConfig
     train_global_batch_size: int
