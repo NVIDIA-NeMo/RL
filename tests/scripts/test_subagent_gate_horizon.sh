@@ -27,20 +27,28 @@ target=$1
 if [[ $target == */run_sc.sh ]]; then
   shift
   for variable in \
-    MAX_STEPS SLURM_ACCOUNT SLURM_QOS SLURM_TIME_LIMIT JOB_CYCLES \
+    MAX_STEPS SLURM_ACCOUNT SLURM_PARTITION SLURM_QOS SLURM_TIME_LIMIT \
+    JOB_CYCLES CHECKPOINT_MARGIN_SECONDS \
     MIN_SLURM_TIME_SECONDS MIN_CHECKPOINT_BUDGET_SECONDS \
     REQUIRE_RESUMABLE_JOB_CYCLES NUM_NODES GPUS_PER_NODE NUM_GEN_NODES \
     SEGMENT_SIZE GENERATION_TENSOR_PARALLEL_SIZE MODEL_PATH \
+    TOKENIZER_CHAT_TEMPLATE VLLM_CHAT_TEMPLATE VLLM_LOAD_FORMAT \
+    SKIP_REPLAY_RESTORE NRL_IGNORE_VERSION_MISMATCH TQ_NUM_STORAGE_UNITS \
     CONFIG_IN_CONTAINER SAVE_PERIOD \
     CHECKPOINT_KEEP_TOP_K RESULTS_DIR CHECKPOINT_ROOT SYNC_GATE_ATTESTATION \
     SYNC_DCP_MANIFEST_SHA256 CONTEXT_COMPACTION \
     AGENTIC_VBENCH_COMPACTION_AUTO AGENTIC_VBENCH_COMPACTION_PRUNE \
     AGENTIC_VBENCH_TRAINING_MODE AGENTIC_VBENCH_SUBAGENTS_ENABLED \
+    AGENTIC_VBENCH_CONCURRENCY AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER \
+    AGENTIC_VBENCH_JUDGE_PROTOCOL \
     CLAW_EVAL_COMPACTION_AUTO CLAW_EVAL_COMPACTION_PRUNE \
     CLAW_EVAL_TRAINING_MODE CLAW_EVAL_SUBAGENTS_ENABLED \
-    AGENTIC_VBENCH_BACKEND CLAW_EVAL_BACKEND WANDB_PROJECT \
+    CLAW_EVAL_CONCURRENCY AGENTIC_VBENCH_BACKEND CLAW_EVAL_BACKEND \
+    WANDB_PROJECT WANDB_MODE WANDB_RUN_GROUP \
     NEMO_RL_TMPE_OUTLIER_THRESHOLD RUN_TMPE_OUTLIER_TESTS \
-    NRL_ROUTER_REPLAY_VALIDATE NRL_R3_TRACE IMMUTABLE_SOURCE_SNAPSHOT \
+    NRL_ROUTER_REPLAY_VALIDATE NRL_R3_TRACE NRL_R3_TRACE_STEPS \
+    NRL_R3_TRACE_SAMPLES NRL_R3_TRACE_MICROBATCHES \
+    NRL_R3_TRACE_VERIFY_FORWARD IMMUTABLE_SOURCE_SNAPSHOT \
     REQUIRE_FRESH_PROVENANCE TRAIN_PATH VAL_PATH; do
     printf '%s=%s\n' "$variable" "${!variable:-unset}"
   done
@@ -339,7 +347,8 @@ grep -Eq '^SYNC_DCP_MANIFEST_SHA256=[0-9a-f]{64}$' "$tmp/claw-async.out"
 unset SYNC_HEALTH_AUDITOR AGENTIC_VBENCH_DELEGATION_PROMPT \
   AGENTIC_VBENCH_SUBAGENT_PROMPT CLAW_EVAL_DELEGATION_PROMPT \
   CLAW_EVAL_SUBAGENT_PROMPT
-BASE_NAME=agentic-exact-contract-$$ PATH="$tmp:$PATH" /bin/bash \
+AGENTIC_VBENCH_BACKEND_DIR=/dedicated-agentic-backend \
+  BASE_NAME=agentic-exact-contract-$$ PATH="$tmp:$PATH" /bin/bash \
   "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
   >"$tmp/agentic-exact-sync.out"
 CLAW_EVAL_BACKEND_DIR=/dedicated-claw-backend BASE_NAME=claw-exact-contract-$$ \
@@ -353,9 +362,31 @@ for output in "$tmp/agentic-exact-sync.out" "$tmp/claw-exact-sync.out"; do
   grep -Fqx 'SAVE_PERIOD=20' "$output"
   grep -Fqx 'CHECKPOINT_KEEP_TOP_K=null' "$output"
   grep -Fqx 'GENERATION_TENSOR_PARALLEL_SIZE=4' "$output"
+  grep -Fqx 'SLURM_PARTITION=batch_long' "$output"
+  grep -Fqx 'CHECKPOINT_MARGIN_SECONDS=1200' "$output"
+  grep -Fqx 'WANDB_MODE=online' "$output"
+  grep -Fqx 'WANDB_RUN_GROUP=cluster-nsc-svg-slurm-1' "$output"
+  grep -Fqx 'TOKENIZER_CHAT_TEMPLATE=default' "$output"
+  grep -Fqx 'VLLM_CHAT_TEMPLATE=null' "$output"
+  grep -Fqx 'VLLM_LOAD_FORMAT=auto' "$output"
+  grep -Fqx 'SKIP_REPLAY_RESTORE=1' "$output"
+  grep -Fqx 'NRL_IGNORE_VERSION_MISMATCH=1' "$output"
+  grep -Fqx 'TQ_NUM_STORAGE_UNITS=16' "$output"
+  grep -Fqx 'NRL_ROUTER_REPLAY_VALIDATE=1' "$output"
+  grep -Fqx 'NRL_R3_TRACE=1' "$output"
+  grep -Fqx 'NRL_R3_TRACE_STEPS=2' "$output"
+  grep -Fqx 'NRL_R3_TRACE_SAMPLES=2' "$output"
+  grep -Fqx 'NRL_R3_TRACE_MICROBATCHES=2' "$output"
+  grep -Fqx 'NRL_R3_TRACE_VERIFY_FORWARD=1' "$output"
 done
 grep -Fqx 'AGENTIC_VBENCH_BACKEND=remote' "$tmp/agentic-exact-sync.out"
 grep -Fqx 'CLAW_EVAL_BACKEND=remote' "$tmp/claw-exact-sync.out"
+grep -Fqx 'AGENTIC_VBENCH_CONCURRENCY=16' "$tmp/agentic-exact-sync.out"
+grep -Fqx 'AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=1.0' \
+  "$tmp/agentic-exact-sync.out"
+grep -Fqx 'AGENTIC_VBENCH_JUDGE_PROTOCOL=nvinference-hybrid' \
+  "$tmp/agentic-exact-sync.out"
+grep -Fqx 'CLAW_EVAL_CONCURRENCY=32' "$tmp/claw-exact-sync.out"
 grep -Fqx "TRAIN_PATH=$agentic_data" "$tmp/agentic-exact-sync.out"
 grep -Fqx "TRAIN_PATH=$claw_data" "$tmp/claw-exact-sync.out"
 grep -Fqx 'ARG=policy.generation.vllm_cfg.tensor_parallel_size=4' \
@@ -374,6 +405,12 @@ if RESULTS_DIR=/wrong /bin/bash \
   echo 'Exact Super sync20 launcher accepted a caller-owned result directory' >&2
   exit 1
 fi
+if env -u AGENTIC_VBENCH_BACKEND_DIR /bin/bash \
+  "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
+  >/dev/null 2>&1; then
+  echo 'Exact Agentic Gate 1 accepted a missing dedicated backend' >&2
+  exit 1
+fi
 
 for backend_injection in \
   'scripts/agentic_vbench/launch_subagents_super_sync20.sh AGENTIC_VBENCH_BACKEND=podman' \
@@ -385,6 +422,23 @@ for backend_injection in \
     echo "$wrapper accepted a non-remote backend" >&2
     exit 1
   fi
+done
+
+for reserved_injection in \
+  'CHECKPOINT_MUST_SAVE_BY=null' \
+  'SBATCH_COMMENT={}' \
+  'NRL_R3_TRACE_DIR=/tmp/injected-r3'; do
+  for wrapper in \
+    scripts/agentic_vbench/launch_subagents_super_sync20.sh \
+    scripts/agentic_vbench/launch_subagents_super_async16.sh \
+    scripts/claweval/launch_subagents_super_sync20.sh \
+    scripts/claweval/launch_subagents_super_async16.sh; do
+    if env "$reserved_injection" /bin/bash "$repo_dir/$wrapper" \
+      >/dev/null 2>&1; then
+      echo "$wrapper accepted reserved environment injection: $reserved_injection" >&2
+      exit 1
+    fi
+  done
 done
 
 # Exact Gate 2 must reject a substituted auditor even when the fake emits PASS.

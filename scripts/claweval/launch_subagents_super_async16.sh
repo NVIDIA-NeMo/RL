@@ -18,6 +18,12 @@ if [[ ${CLAW_EVAL_BACKEND:-remote} != remote ]]; then
   exit 2
 fi
 export CLAW_EVAL_BACKEND=remote
+for reserved_variable in CHECKPOINT_MUST_SAVE_BY SBATCH_COMMENT NRL_R3_TRACE_DIR; do
+  if [[ -n ${!reserved_variable+x} ]]; then
+    echo "ERROR: exact Super Gate 2 owns $reserved_variable; unset it before launch" >&2
+    exit 2
+  fi
+done
 : "${CLAW_EVAL_BACKEND_DIR:?Set CLAW_EVAL_BACKEND_DIR to a fresh dedicated live async backend}"
 : "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
 
@@ -70,11 +76,20 @@ export SEGMENT_SIZE=8
 export NUM_PROMPTS=8
 export NUM_GENERATIONS=4
 export GENERATION_TENSOR_PARALLEL_SIZE=4
+export CLAW_EVAL_CONCURRENCY=32
+export TQ_NUM_STORAGE_UNITS=32
+export TOKENIZER_CHAT_TEMPLATE=default
+export VLLM_CHAT_TEMPLATE=null
+export VLLM_LOAD_FORMAT=auto
+export SKIP_REPLAY_RESTORE=1
+export NRL_IGNORE_VERSION_MISMATCH=1
 export MAX_STEPS=1000000
 export JOB_CYCLES=6
 export SLURM_ACCOUNT=nemotron_n4_omni
+export SLURM_PARTITION=batch_long
 export SLURM_QOS=normal
 export SLURM_TIME_LIMIT=24:00:00
+export CHECKPOINT_MARGIN_SECONDS=1200
 export MIN_SLURM_TIME_SECONDS=86400
 export MIN_CHECKPOINT_BUDGET_SECONDS=82800
 export REQUIRE_RESUMABLE_JOB_CYCLES=true
@@ -89,7 +104,9 @@ export CLAW_EVAL_SUBAGENTS_ENABLED=true
 
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=adlr
+export WANDB_MODE=online
 export WANDB_CLUSTER_NAME=nsc-svg-slurm-1
+export WANDB_RUN_GROUP=cluster-nsc-svg-slurm-1
 export CLAW_EVAL_CREDENTIALS_FILE=${CLAW_EVAL_CREDENTIALS_FILE:-/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/codex/credentials.env}
 export BASE_NAME=${BASE_NAME:-claweval_subagents_super_async16_$(date -u +%Y%m%d-%H%M%S)_current_head}
 export WANDB_RUN_NAME=$BASE_NAME
@@ -106,6 +123,12 @@ export CLAW_EVAL_JUDGE_API_KEY_ENV=NV_INFERENCE_API_KEY
 export NEMO_RL_TMPE_OUTLIER_DUMP_PATH=$repo_dir/results/$BASE_NAME/tmpe_outliers
 export NEMO_RL_TMPE_OUTLIER_THRESHOLD=1.03
 export RUN_TMPE_OUTLIER_TESTS=1
+export NRL_ROUTER_REPLAY_VALIDATE=1
+export NRL_R3_TRACE=1
+export NRL_R3_TRACE_STEPS=2
+export NRL_R3_TRACE_SAMPLES=2
+export NRL_R3_TRACE_MICROBATCHES=2
+export NRL_R3_TRACE_VERIFY_FORWARD=1
 
 exec bash "$script_dir/train_subagents_async_16n.sh" \
   checkpointing.save_period=20 \

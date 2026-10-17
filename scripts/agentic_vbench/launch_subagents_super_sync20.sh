@@ -22,7 +22,7 @@ export AGENTIC_VBENCH_BACKEND=remote
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
-for reserved_variable in RESULTS_DIR CHECKPOINT_ROOT CHECKPOINT_DIR TOKEN_CAPTURE_DIR AGENTIC_VBENCH_OUTPUT_ROOT WANDB_RUN_ID SYNC_POLICY_CHECKPOINT SYNC_GATE_ATTESTATION; do
+for reserved_variable in RESULTS_DIR CHECKPOINT_ROOT CHECKPOINT_DIR TOKEN_CAPTURE_DIR AGENTIC_VBENCH_OUTPUT_ROOT WANDB_RUN_ID SYNC_POLICY_CHECKPOINT SYNC_GATE_ATTESTATION CHECKPOINT_MUST_SAVE_BY SBATCH_COMMENT NRL_R3_TRACE_DIR; do
   if [[ -n ${!reserved_variable+x} ]]; then
     echo "ERROR: exact Super Gate 1 owns $reserved_variable; unset it before launch" >&2
     exit 2
@@ -55,6 +55,14 @@ export NUM_GENERATIONS=4
 # This is the currently validated base topology. The live v27 experiment tests
 # TP8 separately; do not claim or select TP8 here until that run proves it.
 export GENERATION_TENSOR_PARALLEL_SIZE=4
+export AGENTIC_VBENCH_CONCURRENCY=16
+export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=1.0
+export TQ_NUM_STORAGE_UNITS=16
+export TOKENIZER_CHAT_TEMPLATE=default
+export VLLM_CHAT_TEMPLATE=null
+export VLLM_LOAD_FORMAT=auto
+export SKIP_REPLAY_RESTORE=1
+export NRL_IGNORE_VERSION_MISMATCH=1
 
 # The sync run is allocation-bounded and remains live after the 20-step audit.
 export MAX_STEPS=1000000
@@ -67,8 +75,10 @@ export TRAIN_PATH=$AVB_DATA_ROOT/train/assembly_first4_x4.jsonl
 export VAL_PATH=$TRAIN_PATH
 export JOB_CYCLES=6
 export SLURM_ACCOUNT=nemotron_n4_omni
+export SLURM_PARTITION=batch_long
 export SLURM_QOS=normal
 export SLURM_TIME_LIMIT=24:00:00
+export CHECKPOINT_MARGIN_SECONDS=1200
 export MIN_SLURM_TIME_SECONDS=86400
 export MIN_CHECKPOINT_BUDGET_SECONDS=82800
 export REQUIRE_RESUMABLE_JOB_CYCLES=true
@@ -89,8 +99,12 @@ export AGENTIC_VBENCH_SUBAGENTS_ENABLED=true
 
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=adlr
+export WANDB_MODE=online
 export WANDB_CLUSTER_NAME=nsc-svg-slurm-1
-export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-$repo_dir/data/agentic_vbench/backend-subagent-sync8-20261014-v20-long}
+export WANDB_RUN_GROUP=cluster-nsc-svg-slurm-1
+export AGENTIC_VBENCH_JUDGE_PROTOCOL=nvinference-hybrid
+: "${AGENTIC_VBENCH_BACKEND_DIR:?Set AGENTIC_VBENCH_BACKEND_DIR to a fresh dedicated live AgenticVBench backend}"
+export AGENTIC_VBENCH_BACKEND_DIR
 export ENV_FILE=${ENV_FILE:-/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/codex/credentials.env}
 
 export BASE_NAME=${BASE_NAME:-agentic_vbench_subagents_super_sync8_$(date -u +%Y%m%d-%H%M%S)_current_head}
@@ -118,6 +132,12 @@ export SUBAGENT_MAX_ROW_TOKENS=65536
 export NEMO_RL_TMPE_OUTLIER_DUMP_PATH=$RESULTS_DIR/tmpe_outliers
 export NEMO_RL_TMPE_OUTLIER_THRESHOLD=1.03
 export RUN_TMPE_OUTLIER_TESTS=1
+export NRL_ROUTER_REPLAY_VALIDATE=1
+export NRL_R3_TRACE=1
+export NRL_R3_TRACE_STEPS=2
+export NRL_R3_TRACE_SAMPLES=2
+export NRL_R3_TRACE_MICROBATCHES=2
+export NRL_R3_TRACE_VERIFY_FORWARD=1
 
 exec bash "$script_dir/debug_subagents_sync_8n.sh" \
   policy.generation.vllm_cfg.tensor_parallel_size="$GENERATION_TENSOR_PARALLEL_SIZE" \
