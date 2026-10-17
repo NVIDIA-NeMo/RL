@@ -41,20 +41,17 @@ policy:
     # logprobs diverge from the generation engine even when text rows agree.
     freeze_vision_model: true
     freeze_vision_projection: true
-    model_overrides:
-      # Keep learner RADIO execution bitwise aligned with vLLM on retained
-      # AgenticVBench media without changing weights or the GRPO objective.
-      vision_qkv_impl: torch
-      vision_attention_impl: torch_sdpa
-      vision_mlp_impl: torch
   generation:
     vllm_cfg:
       # Keep generation logits on the same fp32 LM-head path as Megatron so
       # token_mult_prob_error measures model parity rather than output rounding.
       fp32_lm_head: true
     vllm_kwargs:
-      # Pair with the learner's explicit Flash-SDPA RADIO override.
-      mm_encoder_attn_backend: TORCH_SDPA
+      # Preserve the validated Super execution paths. Forcing both towers onto
+      # the Nano-oriented torch/TORCH_SDPA diagnostic path regressed Super's
+      # raw step-0 sequence TMPE from 1.011-1.015 to 1.0443. Keep the RADIO
+      # weight/layout fixes below the recipe layer, but do not override the
+      # model-native vision kernels for this Super gate.
       # Do not size the prefill chunk to the whole window: vLLM profiles and
       # warms up at max_num_batched_tokens, and 256k-token chunks would also
       # starve concurrent decodes. Chunked prefill covers long inputs.
