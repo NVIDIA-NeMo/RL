@@ -44,6 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    GYM_INFRA_FAILURE_KEY,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
 )
@@ -75,8 +76,8 @@ from nemo_rl.experience.rollout_recovery import (
     SiblingSealResult,
 )
 from nemo_rl.experience.rollouts import (
-    _SHARED_GENRM_METRICS,
     EffortLevelsConfig,
+    RolloutMetricsHook,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
@@ -84,12 +85,16 @@ from nemo_rl.experience.rollouts import (
     _EffortShapingMetrics,
     _find_routed_experts_template,
     _nemo_gym_group_metrics,
+    _nemo_gym_rollout_config,
     _tensorize_by_key,
+    apply_nemo_gym_rollout_metrics_hook,
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    get_nemo_gym_rollout_metrics_hook,
     nemo_gym_rollout_hit_max_tokens,
+    per_agent_result_metrics,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -925,6 +930,11 @@ class AsyncRolloutImpl:
         return rollout_metrics
 
 
+# Sentinel for a rollout-metrics hook not yet read from the Gym actor's
+# configuration; distinct from None, which is the resolved "no hook" answer.
+_HOOK_UNRESOLVED = object()
+
+
 class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
@@ -973,6 +983,9 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        # Resolved from the Gym actor's rollout_config on first use, exactly
+        # like the driver path, so both paths apply the same configured hook.
+        self._rollout_metrics_hook: Any = _HOOK_UNRESOLVED
 
         self._validate_init_params()
 
@@ -1143,6 +1156,8 @@ class AsyncNemoGymRolloutImpl:
         total_rows: int,
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
+        infra_failures: Optional[dict[int, str]] = None,
+        stop_on_infra_failure: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1154,6 +1169,17 @@ class AsyncNemoGymRolloutImpl:
                 completion can be published to the recovery ledger.
             total_rows: Size of the original prompt group, used to validate row indices.
             timer_prefix: Timer namespace forwarded to the environment.
+            on_completion: Called once per landed row with its completion.
+            infra_failures: Mutated in place: each failure marker's detail is
+                recorded under its row index, so the caller can name the actual
+                failure when a row never lands within its attempt budget.
+            stop_on_infra_failure: End the attempt with ``GymTransportError`` at
+                the first failure marker instead of draining the stream. The
+                caller passes True on the last attempt, when nothing would
+                dispatch the marked row again: a group-buffering verifier (one
+                that waits in ``/verify`` for every sibling of a prompt group)
+                would otherwise hold the stream open for a row that never
+                comes, until its own cohort timeout.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1187,6 +1213,23 @@ class AsyncNemoGymRolloutImpl:
             if rowidx in received:
                 raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
             received.add(rowidx)
+            if timing_metrics is not None:
+                env_timing_metrics = timing_metrics
+            if GYM_INFRA_FAILURE_KEY in result:
+                # The actor reports a row whose /run failed at the infrastructure
+                # level as a marker instead of ending the stream. Its slot stays
+                # None so the attempt loop dispatches it again, and the stream
+                # keeps delivering the other rows; on the last attempt the marker
+                # ends the attempt instead, because no re-dispatch follows.
+                if infra_failures is not None:
+                    infra_failures[rowidx] = result[GYM_INFRA_FAILURE_KEY]
+                if stop_on_infra_failure:
+                    raise GymTransportError(
+                        f"NeMo-Gym row {rowidx} of {total_rows} failed at the "
+                        f"infrastructure level on the last attempt: "
+                        f"{result[GYM_INFRA_FAILURE_KEY]}"
+                    )
+                continue
             inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
             if "receipt" in result:
                 result["reward_checks"] = compute_reward_checks(
@@ -1217,8 +1260,6 @@ class AsyncNemoGymRolloutImpl:
                 # conversion lightweight and safe to repeat during group metrics.
                 row_completions, _ = self._results_to_completions([result])
                 await on_completion(rowidx, row_completions[0])
-            if timing_metrics is not None:
-                env_timing_metrics = timing_metrics
 
         return env_timing_metrics
 
@@ -1235,7 +1276,13 @@ class AsyncNemoGymRolloutImpl:
 
         Sibling recovery re-dispatches only rows that never arrive. Prompt-group
         recovery performs one physical Gym dispatch here and delegates a complete
-        cohort replacement to the outer recovery loop.
+        cohort replacement to the outer recovery loop. The first attempt's actor
+        timing is reported under the instance label and every later attempt's
+        under ``<instance label>/retry<n>``, the rule the driver path's stream
+        merge applies, so a one-row re-dispatch never replaces the group's totals.
+        The metrics also carry ``nemo_gym_infra_redispatches``, the number of rows
+        sent again after an attempt ended without them, zero included; the driver
+        path reports the same key from its stream merge.
         """
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
@@ -1259,6 +1306,10 @@ class AsyncNemoGymRolloutImpl:
         expected_indices = [row["_rowidx"] for row in inputs]
         if len(expected_indices) != len(set(expected_indices)):
             raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
+        # Resolved before any dispatch, as the driver path resolves it before
+        # preparing its rows, so a bad hook path fails at configuration time
+        # instead of after a generated prompt group.
+        hook = await self._resolve_rollout_metrics_hook()
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
@@ -1267,6 +1318,7 @@ class AsyncNemoGymRolloutImpl:
                 None for _ in range(total_rows)
             ]
             env_timing_metrics: dict[str, Any] = {}
+            timing_payloads = 0
             # One deadline for the whole prompt group, re-dispatches included -- it is
             # the group that has a budget, not each attempt. It also spans the stream
             # rather than each await: NeMo-Gym yields rows as they finish, so a
@@ -1281,11 +1333,18 @@ class AsyncNemoGymRolloutImpl:
             # below, and a wider annotation makes the `raise ... from last_error` at the
             # end unverifiable.
             last_error: Optional[Exception] = None
+            # Detail of the latest failure marker per row, across attempts. A
+            # marker ends an attempt's stream cleanly, so without this record a
+            # row that failed on every attempt would be reported as "stream
+            # ended before all rows arrived" with no cause attached.
+            infra_failures: dict[int, str] = {}
             max_row_attempts = (
                 1
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
+            # Rows sent again across every later attempt, reported per rollout.
+            infra_redispatches = 0
             async with _Deadline(
                 self._timeouts.rollout_s,
                 "NeMo-Gym prompt group",
@@ -1301,6 +1360,7 @@ class AsyncNemoGymRolloutImpl:
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
                             flush=True,
                         )
+                        infra_redispatches += len(pending)
                         # Row re-dispatches are invisible in redispatch_total -- they
                         # recover a partial group instead of retrying the prompt -- so
                         # gym could retry rows all run with every counter flat.
@@ -1315,6 +1375,10 @@ class AsyncNemoGymRolloutImpl:
                             total_rows,
                             instance_timer_prefix,
                             on_completion=on_completion,
+                            infra_failures=infra_failures,
+                            # Nothing re-dispatches a marked row after the last
+                            # attempt, so a marker ends it at once (see _stream_rows).
+                            stop_on_infra_failure=attempt == max_row_attempts,
                         )
                     except Exception as error:
                         last_error = error
@@ -1330,16 +1394,46 @@ class AsyncNemoGymRolloutImpl:
                             raise
                     else:
                         if timing_metrics is not None:
-                            env_timing_metrics = timing_metrics
+                            timing_payloads += 1
+                            if timing_payloads == 1:
+                                env_timing_metrics = dict(timing_metrics)
+                            else:
+                                # A later attempt re-dispatches a subset of the group,
+                                # so its payload goes under its own label instead of
+                                # replacing the group's totals.
+                                retry_prefix = f"{instance_timer_prefix}/retry{timing_payloads - 1}"
+                                suffix_start = len(instance_timer_prefix)
+                                for key, value in timing_metrics.items():
+                                    relabeled = (
+                                        retry_prefix + key[suffix_start:]
+                                        if key.startswith(instance_timer_prefix)
+                                        else key
+                                    )
+                                    env_timing_metrics[relabeled] = value
 
             missing = [index for index in expected_indices if results[index] is None]
             if missing:
-                failure = GymTransportError(
-                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
-                    "before all rows arrived; missing "
-                    f"rows {missing} of {total_rows} after "
-                    f"{max_row_attempts} attempt(s)"
-                )
+                marked = [index for index in missing if index in infra_failures]
+                unmarked = [index for index in missing if index not in infra_failures]
+                if marked:
+                    details = "; ".join(
+                        f"row {index}: {infra_failures[index]}" for index in marked
+                    )
+                    message = (
+                        f"NeMo-Gym instance '{instance_label}': rows {marked} of "
+                        f"{total_rows} failed at the infrastructure level on "
+                        f"every attempt ({max_row_attempts}): {details}"
+                    )
+                    if unmarked:
+                        message += f"; rows {unmarked} never arrived"
+                    failure = GymTransportError(message)
+                else:
+                    failure = GymTransportError(
+                        f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                        "before all rows arrived; missing "
+                        f"rows {missing} of {total_rows} after "
+                        f"{max_row_attempts} attempt(s)"
+                    )
                 # Narrowed before the raise: pyrefly rejects an Optional in a `from`
                 # clause, even though `raise ... from None` is legal at runtime.
                 if last_error is None:
@@ -1402,14 +1496,49 @@ class AsyncNemoGymRolloutImpl:
                     sum("receipt" not in result for result in completed_results),
                 )
             )
+            # The configured rollout-metrics hook runs after every built-in
+            # writer of the group (the timing and routing keys are added
+            # below), with the same (rows, full_results) contract as the
+            # driver path (see get_nemo_gym_rollout_metrics_hook): each
+            # rollout's own full_result, which under token capture (receipt
+            # mode) carries the verifier's reward before shaping and
+            # penalties, applied at capture finalization. completed_results
+            # is in _rowidx order, like completions.
+            hook_rows: list[dict[str, Any]] = []
+            hook_full_results: list[dict[str, Any]] = []
+            for row, result in zip(
+                sorted(inputs, key=lambda row: row["_rowidx"]), completed_results
+            ):
+                full_result = result.get("full_result")
+                if isinstance(full_result, dict):
+                    hook_rows.append(row)
+                    hook_full_results.append(full_result)
+            apply_nemo_gym_rollout_metrics_hook(
+                hook, hook_rows, hook_full_results, rollout_metrics
+            )
 
         rollout_metrics.update(env_timing_metrics)
+        # Reported on every rollout, zero included, so a mean over steps is a rate;
+        # the same key the driver path reports from its stream merge.
+        rollout_metrics["nemo_gym_infra_redispatches"] = infra_redispatches
         for handle in shard_set.all_handles:
             label = shard_set.instance_label(handle)
             rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
         rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
+
+    async def _resolve_rollout_metrics_hook(self) -> Optional[RolloutMetricsHook]:
+        """The configured ``env.nemo_gym.rollout_metrics_hook``, resolved once.
+
+        Read from the Gym actor's ``rollout_config`` exactly like the driver
+        path, so both paths apply the same configured hook; ``None`` (no hook)
+        is cached the same way.
+        """
+        if self._rollout_metrics_hook is _HOOK_UNRESOLVED:
+            env_config = await _nemo_gym_rollout_config(self._task_to_env["nemo_gym"])
+            self._rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(env_config)
+        return self._rollout_metrics_hook
 
     def _results_to_completions(
         self, results: list[dict]
@@ -1613,18 +1742,16 @@ class AsyncNemoGymRolloutImpl:
                 }
                 for c in completions
             ]
-        for key in agent_extras[0].keys():
-            if key in _SHARED_GENRM_METRICS:
-                continue
-            values = [
-                float(r[key])  # type: ignore
-                for r in agent_extras
-                if isinstance(r.get(key), (bool, int, float))
-            ]
-            if values:
-                rollout_metrics.update(
-                    calculate_single_metric(values, n, f"{agent_name}/{key}")
-                )
+        # Every numeric result field over the completions, by the helper the
+        # driver path uses so the two cannot drift; an environment-masked
+        # completion votes only while the mask gate honors its flag.
+        rollout_metrics.update(
+            per_agent_result_metrics(
+                agent_name,
+                agent_extras,
+                exclude_masked=self._mask_env_flagged_samples,
+            )
+        )
 
         # Emit authoritative live token metrics after full-result metrics so
         # similarly named environment metadata cannot overwrite them. In receipt

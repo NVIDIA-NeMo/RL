@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 import uuid
 from copy import deepcopy
@@ -34,6 +35,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
@@ -1171,6 +1173,642 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert (context.full_result_json is not None) is log_full_result_tables
     if log_full_result_tables:
         assert "reward" not in json.loads(context.full_result_json)
+
+
+def test_nemo_gym_stream_rows_leaves_the_infra_marker_slot_empty():
+    """The Gym actor reports a row whose /run failed at the infrastructure level
+    as a marker. Its slot stays None so the attempt loop dispatches it again,
+    and the stream keeps delivering the other rows."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def marker_ref():
+                return (
+                    1,
+                    {"name": "resolved-agent"},
+                    {
+                        GYM_INFRA_FAILURE_KEY: (
+                            "NeMo-Gym /run failed with HTTP 503: down"
+                        )
+                    },
+                    None,
+                )
+
+            async def result_ref():
+                return (
+                    0,
+                    {"name": "resolved-agent"},
+                    _mask_gate_receipt_result(),
+                    {"timing/remote": 1.0},
+                )
+
+            async def stream():
+                yield marker_ref()
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    pending = [{"_rowidx": 0}, {"_rowidx": 1}]
+    results = [None, None]
+    shaping = [None, None]
+    failures: dict[int, str] = {}
+
+    timing = _run(
+        impl._stream_rows(
+            env, pending, results, shaping, 2, "timing/test", infra_failures=failures
+        )
+    )
+
+    # Row 0 landed after the marker, so the stream was drained; row 1's slot
+    # stays empty for the attempt loop, untouched by shaping and hydration,
+    # and the marker's detail is recorded for the final error.
+    assert results[0] is not None
+    assert results[1] is None
+    assert shaping[1] is None
+    assert "agent_ref" not in pending[1]
+    assert timing == {"timing/remote": 1.0}
+    assert failures == {1: "NeMo-Gym /run failed with HTTP 503: down"}
+
+
+def test_nemo_gym_stream_rows_ends_the_last_attempt_at_the_first_marker():
+    """On the last attempt nothing would dispatch a marked row again, so the
+    marker ends the attempt with the transport error at once instead of
+    draining the stream. A verifier that scores a prompt group together holds
+    the siblings in /verify waiting for the failed row, so the drain would
+    last until that verifier's cohort timeout."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def marker_ref():
+                return (
+                    1,
+                    {"name": "resolved-agent"},
+                    {
+                        GYM_INFRA_FAILURE_KEY: (
+                            "NeMo-Gym /run failed with HTTP 503: down"
+                        )
+                    },
+                    None,
+                )
+
+            async def held_ref():
+                # Row 0 waits in the verifier for its failed sibling and never lands.
+                await asyncio.Event().wait()
+
+            async def stream():
+                yield marker_ref()
+                yield held_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    pending = [{"_rowidx": 0}, {"_rowidx": 1}]
+    results = [None, None]
+    shaping = [None, None]
+    failures: dict[int, str] = {}
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"row 1 of 2 failed at the infrastructure level on the last attempt: "
+            r"NeMo-Gym /run failed with HTTP 503: down"
+        ),
+    ):
+        # The bound turns a regression into a failure instead of a hang.
+        _run(
+            asyncio.wait_for(
+                impl._stream_rows(
+                    env,
+                    pending,
+                    results,
+                    shaping,
+                    2,
+                    "timing/test",
+                    infra_failures=failures,
+                    stop_on_infra_failure=True,
+                ),
+                timeout=5.0,
+            )
+        )
+
+    assert results == [None, None]
+    assert failures == {1: "NeMo-Gym /run failed with HTTP 503: down"}
+
+
+class _ScriptedGymEnv:
+    """A NemoGym environment whose run_rollouts yields one scripted item list
+    per dispatch, pausing on an asyncio.Event item until it is set, and records
+    the dispatched row indices."""
+
+    def __init__(self, scripts, rollout_settings=None):
+        self.scripts = list(scripts)
+        self.rollout_settings = dict(rollout_settings or {})
+        self.dispatched = []
+        env = self
+
+        class _RunRollouts:
+            def options(self, *, num_returns):
+                assert num_returns == "streaming"
+                return self
+
+            def remote(self, pending, timer_prefix, per_prompt=False):
+                del timer_prefix, per_prompt
+                env.dispatched.append([row["_rowidx"] for row in pending])
+                items = env.scripts.pop(0)
+
+                async def stream():
+                    for item in items:
+                        if isinstance(item, asyncio.Event):
+                            await item.wait()
+                            continue
+
+                        async def ref(item=item):
+                            return item
+
+                        yield ref()
+
+                return stream()
+
+        class _RolloutConfig:
+            async def remote(self):
+                return dict(env.rollout_settings)
+
+        self.run_rollouts = _RunRollouts()
+        self.rollout_config = _RolloutConfig()
+
+
+def _streamed_gym_result():
+    """One streamed row as _run_rollouts consumes it: a receipt result plus the
+    input message log the returned prompt is rebuilt from."""
+    return {**_mask_gate_receipt_result(), "input_message_log": [{"token_ids": [1]}]}
+
+
+def _run_rollouts_impl(env, max_attempts):
+    """AsyncNemoGymRolloutImpl wired to a scripted two-row group."""
+    impl = _nemo_gym_impl(False)
+    impl._num_generations_per_prompt = 2
+    impl._max_gym_row_attempts = max_attempts
+    impl._task_to_env = {"nemo_gym": env}
+    impl._results_to_completions = lambda results: ([object()] * len(results), {})
+    # The metric stubs take any arguments: the loop passes the aligned Gym results
+    # to _compute_rollout_metrics by keyword, and these tests check dispatch only.
+    impl._compute_rollout_metrics = lambda *args, **kwargs: {}
+    impl._compute_reward_penalty_metrics = lambda *args, **kwargs: {}
+    return impl
+
+
+def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
+    """With an attempt budget above one, a failure marker's row is dispatched
+    again by itself, the group completes from both attempts, and the metrics
+    count the one row that was sent again."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+            ],
+            [(1, {"name": "agent"}, _streamed_gym_result(), None)],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert len(completions) == 2
+    assert metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_nemo_gym_run_rollouts_reports_zero_redispatches_for_a_clean_group():
+    """A group whose rows all arrive on the first attempt still reports the
+    re-dispatch count, as zero, so the metric is present on every rollout and
+    a mean over steps is a rate."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (1, {"name": "agent"}, _streamed_gym_result(), None),
+            ]
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1]]
+    assert metrics["nemo_gym_infra_redispatches"] == 0
+
+
+def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
+    """When the budget is one attempt, nothing would dispatch a marked row
+    again, so the marker ends the attempt at once with its own detail and the
+    rest of the stream is never awaited: here the other row is held by a
+    verifier that waits for the failed sibling, and the error names the row
+    that failed instead of waiting for the one that cannot arrive."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                # Never set: row 0 sits in /verify waiting for row 1.
+                asyncio.Event(),
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+            ]
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=1)
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"row 1 of 2 failed at the infrastructure level on the last attempt: "
+            r"NeMo-Gym /run failed with HTTP 503: down"
+        ),
+    ):
+        # The bound turns a regression into a failure instead of a hang.
+        _run(
+            asyncio.wait_for(
+                impl._run_rollouts(
+                    inputs=[
+                        {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                        {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                    ],
+                    timer=Timer(),
+                    timer_prefix="timing/test",
+                ),
+                timeout=5.0,
+            )
+        )
+    assert env.dispatched == [[0, 1]]
+
+
+def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
+    """A group can run out of attempts with a row marked on an earlier attempt
+    and a row that simply never arrived. The final error names the marker's
+    detail for the first and says the second never arrived, so neither is
+    misreported."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.failures import GymTransportError
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            # Attempt 1: row 0 fails at the infrastructure level, row 1 never
+            # arrives. Attempt 2 re-dispatches both and delivers nothing.
+            [
+                (
+                    0,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                )
+            ],
+            [],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    with pytest.raises(
+        GymTransportError,
+        match=(
+            r"rows \[0\] of 2 failed at the infrastructure level on every "
+            r"attempt \(2\): row 0: NeMo-Gym /run failed with HTTP 503: down; "
+            r"rows \[1\] never arrived"
+        ),
+    ):
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert env.dispatched == [[0, 1], [0, 1]]
+
+
+def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
+    """The actor attaches its timing to the last tuple of each attempt's stream.
+    A one-row re-dispatch reports under its own ``retry<n>`` label, so the
+    first attempt's timing, the group's, is what the instance label reports."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.rollouts import Timer
+
+    key = "timing/test/shard/nemo_gym/await_results"
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    {key: 100.0},
+                ),
+            ],
+            [(1, {"name": "agent"}, _streamed_gym_result(), {key: 1.0})],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert metrics[key] == 100.0
+    assert metrics["timing/test/shard/nemo_gym/retry1/await_results"] == 1.0
+
+
+def _sum_rewards_hook(rows, full_results):
+    """Rollout-metrics hook the SC parity test names by its dotted path.
+
+    Reports what it saw through its returned metrics, because the dotted-path
+    import can hand the test a second module instance whose globals the test
+    cannot read.
+    """
+    assert len(rows) == len(full_results)
+    return {
+        "reward_sum": sum(r.get("reward", 0.0) for r in full_results),
+        "hook_rows_seen": float(sum(1 for row in rows if "_rowidx" in row)),
+    }
+
+
+def test_nemo_gym_sc_path_applies_the_rollout_metrics_hook():
+    """The single-controller path resolves env.nemo_gym.rollout_metrics_hook
+    from the actor's rollout_config and applies it after the built-in metrics,
+    exactly like the driver path."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (1, {"name": "agent"}, _streamed_gym_result(), None),
+            ]
+        ],
+        rollout_settings={
+            "rollout_metrics_hook": (
+                "tests.unit.experience.test_rollout_manager._sum_rewards_hook"
+            )
+        },
+    )
+    impl = _nemo_gym_impl(False)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert metrics["reward_sum"] == 2.0
+    assert metrics["hook_rows_seen"] == 2.0
+
+
+def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
+    """A numeric field only some completions carry is still aggregated: the
+    per-agent keys are the union over the completions, not the first
+    completion's keys."""
+    impl = _nemo_gym_impl(False)
+    completions = [
+        Completion(
+            message_log=[{"role": "assistant", "token_ids": [1]}],
+            env_extras=extras,
+            truncated=False,
+            reward=reward,
+        )
+        for reward, extras in [
+            (0.0, {"reward": 0.0}),
+            (1.0, {"reward": 1.0, "speedup": 2.0}),
+            (1.0, {"reward": 1.0, "speedup": 4.0}),
+        ]
+    ]
+
+    metrics = impl._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
+    assert metrics["agent/speedup/max"] == 4.0
+
+
+def _masked_flag(flag_form, value):
+    if flag_form == "first_class":
+        return {"mask_sample": value}
+    return {"instance_config": {"mask_sample": value}}
+
+
+@pytest.mark.parametrize("flag_form", ["first_class", "instance_config"])
+def test_nemo_gym_sc_per_agent_value_metrics_exclude_environment_masked_rollouts(
+    flag_form,
+):
+    """An environment-masked completion votes in no per-agent value metric on
+    the single-controller path either, whichever form the flag takes; the
+    masked share is reported for both forms; with the gate off every completion
+    votes, so the two paths agree in both settings."""
+
+    def completion(reward, **extras):
+        return Completion(
+            message_log=[
+                {"role": "user", "token_ids": [1]},
+                {"role": "assistant", "token_ids": [2]},
+            ],
+            env_extras={"reward": reward, **extras},
+            truncated=False,
+            reward=reward,
+        )
+
+    completions = [
+        completion(1.0, correctness=1.0, speedup=4.0, **_masked_flag(flag_form, False)),
+        completion(0.0, correctness=0.0, speedup=2.0, **_masked_flag(flag_form, False)),
+        # The masked rollout's values are placeholders, not measurements.
+        completion(0.0, correctness=0.0, speedup=0.0, **_masked_flag(flag_form, True)),
+    ]
+
+    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+
+    assert metrics["agent/correctness/mean"] == pytest.approx(0.5)
+    assert metrics["agent/speedup/mean"] == pytest.approx(3.0)
+    assert metrics["agent/speedup/histogram"] == [4.0, 2.0]
+    assert metrics["agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+    # The sample-level reward statistic is not a per-agent metric and still
+    # covers every completion.
+    assert metrics["total_reward/mean"] == pytest.approx(1 / 3)
+
+    voting = _nemo_gym_impl(False)._compute_rollout_metrics(completions, "agent")
+    assert voting["agent/correctness/mean"] == pytest.approx(1 / 3)
+    assert voting["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+
+    all_masked = _nemo_gym_impl(True)._compute_rollout_metrics(
+        [completion(0.0, correctness=0.0, mask_sample=True)] * 2, "agent"
+    )
+    assert all_masked["agent/mask_sample/mean"] == 1.0
+    assert "agent/correctness/mean" not in all_masked
+
+
+def _token_result(rowidx, reward):
+    """One token-mode Gym row as the single-controller stream yields it."""
+    return {
+        "input_message_log": [{"role": "user", "token_ids": [rowidx + 1]}],
+        "message_log": [
+            {"role": "user", "token_ids": [rowidx + 1]},
+            {
+                "role": "assistant",
+                "token_ids": [2, 3],
+                "generation_logprobs": [0.0, 0.0],
+            },
+        ],
+        "full_result": {"reward": reward},
+    }
+
+
+def test_nemo_gym_sc_rollout_metrics_hook_runs_after_the_built_in_metrics(
+    caplog, monkeypatch
+):
+    """On the single-controller path the hook sees rows and full results
+    aligned in row order whatever order the inputs arrive in, and a key it
+    returns survives the built-in writers with a collision warning."""
+    from nemo_rl.experience.rollouts import Timer
+
+    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    seen = []
+
+    def hook(rows, full_results):
+        seen.append(
+            list(
+                zip(
+                    [row["_rowidx"] for row in rows],
+                    [full_result["reward"] for full_result in full_results],
+                )
+            )
+        )
+        return {"agent/reward/mean": 99.0, "mean_gen_tokens_per_sample": 77.0}
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _token_result(0, 0.0), None),
+                (1, {"name": "agent"}, _token_result(1, 1.0), None),
+            ]
+        ]
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": env}
+    # Resolution from rollout_config is pinned by
+    # test_nemo_gym_sc_path_applies_the_rollout_metrics_hook.
+    impl._rollout_metrics_hook = hook
+
+    with caplog.at_level(logging.WARNING):
+        _completions, _prompt, metrics = _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+
+    assert seen == [[(0, 0.0), (1, 1.0)]]
+    assert metrics["agent/reward/mean"] == 99.0
+    assert metrics["mean_gen_tokens_per_sample"] == 77.0
+    assert any("overrides built-in metric key" in r.message for r in caplog.records)
+
+
+def test_nemo_gym_sc_path_rejects_a_bad_metrics_hook_path_before_dispatch():
+    """An unresolvable hook path fails the single-controller rollout before any
+    row is dispatched, as on the driver path, instead of after a generated
+    prompt group."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[[(0, {"name": "agent"}, _streamed_gym_result(), None)]],
+        rollout_settings={"rollout_metrics_hook": "no.such.module.function"},
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 1
+    impl._task_to_env = {"nemo_gym": env}
+
+    with pytest.raises(ModuleNotFoundError):
+        _run(
+            impl._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+    assert env.dispatched == []
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

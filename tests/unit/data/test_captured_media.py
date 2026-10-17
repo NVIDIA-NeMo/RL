@@ -1349,13 +1349,20 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         gym_response = await client.get("/run")
     assert gym_response.status_code == 500
     assert "retained_media_changed" in gym_response.text
+    # The row Gym's rollout collector hands back for the failed /run
+    # (rollout_collection._agent_request_failure_row): raise_for_status raised
+    # on the 500, so the message is aiohttp's status line and the body the
+    # collector read rides beside it.
     failure = _typed_gym_failure(
-        ClientResponseError(
-            request_info=SimpleNamespace(real_url="http://gym/run"),
-            history=(),
-            status=gym_response.status_code,
-            message=gym_response.text,
-        )
+        {
+            "_ng_failure_class": "agent_run_error",
+            "_ng_failure_type": "ClientResponseError",
+            "_ng_failure_message": (
+                f"{gym_response.status_code}, message='Internal Server Error'"
+            ),
+            "_ng_failure_http_status": gym_response.status_code,
+            "_ng_failure_response_body": gym_response.text,
+        }
     )
     assert isinstance(failure, GymTransportError)
     assert "retained_media_changed" in str(failure)
