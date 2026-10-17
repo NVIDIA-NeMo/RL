@@ -431,30 +431,11 @@ class DynamoRefitChannel:
                 resume_errors.append(f"{worker.system_url}: {error}")
         return resume_errors
 
-    def pause(self) -> None:
-        """Drain and pause every worker ahead of a weight update.
-
-        Workers that confirmed the pause are resumed if any peer fails.
-        """
-        paused_workers, pause_errors = self._pause_workers()
-        if pause_errors:
-            resume_errors = self._resume_workers(paused_workers)
-            details = "pause/clear failed for " + "; ".join(pause_errors)
-            if resume_errors:
-                details += "; resume failed for " + "; ".join(resume_errors)
-            raise RuntimeError(f"Dynamo pause before weight update failed: {details}")
-
-    def resume(self) -> None:
-        """Resume every worker after a weight update."""
-        resume_errors = self._resume_workers(self._workers)
-        if resume_errors:
-            raise RuntimeError(
-                "Dynamo resume after weight update failed for "
-                + "; ".join(resume_errors)
-            )
-
     def flush_cache(self) -> bool:
-        """Drain, clear, and resume every worker using immutable endpoints."""
+        """Drain, clear, and resume every worker using immutable endpoints.
+
+        Workers that confirmed the pause are resumed even if a peer fails.
+        """
         paused_workers, pause_errors = self._pause_workers()
         resume_errors = self._resume_workers(paused_workers)
 

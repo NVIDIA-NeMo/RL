@@ -216,11 +216,13 @@ shards. No Dynamo-side component writes to TransferQueue.
 
 Start from
 [`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml)
-and launch it with `examples/run_grpo_single_controller.py`. Before every weight
-update the SingleController drains and pauses each Dynamo worker (requests the
-engine is running finish on the old weights; queued and new requests wait and
-run on the new weights), runs the NCCL refit, and then resumes the workers. The
-drain is bounded by `dynamo_cfg.control_timeout_s`.
+and launch it with `examples/run_grpo_single_controller.py`. Weight updates are
+live, as on the vLLM backend: the SingleController stops new dispatches and runs
+the NCCL refit while every engine keeps serving, so running requests continue on
+the new weights and the prefix cache is kept. Set
+`async_rl.recompute_kv_cache_after_weight_updates: true` to also drain every
+worker and clear its KV and prefix cache after each refit, before dispatch
+resumes; `dynamo_cfg.control_timeout_s` bounds that drain.
 
 Current limits on this path:
 
@@ -229,10 +231,9 @@ Current limits on this path:
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.
-- `async_rl.recompute_kv_cache_after_weight_updates` must be false: the
-  pre-refit drain already clears every worker's cache.
-- `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
-  because it bounds the drain.
+- With `async_rl.recompute_kv_cache_after_weight_updates`,
+  `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
+  because it bounds the post-refit drain.
 - `vllm_cfg.enable_vllm_metrics_logger` must be false; only the legacy GRPO loop
   reads the Dynamo metrics sampler.
 

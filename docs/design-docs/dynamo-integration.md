@@ -42,7 +42,11 @@ through Dynamo's per-worker `/engine/*` RL routes, which forward an
 `engine_rpc` name to vLLM `collective_rpc`; Dynamo needs no NeMo RL code of its
 own. Setup calls go to `init_weights_update_group`, whose server deadline is
 `dynamo_cfg.control_timeout_s`, and refits go to
-`update_weights_from_distributed` with `allow_unpaused=True`.
+`update_weights_from_distributed` with `allow_unpaused=True` and
+`reset_prefix_cache=False`. A refit is one `collective_rpc` per engine, which
+vLLM runs between engine steps, so engines serve through it exactly as the vLLM
+backend's do: no step sees partly loaded weights, running requests continue on
+the new weights, and the prefix cache is kept.
 
 Each engine is one DP shard of `E = TP x PP` refit ranks
 (`get_refit_fleet_shape`), and engine `i` gets rank prefix `i * E`; the

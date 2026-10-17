@@ -165,23 +165,20 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
-        if master_config.async_rl.recompute_kv_cache_after_weight_updates:
-            # The pre-refit drain already clears every worker's cache, and nothing
-            # runs until resume, so a post-refit flush only adds a second drain.
-            raise ValueError(
-                "async_rl.recompute_kv_cache_after_weight_updates must be false with "
-                "policy.generation.backend='dynamo'; the pre-refit drain already "
-                "clears every worker's KV and prefix cache."
-            )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         dynamo_cfg = generation["dynamo_cfg"]
-        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
+        if (
+            master_config.async_rl.recompute_kv_cache_after_weight_updates
+            and dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]
+        ):
             raise ValueError(
                 "policy.generation.dynamo_cfg.control_timeout_s "
                 f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
-                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
-                "which waits for running requests to finish."
+                f"({dynamo_cfg['request_timeout_s']}) with "
+                "async_rl.recompute_kv_cache_after_weight_updates=true: it bounds "
+                "the post-refit cache flush, which waits for running requests to "
+                "finish."
             )
         if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
             # Only the legacy GRPO loop reads and clears the driver's sampler; here
@@ -785,22 +782,8 @@ class DynamoGeneration(GenerationInterface):
         return self._require_refit_channel().nccl_reshard_refit(refit_timeout_s)
 
     def invalidate_kv_cache(self) -> bool:
-        """Flush every fixed Dynamo worker's prefix/KV cache."""
+        """Drain every fixed Dynamo worker, then clear its prefix/KV cache."""
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.flush_cache()
-
-    def drain_for_weight_update(self) -> None:
-        """Drain and pause every worker; layerwise reload is unsafe mid-request."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.pause()
-
-    def resume_after_weight_update(self) -> None:
-        """Resume every worker after a weight update."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.resume()
