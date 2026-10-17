@@ -105,6 +105,7 @@ RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+    from nemo_rl.experience.rollout_reassembler import RolloutSelection
     from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
 
@@ -2233,14 +2234,29 @@ class RolloutManager:
         infra_attempts = 0
         data_attempts = 0
         last_infra_error: Optional[Exception] = None
+        # Carry forest selection metadata for generations already sealed by the ledger.
+        rollout_selections: dict[int, RolloutSelection] = {}
         while infra_attempts < policy.max_infra_attempts:
             try:
                 request = await self._generate_for_finalization_attempt(
                     input_sample,
                     recovery_group_id=recovery_group_id,
                     inflight_registry=inflight_registry,
+                    rollout_selections=rollout_selections,
                 )
             except Exception as error:
+                if self._forest_training:
+                    # An interrupted sibling may have reported a selection before
+                    # its receipt was sealed. Keep only selections whose data
+                    # survived the attempt cleanup, for either recovery policy.
+                    sealed_indices = set(
+                        self._recovery_ledger.get_group(
+                            recovery_group_id
+                        ).sealed_generation_indices
+                    )
+                    for index in tuple(rollout_selections):
+                        if index not in sealed_indices:
+                            del rollout_selections[index]
                 if (
                     self._forest_training
                     and classify_rollout_failure(error) is not FailureClass.INFRA
@@ -2250,11 +2266,6 @@ class RolloutManager:
                 if classify_rollout_failure(error) is FailureClass.INFRA:
                     infra_attempts += 1
                     last_infra_error = error
-                    # Forest selections are request-local until checkpoint recovery
-                    # persists them. Drop this abandoned group through the usual
-                    # bounded policy; do not redispatch and lose sealed selections.
-                    if self._forest_training:
-                        break
                     if infra_attempts >= policy.max_infra_attempts:
                         break
                     self._stats.record_redispatch(reason)
@@ -2307,6 +2318,7 @@ class RolloutManager:
         *,
         recovery_group_id: str,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]],
+        rollout_selections: dict[int, RolloutSelection],
     ) -> "ReassemblyRequest":
         """Dispatch the current sibling cohort and leave one slot unready."""
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -2340,9 +2352,8 @@ class RolloutManager:
             rollout_ids=list(rollout_ids),
         )
         pending_group_results: dict[int, SiblingSealResult] = {}
-        # Forest does not retry or checkpoint; keep selected-response metadata in this request
-        # while the existing ledger tracks sibling completion and publication.
-        rollout_selections = {}
+        # Selection metadata is scoped to this live retry loop; completed
+        # siblings retain it across failed dispatch attempts.
 
         async def _record_streamed_completion(
             generation_index: int, completion: Completion
