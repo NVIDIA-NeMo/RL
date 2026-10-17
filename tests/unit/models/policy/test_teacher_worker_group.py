@@ -719,3 +719,38 @@ def test_teacher_worker_presharded_entrypoint_skips_the_payload_off_the_last_sta
 
     assert worker.stage_local_writes == []
     assert worker.written is not None
+
+
+def test_get_logprobs_fetches_only_returned_teacher_workers():
+    """The legacy teacher gather skips CP/TP/PP replicas, like Policy's."""
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+
+    class Sharding:
+        def get_axis_size(self, axis):
+            assert axis == "data_parallel"
+            return 2
+
+    worker_group = MagicMock()
+    worker_group.run_all_workers_sharded_data.return_value = "futures"
+    worker_group.get_all_worker_results.return_value = [
+        BatchedDataDict(logprobs=torch.zeros(1, 3)),
+        BatchedDataDict(logprobs=torch.ones(1, 3)),
+    ]
+    teacher = object.__new__(TeacherWorkerGroup)
+    teacher.use_sequence_packing = False
+    teacher.sharding_annotations = Sharding()
+    teacher.worker_group = worker_group
+    teacher._micro_batch_size = 1
+    data = BatchedDataDict(
+        input_ids=torch.zeros(2, 3, dtype=torch.long),
+        input_lengths=torch.tensor([3, 3]),
+    )
+
+    result = teacher.get_logprobs(data)
+
+    worker_group.get_all_worker_results.assert_called_once_with(
+        "futures", fetch_returned_only=True
+    )
+    torch.testing.assert_close(
+        result["reference_logprobs"], torch.tensor([[0.0] * 3, [1.0] * 3])
+    )

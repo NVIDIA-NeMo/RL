@@ -757,7 +757,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
             )
         logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
-            self.worker_group.get_all_worker_results(futures)
+            self.worker_group.get_all_worker_results(futures, fetch_returned_only=True)
         )
 
         # dynamic batching sorts the inputs by sequence length to improve load balancing,
@@ -810,7 +810,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
             BatchedDataDict.from_batches(
-                self.worker_group.get_all_worker_results(futures)
+                self.worker_group.get_all_worker_results(
+                    futures, fetch_returned_only=True
+                )
             )
         )
 
