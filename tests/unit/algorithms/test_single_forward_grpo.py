@@ -241,6 +241,63 @@ def test_sequence_error_uses_only_loss_tokens_and_preserves_threshold_boundary()
     assert not errors.requires_grad
 
 
+@pytest.mark.parametrize("sample_weight", [0.03, 0.75, 6.0])
+def test_sequence_error_does_not_depend_on_sample_weight(sample_weight: float) -> None:
+    errors, valid = compute_seq_logprob_errors(
+        policy_logprobs=torch.zeros(2, 2),
+        generation_logprobs=torch.tensor([[0.2, float("nan")], [100.0, 100.0]]),
+        token_mask=torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+        sample_mask=torch.tensor([sample_weight, 0.0]),
+    )
+    assert errors.tolist() == pytest.approx([math.exp(0.2), 0.0])
+    assert valid.tolist() == [True, False]
+
+
+@pytest.mark.parametrize("weights", [[0.75, 6.0], [0.03, 6.0]])
+@pytest.mark.parametrize("logprob_error,kept", [(0.2, True), (0.7, False)])
+def test_weighted_loss_preserves_sequence_filter_and_error_metric(
+    weights: list[float], logprob_error: float, kept: bool
+) -> None:
+    """Equal rollout errors make equal decisions even with unequal agent weights."""
+    sample_mask = torch.tensor(weights)
+    current = torch.full((2, 2), -1.0, requires_grad=True)
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * 2),
+            "sample_mask": sample_mask,
+            "advantages": torch.ones(2, 3),
+            "generation_logprobs": torch.full((2, 3), -1.0 - logprob_error),
+        }
+    )
+    loss, metrics = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0.0,
+        ),
+        seq_logprob_error_threshold=1.5,
+    )(
+        next_token_logprobs=current,
+        data=data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=2 * sample_mask.sum(),
+    )
+    loss.backward()
+    expected_gradient = (
+        -sample_mask[:, None].expand_as(current) / (2 * sample_mask.sum())
+        if kept
+        else torch.zeros_like(current)
+    )
+    torch.testing.assert_close(current.grad, expected_gradient)
+    assert loss.item() == pytest.approx(-1.0 if kept else 0.0)
+    assert metrics["token_mult_prob_error"] == pytest.approx(
+        math.exp(logprob_error) if kept else 0.0
+    )
+    assert metrics["seq_logprob_error_valid_seqs"] == pytest.approx(
+        sample_mask.sum().item() if kept else 0.0
+    )
+
+
 def test_all_rejected_loss_reports_zero_survivors_and_zero_gradient():
     data, values = _batch()
     lp = values.requires_grad_()

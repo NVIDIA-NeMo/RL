@@ -625,30 +625,26 @@ Set `overlong_filtering` to true when training on tasks where truncation at the 
 
 #### Per-Agent Loss Weights
 
-When one NeMo-Gym batch mixes several agents (for example short single-step tool-use tasks next to long multi-turn agentic traces), token-level loss normalization gives each agent a share of the gradient proportional to its trained tokens. A 250-token rollout next to a 25,000-token rollout contributes about 1% of the update, so a short-episode environment can stop moving even though its rewards carry signal.
+With token-level loss normalization (`loss_fn.token_level_loss: true`, the default), agents in a mixed NeMo-Gym batch receive a share of the update proportional to their trained tokens. For example, 64 tool-use rollouts of 250 tokens next to 8 agentic rollouts of 25,000 tokens contribute about 7% of the trained tokens. `agent_loss_weights` can increase the short agent's share.
 
-`agent_loss_weights` maps an agent name (the rollout's `agent_ref.name`) to a weight $w_a$; agents that are not listed keep weight 1. Right before the policy update, each sample's loss weight $m_i$ (`sample_mask`) becomes
-
-$$
-\tilde m_i = c \, w_{a(i)} \, m_i,
-\qquad
-c = \frac{\sum_i m_i \,\lvert o_i\rvert}{\sum_i w_{a(i)} \, m_i \,\lvert o_i\rvert},
-$$
-
-where $\lvert o_i\rvert$ is the number of trained tokens in response $i$ and both sums run over one optimizer-step global batch: each consecutive `policy.train_global_batch_size` rows of the training batch, which is how `Policy.train` forms the global batches that every worker normalizes over. Two properties follow:
-
-- **The weights are relative.** The policy loss divides its $\tilde m$-weighted numerator by $\sum_i \tilde m_i \lvert o_i\rvert$ (`global_valid_toks`; or by $\sum_i \tilde m_i$, `global_valid_seqs`, under sequence-level normalization), so $c$ cancels and each agent's share of the gradient is set only by the ratios of the $w_a$. Multiplying every weight by the same constant is an exact no-op.
-- **The valid-token mass is preserved.** $\sum_i \tilde m_i \lvert o_i\rvert = \sum_i m_i \lvert o_i\rvert$, so `global_valid_toks` is the same number it would be without agent weights. This matters for auxiliary objectives that are normalized by `global_valid_toks` but whose numerator does not carry `sample_mask`: the Megatron backend scales the MoE load-balancing and router z-loss gradients by `1 / global_valid_toks` through `MoEAuxLossAutoScaler`, so without the rescaling a uniform weight of 2 would halve those gradients. With it, they are exactly what they are without agent weights, with the one exception for `loss_fn.seq_logprob_error_in_loss` noted below. MTP already weights its numerator by `token_mask * sample_mask`, so it follows the policy loss and is relative as well.
-
-Because $c$ is fixed before the global batch is split across data-parallel ranks and microbatches, the result does not depend on that partition. Baselines, advantages, dynamic sampling, and the pre-training sequence-logprob-error filter run before weighting and are unchanged. With `loss_fn.seq_logprob_error_in_loss`, the Megatron worker renormalizes every gradient by the *weighted* surviving token mass (`_normalize_in_loss_seq_filter` scales by `global_valid_toks / kept_tokens`, and `kept_tokens` sums the weighted mask), so the auxiliary-gradient and `global_valid_toks` guarantees above hold exactly only when no row is rejected in-loss; uniform weights stay an exact no-op either way. Rows whose `sample_mask` is already 0 stay 0, and fractional masks are scaled like any other. `global_valid_seqs` and `num_valid_samples` report $\sum_i \tilde m_i$, the normalized weighted mask.
+To configure:
 
 ```yaml
 grpo:
-  agent_loss_weights:
-    short_tool_use_agent: 8.0
+  agent_loss_weights: null  # default; e.g. {short_tool_use_agent: 8.0}
 ```
 
-Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,token_share_unweighted,token_share_weighted}`: the configured $w_a$, the multiplier $c \, w_a$ that was actually applied to the agent's rows, and the agent's share of the trained-token mass before and after weighting. A configured agent that appears in no row of the step is logged with `num_samples = 0` and `effective_weight = 0`, and a warning names it, so a misspelled agent name is visible instead of silently training as weight 1. The option requires the NeMo-Gym rollout path and is applied by `grpo_train` and `async_grpo_train`; the data-plane and SingleController trainers reject it.
+Keys are the **resolved agent name** that Gym dispatches to (`agent_ref.name`), not the dataset's `task_source`. Use the agent names in the rollout metrics. Unlisted agents keep weight 1. Weights must be finite and nonnegative; zero sets that agent's sample loss weight to zero. A configured name absent from the batch produces a warning listing the names present.
+
+**Choosing a weight.** For a target trained-token share $s$ for agent A, set $w_A = \frac{s}{1-s} \cdot \frac{T_\text{other}}{T_A}$, where $T_A$ and $T_\text{other}$ are their unweighted trained-token counts. In the example above, weight 8 increases the tool-use share from 7% to about 39%. Setting weights proportional to the inverse mean episode length approximates equal per-rollout weighting. Weights only rebalance agents sharing an optimizer step (`policy.train_global_batch_size` rows).
+
+Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,token_share_unweighted,token_share_weighted}`. To measure baseline shares with these metrics, configure weight 1 for the agents first; the default `null` does not emit them. Compare per-agent rewards and gradient norms as well as token shares when selecting weights.
+
+Weights multiply `sample_mask`, so they affect the policy gradient and other losses that consume that mask, including reference KL and MTP. They leave baselines, advantages, dynamic sampling and the pre-training sequence-error filter unchanged. The in-loss filter uses each row's original probability error; loss-side diagnostics such as KL and `token_mult_prob_error` become weighted averages.
+
+Weights are normalized within each optimizer step to preserve its valid-token mass before in-loss filtering, provided at least one trained row has positive weight. Only relative weights matter, up to floating-point rounding. An all-zero-weight step has zero valid tokens. With `loss_fn.seq_logprob_error_in_loss`, rejected rows change the surviving weighted token mass and hence the final auxiliary-gradient scale; see the implementation docstring for details.
+
+The option requires `env.should_use_nemo_gym: true` and applies to `grpo_train` and `async_grpo_train`. Data-plane and SingleController trainers reject it.
 
 #### Advantage Clipping
 

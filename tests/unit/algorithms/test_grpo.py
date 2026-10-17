@@ -455,7 +455,8 @@ class TestAgentLossWeights:
         assert metrics["agent_loss_weights/b/effective_weight"] == pytest.approx(1.0)
 
     def test_masked_rows_stay_masked_and_do_not_count_tokens(self):
-        train_data = self._train_data([10, 10, 10], [1.0, 0.0, 0.5])
+        # The masked row is longest: counting its tokens would change the normalizer.
+        train_data = self._train_data([10, 40, 10], [1.0, 0.0, 0.5])
         agent_refs = [{"name": "a"}, {"name": "a"}, {"name": "b"}]
 
         metrics = _apply_agent_loss_weights(

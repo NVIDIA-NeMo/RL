@@ -380,21 +380,11 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
-    # Optional per-agent loss weights for mixed NeMo-Gym batches, keyed on the
-    # rollout's ``agent_ref.name``: {agent_name: weight}. Right before the policy
-    # update each sample's loss weight (``sample_mask``) is multiplied by its
-    # agent's weight (agents not listed keep 1.0) and the result is rescaled per
-    # optimizer-step global batch so the valid-token mass (``global_valid_toks``)
-    # is unchanged. The weights are therefore purely relative: they set each
-    # agent's share of the gradient, never its overall scale (all weights 2.0 is
-    # an exact no-op), and auxiliary objectives normalized by
-    # ``global_valid_toks`` (Megatron MoE load-balancing / z-loss) keep the
-    # gradient they have without weights, except that with
-    # ``loss_fn.seq_logprob_error_in_loss`` the worker renormalizes by the
-    # weighted surviving token mass (see docs/guides/grpo.md). Baselines,
-    # advantages and dynamic sampling run before weighting. A name that matches
-    # no rollout row warns and logs num_samples 0. NeMo-Gym only; the data-plane
-    # and SingleController trainers reject it. None disables.
+    # NeMo-Gym loss weights keyed by resolved agent_ref.name. Values must be
+    # finite and >= 0; unlisted agents keep 1, and zero excludes a row's loss.
+    # Weights are relative and normalized per optimizer step; the guide explains
+    # the all-zero and in-loss-filter cases. Baselines and advantages are unchanged.
+    # Legacy synchronous/asynchronous GRPO only; None disables.
     agent_loss_weights: dict[str, float] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -2682,7 +2672,9 @@ def _apply_agent_loss_weights(
     ``grpo.agent_loss_weights[agent_ref.name]`` (agents not listed keep 1.0;
     already-masked rows stay 0), then rescales the product within every
     optimizer-step global batch so that ``sum(token_mask[:, 1:] * sample_mask)``
-    is unchanged. A global batch is each consecutive ``train_global_batch_size``
+    is unchanged when some trained row retains positive weight. An all-zero
+    weighted batch has zero valid tokens. A global batch is each consecutive
+    ``train_global_batch_size``
     rows of ``train_data``: that is how ``Policy.train`` splits the batch
     (``BatchedDataDict.shard_by_batch_size``) before every worker computes
     ``global_valid_toks`` over it (``process_global_batch``).
@@ -2700,7 +2692,7 @@ def _apply_agent_loss_weights(
     rescales every gradient by ``global_valid_toks / kept_tokens``
     (``_normalize_in_loss_seq_filter``) and ``kept_tokens`` sums the weighted
     mask, so that guarantee holds exactly only when no row is rejected in-loss;
-    uniform weights remain an exact no-op.
+    uniform positive weights remain a no-op up to floating-point rounding.
 
     Returns per-agent metrics: the configured weight, the effective (normalized)
     multiplier applied to the agent's rows, its number of samples, and its share

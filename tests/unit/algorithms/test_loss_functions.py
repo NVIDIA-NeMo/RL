@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 import pickle
 
 import pytest
@@ -53,6 +54,48 @@ def test_clipped_pg_loss_config_rejects_invalid_reference_kl_penalty(
 ) -> None:
     with pytest.raises(ValueError):
         ClippedPGLossConfig(reference_policy_kl_penalty=invalid_penalty)
+
+
+@pytest.mark.parametrize("weights", [[0.75, 6.0], [0.03, 6.0]])
+def test_sequence_importance_ratio_does_not_depend_on_sample_weight(
+    weights: list[float],
+) -> None:
+    """Agent weights scale reductions, not the sequence probability ratio."""
+    sample_mask = torch.tensor(weights)
+    current = torch.full((2, 2), -1.0, requires_grad=True)
+    data = BatchedDataDict(
+        {
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * 2),
+            "sample_mask": sample_mask,
+            "advantages": torch.ones(2, 3),
+            "prev_logprobs": torch.full((2, 3), -1.0),
+            "generation_logprobs": torch.full((2, 3), -1.2),
+        }
+    )
+    loss, metrics = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            sequence_level_importance_ratios=True,
+            token_level_loss=False,
+            use_importance_sampling_correction=True,
+        )
+    )(
+        next_token_logprobs=current,
+        data=data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=2 * sample_mask.sum(),
+    )
+    expected_ratio = math.exp(0.4)
+    assert metrics["sampling_importance_ratio"] == pytest.approx(expected_ratio)
+    assert metrics["token_mult_prob_error"] == pytest.approx(math.exp(0.2))
+    assert loss.item() == pytest.approx(-expected_ratio)
+    loss.backward()
+    torch.testing.assert_close(
+        current.grad,
+        -expected_ratio
+        * sample_mask[:, None].expand_as(current)
+        / (2 * sample_mask.sum()),
+    )
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
