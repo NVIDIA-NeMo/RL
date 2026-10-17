@@ -7,6 +7,7 @@ set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 code_dir=$(cd "$script_dir/../.." && pwd)
+export LAUNCH_BENCHMARK=claweval
 
 export CLAW_EVAL_SOURCE=${CLAW_EVAL_SOURCE:-/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/arushig/claw-eval}
 export CLAW_EVAL_ORIGINAL_TASK_ROOT=${CLAW_EVAL_ORIGINAL_TASK_ROOT:-$CLAW_EVAL_SOURCE/data_generation/runs/kimi_video_scaled_100/generated/tasks}

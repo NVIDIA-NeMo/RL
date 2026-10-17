@@ -236,19 +236,311 @@ esac
 wandb_group="${WANDB_RUN_GROUP:-cluster-${wandb_cluster_name}}"
 wandb_cluster_tag="cluster-${wandb_cluster_name}"
 
+# Exact gates execute a committed snapshot rather than a mutable shared checkout.
+# The snapshot is assembled from the superproject plus the three nested runtime
+# repositories and is verified again inside the allocation before model load.
+immutable_source_snapshot=${IMMUTABLE_SOURCE_SNAPSHOT:-false}
+case "$immutable_source_snapshot" in
+  true|false) ;;
+  *) echo "ERROR: IMMUTABLE_SOURCE_SNAPSHOT must be true or false" >&2; exit 1 ;;
+esac
+runtime_code_dir=$code_dir
+runtime_snapshot_dir=
+runtime_source_manifest=
+runtime_manifest_sha256=
+if [[ $immutable_source_snapshot == true ]]; then
+  runtime_snapshot_dir=$results_dir/runtime_source
+  runtime_source_manifest=$results_dir/runtime_source_manifest.json
+  python3 "$code_dir/tools/runtime_source_snapshot.py" \
+    --create --repo "$code_dir" --destination "$runtime_snapshot_dir" \
+    --manifest "$runtime_source_manifest" >/dev/null
+  runtime_manifest_sha256=$(python3 - "$runtime_source_manifest" <<'MANIFEST_DIGEST_PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(payload["runtime_manifest_sha256"])
+MANIFEST_DIGEST_PY
+  )
+  runtime_code_dir=$runtime_snapshot_dir
+fi
+
+# Persist the exact source/data/topology identity before submission.  The
+# sync-to-async handoff validator requires this file so a directory merely
+# named step_20 cannot be mistaken for the qualified donor.
+source_commit=$(git -C "${code_dir}" rev-parse HEAD)
+source_branch=$(git -C "${code_dir}" symbolic-ref --quiet --short HEAD 2>/dev/null || echo DETACHED)
+gym_commit=$(git -C "${code_dir}/3rdparty/Gym-workspace/Gym" rev-parse HEAD)
+bridge_commit=$(git -C "${code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" rev-parse HEAD)
+mcore_commit=$(git -C "${code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" rev-parse HEAD)
+source_worktree_dirty=false
+[[ -z $(git -C "${code_dir}" status --porcelain --untracked-files=no) ]] || source_worktree_dirty=true
+case ${LAUNCH_BENCHMARK:-} in
+ claweval)
+  launch_benchmark=$LAUNCH_BENCHMARK
+  launch_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-false}
+  launch_compaction_prune=${CLAW_EVAL_COMPACTION_PRUNE:-false}
+  launch_subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false}
+  launch_training_mode=${CLAW_EVAL_TRAINING_MODE:-standard}
+  launch_max_turns=${CLAW_EVAL_MAX_TURNS:-40}
+  launch_context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152}
+  launch_output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}
+  launch_tool_output_max_lines=${CLAW_EVAL_TOOL_OUTPUT_MAX_LINES:-}
+  launch_tool_output_max_bytes=${CLAW_EVAL_TOOL_OUTPUT_MAX_BYTES:-}
+  launch_max_train_row_tokens=${CLAW_EVAL_MAX_ROW_TOKENS:-}
+  launch_task_selection=all
+  launch_train_limit=
+  launch_train_repeats=1
+  launch_delegation_prompt=${CLAW_EVAL_DELEGATION_PROMPT:-}
+  launch_subagent_prompt=${CLAW_EVAL_SUBAGENT_PROMPT:-}
+  ;;
+ agentic_vbench)
+  launch_benchmark=$LAUNCH_BENCHMARK
+  launch_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO:-false}
+  launch_compaction_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE:-false}
+  launch_subagents=${AGENTIC_VBENCH_SUBAGENTS_ENABLED:-false}
+  launch_training_mode=${AGENTIC_VBENCH_TRAINING_MODE:-standard}
+  launch_max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32}
+  launch_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152}
+  launch_output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192}
+  launch_tool_output_max_lines=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-}
+  launch_tool_output_max_bytes=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-}
+  launch_max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS:-}
+  launch_task_selection=${AGENTIC_VBENCH_TASKS:-all}
+  launch_train_limit=${TRAIN_LIMIT:-}
+  launch_train_repeats=${TRAIN_REPEATS:-1}
+  launch_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT:-}
+  launch_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-}
+  ;;
+ *)
+  echo "ERROR: LAUNCH_BENCHMARK must be agentic_vbench or claweval" >&2
+  exit 1
+  ;;
+esac
+provenance_path=${results_dir}/launch_provenance.json
+case ${REQUIRE_FRESH_PROVENANCE:-false} in
+  true)
+    [[ ! -e $provenance_path ]] || {
+      echo "ERROR: refusing to overwrite launch provenance: $provenance_path" >&2
+      exit 1
+    }
+    ;;
+  false) ;;
+  *) echo "ERROR: REQUIRE_FRESH_PROVENANCE must be true or false" >&2; exit 1 ;;
+esac
+python3 - \
+  "${provenance_path}" \
+  "${launch_benchmark}" "${source_commit}" "${source_branch}" \
+  "${source_worktree_dirty}" "${gym_commit}" "${bridge_commit}" \
+  "${mcore_commit}" "${results_dir}" "${checkpoint_dir}" "${model_path}" \
+  "${config_in_container}" "${runtime_code_dir}/${config_in_container}" \
+  "${TRAIN_PATH}" "${VAL_PATH}" "${container}" \
+  "${num_nodes}" "${num_gen_nodes}" "${gpus_per_node}" "${segment_size}" \
+  "${num_prompts}" "${num_generations}" "${max_steps}" "${save_period}" \
+  "${checkpoint_keep_top_k}" "${context_compaction}" \
+  "${launch_compaction_auto}" "${launch_compaction_prune}" \
+  "${launch_subagents}" "${launch_training_mode}" "${wandb_project}" \
+  "${wandb_run_id}" "${wandb_run_name}" "${wandb_cluster_name}" \
+  "${SYNC_POLICY_CHECKPOINT:-}" "${SYNC_GATE_ATTESTATION:-}" \
+  "${immutable_source_snapshot}" "${runtime_snapshot_dir}" \
+  "${runtime_source_manifest}" "${runtime_manifest_sha256}" \
+  "${launch_max_turns}" "${launch_context_tokens}" "${launch_output_tokens}" \
+  "${launch_tool_output_max_lines}" "${launch_tool_output_max_bytes}" \
+  "${launch_max_train_row_tokens}" "${launch_task_selection}" \
+  "${launch_train_limit}" "${launch_train_repeats}" \
+  "${launch_delegation_prompt}" "${launch_subagent_prompt}" <<'PROVENANCE_PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(
+    output,
+    benchmark,
+    source_commit,
+    source_branch,
+    source_worktree_dirty,
+    gym_commit,
+    bridge_commit,
+    mcore_commit,
+    result_directory,
+    checkpoint_directory,
+    model_path,
+    config,
+    config_path,
+    train_path,
+    validation_path,
+    container_path,
+    num_nodes,
+    num_generation_nodes,
+    gpus_per_node,
+    segment_size,
+    num_prompts,
+    num_generations,
+    max_num_steps,
+    save_period,
+    keep_top_k,
+    context_compaction,
+    opencode_compaction_auto,
+    opencode_compaction_prune,
+    subagents_enabled,
+    training_mode,
+    wandb_project,
+    wandb_run_id,
+    wandb_run_name,
+    wandb_cluster_name,
+    sync_policy_checkpoint,
+    sync_gate_attestation,
+    immutable_source_snapshot,
+    runtime_snapshot_directory,
+    runtime_source_manifest,
+    runtime_manifest_sha256,
+    max_turns,
+    context_tokens,
+    output_tokens,
+    tool_output_max_lines,
+    tool_output_max_bytes,
+    max_train_row_tokens,
+    task_selection,
+    train_limit,
+    train_repeats,
+    delegation_prompt,
+    subagent_prompt,
+) = sys.argv[1:]
+
+
+def boolean(value: str) -> bool:
+    if value not in {"true", "false"}:
+        raise SystemExit(f"invalid provenance boolean: {value!r}")
+    return value == "true"
+
+
+def resolved(value: str) -> str:
+    return str(Path(value).resolve())
+
+
+def optional_int(value: str) -> int | None:
+    return int(value) if value else None
+
+
+def file_identity(value: str, *, hash_contents: bool = True) -> dict[str, object]:
+    path = Path(value).resolve(strict=True)
+    stat_result = path.stat()
+    identity: dict[str, object] = {
+        "path": str(path),
+        "size_bytes": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+    }
+    if hash_contents:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        identity["sha256"] = digest.hexdigest()
+    return identity
+
+
+def prompt_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+payload = {
+    "schema_version": 2,
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "benchmark": benchmark,
+    "source_commit": source_commit,
+    "source_branch": source_branch,
+    "source_worktree_dirty": boolean(source_worktree_dirty),
+    "gym_commit": gym_commit,
+    "bridge_commit": bridge_commit,
+    "mcore_commit": mcore_commit,
+    "result_directory": resolved(result_directory),
+    "checkpoint_directory": resolved(checkpoint_directory),
+    "model_path": resolved(model_path),
+    "config": config,
+    "config_identity": file_identity(config_path),
+    "train_data": file_identity(train_path),
+    "validation_data": file_identity(validation_path),
+    # The 50-GB squashfs is pinned by canonical path plus immutable stat identity;
+    # hashing it at every launch would add avoidable shared-filesystem load.
+    "container": file_identity(container_path, hash_contents=False),
+    "num_nodes": int(num_nodes),
+    "num_generation_nodes": int(num_generation_nodes),
+    "gpus_per_node": int(gpus_per_node),
+    "segment_size": int(segment_size),
+    "num_prompts": int(num_prompts),
+    "num_generations": int(num_generations),
+    "max_num_steps": int(max_num_steps),
+    "max_num_epochs": None,
+    "save_period": int(save_period),
+    "keep_top_k": None if keep_top_k == "null" else int(keep_top_k),
+    "context_compaction": boolean(context_compaction),
+    "opencode_compaction_auto": boolean(opencode_compaction_auto),
+    "opencode_compaction_prune": boolean(opencode_compaction_prune),
+    "subagents_enabled": boolean(subagents_enabled),
+    "training_mode": training_mode,
+    "wandb_project": wandb_project,
+    "wandb_run_id": wandb_run_id,
+    "wandb_run_name": wandb_run_name,
+    "wandb_cluster_name": wandb_cluster_name,
+    "sync_policy_checkpoint": resolved(sync_policy_checkpoint)
+    if sync_policy_checkpoint
+    else None,
+    "sync_gate_attestation": resolved(sync_gate_attestation)
+    if sync_gate_attestation
+    else None,
+    "immutable_source_snapshot": boolean(immutable_source_snapshot),
+    "runtime_snapshot_directory": resolved(runtime_snapshot_directory)
+    if runtime_snapshot_directory
+    else None,
+    "runtime_source_manifest": resolved(runtime_source_manifest)
+    if runtime_source_manifest
+    else None,
+    "runtime_manifest_sha256": runtime_manifest_sha256 or None,
+    "max_turns": int(max_turns),
+    "context_tokens": int(context_tokens),
+    "output_tokens": int(output_tokens),
+    "tool_output_max_lines": optional_int(tool_output_max_lines),
+    "tool_output_max_bytes": optional_int(tool_output_max_bytes),
+    "max_train_row_tokens": optional_int(max_train_row_tokens),
+    "task_selection": task_selection,
+    "train_limit": optional_int(train_limit),
+    "train_repeats": int(train_repeats),
+    "delegation_prompt_sha256": prompt_sha256(delegation_prompt),
+    "subagent_prompt_sha256": prompt_sha256(subagent_prompt),
+}
+destination = Path(output)
+temporary = destination.with_suffix(destination.suffix + ".tmp")
+temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+temporary.replace(destination)
+PROVENANCE_PY
+
+if [[ -n ${SYNC_POLICY_CHECKPOINT:-} ]]; then
+  : "${SYNC_GATE_ATTESTATION:?async donor requires SYNC_GATE_ATTESTATION}"
+  : "${SYNC_DCP_MANIFEST_SHA256:?async donor requires SYNC_DCP_MANIFEST_SHA256}"
+  [[ $SYNC_DCP_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+    echo "ERROR: SYNC_DCP_MANIFEST_SHA256 must be 64 lowercase hexadecimal characters" >&2
+    exit 1
+  }
+fi
+
 base_mounts="/lustre:/lustre,/scratch:/scratch"
-selective_mounts="${code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
-selective_mounts+=",${code_dir}/examples:/opt/nemo-rl/examples"
-selective_mounts+=",${code_dir}/tools:/opt/nemo-rl/tools"
-selective_mounts+=",${code_dir}/scripts:/opt/nemo-rl/scripts"
-selective_mounts+=",${code_dir}/tests:/opt/nemo-rl/tests"
-selective_mounts+=",${code_dir}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
-selective_mounts+=",${code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+selective_mounts="${runtime_code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
+selective_mounts+=",${runtime_code_dir}/examples:/opt/nemo-rl/examples"
+selective_mounts+=",${runtime_code_dir}/tools:/opt/nemo-rl/tools"
+selective_mounts+=",${runtime_code_dir}/scripts:/opt/nemo-rl/scripts"
+selective_mounts+=",${runtime_code_dir}/tests:/opt/nemo-rl/tests"
+selective_mounts+=",${runtime_code_dir}/pyproject.toml:/opt/nemo-rl/pyproject.toml"
+selective_mounts+=",${runtime_code_dir}/uv.lock:/opt/nemo-rl/uv.lock"
+selective_mounts+=",${runtime_code_dir}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+selective_mounts+=",${runtime_code_dir}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 # The mounts above shadow the image's copies: an uninitialized submodule would hide
 # the installed Gym or Megatron-Bridge/Megatron-LM (ModuleNotFoundError: megatron.bridge
 # at worker creation, after the GPUs are allocated). Fail here instead.
 for sub in 3rdparty/Gym-workspace/Gym 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM; do
-  [[ -n "$(ls -A "${code_dir}/${sub}" 2>/dev/null)" ]] || { echo "ERROR: ${sub} is empty; run: git submodule update --init --recursive ${sub%%/3rdparty/Megatron-LM}" >&2; exit 1; }
+  [[ -n "$(ls -A "${runtime_code_dir}/${sub}" 2>/dev/null)" ]] || { echo "ERROR: ${sub} is empty in the selected runtime source" >&2; exit 1; }
 done
 export MOUNTS="${base_mounts},${selective_mounts}${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 export CONTAINER="${container}"
@@ -313,6 +605,11 @@ export RAY_USAGE_STATS_ENABLED=0
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:\${PYTHONPATH:-}
 uv_bin=\$(command -v uv || echo /usr/local/bin/uv)
 test -x "\${uv_bin}"
+if [[ -n "${runtime_source_manifest}" ]]; then
+  "\${uv_bin}" run --no-sync python tools/runtime_source_snapshot.py \
+    --verify --allow-extra --root /opt/nemo-rl --manifest "${runtime_source_manifest}" \
+    >"${results_dir}/runtime_source_verification-\${SLURM_JOB_ID:-local}-\${SLURM_ARRAY_TASK_ID:-0}.json"
+fi
 if [[ "\${RUN_TMPE_OUTLIER_TESTS:-0}" == 1 ]]; then
   "\${uv_bin}" run --no-sync pytest -q tests/unit/single_controller/test_tmpe_outlier_dump.py
 fi
@@ -347,6 +644,22 @@ if [[ "${SKIP_REPLAY_RESTORE:-1}" == "1" ]]; then
   for meta in "${checkpoint_dir}"/step_*/replay_buffer_metadata.pt "${checkpoint_dir}"/step_*/rollout_recovery.pt; do
     [[ -f "\$meta" ]] && mv "\$meta" "\$meta.disabled" && echo "[launch_sc] disabled replay restore: \$meta"
   done
+fi
+if [[ -n "${SYNC_POLICY_CHECKPOINT:-}" ]]; then
+  sync_iteration=\$(<"${SYNC_POLICY_CHECKPOINT:-}/latest_checkpointed_iteration.txt")
+  if [[ "\$sync_iteration" == release ]]; then
+    sync_iteration_dir=release
+  elif [[ "\$sync_iteration" =~ ^[0-9]+$ ]]; then
+    printf -v sync_iteration_dir 'iter_%07d' "\$((10#\$sync_iteration))"
+  else
+    echo "ERROR: invalid async donor iteration marker: \$sync_iteration" >&2
+    exit 1
+  fi
+  megatron_python=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
+  "\$megatron_python" tools/verify_torch_dcp_checkpoint.py \
+    --checkpoint-dir "${SYNC_POLICY_CHECKPOINT:-}/\$sync_iteration_dir" \
+    --sha256 --expected-manifest-sha256 "${SYNC_DCP_MANIFEST_SHA256:-}" \
+    >"${results_dir}/sync_dcp_revalidation-\${SLURM_JOB_ID:-local}-\${SLURM_ARRAY_TASK_ID:-0}.json"
 fi
 "\${uv_bin}" run --no-sync python examples/run_grpo_single_controller.py \
   --config "${config_in_container}" \
@@ -420,7 +733,7 @@ echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_s
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
 echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
 echo "context_compaction=${context_compaction}"
-if [[ -n ${CLAW_EVAL_SOURCE:-} ]]; then
+if [[ $launch_benchmark == claweval ]]; then
   echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"
 else
   echo "agentic_vbench_compaction_auto=${AGENTIC_VBENCH_COMPACTION_AUTO} agentic_vbench_prune=${AGENTIC_VBENCH_COMPACTION_PRUNE} max_turns=${AGENTIC_VBENCH_MAX_TURNS:-32} context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS:-49152} output_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS:-8192} tool_output_max_lines=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-native} tool_output_max_bytes=${AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-native} tasks=${AGENTIC_VBENCH_TASKS:-all}"
@@ -438,11 +751,14 @@ echo "job_local_cache_root=${job_local_cache_root}"
 # Record the AgenticVBench environment the Gym agent will read, for reproducibility.
 env | grep -E '^(AGENTIC_VBENCH_|AVB_DATA_ROOT|CLAW_EVAL_|TRAIN_PATH|VAL_PATH|MODEL_PATH|CONTEXT_COMPACTION|NEMO_RL_TMPE_|NRL_MEGATRON_|WANDB_MODE|WANDB_PROJECT|WANDB_ENTITY|TMPDIR|TORCHINDUCTOR_CACHE_DIR|TRITON_CACHE_DIR|CUDA_CACHE_PATH)' | grep -v -i 'key\|token\|secret' | sort > "${results_dir}/gym_environment.env"
 
+# Archive the exact executable commands for both real submissions and dry runs.
+# These contain paths and Hydra settings but no credential values.
+printf '%s\n' "${COMMAND}" > "${results_dir}/training_command.sh"
+printf '%s\n' "${SETUP_COMMAND}" > "${results_dir}/setup_command.sh"
+bash -n "${results_dir}/training_command.sh"
+bash -n "${results_dir}/setup_command.sh"
+
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
-  printf '%s\n' "${COMMAND}" > "${results_dir}/training_command.sh"
-  printf '%s\n' "${SETUP_COMMAND}" > "${results_dir}/setup_command.sh"
-  bash -n "${results_dir}/training_command.sh"
-  bash -n "${results_dir}/setup_command.sh"
   echo "driver_preview=${results_dir}/training_command.sh"
   printf 'sbatch '
   printf '%q ' "${submit_args[@]}"

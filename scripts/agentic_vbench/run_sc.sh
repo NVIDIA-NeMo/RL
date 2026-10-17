@@ -9,6 +9,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 code_dir=$(cd "$script_dir/../.." && pwd)
 gym_dir=$code_dir/3rdparty/Gym-workspace/Gym
+export LAUNCH_BENCHMARK=agentic_vbench
 export AVB_DATA_ROOT=${AVB_DATA_ROOT:-$code_dir/data/agentic_vbench}
 export AGENTIC_VBENCH_ROOT=${AGENTIC_VBENCH_ROOT:-$AVB_DATA_ROOT/agentic-vbench}
 export AGENTIC_VBENCH_HARBOR_PYTHON=${AGENTIC_VBENCH_HARBOR_PYTHON:-$AVB_DATA_ROOT/harbor-venv/bin/python}
