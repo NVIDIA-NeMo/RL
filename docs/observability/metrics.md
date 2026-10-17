@@ -1,14 +1,14 @@
 # Metrics
 
-NeMo-RL emits six namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), and per-host memory (`rl.host.memory.*`).
+NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
 
-Metrics are emitted **only when telemetry is exporting**. All of them are produced on the driver, which always exports: most pass through the driver's metrics logger, while `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer.
+Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver for most series, and the Single-Controller actor for `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — two prefixes are read, the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, so other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 
@@ -126,6 +126,85 @@ The vLLM request, KV-cache, controller-waiter, buffer-occupancy, and per-mutatio
 kind fields are diagnostic drill-down signals. They are useful when one of the
 primary throughput or barrier metrics regresses, but do not need to appear on
 the primary rollout checkpoint dashboard.
+
+## Rollout checkpoint metrics (`rl.checkpoint.*`)
+
+The `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries
+described above also reach Lens. They reuse the controller's existing
+measurements; telemetry does not retime the save or restore.
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.checkpoint.duration` | Histogram / seconds | `rl.checkpoint.operation` (`save`, `restore`) and `rl.checkpoint.phase` |
+| `rl.checkpoint.rows` | Gauge / rows | Latest replay, staging, or total snapshot rows |
+| `rl.checkpoint.groups` | Gauge / groups | Saved replay/ledger groups or restored complete/unfinished groups |
+| `rl.checkpoint.siblings` | Gauge / rollouts | Sealed siblings reused or unfinished siblings redispatched |
+| `rl.checkpoint.sidecar_bytes` | Gauge / bytes | Controller sidecar size |
+
+Every point carries `rl.checkpoint.operation`. Durations add
+`rl.checkpoint.phase`; the other series add `rl.checkpoint.category`:
+
+| Logger key | Metric | `operation` | `phase` / `category` |
+|---|---|---|---|
+| `total_save_seconds` | `rl.checkpoint.duration` | `save` | `total` |
+| `tq_save_seconds` | `rl.checkpoint.duration` | `save` | `tq` |
+| `barrier_wait_seconds` | `rl.checkpoint.duration` | `save` | `barrier_wait` |
+| `exclusive_hold_seconds` | `rl.checkpoint.duration` | `save` | `exclusive_hold` |
+| `sidecar_save_seconds` | `rl.checkpoint.duration` | `save` | `sidecar_save` |
+| `snapshot_commit_seconds` | `rl.checkpoint.duration` | `save` | `publication` |
+| `total_load_seconds` | `rl.checkpoint.duration` | `restore` | `total` |
+| `snapshot_resolution_seconds` | `rl.checkpoint.duration` | `restore` | `snapshot_resolution` |
+| `dataloader_load_seconds` | `rl.checkpoint.duration` | `restore` | `dataloader_load` |
+| `tq_load_seconds` | `rl.checkpoint.duration` | `restore` | `tq` |
+| `replay_metadata_load_seconds` | `rl.checkpoint.duration` | `restore` | `replay_metadata_load` |
+| `recovery_prepare_seconds` | `rl.checkpoint.duration` | `restore` | `recovery_prepare` |
+| `redispatch_schedule_seconds` | `rl.checkpoint.duration` | `restore` | `redispatch_schedule` |
+| `replay_rows` | `rl.checkpoint.rows` | `save` | `replay` |
+| `staging_rows` | `rl.checkpoint.rows` | `save` | `staging` |
+| `snapshot_rows` | `rl.checkpoint.rows` | `save` | `snapshot` |
+| `replay_groups` | `rl.checkpoint.groups` | `save` | `replay` |
+| `ledger_groups` | `rl.checkpoint.groups` | `save` | `ledger` |
+| `groups_complete_restored` | `rl.checkpoint.groups` | `restore` | `complete_restored` |
+| `groups_unfinished_found` | `rl.checkpoint.groups` | `restore` | `unfinished` |
+| `siblings_reused` | `rl.checkpoint.siblings` | `restore` | `reused` |
+| `siblings_rerun` | `rl.checkpoint.siblings` | `restore` | `rerun` |
+| `controller_sidecar_bytes` | `rl.checkpoint.sidecar_bytes` | `save` | `controller` |
+
+Missing phases are absent, not zero. Save phases nest inside `total` (barrier
+wait, exclusive hold, sidecar save and publication all overlap it, and `tq` sits
+inside exclusive hold), so **do not sum save phases into checkpoint latency or
+goodput**. Restore phases are disjoint and `total` is their sum, excluding
+`redispatch_schedule`, which is logged separately after the controller is ready.
+The restore total is not allocation-to-ready wall time. These metrics describe
+completed operations, not a pending checkpoint's current phase.
+
+All points come from the Single-Controller actor process. Percentile resolution
+depends on the SDK/exporter's aggregation and bucket boundaries. No step,
+checkpoint, rollout, or model-call IDs are metric labels.
+
+To find *which* save was slow, each completed save also emits one trace-only
+`rl.sc.rollout_checkpoint.save` span carrying the same fields plus the snapshot
+sequence and trainer step. See
+[Span groups — trace-only rollout checkpoint save](span-groups.md#trace-only-the-rollout-checkpoint-save).
+
+### Snapshot attempts
+
+The series above report completed operations only. Every periodic snapshot
+attempt, including skipped and failed ones, is also exported from the
+`rollout/checkpoint_outcome` dictionary:
+
+| Metric | Kind / unit | Dimensions and meaning |
+|---|---|---|
+| `rl.checkpoint.attempts` | Counter / attempts | `rl.checkpoint.outcome` (`completed`, `skipped`, `failed`) and `rl.checkpoint.reason` (`completed`, `missing_trainer_anchor`, `no_data_plane_mutations`, `optimizer_commit_in_progress`, `trainer_state_changed`, `timeout`, `io_error`, `invariant_error`) |
+| `rl.checkpoint.attempt_duration` | Histogram / seconds | `rl.checkpoint.outcome`; skips return quickly, so read completed attempts separately |
+| `rl.checkpoint.seconds_since_last_success` | Gauge / seconds | Age of the newest completed snapshot at each attempt; `0` on success, absent until the first success |
+
+Skipping is expected: a snapshot is only valid while the trainer is at a durable
+checkpoint step, so attempts after the next optimizer commit skip with
+`missing_trainer_anchor` until the following trainer checkpoint. If
+`outcome=skipped` climbs while `outcome=completed` stays at zero, snapshots are
+not completing; compare the snapshot interval with the trainer checkpoint
+cadence and step time. No attempts at all means the pump or telemetry is off.
 
 ## Async efficiency metrics (`rl.efficiency.*`)
 
