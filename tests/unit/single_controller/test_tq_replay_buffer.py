@@ -538,13 +538,16 @@ class TestTQReplayBufferReserveCommit:
         buf = _make_buffer(dp)
         observations = []
 
-        async def enrich(meta, record):
-            del record
+        async def enrich(meta, extra_env_info):
+            assert extra_env_info == {"agent_ref": {"name": "image_agent"}}
             observations.append((dp.depth(), list(buf.ready_list)))
             return meta.with_fields(["teacher_reference_logprobs"])
 
         buf.set_post_write_enricher(enrich)
-        meta = _add_group(buf, weight=3)
+        record = _make_record()
+        record.extra_env_info = {"agent_ref": {"name": "image_agent"}}
+        group_id = buf.reserve(weight_version=3)
+        meta = _run(buf.commit(group_id, record, 3, 3))
 
         assert observations == [(_N_GENS, [False])]
         assert "teacher_reference_logprobs" in meta.fields
@@ -1813,6 +1816,47 @@ class TestTQReplayBufferTokenCaptureMode:
         )
         with pytest.raises(ValueError, match="no live slot"):
             _run(_commit_finalized(buf, "ghost", meta, 0, 0))
+
+    @pytest.mark.parametrize("evict_target", [False, True])
+    def test_commit_finalized_rechecks_slot_after_enrichment(self, evict_target):
+        async def exercise():
+            buf = self._make_capture_buffer(MultiPartitionFakeDataPlaneClient())
+            previous = buf.reserve(weight_version=1)
+            target = buf.reserve(weight_version=2)
+            meta = KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=[f"{target}_g0"],
+                fields=["input_ids"],
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def enrich(meta, extra_env_info):
+                started.set()
+                await release.wait()
+                return meta.with_fields(["teacher_reference_logprobs"])
+
+            buf.set_post_write_enricher(enrich)
+            task = asyncio.create_task(_commit_finalized(buf, target, meta, 2, 3))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert buf.ready_list == [False, False]
+            assert buf.abort(target if evict_target else previous)
+            release.set()
+            if evict_target:
+                with pytest.raises(ValueError, match="evicted during enrichment"):
+                    await task
+                assert buf.group_ids == (previous,)
+                assert buf.ready_list == [False]
+                assert buf.meta_list == [None]
+            else:
+                enriched = await task
+                assert buf.group_ids == (target,)
+                assert buf.meta_list == [enriched]
+                assert "teacher_reference_logprobs" in enriched.fields
+                assert buf.ready_list == [True]
+
+        _run(exercise())
 
     def test_commit_finalized_verifies_full_plan_manifest_ownership(self):
         dp = MultiPartitionFakeDataPlaneClient()
