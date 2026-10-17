@@ -53,6 +53,20 @@ new container image is built.
 
 **Default on merge group / push to main**: L1.
 
+### PR platform selection
+
+Keep exactly one `CI:*` tier label. An optional, separate `CI-platform:h100`
+or `CI-platform:gb200` label selects the hardware for the normal bot-branch
+push run. With no platform label (or `CI-platform:all`), both platforms remain
+selected. Multiple or unrecognized `CI-platform:*` labels fail preflight.
+Platform selection preserves the selected tier and does not filter test names.
+After changing the platform label, trigger CI for the current SHA as above.
+
+Use this path when a platform-specific run must satisfy the PR's required
+checks. A `workflow_dispatch` run can validate the same code, but GitHub does
+not evaluate its job checks as required PR checks. Manual dispatch retains
+its explicit `test_platform` input.
+
 **Which label to attach when opening a PR:**
 
 | Changed paths / nature of change | Label |

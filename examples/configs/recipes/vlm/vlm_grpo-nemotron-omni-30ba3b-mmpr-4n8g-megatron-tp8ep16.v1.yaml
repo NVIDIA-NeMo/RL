@@ -33,10 +33,13 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 2
       load_format: auto
-      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
       gpu_memory_utilization: 0.6
     vllm_kwargs:
+      compilation_config:
+        # Restore vLLM's default; the parent disables this fusion only for its own A/B-tested setting.
+        pass_config:
+          fuse_allreduce_rms: true
       max_num_batched_tokens: 32768
       max_num_seqs: 512
 data:
