@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import types
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack, contextmanager
+from typing import Any
 
 import torch
 import vllm  # noqa: F401
@@ -75,6 +77,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             torch.accelerator.synchronize()
             return
         super()._synchronize_before_ipc_data_ack()
+
+    def _prepare_ipc_weight_buffer(
+        self, buffer: torch.Tensor, used_bytes: int
+    ) -> tuple[torch.Tensor, Callable[[Iterable[tuple[str, torch.Tensor]]], Any]]:
+        if self._is_real_quant_model():
+            # Own only the used bytes once: native reload can retain views until
+            # later packets complete a layer. Never reuse this owned storage.
+            return buffer[:used_bytes].clone(), self.model_runner.model.load_weights
+        return super()._prepare_ipc_weight_buffer(buffer, used_bytes)
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):

@@ -1031,6 +1031,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
     extension._load_weights = lambda _weights: None
+    extension.model_runner.model.load_weights = extension._load_weights
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -1060,18 +1061,23 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
-def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monkeypatch):
+@pytest.mark.parametrize("failure", [None, "prepare", "load"])
+def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
+    monkeypatch, failure
+):
     backend = _import_vllm_quant_backend(monkeypatch)
     base_backend = _base_vllm_backend()
     reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
     from nemo_rl.models.policy.utils import IPCProtocol
 
     payload_weight = torch.tensor([1.0, 2.0], dtype=torch.float32)
-    payload_buffer = payload_weight.view(torch.uint8)
     used_bytes = base_backend.calculate_aligned_size(payload_weight.nbytes)
+    payload_buffer = torch.zeros(used_bytes * 2, dtype=torch.uint8)
+    payload_buffer[: payload_weight.nbytes].view(torch.float32).copy_(payload_weight)
     loaded = []
     calls = []
     view_refs = []
+    ipc_refs = []
 
     class FakeSocket:
         def __init__(self):
@@ -1088,7 +1094,9 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
             return next(self.payloads)
 
         def send(self, payload):
-            if len(self.sent) < 2:
+            if failure is None:
+                assert all(ref() is None for ref in ipc_refs)
+            if len(self.sent) < 2 and failure is None:
                 assert view_refs
                 assert all(view_ref() is None for view_ref in view_refs)
                 calls.append("views_released")
@@ -1114,8 +1122,28 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))
+        if failure == "load":
+            raise RuntimeError("load failed")
 
-    extension._load_weights = load_weights
+    model.load_weights = load_weights
+    extension._load_weights = lambda _: pytest.fail("owned IPC must load directly")
+    original_prepare = extension._prepare_ipc_weight_buffer
+
+    def prepare_buffer(buffer, size):
+        if failure == "prepare":
+            raise RuntimeError("prepare failed")
+        return original_prepare(buffer, size)
+
+    extension._prepare_ipc_weight_buffer = prepare_buffer
+
+    def rebuild_buffer(ipc_handle, device_index):
+        buffer = payload_buffer[:]
+        ipc_refs.append(weakref.ref(buffer))
+        return buffer
+
+    def synchronize():
+        assert ipc_refs[-1]() is not None
+        calls.append("sync")
 
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
@@ -1135,7 +1163,7 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
     monkeypatch.setattr(
         base_backend,
         "rebuild_cuda_tensor_from_ipc",
-        lambda ipc_handle, device_index: payload_buffer,
+        rebuild_buffer,
     )
     monkeypatch.setattr(
         base_backend.torch.cuda,
@@ -1145,7 +1173,7 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
     monkeypatch.setattr(
         backend.torch.accelerator,
         "synchronize",
-        lambda: calls.append("sync"),
+        synchronize,
     )
     monkeypatch.setattr(
         base_backend.torch.cuda,
@@ -1157,27 +1185,91 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(monke
     )
     monkeypatch.setattr(base_backend.gc, "collect", lambda: calls.append("gc"))
 
-    assert extension.update_weights_via_ipc_zmq() is True
+    if failure is None:
+        assert extension.update_weights_via_ipc_zmq() is True
+    else:
+        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+            extension.update_weights_via_ipc_zmq()
 
     assert extension.zmq_socket.sent == [
         IPCProtocol.ACK.value.encode(),
         IPCProtocol.ACK.value.encode(),
         IPCProtocol.ACK.value.encode(),
     ]
-    assert [name for name, _ in loaded] == ["decoder.weight", "decoder.bias"]
+    assert [name for name, _ in loaded] == (
+        []
+        if failure == "prepare"
+        else ["decoder.weight"]
+        if failure == "load"
+        else ["decoder.weight", "decoder.bias"]
+    )
     for _, loaded_weight in loaded:
         torch.testing.assert_close(loaded_weight, payload_weight)
-    assert calls == [
-        ("initialize", model),
-        "sync",
-        "views_released",
-        "sync",
-        "views_released",
-        ("finalize", model, model_config),
-        "sync",
-        "gc",
-        "empty",
-    ]
+    if failure:
+        assert calls == [("initialize", model), "sync"]
+    else:
+        assert calls == [
+            ("initialize", model),
+            "sync",
+            "views_released",
+            "sync",
+            "views_released",
+            ("finalize", model, model_config),
+            "sync",
+            "gc",
+            "empty",
+        ]
+
+
+@pytest.mark.parametrize("real_quant", [False, True])
+def test_ipc_packet_ownership_preserves_deferred_views(monkeypatch, real_quant):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    pending = []
+    loader = lambda weights: pending.extend(weights)
+    extension.model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(load_weights=loader)
+    )
+    extension._load_weights = loader
+    extension._is_real_quant_model = lambda: real_quant
+    source = torch.arange(4096, dtype=torch.int32).view(torch.uint8)[512:]
+    used_bytes = 1024
+    clones = []
+    original_clone = torch.Tensor.clone
+
+    def clone(tensor, *args, **kwargs):
+        clones.append(tensor.numel())
+        return original_clone(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", clone)
+    buffer, load_weights = extension._prepare_ipc_weight_buffer(source, used_bytes)
+    assert buffer.numel() == (used_bytes if real_quant else source.numel())
+    assert clones == ([used_bytes] if real_quant else [])
+    assert (buffer is source) is (not real_quant)
+    load_weights(
+        [
+            ("first", buffer[:8].view(torch.int32)),
+            ("second", buffer[512:520].view(torch.int32)),
+        ]
+    )
+    assert (
+        pending[0][1].untyped_storage().data_ptr()
+        == pending[1][1].untyped_storage().data_ptr()
+    )
+    assert (
+        pending[0][1].untyped_storage().data_ptr()
+        == source.untyped_storage().data_ptr()
+    ) is (not real_quant)
+    source.zero_()
+    del buffer
+    torch.testing.assert_close(
+        pending[0][1],
+        torch.tensor([128, 129] if real_quant else [0, 0], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        pending[1][1],
+        torch.tensor([256, 257] if real_quant else [0, 0], dtype=torch.int32),
+    )
 
 
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):

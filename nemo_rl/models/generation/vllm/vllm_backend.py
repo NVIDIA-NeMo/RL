@@ -1237,6 +1237,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
 
+    def _prepare_ipc_weight_buffer(
+        self, buffer: torch.Tensor, used_bytes: int
+    ) -> tuple[torch.Tensor, Callable[[Iterable[tuple[str, torch.Tensor]]], Any]]:
+        """Select the storage and loader for one received IPC packet."""
+        return buffer, self._load_weights
+
     def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
         """Return this worker's transport-neutral checkpoint preparer."""
         return None
@@ -1414,6 +1420,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if preparer is not None:
             return self._update_weights_via_ipc_zmq_with_reload(preparer)
 
+        ipc_buffer = None
         buffer = None
         weight = None
         weights = None
@@ -1445,8 +1452,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         if batch_keys is None:
                             continue
 
-                        buffer = rebuild_cuda_tensor_from_ipc(
+                        ipc_buffer = rebuild_cuda_tensor_from_ipc(
                             ipc_handle, self.device.index
+                        )
+                        buffer, load_weights = self._prepare_ipc_weight_buffer(
+                            ipc_buffer, used_bytes
                         )
                         weights = []
                         offset = 0
@@ -1469,7 +1479,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
-                        self._load_weights(weights)
+                        load_weights(weights)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -1485,7 +1495,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     finally:
                         # Synchronize before releasing or ACKing an IPC allocation,
                         # including when a loader failed after scheduling CUDA work.
-                        if buffer is not None:
+                        if ipc_buffer is not None:
                             try:
                                 self._synchronize_before_ipc_data_ack()
                             except Exception as error:
@@ -1498,10 +1508,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             manifest.record_loaded(batch_keys)
 
                         # Drop every view before ACK permits sender-side reuse.
-                        del weight, weights, buffer
+                        del weight, weights, buffer, ipc_buffer
                         weight = None
                         weights = None
                         buffer = None
+                        ipc_buffer = None
                         self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
             gc.collect()
