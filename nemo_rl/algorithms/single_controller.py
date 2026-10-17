@@ -3582,12 +3582,13 @@ class SingleControllerActor:
                         )
                 else:
                     if forest_training and (
-                        groups_dispatched != self._algo_cfg.num_prompts_per_step
+                        groups_dispatched
+                        != self._target_groups_for_step(version_during_step)
                         or len(logical_owners)
-                        != self._master_config.policy["train_global_batch_size"]
+                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
                     ):
                         raise ValueError(
-                            "Forest optimizer step requires the full logical sample count"
+                            "Forest optimizer step requires complete retained logical groups"
                         )
                     if not step_open:
                         raise RuntimeError(

@@ -1532,8 +1532,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
-        if async_config.rollout_failure.min_step_batch_fraction != 1:
-            raise ValueError("forest training requires min_step_batch_fraction=1")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
         if master_config.checkpointing["enabled"]:
             raise ValueError(

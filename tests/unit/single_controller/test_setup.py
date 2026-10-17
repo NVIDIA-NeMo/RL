@@ -3266,11 +3266,6 @@ def forest_config():
         ("grpo.invalid_tool_call_advantage", 0.0, "message-level advantage"),
         ("grpo.malformed_thinking_advantage", 0.0, "message-level advantage"),
         ("token_capture.defer_routed_experts_to_policy", True, "direct routed-expert"),
-        (
-            "async_rl.rollout_failure.min_step_batch_fraction",
-            0.5,
-            "min_step_batch_fraction=1",
-        ),
         ("checkpointing.enabled", True, "pull/4200"),
         ("rollout_checkpointing.snapshot_attempt_interval_s", 60, "pull/4200"),
         ("reward_penalties.penalize_malformed_think_tag", True, "reward penalties"),
@@ -3338,3 +3333,15 @@ def test_setup_and_advantage_share_logprob_requirements(
         stage.policy_logprobs_required,
         stage.reference_logprobs_required,
     ) == expected
+
+
+@pytest.mark.parametrize("fraction", [0.5, 0.9, 1.0])
+def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
+    forest_config.async_rl.rollout_failure.min_step_batch_fraction = fraction
+    validate_single_controller_config(forest_config)
+
+
+def test_forest_startup_rejects_mismatched_configured_batch_size(forest_config):
+    forest_config.policy["train_global_batch_size"] += 1
+    with pytest.raises(ValueError, match="must equal policy.train_global_batch_size"):
+        validate_single_controller_config(forest_config)

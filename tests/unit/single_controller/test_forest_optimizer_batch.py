@@ -29,6 +29,7 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from tests.unit.single_controller.test_logical_advantage import _batch, _controller
 from tests.unit.single_controller.test_single_controller_actor import (
+    _DroppingSampler,
     _FullStepSampler,
     _NoOpTrainer,
     _SequenceSampler,
@@ -80,9 +81,7 @@ def _setup(
     ctrl._algo_cfg.max_num_steps = 1
     ctrl._master_config.grpo = ctrl._algo_cfg
     ctrl._master_config.loss_fn = stage._master_config.loss_fn
-    ctrl._master_config.policy = {
-        "train_global_batch_size": 5 if failure == "gbs" else 2 * num_prompts
-    }
+    ctrl._master_config.policy = {"train_global_batch_size": 2 * num_prompts}
     ctrl._master_config.token_capture = TokenCaptureConfig(
         enabled=True, forest_training=True
     )
@@ -239,7 +238,6 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
         ("duplicate", 1, "new, complete logical groups"),
         ("short", 1, "before a complete training step"),
         ("group_tally", 0, "new, complete logical groups"),
-        ("gbs", 2, "full logical sample count"),
         ("missing_segment", 0, "every segment exactly once"),
     ],
 )
@@ -255,3 +253,100 @@ def test_invalid_logical_batch_never_completes_optimizer_step(
     ctrl._sync_weights.assert_not_awaited()
     assert ctrl._trainer_version == ctrl._train_steps == ctrl._consumed_samples == 0
     assert set(ctrl._dp_client.list_sample_ids("train")) == initial_ids
+
+
+@pytest.mark.parametrize("credit_in_evict", [False, True])
+@pytest.mark.parametrize("padding", [False, True])
+def test_forest_partial_step_matches_same_survivors_in_a_full_step(
+    monkeypatch, credit_in_evict, padding
+):
+    """A drop changes the number of groups, not surviving owners' GRPO inputs."""
+    reference, _ = _setup(
+        monkeypatch,
+        batches=[_batch([("a", [(0.0, 2), (1.0, 1)])], padding=padding)],
+    )
+    partial, metas = _setup(monkeypatch, failure="short", padding=padding)
+    sampler = _DroppingSampler(metas[0], credit_in_evict=credit_in_evict)
+    sampler.ctrl = partial
+    partial._sampler = sampler
+    partial._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    partial._rollout_exhausted.clear()
+    captured = []
+    for ctrl in (reference, partial):
+        ids = ctrl._dp_client.list_sample_ids("train")
+        ctrl._dp_client.put_samples(
+            ids,
+            "train",
+            TensorDict(
+                {
+                    "input_ids": torch.arange(10, 10 + len(ids) * 3).reshape(
+                        len(ids), 3
+                    ),
+                    "input_lengths": torch.full((len(ids),), 3),
+                },
+                batch_size=[len(ids)],
+            ),
+        )
+
+        def collect(meta, *, train_fields):
+            captured.append(
+                ctrl._dp_client.get_samples(
+                    sample_ids=meta.sample_ids,
+                    partition_id=meta.partition_id,
+                    select_fields=list(train_fields),
+                ).clone()
+            )
+            return {}
+
+        ctrl._trainer.train_microbatches_from_meta.side_effect = collect
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+        ctrl._trainer.begin_train_step.assert_called_once_with(None)
+        ctrl._trainer.finish_train_step.assert_called_once_with()
+        ctrl._sync_weights.assert_awaited_once()
+        assert ctrl._trainer_version == ctrl._train_steps == ctrl._consumed_samples == 1
+        assert not ctrl._dp_client.list_sample_ids("train")
+    assert len(captured) == 2
+    for field in captured[0].keys():
+        torch.testing.assert_close(captured[0][field], captured[1][field])
+    assert captured[1]["advantages"].abs().sum() > 0
+    assert (captured[1]["sample_mask"][:, None] * captured[1]["token_mask"]).sum() == 6
+    assert reference._master_config.policy["train_global_batch_size"] == 2
+    assert partial._master_config.policy["train_global_batch_size"] == 4
+    metrics = partial._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["dropped_prompt_groups"] == 1
+    assert partial._batch_shortfall == {}
+
+
+@pytest.mark.parametrize("fraction,dropped", [(0.75, 1), (0.5, 2)])
+def test_forest_partial_step_enforces_floor_and_nonempty_batch(
+    monkeypatch, fraction, dropped
+):
+    ctrl, _ = _setup(monkeypatch)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
+    ctrl._batch_shortfall[0] = dropped
+    with pytest.raises(RuntimeError, match="below the floor"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    ctrl._trainer.train_microbatches_from_meta.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._trainer_version == ctrl._train_steps == 0
+
+
+@pytest.mark.parametrize("missing_sibling", [False, True])
+def test_forest_partial_step_still_requires_complete_retained_groups(
+    monkeypatch, missing_sibling
+):
+    batch = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=False)
+    meta, data = batch
+    indices = [0, 1] if missing_sibling else [0, 2]
+    ctrl, _ = _setup(monkeypatch, batches=[(meta.subset(indices), data[indices])])
+    ctrl._algo_cfg.num_prompts_per_step = 2
+    ctrl._master_config.policy["train_global_batch_size"] = 4
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    ctrl._batch_shortfall[0] = 1
+    with pytest.raises(
+        ValueError, match="every logical slot|every segment exactly once"
+    ):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    ctrl._trainer.train_microbatches_from_meta.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._trainer_version == ctrl._train_steps == 0
