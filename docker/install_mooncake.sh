@@ -35,13 +35,14 @@ set -euo pipefail
 # Without this a failure inside a $(...) command substitution would not abort the script.
 shopt -s inherit_errexit
 
-GO_VERSION=1.25.13
-GO_AMD64_SHA256=39042a078ea9ceebe3ecda4a7188f0f5b96e14a071d27923ba7f40b456e85ae3
-GO_ARM64_SHA256=adad240fcb6bd180cf973b4b7c747baf4ec81d08b7d40ca35940ee4531971490
+GO_VERSION=1.26.6
+GO_AMD64_SHA256=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89
+GO_ARM64_SHA256=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e
 ETCD_VERSION=3.5.33
-GO_TEXT_VERSION=0.39.0
-GO_NET_VERSION=0.56.0
-GRPC_VERSION=1.83.1
+GO_TEXT_VERSION=0.41.0
+# gRPC 1.83.2 requires x/net >= 0.58.0.
+GO_NET_VERSION=0.58.0
+GRPC_VERSION=1.83.2
 
 # Mooncake wheel versions this script knows how to patch, with the sha256 of the
 # matching GitHub source tarball (v<version>). The build fails for any other
