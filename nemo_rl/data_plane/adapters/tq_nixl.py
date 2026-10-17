@@ -37,7 +37,8 @@ creates the TQ controller: starts the BlobDirectory and the storage units
 resolves from ``storage_unit_placement``). ``transfer_queue.close`` does not stop
 third-party backends, so the owner calls :func:`shutdown` after it.
 
-**Manager.** Everything on the data path is inherited from ``KVStorageManager``.
+**Manager.** Everything on the data path is inherited from ``KVStorageManager``;
+checkpointing goes through :mod:`nemo_rl.data_plane.adapters.tq_nixl_checkpoint`.
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 
+from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import (
     LostBlobs,
@@ -653,6 +655,22 @@ class NixlStorageManager(KVStorageManager):
         # take that argument. KV managers only use ZMQ for the controller notify path,
         # so owning a private context is correct on both.
         super().__init__(controller_info, cfg)
+
+    # TQ calls these from its client event loop (sync wrappers block on them);
+    # the work is Ray RPCs plus file I/O, so run it off the loop.
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.save_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        await asyncio.to_thread(
+            tq_nixl_checkpoint.load_storage_checkpoint,
+            self.storage_client,
+            checkpoint_dir,
+        )
 
     def close(self) -> None:
         try:
