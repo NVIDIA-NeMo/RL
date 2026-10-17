@@ -336,7 +336,7 @@ def _store_with(ep_transfer_error: TransferError):
         timeout_ms=30_000,
     )
     st.placement = SimpleNamespace(order=lambda units, **kw: units)
-    st.node_id, st.timeout_s = "n0", 0.01
+    st.node_id, st.timeout_s, st.ssd = "n0", 0.01, False
     st._units, st._blob_unit = {0: unit}, {}
     st._refresh_units = lambda: None
     st._unit_dead = lambda unit_id: False  # a live unit: failures are retryable
@@ -362,7 +362,7 @@ def test_in_flight_hinted_read_fails_instead_of_refilling_the_same_buffer():
 
     st, _ = _store_with(TransferError("timed out", in_flight=True))
     pinned = []
-    st._read_pinned = lambda reqs, deadline=None: pinned.append(reqs)
+    st._read_pinned = lambda reqs, deadline=None, metas=None: pinned.append(reqs)
     meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
     scratch = (5000, memoryview(bytearray(64)))
     # Retryable (the unit is alive), but never refilled into the same buffer.
@@ -374,7 +374,7 @@ def test_in_flight_hinted_read_fails_instead_of_refilling_the_same_buffer():
 def test_failed_hinted_read_that_never_posted_falls_back_to_pinned():
     st, _ = _store_with(TransferError("no peer", in_flight=False))
     pinned = []
-    st._read_pinned = lambda reqs, deadline=None: pinned.append(reqs)
+    st._read_pinned = lambda reqs, deadline=None, metas=None: pinned.append(reqs)
     meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
     st.read({"b": [(0, 64, 1000)]}, {"b": meta}, (5000, memoryview(bytearray(64))))
     assert pinned == [{"b": [(0, 64, 1000)]}]
@@ -391,6 +391,7 @@ def _unit_abort():
         _mu=threading.RLock(),
         alloc_=alloc,
         retired_bytes=0,
+        ssd_dir=None,
         blobs={"b": BlobRec(off=off, nbytes=4096, refs=1, created_at=0.0)},
     )
     return cls.abort, unit, alloc

@@ -19,28 +19,15 @@ every exit drops exactly the holds taken. CPU-only, no Ray actor.
 import os
 import threading
 
-import numpy as np
 import pytest
 
 from nemo_rl.data_plane import nixl_storage_unit
-from nemo_rl.data_plane.nixl.allocator import SlabAllocator
+from tests.unit.data_plane._nixl_helpers import bare_unit
 
 
 def _unit(slab_bytes: int = 1 << 16):
-    cls = nixl_storage_unit.NixlStorageUnit.__ray_metadata__.modified_class
-    u = cls.__new__(cls)
-    u.unit_id = 0
-    u.read_pin_s = 0.0  # free at once, so the test sees the region come back
-    u.slab = np.zeros(slab_bytes, dtype=np.uint8)
-    u.alloc_ = SlabAllocator(slab_bytes)
-    u.blobs = {}
-    u._pins = {}
-    u.retired_bytes = 0
-    u._released_held = {}
-    u.checkpointing = False
-    u.clears_during_save = 0
-    u._mu = threading.RLock()
-    return u
+    # read_pin_s 0: free at once, so the test sees the region come back
+    return bare_unit(slab_bytes)
 
 
 def _put(u, blob_id: str, nbytes: int, fill: int) -> int:
