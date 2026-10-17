@@ -16,14 +16,19 @@ LAUNCHERS = (
 def test_subagent_launchers_require_and_validate_solution_schema() -> None:
     for launcher in LAUNCHERS:
         text = launcher.read_text()
-        assert "top-level JSON object with a segments list and never a bare JSON list" in text
+        assert (
+            "top-level JSON object with a segments list and never a bare JSON list"
+            in text
+        )
         assert (
             "use Python to assert solution.json parses as a top-level JSON object "
             "with a segments list containing only objects"
         ) in text
 
 
-def test_subagent_launchers_bound_observations_without_changing_training_horizon() -> None:
+def test_subagent_launchers_bound_observations_without_changing_training_horizon() -> (
+    None
+):
     for launcher in LAUNCHERS:
         text = launcher.read_text()
         assert "AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-400" in text
@@ -37,7 +42,9 @@ def test_subagent_launchers_bound_observations_without_changing_training_horizon
 def test_subagent_launchers_make_child_artifacts_scoreable_before_return() -> None:
     for launcher in LAUNCHERS:
         text = launcher.read_text()
-        assert "Delegate the complete video assembly task to the general subagent" in text
+        assert (
+            "Delegate the complete video assembly task to the general subagent" in text
+        )
         assert "create both required deliverables before returning" in text
         assert "do not repeat its visual analysis" in text
 
@@ -47,21 +54,31 @@ def test_subagent_launchers_bound_the_observed_timeout_loops() -> None:
         text = launcher.read_text()
         assert "Read every overview exactly once in one parallel read batch" in text
         assert "never create diagnostic or comparison images" in text
-        assert "Your very next response after the overview read results must call bash" in text
-        assert "do not tune timestamps frame counts or sub-frame MP4 duration rounding" in text
+        assert (
+            "Your very next response after the overview read results must call bash"
+            in text
+        )
+        assert (
+            "do not tune timestamps frame counts or sub-frame MP4 duration rounding"
+            in text
+        )
         assert "Do not use todowrite and do not retry cosmetic labels" in text
-        assert "immediate creation from existing work in at most four tool calls" in text
+        assert (
+            "immediate creation from existing work in at most four tool calls" in text
+        )
 
 
 def test_agentic_submission_rejects_an_occupied_task_backend() -> None:
     text = RUN_SC.read_text()
-    assert "mapfile -t existing_containers < <(docker ps -q)" in text
+    assert "mapfile -t existing_containers < <(docker ps -aq)" in text
+    assert "docker ps -a --format" in text
     assert "Task backend is not empty:" in text
     assert "Use a dedicated empty backend" in text
 
 
 def test_claweval_submission_rejects_an_occupied_task_backend() -> None:
     text = CLAW_RUN_SC.read_text()
-    assert "mapfile -t existing_containers < <(docker ps -q)" in text
+    assert "mapfile -t existing_containers < <(docker ps -aq)" in text
+    assert "docker ps -a --format" in text
     assert "ClawEval task backend is not empty:" in text
     assert "Use a dedicated empty backend" in text

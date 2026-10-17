@@ -124,6 +124,50 @@ if CLAW_EVAL_BACKEND=remote CLAW_EVAL_BACKEND_DIR="$tmp/incomplete-claw-backend"
 fi
 grep -Fq 'ClawEval Docker client missing:' "$tmp/incomplete-claw.out"
 
+# A stopped container is still occupied backend state: fixed container names,
+# task slots, and volumes can collide even though plain `docker ps` is empty.
+stale_backend=$tmp/stale-backend
+stale_docker=$tmp/stale-docker
+mkdir -p "$stale_backend" "$stale_docker/cli-plugins"
+printf 'DOCKER_HOST=tcp://fake.example:1\n' >"$stale_backend/client.env"
+cat >"$stale_docker/docker" <<'FAKE_DOCKER'
+#!/bin/bash
+set -euo pipefail
+case ${1:-} in
+  info) printf '4.9.3\n' ;;
+  ps)
+    if [[ " $* " == *' -aq '* ]]; then
+      printf 'stopped-container-id\n'
+    elif [[ " $* " == *' -a '* ]]; then
+      printf 'stopped-container-id stale-task Exited\n'
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+FAKE_DOCKER
+chmod +x "$stale_docker/docker"
+printf '#!/bin/bash\nexit 0\n' >"$stale_docker/cli-plugins/docker-compose"
+chmod +x "$stale_docker/cli-plugins/docker-compose"
+
+if AGENTIC_VBENCH_JUDGE_PROTOCOL= \
+  AGENTIC_VBENCH_BACKEND_DIR="$stale_backend" \
+  AGENTIC_VBENCH_DOCKER_CLI_DIR="$stale_docker" \
+  /bin/bash "$repo_dir/scripts/agentic_vbench/run_sc.sh" \
+  >"$tmp/stale-agentic.out" 2>&1; then
+  echo 'AgenticVBench accepted a backend with a stopped container' >&2
+  exit 1
+fi
+grep -Fq 'Task backend is not empty: 1 container(s)' "$tmp/stale-agentic.out"
+
+if CLAW_EVAL_BACKEND=remote CLAW_EVAL_BACKEND_DIR="$stale_backend" \
+  CLAW_EVAL_DOCKER_CLI_DIR="$stale_docker" \
+  /bin/bash "$repo_dir/scripts/claweval/run_sc.sh" \
+  >"$tmp/stale-claw.out" 2>&1; then
+  echo 'ClawEval accepted a backend with a stopped container' >&2
+  exit 1
+fi
+grep -Fq 'ClawEval task backend is not empty: 1 container(s)' "$tmp/stale-claw.out"
+
 create_fixture() {
   local root=$1 benchmark=$2 config=$3 train_data=$4 delegation=$5 subagent=$6
   local snapshot=$root/runtime_source manifest=$root/runtime_source_manifest.json

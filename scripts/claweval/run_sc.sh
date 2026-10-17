@@ -64,10 +64,10 @@ case $CLAW_EVAL_BACKEND in
         echo 'ERROR: ClawEval task backend is unreachable from this host' >&2
         exit 1
       }
-      mapfile -t existing_containers < <(docker ps -q)
+      mapfile -t existing_containers < <(docker ps -aq)
       if (( ${#existing_containers[@]} != 0 )); then
-        echo "ERROR: ClawEval task backend is not empty: ${#existing_containers[@]} running container(s) at $CLAW_EVAL_BACKEND_DIR" >&2
-        docker ps --format '{{.ID}} {{.Names}} {{.Status}}' >&2
+        echo "ERROR: ClawEval task backend is not empty: ${#existing_containers[@]} container(s) at $CLAW_EVAL_BACKEND_DIR" >&2
+        docker ps -a --format '{{.ID}} {{.Names}} {{.Status}}' >&2
         echo 'Use a dedicated empty backend or validate and clean stale containers before submission.' >&2
         exit 1
       fi
