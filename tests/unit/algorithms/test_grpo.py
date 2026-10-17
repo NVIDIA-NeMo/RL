@@ -5941,6 +5941,11 @@ class TestValidateFunction:
 class TestComputeAndApplySeqLogprobErrorMasking:
     """Tests for the compute_and_apply_seq_logprob_error_masking function."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        # These pure tensor tests do not need the module's environment fixture.
+        yield
+
     def _create_train_data(
         self,
         batch_size: int,
@@ -5990,6 +5995,20 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("threshold", [None, 2.0])
+    def test_support_filtered_tokenless_rows_are_excluded(self, threshold):
+        train_data = self._create_train_data(
+            2,
+            3,
+            torch.zeros(2, 3),
+            torch.zeros(2, 3),
+            token_mask=torch.tensor([[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]),
+        )
+        compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(2), threshold
+        )
+        torch.testing.assert_close(train_data["sample_mask"], torch.tensor([0.0, 1.0]))
 
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
@@ -6259,7 +6278,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
-        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""

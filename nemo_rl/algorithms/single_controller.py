@@ -5201,11 +5201,16 @@ class SingleControllerActor:
         if self._algo_cfg.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        final_sample_mask = final_sample_mask * token_mask[:, 1:].bool().any(dim=-1)
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
         if self._policy_logprobs_required:
+            if opd_module.get_opd_full_config(self._master_config) is not None:
+                # Full KL compares unfiltered policy with possibly filtered rollout
+                # logprobs. Their normalization gap is diagnostic, not model drift.
+                seq_logprob_error_threshold = None
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
