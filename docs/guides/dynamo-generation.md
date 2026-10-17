@@ -192,10 +192,17 @@ one node exchange KV over CUDA; across nodes NIXL needs a working UCX/RDMA
 path, which you can tune through `vllm_cfg.env_vars` (`UCX_TLS`,
 `UCX_NET_DEVICES`).
 
-Refit gives every engine of both roles the full weights. The drain before each
-refit pauses prefill engines first, so the decode engines are still running
-when they pull the KV for requests that prefill already finished. Decode
-engines are paused next, and resume runs in reverse order. Run the three-GPU
+Refit gives every engine of both roles the full weights. vLLM cannot drop KV
+that a decode engine is still receiving, so with
+`async_rl.recompute_kv_cache_after_weight_updates` (the default) the pause before
+each refit drains instead of freezing. It pauses prefill engines first, so the
+decode engines are still running when they pull the KV for requests that
+prefill already finished. Decode engines are paused once they have started
+every handed-off request, and resume runs in reverse order.
+`dynamo_cfg.control_timeout_s` bounds that drain, so it must be at least
+`dynamo_cfg.request_timeout_s`. With the flag false the fleet freezes in place
+instead, prefill first, and frozen requests keep the KV computed on the old
+weights. Run the three-GPU
 smoke (one training GPU, one prefill engine, one decode engine) with
 `examples/configs/grpo_math_1B_dynamo_disagg.yaml`.
 

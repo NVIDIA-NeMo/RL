@@ -94,16 +94,25 @@ aggregated serving, so startup waits for the expected count of each component.
 Unlike TRT-LLM's per-replica frontends, one Dynamo frontend routes across the
 whole fleet.
 
-The pre-refit drain is ordered. vLLM queues new requests on a paused engine. A
+A refit pause that clears caches cannot freeze a disaggregated fleet in place:
+vLLM's cache reset raises while a decode engine still holds a request waiting
+for remote KV, and a prefill engine still holds blocks it handed off. So with
+`clear_cache` the pause drains instead (`wait`), and without it the engines
+freeze (`keep`) in the same order.
+
+The drain is ordered. vLLM queues new requests on a paused engine. A
 prefill engine's `wait` drain also keeps stepping until decode has pulled every
 prompt KV it handed off. If decode were paused first, a request prefilled just
 before the drain would sit on the paused decode engine without pulling. The
 prefill engine's KV lease (30 s by default) would then expire and its blocks
 would be freed and cleared, and after resume decode would read those blocks;
 NIXL does not check a lease on a normal read. So prefill engines pause first,
-while decode is still running. Decode engines pause next, which drains every
-handed-off request. Resume runs decode first, so no new handoff waits on a
-paused decode engine.
+while decode is still running. vLLM's `wait` drain also counts only running
+requests and starts no waiting one, so a decode request still receiving its
+prompt KV would keep its blocks and fail the cache reset. Decode engines are
+therefore paused only once each reports `vllm:num_requests_waiting` of zero on
+its `/metrics`; with prefill paused, that queue only empties. Resume runs decode
+first, so no new handoff waits on a paused decode engine.
 
 Caches are cleared through `pause_generation(clear_cache=True)`, which fails
 loudly when vLLM cannot reset its prefix cache. Dynamo's `flush_cache` route

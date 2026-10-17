@@ -21,6 +21,7 @@ methods through Dynamo's per-worker ``/engine/*`` RL routes, which forward an
 NCCL, exactly as for the vLLM backend.
 """
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -31,6 +32,7 @@ from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.http_client import (
     format_dynamo_error,
+    http_get_text,
     http_post_json,
 )
 from nemo_rl.utils.staged_payload import encode_staged_payload
@@ -46,6 +48,11 @@ _UPDATE_ROUTE = "update_weights_from_distributed"
 _INIT_ROUTE_CLIENT_MARGIN_S = 30.0
 # Margin past a refit's own deadline for the HTTP call that carries it.
 _REFIT_CLIENT_MARGIN_S = 60.0
+# vLLM's gauge of every request an engine holds but is not running, including
+# those still receiving prompt KV; Dynamo serves it on each worker's /metrics.
+_WAITING_REQUESTS_METRIC = "vllm:num_requests_waiting"
+_HANDOFF_POLL_INTERVAL_S = 0.2
+_METRICS_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,27 @@ def _stage_and_post_worker_route(  # pragma: no cover
         )
     _post_route(system_url, _INIT_ROUTE, payload, timeout_s)
     return True
+
+
+def _waiting_requests(
+    workers: Sequence[DynamoWorkerEndpoint],
+) -> dict[str, float | None]:
+    """Each engine's waiting requests by admin URL; None when it cannot be read."""
+    # metrics.py imports this module.
+    from nemo_rl.models.generation.dynamo.metrics import parse_prometheus_metrics
+
+    waiting: dict[str, float | None] = {}
+    for worker in workers:
+        text = http_get_text(f"{worker.system_url}/metrics", _METRICS_TIMEOUT_S)
+        metrics = (
+            {}
+            if text is None
+            else parse_prometheus_metrics(text, (_WAITING_REQUESTS_METRIC,))
+        )
+        waiting[worker.system_url] = metrics.get(
+            _WAITING_REQUESTS_METRIC.replace(":", "_")
+        )
+    return waiting
 
 
 class DynamoRefitChannel:
@@ -403,6 +431,8 @@ class DynamoRefitChannel:
         prompt KV it handed off, so decode must still be running then. Pausing
         decode first would strand such a handoff until the prefill engine's KV
         lease expires, and after resume decode would read the freed blocks.
+        Decode is then paused once it has started every handoff
+        (``_wait_for_handoffs``).
         """
         prefill = tuple(worker for worker in self._workers if worker.role == "prefill")
         rest = tuple(worker for worker in self._workers if worker.role != "prefill")
@@ -437,12 +467,43 @@ class DynamoRefitChannel:
                 paused_workers.append(worker)
         return paused_workers, pause_errors
 
+    def _wait_for_handoffs(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
+        """Wait until no decode engine holds a request it has not started.
+
+        vLLM's ``wait`` pause drains only running requests and starts no waiting
+        one, so a request still receiving its prompt KV keeps its blocks and the
+        cache reset that completes the pause fails. Once every prefill engine has
+        drained nothing new is handed off, so each waiting queue only empties.
+        """
+        deadline = time.monotonic() + self._control_timeout_s
+        waiting = _waiting_requests(workers)
+        while any(count != 0 for count in waiting.values()):
+            if time.monotonic() >= deadline:
+                return [
+                    f"{url}: {_WAITING_REQUESTS_METRIC}={count} after "
+                    f"{self._control_timeout_s}s"
+                    for url, count in waiting.items()
+                    if count != 0
+                ]
+            time.sleep(_HANDOFF_POLL_INTERVAL_S)
+            waiting = _waiting_requests(workers)
+        return []
+
     def _pause_in_order(
         self, *, mode: str, clear_cache: bool, timeout_s: float
     ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Pause phase by phase, stopping at the first phase that fails."""
+        """Pause phase by phase, stopping at the first phase that fails.
+
+        A drain (``wait``) pauses decode only once it has started every prefill
+        handoff; a frozen (``keep``) prefill engine hands off nothing new, and a
+        frozen decode engine keeps any handoff it is still receiving.
+        """
         paused_workers: list[DynamoWorkerEndpoint] = []
-        for phase in self._drain_phases():
+        for index, phase in enumerate(self._drain_phases()):
+            if index > 0 and mode == "wait":
+                handoff_errors = self._wait_for_handoffs(phase)
+                if handoff_errors:
+                    return paused_workers, handoff_errors
             phase_paused, pause_errors = self._pause_workers(
                 phase, mode=mode, clear_cache=clear_cache, timeout_s=timeout_s
             )

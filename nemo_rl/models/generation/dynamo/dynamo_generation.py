@@ -182,6 +182,22 @@ class DynamoGeneration(GenerationInterface):
             )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
+        dynamo_cfg = generation["dynamo_cfg"]
+        if (
+            generation["disaggregation"]["enabled"]
+            and master_config.async_rl.recompute_kv_cache_after_weight_updates
+            and dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]
+        ):
+            # vLLM cannot drop KV a decode engine is still receiving, so a
+            # disaggregated fleet drains instead of freezing when it clears caches.
+            raise ValueError(
+                "policy.generation.dynamo_cfg.control_timeout_s "
+                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
+                f"({dynamo_cfg['request_timeout_s']}) with "
+                "policy.generation.disaggregation and "
+                "async_rl.recompute_kv_cache_after_weight_updates=true: it bounds "
+                "the pre-refit drain, which waits for running requests to finish."
+            )
         if (
             generation["vllm_cfg"]["enable_vllm_metrics_logger"]
             and master_config.rollout_checkpointing.telemetry_interval_s is None
