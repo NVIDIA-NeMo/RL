@@ -69,11 +69,10 @@ def shard_meta_for_dp(
         dynamic_batching_args: Dynamic-batching config dict; mutually exclusive with the above.
 
     Returns:
-        ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` is
-        the inverse permutation that maps DP-rank-order outputs back to
-        original ``meta.sample_ids`` order (feed to
-        ``BatchedDataDict.reorder_data`` post-aggregation); ``None`` if
-        no reorder occurred.
+        ``(per_rank_metas, unsorted_indices)``. ``unsorted_indices`` contains
+        the original-row index for each row in DP-rank concatenation order,
+        matching :meth:`BatchedDataDict.reorder_data`. ``None`` means no
+        reorder occurred.
     """
     n = len(meta.sample_ids)
     if n == 0:
@@ -163,14 +162,9 @@ def shard_meta_for_dp(
         # Only ``extra_info`` is per-shard rather than per-sample.
         out.append(replace(meta.subset(idx_list), extra_info=rank_extra))
 
-    # Build inverse permutation: unsorted[orig_idx] = position_in_aggregated.
-    # When workers' results are concatenated in DP-rank order, row `j` of
-    # the aggregate corresponds to original index `flat_idx[j]`. To restore
-    # original meta.sample_ids order, the caller does aggregated.reorder_data(
-    # unsorted_indices) — same contract as `_shard_for_logprob`.
+    # ``reorder_data`` expects the forward permutation: row `j` in the
+    # DP-rank-concatenated aggregate came from original row ``flat_idx[j]``.
     unsorted: Optional[list[int]] = None
     if flat_idx != list(range(n)):
-        unsorted = [0] * n
-        for new_pos, old_idx in enumerate(flat_idx):
-            unsorted[old_idx] = new_pos
+        unsorted = flat_idx
     return out, unsorted
