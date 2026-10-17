@@ -232,6 +232,17 @@ def test_not_applied_to_simple_backend(clean_env, fake_fabric):
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
 
 
+@pytest.mark.parametrize("preset", [None, "rc_x,self"])
+def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
+    """nixl refuses an unset UCX_TLS; fill an RDMA-only default, keep a launcher's."""
+    monkeypatch.delenv("UCX_TLS", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_TLS", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == (preset or "rc,self,sm")
+    assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
     """The whole point of the split: too-late must be loud, not silent.
 
