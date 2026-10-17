@@ -354,7 +354,7 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
 
 ### Config → behavior map
 
