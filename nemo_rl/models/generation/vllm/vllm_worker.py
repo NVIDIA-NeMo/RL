@@ -1541,7 +1541,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             return False
 
     def reset_prefix_cache(self) -> bool:
-        """Reset the prefix cache of vLLM engine."""
+        """Reset the prefix cache of vLLM engine.
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )

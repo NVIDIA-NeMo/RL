@@ -2267,7 +2267,12 @@ class VllmAsyncGenerationWorkerImpl(
             return False
 
     async def reset_prefix_cache_async(self) -> bool:
-        """Async version of reset_prefix_cache."""
+        """Reset the prefix cache of vLLM engine.
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )

@@ -665,36 +665,38 @@ def test_invalidate_kv_cache_requires_a_reported_success(
     assert generation.invalidate_kv_cache() is expected
 
 
+@pytest.mark.parametrize("engine_result", [True, False])
 def test_reset_prefix_cache_returns_engine_bool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, engine_result: bool
 ) -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": False}}
     worker.llm = MagicMock()
-    worker.llm.llm_engine.reset_prefix_cache.return_value = False
+    worker.llm.llm_engine.reset_prefix_cache.return_value = engine_result
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
         lambda: None,
     )
 
-    assert worker.reset_prefix_cache() is False
+    assert worker.reset_prefix_cache() is engine_result
     worker.llm.llm_engine.reset_prefix_cache.assert_called_once_with()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("engine_result", [True, False])
 async def test_reset_prefix_cache_async_returns_engine_bool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, engine_result: bool
 ) -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": True}}
     worker.llm = MagicMock()
-    worker.llm.reset_prefix_cache = AsyncMock(return_value=False)
+    worker.llm.reset_prefix_cache = AsyncMock(return_value=engine_result)
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
         lambda: None,
     )
 
-    assert await worker.reset_prefix_cache_async() is False
+    assert await worker.reset_prefix_cache_async() is engine_result
     worker.llm.reset_prefix_cache.assert_awaited_once_with()
 
 
