@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RUN_SC = ROOT / "scripts" / "agentic_vbench" / "run_sc.sh"
 LAUNCHERS = (
     ROOT / "scripts" / "agentic_vbench" / "debug_subagents_sync_8n.sh",
     ROOT / "scripts" / "agentic_vbench" / "debug_subagents_async_16n.sh",
@@ -38,3 +39,10 @@ def test_subagent_launchers_make_child_artifacts_scoreable_before_return() -> No
         assert "Delegate the complete video assembly task to the general subagent" in text
         assert "create both required deliverables before returning" in text
         assert "do not repeat its visual analysis" in text
+
+
+def test_agentic_submission_rejects_an_occupied_task_backend() -> None:
+    text = RUN_SC.read_text()
+    assert "mapfile -t existing_containers < <(docker ps -q)" in text
+    assert "Task backend is not empty:" in text
+    assert "Use a dedicated empty backend" in text

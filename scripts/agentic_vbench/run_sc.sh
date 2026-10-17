@@ -44,6 +44,13 @@ if [[ ${DRY_RUN:-0} != 1 ]]; then
     set -a; source "$AGENTIC_VBENCH_BACKEND_DIR/client.env"; set +a
     export DOCKER_CERT_PATH=$AGENTIC_VBENCH_BACKEND_DIR PATH=$AGENTIC_VBENCH_DOCKER_CLI_DIR:$PATH DOCKER_CONFIG=$AGENTIC_VBENCH_DOCKER_CLI_DIR
     docker info --format '{{.ServerVersion}}' >/dev/null || { echo 'Task backend is unreachable from this host' >&2; exit 1; }
+    mapfile -t existing_containers < <(docker ps -q)
+    if (( ${#existing_containers[@]} )); then
+      echo "Task backend is not empty: ${#existing_containers[@]} running container(s) at $AGENTIC_VBENCH_BACKEND_DIR" >&2
+      docker ps --format '{{.ID}} {{.Names}} {{.Status}}' >&2
+      echo 'Use a dedicated empty backend or remove only containers from the terminated run before submitting.' >&2
+      exit 1
+    fi
   )
 fi
 export AGENTIC_VBENCH_BACKEND_DIR=${AGENTIC_VBENCH_BACKEND_DIR:-}
