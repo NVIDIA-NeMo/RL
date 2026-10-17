@@ -51,6 +51,7 @@ from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -1307,6 +1308,10 @@ class AsyncNemoGymRolloutImpl:
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
+
+        Raises:
+            A row's transport-shaped failure only once the stream has ended, and a
+            data failure at once.
         """
         if dispatch_recorder is not None and admission_closed_rows is None:
             raise ValueError(
@@ -1316,6 +1321,7 @@ class AsyncNemoGymRolloutImpl:
         inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
+        row_failure: Optional[Exception] = None
 
         options: dict[str, Any] = {"num_returns": "streaming"}
         if self._forest_training:
@@ -1368,6 +1374,23 @@ class AsyncNemoGymRolloutImpl:
                 admission_closed_rows.add(rowidx)
                 if item.timing_metrics is not None:
                     env_timing_metrics = item.timing_metrics
+                continue
+            if isinstance(item, GymRowFailure):
+                rowidx = item.rowidx
+                if rowidx not in dispatched or rowidx in received:
+                    raise ValueError(
+                        f"NeMo-Gym failed row index {rowidx}, which is not an "
+                        f"outstanding row of this attempt ({sorted(dispatched)})"
+                    )
+                received.add(rowidx)
+                if classify_rollout_failure(item.error) is not FailureClass.INFRA:
+                    # The prompt fails as a whole; its other rows cannot save it.
+                    raise item.error
+                # Raised once the stream ends. The other rows keep running in
+                # Gym either way; ending the stream now would only re-send them
+                # while they still run.
+                if row_failure is None:
+                    row_failure = item.error
                 continue
             rowidx, resolved_agent_ref, result, timing_metrics = item
             # Validated against the original group, not the pending subset: on a
@@ -1422,6 +1445,8 @@ class AsyncNemoGymRolloutImpl:
             if timing_metrics is not None:
                 env_timing_metrics = timing_metrics
 
+        if row_failure is not None:
+            raise row_failure
         return env_timing_metrics
 
     async def _replace_unreturned_rows(

@@ -42,6 +42,7 @@ an actor are converted to a picklable member of this taxonomy *before* they cros
 from __future__ import annotations
 
 import enum
+from dataclasses import dataclass
 from typing import Any, Final, Optional
 
 import ray.exceptions
@@ -134,6 +135,21 @@ class GymAdmissionClosed(RolloutInfraFailure):
 
     def __str__(self) -> str:
         return self.detail
+
+
+@dataclass(frozen=True)
+class GymRowFailure:
+    """One row whose Gym ``/run`` failed, yielded so the rest of its stream continues.
+
+    The NemoGym actor yields this instead of raising: a raise ends the stream
+    for every row of the dispatch, while their ``/run``s keep going in Gym, and
+    the caller would then re-send rows that are still running.
+    """
+
+    rowidx: int
+    error: Exception
+    # The ``/run`` timing, when this failure was the run's last row.
+    timing_metrics: Optional[dict[str, Any]] = None
 
 
 class RolloutDataFailure(RolloutFailure):
