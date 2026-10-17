@@ -37,7 +37,8 @@ if [[ $target == */run_sc.sh ]]; then
     AGENTIC_VBENCH_COMPACTION_AUTO AGENTIC_VBENCH_COMPACTION_PRUNE \
     AGENTIC_VBENCH_TRAINING_MODE AGENTIC_VBENCH_SUBAGENTS_ENABLED \
     CLAW_EVAL_COMPACTION_AUTO CLAW_EVAL_COMPACTION_PRUNE \
-    CLAW_EVAL_TRAINING_MODE CLAW_EVAL_SUBAGENTS_ENABLED WANDB_PROJECT \
+    CLAW_EVAL_TRAINING_MODE CLAW_EVAL_SUBAGENTS_ENABLED \
+    AGENTIC_VBENCH_BACKEND CLAW_EVAL_BACKEND WANDB_PROJECT \
     NEMO_RL_TMPE_OUTLIER_THRESHOLD RUN_TMPE_OUTLIER_TESTS \
     NRL_ROUTER_REPLAY_VALIDATE NRL_R3_TRACE IMMUTABLE_SOURCE_SNAPSHOT \
     REQUIRE_FRESH_PROVENANCE TRAIN_PATH VAL_PATH; do
@@ -353,6 +354,8 @@ for output in "$tmp/agentic-exact-sync.out" "$tmp/claw-exact-sync.out"; do
   grep -Fqx 'CHECKPOINT_KEEP_TOP_K=null' "$output"
   grep -Fqx 'GENERATION_TENSOR_PARALLEL_SIZE=4' "$output"
 done
+grep -Fqx 'AGENTIC_VBENCH_BACKEND=remote' "$tmp/agentic-exact-sync.out"
+grep -Fqx 'CLAW_EVAL_BACKEND=remote' "$tmp/claw-exact-sync.out"
 grep -Fqx "TRAIN_PATH=$agentic_data" "$tmp/agentic-exact-sync.out"
 grep -Fqx "TRAIN_PATH=$claw_data" "$tmp/claw-exact-sync.out"
 grep -Fqx 'ARG=policy.generation.vllm_cfg.tensor_parallel_size=4' \
@@ -371,6 +374,18 @@ if RESULTS_DIR=/wrong /bin/bash \
   echo 'Exact Super sync20 launcher accepted a caller-owned result directory' >&2
   exit 1
 fi
+
+for backend_injection in \
+  'scripts/agentic_vbench/launch_subagents_super_sync20.sh AGENTIC_VBENCH_BACKEND=podman' \
+  'scripts/agentic_vbench/launch_subagents_super_async16.sh AGENTIC_VBENCH_BACKEND=podman' \
+  'scripts/claweval/launch_subagents_super_sync20.sh CLAW_EVAL_BACKEND=podman' \
+  'scripts/claweval/launch_subagents_super_async16.sh CLAW_EVAL_BACKEND=podman'; do
+  read -r wrapper backend_assignment <<<"$backend_injection"
+  if env "$backend_assignment" /bin/bash "$repo_dir/$wrapper" >/dev/null 2>&1; then
+    echo "$wrapper accepted a non-remote backend" >&2
+    exit 1
+  fi
+done
 
 # Exact Gate 2 must reject a substituted auditor even when the fake emits PASS.
 if SYNC_HEALTH_AUDITOR=$tmp/fake_health_auditor.py \

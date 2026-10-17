@@ -13,6 +13,11 @@ if [[ -n ${EXTRA_OVERRIDES:-} ]]; then
   echo "ERROR: this exact async launcher requires EXTRA_OVERRIDES to be empty" >&2
   exit 2
 fi
+if [[ ${CLAW_EVAL_BACKEND:-remote} != remote ]]; then
+  echo "ERROR: exact ClawEval Gate 2 requires CLAW_EVAL_BACKEND=remote" >&2
+  exit 2
+fi
+export CLAW_EVAL_BACKEND=remote
 : "${CLAW_EVAL_BACKEND_DIR:?Set CLAW_EVAL_BACKEND_DIR to a fresh dedicated live async backend}"
 : "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
 

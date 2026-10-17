@@ -13,6 +13,11 @@ if [[ -n ${EXTRA_OVERRIDES:-} ]]; then
   echo "ERROR: this exact async launcher requires EXTRA_OVERRIDES to be empty" >&2
   exit 2
 fi
+if [[ ${AGENTIC_VBENCH_BACKEND:-remote} != remote ]]; then
+  echo "ERROR: exact AgenticVBench Gate 2 requires AGENTIC_VBENCH_BACKEND=remote" >&2
+  exit 2
+fi
+export AGENTIC_VBENCH_BACKEND=remote
 : "${AGENTIC_VBENCH_BACKEND_DIR:?Set AGENTIC_VBENCH_BACKEND_DIR to a fresh dedicated live async backend}"
 : "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
 

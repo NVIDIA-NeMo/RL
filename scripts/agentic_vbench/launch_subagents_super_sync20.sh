@@ -13,6 +13,11 @@ if [[ -n ${EXTRA_OVERRIDES:-} ]]; then
   echo "ERROR: this exact gate launcher requires EXTRA_OVERRIDES to be empty" >&2
   exit 2
 fi
+if [[ ${AGENTIC_VBENCH_BACKEND:-remote} != remote ]]; then
+  echo "ERROR: exact AgenticVBench Gate 1 requires AGENTIC_VBENCH_BACKEND=remote" >&2
+  exit 2
+fi
+export AGENTIC_VBENCH_BACKEND=remote
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)

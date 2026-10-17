@@ -13,6 +13,11 @@ if [[ -n ${EXTRA_OVERRIDES:-} ]]; then
   echo "ERROR: this exact gate launcher requires EXTRA_OVERRIDES to be empty" >&2
   exit 2
 fi
+if [[ ${CLAW_EVAL_BACKEND:-remote} != remote ]]; then
+  echo "ERROR: exact ClawEval Gate 1 requires CLAW_EVAL_BACKEND=remote" >&2
+  exit 2
+fi
+export CLAW_EVAL_BACKEND=remote
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
