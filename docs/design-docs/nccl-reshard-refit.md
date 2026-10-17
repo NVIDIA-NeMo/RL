@@ -379,6 +379,21 @@ generation side maps those HF names onto whatever its own storage layout is.
   Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
 
+Parameter-spec construction lives in two stateless collections in the existing
+backend files. `MegatronReshardParamSpecCollection` provides `_default_param_spec`
+and `_grouped_expert_spec` for source hooks. `VllmReshardParamSpecCollection`
+provides `_direct_param_spec`, `_default_staged_param_spec`, and the separate
+MXFP8, blockwise FP8, and TRTLLM grouped-expert factories. Workers retain parameter
+discovery, validation, factory selection, map construction, and transport orchestration.
+
+The vLLM direct factory returns a hook-free spec whose base aliases the destination
+storage captured when the map is built. The staged factory resolves live parameter
+storage in `pre`, so it continues to support replacing that storage between refits.
+The TRTLLM factory receives the PP communicator rank, device, registered destination
+name, and existing full-HF loader callback explicitly. Each factory returns specs
+with their own parameter references and hook closures; neither collection stores
+worker state or a shared cache.
+
 **To extend to a new backend**, provide a destination map from canonical HF weights
 to that backend's local storage. Both backends implement this as
 `build_hf_to_local_param_map`; Megatron derives its targets from Bridge conversion tasks.

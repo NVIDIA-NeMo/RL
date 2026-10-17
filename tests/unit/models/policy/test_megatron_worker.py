@@ -1616,8 +1616,9 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
     monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", single_decode)
     monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    spec = worker._default_param_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
+    spec = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+        source, LocalHFParamSpec("gate", -2, 0, 2)
+    )
     assert spec.wire_dtype == torch.bfloat16
 
     for _ in range(2):
@@ -1644,7 +1645,6 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
 
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     sources = tuple(
         torch.arange(8, dtype=torch.uint8).reshape(4, 2) + offset for offset in (0, 16)
     )
@@ -1668,7 +1668,7 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     prefix = "model.layers.0.mlp.experts"
     groups = {
         (prefix, proj): [
-            worker._default_param_spec(
+            worker_module.MegatronReshardParamSpecCollection._default_param_spec(
                 source,
                 LocalHFParamSpec(f"{prefix}.{index}.{proj}.weight", -2, split, 2),
             )
@@ -1681,7 +1681,9 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
             assert member.base.tensor is source
             member.pre = MagicMock(side_effect=AssertionError("individual pre called"))
     grouped_specs = tuple(
-        worker._group_experts(proj, f"{prefix}.{proj}.weight", groups)
+        worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
+            proj, f"{prefix}.{proj}.weight", groups
+        )
         for proj in ("gate_proj", "up_proj")
     )
     grouped_decode.assert_not_called()
@@ -1782,7 +1784,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
                 name = f"{layer}.mlp.{proj}_proj.weight"
                 yield (
                     name,
-                    worker._default_param_spec(
+                    worker_module.MegatronReshardParamSpecCollection._default_param_spec(
                         source,
                         LocalHFParamSpec(name, -2, split_index, 2),
                     ),
@@ -1869,7 +1871,6 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
 
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         quantized_source = torch.arange(8, device="cuda", dtype=torch.uint8).reshape(
@@ -1888,11 +1889,11 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
         monkeypatch.setattr(
             worker_module, "_dequantize_refit_source_group", dequantize_group
         )
-        member = worker._default_param_spec(
+        member = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
             quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
         )
         prefix = "model.layers.0.mlp.experts"
-        grouped = worker._group_experts(
+        grouped = worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
             "gate_proj",
             f"{prefix}.gate_proj.weight",
             {(prefix, "gate_proj"): [member, member]},
