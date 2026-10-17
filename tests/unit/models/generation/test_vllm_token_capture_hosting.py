@@ -80,9 +80,12 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
 
 def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     sink = _MemorySink()
+    segment_sizes = []
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(name="dp_client"),
+        lambda dp_cfg, bootstrap, segment_size=None: (
+            segment_sizes.append(segment_size) or MagicMock(name="dp_client")
+        ),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
@@ -101,6 +104,8 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     )
 
     assert installed is True
+    # The capture client owns no Mooncake memory, so no save waits on vLLM.
+    assert segment_sizes == [0]
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert worker.token_capture.adapter is not None
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
@@ -125,7 +130,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     sink = _MemorySink()
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(),
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
@@ -560,7 +565,7 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
     )
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
-        lambda dp_cfg, bootstrap: MagicMock(),
+        lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
@@ -591,7 +596,6 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
             {
                 "message": {
                     "routed_experts": routes,
-                    "predecessor_tail_route": [[99]],
                 }
             }
         ]
@@ -605,9 +609,6 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
     extras = VLLMCaptureAdapter().extract_extras(payload)
     assert (
         decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
-        == routes[prev_len:]
+        == routes[max(0, prev_len - 1) :]
     )
-    if prev_len:
-        assert extras["predecessor_tail_route"] == [[prev_len - 1]]
-    else:
-        assert "predecessor_tail_route" not in extras
+    assert "predecessor_tail_route" not in extras

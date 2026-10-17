@@ -30,7 +30,7 @@ pytestmark = pytest.mark.nemo_gym
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_cls)
-    env._context_compaction = False
+    env._forest_training = False
     return env
 
 
@@ -217,7 +217,6 @@ def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted(
 def test_a_failed_call_keeps_pending_write_custody() -> None:
     """Failure masks the rollout without transferring unfinished writes to cleanup."""
     from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
-
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
@@ -292,14 +291,17 @@ def test_an_undrained_receipt_masks_instead_of_wedging() -> None:
     assert _receipt_staging_keys(receipt) == ["r0/c1"]
 
 
+@pytest.mark.parametrize("compaction", [False, True])
 def test_the_terminal_manifest_read_drains_an_in_flight_call(
     monkeypatch: pytest.MonkeyPatch,
+    compaction: bool,
 ) -> None:
     """A session ended at its budget can leave its last call executing in the
     engine; the terminal manifest read polls until the call resolves."""
     import nemo_rl.environments.nemo_gym as env_module
 
     env = _capture_env()
+    env._forest_training = compaction
     pending = {
         "rollout_id": "r0",
         "records": [],
@@ -319,6 +321,14 @@ def test_the_terminal_manifest_read_drains_an_in_flight_call(
     manifest = asyncio.run(env._drained_manifest("r0"))
     assert manifest["pending_call_ids"] == []
     assert env._control.await_count == 2
+    assert env._control.await_args_list[0].args == (
+        "POST" if compaction else "GET",
+        f"/training-token-capture/control/rollouts/r0/{'close' if compaction else 'manifest'}",
+    )
+    assert env._control.await_args_list[1].args == (
+        "GET",
+        "/training-token-capture/control/rollouts/r0/manifest",
+    )
 
 
 def test_the_drain_budget_bounds_the_wait(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -781,11 +791,13 @@ def test_public_postprocess_timeout_masks_without_taking_pending_write(
     assert keys == ["r0/c1"]
 
 
-def test_cc_failed_pending_was_already_masked() -> None:
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+def test_forest_failed_pending_was_already_masked(policy: str) -> None:
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
-    env._context_compaction, env.cfg = True, {}
+    env._forest_training, env.cfg = True, {}
+    env._selection_policy = policy
     pending = {
         "rollout_id": "r0",
         "records": [],

@@ -61,7 +61,7 @@ svg a text{text-decoration:underline;fill:var(--accent);font:10.5px ui-monospace
   <text class="lbl-b" x="42" y="338">1 row · 12 tokens · 4 tokens eligible for loss</text>
   <text class="mono" x="42" y="358">[10,11,1001,20,21,1002,30,31,1003,50,51,1005]</text>
   <text class="note" x="30" y="400">c4 is captured but unselected; it contributes no loss.</text>
-  <text class="note" x="30" y="418">Both panels use the CC-capable selected-forest path.</text>
+  <text class="note" x="30" y="418">Both panels use the selected-forest training path.</text>
   <text class="note" x="30" y="434">A rollout without a rewrite still produces just one row.</text>
 
   <!-- RIGHT lane -->

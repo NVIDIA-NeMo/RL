@@ -5,9 +5,11 @@
 Strict xfails document deferred provider shapes, not required forest behavior.
 """
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -18,13 +20,16 @@ from responses_api_models.vllm_model.tests import test_framework_context as gym
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     ActionOutputFlags,
     RolloutReassembler,
     RolloutSelection,
     SegmentReceipt,
 )
+from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.capture_context import decide_capture_input
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import PublicationDataPlane
 
 pytestmark = pytest.mark.nemo_gym
@@ -133,6 +138,233 @@ def assert_loss_once(forest: ForestCapture, selected: list, all_records: list) -
     assert counts == expected
 
 
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+def test_selection_policy_reuses_forest_publication(forest, policy, reverse_manifest):
+    # A -> abandoned B; A -> scored C; independent D -> E.
+    records, replies = forest.capture([None, 0, 0, None, 3])
+    accepted = [records[i] for i in (0, 2, 3, 4)]
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    original = env._drained_manifest
+
+    async def drained(owner):
+        manifest = await original(owner)
+        if reverse_manifest:
+            manifest["records"].reverse()
+        return manifest
+
+    env._drained_manifest = drained
+    output = ordinary([replies[i] for i in (0, 2, 3, 4)], terminal=replies[2]["id"])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    assert processed["receipt"]["terminal_model_call_id"] == records[2].model_call_id
+    selected = records if policy == "all_captured" else accepted
+    assert set(processed["logical_selection"].response_ids) == {
+        r.response_id for r in selected
+    }
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert result.meta is not None
+    assert_loss_once(forest, selected, records)
+
+
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "failed_leaf",
+        "failed_parent",
+        "failed_terminal",
+        "uncommitted",
+        "capture_lost",
+        "pending",
+    ],
+)
+def test_subagent_failures_reach_final_training_rows(
+    forest: ForestCapture,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    reverse_manifest: bool,
+    failure: str,
+) -> None:
+    from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+
+    # Main A -> B / retry C; worker D -> E / H;
+    # main compacts into F -> scored G. H completes after G.
+    records, replies = forest.capture([None, 0, 0, None, 3, None, 5, 3])
+    failed_index = {"failed_leaf": 2, "failed_parent": 3, "failed_terminal": 6}.get(
+        failure
+    )
+    pending = failure in ("uncommitted", "capture_lost", "pending")
+    if pending:
+        asyncio.run(forest.harness.ledger.begin_call("attempt", "lost"))
+        if failure != "pending":
+            asyncio.run(
+                forest.harness.ledger.record_failure(
+                    "attempt",
+                    "lost",
+                    "capture_lost"
+                    if failure == "capture_lost"
+                    else UNCOMMITTED_CALL_REASON,
+                )
+            )
+        # A failure does not acknowledge the worker's possible late write.
+        assert forest.harness.manifest("attempt").pending_call_ids == ["lost"]
+        forest.plane.rows["staged", "attempt/lost"] = forest.plane.rows[
+            "staged", records[0].staging_key
+        ].clone()
+    if failure == "pending":
+        monkeypatch.setattr("nemo_rl.environments.nemo_gym._CAPTURE_DRAIN_TIMEOUT_S", 0)
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    control = env._control
+
+    async def capture_control(method: str, path: str) -> dict:
+        manifest = await control(method, path)
+        if failed_index is not None:
+            for record in manifest["records"]:
+                if record["model_call_id"] == records[failed_index].model_call_id:
+                    record["response_status"] = "failed"
+        if reverse_manifest:
+            manifest["records"].reverse()
+        return manifest
+
+    env._control = AsyncMock(side_effect=capture_control)
+    accepted_indices = (0, 1, 3, 4, 5, 6, 7)
+    output = ordinary([replies[i] for i in accepted_indices], terminal=replies[6]["id"])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    masked = pending or failure in ("failed_parent", "failed_terminal")
+    assert processed["receipt"]["capture_poisoned"] is masked
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+        execution_row_multiple=4,
+    )
+    selected = (
+        records
+        if policy == "all_captured" and failure != "failed_leaf"
+        else [records[i] for i in accepted_indices]
+    )
+    assert_loss_once(forest, [] if masked else selected, records)
+    assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    assert {key for partition, key in forest.plane.rows if partition == "staged"} == (
+        {"attempt/lost"} if pending else set()
+    )
+
+
+def test_all_captured_does_not_require_returned_execution_history(forest):
+    records, replies = forest.capture([None, 0, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    # Explicit scored identity suffices; no output history is supplied.
+    result = {"terminal_response_id": replies[1]["id"], "reward": 1.0}
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    assert set(processed["logical_selection"].response_ids) == {
+        r.response_id for r in records
+    }
+    assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+
+
+@pytest.mark.parametrize("response_id", [None, "exporter-local-response"])
+@pytest.mark.parametrize("cumulative", [False, True])
+@pytest.mark.parametrize("unique_output", [False, True])
+def test_all_captured_attributes_exported_content(
+    forest, monkeypatch, response_id, cumulative, unique_output
+):
+    # The scored conversation ends before an independent worker completes.
+    # Exporter-local identities must not force selection of that later leaf.
+    if unique_output:
+        worker = gym.NeMoGymAsyncOpenAI.create_chat_completion
+
+        async def distinct_worker(client, **body):
+            payload = await worker(client, **body)
+            payload["choices"][0]["message"]["content"] += payload["id"]
+            return payload
+
+        monkeypatch.setattr(
+            gym.NeMoGymAsyncOpenAI, "create_chat_completion", distinct_worker
+        )
+    records, replies = forest.capture([None, 0, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    result = ordinary(replies[:2] if cumulative else [replies[1]])
+    result["response"]["id"] = response_id
+    result["response"]["output"] = [
+        {**item, "id": f"exporter-local-item-{index}"}
+        for index, item in enumerate(result["response"]["output"])
+    ]
+    result["reward"] = 1.0
+    if not cumulative and not unique_output:
+        # This fixture otherwise returns the same "answer" on every call.
+        # Its final text alone cannot identify which call was scored.
+        with pytest.raises(ValueError, match="content_ambiguous"):
+            asyncio.run(
+                env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+            )
+        assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
+        return
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+    assert set(processed["logical_selection"].response_ids) == {
+        record.response_id for record in records
+    }
+    finalized = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert finalized.valid_row_count == 2
+    assert_loss_once(forest, records, records)
+
+
+@pytest.mark.parametrize("contradictory", [False, True])
+def test_all_captured_never_guesses_scored_terminal(forest, contradictory):
+    records, replies = forest.capture([None, None])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    result = {"reward": 1.0}
+    if contradictory:
+        result.update(response=replies[0], terminal_response_id=replies[1]["id"])
+    with pytest.raises(ValueError, match="identifiable scored terminal"):
+        asyncio.run(
+            env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+        )
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_twenty_calls_keep_baseline_rows(forest: ForestCapture, compact: bool) -> None:
     parents = [None] + list(range(19))
@@ -231,7 +463,7 @@ def test_shared_forest_loss_and_gradient_match_independent_calls(
             "attempt",
             receipt([records[i] for i in indices], terminal=records[indices[-1]]),
             reward=1.0,
-            context_compaction=True,
+            forest_training=True,
         )
         for indices in ([0], [0, 1], [0, 2])
     ]
@@ -288,9 +520,6 @@ def test_excluded_leaf_preserves_selected_ancestor(forest: ForestCapture) -> Non
     assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
 
-@pytest.mark.xfail(
-    strict=True, raises=ValueError, reason="Selector requires global capture order"
-)
 def test_per_chain_envelopes_preserve_membership(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, None, 0, 1])
     result = {
@@ -303,11 +532,6 @@ def test_per_chain_envelopes_preserve_membership(forest: ForestCapture) -> None:
     assert {r.model_call_id for r in selected} == {r.model_call_id for r in records}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason="Scored terminal must be the last selected call",
-)
 def test_explicit_scored_parent_can_precede_worker(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, None, 0, 1])
     result = ordinary(replies)
@@ -337,7 +561,7 @@ def test_shared_paths_need_loss_ownership_beyond_planning(
             "attempt",
             row_receipt,
             reward=1.0,
-            context_compaction=True,
+            forest_training=True,
             action_flags=flags,
         )
         assert row.valid
@@ -364,6 +588,8 @@ def test_shared_paths_need_loss_ownership_beyond_planning(
         [1.0],
         [False],
         canonical_sample_ids=["group_g0"],
+        receipts=[receipt(records, terminal=records[-1])],
+        reward_checks=(None,),
     )
     assert prepared.valid_owner_count == 1
     assert all(row.valid for row in prepared.rows)
@@ -387,8 +613,13 @@ def test_invalid_selected_edges_fail_before_publication(
         "future": records[2].model_call_id,
     }[bad_parent]
     records[1] = records[1].model_copy(update={"parent_call_id": parent})
-    with pytest.raises(ValueError, match="selected predecessor"):
-        publish(forest, records, records)
+    if bad_parent == "future":
+        # Completion order is no longer proof against this edge. The capture
+        # digests still reject the forged parent and mask the owner.
+        assert publish(forest, records, records).valid_row_count == 0
+    else:
+        with pytest.raises(ValueError, match="selected predecessor|cycle"):
+            publish(forest, records, records)
     assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
 
 
@@ -440,8 +671,103 @@ def test_shared_plan_and_masks_survive_selection_serialization(
             [1.0],
             [False],
             canonical_sample_ids=["group_g0"],
+            receipts=[wire],
+            reward_checks=(None,),
         )
         for plan in plans
     ]
     assert prepared[0] == prepared[1]
     assert prepared[0].valid_owner_count == 1
+
+
+@pytest.mark.parametrize("parents", [[None, 0, 0], [None, 0, None], [None, None, 0, 1]])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_completion_order_does_not_change_selected_forest(
+    forest: ForestCapture, parents: list[int | None], reverse: bool
+) -> None:
+    records, replies = forest.capture(parents)
+    manifest = list(reversed(records)) if reverse else records
+    # Deliberately exercise a stronger permutation than real completion order:
+    # storage order is not an ancestry or accepted-history contract.
+    selected = select_captured_calls(manifest, ordinary(replies))
+    result = publish(forest, manifest, selected)
+    assert result.valid_row_count == 2
+    assert_loss_once(forest, selected, records)
+    first = forest.plane.rows["canonical", result.meta.sample_ids[0]]
+    assert first["input_ids"].tolist()[0][:2] == [10, 11]
+
+
+def test_all_captured_membership_uses_existing_planner_boundary(
+    forest: ForestCapture,
+) -> None:
+    records, _ = forest.capture([None, 0, 0, None, 3])
+    # A provider supplies membership directly; ordinary-history matching is
+    # not required by the shared planner. Terminal and membership are separate.
+    selected = [records[i] for i in (1, 2, 0, 4, 3)]
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(list(reversed(records)), terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(selected)],
+    )
+    assert result.valid_row_count == 3
+    assert_loss_once(forest, selected, records)
+
+
+@pytest.mark.parametrize("scored_index", [0, 1, 2, 3])
+def test_forest_shaping_and_observations_are_per_owner(
+    forest: ForestCapture, scored_index: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A shared root with two leaves plus a new root (compaction). The scored
+    # call can precede either endpoint, and must shape this owner's reward once.
+    complete = gym.RolloutTokenCapture.complete_call
+
+    def variable_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
+        generated = kwargs["generated_token_ids"]
+        generated *= generated[0] - 1000
+        kwargs["generated_logprobs"] = [-0.25] * len(generated)
+        return complete(capture, active, **kwargs)
+
+    monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", variable_completion)
+    records, _ = forest.capture([None, 0, 0, None])
+    forest.finalizer._effort_config = EffortLevelsConfig(
+        low_weight=1, low_penalty=1, low_ub=10, low_string="budget"
+    )
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[scored_index])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+        execution_row_multiple=4,
+        reward_checks=[RewardChecks(False, False, True)],
+        reward_log_contexts=[RewardLogContext("test-agent", None)],
+    )
+    assert result.valid_row_count == 3
+    assert len(result.meta.sample_ids) == 4
+    assert len(result.reward_observations) == 1
+    observation = result.reward_observations[0]
+    assert observation.sample_id == "group_g0"
+    assert observation.rollout_id == "attempt"
+    assert observation.reward == pytest.approx(2.0 - (scored_index + 1) / 10)
+    assert observation.log_context.agent_name == "test-agent"
+    assert result.metrics[f"finalize/effort/low/{scored_index + 1}"] == 1
+    for key in result.meta.sample_ids[:3]:
+        assert forest.plane.rows["canonical", key][
+            "total_reward"
+        ].item() == pytest.approx(2.0 - (scored_index + 1) / 10)
+    assert (
+        forest.plane.rows["canonical", result.meta.sample_ids[-1]][
+            "total_reward"
+        ].item()
+        == 0
+    )

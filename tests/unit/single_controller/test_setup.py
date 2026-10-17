@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -69,6 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
+    forest_execution_row_multiple,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -617,7 +619,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     )
     overrides = [
         "policy.model_name=Qwen/Qwen3-0.6B",
-        "policy.dtensor_cfg.enabled=false",
+        "policy.automodel_cfg.enabled=false",
         "policy.megatron_cfg.enabled=true",
         "policy.megatron_cfg.tensor_model_parallel_size=1",
         "policy.megatron_cfg.pipeline_model_parallel_size=1",
@@ -779,6 +781,33 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
+        with pytest.raises(
+            ValueError, match="does not support.*penalize_malformed_think_tag"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_capture_allows_text_and_token_penalties_without_warning(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+        assert not [w for w in caught if "reward_penalties" in str(w.message)]
 
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
@@ -1405,7 +1434,7 @@ class TestSetup:
                 "must equal policy.train_global_batch_size",
             ),
             ("buffer_capacity", ValueError, "required capacity"),
-            ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
+            ("megatron_automodel_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             (
@@ -1457,7 +1486,7 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
-        elif invalid_case == "megatron_dtensor_trainer":
+        elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
@@ -1886,8 +1915,9 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     @pytest.mark.parametrize("with_processor", [True, False])
+    @pytest.mark.parametrize("shaping_enabled", [False, True])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor
+        self, patched_factories, with_processor, shaping_enabled
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -1901,7 +1931,26 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
         mc.token_capture.enabled = True
+        effort = (
+            EffortLevelsConfig(
+                low_weight=1, low_penalty=2, low_ub=500, low_string="budget"
+            )
+            if shaping_enabled
+            else None
+        )
+        mc.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": effort.model_dump() if effort is not None else None
+            },
+        }
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -1934,6 +1983,8 @@ class TestSetup:
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_config.capture_media is with_processor
+        assert actor_config.reward_penalty_config == mc.reward_penalties
+        assert actor_config.effort_config == effort
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
@@ -2508,14 +2559,42 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
-@pytest.mark.parametrize("cc", [False, True])
+@pytest.mark.parametrize("packing", [False, True])
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_forest_row_multiple_depends_on_packing(packing: bool, logprobs: bool) -> None:
+    mc = _make_master_config(megatron_enabled=True)
+    mc.policy.update(
+        sequence_packing={"enabled": packing},
+        dynamic_batching={"enabled": False},
+        train_micro_batch_size=4,
+        logprob_batch_size=6,
+    )
+    assert forest_execution_row_multiple(
+        mc.policy, dp_size=2, logprobs_required=logprobs
+    ) == (2 if packing else (24 if logprobs else 8))
+    for invalid_dp in (0, -1, True):
+        with pytest.raises(ValueError, match="positive"):
+            forest_execution_row_multiple(
+                mc.policy, dp_size=invalid_dp, logprobs_required=logprobs
+            )
+    mc.policy["dynamic_batching"]["enabled"] = True
+    with pytest.raises(ValueError, match="non-interleaved Megatron"):
+        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+    mc.policy["dynamic_batching"]["enabled"] = False
+    mc.policy["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = 2
+    with pytest.raises(ValueError, match="non-interleaved Megatron"):
+        forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
+
+
+@pytest.mark.parametrize("forest_training", [False, True])
 @pytest.mark.parametrize("supported_router", [False, True])
-def test_cc_router_is_validated_before_rollout_manager(
-    patched_factories, cc: bool, supported_router: bool
+@pytest.mark.parametrize("packing", [False, True])
+def test_forest_router_is_validated_before_rollout_manager(
+    patched_factories, forest_training: bool, supported_router: bool, packing: bool
 ) -> None:
     mc = _make_master_config(megatron_enabled=True)
     mc.policy.update(
-        sequence_packing={"enabled": False},
+        sequence_packing={"enabled": packing},
         dynamic_batching={"enabled": False},
         train_micro_batch_size=1,
         logprob_batch_size=1,
@@ -2527,7 +2606,7 @@ def test_cc_router_is_validated_before_rollout_manager(
         top_k=None,
         vllm_cfg={"async_engine": True},
     )
-    mc.token_capture = TokenCaptureConfig(enabled=True, context_compaction=cc)
+    mc.token_capture = TokenCaptureConfig(enabled=True, forest_training=forest_training)
     mc.async_rl.rollout_failure.min_step_batch_fraction = 1
     trainer = patched_factories["fake_policy"]
     trainer.cfg = mc.policy
@@ -2556,18 +2635,18 @@ def test_cc_router_is_validated_before_rollout_manager(
             side_effect=lambda **kw: events.append("rollout_manager"),
         ),
     ):
-        if cc and not supported_router:
+        if forest_training and not supported_router:
             with pytest.raises(ValueError, match="unsafe router"):
                 setup_single_controller(mc, MagicMock(pad_token_id=0))
             assert events == ["validate_loaded_model"]
         else:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
-            assert events == (["validate_loaded_model"] if cc else []) + [
+            assert events == (["validate_loaded_model"] if forest_training else []) + [
                 "rollout_manager"
             ]
-    if cc:
+    if forest_training:
         trainer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "validate_cc_execution_padding"
+            "validate_forest_execution_padding"
         )
     else:
         trainer.worker_group.run_all_workers_single_data.assert_not_called()

@@ -48,7 +48,7 @@ from nemo_rl.experience.rollout_recovery import (
     _receipt_staging_keys,
 )
 from nemo_rl.models.generation.capture_context import decide_capture_input
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     capture_segment,
     finalize,
@@ -59,7 +59,7 @@ from tests.unit.experience.test_rollout_manager import (
     _make_capture_manager,
     _receipt_record,
 )
-from tests.unit.single_controller.test_cc_optimizer_batch import _setup
+from tests.unit.single_controller.test_forest_optimizer_batch import _setup
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -258,12 +258,17 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+@pytest.mark.parametrize("selection_policy", ["returned_history", "all_captured"])
 def test_transient_failure_recovers_full_cc_group_into_train_pump(
-    pipeline: tuple, monkeypatch: pytest.MonkeyPatch, granularity: RecoveryGranularity
+    pipeline: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+    granularity: RecoveryGranularity,
+    selection_policy: str,
 ) -> None:
     """Compose live retry, real capture/finalization and the controller train pump."""
     harness, plane, finalizer = pipeline
     env = _env(harness)
+    env._selection_policy = selection_policy
     manager = _make_capture_manager(
         _FakeCaptureBuffer(),
         retry_policy=RolloutRetryPolicy(
@@ -277,7 +282,7 @@ def test_transient_failure_recovers_full_cc_group_into_train_pump(
         ),
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     attempts: list[tuple[int, ...]] = []
     expected_tokens: dict[int, list[int]] = {}
 
@@ -500,7 +505,7 @@ def test_mixed_failed_owner_padding_replay_and_controller(
             ctrl._trainer.finish_train_step.assert_called_once()
             assert plane.list_sample_ids("train") == []
             assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
-        check.assert_called_once_with("validate_cc_execution_padding")
+        check.assert_called_once_with("validate_forest_execution_padding")
 
     asyncio.run(exercise())
 

@@ -3,9 +3,6 @@
 
 """Source rewrites and unsupported replay must be distinguished before splice."""
 
-import logging
-from copy import deepcopy
-
 import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
@@ -30,6 +27,7 @@ def candidate(items=None, **overrides):
         rollout_id="attempt",
         model_call_id="next",
         mode="candidate",
+        requires_empty_tool_content_equivalence=False,
         parent_call_id="previous",
         prev_len=3,
         required_prefix_token_ids=[10, 11, 2],
@@ -55,50 +53,6 @@ def test_compatible_request_preserves_prefix_and_links_delta_capture():
     assert decision.verify_retained_media
 
 
-@pytest.mark.parametrize("index, replacement", [(0, "summary"), (1, "answer")])
-def test_edited_history_or_removed_exposed_reasoning_renders_without_splice(
-    index, replacement
-):
-    items = [dict(item) for item in HISTORY] + [OBSERVATION]
-    items[index]["content"] = replacement
-    decision = decide_capture_input(candidate(items), messages=items)
-    assert decision.serving is None
-    assert decision.storage.mode == "text"
-
-
-def test_missing_render_evidence_is_not_a_rewrite():
-    admission = candidate(candidate_replay=summarize_replay(replay_context(HISTORY)))
-    with pytest.raises(ValueError, match="Missing predecessor"):
-        decide_capture_input(admission, messages=HISTORY + [OBSERVATION])
-
-
-def test_render_option_change_is_a_rewrite():
-    admission = candidate(
-        request_replay=replay_context(HISTORY + [OBSERVATION], render_digest="c" * 64)
-    )
-    assert (
-        decide_capture_input(admission, messages=HISTORY + [OBSERVATION]).serving
-        is None
-    )
-
-
-@pytest.mark.parametrize("suffix", [[], [{"role": "assistant", "content": "prefill"}]])
-def test_no_supported_observation_or_appended_assistant_roots_a_new_segment(
-    suffix, caplog
-):
-    with caplog.at_level(
-        logging.WARNING, logger="nemo_rl.models.generation.capture_context"
-    ):
-        decision = decide_capture_input(
-            candidate(HISTORY + suffix), messages=HISTORY + suffix
-        )
-    assert decision.storage.mode == "text"
-    assert decision.storage.parent_call_id is None
-    assert decision.serving is None
-    assert decision.verify_retained_media
-    assert "rooting a new segment" in caplog.text
-
-
 def test_an_unproven_response_boundary_roots_a_new_segment():
     decision = decide_capture_input(
         candidate(), messages=HISTORY + [OBSERVATION, HISTORY[-1]]
@@ -113,44 +67,6 @@ def test_ordinary_admission_is_unchanged():
     assert decision.storage is admission
     assert decision.serving is admission
     assert not decision.verify_retained_media
-
-
-@pytest.mark.parametrize(
-    "items", [[], HISTORY[:1], list(reversed(HISTORY)) + [OBSERVATION]]
-)
-def test_shortened_or_reordered_history_starts_a_root(items):
-    decision = decide_capture_input(candidate(items), messages=items)
-    assert decision.storage.mode == "text"
-    assert decision.serving is None
-
-
-@pytest.mark.parametrize("edited", [False, True])
-def test_long_history_checks_early_media_and_last_response(edited):
-    history = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_image", "image_url": "https://example.test/a.png"}
-            ],
-        },
-        HISTORY[1],
-    ] + [item for _ in range(127) for item in HISTORY]
-    current = [dict(item) for item in history] + [OBSERVATION]
-    if edited:
-        current[0] = {
-            "role": "user",
-            "content": [
-                {"type": "input_image", "image_url": "https://example.test/b.png"}
-            ],
-        }
-    admission = candidate(
-        current,
-        candidate_replay=summarize_replay(
-            replay_context(history, render_digest="b" * 64)
-        ),
-    )
-    decision = decide_capture_input(admission, messages=current)
-    assert decision.storage.mode == ("text" if edited else "token_in")
 
 
 def test_previous_array_format_and_unknown_normalization_fail_closed():
@@ -185,6 +101,7 @@ def test_empty_tool_content_needs_renderer_proof(before, after, qualified):
     items = tool_history(after) + [OBSERVATION]
     admission = candidate(
         items,
+        requires_empty_tool_content_equivalence=True,
         candidate_replay=summarize_replay(
             replay_context(tool_history(before), render_digest="b" * 64)
         ),
@@ -198,68 +115,201 @@ def test_empty_tool_content_needs_renderer_proof(before, after, qualified):
         assert decision.storage.parent_call_id == "previous"
 
 
-@pytest.mark.parametrize(
-    "edit",
-    ["text", "whitespace", "tool_id", "arguments", "reasoning", "render", "order"],
-)
-def test_empty_content_equivalence_does_not_hide_real_edits(edit):
-    items = tool_history("") + [OBSERVATION]
-    original = deepcopy(items)
-    if edit in ("text", "whitespace"):
-        items[1]["content"] = "changed" if edit == "text" else " "
-    elif edit == "tool_id":
-        items[1]["tool_calls"][0]["id"] = "different"
-    elif edit == "arguments":
-        items[1]["tool_calls"][0]["function"]["arguments"] = '{"x":2}'
-    elif edit == "reasoning":
-        items[1]["reasoning"] = "new reasoning"
-    elif edit == "order":
-        items[:2] = reversed(items[:2])
+@pytest.mark.parametrize("proof", [None, "false", 0])
+def test_missing_or_nonboolean_source_proof_fails_closed(proof):
+    with pytest.raises(ValidationError):
+        candidate(requires_empty_tool_content_equivalence=proof)
+
+
+def test_candidate_requires_parent_and_root_cannot_carry_candidate_proof():
+    with pytest.raises(ValidationError):
+        candidate(
+            parent_call_id=None,
+            prev_len=0,
+            required_prefix_token_ids=[],
+            parent_chain_hash=None,
+        )
+    with pytest.raises(ValidationError):
+        CaptureAdmission(
+            rollout_id="a",
+            model_call_id="b",
+            mode="text",
+            requires_empty_tool_content_equivalence=False,
+        )
+
+
+def test_managed_root_preserves_media_verification_without_serving_prefix():
+    admission = CaptureAdmission(
+        rollout_id="a",
+        model_call_id="b",
+        mode="text",
+        request_replay=replay_context(HISTORY, render_digest="b" * 64),
+    )
+    decision = decide_capture_input(admission, messages=HISTORY)
+    assert decision.serving is None
+    assert decision.storage.mode == "text"
+    assert decision.storage.parent_call_id is None
+    assert decision.verify_retained_media
+    with pytest.raises(ValueError, match="Missing current"):
+        decide_capture_input(
+            admission.model_copy(update={"request_replay": replay_context(HISTORY)}),
+            messages=HISTORY,
+        )
+
+
+def test_exact_source_match_does_not_require_renderer_equivalence():
+    items = tool_history(None) + [OBSERVATION]
     admission = candidate(
         items,
         candidate_replay=summarize_replay(
             replay_context(tool_history(None), render_digest="b" * 64)
         ),
     )
-    if edit == "render":
-        admission.request_replay.render_digest = "c" * 64
     assert (
         decide_capture_input(
-            admission, messages=items, allow_empty_tool_content=True
+            admission, messages=items, allow_empty_tool_content=False
         ).storage.mode
-        == "text"
+        == "token_in"
     )
-    assert original[1]["content"] == ""
 
 
-def test_old_strict_evidence_remains_usable_but_cannot_authorize_equivalence():
-    summary = summarize_replay(
-        replay_context(tool_history(None), render_digest="b" * 64)
+@pytest.mark.parametrize("root_cause", ["source", "options", "boundary"])
+def test_paired_root_append_root_append_keeps_exact_tokens(
+    monkeypatch, tmp_path, root_cause
+):
+    from responses_api_models.vllm_model.tests import test_framework_context as gym
+
+    from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+    from tests.unit.experience.test_logical_owner_finalization import (
+        PublicationDataPlane,
     )
-    summary.empty_tool_content_digest = None
-    for content, expected in [(None, "token_in"), ("", "text")]:
-        items = tool_history(content) + [OBSERVATION]
-        decision = decide_capture_input(
-            candidate(items, candidate_replay=summary),
-            messages=items,
-            allow_empty_tool_content=True,
-        )
-        assert decision.storage.mode == expected
+
+    plane = PublicationDataPlane()
+    source = TQTokenSource(plane, staging_partition="staged")
+    fetches = []
+    decisions = []
+
+    def fetch(keys):
+        fetches.append(list(keys))
+        return source.fetch_prefix_token_ids(keys)
+
+    def decide(admission, *, messages):
+        if root_cause == "boundary" and len(decisions) == 2:
+            messages = messages + [
+                {"role": "assistant", "content": "conversion moved the cut"}
+            ]
+        result = decide_capture_input(admission, messages=messages)
+        decisions.append(result)
+        return result
+
+    harness = gym.make_capture_harness(
+        monkeypatch,
+        tmp_path,
+        sink=TQTokenSink(plane, staging_partition="staged"),
+        fetch_prefix=fetch,
+        root_prompt=[10, 11],
+        decide_input=decide,
+    )
+    items = [{"role": "user", "content": "task"}]
+    for turn in range(4):
+        if turn == 2:
+            if root_cause == "source":
+                items = [{"role": "user", "content": "summary"}]
+            elif root_cause == "options":
+                harness.model.config.model = "changed-model"
+        response = gym.assert_clean(harness.post("attempt", items))
+        items += response["output"] + [{"role": "user", "content": "next"}]
+    manifest = harness.manifest("attempt")
+    records = manifest.records
+    assert not manifest.failures and not manifest.pending_call_ids
+    assert [r.parent_call_id for r in records] == [
+        None,
+        records[0].model_call_id,
+        None,
+        records[2].model_call_id,
+    ]
+    assert [r.prev_len for r in records] == [0, 3, 0, 3]
+    assert [r.cum_len for r in records] == [3, 6, 3, 6]
+    assert all(r.replay and r.replay.render_digest for r in records)
+    # Direct roots and worker downgrades never fetch a discarded parent prefix.
+    assert fetches == [[records[0].staging_key], [records[2].staging_key]]
+    assert all(d.verify_retained_media for d in decisions)
+    assert source.fetch_prefix_token_ids([r.staging_key for r in records[:2]]) == [
+        10,
+        11,
+        1001,
+        20,
+        21,
+        1002,
+    ]
+    assert source.fetch_prefix_token_ids([r.staging_key for r in records[2:]]) == [
+        10,
+        11,
+        1003,
+        40,
+        41,
+        1004,
+    ]
+    assert harness.worker_calls[2][0].mode == (
+        "candidate" if root_cause == "boundary" else "text"
+    )
 
 
-@pytest.mark.parametrize("role", ["user", "assistant", "tool"])
-def test_empty_equivalence_does_not_normalize_other_messages(role):
-    history = [{"role": role, "content": None}, HISTORY[1]]
-    items = [{"role": role, "content": ""}, HISTORY[1], OBSERVATION]
-    admission = candidate(
-        items,
-        candidate_replay=summarize_replay(
-            replay_context(history, render_digest="b" * 64)
-        ),
+@pytest.mark.asyncio
+async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
     )
-    assert (
-        decide_capture_input(
-            admission, messages=items, allow_empty_tool_content=True
-        ).storage.mode
-        == "text"
+    from tests.unit.models.generation.test_vllm_chat_template_wiring import (
+        _build_server,
+        _OnlineRenderer,
     )
+
+    renderer = _build_server(monkeypatch, {})[0][0]
+    renderer.renderer = SimpleNamespace()
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "token_capture", object(), raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", True, raising=False
+    )
+    capture_media = MagicMock(return_value=None)
+    begin = MagicMock()
+    fetch = MagicMock(side_effect=AssertionError("root must not fetch a prefix"))
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture_media
+    )
+    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_resolve_admission_prefix", fetch
+    )
+    prompt = {"prompt_token_ids": [10, 11]}
+
+    async def render(self, **kwargs):
+        assert kwargs["skip_mm_cache"]
+        return HISTORY, [prompt]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", render, raising=False)
+    admission = CaptureAdmission(
+        rollout_id="a",
+        model_call_id="b",
+        mode="text",
+        request_replay=replay_context(HISTORY, render_digest="b" * 64),
+    )
+    request = SimpleNamespace(
+        ng_capture=admission.model_dump(), required_prefix_token_ids=[999]
+    )
+    result = await renderer.preprocess_chat(request, HISTORY, None, "string", {})
+    assert request.required_prefix_token_ids is None
+    assert result[1][0] is prompt
+    fetch.assert_not_called()
+    capture_media.assert_called_once()
+    assert capture_media.call_args.kwargs["verify_retained_media"] is True
+    assert capture_media.call_args.kwargs["admission"].mode == "text"
+    begin.assert_called_once()
+    assert begin.call_args.args[1] == [10, 11]

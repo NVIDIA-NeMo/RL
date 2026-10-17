@@ -512,7 +512,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Under data_plane.backend=mooncake_cpu each worker is its own TQ client and
     # mounts a full global_segment_size + local_buffer_size, like each
     # token-capture finalizer; budget it on top of
-    # gpus_per_node x (segment + buffer).
+    # gpus_per_node x (segment + buffer). With storage units on
+    # (storage_unit_segment_size > 0) the segment is 0; only the buffer remains.
     num_advantage_workers: NonNegativeInt = 0
 
     @model_validator(mode="after")
@@ -665,11 +666,22 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
 
-    # Expect the shared Gym context-management result for every logical owner.
-    # CC mutations are single-attempt; ordinary capture keeps its retry policy.
+    # Reconstruct selected capture paths as rows of one logical rollout.
+    # Forest groups are single-attempt; ordinary capture keeps its retry policy.
     # Initially requires unit dataset loss weights and disables both trainer and
     # rollout checkpointing; ordinary capture retains those capabilities.
-    context_compaction: bool = False
+    forest_training: bool = False
+    # returned_history preserves the harness-selected trajectory (default).
+    # all_captured includes every captured call, including abandoned attempts.
+    selection_policy: Literal["returned_history", "all_captured"] = "returned_history"
+
+    @model_validator(mode="after")
+    def validate_selection_policy(self) -> "TokenCaptureConfig":
+        if self.selection_policy == "all_captured" and not self.forest_training:
+            raise ValueError(
+                "selection_policy=all_captured requires forest_training=true"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -870,8 +882,8 @@ class MasterConfig(BaseModel, extra="allow"):
         return self
 
 
-def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Keep the initial CC objective identical at startup and before fanout."""
+def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
+    """Keep the initial Forest objective identical at startup and before fanout."""
     if (
         grpo.adv_estimator.name != "grpo"
         or not loss.token_level_loss
@@ -879,9 +891,6 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         or loss.truncated_importance_sampling_type == "seq-mask-tis"
         or loss.use_kl_in_reward
         or loss.positive_example_nll_weight != 0
-        or grpo.advantage_clip_low is not None
-        or grpo.advantage_clip_high is not None
-        or grpo.seq_logprob_error_threshold is not None
         or grpo.use_dynamic_sampling
         or grpo.reward_shaping.enabled
         or grpo.reward_scaling.enabled
@@ -890,35 +899,39 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         or grpo.malformed_thinking_advantage is not None
     ):
         raise ValueError(
-            "CC requires standard token-level GRPO without advantage overrides"
+            "Forest requires standard token-level GRPO without advantage overrides"
         )
 
 
-def cc_execution_row_multiple(
+def forest_execution_row_multiple(
     policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
-    """Common row divisibility for the initial fixed-batch Megatron consumers.
+    """Common row divisibility for fixed or packed Megatron consumers.
 
     Policy and reference forwards share this trainer's mesh and logprob MBS.
+    Packed consumers form their own bins and only need complete DP shards.
     Non-interleaved PP admits any positive microbatch count; interleaved PP
-    and token-budget planners require separate qualification.
+    and dynamic batching require separate qualification.
     """
     if (
         not policy["megatron_cfg"]["enabled"]
-        or policy["sequence_packing"]["enabled"]
         or policy["dynamic_batching"]["enabled"]
         or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
         is not None
     ):
         raise ValueError(
-            "CC execution padding requires fixed-batch, non-interleaved Megatron"
+            "Forest execution padding requires fixed or packed, non-interleaved Megatron"
         )
+    if policy["sequence_packing"]["enabled"]:
+        if type(dp_size) is not int or dp_size < 1:
+            raise ValueError("Forest consumer DP size must be a positive integer")
+        return dp_size
     sizes = [policy["train_micro_batch_size"]]
     if logprobs_required:
         sizes.append(policy["logprob_batch_size"])
     if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
         raise ValueError(
-            "CC consumer DP and microbatch sizes must be positive integers"
+            "Forest consumer DP and microbatch sizes must be positive integers"
         )
     return dp_size * math.lcm(*sizes)
 
@@ -1179,6 +1192,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
             ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
+            # getattr: PPO's config has no length_penalty field.
+            ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
         if enabled
     ]
@@ -1264,6 +1279,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 )
         return
 
+    algo_cfg = cast(PPOConfig, algo_cfg)
     for name in ("value", "value_loss_fn"):
         if getattr(master_config, name, None) is None:
             raise ValueError(
@@ -1273,7 +1289,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
-    # model already on GPU. ppo_math_1B.yaml ships dtensor_cfg.enabled=true.
+    # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
@@ -1282,20 +1298,53 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # Each PPO epoch must consume the complete RL batch. Without this guard, every
-    # chunk would independently run the configured actor and critic optimizer steps.
-    if async_config.min_groups_for_streaming_train != algo_cfg.num_prompts_per_step:
-        raise ValueError(
-            "PPO on the SingleController path requires "
-            "async_rl.min_groups_for_streaming_train "
-            f"({async_config.min_groups_for_streaming_train}) == "
-            f"num_prompts_per_step ({algo_cfg.num_prompts_per_step}) so that each RL "
-            "step is assembled from a single chunk. Otherwise each chunk would "
-            "run ppo.critic_ppo_epochs critic optimizer steps and ppo.ppo_epochs "
-            "policy optimizer steps on only part of the RL batch. Streaming PPO "
-            "needs a split train API on the value workers, which they do not have "
-            "yet (#2625)."
-        )
+    policy_megatron_cfg = master_config.policy.get("megatron_cfg")
+    if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
+        # Policy chunks accumulate into one optimizer update; critic epochs
+        # still consume the complete batch after the final policy chunk.
+        if algo_cfg.ppo_epochs != 1:
+            raise ValueError(
+                "Streaming PPO requires ppo.ppo_epochs=1 when "
+                "async_rl.min_groups_for_streaming_train < ppo.num_prompts_per_step. "
+                f"Got ppo.ppo_epochs={algo_cfg.ppo_epochs}. Use a full-batch chunk "
+                "to run multiple policy epochs."
+            )
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "Streaming PPO requires a Megatron policy "
+                "(policy.megatron_cfg.enabled=true) to preserve accumulated "
+                "gradients across policy/value model switches."
+            )
+        policy_megatron_cfg = cast(MegatronConfig, policy_megatron_cfg)
+        ddp_config = policy_megatron_cfg.get("distributed_data_parallel_config")
+        if ddp_config is not None and (
+            ddp_config.get("use_custom_fsdp") or ddp_config.get("use_megatron_fsdp")
+        ):
+            raise ValueError(
+                "Streaming PPO requires classic Megatron DDP; policy gradient "
+                "offload during an open step does not support Megatron FSDP."
+            )
+        fp8_config = policy_megatron_cfg.get("fp8_cfg")
+        if (
+            fp8_config is not None
+            and fp8_config.get("enabled")
+            and fp8_config.get("fp8_param")
+            and fp8_config.get("fp8_recipe") == "mxfp8"
+            and policy_megatron_cfg["optimizer"]["use_distributed_optimizer"]
+        ):
+            raise ValueError(
+                "Streaming PPO does not support MXFP8 parameters with "
+                "the distributed optimizer: parameters and accumulated gradients "
+                "share storage even when overlap_param_gather=false. Disable "
+                "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
+            )
+        if algo_cfg.adv_estimator.normalize_advantages:
+            warnings.warn(
+                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
+                "normalizes GAE advantages per chunk instead of across the full "
+                "batch. Changing chunk boundaries can change normalized advantages.",
+                stacklevel=2,
+            )
 
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1313,15 +1362,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "inside the value workers (#2625)."
         )
 
-    policy_megatron_cfg = master_config.policy.get("megatron_cfg", {})  # type: ignore
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing["enabled"]
         and master_config.checkpointing["save_optimizer"]
+        and policy_megatron_cfg is not None
         and policy_megatron_cfg.get("enabled")
-        and policy_megatron_cfg.get("checkpoint", {}).get(
-            "ckpt_assume_constant_structure"
-        )
+        and cast(MegatronConfig, policy_megatron_cfg)
+        .get("checkpoint", {})
+        .get("ckpt_assume_constant_structure")
     ):
         raise ValueError(
             "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
@@ -1445,38 +1494,38 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
-    if token_capture_config.context_compaction:
+    if token_capture_config.forest_training:
         if master_config.grpo is None:
-            raise ValueError("context compaction requires GRPO")
+            raise ValueError("forest training requires GRPO")
         if not token_capture_config.enabled:
             raise ValueError(
-                "token_capture.context_compaction requires token_capture.enabled=true"
+                "token_capture.forest_training requires token_capture.enabled=true"
             )
         if (
             master_config.grpo.invalid_tool_call_advantage is not None
             or master_config.grpo.malformed_thinking_advantage is not None
         ):
             raise ValueError(
-                "context compaction does not support message-level advantage overrides"
+                "forest training does not support message-level advantage overrides"
             )
         if token_capture_config.defer_routed_experts_to_policy:
-            raise ValueError(
-                "context compaction requires direct routed-expert assembly"
-            )
+            raise ValueError("forest training requires direct routed-expert assembly")
         if async_config.rollout_failure.min_step_batch_fraction != 1:
-            raise ValueError("context compaction requires min_step_batch_fraction=1")
-        validate_cc_objective(master_config.grpo, master_config.loss_fn)
+            raise ValueError("forest training requires min_step_batch_fraction=1")
+        validate_forest_objective(master_config.grpo, master_config.loss_fn)
         if master_config.checkpointing["enabled"]:
-            raise ValueError("CC checkpoint/resume is not supported initially")
+            raise ValueError("Forest checkpoint/resume is not supported initially")
         if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
-            raise ValueError("CC rollout checkpoint/resume is not supported initially")
+            raise ValueError(
+                "Forest rollout checkpoint/resume is not supported initially"
+            )
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
-                "CC does not support reward penalties or on-policy distillation"
+                "Forest does not support reward penalties or on-policy distillation"
             )
         # Validate the fixed-batch policy shape before workers/generation start.
         # Setup recomputes Q from the actual trainer DP mesh.
-        cc_execution_row_multiple(
+        forest_execution_row_multiple(
             master_config.policy, dp_size=1, logprobs_required=True
         )
     if token_capture_config.defer_routed_experts_to_policy and not (
@@ -1496,15 +1545,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "async_rl.max_buffered_rollouts; excess finalizer actors cannot be busy",
             stacklevel=2,
         )
-    if token_capture_config.enabled and reward_penalties_enabled:
-        warnings.warn(
-            "reward_penalties are enabled but token-capture receipt rollouts "
-            "carry no generated tokens/text at rollout time, so the penalty "
-            "checks are skipped and capture-path rewards stay unpenalized "
-            "(penalty-rate metrics will read 0). Disable the reward_penalties "
-            "flags to make this explicit, or run without token capture to "
-            "train with penalized rewards.",
-            stacklevel=2,
+    if (
+        token_capture_config.enabled
+        and master_config.reward_penalties.penalize_malformed_think_tag
+    ):
+        raise ValueError(
+            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
         )
     if (
         token_capture_config.enabled
@@ -1603,6 +1649,7 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "on_policy_distillation.enabled=true."
         )
     if opd_enabled:
+        algo_cfg = cast(GRPOConfig, algo_cfg)
         opd_config = master_config.on_policy_distillation
         assert opd_config is not None
         if algo_cfg.adv_estimator.name != "opd":

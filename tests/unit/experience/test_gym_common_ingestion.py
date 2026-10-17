@@ -32,13 +32,13 @@ from nemo_rl.environments.gym_selection import select_captured_calls
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
-from tests.unit.experience.test_cc_dispatch import _env
 from tests.unit.experience.test_common_output_comparison import message, record
 from tests.unit.experience.test_external_exporter_compatibility import (
     ForkInstanceConfig,
     fork_exporter,  # noqa: F401
     response,
 )
+from tests.unit.experience.test_forest_dispatch import _env
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -80,11 +80,13 @@ def test_accepted_earlier_call_after_rejected_attempt_needs_no_parent_hint(
         ("response_status", "incomplete", "finish reason"),
     ],
 )
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
 def test_missing_capture_evidence_is_rejected(
     captured: Any,  # noqa: F811
     field: str,
     value: Any,
     error: str,  # noqa: F811
+    policy: str,
 ) -> None:  # noqa: F811
     captured.queue.append({"role": "assistant", "content": "answer", "reasoning": None})
     served = captured.harness.post(
@@ -95,6 +97,7 @@ def test_missing_capture_evidence_is_rejected(
     if field == "response_status" and value == "incomplete":
         manifest["records"][0]["finish_reason"] = None
     env = _env(captured.harness)
+    env._selection_policy = policy
     env._control = AsyncMock(return_value=manifest)
     with pytest.raises(ValueError, match=error):
         asyncio.run(
@@ -261,6 +264,36 @@ def test_response_collection_native_id_cannot_contradict_output() -> None:
             records,
             {"responses": [{"id": "response-1", "output": [second]}]},
         )
+
+
+@pytest.mark.parametrize("collection", [False, True])
+def test_native_envelope_accepts_scored_call_before_last_history_item(
+    collection: bool,
+) -> None:
+    first, scored, worker = [
+        message("same") | {"id": name} for name in ("first", "scored", "worker")
+    ]
+    records = [call(1, [first]), call(2, [worker]), call(3, [scored], parent=1)]
+    envelope = {"id": "response-3", "output": [first, scored, worker]}
+    result = {"responses": [envelope]} if collection else {"response": envelope}
+    assert select_captured_calls(records, result) == [
+        records[0],
+        records[2],
+        records[1],
+    ]
+
+
+def test_native_envelope_cannot_borrow_identity_from_previous_envelope() -> None:
+    first, second = message("first"), message("second")
+    records = [call(1, [first]), call(2, [second])]
+    result = {
+        "responses": [
+            {"id": "export", "output": [first]},
+            {"id": "response-1", "output": [second]},
+        ]
+    }
+    with pytest.raises(ValueError, match="Missing or ambiguous"):
+        select_captured_calls(records, result)
 
 
 def test_response_collection_native_id_identifies_cumulative_terminal() -> None:

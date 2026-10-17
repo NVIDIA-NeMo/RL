@@ -40,7 +40,7 @@ from responses_api_agents.simple_agent_with_compaction.tests.test_client import 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.common_output_comparison import selected_response_ids
-from tests.unit.experience.test_cc_dispatch import _env
+from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     PublicationDataPlane,
     decide_capture_input,

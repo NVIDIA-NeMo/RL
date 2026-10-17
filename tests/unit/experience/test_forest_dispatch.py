@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Preserve original CC actor replay guards under RL-owned selection."""
+"""Preserve original Forest actor replay guards under RL-owned selection."""
 
 import asyncio
 from copy import deepcopy
@@ -32,19 +32,22 @@ pytestmark = pytest.mark.nemo_gym
 
 def _env(harness):
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
-    env._context_compaction = True
+    env._forest_training = True
+    env._selection_policy = "returned_history"
     env.cfg = {}
 
     async def control(method, path):
-        assert method == "GET"
         capture_id = path.split("/")[-2]
+        if method == "POST" and path.endswith("/close"):
+            return await harness.ledger.close_admissions(capture_id)
+        assert method == "GET" and path.endswith("/manifest")
         return await harness.ledger.manifest(capture_id)
 
     env._control = AsyncMock(side_effect=control)
     return env
 
 
-def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
+def test_forest_row_stream_disables_ray_replay_and_row_redispatch():
     class Remote:
         def __init__(self):
             self.calls = 0
@@ -62,7 +65,7 @@ def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
 
     remote = Remote()
     impl = _make_gym_impl(remote, row_attempts=5)
-    impl._context_compaction = True
+    impl._forest_training = True
     with pytest.raises(GymTransportError, match="stream response lost"):
         asyncio.run(
             impl._run_rollouts(
@@ -74,7 +77,7 @@ def test_cc_row_stream_disables_ray_replay_and_row_redispatch():
 
 
 @pytest.mark.parametrize("failure_type", [GymTransportError, ValueError, TimeoutError])
-def test_cc_group_retries_infrastructure_failures_until_budget_exhausted(
+def test_forest_group_retries_infrastructure_failures_until_budget_exhausted(
     failure_type, monkeypatch
 ):
     attempts = []
@@ -98,7 +101,7 @@ def test_cc_group_retries_infrastructure_failures_until_budget_exhausted(
     manager = _make_capture_manager(
         buffer, retry_policy=policy, on_run=execute_then_lose_response
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     if failure_type is ValueError:
         with pytest.raises(ValueError, match="response lost"):
             asyncio.run(manager.generate_for_finalization({"idx": 1}))
@@ -117,7 +120,7 @@ def test_cc_group_retries_infrastructure_failures_until_budget_exhausted(
 @pytest.mark.parametrize(
     "granularity", [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP]
 )
-def test_cc_infra_retry_preserves_only_sealed_selections(granularity):
+def test_forest_infra_retry_preserves_only_sealed_selections(granularity):
     """Retry only missing siblings; discard unsealed selections on a group restart."""
     first_selection = RolloutSelection(("first",), (ActionOutputFlags(False, False),))
     retried_selection = RolloutSelection(
@@ -140,7 +143,7 @@ def test_cc_infra_retry_preserves_only_sealed_selections(granularity):
         retry_policy=policy,
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
 
     async def run_with_one_transient_failure(
         _sample, *, rollout_ids, generation_indices, on_completion, **_kwargs
@@ -188,7 +191,7 @@ def test_cc_infra_retry_preserves_only_sealed_selections(granularity):
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_cc_retry_discards_selection_if_sealing_fails(monkeypatch, granularity):
+def test_forest_retry_discards_selection_if_sealing_fails(monkeypatch, granularity):
     """A reported selection must not outlive its failed receipt seal."""
     manager = _make_capture_manager(
         _FakeCaptureBuffer(),
@@ -197,7 +200,7 @@ def test_cc_retry_discards_selection_if_sealing_fails(monkeypatch, granularity):
         ),
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     attempts = []
     selections = [
         RolloutSelection((name,), (ActionOutputFlags(False, False),))
@@ -237,7 +240,7 @@ def test_cc_retry_discards_selection_if_sealing_fails(monkeypatch, granularity):
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_cc_retry_after_all_siblings_sealed_does_not_replay(granularity):
+def test_forest_retry_after_all_siblings_sealed_does_not_replay(granularity):
     manager = _make_capture_manager(
         _FakeCaptureBuffer(),
         retry_policy=RolloutRetryPolicy.single_attempt(
@@ -245,7 +248,7 @@ def test_cc_retry_after_all_siblings_sealed_does_not_replay(granularity):
         ),
         recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     selection = RolloutSelection(("accepted",), (ActionOutputFlags(False, False),))
     attempts = []
 
@@ -264,7 +267,7 @@ def test_cc_retry_after_all_siblings_sealed_does_not_replay(granularity):
     assert manager.stats.skipped == 0
 
 
-def test_cc_cancellation_cleans_up_without_retry():
+def test_forest_cancellation_cleans_up_without_retry():
     buffer = _FakeCaptureBuffer()
     attempts = []
 
@@ -277,7 +280,7 @@ def test_cc_cancellation_cleans_up_without_retry():
         on_run=cancelled,
         retry_policy=RolloutRetryPolicy.single_attempt(max_infra_attempts=2),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(manager.generate_for_finalization({"idx": 1}))
     assert attempts == [1]
@@ -285,10 +288,10 @@ def test_cc_cancellation_cleans_up_without_retry():
     assert manager.stats.skipped == 0
 
 
-def test_cc_hung_stream_deadline_drops_group_and_cancels_collection():
+def test_forest_hung_stream_deadline_drops_group_and_cancels_collection():
     method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
     impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.01))
-    impl._context_compaction = True
+    impl._forest_training = True
 
     async def hung_stream(_sample):
         await impl._run_rollouts(_gym_rows(2), Timer(), "test")
@@ -304,17 +307,17 @@ def test_cc_hung_stream_deadline_drops_group_and_cancels_collection():
             max_consecutive_dropped_prompts=1,
         ),
     )
-    manager._context_compaction = True
+    manager._forest_training = True
     assert asyncio.run(manager.generate_for_finalization({"idx": 1})) is None
     assert method.cancelled == 1
     assert len(buffer.abort_calls) == 1 and not buffer.commit_calls
     assert manager.stats.skipped == 1
 
 
-def test_cc_seals_failed_owner_without_claiming_its_pending_write():
+def test_forest_seals_failed_owner_without_claiming_its_pending_write():
     buffer = _FakeCaptureBuffer()
     manager = _make_capture_manager(buffer)
-    manager._context_compaction = True
+    manager._forest_training = True
     manager._execution_row_multiple = 1
 
     async def completed(
@@ -354,8 +357,10 @@ def test_cc_seals_failed_owner_without_claiming_its_pending_write():
     assert not buffer.abort_calls
 
 
-@pytest.mark.parametrize("cc", [False, True])
-def test_actor_creation_preserves_foundation_no_replay_defaults(monkeypatch, cc):
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_actor_creation_preserves_foundation_no_replay_defaults(
+    monkeypatch, forest_training
+):
     # The foundation now disables replay on the actor declaration for all runs.
     assert NemoGym._default_options["max_restarts"] == 0
     assert NemoGym._default_options["max_task_retries"] == 0
@@ -376,7 +381,11 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(monkeypatch, cc)
         tokenizer=None,
         enable_router_replay=False,
         use_fastokens=False,
-        token_capture={"enabled": True, "context_compaction": cc},
+        token_capture={
+            "enabled": True,
+            "forest_training": forest_training,
+            "selection_policy": "returned_history",
+        },
     )
     assert created is actor
     expected = {"runtime_env": {"existing": "runtime"}}
@@ -385,12 +394,12 @@ def test_actor_creation_preserves_foundation_no_replay_defaults(monkeypatch, cc)
     actor.set_tokenizer.remote.assert_called_once_with(None)
 
 
-@pytest.mark.parametrize("mode", ["legacy", "capture", "cc"])
+@pytest.mark.parametrize("mode", ["legacy", "capture", "forest_training"])
 @pytest.mark.parametrize("top,nested", [(True, False), (False, True), (False, False)])
-def test_validity_normalization_is_confined_to_cc(
+def test_validity_normalization_is_confined_to_forest_training(
     mode: str, top: bool, nested: bool
 ) -> None:
-    """Ordinary streams preserve verifier output; CC projects its combined mask."""
+    """Ordinary streams preserve verifier output; Forest projects its combined mask."""
     row = {
         "_rowidx": 0,
         "_ng_rollout_id": "owner",
@@ -419,7 +428,7 @@ def test_validity_normalization_is_confined_to_cc(
     env.head_server_config = object()
     env._tokenizer = object()
     env._token_capture_enabled = mode != "legacy"
-    env._context_compaction = mode == "cc"
+    env._forest_training = mode == "forest_training"
     env._require_spinup = lambda: None
     # Token decoding and storage are irrelevant to verifier-field propagation.
     env._postprocess_nemo_gym_to_nemo_rl_result = lambda row, result, tokenizer, **kw: {
@@ -436,8 +445,8 @@ def test_validity_normalization_is_confined_to_cc(
 
     actual = asyncio.run(run())[0][2]["full_result"]
     assert actual["instance_config"]["mask_sample"] == (
-        top or nested if mode == "cc" else nested
+        top or nested if mode == "forest_training" else nested
     )
-    if mode != "cc":
+    if mode != "forest_training":
         assert actual == raw
     assert raw["instance_config"]["mask_sample"] == nested

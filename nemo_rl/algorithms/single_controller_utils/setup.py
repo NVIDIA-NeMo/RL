@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
 )
@@ -69,7 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
-    cc_execution_row_multiple,
+    forest_execution_row_multiple,
     is_ppo_run,
     validate_single_controller_config,
 )
@@ -179,6 +180,8 @@ class SingleControllerActorArgs:
     partition_includes_multimodal_fields: bool = False
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
+    # MooncakeStorageUnit actors; empty unless storage_unit_segment_size > 0.
+    storage_units: tuple[Any, ...] = ()
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -332,7 +335,7 @@ def _register_single_controller_partitions(
 
         partition_fields = fields_with_optional_routed_experts(
             SC_ROLLOUT_SCHEMA_FIELDS
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.forest_training
             else DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
@@ -686,6 +689,7 @@ def _build_trainer(
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
     checkpointing: bool,
+    storage_unit_node_ids: Optional[list[str]] = None,
     reserved_http_server_ports: Optional[dict[int, int]] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
@@ -698,6 +702,8 @@ def _build_trainer(
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
         checkpointing: Whether data-plane checkpoint save or restore is needed.
+        storage_unit_node_ids: Storage-unit plan for TQ's bootstrap, one Ray
+            node ID per unit; None when storage units are off.
         reserved_http_server_ports: Pre-published OpenAI server ports for NeMo Gym,
             keyed by the colocated Megatron trainer rank that adopts each one.
 
@@ -718,6 +724,7 @@ def _build_trainer(
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
         checkpointing=checkpointing,
+        storage_unit_node_ids=storage_unit_node_ids,
         reserved_http_server_ports=reserved_http_server_ports,
     )
     return trainer, time.perf_counter() - t0
@@ -1339,8 +1346,8 @@ def setup_single_controller(
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
     trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    if token_capture_cfg.context_compaction and trainer_checkpoint_path is not None:
-        raise ValueError("CC checkpoint/resume is not supported initially")
+    if token_capture_cfg.forest_training and trainer_checkpoint_path is not None:
+        raise ValueError("Forest checkpoint/resume is not supported initially")
     loaded_state = cast(
         Optional[dict[str, Any]],
         checkpointer.load_training_info(trainer_checkpoint_path),
@@ -1546,6 +1553,22 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
+    # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
+    # after the train/teacher claims above, and used twice: TQ's bootstrap in
+    # the trainer pins SimpleStorageUnits to it, and start_storage_units below
+    # starts the Mooncake units on it.
+    from nemo_rl.data_plane.mooncake_storage_unit import (
+        plan_storage_unit_nodes,
+        start_storage_units,
+    )
+
+    clusters_by_name: dict[str, RayVirtualCluster] = {
+        "train": train_cluster,
+        "inference": inference_cluster,
+        **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
+    }
+    storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
+
     # Create build tasks for generation / trainer / (nemo-gym) workers
     build_tasks: dict[str, Callable[[], Any]] = {}
     generation = None
@@ -1597,6 +1620,7 @@ def setup_single_controller(
                     and master_config.checkpointing.get("save_data_plane")
                 )
             ),
+            storage_unit_node_ids=storage_unit_node_ids,
             reserved_http_server_ports=reserved_http_server_ports,
         )
         if not is_ppo_run(master_config):
@@ -1940,6 +1964,8 @@ def setup_single_controller(
             partition_id=partition_id,
             include_multimodal_fields=processor is not None,
         )
+    # Mooncake memory owners when storage_unit_segment_size > 0.
+    storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
         # Both active backends stage canonical Gym rows in serving workers;
         # only vLLM workers stage captured media beside them (capture_media).
@@ -2011,6 +2037,10 @@ def setup_single_controller(
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
+                effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+                reward_penalty_config=RewardPenaltyConfig.model_validate(
+                    resolved_reward_penalty_config
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2033,12 +2063,12 @@ def setup_single_controller(
             advantage_estimator,
             num_workers=master_config.async_rl.num_advantage_workers,
         )
-    if token_capture_cfg.context_compaction:
+    if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
         # model before admitting rollouts, even if the first batch needs neither.
         ray.get(
             trainer.worker_group.run_all_workers_single_data(
-                "validate_cc_execution_padding"
+                "validate_forest_execution_padding"
             )
         )
     rollout_manager = RolloutManager(
@@ -2064,9 +2094,9 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
-        context_compaction=token_capture_cfg.context_compaction,
+        forest_training=token_capture_cfg.forest_training,
         execution_row_multiple=(
-            cc_execution_row_multiple(
+            forest_execution_row_multiple(
                 trainer.cfg,
                 dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
                 logprobs_required=(
@@ -2080,7 +2110,7 @@ def setup_single_controller(
                     )
                 ),
             )
-            if token_capture_cfg.context_compaction
+            if token_capture_cfg.forest_training
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
@@ -2114,6 +2144,7 @@ def setup_single_controller(
         bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
+        storage_units=storage_units,
         advantage_actors=advantage_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

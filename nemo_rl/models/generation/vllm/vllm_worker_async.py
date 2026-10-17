@@ -47,6 +47,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -550,7 +551,9 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
@@ -809,13 +812,12 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
-        message.pop("predecessor_tail_route", None)
         routed = message.get("routed_experts")
         if routed is None:
             return
@@ -843,11 +845,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
-            if prev_len:
-                # The previous generation's final token gets its decode route
-                # when this continuation processes it as a prompt token.
-                message["predecessor_tail_route"] = experts[prev_len - 1].tolist()
+            start = prev_len - boundary_route_rows(prev_len)
+            message["routed_experts"] = encode_routed_experts(experts[start:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -909,7 +908,6 @@ class VllmAsyncGenerationWorkerImpl(
                     "generation_token_ids",
                     "generation_log_probs",
                     "routed_experts",
-                    "predecessor_tail_route",
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
@@ -1112,7 +1110,10 @@ class VllmAsyncGenerationWorkerImpl(
                 admission = worker_self._capture_admission(request)
                 serving_admission = admission
                 verify_retained_media = False
-                if admission is not None and admission.mode == "candidate":
+                if admission is not None and (
+                    admission.mode == "candidate"
+                    or admission.request_replay is not None
+                ):
                     # Inline assistant token fields cannot override RL's decision.
                     request.required_prefix_token_ids = None
                     decision = decide_capture_input(
@@ -1120,7 +1121,7 @@ class VllmAsyncGenerationWorkerImpl(
                         messages=messages_for_replace_prefix_tokens,
                         # HF/string parsing maps null and empty tool content to
                         # identical template inputs. Structured content and
-                        # other renderers retain the strict source comparison.
+                        # other renderers cannot authorize that equivalence.
                         allow_empty_tool_content=(
                             type(self.renderer) is HfRenderer
                             and bool(res[0])

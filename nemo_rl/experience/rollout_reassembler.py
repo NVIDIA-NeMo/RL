@@ -38,7 +38,8 @@ import math
 import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from typing import Any, Optional, cast
+from graphlib import CycleError, TopologicalSorter
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
@@ -59,10 +60,18 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.reward_penalties import (
+    CAPTURE_PENALTIES,
+    FinalizedReward,
+    RewardChecks,
+    RewardLogContext,
+    finalize_capture_reward,
+)
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    boundary_route_rows,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (
@@ -73,6 +82,10 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @dataclass(frozen=True)
@@ -94,9 +107,11 @@ class FinalizedRollout:
     # the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
-    # Selected chain already proven by Gym; CC compares it to agent selection.
+    # Gym validates the receipt chain; RL validates selected-call membership.
     model_call_ids: tuple[str, ...] = ()
     media: Optional[dict[str, PackedTensor]] = None
+    penalty_counts: dict[str, int] = field(default_factory=dict)
+    reward_metrics: dict[str, float] = field(default_factory=dict)
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
 
 
@@ -110,7 +125,12 @@ class ActionOutputFlags:
 
 @dataclass(frozen=True)
 class RolloutSelection:
-    """Harness-independent ordered action selection within one capture attempt."""
+    """Eligible calls and flags within one attempt, independent of commit order.
+
+    Selection order determines root/path priority, including the grouping prompt;
+    parents determine reconstruction order. The receipt identifies the scored
+    terminal separately. Providers need not use Gym's accepted-history matcher.
+    """
 
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
@@ -124,7 +144,7 @@ class SegmentReceipt:
     capture_rollout_id: str
     receipt: Optional[dict[str, Any]]
     selected_response_ids: tuple[str, ...]
-    # Optional for ordinary slice callers; CC dispatch supplies semantic stops.
+    # Optional for ordinary slice callers; Forest dispatch supplies semantic stops.
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
@@ -151,6 +171,7 @@ class FinalizedGroup:
     staging_keys: list[str]
     canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
+    reward_observations: list[FinalizedReward] = field(default_factory=list)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
     # Policy decisions like a low valid-row fraction are no longer made here --
@@ -264,10 +285,14 @@ class RolloutReassembler:
         staging_partition: str,
         pad_token_id: int,
         max_seq_len: int,
+        reward_penalty_config: RewardPenaltyConfig | None = None,
+        effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
     ) -> None:
+        self._reward_penalty_config = reward_penalty_config
+        self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
         # Whether the staging partition carries media columns (setup's
@@ -304,9 +329,11 @@ class RolloutReassembler:
         receipt: Optional[dict[str, Any]],
         *,
         reward: float,
-        context_compaction: bool = False,
+        forest_training: bool = False,
         action_flags: tuple[ActionOutputFlags, ...] | None = None,
         loss_excluded_call_ids: frozenset[str] = frozenset(),
+        reward_checks: RewardChecks | None = None,
+        reward_call_id: str | None = None,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -361,7 +388,7 @@ class RolloutReassembler:
 
         fetch_fragments = (
             self._router_replay_enabled and not self._defer_routed_experts_to_policy
-        ) or (self._capture_media and context_compaction)
+        ) or (self._capture_media and forest_training)
         try:
             fetched = self._source.fetch_for_finalization(
                 staging_keys, include_route_fragments=fetch_fragments
@@ -397,6 +424,28 @@ class RolloutReassembler:
             NotImplementedError,
         ) as error:
             return rejected(f"rebuild_failed:{error}", staging_keys)
+        penalty_counts: dict[str, int] = {}
+        reward_metrics: dict[str, float] = {}
+        # Forest applies shaping once, using the scored call rather than an arbitrary
+        # graph endpoint. Other segments retain the same logical rollout reward.
+        if not forest_training or reward_call_id is not None:
+            reward_spans = row.link_spans
+            if reward_call_id is not None:
+                call_ids = [span[0] for span in reward_spans]
+                if reward_call_id not in call_ids:
+                    return rejected("reward_call_missing", staging_keys)
+                reward_spans = reward_spans[: call_ids.index(reward_call_id) + 1]
+            try:
+                reward, penalty_counts, reward_metrics = finalize_capture_reward(
+                    reward,
+                    checks=reward_checks,
+                    penalty_config=self._reward_penalty_config,
+                    effort_config=self._effort_config,
+                    token_ids=row.token_ids,
+                    link_spans=reward_spans,
+                )
+            except ValueError as error:
+                return rejected(f"reward_processing:{error}", staging_keys)
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
@@ -404,7 +453,7 @@ class RolloutReassembler:
         # terminal-chain calls carry pixels; one batched read pulls them,
         # after token verification so a rejected rollout never moves pixels.
         media, media_failure = self._resolve_media(
-            row, fetched_by_call, verify_occurrences=context_compaction
+            row, fetched_by_call, verify_occurrences=forest_training
         )
         if media_failure is not None:
             return rejected(media_failure, staging_keys)
@@ -431,7 +480,12 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                if item.routed_len not in (0, record.delta_len):
+                expected_routed_len = record.delta_len + boundary_route_rows(
+                    record.prev_len
+                )
+                if forest_training and item.routed_len == 0:
+                    return rejected("route_assembly:missing_fragment", staging_keys)
+                if item.routed_len not in (0, expected_routed_len):
                     return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
                 if generation_len < 0 or generation_len > record.delta_len:
                     return rejected(
@@ -449,6 +503,11 @@ class RolloutReassembler:
                         staged_route_len=item.routed_len,
                         extras_digest_version=commitment.extras_digest_version,
                         extras_digest=commitment.extras_digest,
+                        boundary_rows=(
+                            boundary_route_rows(record.prev_len)
+                            if item.routed_len
+                            else 0
+                        ),
                     )
                 )
             if sum(span.carry_len + span.generation_len for span in route_spans) != len(
@@ -471,9 +530,7 @@ class RolloutReassembler:
             # the published row carries the assembled tensor instead).
             route_plan = plan
             if not self._defer_routed_experts_to_policy:
-                routed_experts, failure = self._execute_direct_plan(
-                    plan, fetched, backpatch_predecessor_tail=context_compaction
-                )
+                routed_experts, failure = self._execute_direct_plan(plan, fetched)
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
 
@@ -524,6 +581,8 @@ class RolloutReassembler:
             media=media,
             model_call_ids=tuple(row.model_call_ids),
             output_masks=output_masks,
+            penalty_counts=penalty_counts,
+            reward_metrics=reward_metrics,
         )
 
     def _resolve_media(
@@ -582,8 +641,6 @@ class RolloutReassembler:
         self,
         plan: RouteAssemblyPlan,
         fetched: list[Any],
-        *,
-        backpatch_predecessor_tail: bool = False,
     ) -> tuple[Optional[torch.Tensor], Optional[str]]:
         """Run the shared executor eagerly with locally fetched fragments.
 
@@ -597,7 +654,7 @@ class RolloutReassembler:
             if item.fragment is not None
         }
         if not any(span.staged_route_len > 0 for span in plan.spans):
-            return None, "missing_fragment" if backpatch_predecessor_tail else None
+            return None, None
         if fragments:
             # Direct mode has no policy model in-process; the fragments'
             # own (num_moe_layers, topk) is the learned-dims heuristic, and
@@ -613,7 +670,6 @@ class RolloutReassembler:
             fragments,
             dims=self._routed_dims,
             canonical_len=plan.expected_token_length,
-            backpatch_predecessor_tail=backpatch_predecessor_tail,
         )
 
     # ── per group ───────────────────────────────────────────────────────────
@@ -632,6 +688,8 @@ class RolloutReassembler:
         canonical_sample_ids: Optional[list[str]] = None,
         logical_selections: Optional[list[RolloutSelection]] = None,
         execution_row_multiple: int = 1,
+        reward_checks: Optional[list[RewardChecks | None]] = None,
+        reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
     ) -> FinalizedGroup:
         """Publish one prompt group, with optional physical rows per logical owner.
 
@@ -657,18 +715,38 @@ class RolloutReassembler:
         assert len(canonical_sample_ids) == len(rollout_ids), (
             "canonical_sample_ids must be one per rollout"
         )
+        checks_by_rollout = (
+            tuple(reward_checks)
+            if reward_checks is not None
+            else (None,) * len(rollout_ids)
+        )
+        assert len(checks_by_rollout) == len(rollout_ids), (
+            "reward_checks must be one per rollout"
+        )
+        log_contexts = (
+            reward_log_contexts
+            if reward_log_contexts is not None
+            else [None] * len(rollout_ids)
+        )
+        assert len(log_contexts) == len(rollout_ids), (
+            "reward_log_contexts must be one per rollout"
+        )
         if type(execution_row_multiple) is not int or execution_row_multiple < 1:
             raise ValueError("execution_row_multiple must be a positive integer")
         if logical_selections is None and execution_row_multiple != 1:
-            raise ValueError("execution row padding requires logical CC segments")
+            raise ValueError("execution row padding requires logical Forest segments")
         if logical_selections is not None and loss_multiplier != 1.0:
-            raise ValueError("CC currently requires unit dataset loss_multiplier")
+            raise ValueError("Forest currently requires unit dataset loss_multiplier")
         _group_t0 = time.perf_counter()
         logical = None
         if logical_selections is None:
             rows = [
-                self.finalize_rollout(rollout_id, receipt, reward=reward)
-                for rollout_id, receipt, reward in zip(rollout_ids, receipts, rewards)
+                self.finalize_rollout(
+                    rollout_id, receipt, reward=reward, reward_checks=checks
+                )
+                for rollout_id, receipt, reward, checks in zip(
+                    rollout_ids, receipts, rewards, checks_by_rollout
+                )
             ]
         else:
             logical_segments = self._plan_selected_calls(
@@ -681,6 +759,8 @@ class RolloutReassembler:
                 rewards,
                 mask_sample,
                 canonical_sample_ids=canonical_sample_ids,
+                receipts=receipts,
+                reward_checks=checks_by_rollout,
             )
             rows = logical.rows
             # Keep every captured call cleanup-owned, including unselected roots.
@@ -718,6 +798,19 @@ class RolloutReassembler:
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
             )
+        # Per-row counts are pooled by the consuming controller once per
+        # committed group, alongside the retained reward observations;
+        # rejected placeholders never enter this population.
+        for row in valid_rows:
+            for name, value in row.reward_metrics.items():
+                metrics[name] = metrics.get(name, 0.0) + value
+        config = self._reward_penalty_config
+        if config is not None:
+            for spec in CAPTURE_PENALTIES:
+                if spec.enabled(config):
+                    metrics[f"finalize/penalty_count/{spec.name}"] = float(
+                        sum(row.penalty_counts.get(spec.name, 0) for row in valid_rows)
+                    )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -807,6 +900,25 @@ class RolloutReassembler:
                 count
             )
 
+        if logical is None:
+            reward_rows = list(enumerate(rows))
+        else:
+            reward_rows = [
+                (tag["logical_slot"], row)
+                for tag, row in zip(logical.tags, rows, strict=True)
+                if tag["segment_index"] == 0
+            ]
+        reward_observations = [
+            FinalizedReward(
+                canonical_sample_ids[slot],
+                rollout_ids[slot],
+                row.reward,
+                log_contexts[slot],
+            )
+            for slot, row in reward_rows
+            if row.valid
+        ]
+
         return self._publish_rows(
             group_id,
             rows,
@@ -817,6 +929,7 @@ class RolloutReassembler:
             staging_keys=staging_keys,
             metrics=metrics,
             rollouts_ms=_rollouts_ms,
+            reward_observations=reward_observations,
             logical=logical,
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
@@ -835,12 +948,13 @@ class RolloutReassembler:
         staging_keys: list[str],
         metrics: dict[str, float],
         rollouts_ms: float,
+        reward_observations: list[FinalizedReward],
         logical: Optional[_LogicalRows],
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
         loss_multiplier: float,
     ) -> FinalizedGroup:
-        """Shared ordinary/CC tensorization, single publication, and cleanup."""
+        """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
         real_row_count = len(rows)
         if logical is not None:
@@ -854,7 +968,7 @@ class RolloutReassembler:
                     staging_keys=[],
                     metrics=metrics,
                     dropped=True,
-                    drop_reason="CC group has no verified input layout for dummy rows",
+                    drop_reason="Forest group has no verified input layout for dummy rows",
                 )
             padding_count = (-real_row_count) % execution_row_multiple
             dummy_layout = valid_rows[0]
@@ -919,7 +1033,7 @@ class RolloutReassembler:
         if logical is None:
             prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
         else:
-            # Original per-owner prompts, never a later compacted segment prompt.
+            # Original per-owner prompts, never a later segment prompt.
             prompt_ids_for_adv = torch.nested.as_nested_tensor(
                 [
                     torch.tensor(prompt, dtype=torch.int64)
@@ -1084,6 +1198,7 @@ class RolloutReassembler:
                 int(mask) for row in valid_rows for mask in row.token_mask
             ),
             metrics=metrics,
+            reward_observations=reward_observations,
             valid_row_count=len(valid_rows),
             total_row_count=real_row_count,
         )
@@ -1143,30 +1258,40 @@ class RolloutReassembler:
                 raise ValueError(
                     "Selected response is missing or ambiguous in the capture manifest"
                 )
+            # Selection supplies membership and semantic root order. Completion
+            # order in the manifest says nothing about independent branches.
             positions = {
-                record.response_id: index
-                for index, record in enumerate(parsed.manifest)
+                response_id: index for index, response_id in enumerate(selected)
             }
-            if [positions[item] for item in selected] != sorted(
-                positions[item] for item in selected
-            ):
-                raise ValueError("Selected responses must preserve capture order")
-            if by_response[selected[-1]].model_call_id != parsed.terminal_model_call_id:
-                raise ValueError("Selected terminal differs from the scored receipt")
-            selected_records = [by_response[response_id] for response_id in selected]
-            by_call = {record.model_call_id: record for record in selected_records}
+            by_call = {by_response[r].model_call_id: by_response[r] for r in selected}
+            if parsed.terminal_model_call_id not in by_call:
+                raise ValueError("Scored terminal is absent from selected calls")
             flags_by_call = dict(zip(by_call, selection.action_flags, strict=True))
+            graph = {
+                call_id: (record.parent_call_id,)
+                if record.parent_call_id is not None
+                else ()
+                for call_id, record in by_call.items()
+            }
+            if any(
+                parent not in by_call
+                for parents in graph.values()
+                for parent in parents
+            ):
+                raise ValueError(
+                    "Selected continuation is missing its selected predecessor"
+                )
+            try:
+                selected_records = [
+                    by_call[c] for c in TopologicalSorter(graph).static_order()
+                ]
+            except CycleError as error:
+                raise ValueError("Selected capture contains a cycle") from error
             root_positions: dict[str, int] = {}
             parents: set[str] = set()
             for record in selected_records:
                 if record.parent_call_id is None:
                     root_positions[record.model_call_id] = positions[record.response_id]
-                elif record.parent_call_id not in root_positions:
-                    # Require selected ancestry and parent-before-child order;
-                    # this also rejects cycles before walking any endpoint.
-                    raise ValueError(
-                        "Selected continuation must follow its selected predecessor"
-                    )
                 else:
                     root_positions[record.model_call_id] = root_positions[
                         record.parent_call_id
@@ -1227,6 +1352,8 @@ class RolloutReassembler:
         mask_sample: list[bool],
         *,
         canonical_sample_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        reward_checks: tuple[RewardChecks | None, ...],
     ) -> _LogicalRows:
         """Verify ordinary segments, then keep all or none of each owner's rows.
 
@@ -1261,6 +1388,10 @@ class RolloutReassembler:
             if not segments:
                 raise ValueError(f"{owner_id}: missing initial prompt evidence")
             rebuilt = []
+            scored_call = RolloutReceipt.model_validate(
+                receipts[slot]
+            ).terminal_model_call_id
+            reward_row = None
             parsed_receipts = []
             owner_valid = True
             owner_records = {}
@@ -1285,14 +1416,26 @@ class RolloutReassembler:
                     prepared.staging_keys.extend(
                         record.staging_key for record in parsed.manifest
                     )
+                applies_reward = (
+                    reward_row is None
+                    and parsed is not None
+                    and any(
+                        record.model_call_id == scored_call
+                        for record in parsed.manifest
+                    )
+                )
                 row = self.finalize_rollout(
                     expected_id,
                     segment.receipt,
                     reward=reward,
-                    context_compaction=True,
+                    forest_training=True,
                     action_flags=segment.action_flags,
                     loss_excluded_call_ids=frozenset(owner_records),
+                    reward_checks=reward_checks[slot],
+                    reward_call_id=scored_call if applies_reward else None,
                 )
+                if applies_reward:
+                    reward_row = row
                 selected = segment.selected_response_ids
                 record_by_call = (
                     {record.model_call_id: record for record in parsed.manifest}
@@ -1377,6 +1520,7 @@ class RolloutReassembler:
                     segments[0].capture_rollout_id,
                     root_receipt.model_dump(),
                     reward=reward,
+                    forest_training=True,
                 )
                 if not root.valid:
                     raise ValueError(
@@ -1386,6 +1530,9 @@ class RolloutReassembler:
             if not original_prompt:
                 raise ValueError(f"{owner_id}: empty initial grouping prompt")
             if owner_valid:
+                if reward_row is None:
+                    raise ValueError(f"{owner_id}: missing scored-call reward evidence")
+                rebuilt = [replace(row, reward=reward_row.reward) for row in rebuilt]
                 prepared.valid_owner_count += 1
             else:
                 rebuilt = [
@@ -1489,7 +1636,8 @@ class RolloutReassembler:
             valid_rows += 1
             covered_tokens += len(row.token_ids)
             if row.routed_experts is None:
-                sentinel_tokens += len(row.token_ids)
+                # The final token never has a recorded route; don't count it.
+                sentinel_tokens += max(len(row.token_ids) - 1, 0)
                 continue
             rows_with_routes += 1
             row_routes = row.routed_experts
@@ -1501,8 +1649,9 @@ class RolloutReassembler:
                     f"rollout {row.rollout_id}"
                 )
             routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
             sentinel_tokens += int(
-                row_routes.eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
             )
         if valid_rows:
             metrics["finalize/routed_experts_row_coverage"] = (

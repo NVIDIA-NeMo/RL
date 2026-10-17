@@ -18,16 +18,19 @@ import os
 import subprocess
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from time import monotonic
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, TypedDict
+from time import monotonic, sleep
+from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, Field, field_validator, model_validator
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -148,7 +151,7 @@ DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
 def _normalize_gym_validity(result: dict) -> dict:
-    """Project CC verifier masks into the existing downstream masking contract."""
+    """Project Forest verifier masks into the existing downstream masking contract."""
     normalized = dict(result)
     config = dict(result.get("instance_config") or {})
     config["mask_sample"] = bool(result.get("mask_sample") or config.get("mask_sample"))
@@ -208,6 +211,45 @@ class NemoGymCompatibleConfig(Protocol):
 
     @property
     def policy(self) -> PolicyConfig: ...
+
+
+class ExternalServiceReadinessTargetConfig(BaseModel, extra="allow"):
+    """Health endpoint and required backend count for one external service.
+
+    ``url`` must be a ``vllm_pool_lb`` ``/health`` endpoint; see
+    ``_probe_external_service`` for the reply it expects. A plain vLLM
+    ``/health`` returns no backend counts and never reads as ready.
+    """
+
+    name: str = Field(min_length=1)
+    url: str
+    expected_backends: int = Field(gt=0)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        """Require an absolute HTTP(S) health endpoint."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("url must be an absolute HTTP(S) URL")
+        return url
+
+
+class ExternalServiceReadinessConfig(BaseModel, extra="allow"):
+    """Startup gate for external services used by NeMo Gym rollouts."""
+
+    services: list[ExternalServiceReadinessTargetConfig] = Field(min_length=1)
+    timeout_seconds: float = Field(gt=0)
+    poll_interval_seconds: float = Field(gt=0)
+    request_timeout_seconds: float = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_unique_service_names(self) -> Self:
+        """Reject ambiguous duplicate service labels in diagnostics."""
+        names = [service.name for service in self.services]
+        if len(names) != len(set(names)):
+            raise ValueError("external readiness service names must be unique")
+        return self
 
 
 def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
@@ -338,6 +380,10 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # Optional startup gate for externally served Gym dependencies. The actor
+    # starts local Gym services first, then waits for every target before it
+    # exposes its rollout collection helper to the training driver.
+    external_service_readiness: NotRequired[ExternalServiceReadinessConfig | None]
     # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
     tokenizer_config: NotRequired[
         Optional[TokenizerConfig]
@@ -392,6 +438,126 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         "token_capture.enabled requires setup-derived generation_backend to be "
         f"'vllm' or 'megatron'; got {generation_backend!r}"
     )
+
+
+def extract_external_service_readiness(
+    nemo_gym_dict: dict[str, Any],
+) -> ExternalServiceReadinessConfig | None:
+    """Remove and validate NeMo-RL's external readiness block from Gym config."""
+    readiness_dict = nemo_gym_dict.pop("external_service_readiness", None)
+    if readiness_dict is None:
+        return None
+    return ExternalServiceReadinessConfig.model_validate(readiness_dict)
+
+
+def _probe_external_service(
+    service: ExternalServiceReadinessTargetConfig,
+    *,
+    request_timeout_seconds: float,
+) -> str | None:
+    """Return a readiness problem for one service, or None when it is ready.
+
+    The URL must be a ``vllm_pool_lb`` ``/health`` endpoint. This reads the
+    ``status``, ``healthy_backends`` and ``total_backends`` fields returned by
+    ``LoadBalancer.handle_health`` in ``tools/external_gym_vllm/vllm_pool_lb.py``.
+    """
+    try:
+        with urllib.request.urlopen(
+            service.url, timeout=request_timeout_seconds
+        ) as response:
+            status_code = response.status
+            response_body = response.read()
+    except OSError as error:
+        return f"request failed: {error}"
+
+    if status_code != 200:
+        return f"HTTP {status_code}"
+
+    try:
+        payload = json.loads(response_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return f"invalid JSON response: {error}"
+    if not isinstance(payload, dict):
+        return f"expected a JSON object, got {type(payload).__name__}"
+
+    status = payload.get("status")
+    healthy_backends = payload.get("healthy_backends")
+    total_backends = payload.get("total_backends")
+    if (
+        not isinstance(healthy_backends, int)
+        or isinstance(healthy_backends, bool)
+        or not isinstance(total_backends, int)
+        or isinstance(total_backends, bool)
+    ):
+        return (
+            "health response must contain integer healthy_backends and total_backends"
+        )
+    if (
+        status != "ok"
+        or healthy_backends < service.expected_backends
+        or total_backends < service.expected_backends
+    ):
+        return (
+            f"status={status!r}, healthy_backends={healthy_backends}, "
+            f"total_backends={total_backends}, "
+            f"expected_backends={service.expected_backends}"
+        )
+    return None
+
+
+def _wait_for_external_services(
+    config: ExternalServiceReadinessConfig | None,
+) -> None:
+    """Wait for all external Gym dependencies under one shared deadline."""
+    if config is None:
+        return
+
+    deadline = monotonic() + config.timeout_seconds
+    previous_problems: dict[str, str] = {}
+    while True:
+        problems: dict[str, str] = {}
+        for service in config.services:
+            remaining_seconds = deadline - monotonic()
+            if remaining_seconds <= 0:
+                problems[service.name] = "startup deadline expired before probe"
+                continue
+            problem = _probe_external_service(
+                service,
+                request_timeout_seconds=min(
+                    config.request_timeout_seconds, remaining_seconds
+                ),
+            )
+            if problem is not None:
+                problems[service.name] = problem
+
+        if not problems:
+            print(
+                "All external NeMo-Gym services are ready: "
+                + ", ".join(service.name for service in config.services)
+            )
+            return
+
+        if problems != previous_problems:
+            print(
+                "Waiting for external NeMo-Gym services: "
+                + "; ".join(f"{name}: {problem}" for name, problem in problems.items())
+            )
+            previous_problems = problems
+
+        remaining_seconds = deadline - monotonic()
+        if remaining_seconds > 0:
+            sleep(min(config.poll_interval_seconds, remaining_seconds))
+            remaining_seconds = deadline - monotonic()
+        # Raise now rather than next round: a round that starts at the
+        # deadline cannot probe, and would overwrite these observations.
+        if remaining_seconds <= 0:
+            details = "; ".join(
+                f"{name}: {problem}" for name, problem in problems.items()
+            )
+            raise TimeoutError(
+                "Timed out waiting for external NeMo-Gym services after "
+                f"{config.timeout_seconds:g}s. Last observations: {details}"
+            )
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -495,11 +661,15 @@ class NemoGym(EnvironmentInterface):
             instrument_aiohttp_client()
         self.cfg = cfg
         capture_config = cfg.get("token_capture")
-        self._context_compaction = bool(
-            capture_config and capture_config.get("context_compaction")
+        self._forest_training = bool(
+            capture_config and capture_config.get("forest_training")
         )
-        if self._context_compaction and not capture_config.get("enabled"):
-            raise ValueError("context compaction requires external token capture")
+        if self._forest_training and not capture_config.get("enabled"):
+            raise ValueError("forest training requires external token capture")
+        # Setup passes the schema-resolved config; defaults live on that schema.
+        self._selection_policy = (
+            capture_config["selection_policy"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -670,7 +840,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
-                "framework_owned_context": self._context_compaction,
+                "framework_owned_context": self._forest_training,
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -693,6 +863,17 @@ Depending on your data shape, you may want to change these values."""
                 skip_load_from_cli=True,
             )
         )
+
+        try:
+            _wait_for_external_services(self.cfg.get("external_service_readiness"))
+        except TimeoutError:
+            # RunHelper.start() has already spawned local Gym services. Do not
+            # leave them behind when an external dependency misses its deadline.
+            # Clear the handle first, as shutdown() does: the caller's teardown
+            # calls shutdown() next, and RunHelper.shutdown() is not idempotent.
+            rh, self.rh = self.rh, None
+            rh.shutdown()
+            raise
 
         # Setup for rollout collection
         self.head_server_config = BaseServerConfig(
@@ -905,7 +1086,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_result_iterator = self.rch.run_examples(
             examples=nemo_gym_examples,
             head_server_config=self.head_server_config,
-            **({"retry_requests": False} if self._context_compaction else {}),
+            **({"retry_requests": False} if self._forest_training else {}),
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -933,7 +1114,7 @@ Depending on your data shape, you may want to change these values."""
                     raise
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._context_compaction or self._token_capture_enabled:
+                if self._forest_training or self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is
                     # rebuilt by the finalizer, so no message_log walk (and no
@@ -1003,11 +1184,17 @@ Depending on your data shape, you may want to change these values."""
         may still stage data, so those IDs cannot transfer to cleanup.
         """
         deadline = monotonic() + _CAPTURE_DRAIN_TIMEOUT_S
+        # Close before the first snapshot: an empty pending set alone does not
+        # prevent a queued request from starting after finalization/cleanup.
+        method, operation = (
+            ("POST", "close") if self._forest_training else ("GET", "manifest")
+        )
         while True:
             manifest = await self._control(
-                "GET",
-                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/manifest",
+                method,
+                f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/{rollout_id}/{operation}",
             )
+            method, operation = "GET", "manifest"
             failed = {
                 failure.get("model_call_id")
                 for failure in manifest.get("failures") or []
@@ -1042,7 +1229,7 @@ Depending on your data shape, you may want to change these values."""
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
-        if self._context_compaction:
+        if self._forest_training:
             return await self._postprocess_captured_history(
                 nemo_gym_row, _normalize_gym_validity(nemo_gym_result)
             )
@@ -1082,8 +1269,9 @@ Depending on your data shape, you may want to change these values."""
         }
 
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
-        """Recover accepted chains from common output and shared capture evidence."""
+        """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
+        from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.gym_selection import select_captured_calls
@@ -1111,9 +1299,44 @@ Depending on your data shape, you may want to change these values."""
         # the receipt: their writes may still arrive and must not be cleaned here.
         capture_failed = bool(parsed.pending_call_ids or parsed.failures)
         selected = []
+        terminal_response_id = None
         if not capture_failed:
             try:
-                selected = select_captured_calls(parsed.records, result)
+                if self._selection_policy == "all_captured":
+                    selected = list(parsed.records)
+                    # Admission/completion order cannot identify the scored call.
+                    # Reuse shared witness attribution, without graph fallback.
+                    attribution = resolve_terminal(
+                        selected,
+                        result.get("response"),
+                        declared_response_id=result.get("terminal_response_id"),
+                    )
+                    if not attribution.attributed:
+                        raise ValueError(
+                            "all_captured requires an identifiable scored terminal: "
+                            + attribution.reason
+                        )
+                    terminal_response_id = next(
+                        record.response_id
+                        for record in selected
+                        if record.model_call_id == attribution.model_call_id
+                    )
+                    # Only an unscored failed leaf can be excluded safely.
+                    # Failed parents or the scored call still invalidate the owner.
+                    parents = {record.parent_call_id for record in selected}
+                    selected = [
+                        record
+                        for record in selected
+                        if record.response_status != "failed"
+                        or record.model_call_id == attribution.model_call_id
+                        or record.model_call_id in parents
+                    ]
+                elif self._selection_policy == "returned_history":
+                    selected = select_captured_calls(parsed.records, result)
+                else:
+                    raise ValueError(
+                        f"Unknown selection policy: {self._selection_policy}"
+                    )
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(
@@ -1131,10 +1354,16 @@ Depending on your data shape, you may want to change these values."""
             r.finish_reason in ("length", "max_tokens", "max_output_tokens")
             for r in selected
         )
+        if selected and terminal_response_id is None:
+            terminal_response_id = result.get("terminal_response_id") or (
+                result.get("response") or {}
+            ).get("id")
+            if terminal_response_id not in {r.response_id for r in selected}:
+                terminal_response_id = selected[-1].response_id
         receipt = self._assemble_receipt(
             owner,
             manifest,
-            terminal_response_id=selected[-1].response_id if selected else None,
+            terminal_response_id=terminal_response_id,
             reward=float(reward),
         )
         if capture_failed:
@@ -1815,6 +2044,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")
@@ -1853,6 +2083,7 @@ def _build_gym_actor_config(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
         **port_range,

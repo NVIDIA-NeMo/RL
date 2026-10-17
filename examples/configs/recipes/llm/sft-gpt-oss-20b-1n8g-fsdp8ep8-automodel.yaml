@@ -11,7 +11,7 @@ policy:
     # Keep as 0.0, not 0: Hugging Face strict config validation declares
     # router_aux_loss_coef as float and rejects YAML's integer 0.
     router_aux_loss_coef: 0.0
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 8
     automodel_kwargs:
       backend:

@@ -16,12 +16,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
     RolloutReassembler,
@@ -30,6 +31,10 @@ from nemo_rl.experience.rollout_reassembler import (
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
 
 
 @dataclass(frozen=True)
@@ -53,10 +58,12 @@ class ReassemblyRequest:
     loss_multiplier: float = 1.0
     logical_selections: Optional[tuple[RolloutSelection, ...]] = None
     execution_row_multiple: int = 1
+    reward_checks: tuple[RewardChecks | None, ...] | None = None
+    reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
-        """Return cleanup receipts only after validating CC capture ownership."""
+        """Return cleanup receipts only after validating Forest capture ownership."""
         if self.logical_selections is None:
             return self.receipts
         from nemo_gym.token_id_capture.staging.records import (
@@ -129,6 +136,8 @@ class RolloutReassemblerActorConfig:
     max_seq_len: int
     # Whether the staging partition carries media columns (VLM capture).
     capture_media: bool
+    reward_penalty_config: RewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
 
 
 @ray.remote(
@@ -155,6 +164,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
+            reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -203,6 +214,12 @@ class RolloutReassemblerActor:  # pragma: no cover
                 else None
             ),
             execution_row_multiple=request.execution_row_multiple,
+            reward_checks=list(request.reward_checks)
+            if request.reward_checks is not None
+            else None,
+            reward_log_contexts=list(request.reward_log_contexts)
+            if request.reward_log_contexts is not None
+            else None,
         )
         assert_metadata_only(result)
         return result

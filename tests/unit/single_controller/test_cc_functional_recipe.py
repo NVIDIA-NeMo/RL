@@ -89,7 +89,7 @@ def functional_recipe(
 
 def test_gym_functional_launch_config(functional_recipe) -> None:
     cc, master, transformed, checks = functional_recipe
-    assert master.token_capture.context_compaction is cc
+    assert master.token_capture.forest_training is cc
     if cc:
         assert transformed["responses_create_params"]["tools"] == [
             {"name": "first"},

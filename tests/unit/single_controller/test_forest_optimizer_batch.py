@@ -84,7 +84,7 @@ def _setup(
         "train_global_batch_size": 5 if failure == "gbs" else 2 * num_prompts
     }
     ctrl._master_config.token_capture = TokenCaptureConfig(
-        enabled=True, context_compaction=True
+        enabled=True, forest_training=True
     )
     ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 1
     ctrl._advantage_estimator = stage._advantage_estimator

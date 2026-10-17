@@ -56,6 +56,16 @@ ROUTE_FAILURE_MODEL_SHAPE = "fragment_model_shape"
 ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
 
 
+def boundary_route_rows(prev_len: int) -> int:
+    """Include the last token of the previous message.
+
+    Chosen experts are only recorded for input tokens.
+    Choice of the last generated token in the previous message was a placeholder.
+    Rewrite it with the correct value, known from the new prefill.
+    """
+    return 1 if prev_len > 0 else 0
+
+
 @dataclass(frozen=True)
 class RouteFragment:
     """One staged route payload plus the metadata its extras digest binds.
@@ -113,7 +123,6 @@ def execute_route_plan(
     *,
     dims: tuple[int, int],
     canonical_len: int,
-    backpatch_predecessor_tail: bool = False,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Assemble one canonical route tensor from staged fragments.
 
@@ -126,9 +135,6 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
-        backpatch_predecessor_tail: CC requires complete delta routes and the
-            committed continuation route for the preceding final token. Each
-            plan is one segment, so no patch can cross a compaction root.
 
     Returns:
         ``(tensor, None)`` on success — ``[canonical_len, num_moe_layers,
@@ -152,10 +158,8 @@ def execute_route_plan(
         mode = classify_route_span(
             carry_len=span.carry_len,
             generation_len=span.generation_len,
-            staged_route_len=span.staged_route_len,
+            staged_route_len=span.staged_route_len - span.boundary_rows,
         )
-        if backpatch_predecessor_tail and mode != "full":
-            return None, ROUTE_FAILURE_MISSING_FRAGMENT
         if mode != "sentinel":
             fragment = fragments.get(span.staging_key)
             if fragment is None:
@@ -173,29 +177,9 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
-            if backpatch_predecessor_tail:
-                # Integrity was checked above over this exact metadata too.
-                metadata = json.loads(fragment.extras_metadata_json)
-                tail = (metadata or {}).get("predecessor_tail_route")
-                if position == 0:
-                    if tail is not None:
-                        return None, "unexpected_predecessor_tail"
-                else:
-                    if (
-                        not isinstance(tail, list)
-                        or len(tail) != num_moe_layers
-                        or any(
-                            not isinstance(layer, list)
-                            or len(layer) != top_k
-                            or any(
-                                type(expert) is not int or not 0 <= expert <= 32767
-                                for expert in layer
-                            )
-                            for layer in tail
-                        )
-                    ):
-                        return None, "invalid_predecessor_tail"
-                    routed[position - 1] = torch.tensor(tail, dtype=torch.int16)
+            if span.boundary_rows:
+                routed[position - 1] = routes[0].to(torch.int16)
+                routes = routes[1:]
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:
