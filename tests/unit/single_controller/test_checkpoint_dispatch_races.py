@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import hashlib
 import threading
+import warnings
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1039,7 +1040,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
             ):
                 raise AssertionError("unreachable")
 
-        with pytest.raises(RuntimeError, match="parked sessions"):
+        with pytest.raises(RuntimeError, match="parked agent sessions"):
             await asyncio.wait_for(checkpoint(), timeout=5.0)
 
         assert actor.operations()[-1] == "resume"
@@ -1100,10 +1101,23 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
             assert gym_commit is not None
             assert gym_commit.manifest.instances == {"tools/replica-0": ()}
 
-        # Retired while Gym is idle, before prepare parks anything.
-        assert actor.operations() == ["retire", "prepare", "renew", "commit", "resume"]
+        # Retired, then forgotten, while Gym is idle, before prepare parks anything.
+        assert actor.operations() == [
+            "retire",
+            "forget",
+            "prepare",
+            "renew",
+            "commit",
+            "resume",
+        ]
         assert frozenset(actor.calls[0][1][1]) == frozenset(abandoned)
+        assert actor.calls[1][1][1] == tuple(
+            sorted(episode.rollout_id for episode in abandoned)
+        )
         assert actor.live == set()
+        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+            "tools/replica-0": ()
+        }
 
     asyncio.run(exercise())
 
@@ -1136,6 +1150,54 @@ def test_turn_checkpoint_retires_each_dropped_attempt_only_once(
         }
         retires = [call for call in actor.calls if call[0] == "retire"]
         assert [call[1][0] for call in retires] == ["save-1"]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("forget_failures", [1, 2])
+def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forget(
+    tmp_path: Path, forget_failures: int
+) -> None:
+    """A refused forget gets the retire again, then the forget, as Gym asks.
+
+    A deployment that still refuses keeps the rollouts queued for the next
+    snapshot: a mark costs one entry, so the snapshot itself goes ahead.
+    """
+
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        async with barrier.mutation() as cut:
+            group = _dispatched_two_sibling_group(ledger, cut)
+        abandoned = _gym_episodes(group)
+        async with barrier.mutation() as cut:
+            ledger.abandon_unsealed(cut, group.group_id)
+
+        actor = FakeGymActor(
+            live=abandoned,
+            forget_errors=(RuntimeError("retire_incomplete"),) * forget_failures,
+        )
+        controller = _controller_for(gym_coordinator(actor), ledger)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            async with controller._prepared_gym_checkpoint(
+                tmp_path, checkpoint_id="save-1"
+            ) as gym_commit:
+                assert gym_commit is not None
+
+        operations = actor.operations()
+        assert operations[:4] == ["retire", "forget", "retire", "forget"]
+        assert operations[4] == "prepare"
+        assert frozenset(actor.calls[2][1][1]) == frozenset(abandoned)
+        pending = ledger.gym_checkpoint_forgets({"tools/replica-0"})
+        forgot_warnings = [w for w in caught if "could not forget" in str(w.message)]
+        if forget_failures == 1:
+            assert pending == {"tools/replica-0": ()}
+            assert not forgot_warnings
+        else:
+            assert set(pending["tools/replica-0"]) == abandoned
+            assert forgot_warnings
 
     asyncio.run(exercise())
 
@@ -1175,6 +1237,48 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
         assert actor.calls[0][0] == "retire"
         assert frozenset(actor.calls[0][1][1]) == frozenset(abandoned)
         assert actor.live == replacements
+
+    asyncio.run(exercise())
+
+
+def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
+    tmp_path: Path,
+) -> None:
+    """Gym refuses a commit that names a restart; the snapshot records it instead.
+
+    The restart is still running in Gym, so the drain must not wait for it and
+    the cut must accept RL still owning it.
+    """
+
+    async def exercise() -> None:
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        async with barrier.mutation() as cut:
+            group = _dispatched_two_sibling_group(ledger, cut)
+        saved, restart = sorted(_gym_episodes(group))
+        actor = FakeGymActor(live={saved, restart}, restarts=(restart,))
+        controller = _controller_for(gym_coordinator(actor), ledger)
+        controller._dp_client = NoOpDataPlaneClient()
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(staging_partition="rollout_staging")
+        )
+
+        async with controller._prepared_gym_checkpoint(
+            tmp_path,
+            checkpoint_id="save-1",
+        ) as gym_commit:
+            assert gym_commit is not None
+            async with barrier.checkpoint() as cut:
+                await controller._validate_gym_checkpoint_cut(
+                    cut, gym_commit, checkpoint_path=tmp_path
+                )
+
+        (commit,) = [call for call in actor.calls if call[0] == "commit"]
+        assert commit[1][2] == (saved,)
+        manifest = load_gym_checkpoint_manifest(tmp_path)
+        assert manifest.instances == {"tools/replica-0": (saved,)}
+        assert manifest.restarts == {"tools/replica-0": (restart,)}
+        assert actor.operations()[-1] == "resume"
 
     asyncio.run(exercise())
 
@@ -1717,20 +1821,41 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
     assert gym_actor.calls[1][1] == (restore_id,)
 
 
+def test_turn_recovery_starts_a_gym_restart_over_from_its_task(tmp_path: Path) -> None:
+    """A rollout Gym could not capture is not restored; it starts over."""
+
+    async def exercise() -> tuple[Any, FakeGymActor]:
+        controller, rollout_manager, gym_actor, episode = await _turn_recovery_restart(
+            tmp_path
+        )
+        _write_turn_manifest(tmp_path, episode, restarted=True)
+        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        return rollout_manager, gym_actor
+
+    rollout_manager, gym_actor = asyncio.run(exercise())
+
+    restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
+    assert restored_group.siblings[0].attempts[0].status is (
+        RolloutAttemptStatus.ABANDONED
+    )
+    assert gym_actor.operations() == ["restore", "resume"]
+    assert gym_actor.calls[0][1][2] == ()
+
+
 def _write_turn_manifest(
-    tmp_path: Path, episode: GymCheckpointEpisode, *, attempt_delta: int = 0
+    tmp_path: Path,
+    episode: GymCheckpointEpisode,
+    *,
+    attempt_delta: int = 0,
+    restarted: bool = False,
 ) -> GymCheckpointManifest:
+    saved = GymCheckpointEpisode(episode.rollout_id, episode.attempt + attempt_delta)
     manifest = GymCheckpointManifest(
         schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
         checkpoint_id="save-1",
-        instances={
-            "tools/replica-0": (
-                GymCheckpointEpisode(
-                    episode.rollout_id, episode.attempt + attempt_delta
-                ),
-            ),
-        },
+        instances={"tools/replica-0": () if restarted else (saved,)},
         staging_keys={"tools/replica-0": ()},
+        restarts={"tools/replica-0": (saved,) if restarted else ()},
     )
     write_gym_checkpoint_manifest(tmp_path, manifest)
     return manifest
