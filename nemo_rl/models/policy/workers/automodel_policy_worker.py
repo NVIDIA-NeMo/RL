@@ -65,7 +65,6 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
