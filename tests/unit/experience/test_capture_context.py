@@ -191,7 +191,7 @@ def test_paired_root_append_root_append_keeps_exact_tokens(
 
     def fetch(keys):
         fetches.append(list(keys))
-        return source.fetch_prefix_token_ids(keys)
+        return source.fetch_prefix_chains(keys).expanded
 
     def decide(admission, *, messages):
         if root_cause == "boundary" and len(decisions) == 2:
@@ -234,7 +234,9 @@ def test_paired_root_append_root_append_keeps_exact_tokens(
     # Direct roots and worker downgrades never fetch a discarded parent prefix.
     assert fetches == [[records[0].staging_key], [records[2].staging_key]]
     assert all(d.verify_retained_media for d in decisions)
-    assert source.fetch_prefix_token_ids([r.staging_key for r in records[:2]]) == [
+    assert source.fetch_prefix_chains(
+        [r.staging_key for r in records[:2]]
+    ).expanded == [
         10,
         11,
         1001,
@@ -242,7 +244,9 @@ def test_paired_root_append_root_append_keeps_exact_tokens(
         21,
         1002,
     ]
-    assert source.fetch_prefix_token_ids([r.staging_key for r in records[2:]]) == [
+    assert source.fetch_prefix_chains(
+        [r.staging_key for r in records[2:]]
+    ).expanded == [
         10,
         11,
         1003,

@@ -121,6 +121,13 @@ def test_packing_bins_preserve_forest_loss_accounting(
             "row_index": torch.arange(6),
         }
     )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        model = _CausalModel().double()
+    with torch.no_grad():
+        batch["prev_logprobs"] = nn.functional.pad(
+            model(batch["input_ids"]) - 0.05, (1, 0)
+        )
     shards, _ = batch.shard_by_batch_size(
         dp_size,
         batch_size=6,
@@ -148,9 +155,6 @@ def test_packing_bins_preserve_forest_loss_accounting(
     denominator = int(
         (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum()
     )
-    with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(11)
-        model = _CausalModel().double()
     reference_loss, reference_grad = _loss_gradient(
         model, batch, denominator=denominator
     )
@@ -194,7 +198,7 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=root_prompt,
         decide_input=decide_capture_input,
     )

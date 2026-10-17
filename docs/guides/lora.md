@@ -220,12 +220,12 @@ Ready-to-run LoRA recipes live under `examples/configs/recipes/llm/`:
 
 | Recipe | Algorithm | Backend |
 | --- | --- | --- |
-| [`sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml) | SFT | DTensor |
+| [`sft-llama3.1-8b-1n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-automodel-lora.yaml) | SFT | DTensor |
 | [`sft-llama3.1-8b-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-megatron-lora.yaml) | SFT | Megatron |
-| [`sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | SFT | DTensor |
-| [`grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`sft-nanov3-30BA3B-2n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml) | SFT | DTensor |
+| [`grpo-qwen3-8B-base-1n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8B-base-1n8g-automodel-lora.yaml) | GRPO | DTensor |
 | [`grpo-qwen3-8b-base-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.yaml) | GRPO | Megatron |
-| [`grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml) | GRPO | DTensor |
 | [`grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml) | GRPO | Megatron |
 
 DPO LoRA is supported on both backends but ships no dedicated recipe — enable it on an existing DPO config with the overrides shown in [Usage by Algorithm → DPO](#dpo).

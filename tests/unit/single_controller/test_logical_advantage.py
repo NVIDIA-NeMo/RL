@@ -415,7 +415,7 @@ def test_real_capture_finalizer_rows_feed_sc_at_actual_segment_lengths(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(data_plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )

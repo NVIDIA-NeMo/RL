@@ -35,6 +35,9 @@ Recipe launchers keep their concrete model and serving settings outside these
 helpers. A launcher can add another service without adding another server body
 or lifecycle path to this wrapper.
 
+The same pools can instead run as their own long-lived job that training jobs
+attach to; see [Persistent pools (serve mode)](#persistent-pools-serve-mode).
+
 ## Pool registration interface
 
 Launchers source `pool_config.sh` and use the same three functions for every
@@ -219,3 +222,108 @@ hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting
 `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
 variables to component 0; Slurm then uses component 0 by default for its steps.
 External nodes therefore cannot accidentally join the training Ray cluster.
+
+## Persistent pools (serve mode)
+
+With `EXTERNAL_VLLM_MODE=serve`, the wrapper runs only the pools, as a plain
+(single-component) job that outlives any training job. Training jobs attach to
+it, so a training job that crashes, is preempted, or is resubmitted after a
+change does not reload the judges, and several jobs can share one set of pools.
+
+```text
+pool job (EXTERNAL_VLLM_MODE=serve)       training job (attach_and_run.sh)
+├── first node: per-pool load balancers <── ray.sub, with URLs and readiness gate
+└── every node: private Ray/vLLM replicas    resolved from EXTERNAL_VLLM_POOL_DIR
+```
+
+### Submitting
+
+Register the pools exactly as for a heterogeneous job, then use the two
+`pool_config.sh` helpers instead of one heterogeneous `sbatch`:
+
+```bash
+source tools/external_gym_vllm/pool_config.sh
+# ... register_external_vllm_pool ... as usual
+pool_job=$(submit_external_vllm_pool_job "${POOL_DIR}" \
+  --account=<account> --partition=<partition> --time=12:00:00)
+submit_external_vllm_attached_job "${POOL_DIR}" "${pool_job}" "${COMMAND}" \
+  --account=<account> --partition=<partition> --nodes=<nemo-rl-nodes> \
+  --exclusive --gres=gpu:4 --time=04:00:00
+```
+
+`submit_external_vllm_pool_job` submits a pool job only when no live job owns or
+was submitted for `POOL_DIR`, and prints the job id either way, so the same
+launcher starts a cold pool and reattaches to a warm one.
+`submit_external_vllm_attached_job` submits `attach_and_run.sh` with `COMMAND`
+(it must contain every pool's URL placeholder and
+`__EXTERNAL_SERVICE_READINESS__`). While the pool is not `READY` yet, the job
+also depends on `after:<pool-job>+EXTERNAL_VLLM_ATTACH_AFTER_MIN` (default 15),
+so it does not hold its nodes idle through the pool's queue wait and model load.
+`POOL_DIR` must be under `EXTERNAL_VLLM_SHARED_ROOT`; the training job needs
+`EXTERNAL_VLLM_TOOLS_DIR_HOST`, `BASE_LOG_DIR` and `RAY_SUB` in its environment.
+
+`attach_and_run.sh` resolves everything at job start, never at submission: it
+waits for `READY` from the expected pool job, replaces each URL placeholder, and
+replaces `__EXTERNAL_SERVICE_READINESS__` with the same backend-count readiness
+gate a heterogeneous job uses, built from the pool's manifest. Then it runs
+`ray.sub`.
+
+### Pool directory
+
+| File | Written by | Meaning |
+|---|---|---|
+| `owner` | pool job | Generation (`<job-id>-<restart-count>`) of the job serving the directory. Created with `O_EXCL`; a second pool job on a directory owned by a live job fails at start. A dead owner's directory, or this job's own after a requeue, is taken over. |
+| `submitted_job` | `submit_external_vllm_pool_job` | Pool job submitted for the directory, so a pending one is reused rather than duplicated. |
+| `generation`, `job_id`, `log_dir`, `end_time` | pool job | Identity, log directory and scheduled end of the current pool job. |
+| `manifest.tsv` | pool job | `pool`, `base_url`, `health_url`, `expected_backends`, `served_model_name`, `startup_timeout` per pool. `<pool>_url` and `pools.env` carry the same URLs for scripts that read one URL. |
+| `READY` | pool job | Present only while every load balancer reports a healthy backend for every replica. |
+| `heartbeat` | pool job | Rewritten every `EXTERNAL_VLLM_SERVE_POLL_S` seconds, also while the pools load. |
+| `attached/<job-id>` | `attach_and_run.sh` | Training jobs currently attached; the pool job logs the set when it changes. Check it before cancelling a pool. |
+| `STOPPED` | pool job | Written on exit, with the generation and exit status; `READY` is removed first. |
+
+### Failure handling
+
+- **A replica or load balancer exits.** The pool job relaunches it on the same
+  nodes; the load balancer drops the dead backend and adds the relaunched one
+  from the registry, so the URLs never change. A step that ran for
+  `EXTERNAL_VLLM_RESTART_RESET_S` before failing has its relaunch count reset;
+  only a step that keeps failing soon after starting exhausts
+  `EXTERNAL_VLLM_MAX_RESTARTS` and ends the pool job.
+- **A pool is below full strength** (a relaunch loading weights, or a replica
+  that is alive but failing health checks). `READY` is withdrawn until every
+  load balancer counts every replica again, so no job attaches to a degraded
+  pool. Jobs already attached keep running against the remaining backends; a
+  wedged replica is not restarted automatically.
+- **The pool job ends, is replaced, or dies without cleanup.** An attached
+  training job stops itself when `STOPPED` appears for its generation, when
+  `generation` changes (a requeued or replaced pool serves from other nodes),
+  or when `heartbeat` is older than `EXTERNAL_VLLM_HEARTBEAT_STALE_S`. Inline
+  mode gets the same guarantee by stopping NeMo RL when a judge exits; without
+  it a run could keep training against dead judges with failing rewards.
+- **Slurm cannot be queried.** While waiting for `READY`, a failed `squeue` is
+  only logged; the pool job counts as gone after
+  `EXTERNAL_VLLM_POOL_GONE_CHECKS` consecutive "finished or unknown" answers.
+- **The pool ends before the training job.** `attach_and_run.sh` warns when the
+  pool's `end_time` is earlier than its own time limit, or refuses to start with
+  `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME=1`.
+
+Restarting the pool job always changes its URLs; resubmit attached training jobs
+afterwards (a queued one resolves the new URLs when it starts).
+
+### Settings
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EXTERNAL_VLLM_MODE` | `inline` | `serve` runs the pools as their own job. |
+| `EXTERNAL_VLLM_POOL_DIR` | required in serve mode | Shared directory through which the pool job and training jobs meet. |
+| `EXTERNAL_VLLM_SERVE_POLL_S` | `10` | Supervision interval of the pool job. |
+| `EXTERNAL_VLLM_MAX_RESTARTS` | `5` | Relaunches per replica or load balancer before the pool job gives up. |
+| `EXTERNAL_VLLM_RESTART_RESET_S` | `1800` | Uptime after which a step's relaunch count resets. |
+| `EXTERNAL_VLLM_POOL_JOB` | set by `submit_external_vllm_attached_job` | Pool job a training job attaches to. |
+| `EXTERNAL_VLLM_ATTACH_TIMEOUT` | `3600` | How long a training job waits for `READY`. |
+| `EXTERNAL_VLLM_ATTACH_POLL_S` | `15` | How often it checks while waiting. |
+| `EXTERNAL_VLLM_ATTACH_WATCH_S` | `30` | How often it checks the pool while training. |
+| `EXTERNAL_VLLM_HEARTBEAT_STALE_S` | `300` | Heartbeat age at which the pool job counts as dead. |
+| `EXTERNAL_VLLM_POOL_GONE_CHECKS` | `3` | Consecutive "finished or unknown" Slurm answers before the pool job counts as gone. |
+| `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME` | `0` | `1` refuses to start a training job that would outlive the pool job. |
+| `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. |

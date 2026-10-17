@@ -402,7 +402,11 @@ class GenerationRouterImpl:
         def _run() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            runner = web.AppRunner(self.build_app(), access_log=None)
+            # Propagate a Gym disconnect upstream so vLLM can abort generation.
+            # Cancellation also bypasses backend-failure accounting in _handle.
+            runner = web.AppRunner(
+                self.build_app(), access_log=None, handler_cancellation=True
+            )
             loop.run_until_complete(runner.setup())
             site = web.SockSite(runner, sock)
             loop.run_until_complete(site.start())

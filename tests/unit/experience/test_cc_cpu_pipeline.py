@@ -65,7 +65,7 @@ def pipeline(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         reasoning=request.param,
         decide_input=decide_capture_input,
@@ -311,12 +311,10 @@ def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("supported", [False, True])
 @pytest.mark.parametrize("logprobs", [False, True])
 def test_mixed_failed_owner_padding_replay_and_controller(
     pipeline: tuple,
     monkeypatch: pytest.MonkeyPatch,
-    supported: bool,
     logprobs: bool,
 ) -> None:
     harness, plane, finalizer = pipeline
@@ -339,41 +337,34 @@ def test_mixed_failed_owner_padding_replay_and_controller(
         ctrl._policy_logprobs_required = ctrl._reference_logprobs_required = logprobs
         original_ids = list(meta.sample_ids)
         check = ctrl._trainer.worker_group.run_all_workers_single_data
-        if not supported:
-            check.side_effect = ValueError("unsafe router")
-            with pytest.raises(ValueError, match="unsafe router"):
-                await asyncio.wait_for(ctrl._train_pump(), timeout=5)
-            ctrl._trainer.get_logprobs_from_meta.assert_not_called()
-            ctrl._trainer.get_reference_policy_logprobs_from_meta.assert_not_called()
-            ctrl._trainer.train_microbatches_from_meta.assert_not_called()
-            ctrl._trainer.finish_train_step.assert_not_called()
-            assert sorted(plane.list_sample_ids("train")) == sorted(original_ids)
-        else:
+        # Setup validates the loaded router before any rollouts are admitted.
+        # The train pump must reuse that validation, including borrowed rows.
+        check.side_effect = AssertionError("router validation was repeated")
 
-            def learner(batch: Any, *args: Any, **kwargs: Any) -> None:
-                assert batch.sample_ids == original_ids and batch.tags == meta.tags
-                data = plane.get_samples(
-                    batch.sample_ids,
-                    "train",
-                    ["total_reward", "sample_mask", "token_mask", "advantages"],
-                )
-                assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
-                assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
-                for index in range(6):
-                    mask = data["token_mask"][index].bool()
-                    if index < 3:
-                        # Only the healthy owner votes: reward and baseline are
-                        # both 1, regardless of its three physical segments.
-                        assert torch.all(data["advantages"][index][mask] == 0.0)
-                    else:
-                        assert not mask.any()
+        def learner(batch: Any, *args: Any, **kwargs: Any) -> None:
+            assert batch.sample_ids == original_ids and batch.tags == meta.tags
+            data = plane.get_samples(
+                batch.sample_ids,
+                "train",
+                ["total_reward", "sample_mask", "token_mask", "advantages"],
+            )
+            assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
+            assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
+            for index in range(6):
+                mask = data["token_mask"][index].bool()
+                if index < 3:
+                    # Only the healthy owner votes: reward and baseline are
+                    # both 1, regardless of its three physical segments.
+                    assert torch.all(data["advantages"][index][mask] == 0.0)
+                else:
+                    assert not mask.any()
 
-            ctrl._trainer.train_microbatches_from_meta.side_effect = learner
-            await asyncio.wait_for(ctrl._train_pump(), timeout=5)
-            ctrl._trainer.finish_train_step.assert_called_once()
-            assert plane.list_sample_ids("train") == []
-            assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
-        check.assert_called_once_with("validate_forest_execution_padding")
+        ctrl._trainer.train_microbatches_from_meta.side_effect = learner
+        await asyncio.wait_for(ctrl._train_pump(), timeout=5)
+        ctrl._trainer.finish_train_step.assert_called_once()
+        assert plane.list_sample_ids("train") == []
+        assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
+        check.assert_not_called()
 
     asyncio.run(exercise())
 

@@ -165,7 +165,7 @@ def test_selected_roots_publish_in_order_and_cleanup_exact_attempt(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )
@@ -212,7 +212,7 @@ def test_lost_publication_ack_preserves_staging_and_exact_cleanup_plan(
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )
@@ -299,7 +299,7 @@ def test_selection_validates_before_publication_and_unselected_roots_are_cleaned
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )
@@ -431,7 +431,7 @@ def test_twenty_calls_have_one_trace_per_context(monkeypatch, tmp_path, compact_
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )
@@ -543,7 +543,7 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
         monkeypatch,
         tmp_path,
         sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
+        fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         root_prompt=[10, 11],
         decide_input=decide_capture_input,
     )

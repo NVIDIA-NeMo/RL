@@ -38,6 +38,25 @@ from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 if TYPE_CHECKING:
     from nemo_rl.models.policy import PolicyConfig
 
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+}
+
+
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 class IPCProtocol(Enum):
     """IPC protocol constants for ZMQ weight streaming."""
@@ -174,7 +193,7 @@ def validate_fp32_lm_head_config(
     if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
-            "with the Megatron trainer because DTensor has no matching "
+            "with the Megatron trainer because Automodel has no matching "
             "policy.automodel_cfg fp32 LM-head implementation."
         )
     if megatron_enabled and megatron_fp32 != vllm_fp32:

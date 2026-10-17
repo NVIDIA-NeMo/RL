@@ -37,12 +37,13 @@ from nemo_gym.token_id_capture.staging.records import (
 
 from nemo_rl.data.captured_media import (
     MediaCaptureRejected,
+    MediaColumnSpec,
     pack_images,
 )
 from nemo_rl.data.captured_media import (
     capture_processed_media as _capture_processed_media,
 )
-from nemo_rl.data.multimodal_utils import reassemble_packed_multimodal
+from nemo_rl.data.multimodal_utils import reassemble_packed_multimodal, row_shapes_key
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.data_plane.tq_token_sink import (
@@ -225,6 +226,10 @@ def receipt(*records, rollout_id="r0", terminal=None):
 
 def finalizer(dp, **kwargs):
     kwargs.setdefault("capture_media", True)
+    if kwargs["capture_media"]:
+        kwargs.setdefault(
+            "media_columns", MediaColumnSpec(pixel_dtype=torch.float32, patch_size=1)
+        )
     return RolloutReassembler(
         dp,
         partition_id="train",
@@ -1832,3 +1837,66 @@ def test_forest_rejects_shape_valid_video_frame_partition_change(dp):
     )
     assert not row.valid
     assert "frame counts disagree" in row.rejection_reason
+
+
+def test_media_column_spec_feature_dim_matches_pack_images_width() -> None:
+    """One packed patch row is ``3*P*P`` wide, the width ``pack_images`` emits."""
+    spec = MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
+    pixels = torch.zeros(3, 4, 4)
+    packed = pack_images(pixels.unsqueeze(0), torch.tensor([[4, 4]]), patch_size=2)
+    assert spec.pixel_feature_dim == packed.shape[-1] == 12
+
+
+@pytest.mark.parametrize(
+    ("pixel_dtype", "patch_size", "error"),
+    [
+        ("bfloat16", 2, TypeError),
+        (torch.bfloat16, 0, ValueError),
+        (torch.bfloat16, 2.0, ValueError),
+    ],
+)
+def test_media_column_spec_rejects_malformed_geometry(
+    pixel_dtype, patch_size, error
+) -> None:
+    with pytest.raises(error):
+        MediaColumnSpec(pixel_dtype=pixel_dtype, patch_size=patch_size)
+
+
+def test_text_only_forest_keeps_pinned_media_columns_on_padding(dp):
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutSelection,
+    )
+
+    record, _ = stage(dp, engine_prompt([10, 11], []))
+    result = finalizer(dp).finalize_group(
+        "g",
+        ["r0"],
+        [receipt(record)],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=3,
+        prompt_idx=0,
+        canonical_sample_ids=["g_g0"],
+        logical_selections=[
+            RolloutSelection((record.response_id,), (ActionOutputFlags(False, False),))
+        ],
+        execution_row_multiple=4,
+    )
+    assert result.valid_row_count == 1
+    assert result.meta.sample_ids == ["g_g0_s0", "g_pad0", "g_pad1", "g_pad2"]
+    fields = dict(dp.get_samples(result.meta.sample_ids, "train", result.meta.fields))
+    # The in-memory plane stacks equal-length empty wire rows into a rectangle.
+    # The shape tags still preserve every row's zero-patch geometry for TQ.
+    for field, shape in (
+        ("pixel_values", [0, 3]),
+        ("imgs_sizes", [0, 2]),
+        ("num_frames", [0]),
+    ):
+        assert fields[field].shape == (4, 0)
+        assert all(
+            tag[row_shapes_key(field)]["shapes"] == [shape] for tag in result.meta.tags
+        )
+    assert fields["pixel_values"].dtype == torch.float32
+    assert fields["sample_mask"].tolist() == [1.0, 0.0, 0.0, 0.0]
+    assert dp.list_sample_ids("staging") == []
