@@ -1,0 +1,41 @@
+# MXFP8 on every Transformer Engine linear: attention QKV and projection, and the routed
+# experts. Modules that are not TE linears (the MoE router, embeddings, the output layer,
+# norms) are unaffected by these matchers and keep their usual precision.
+#
+# Megatron-Core's MXFP8 batch-invariant parity tests are MoE-only; the dense attention
+# linears are covered end to end by the zero-KL nightly that uses this file.
+#
+# Use the same file on train and generation (generation inherits megatron_cfg).
+configs:
+  mxfp8:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      # Both flags are required under zero_train_gen_mismatch, and they apply to
+      # different surrounding forwards. Repeat them on evaluation_recipe: model
+      # construction uses that block whenever grad is disabled.
+      # - override_quantized_autocast: the training step is already inside an FP8
+      #   autocast; this replaces that outer recipe with this block's MXFP8.
+      # - override_nonquantized_autocast: logprob and other grad-disabled forwards
+      #   are not. Without it the module dequantizes these weights and runs BF16
+      #   while generation stays MXFP8.
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+    # Model construction picks evaluation_recipe whenever grad is disabled (the
+    # generation model), so it has to repeat the training precision; an empty block
+    # would mean BF16. Both autocast overrides are repeated for the same reason.
+    evaluation_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+      fp8_param: true
+      override_quantized_autocast: true
+      override_nonquantized_autocast: true
+
+matchers:
+  linear_mxfp8:
+    config: "mxfp8"
+    type: "glob"
+    pattern: "*"
+    enabled: true

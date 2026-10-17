@@ -14,8 +14,8 @@
 
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
-The recipe sets every required value; this module only checks them. Only BF16
-(no FP8) is supported.
+The recipe sets every required value; this module only checks them. Supported
+precisions are BF16 and MXFP8 (the same on train and generation).
 """
 
 from __future__ import annotations
@@ -68,6 +68,14 @@ _ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
 _TE_NATIVE_ENV_VARS = {
     "CUBLASLT_WORKSPACE_SIZE": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+}
+
+# Hybrid Mamba models: the SSM Triton ops read both at import. Without
+# TRITON_CACHE_AUTOTUNING, MAMBA_DETERMINISTIC replaces autotuning with the cheapest
+# config.
+_HYBRID_MAMBA_ENV_VARS = {
+    "MAMBA_DETERMINISTIC": "1",
+    "TRITON_CACHE_AUTOTUNING": "1",
 }
 
 
@@ -410,6 +418,22 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             f"generation transformer_impl must be 'inference_optimized' (got {impl!r})."
         )
 
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    backend = inference_cfg.get("inference_grouped_gemm_backend")
+    backend = getattr(backend, "value", backend)
+    if (
+        impl == "inference_optimized"
+        and backend == "flashinfer"
+        and fp8_cfg.get("enabled")
+        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch does not support "
+            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Use 'torch' or 'vllm'."
+        )
+
 
 def _validate_platform(out: ZeroTrainGenValidation, *, check_device: bool) -> None:
     """Blackwell + FA4 only (mcore extra: flash-attn-4, CuteDSL). Hopper/FA3 not supported."""
@@ -497,15 +521,39 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
 def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
-    """Reject unsupported architectures using the resolved Bridge provider."""
+    """Reject unsupported architectures using the resolved Bridge provider.
+
+    Hybrid Mamba models are supported with MAMBA_DETERMINISTIC=1 and
+    TRITON_CACHE_AUTOTUNING=1, from policy.megatron_cfg.env_vars or the launch
+    environment.
+    """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
+
+    if getattr(model_cfg, "is_hybrid_model", False) or "M" in (
+        getattr(model_cfg, "hybrid_layer_pattern", None) or ""
+    ):
+        env_vars = config["megatron_cfg"].get("env_vars") or {}
+        wrong = {}
+        for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+            got = env_vars.get(key, os.environ.get(key))
+            if got != value:
+                wrong[key] = got
+        if wrong:
+            required = ", ".join(
+                f"{k}={v!r}" for k, v in _HYBRID_MAMBA_ENV_VARS.items()
+            )
+            got = ", ".join(f"{k}={v!r}" for k, v in wrong.items())
+            raise ValueError(
+                "zero_train_gen_mismatch on a hybrid Mamba model requires "
+                f"{required} together in policy.megatron_cfg.env_vars or the launch "
+                f"environment (got {got})."
+            )
 
     unsupported_fields = [
         field_name
         for field_name in (
             "multi_latent_attention",
-            "hybrid_layer_pattern",
             "experimental_attention_variant",
         )
         if getattr(model_cfg, field_name, None)
@@ -518,7 +566,7 @@ def validate_zero_train_gen_model_provider(
 
 
 def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
-    """Only BF16 without FP8 is supported, on both the train and generation side."""
+    """BF16, or FP8 with the MXFP8 recipe; train and generation must agree."""
     if config.get("precision") != "bfloat16":
         out.violations.append(
             "zero_train_gen_mismatch requires policy.precision='bfloat16' "
@@ -529,8 +577,20 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
     generation = config.get("generation")
     if generation is not None and generation.get("backend") == "megatron":
         sides.append(("generation", merged_inference_megatron_cfg(config)))
+    kinds: dict[str, str] = {}
     for label, cfg in sides:
-        if cfg.get("fp8_cfg") and cfg["fp8_cfg"].get("enabled"):
+        fp8_cfg = cfg.get("fp8_cfg") or {}
+        if not fp8_cfg.get("enabled"):
+            kinds[label] = "bf16"
+            continue
+        kinds[label] = f"fp8:{fp8_cfg.get('fp8_recipe')}"
+        if fp8_cfg.get("fp8_recipe") != "mxfp8":
             out.violations.append(
-                f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
+                "zero_train_gen_mismatch supports FP8 only with fp8_recipe='mxfp8' "
+                f"(got {label}.fp8_cfg.fp8_recipe={fp8_cfg.get('fp8_recipe')!r})."
             )
+    if len(set(kinds.values())) > 1:
+        out.violations.append(
+            "zero_train_gen_mismatch requires the same precision on the train and "
+            f"generation side (got {kinds})."
+        )
