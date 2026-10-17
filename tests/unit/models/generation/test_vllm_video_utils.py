@@ -347,3 +347,10 @@ def test_video_config_rejects_unknown_sampling_fields():
 
     with pytest.raises(ValueError, match="sampling_stlye"):
         resolve_vllm_video_config(generation)
+
+
+def test_video_config_rejects_obsolete_video_loader_block():
+    generation = {"vllm_cfg": {"video_loader": {"num_frames": 32}}}
+
+    with pytest.raises(ValueError, match="vllm_cfg.video_loader is not supported"):
+        resolve_vllm_video_config(generation)

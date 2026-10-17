@@ -152,6 +152,66 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_processor_custom_template_updates_processor_and_tokenizer():
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "stale-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "new-template"
+
+
+def test_get_processor_custom_template_preserves_native_multimodal_template():
+    class Qwen2_5_VLProcessor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = Qwen2_5_VLProcessor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "native-multimodal-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "native-multimodal-template"
+
+
 def test_get_tokenizer_forwards_tokenizer_kwargs():
     """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
     config = {
