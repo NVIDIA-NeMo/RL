@@ -99,6 +99,9 @@ def _participants(client: object, label: str) -> SimpleNamespace:
     )
 
 
+_ACTOR_A_PARTICIPANTS = ("actor-a-environment", "actor-a-model")
+
+
 def _participant_manifest(
     label: str,
     kind: str,
@@ -314,10 +317,13 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         # A fresh deployment, as after a crash.
         restored, restored_agent, hooks = _in_process_gym(tmp_path / "ledger-after")
         await restored.discover()
+        # The restored deployment must have the participants that committed.
+        assert summary.participants == ("agent", "policy")
         await restored.restore(
             "restore-1",
             checkpoint_root,
             [episode],
+            participants=summary.participants,
             source_checkpoint_id="save-1",
             deadline_ts=time.time() + 5,
         )
@@ -748,6 +754,70 @@ def test_adapter_rejects_a_run_episode_the_agent_did_not_export(monkeypatch) -> 
         )
 
 
+class TestRestoreRequiresTheCommittedParticipants:
+    """Gym restores only live participants, so a missing one's state would be lost."""
+
+    @staticmethod
+    def _adapter(
+        monkeypatch, live: dict[str, str]
+    ) -> tuple[GymCheckpointAdapter, AsyncMock]:
+        from nemo_gym._checkpoint import coordination
+
+        restore = AsyncMock(
+            return_value={name: {"source_checkpoint_id": "save-1"} for name in live}
+        )
+        monkeypatch.setattr(coordination, "restore", restore)
+        adapter = GymCheckpointAdapter(
+            instance=GymCheckpointInstance("actor-a", 0),
+            client=object(),
+            auth_token="secret",
+        )
+        adapter._participants = SimpleNamespace(
+            client=object(),
+            members=tuple(
+                SimpleNamespace(server_name=name, kind=kind)
+                for name, kind in live.items()
+            ),
+        )
+        return adapter, restore
+
+    @staticmethod
+    def _restore(adapter: GymCheckpointAdapter) -> None:
+        asyncio.run(
+            adapter.restore(
+                "restore-1",
+                "/unused",
+                [GymCheckpointEpisode("rollout-1", 0)],
+                participants=_ACTOR_A_PARTICIPANTS,
+                source_checkpoint_id="save-1",
+                deadline_ts=10.0,
+            )
+        )
+
+    def test_a_deployment_missing_a_committed_participant_is_refused_before_gym_restores(
+        self, monkeypatch
+    ) -> None:
+        adapter, restore = self._adapter(
+            monkeypatch, {"actor-a-environment": "environment"}
+        )
+
+        with pytest.raises(
+            RuntimeError, match=r"lacks participants .*\['actor-a-model'\]"
+        ):
+            self._restore(adapter)
+        restore.assert_not_awaited()
+
+    def test_the_committed_deployment_restores(self, monkeypatch) -> None:
+        adapter, restore = self._adapter(
+            monkeypatch,
+            {"actor-a-model": "model", "actor-a-environment": "environment"},
+        )
+
+        self._restore(adapter)
+
+        restore.assert_awaited_once()
+
+
 def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
     from nemo_gym._checkpoint import coordination
 
@@ -781,6 +851,7 @@ def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
                 "restore-1",
                 "/checkpoints/step-1",
                 [GymCheckpointEpisode("rollout-1", 0)],
+                participants=_ACTOR_A_PARTICIPANTS,
                 source_checkpoint_id="save-1",
                 deadline_ts=10.0,
             )
@@ -827,6 +898,7 @@ def test_a_failed_checkpoint_control_call_crosses_ray_typed(
             "restore-1",
             "/unused",
             episodes,
+            participants=_ACTOR_A_PARTICIPANTS,
             source_checkpoint_id="save-1",
             deadline_ts=1.0,
         ),
