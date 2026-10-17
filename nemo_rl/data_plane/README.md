@@ -466,6 +466,10 @@ data_plane:
     storage_unit_segment_size: 0       # >0: storage units on (see "Storage layout")
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
+    ssd_offload:                       # needs storage_unit_segment_size > 0; no checkpointing
+      enabled: false                   # true: units spill memory to local SSD
+      path: null                       # absolute node-local dir; required if enabled
+      offload_threshold: 0.9           # offload above this share of unit memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
@@ -1053,7 +1057,9 @@ offload for runs that save or resume checkpoints; these are not additional user
 configuration knobs. Workers inherit this storage mode from TQ's controller.
 Other jobs keep TQ's storage defaults. A checkpoint saved with
 `simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises
-at load otherwise); `path` and `threshold_bytes` may change. This version supports NeMo-RL's HTTP
+at load otherwise); `path` and `threshold_bytes` may change.
+`mooncake_cpu.ssd_offload` cannot checkpoint at all: the run fails at
+bootstrap if both are on. This version supports NeMo-RL's HTTP
 metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
 exact storage-process matching.
