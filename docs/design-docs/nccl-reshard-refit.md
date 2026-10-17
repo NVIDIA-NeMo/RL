@@ -388,16 +388,6 @@ discovery, shared metadata and scale validation, factory selection, map construc
 communicator lifecycle, and transport orchestration. The TRTLLM factory owns its
 destination-shard, mesh, expert-divisibility, and registered-name checks.
 
-The vLLM direct factory returns a hook-free spec whose base aliases the destination
-storage captured when the map is built. The staged factory resolves live parameter
-storage in `pre`, so it continues to support replacing that storage between refits.
-The TRTLLM factory receives the refit communicator groups, device, registered
-destination name, and existing full-HF loader callback explicitly. It resolves the
-refit communicator rank for the parameter's training PP stage to select the local
-expert range. The worker defers this map construction until the communicators are
-initialized. Each factory returns specs with their own parameter references and
-hook closures; neither collection stores worker state or a shared cache.
-
 **To extend to a new backend**, provide a destination map from canonical HF weights
 to that backend's local storage. Both backends implement this as
 `build_hf_to_local_param_map`; Megatron derives its targets from Bridge conversion tasks.
