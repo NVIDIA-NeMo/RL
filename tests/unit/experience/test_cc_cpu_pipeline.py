@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+from tensordict import TensorDict
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
@@ -246,10 +247,12 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
     asyncio.run(exercise())
 
 
-def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
+@pytest.mark.parametrize("mask_all", [False, True])
+def test_mixed_cc_snapshot_restores_segmented_replay_and_owner_advantages(
     pipeline: tuple,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    mask_all: bool,
 ) -> None:
     harness, plane, finalizer = pipeline
     healthy = [capture_segment(harness, "group_g0") for _ in range(3)]
@@ -260,6 +263,16 @@ def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
     result = finalize(finalizer, [healthy, [failed]], execution_row_multiple=3)
     meta = result.meta
     assert meta.size == 6
+    if mask_all:
+        # Loss filtering does not remove the verified physical input layouts.
+        plane.put_samples(
+            sample_ids=meta.sample_ids,
+            partition_id="train",
+            fields=TensorDict(
+                {"mask_sample": torch.ones(meta.size, dtype=torch.bool)},
+                batch_size=[meta.size],
+            ),
+        )
 
     async def exercise() -> None:
         ctrl = await ready_controller(monkeypatch, plane, meta)
@@ -293,30 +306,45 @@ def test_mixed_cc_snapshot_preserves_rows_but_replay_restore_is_unsupported(
             pad_value_dict={"token_ids": 0},
             include_message_violation_fields=False,
         )
-        # Do not lie about the logical group size (2) to make six physical rows load.
-        with pytest.raises(ValueError, match="expected_group_size=2"):
-            await restored_buffer.load_state_dict(
-                state,
-                max_groups=1,
-                expected_partition_id="train",
-                expected_group_size=2,
-                expected_manifest_digest=native_metadata["manifest_digest"],
-            )
-        assert restored_buffer.meta_list == []
+        # Two logical owners, six physical rows, and capacity for one group.
+        count = await restored_buffer.load_state_dict(
+            state,
+            max_groups=1,
+            expected_partition_id="train",
+            expected_group_size=2,
+            expected_manifest_digest=native_metadata["manifest_digest"],
+        )
+        assert count == restored_buffer.size() == 1
+        assert restored_buffer.meta_list == [restored_meta]
+        assert restored_buffer.target_step_list == ctrl._buffer.target_step_list
+        assert restored_buffer.start_weight_list == ctrl._buffer.start_weight_list
+        assert restored_buffer.end_weight_list == ctrl._buffer.end_weight_list
         assert sorted(restored_plane.list_sample_ids("train")) == sorted(
             meta.sample_ids
         )
+        restored_ctrl = await ready_controller(
+            monkeypatch, restored_plane, restored_meta
+        )
+        await ctrl._advantage_stage(meta)
+        await restored_ctrl._advantage_stage(restored_meta)
+        for field in ("advantages", "sample_mask"):
+            original = plane.get_samples(meta.sample_ids, "train", [field])[field]
+            restored = restored_plane.get_samples(meta.sample_ids, "train", [field])[
+                field
+            ]
+            for left, right in zip(original.unbind(), restored.unbind(), strict=True):
+                torch.testing.assert_close(left, right, rtol=0, atol=0)
+                if mask_all:
+                    assert right.count_nonzero() == 0
         restored_plane.close()
 
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("supported", [False, True])
 @pytest.mark.parametrize("logprobs", [False, True])
 def test_mixed_failed_owner_padding_replay_and_controller(
     pipeline: tuple,
     monkeypatch: pytest.MonkeyPatch,
-    supported: bool,
     logprobs: bool,
 ) -> None:
     harness, plane, finalizer = pipeline
@@ -338,42 +366,31 @@ def test_mixed_failed_owner_padding_replay_and_controller(
         ctrl = await ready_controller(monkeypatch, plane, meta)
         ctrl._policy_logprobs_required = ctrl._reference_logprobs_required = logprobs
         original_ids = list(meta.sample_ids)
-        check = ctrl._trainer.worker_group.run_all_workers_single_data
-        if not supported:
-            check.side_effect = ValueError("unsafe router")
-            with pytest.raises(ValueError, match="unsafe router"):
-                await asyncio.wait_for(ctrl._train_pump(), timeout=5)
-            ctrl._trainer.get_logprobs_from_meta.assert_not_called()
-            ctrl._trainer.get_reference_policy_logprobs_from_meta.assert_not_called()
-            ctrl._trainer.train_microbatches_from_meta.assert_not_called()
-            ctrl._trainer.finish_train_step.assert_not_called()
-            assert sorted(plane.list_sample_ids("train")) == sorted(original_ids)
-        else:
 
-            def learner(batch: Any, *args: Any, **kwargs: Any) -> None:
-                assert batch.sample_ids == original_ids and batch.tags == meta.tags
-                data = plane.get_samples(
-                    batch.sample_ids,
-                    "train",
-                    ["total_reward", "sample_mask", "token_mask", "advantages"],
-                )
-                assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
-                assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
-                for index in range(6):
-                    mask = data["token_mask"][index].bool()
-                    if index < 3:
-                        # Only the healthy owner votes: reward and baseline are
-                        # both 1, regardless of its three physical segments.
-                        assert torch.all(data["advantages"][index][mask] == 0.0)
-                    else:
-                        assert not mask.any()
+        # Model routing safety is checked at setup, before dispatch.
+        def learner(batch: Any, *args: Any, **kwargs: Any) -> None:
+            assert batch.sample_ids == original_ids and batch.tags == meta.tags
+            data = plane.get_samples(
+                batch.sample_ids,
+                "train",
+                ["total_reward", "sample_mask", "token_mask", "advantages"],
+            )
+            assert data["total_reward"].tolist() == [1, 1, 1, 2, 0, 0]
+            assert data["sample_mask"].tolist() == [1, 1, 1, 0, 0, 0]
+            for index in range(6):
+                mask = data["token_mask"][index].bool()
+                if index < 3:
+                    # Only the healthy owner votes: reward and baseline are
+                    # both 1, regardless of its three physical segments.
+                    assert torch.all(data["advantages"][index][mask] == 0.0)
+                else:
+                    assert not mask.any()
 
-            ctrl._trainer.train_microbatches_from_meta.side_effect = learner
-            await asyncio.wait_for(ctrl._train_pump(), timeout=5)
-            ctrl._trainer.finish_train_step.assert_called_once()
-            assert plane.list_sample_ids("train") == []
-            assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
-        check.assert_called_once_with("validate_forest_execution_padding")
+        ctrl._trainer.train_microbatches_from_meta.side_effect = learner
+        await asyncio.wait_for(ctrl._train_pump(), timeout=5)
+        ctrl._trainer.finish_train_step.assert_called_once()
+        assert plane.list_sample_ids("train") == []
+        assert ctrl._trainer_version == 1 and ctrl._consumed_samples == 1
 
     asyncio.run(exercise())
 

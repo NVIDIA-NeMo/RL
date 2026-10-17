@@ -1513,12 +1513,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         if async_config.rollout_failure.min_step_batch_fraction != 1:
             raise ValueError("forest training requires min_step_batch_fraction=1")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
-        if master_config.checkpointing["enabled"]:
-            raise ValueError("Forest checkpoint/resume is not supported initially")
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
-            raise ValueError(
-                "Forest rollout checkpoint/resume is not supported initially"
-            )
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "Forest does not support reward penalties or on-policy distillation"
