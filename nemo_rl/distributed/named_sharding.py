@@ -27,6 +27,10 @@ REPLICATED_AXES: tuple[str, ...] = (
     "pipeline_parallel",
 )
 
+# Data-shard axis for Generalized Tensor Parallel rematerialization. Each GTP
+# coordinate consumes a distinct microbatch, unlike REPLICATED_AXES.
+GTP_WEIGHT_REMAT_AXIS = "gtp_weight_remat"
+
 
 class NamedSharding:
     """Represents an N-dimensional arrangement of ranks with named axes, facilitating data sharding, replication, and collection based on these axes.

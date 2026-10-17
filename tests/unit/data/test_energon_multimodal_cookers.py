@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from dataclasses import FrozenInstanceError
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 # cookers.generic imports megatron.energon at module scope, and it ships only in
 # the `mcore` extra. importorskip must run before that import: the mcore mark is
@@ -66,3 +68,65 @@ def test_generic_cooker_freezes_explicit_media_metadata_without_opening_media():
     assert cooked.media[0].metadata == (("height", 16), ("width", 32))
     with pytest.raises(FrozenInstanceError):
         cooked.media[0].metadata = ()
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_generic_cooker_derives_missing_image_dimensions(encoded):
+    image = Image.new("RGB", (32, 16))
+    if encoded:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        value = buffer.getvalue()
+    else:
+        value = image
+    cooked = cook_conversation(
+        _sample(
+            {
+                "messages": [
+                    {"role": "user", "content": [{"type": "image", "media_index": 0}]}
+                ],
+                "media": [
+                    {"type": "image", "value": value, "metadata": {"source": "test"}}
+                ],
+            }
+        )
+    )
+    assert cooked.media[0].value is value
+    assert dict(cooked.media[0].metadata) == {
+        "width": 32,
+        "height": 16,
+        "source": "test",
+    }
+
+
+def test_generic_cooker_preserves_partial_explicit_dimensions():
+    image = Image.new("RGB", (32, 16))
+    metadata = {"width": 64}
+    cooked = cook_conversation(
+        _sample(
+            {
+                "messages": [{"role": "user", "content": "image"}],
+                "media": [{"type": "image", "value": image, "metadata": metadata}],
+            }
+        )
+    )
+    assert dict(cooked.media[0].metadata) == {"width": 64, "height": 16}
+    assert metadata == {"width": 64}
+
+
+def test_generic_cooker_resolves_lazy_image_without_replacing_reference():
+    class LazyImage:
+        def get(self, sample):
+            return (Image.new("RGB", (32, 16)),)
+
+    value = LazyImage()
+    cooked = cook_conversation(
+        _sample(
+            {
+                "messages": [{"role": "user", "content": "image"}],
+                "media": [{"type": "image", "value": value}],
+            }
+        )
+    )
+    assert cooked.media[0].value is value
+    assert dict(cooked.media[0].metadata) == {"width": 32, "height": 16}
