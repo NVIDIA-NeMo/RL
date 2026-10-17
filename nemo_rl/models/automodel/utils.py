@@ -60,8 +60,8 @@ def resolve_model_class(model_name: str) -> Any:
 # Per-dispatch tensors that Automodel's flex token-dispatch managers (DeepEP,
 # HybridEP, UCCL-EP) keep as attributes. Each dispatch reassigns them, so none
 # is needed across steps.
-# TODO: drop this workaround once Automodel releases this state itself
-# (upstream issue to be linked).
+# TODO(https://github.com/NVIDIA-NeMo/Automodel/issues/4401): drop this workaround
+# once Automodel releases this state itself.
 _MOE_DISPATCH_STATE_ATTRS = (
     "token_probs",
     "token_indices",
