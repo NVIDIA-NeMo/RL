@@ -71,6 +71,7 @@ export MODEL_PATH=${MODEL_PATH:-$super_checkpoint}
   echo "ERROR: async qualification requires the exact Super-GA checkpoint: $super_checkpoint" >&2
   exit 2
 }
+export GENERATION_TENSOR_PARALLEL_SIZE=${GENERATION_TENSOR_PARALLEL_SIZE:-4}
 # Gate 2 keeps the exact Gate 1 prompts; only sampler topology changes.
 debug_delegation_prompt="During this task call the task tool exactly once near the beginning to delegate one suitable bounded subtask to the general subagent. "
 debug_delegation_prompt+="Do not delegate the full task. Review and integrate the child result. Continue until every required deliverable exists. "
@@ -115,6 +116,7 @@ python3 "$repo_dir/tools/validate_subagent_sync_handoff.py" \
   --expected-container "$expected_container" \
   --expected-delegation-prompt-sha256 "$delegation_prompt_sha256" \
   --expected-subagent-prompt-sha256 "$subagent_prompt_sha256" \
+  --expected-generation-tensor-parallel-size "$GENERATION_TENSOR_PARALLEL_SIZE" \
   --health-auditor-sha256 "$actual_auditor_sha256" \
   --expected-wandb-project nemorl-v2-subagent-comapction-debug \
   --min-steps 20 --tmpe-threshold 1.03 >"$handoff_json"
@@ -190,6 +192,7 @@ inflight_groups=$((NUM_PROMPTS * 3))
 # groups remain selectable. Audit the realized `lag=` metric during this gate.
 agent=env.nemo_gym.claweval_agent.responses_api_agents.claweval_agent
 exec bash "$script_dir/run_sc.sh" \
+  "policy.generation.vllm_cfg.tensor_parallel_size=${GENERATION_TENSOR_PARALLEL_SIZE}" \
   +policy.router_replay.enabled=true \
   async_rl.sampler.name=ready_first \
   ~async_rl.sampler.max_lookahead_versions \

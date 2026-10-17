@@ -47,6 +47,7 @@ export NUM_GEN_NODES=4
 export SEGMENT_SIZE=4
 export NUM_PROMPTS=8
 export NUM_GENERATIONS=4
+export GENERATION_TENSOR_PARALLEL_SIZE=4
 
 # The sync run is allocation-bounded and remains live after the 20-step audit.
 export MAX_STEPS=1000000
@@ -117,6 +118,7 @@ export NEMO_RL_TMPE_OUTLIER_THRESHOLD=1.03
 export RUN_TMPE_OUTLIER_TESTS=1
 
 exec bash "$script_dir/train_subagents_sync_8n.sh" \
+  policy.generation.vllm_cfg.tensor_parallel_size="$GENERATION_TENSOR_PARALLEL_SIZE" \
   checkpointing.save_period=20 \
   checkpointing.keep_top_k=null \
   +checkpointing.ft_save_period=1 \

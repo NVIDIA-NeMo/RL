@@ -30,7 +30,8 @@ if [[ $target == */run_sc.sh ]]; then
     MAX_STEPS SLURM_ACCOUNT SLURM_QOS SLURM_TIME_LIMIT JOB_CYCLES \
     MIN_SLURM_TIME_SECONDS MIN_CHECKPOINT_BUDGET_SECONDS \
     REQUIRE_RESUMABLE_JOB_CYCLES NUM_NODES GPUS_PER_NODE NUM_GEN_NODES \
-    SEGMENT_SIZE MODEL_PATH CONFIG_IN_CONTAINER SAVE_PERIOD \
+    SEGMENT_SIZE GENERATION_TENSOR_PARALLEL_SIZE MODEL_PATH \
+    CONFIG_IN_CONTAINER SAVE_PERIOD \
     CHECKPOINT_KEEP_TOP_K RESULTS_DIR CHECKPOINT_ROOT SYNC_GATE_ATTESTATION \
     SYNC_DCP_MANIFEST_SHA256 CONTEXT_COMPACTION \
     AGENTIC_VBENCH_COMPACTION_AUTO AGENTIC_VBENCH_COMPACTION_PRUNE \
@@ -225,6 +226,7 @@ iteration.mkdir(parents=True)
     'run_grpo grpo.max_num_steps=1000000 grpo.max_num_epochs=null '
     'checkpointing.save_period=20 checkpointing.keep_top_k=null '
     'token_capture.context_compaction=true '
+    'policy.generation.vllm_cfg.tensor_parallel_size=4 '
     'logger.wandb.project="nemorl-v2-subagent-comapction-debug"\n'
 )
 provenance = {
@@ -248,6 +250,7 @@ provenance = {
     "segment_size": 4,
     "num_prompts": contract["num_prompts"],
     "num_generations": 4,
+    "generation_tensor_parallel_size": 4,
     "max_num_steps": 1000000,
     "max_num_epochs": None,
     "save_period": 20,
@@ -348,9 +351,14 @@ for output in "$tmp/agentic-exact-sync.out" "$tmp/claw-exact-sync.out"; do
   grep -Fqx 'WANDB_PROJECT=nemorl-v2-subagent-comapction-debug' "$output"
   grep -Fqx 'SAVE_PERIOD=20' "$output"
   grep -Fqx 'CHECKPOINT_KEEP_TOP_K=null' "$output"
+  grep -Fqx 'GENERATION_TENSOR_PARALLEL_SIZE=4' "$output"
 done
 grep -Fqx "TRAIN_PATH=$agentic_data" "$tmp/agentic-exact-sync.out"
 grep -Fqx "TRAIN_PATH=$claw_data" "$tmp/claw-exact-sync.out"
+grep -Fqx 'ARG=policy.generation.vllm_cfg.tensor_parallel_size=4' \
+  "$tmp/agentic-exact-sync.out"
+grep -Fqx 'ARG=policy.generation.vllm_cfg.tensor_parallel_size=4' \
+  "$tmp/claw-exact-sync.out"
 
 if /bin/bash "$repo_dir/scripts/agentic_vbench/launch_subagents_super_sync20.sh" \
   grpo.max_num_steps=20 >/dev/null 2>&1; then

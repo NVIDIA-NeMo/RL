@@ -70,6 +70,7 @@ export MODEL_PATH=${MODEL_PATH:-$super_checkpoint}
   echo "ERROR: async qualification requires the exact Super-GA checkpoint: $super_checkpoint" >&2
   exit 2
 }
+export GENERATION_TENSOR_PARALLEL_SIZE=${GENERATION_TENSOR_PARALLEL_SIZE:-4}
 # Gate 2 keeps the exact Gate 1 prompts; only sampler topology changes.
 debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
 debug_delegation_prompt+="Delegate the complete video assembly task to the general subagent. Include the original storyboard slot requirements and require the child to inspect the supplied clips choose every slot create solution.mp4 and create a truthful solution.json before returning. Require solution.json to be a top-level JSON object with a segments list and never a bare JSON list. "
@@ -117,6 +118,7 @@ python3 "$repo_dir/tools/validate_subagent_sync_handoff.py" \
   --expected-container "$expected_container" \
   --expected-delegation-prompt-sha256 "$delegation_prompt_sha256" \
   --expected-subagent-prompt-sha256 "$subagent_prompt_sha256" \
+  --expected-generation-tensor-parallel-size "$GENERATION_TENSOR_PARALLEL_SIZE" \
   --health-auditor-sha256 "$actual_auditor_sha256" \
   --expected-wandb-project nemorl-v2-subagent-comapction-debug \
   --min-steps 20 --tmpe-threshold 1.03 >"$handoff_json"
@@ -190,6 +192,7 @@ inflight_groups=$((NUM_PROMPTS * 3))
 # late stragglers remain selectable by design, so live qualification must report
 # the realized `lag=` metric instead of treating this knob as a hard age filter.
 exec bash "$script_dir/smoke_subagents_fast_step.sh" \
+  "policy.generation.vllm_cfg.tensor_parallel_size=${GENERATION_TENSOR_PARALLEL_SIZE}" \
   +policy.router_replay.enabled=true \
   async_rl.sampler.name=ready_first \
   ~async_rl.sampler.max_lookahead_versions \

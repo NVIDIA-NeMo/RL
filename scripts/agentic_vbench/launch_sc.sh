@@ -153,6 +153,11 @@ num_gen_nodes="${NUM_GEN_NODES:-8}"
 segment_size="${SEGMENT_SIZE:-8}"
 num_prompts="${NUM_PROMPTS:-8}"
 num_generations="${NUM_GENERATIONS:-4}"
+generation_tensor_parallel_size="${GENERATION_TENSOR_PARALLEL_SIZE:-}"
+if [[ -n $generation_tensor_parallel_size && ! $generation_tensor_parallel_size =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: GENERATION_TENSOR_PARALLEL_SIZE must be a positive integer when set" >&2
+  exit 1
+fi
 # Keep the production GRPO horizon. The controller still stops at the data-epoch
 # or Slurm/checkpoint boundary; this must not become a one-step smoke cap.
 max_steps="${MAX_STEPS:-1000000}"
@@ -337,7 +342,8 @@ python3 - \
   "${config_in_container}" "${runtime_code_dir}/${config_in_container}" \
   "${TRAIN_PATH}" "${VAL_PATH}" "${container}" \
   "${num_nodes}" "${num_gen_nodes}" "${gpus_per_node}" "${segment_size}" \
-  "${num_prompts}" "${num_generations}" "${max_steps}" "${save_period}" \
+  "${num_prompts}" "${num_generations}" "${generation_tensor_parallel_size}" \
+  "${max_steps}" "${save_period}" \
   "${checkpoint_keep_top_k}" "${context_compaction}" \
   "${launch_compaction_auto}" "${launch_compaction_prune}" \
   "${launch_subagents}" "${launch_training_mode}" "${wandb_project}" \
@@ -379,6 +385,7 @@ from pathlib import Path
     segment_size,
     num_prompts,
     num_generations,
+    generation_tensor_parallel_size,
     max_num_steps,
     save_period,
     keep_top_k,
@@ -472,6 +479,9 @@ payload = {
     "segment_size": int(segment_size),
     "num_prompts": int(num_prompts),
     "num_generations": int(num_generations),
+    "generation_tensor_parallel_size": optional_int(
+        generation_tensor_parallel_size
+    ),
     "max_num_steps": int(max_num_steps),
     "max_num_epochs": None,
     "save_period": int(save_period),

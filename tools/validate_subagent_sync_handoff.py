@@ -243,6 +243,7 @@ def _validate_provenance(
     expected_container: Path,
     expected_delegation_prompt_sha256: str,
     expected_subagent_prompt_sha256: str,
+    expected_generation_tensor_parallel_size: int,
 ) -> None:
     if provenance.get("schema_version") != 2:
         _fail("launch provenance must use schema version 2")
@@ -262,6 +263,7 @@ def _validate_provenance(
         "segment_size": 4,
         "num_prompts": contract["num_prompts"],
         "num_generations": 4,
+        "generation_tensor_parallel_size": (expected_generation_tensor_parallel_size),
         "max_num_steps": 1_000_000,
         "max_num_epochs": None,
         "save_period": 20,
@@ -365,6 +367,8 @@ def _validate_provenance(
 
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
+    if args.expected_generation_tensor_parallel_size <= 0:
+        _fail("expected generation tensor-parallel size must be positive")
     result_dir = args.result_dir.resolve(strict=True)
     weights_dir = args.weights_dir.resolve(strict=True)
     expected_weights = result_dir / "checkpoints" / "step_20" / "policy" / "weights"
@@ -397,6 +401,9 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         expected_container=args.expected_container,
         expected_delegation_prompt_sha256=args.expected_delegation_prompt_sha256,
         expected_subagent_prompt_sha256=args.expected_subagent_prompt_sha256,
+        expected_generation_tensor_parallel_size=(
+            args.expected_generation_tensor_parallel_size
+        ),
     )
     training_command_path = result_dir / "training_command.sh"
     _nonempty(training_command_path, "archived training command")
@@ -408,6 +415,8 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpointing.save_period=20",
         "checkpointing.keep_top_k=null",
         "token_capture.context_compaction=true",
+        "policy.generation.vllm_cfg.tensor_parallel_size="
+        f"{args.expected_generation_tensor_parallel_size}",
     ):
         if required_setting not in training_command:
             _fail(f"archived training command omits {required_setting!r}")
@@ -548,6 +557,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-container", type=Path, required=True)
     parser.add_argument("--expected-delegation-prompt-sha256", required=True)
     parser.add_argument("--expected-subagent-prompt-sha256", required=True)
+    parser.add_argument(
+        "--expected-generation-tensor-parallel-size", type=int, required=True
+    )
     parser.add_argument("--health-auditor-sha256", required=True)
     parser.add_argument(
         "--expected-wandb-project",
