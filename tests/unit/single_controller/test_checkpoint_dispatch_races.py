@@ -1800,6 +1800,7 @@ def _write_turn_manifest(
         instances={"tools/replica-0": () if restarted else (saved,)},
         staging_keys={"tools/replica-0": ()},
         restarts={"tools/replica-0": (saved,) if restarted else ()},
+        participants={"tools/replica-0": ()},
     )
     write_gym_checkpoint_manifest(tmp_path, manifest)
     return manifest
