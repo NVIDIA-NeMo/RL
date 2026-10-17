@@ -1266,6 +1266,9 @@ class AsyncNemoGymRolloutImpl:
         timing is reported under the instance label and every later attempt's
         under ``<instance label>/retry<n>``, the rule the driver path's stream
         merge applies, so a one-row re-dispatch never replaces the group's totals.
+        The metrics also carry ``nemo_gym_infra_redispatches``, the number of rows
+        sent again after an attempt ended without them, zero included; the driver
+        path reports the same key from its stream merge.
         """
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
@@ -1322,6 +1325,8 @@ class AsyncNemoGymRolloutImpl:
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
+            # Rows sent again across every later attempt, reported per rollout.
+            infra_redispatches = 0
             async with _Deadline(
                 self._timeouts.rollout_s,
                 "NeMo-Gym prompt group",
@@ -1337,6 +1342,7 @@ class AsyncNemoGymRolloutImpl:
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
                             flush=True,
                         )
+                        infra_redispatches += len(pending)
                         # Row re-dispatches are invisible in redispatch_total -- they
                         # recover a partial group instead of retrying the prompt -- so
                         # gym could retry rows all run with every counter flat.
@@ -1470,6 +1476,9 @@ class AsyncNemoGymRolloutImpl:
             )
 
         rollout_metrics.update(env_timing_metrics)
+        # Reported on every rollout, zero included, so a mean over steps is a rate;
+        # the same key the driver path reports from its stream merge.
+        rollout_metrics["nemo_gym_infra_redispatches"] = infra_redispatches
         for handle in shard_set.all_handles:
             label = shard_set.instance_label(handle)
             rollout_metrics[f"{timer_prefix}/routing/group_share/{label}"] = 0
