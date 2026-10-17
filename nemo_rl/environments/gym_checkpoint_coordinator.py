@@ -39,7 +39,7 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
-GYM_CHECKPOINT_SCHEMA_VERSION = 3
+GYM_CHECKPOINT_SCHEMA_VERSION = 1
 # Upper bound on how long past a call's deadline RL waits for Gym's reply. Gym
 # answers by the deadline once it runs the call, so this only covers the reply
 # crossing Ray; a call still unanswered after it was never run.
@@ -201,86 +201,29 @@ class GymCheckpointManifest:
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> GymCheckpointManifest:
-        unknown = set(raw) - {
-            "schema_version",
-            "checkpoint_id",
-            "instances",
-            "staging_keys",
-            "restarts",
-        }
-        if unknown:
-            raise ValueError(
-                f"Gym checkpoint manifest contains unknown fields: {sorted(unknown)!r}"
-            )
-        schema_version = raw.get("schema_version")
-        checkpoint_id = raw.get("checkpoint_id")
-        raw_instances = raw.get("instances")
-        raw_staging_keys = raw.get("staging_keys")
-        raw_restarts = raw.get("restarts")
-        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
-            raise ValueError("Gym checkpoint schema_version must be an integer")
-        if not isinstance(checkpoint_id, str):
-            raise ValueError("Gym checkpoint checkpoint_id must be a string")
-        if not isinstance(raw_instances, dict):
-            raise ValueError("Gym checkpoint instances must be a mapping")
-        if not isinstance(raw_staging_keys, dict):
-            raise ValueError("Gym checkpoint staging_keys must be a mapping")
-        if not isinstance(raw_restarts, dict):
-            raise ValueError("Gym checkpoint restarts must be a mapping")
-
-        instances = _episodes_by_instance(raw_instances, "episodes")
-        restarts = _episodes_by_instance(raw_restarts, "restarts")
-        staging_keys: dict[str, tuple[str, ...]] = {}
-        for instance_id, raw_keys in raw_staging_keys.items():
-            if not isinstance(instance_id, str):
-                raise ValueError(
-                    "Gym checkpoint staging-key instance IDs must be strings"
-                )
-            if not isinstance(raw_keys, list) or not all(
-                isinstance(key, str) for key in raw_keys
-            ):
-                raise ValueError(
-                    f"Gym checkpoint staging keys for {instance_id!r} must be strings"
-                )
-            staging_keys[instance_id] = tuple(raw_keys)
+        """Parse a manifest RL wrote; __post_init__ checks what it means."""
         return cls(
-            schema_version=schema_version,
-            checkpoint_id=checkpoint_id,
-            instances=instances,
-            staging_keys=staging_keys,
-            restarts=restarts,
+            schema_version=raw["schema_version"],
+            checkpoint_id=raw["checkpoint_id"],
+            instances=_episodes_by_instance(raw["instances"]),
+            staging_keys={
+                instance_id: tuple(keys)
+                for instance_id, keys in raw["staging_keys"].items()
+            },
+            restarts=_episodes_by_instance(raw["restarts"]),
         )
 
 
 def _episodes_by_instance(
-    raw: Mapping[Any, Any], name: str
+    raw: Mapping[str, list[Mapping[str, Any]]],
 ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
-    """Parse one manifest mapping from Gym instance IDs to episode lists."""
-    episodes_by_instance: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-    for instance_id, raw_episodes in raw.items():
-        if not isinstance(instance_id, str):
-            raise ValueError("Gym checkpoint instance IDs must be strings")
-        if not isinstance(raw_episodes, list):
-            raise ValueError(
-                f"Gym checkpoint {name} for {instance_id!r} must be a list"
-            )
-        episodes = []
-        for raw_episode in raw_episodes:
-            if not isinstance(raw_episode, dict):
-                raise ValueError("Gym checkpoint episode must be a mapping")
-            if set(raw_episode) != {"rollout_id", "attempt"}:
-                raise ValueError(
-                    "Gym checkpoint episode must contain exactly rollout_id and attempt"
-                )
-            rollout_id = raw_episode["rollout_id"]
-            attempt = raw_episode["attempt"]
-            if not isinstance(rollout_id, str):
-                raise ValueError("Gym checkpoint episode rollout_id must be a string")
-            if not isinstance(attempt, int) or isinstance(attempt, bool):
-                raise ValueError("Gym checkpoint episode attempt must be an integer")
-            episodes.append(GymCheckpointEpisode(rollout_id, attempt))
-        episodes_by_instance[instance_id] = tuple(episodes)
-    return episodes_by_instance
+    return {
+        instance_id: tuple(
+            GymCheckpointEpisode(episode["rollout_id"], episode["attempt"])
+            for episode in episodes
+        )
+        for instance_id, episodes in raw.items()
+    }
 
 
 @dataclass(frozen=True)
