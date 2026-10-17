@@ -330,6 +330,62 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
     model.experts.w2_input_scale.copy_(torch.arange(4, dtype=torch.float32))
 
 
+@pytest.mark.parametrize("backend", ["FLASHINFER_TRTLLM", "MARLIN"])
+def test_real_quant_moe_scales_use_native_reload_copyback(backend):
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        get_layerwise_info,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+    method = object.__new__(ModelOptNvFp4FusedMoE)
+    method.nvfp4_backend = NvFp4MoeBackend[backend]
+    layer.quant_method = method
+
+    def process_weights(target):
+        target.weight = torch.nn.Parameter(target.weight.clone(), requires_grad=False)
+        method.moe_quant_config = types.SimpleNamespace(
+            a1_gscale=target.weight * 2 if backend != "MARLIN" else None,
+            a2_gscale=target.weight * 3 if backend != "MARLIN" else None,
+            w1_scale=target.weight,
+        )
+        method.moe_kernel = object()
+
+    method.process_weights_after_loading = process_weights
+    # The real model loader records checkpoint metadata before cold processing.
+    record_metadata_for_reloading(layer)
+    process_weights(layer)
+    patch_mod._preserve_nvfp4_moe_reload_scales(layer)
+    config, kernel = method.moe_quant_config, method.moe_kernel
+    if backend != "MARLIN":
+        assert layer._nrl_a1_gscale is config.a1_gscale
+        assert layer._nrl_a2_gscale is config.a2_gscale
+    assert not get_layerwise_info(layer).restore_metadata[1]
+
+    for value in (2.0, 3.0, 1.0):
+        initialize_layerwise_reload(layer)
+        assert not layer._buffers  # No derived scales are checkpoint load targets.
+        assert get_layerwise_info(layer).load_numel_total == 2
+        layer.weight.weight_loader(layer.weight, torch.full((2,), value))
+        finalize_layerwise_reload(layer, None)
+        assert method.moe_quant_config is config and method.moe_kernel is kernel
+        if backend != "MARLIN":
+            assert layer._nrl_a1_gscale is config.a1_gscale
+            assert layer._nrl_a2_gscale is config.a2_gscale
+            torch.testing.assert_close(config.a1_gscale, torch.full((2,), value * 2))
+            torch.testing.assert_close(config.a2_gscale, torch.full((2,), value * 3))
+        assert config.w1_scale is layer.weight
+        torch.testing.assert_close(layer.weight, torch.full((2,), value))
+
+
 def test_real_quant_worker_loads_model_outside_inference_mode(monkeypatch):
     patch_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_patch"

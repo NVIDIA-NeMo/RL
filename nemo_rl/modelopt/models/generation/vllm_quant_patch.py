@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
+from functools import partial
 from typing import Any
 
 import modelopt.torch.quantization as mtq
@@ -253,8 +255,77 @@ def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
             scale.data = scale.detach().clone()
 
 
+def _process_nvfp4_moe_reload(
+    layer: torch.nn.Module,
+    *,
+    quant_method: Any,
+    process_weights: Callable[[torch.nn.Module], None],
+) -> None:
+    # Import only in the real-quant worker; fake quant does not use native reload.
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    reloading = get_layerwise_info(layer).kernel_tensors is not None
+    previous_config = quant_method.moe_quant_config
+    previous_kernel = quant_method.moe_kernel
+    process_weights(layer)
+    config = quant_method.moe_quant_config
+    for name in ("a1_gscale", "a2_gscale"):
+        current = getattr(config, name)
+        if reloading:
+            previous = getattr(previous_config, name)
+            if current is None or previous is None:
+                if current is not previous:
+                    raise ValueError("NVFP4 MoE scale metadata changed during refit")
+            elif (
+                current.shape != previous.shape
+                or current.dtype != previous.dtype
+                or current.device != previous.device
+            ):
+                raise ValueError("NVFP4 MoE scale metadata changed during refit")
+    for name in ("a1_gscale", "a2_gscale"):
+        scale = getattr(config, name)
+        if scale is not None:
+            layer.register_buffer(f"_nrl_{name}", scale)
+    if reloading:
+        # Native copy-back updates the registered scales, including our two
+        # reciprocals. Keep the kernel that references that original storage;
+        # a newly built kernel would retain temporary postprocessing tensors.
+        quant_method.moe_quant_config = previous_config
+        quant_method.moe_kernel = previous_kernel
+
+
+def _preserve_nvfp4_moe_reload_scales(model: torch.nn.Module) -> None:
+    """Keep CUDA-graph scale storage stable across native NVFP4 MoE reloads."""
+    # These backend types are optional outside vLLM's real-quant worker.
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+
+    for layer in model.modules():
+        method = getattr(layer, "quant_method", None)
+        if not isinstance(
+            method, ModelOptNvFp4FusedMoE
+        ) or method.nvfp4_backend not in (
+            NvFp4MoeBackend.VLLM_CUTLASS,
+            NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.MARLIN,
+        ):
+            continue
+        # Install after cold loading: checkpoint metadata excludes these derived
+        # buffers. Persistent buffers participate in native reload copy-back;
+        # nonpersistent buffers absent from the checkpoint would be skipped.
+        for name in ("a1_gscale", "a2_gscale"):
+            scale = getattr(method.moe_quant_config, name)
+            if scale is not None:
+                layer.register_buffer(f"_nrl_{name}", scale)
+        method.process_weights_after_loading = partial(
+            _process_nvfp4_moe_reload,
+            quant_method=method,
+            process_weights=method.process_weights_after_loading,
+        )
+
+
 class RealQuantWorker(NixlVllmWorker):
-    """vLLM worker with the NVFP4 MoE reload fix missing from vLLM 0.25.1."""
+    """vLLM worker with graph-safe native NVFP4 MoE reloads."""
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
@@ -262,6 +333,7 @@ class RealQuantWorker(NixlVllmWorker):
         if hasattr(model, "unwrap"):
             model = model.unwrap()
         _make_nvfp4_moe_input_scales_writable(model)
+        _preserve_nvfp4_moe_reload_scales(model)
 
 
 class FakeQuantWorker(NixlVllmWorker):
