@@ -130,11 +130,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             if self._baseline_commit_refs:
                 ray.get(self._baseline_commit_refs)
                 self._baseline_commit_refs.clear()
-            if not self._generation.invalidate_kv_cache():
-                raise RuntimeError(
-                    f"vLLM KV cache invalidation failed before {self._transport} "
-                    "weight update."
-                )
+            # Cache policy belongs to finish_generation and recompute_kv_cache_after_weight_updates.
             if self._baseline_init_refs:
                 ray.get(self._baseline_init_refs)
                 self._baseline_init_refs.clear()
