@@ -43,6 +43,8 @@ pytestmark = pytest.mark.nemo_gym
 
 
 _FakeGymActor = FakeGymActor
+_NO_RESTARTS = {"tools/replica-0": ()}
+_NO_RESTARTS_TWO = {"tools/replica-0": (), "tools/replica-1": ()}
 
 
 def _coordinator(*actors: FakeGymActor) -> GymCheckpointCoordinator:
@@ -86,6 +88,7 @@ def test_manifest_rejects_duplicate_episode_identity() -> None:
             checkpoint_id="save-1",
             instances={"tools/replica-0": (episode, episode)},
             staging_keys={"tools/replica-0": ()},
+            restarts={"tools/replica-0": ()},
         )
 
 
@@ -106,7 +109,9 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
 
     async def exercise() -> None:
         async with coordinator.prepared("save-1"):
-            result = await coordinator.commit("save-1", tmp_path, inventory)
+            result = await coordinator.commit(
+                "save-1", tmp_path, inventory, restarts=_NO_RESTARTS_TWO
+            )
             assert result.manifest.instances == inventory
             assert set(result.instances) == set(inventory)
             assert result.instances["tools/replica-0"].exported_episodes == (
@@ -200,6 +205,7 @@ def test_coordinator_rejects_inventory_for_the_wrong_actor_topology(
                 "save-1",
                 tmp_path,
                 {"other/replica-0": ()},
+                restarts=_NO_RESTARTS,
             )
         )
 
@@ -214,6 +220,7 @@ def test_coordinator_uses_environment_exported_subset_as_manifest(
             "save-1",
             tmp_path,
             {"tools/replica-0": (GymCheckpointEpisode("rollout-on-wire", 0),)},
+            restarts=_NO_RESTARTS,
         )
     )
 
@@ -246,7 +253,12 @@ def test_manifest_keeps_only_the_staging_keys_of_episodes_gym_saved(
     )
 
     result = asyncio.run(
-        coordinator.commit("save-1", tmp_path, {"tools/replica-0": (*saved, on_wire)})
+        coordinator.commit(
+            "save-1",
+            tmp_path,
+            {"tools/replica-0": (*saved, on_wire)},
+            restarts=_NO_RESTARTS,
+        )
     )
 
     kept = {
@@ -282,6 +294,7 @@ def test_coordinator_rejects_episode_outside_candidate_set(tmp_path: Path) -> No
                 "save-1",
                 tmp_path,
                 {"tools/replica-0": (GymCheckpointEpisode("rollout-on-wire", 0),)},
+                restarts=_NO_RESTARTS,
             )
         )
 
@@ -301,6 +314,7 @@ def test_restore_failure_discards_every_actor_under_uncertain_outcome() -> None:
             "tools/replica-0": (),
             "tools/replica-1": (),
         },
+        restarts=_NO_RESTARTS_TWO,
     )
 
     with pytest.raises(GymCheckpointOperationError, match="restore failed"):
@@ -388,6 +402,7 @@ def _restore_manifest() -> GymCheckpointManifest:
         checkpoint_id="save-1",
         instances={"tools/replica-0": (GymCheckpointEpisode("rollout-0", 0),)},
         staging_keys={"tools/replica-0": ()},
+        restarts=_NO_RESTARTS,
     )
 
 
@@ -445,6 +460,24 @@ def test_a_lost_resume_is_retried_on_only_the_actor_that_lost_it() -> None:
     assert all(call[1] == ("save-1",) for call in lost.calls if call[0] == "resume")
 
 
+def test_a_resume_lost_after_a_successful_body_is_reported_not_raised() -> None:
+    """Every commit is written by then; Gym's lease reopens the lost deployment."""
+    healthy = _FakeGymActor()
+    lost = _FakeGymActor(resume_errors=(ConnectionError("reply lost"),) * 2)
+    coordinator = _coordinator(healthy, lost)
+    entered = []
+
+    async def exercise() -> None:
+        with pytest.warns(UserWarning, match=r"is saved, but resume failed on"):
+            async with coordinator.prepared("save-1"):
+                entered.append(True)
+
+    _run_guarded(exercise)
+
+    assert entered == [True]
+    assert [call[0] for call in lost.calls].count("resume") == 2
+
+
 def test_a_resume_that_breaks_an_invariant_is_not_retried() -> None:
     actor = _FakeGymActor(resume_errors=(ValueError("malformed reply"),))
     coordinator = _coordinator(actor)
@@ -469,9 +502,12 @@ def test_every_control_operation_is_bounded(operation: str, tmp_path: Path) -> N
         checkpoint_id="save-1",
         instances=episodes,
         staging_keys={"tools/replica-0": ()},
+        restarts=_NO_RESTARTS,
     )
     calls = {
-        "commit": lambda: coordinator.commit("save-1", tmp_path, episodes),
+        "commit": lambda: coordinator.commit(
+            "save-1", tmp_path, episodes, restarts=_NO_RESTARTS
+        ),
         "restore": lambda: coordinator.restore("restore-1", tmp_path, manifest),
         "retire": lambda: coordinator.retire("save-1", episodes),
     }
