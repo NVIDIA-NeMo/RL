@@ -104,17 +104,20 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
 - `returned_history` (default) matches ordinary returned history or call references
   to capture records. It preserves the existing evidence requirements and excludes
   calls absent from that history.
-- `all_captured` includes all recorded calls, including abandoned retries and
-  independent branches. It does not require the full execution history, but still
-  requires an attributable scored terminal through `terminal_response_id` or the
+- `all_captured` includes recorded calls across abandoned retries and independent
+  branches, excluding failed unscored leaves that no later call uses. It does not
+  require the full execution history, but still requires an attributable scored
+  terminal through `terminal_response_id` or the
   returned response's identity/content. Capture order is not a terminal witness.
   For `A → B` and `A → C`, both branches train; it does not choose the latest
   sibling. Shared `A` contributes loss once, and both rows share the rollout's
   reward and advantage.
 
 Both policies reuse capture validation, completion checks, forest reconstruction,
-and once-only loss ownership for shared ancestors. Pending/failed capture and
-failed selected executions still mask the logical rollout. Neither policy infers
+and once-only loss ownership for shared ancestors. Pending calls, lost capture
+evidence, and failed selected executions still mask the logical rollout. A failure
+record does not acknowledge a pending worker's writes or transfer them to cleanup.
+Failed parents and failed scored calls remain invalid. Neither policy infers
 agent roles. `all_captured` requires `forest_training: true`; it does not enable
 per-agent rewards or remove the execution restrictions below.
 

@@ -1321,6 +1321,16 @@ Depending on your data shape, you may want to change these values."""
                         for record in selected
                         if record.model_call_id == attribution.model_call_id
                     )
+                    # Only an unscored failed leaf can be excluded safely.
+                    # Failed parents or the scored call still invalidate the owner.
+                    parents = {record.parent_call_id for record in selected}
+                    selected = [
+                        record
+                        for record in selected
+                        if record.response_status != "failed"
+                        or record.model_call_id == attribution.model_call_id
+                        or record.model_call_id in parents
+                    ]
                 elif self._selection_policy == "returned_history":
                     selected = select_captured_calls(parsed.records, result)
                 else:

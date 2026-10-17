@@ -9,6 +9,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -177,6 +178,102 @@ def test_selection_policy_reuses_forest_publication(forest, policy, reverse_mani
     )
     assert result.meta is not None
     assert_loss_once(forest, selected, records)
+
+
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("reverse_manifest", [False, True])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "failed_leaf",
+        "failed_parent",
+        "failed_terminal",
+        "uncommitted",
+        "capture_lost",
+        "pending",
+    ],
+)
+def test_subagent_failures_reach_final_training_rows(
+    forest: ForestCapture,
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    reverse_manifest: bool,
+    failure: str,
+) -> None:
+    from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+
+    # Main A -> B / retry C; worker D -> E / H;
+    # main compacts into F -> scored G. H completes after G.
+    records, replies = forest.capture([None, 0, 0, None, 3, None, 5, 3])
+    failed_index = {"failed_leaf": 2, "failed_parent": 3, "failed_terminal": 6}.get(
+        failure
+    )
+    pending = failure in ("uncommitted", "capture_lost", "pending")
+    if pending:
+        asyncio.run(forest.harness.ledger.begin_call("attempt", "lost"))
+        if failure != "pending":
+            asyncio.run(
+                forest.harness.ledger.record_failure(
+                    "attempt",
+                    "lost",
+                    "capture_lost"
+                    if failure == "capture_lost"
+                    else UNCOMMITTED_CALL_REASON,
+                )
+            )
+        # A failure does not acknowledge the worker's possible late write.
+        assert forest.harness.manifest("attempt").pending_call_ids == ["lost"]
+        forest.plane.rows["staged", "attempt/lost"] = forest.plane.rows[
+            "staged", records[0].staging_key
+        ].clone()
+    if failure == "pending":
+        monkeypatch.setattr("nemo_rl.environments.nemo_gym._CAPTURE_DRAIN_TIMEOUT_S", 0)
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    control = env._control
+
+    async def capture_control(method: str, path: str) -> dict:
+        manifest = await control(method, path)
+        if failed_index is not None:
+            for record in manifest["records"]:
+                if record["model_call_id"] == records[failed_index].model_call_id:
+                    record["response_status"] = "failed"
+        if reverse_manifest:
+            manifest["records"].reverse()
+        return manifest
+
+    env._control = AsyncMock(side_effect=capture_control)
+    accepted_indices = (0, 1, 3, 4, 5, 6, 7)
+    output = ordinary([replies[i] for i in accepted_indices], terminal=replies[6]["id"])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    masked = pending or failure in ("failed_parent", "failed_terminal")
+    assert processed["receipt"]["capture_poisoned"] is masked
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+        execution_row_multiple=4,
+    )
+    selected = (
+        records
+        if policy == "all_captured" and failure != "failed_leaf"
+        else [records[i] for i in accepted_indices]
+    )
+    assert_loss_once(forest, [] if masked else selected, records)
+    assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    assert {key for partition, key in forest.plane.rows if partition == "staged"} == (
+        {"attempt/lost"} if pending else set()
+    )
 
 
 def test_all_captured_does_not_require_returned_execution_history(forest):
