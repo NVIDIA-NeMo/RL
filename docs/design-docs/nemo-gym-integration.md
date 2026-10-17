@@ -115,6 +115,20 @@ env:
 
 `PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`. Shards with `replicas > 1` require the default `STRICT_SPREAD`; replicas share one merged configuration and port range, so any other strategy could place them on the same node.
 
+#### Set the startup timeout
+
+All shards start concurrently under one shared deadline, `spinup_timeout`, in seconds. It defaults to `1800` and covers starting each shard's Gym servers, any `external_service_readiness` wait, and installing the tokenizer on every replica:
+
+```yaml
+env:
+  nemo_gym:
+    spinup_timeout: 4200
+```
+
+When `external_service_readiness` is set, setup rejects a `spinup_timeout` shorter than its `timeout_seconds`, because the shards would time out while the readiness wait could still succeed. Leave extra time for the local Gym servers, which start before that wait begins and which Gym bounds separately with `server_spinup_timeout_seconds`.
+
+Like `placement_strategy`, `spinup_timeout` belongs directly under `env.nemo_gym` and applies to all shards. NeMo RL removes it before the configuration reaches NeMo Gym, and rejects it without a `shards` block or inside `overrides` or `common_overrides`. An unsharded job's single actor has no startup deadline.
+
 See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
 ### Version Requirements

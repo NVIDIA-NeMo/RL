@@ -48,6 +48,12 @@ NEMO_RL_DICT_CONFIG_KEYS = frozenset(
 PLACEMENT_STRATEGIES = frozenset({"STRICT_SPREAD", "SPREAD", "STRICT_PACK", "PACK"})
 DEFAULT_PLACEMENT_STRATEGY = "STRICT_SPREAD"
 DEFAULT_REPLICAS = 1
+
+# Startup budget shared by every shard: Gym server startup, any
+# external_service_readiness wait and the tokenizer install. Generous because a
+# node that has never run Gym builds every server's venv first; with venvs baked
+# into the image this is far shorter.
+DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS = 1800.0
 SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 # Gym's log-directory key (``nemo_gym.global_config.NEMO_GYM_LOG_DIR_KEY_NAME``).
@@ -98,6 +104,7 @@ class ShardPlan:
     common_overrides: dict[str, Any] = field(default_factory=dict)
     allowed_duplicate_entries: frozenset[str] = frozenset()
     placement_strategy: str = DEFAULT_PLACEMENT_STRATEGY
+    spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS
 
 
 SHARDING_CONFIG_KEYS = frozenset(field.name for field in fields(ShardPlan))
@@ -350,6 +357,24 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             f"{sorted(PLACEMENT_STRATEGIES)}, got {placement_strategy!r}"
         )
 
+    # A null reads as unset, as for config_paths above.
+    configured_spinup_timeout = nemo_gym_config.get("spinup_timeout")
+    spinup_timeout = (
+        DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS
+        if configured_spinup_timeout is None
+        else configured_spinup_timeout
+    )
+    if (
+        not isinstance(spinup_timeout, (int, float))
+        or isinstance(spinup_timeout, bool)
+        or not math.isfinite(spinup_timeout)
+        or spinup_timeout <= 0
+    ):
+        raise ShardConfigError(
+            "env.nemo_gym.spinup_timeout must be a positive, finite number of "
+            f"seconds, got {spinup_timeout!r}"
+        )
+
     # Replicas are stamped from one merge, so they share that shard's port
     # range and no per-replica override exists to give them separate ones.
     # Only STRICT_SPREAD guarantees each one its own node, and therefore its
@@ -403,6 +428,15 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             "env.nemo_gym.common_overrides cannot set config_paths; "
             "declare paths on each shard"
         )
+    # The overlays are merged into each shard's Gym config, from which the
+    # sharding keys are dropped, so one set here would be silently ignored.
+    misplaced_common = sorted(set(common_overrides) & SHARDING_CONFIG_KEYS)
+    if misplaced_common:
+        raise ShardConfigError(
+            f"env.nemo_gym.common_overrides cannot set {misplaced_common}; "
+            "sharding settings apply to all shards and belong directly under "
+            "env.nemo_gym"
+        )
     wrongly_common = sorted(
         key
         for key in common_overrides
@@ -418,6 +452,13 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
             raise ShardConfigError(
                 f"shard '{shard.name}' overrides cannot set config_paths; "
                 "use the shard's config_paths field"
+            )
+        misplaced = sorted(set(shard.overrides) & SHARDING_CONFIG_KEYS)
+        if misplaced:
+            raise ShardConfigError(
+                f"shard '{shard.name}' overrides cannot set {misplaced}; "
+                "sharding settings apply to all shards and belong directly under "
+                "env.nemo_gym"
             )
         wrongly_owned = sorted(
             key
@@ -443,6 +484,7 @@ def parse_shard_plan(nemo_gym_config: Mapping[str, Any]) -> ShardPlan | None:
         common_overrides=common_overrides,
         allowed_duplicate_entries=raw_allowed,
         placement_strategy=placement_strategy,
+        spinup_timeout=float(spinup_timeout),
     )
 
 
