@@ -9,6 +9,7 @@ import json
 import math
 import pickletools
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -105,6 +106,29 @@ def _json_object(path: Path, label: str) -> dict[str, Any]:
 def _nonempty(path: Path, label: str) -> None:
     if not path.is_file() or path.stat().st_size <= 0:
         _fail(f"missing or empty {label}: {path}")
+
+
+def _training_command_tokens(script: str) -> set[str]:
+    candidate_lines = [
+        line
+        for line in script.splitlines()
+        if "grpo.max_num_steps=" in line and "logger.wandb.project=" in line
+    ]
+    if len(candidate_lines) != 1:
+        _fail(
+            "archived training command must contain exactly one rendered GRPO "
+            f"invocation; found {len(candidate_lines)}"
+        )
+    try:
+        tokens = set(shlex.split(candidate_lines[0]))
+    except ValueError as error:
+        _fail(f"archived training command is not valid shell syntax: {error}")
+    if not {
+        "run_grpo",
+        "examples/run_grpo_single_controller.py",
+    }.intersection(tokens):
+        _fail("archived GRPO settings are not part of a training invocation")
+    return tokens
 
 
 def _exact_int(value: Any, expected: int, label: str) -> None:
@@ -408,17 +432,18 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     training_command_path = result_dir / "training_command.sh"
     _nonempty(training_command_path, "archived training command")
     training_command = training_command_path.read_text(encoding="utf-8")
+    training_tokens = _training_command_tokens(training_command)
     for required_setting in (
         "grpo.max_num_steps=1000000",
         "grpo.max_num_epochs=null",
-        f'logger.wandb.project="{args.expected_wandb_project}"',
+        f"logger.wandb.project={args.expected_wandb_project}",
         "checkpointing.save_period=20",
         "checkpointing.keep_top_k=null",
         "token_capture.context_compaction=true",
         "policy.generation.vllm_cfg.tensor_parallel_size="
         f"{args.expected_generation_tensor_parallel_size}",
     ):
-        if required_setting not in training_command:
+        if required_setting not in training_tokens:
             _fail(f"archived training command omits {required_setting!r}")
 
     status = _json_object(

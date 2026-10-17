@@ -225,7 +225,7 @@ iteration.mkdir(parents=True)
 (root / "training_command.sh").write_text(
     'run_grpo grpo.max_num_steps=1000000 grpo.max_num_epochs=null '
     'checkpointing.save_period=20 checkpointing.keep_top_k=null '
-    'token_capture.context_compaction=true '
+    'token_capture.context_compaction="true" '
     'policy.generation.vllm_cfg.tensor_parallel_size=4 '
     'logger.wandb.project="nemorl-v2-subagent-comapction-debug"\n'
 )
