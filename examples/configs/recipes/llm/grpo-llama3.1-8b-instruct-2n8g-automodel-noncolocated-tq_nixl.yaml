@@ -1,3 +1,4 @@
 defaults: grpo-llama3.1-8b-instruct-2n8g-automodel-noncolocated.yaml
 data_plane:
   enabled: true
+  backend: nixl
