@@ -617,6 +617,9 @@ class ClippedPGLossFn(LossFunction):
                 "curr_logprobs_unfiltered", curr_logprobs
             )
 
+        # Preserve the global-batch denominators when a microbatch has
+        # rows without response loss tokens.
+        sample_mask = sample_mask * token_mask.bool().any(dim=-1)
         mask = token_mask * sample_mask.unsqueeze(-1)
         full_metrics = self.metrics_level == "full"
         need_importance_weights = (
@@ -657,19 +660,7 @@ class ClippedPGLossFn(LossFunction):
             mask = token_mask * sample_mask.unsqueeze(-1)
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
-            # A rejected nonfinite logprob must not poison a zero-weight loss.
-            curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
             prev_logprobs = curr_logprobs.detach()
-            generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
-            if self.reference_policy_kl_penalty != 0:
-                curr_logprobs_unfiltered = torch.where(
-                    mask.bool(),
-                    data.get("curr_logprobs_unfiltered", next_token_logprobs),
-                    0.0,
-                )
-                reference_policy_logprobs = torch.where(
-                    mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
-                )
 
         # Reference KL uses the unfiltered policy and retains its own token set.
         # Actor support mismatches must not discard otherwise valid KL terms.
@@ -677,6 +668,15 @@ class ClippedPGLossFn(LossFunction):
         kl_sample_mask = sample_mask
         kl_mask = mask
         kl_generation_logprobs = torch.where(kl_mask.bool(), generation_logprobs, 0.0)
+        if self.reference_policy_kl_penalty != 0:
+            # Sanitize before KL arithmetic even without sequence rejection;
+            # multiplying a masked nonfinite result by zero is too late.
+            curr_logprobs_unfiltered = torch.where(
+                kl_mask.bool(), curr_logprobs_unfiltered, 0.0
+            )
+            reference_policy_logprobs = torch.where(
+                kl_mask.bool(), reference_policy_logprobs, 0.0
+            )
 
         # Keep support information until all three policy distributions are
         # available. Replacing -inf with zero earlier turns an impossible token

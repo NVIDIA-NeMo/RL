@@ -69,6 +69,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
@@ -3158,14 +3161,63 @@ class TestOPDFullValidation:
     until the first training forward.
     """
 
+    @pytest.mark.parametrize("full_vocab", [False, True])
+    def test_advantage_stage_config_derives_full_vocab_mode(self, full_vocab):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full.enabled = full_vocab
+        config.grpo.seq_logprob_error_threshold = 2.0
+
+        stage_config = AdvantageStageConfig.from_master_config(config)
+
+        assert stage_config.opd_full_enabled == full_vocab
+        assert stage_config.algo.seq_logprob_error_threshold == 2.0
+
     def test_accepts_the_shipped_recipe(self):
         config = _load_fullvocab_master_config()
         _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_is_a_no_op_when_full_is_absent(self):
+    @pytest.mark.parametrize(
+        ("top_k", "top_p", "expected_warning"),
+        [
+            (20, 1.0, True),
+            (None, 0.95, True),
+            (20, 0.95, True),
+            (None, 1.0, False),
+            (-1, 1.0, False),
+            (0, 1.0, False),
+        ],
+    )
+    def test_rollout_filtering_warns_without_changing_config(
+        self,
+        top_k: int | None,
+        top_p: float,
+        expected_warning: bool,
+        recwarn: pytest.WarningsRecorder,
+    ) -> None:
+        config = _load_fullvocab_master_config()
+        generation_config = config.policy["generation"]
+        generation_config.update(top_k=top_k, top_p=top_p)
+
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+        assert len(recwarn) == int(expected_warning)
+        if expected_warning:
+            message = str(recwarn[0].message)
+            assert "does not apply top-k/top-p filtering to policy logprobs" in message
+            assert "still applied during rollout" in message
+        assert (generation_config["top_k"], generation_config["top_p"]) == (
+            top_k,
+            top_p,
+        )
+
+    def test_is_a_no_op_when_full_is_absent(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.full = None
+        config.policy["generation"].update(top_k=20, top_p=0.95)
         _validate_opd_full_config(config, config.on_policy_distillation)
+        assert not recwarn
 
     def test_rejects_fused_linear_logprobs(self):
         """The fused forward bypasses output_layer, so the capture hook never fires."""
