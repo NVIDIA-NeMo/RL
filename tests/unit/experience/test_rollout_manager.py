@@ -1369,7 +1369,8 @@ def _run_rollouts_impl(env, max_attempts):
 
 def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
     """With an attempt budget above one, a failure marker's row is dispatched
-    again by itself and the group completes from both attempts."""
+    again by itself, the group completes from both attempts, and the metrics
+    count the one row that was sent again."""
     from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
     from nemo_rl.experience.rollouts import Timer
 
@@ -1389,7 +1390,7 @@ def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
     )
     impl = _run_rollouts_impl(env, max_attempts=2)
 
-    completions, _message_log, _metrics = _run(
+    completions, _message_log, metrics = _run(
         impl._run_rollouts(
             inputs=[
                 {"_rowidx": 0, "agent_ref": {"name": "agent"}},
@@ -1402,6 +1403,38 @@ def test_nemo_gym_run_rollouts_redispatches_only_the_infra_failed_row():
 
     assert env.dispatched == [[0, 1], [1]]
     assert len(completions) == 2
+    assert metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_nemo_gym_run_rollouts_reports_zero_redispatches_for_a_clean_group():
+    """A group whose rows all arrive on the first attempt still reports the
+    re-dispatch count, as zero, so the metric is present on every rollout and
+    a mean over steps is a rate."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (1, {"name": "agent"}, _streamed_gym_result(), None),
+            ]
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+
+    _completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1]]
+    assert metrics["nemo_gym_infra_redispatches"] == 0
 
 
 def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
