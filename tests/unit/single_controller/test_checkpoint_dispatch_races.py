@@ -739,23 +739,7 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
         ledger = RolloutRecoveryLedger()
         barrier = DataPlaneCheckpointBarrier()
         async with barrier.mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=())
         controller = _controller_for(gym_coordinator(actor), ledger)
@@ -855,23 +839,7 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
         ledger = RolloutRecoveryLedger()
         barrier = DataPlaneCheckpointBarrier()
         async with barrier.mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
         controller = _controller_for(gym_coordinator(actor), ledger)
@@ -971,23 +939,7 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
     async def exercise() -> None:
         ledger = RolloutRecoveryLedger()
         async with DataPlaneCheckpointBarrier().mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor(exported_episodes=())
         controller = _controller_for(
@@ -1014,23 +966,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
     async def exercise() -> None:
         ledger = RolloutRecoveryLedger()
         async with DataPlaneCheckpointBarrier().mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         (stranded,) = ledger.gym_checkpoint_inventory(frozenset({"tools/replica-0"}))[
             "tools/replica-0"
@@ -1055,16 +991,20 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
     asyncio.run(exercise())
 
 
-def _dispatched_two_sibling_group(
-    ledger: RolloutRecoveryLedger, cut: DataPlaneMutationCut
+def _dispatched_turn_group(
+    ledger: RolloutRecoveryLedger,
+    cut: DataPlaneMutationCut,
+    *,
+    generations: int = 2,
 ) -> PromptGroupRecoveryRecord:
+    """An admitted turn-level group, dispatched to ``tools/replica-0``."""
     group = ledger.reserve_group(
         cut,
         group_id="batch-7-prompt-0",
         admission_id="batch-7",
         prompt_id="70",
         prompt_payload={"idx": 70, "message_log": []},
-        expected_generations=2,
+        expected_generations=generations,
         target_step=7,
         start_weight_version=7,
         restore_level=RecoveryTargetLevel.TURN,
@@ -1092,7 +1032,7 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
         barrier = DataPlaneCheckpointBarrier()
         ledger = RolloutRecoveryLedger()
         async with barrier.mutation() as cut:
-            group = _dispatched_two_sibling_group(ledger, cut)
+            group = _dispatched_turn_group(ledger, cut)
         abandoned = _gym_episodes(group)
         # The group task was cancelled after Ray accepted its submission.
         async with barrier.mutation() as cut:
@@ -1138,7 +1078,7 @@ def test_turn_checkpoint_retires_each_dropped_attempt_only_once(
         barrier = DataPlaneCheckpointBarrier()
         ledger = RolloutRecoveryLedger()
         async with barrier.mutation() as cut:
-            group = _dispatched_two_sibling_group(ledger, cut)
+            group = _dispatched_turn_group(ledger, cut)
         async with barrier.mutation() as cut:
             ledger.abandon_unsealed(cut, group.group_id)
 
@@ -1175,7 +1115,7 @@ def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forg
         barrier = DataPlaneCheckpointBarrier()
         ledger = RolloutRecoveryLedger()
         async with barrier.mutation() as cut:
-            group = _dispatched_two_sibling_group(ledger, cut)
+            group = _dispatched_turn_group(ledger, cut)
         abandoned = _gym_episodes(group)
         async with barrier.mutation() as cut:
             ledger.abandon_unsealed(cut, group.group_id)
@@ -1218,7 +1158,7 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
         barrier = DataPlaneCheckpointBarrier()
         ledger = RolloutRecoveryLedger()
         async with barrier.mutation() as cut:
-            group = _dispatched_two_sibling_group(ledger, cut)
+            group = _dispatched_turn_group(ledger, cut)
         abandoned = _gym_episodes(group)
         async with barrier.mutation() as cut:
             ledger.abandon_unsealed(cut, group.group_id)
@@ -1261,7 +1201,7 @@ def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
         barrier = DataPlaneCheckpointBarrier()
         ledger = RolloutRecoveryLedger()
         async with barrier.mutation() as cut:
-            group = _dispatched_two_sibling_group(ledger, cut)
+            group = _dispatched_turn_group(ledger, cut)
         saved, restart = sorted(_gym_episodes(group))
         actor = FakeGymActor(live={saved, restart}, restarts=(restart,))
         controller = _controller_for(gym_coordinator(actor), ledger)
@@ -1295,23 +1235,7 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         ledger = RolloutRecoveryLedger()
         barrier = DataPlaneCheckpointBarrier()
         async with barrier.mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         episode = group.gym_episode(0)
         actor = FakeGymActor(staging_keys_by_episode={episode: ("missing-call-row",)})
@@ -2035,23 +1959,7 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
     async def exercise() -> None:
         ledger = RolloutRecoveryLedger()
         async with DataPlaneCheckpointBarrier().mutation() as cut:
-            group = ledger.reserve_group(
-                cut,
-                group_id="batch-7-prompt-0",
-                admission_id="batch-7",
-                prompt_id="70",
-                prompt_payload={"idx": 70, "message_log": []},
-                expected_generations=1,
-                target_step=7,
-                start_weight_version=7,
-                restore_level=RecoveryTargetLevel.TURN,
-                admitted=True,
-            )
-            ledger.mark_group_dispatched(
-                cut,
-                group.group_id,
-                gym_instance_id="tools/replica-0",
-            )
+            group = _dispatched_turn_group(ledger, cut, generations=1)
 
         actor = FakeGymActor()
         controller = _controller_for(gym_coordinator(actor), ledger)
@@ -2658,7 +2566,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             barrier = DataPlaneCheckpointBarrier()
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
-                group = _dispatched_two_sibling_group(ledger, cut)
+                group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
 
             coordinator = gym_coordinator(
@@ -2688,7 +2596,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             barrier = DataPlaneCheckpointBarrier()
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
-                group = _dispatched_two_sibling_group(ledger, cut)
+                group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
             # Row 0 is parked in Gym and exported; row 1's reply is on the wire.
             actor = FakeGymActor(live={row_0})
@@ -2723,7 +2631,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             barrier = DataPlaneCheckpointBarrier()
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
-                group = _dispatched_two_sibling_group(ledger, cut)
+                group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(
                 FakeGymActor(
@@ -2767,7 +2675,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             barrier = DataPlaneCheckpointBarrier()
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
-                group = _dispatched_two_sibling_group(ledger, cut)
+                group = _dispatched_turn_group(ledger, cut)
             row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(FakeGymActor(live={row_0, row_1}))
             controller = _controller_for(coordinator, ledger)
