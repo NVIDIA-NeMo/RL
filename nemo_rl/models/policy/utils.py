@@ -471,6 +471,7 @@ def stream_weights_via_ipc_zmq_impl(
     """
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
+    buffer_capacity = 0 if drain_between_groups else buffer_size_bytes
 
     def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
         """Send a group of parameters and return new pending_recv state."""
@@ -488,7 +489,7 @@ def stream_weights_via_ipc_zmq_impl(
 
     def allocate_buffer(device):
         """Allocate a new aligned buffer with proper memory alignment."""
-        aligned_size = calculate_aligned_size(buffer_size_bytes)
+        aligned_size = calculate_aligned_size(buffer_capacity)
         return torch.empty(
             aligned_size,
             device=device,
@@ -532,12 +533,28 @@ def stream_weights_via_ipc_zmq_impl(
             param_groups = params_generator
 
             def _iter_params_with_group_boundaries():
+                nonlocal buffer_capacity
+
                 groups = iter(param_groups)
                 while True:
                     try:
-                        group = next(groups)
+                        group = tuple(next(groups))
                     except StopIteration:
                         return
+                    # Zero-sized tensors still need storage for a CUDA IPC handle.
+                    required_capacity = min(
+                        buffer_size_bytes,
+                        max(
+                            1,
+                            sum(calculate_aligned_size(t.nbytes) for _, t in group),
+                        ),
+                    )
+                    if required_capacity > buffer_capacity:
+                        # The preceding group's ACKs have drained. Release the
+                        # old pair before growing; retain capacity for reuse.
+                        torch.cuda.current_stream().synchronize()
+                        release_staging_buffers()
+                        buffer_capacity = required_capacity
                     try:
                         yield from group
                     finally:
@@ -618,7 +635,7 @@ def stream_weights_via_ipc_zmq_impl(
                 continue
 
             # Check if we need to send current buffer and switch to the other one
-            if used_bytes + aligned_size > buffer_size_bytes:
+            if used_bytes + aligned_size > buffer_capacity:
                 await_recv = send_buffer_group_overlap(
                     current_buffer, param_names, used_bytes, await_recv
                 )

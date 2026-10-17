@@ -139,8 +139,23 @@ class _FakeIpcSocket:
         return 0
 
 
-def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
+@pytest.mark.parametrize("empty_first_tensor", [False, True])
+def test_stream_weights_drains_group_before_requesting_next(
+    monkeypatch, empty_first_tensor
+):
     events = []
+    allocations = []
+    buffer_refs = []
+    original_empty = torch.empty
+
+    def tracking_empty(size, **kwargs):
+        if len(allocations) == 2:
+            assert events[-1] == "group_1"
+            assert all(ref() is None for ref in buffer_refs)
+        buffer = original_empty(size, **kwargs)
+        allocations.append(size)
+        buffer_refs.append(weakref.ref(buffer))
+        return buffer
 
     class OrderingSocket(_FakeIpcSocket):
         def send_pyobj(self, payload):
@@ -155,8 +170,10 @@ def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
             return super().recv()
 
     def param_groups():
+        events.append("leading_empty_group")
+        yield ()
         events.append("group_0")
-        tensor = torch.ones(1)
+        tensor = torch.ones(0 if empty_first_tensor else 1)
         tensor_ref = weakref.ref(tensor)
         group = (("weight_0", tensor),)
         yield group
@@ -165,14 +182,21 @@ def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
         events.append("group_0_released")
 
         events.append("group_1")
-        yield tuple((f"weight_{index}", torch.ones(1)) for index in range(1, 4))
+        yield ((f"weight_{index}", torch.ones(1)) for index in range(1, 4))
 
         events.append("group_2")
-        yield (("oversized_weight", torch.ones(300)),)
+        yield (
+            ("oversized_weight", torch.ones(300)),
+            ("weight_4", torch.ones(1)),
+        )
+
+        events.append("small_group")
+        yield (("weight_5", torch.ones(1)),)
 
         events.append("empty_group")
         yield ()
 
+    monkeypatch.setattr(torch, "empty", tracking_empty)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(
         torch.cuda,
@@ -194,6 +218,7 @@ def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
     )
 
     assert events == [
+        "leading_empty_group",
         "group_0",
         ("send", ["weight_0"]),
         "ack",
@@ -206,10 +231,17 @@ def test_stream_weights_drains_group_before_requesting_next(monkeypatch):
         "group_2",
         ("send", ["oversized_weight"]),
         "ack",
+        ("send", ["weight_4"]),
+        "ack",
+        "small_group",
+        ("send", ["weight_5"]),
+        "ack",
         "empty_group",
         "complete",
         "ack",
     ]
+    assert allocations == [512, 512, 1024, 1024, 1536]
+    assert all(ref() is None for ref in buffer_refs)
 
 
 def test_stream_weights_releases_buffers_before_complete_without_full_gc(
