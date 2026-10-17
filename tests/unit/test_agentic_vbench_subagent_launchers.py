@@ -42,6 +42,17 @@ def test_subagent_launchers_make_child_artifacts_scoreable_before_return() -> No
         assert "do not repeat its visual analysis" in text
 
 
+def test_subagent_launchers_bound_the_observed_timeout_loops() -> None:
+    for launcher in LAUNCHERS:
+        text = launcher.read_text()
+        assert "Read every overview exactly once in one parallel read batch" in text
+        assert "never create diagnostic or comparison images" in text
+        assert "Your very next response after the overview read results must call bash" in text
+        assert "do not tune timestamps frame counts or sub-frame MP4 duration rounding" in text
+        assert "Do not use todowrite and do not retry cosmetic labels" in text
+        assert "immediate creation from existing work in at most four tool calls" in text
+
+
 def test_agentic_submission_rejects_an_occupied_task_backend() -> None:
     text = RUN_SC.read_text()
     assert "mapfile -t existing_containers < <(docker ps -q)" in text
