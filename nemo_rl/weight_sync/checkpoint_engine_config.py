@@ -36,6 +36,7 @@ def checkpoint_engine_refit_config(
     if (
         refit_config is None
         or transport is None
+        or transport == "hf_checkpoint"
         or transport in VLLM_SPARSE_REFIT_TRANSPORTS
     ):
         return None

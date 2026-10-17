@@ -1477,3 +1477,28 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_distillation_rejects_hf_checkpoint_before_creating_workers(tmp_path):
+    master_config = MasterConfig.model_construct(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "refit_transport": "hf_checkpoint",
+                "refit_cfg": {"hf_checkpoint": {"checkpoint_dir": str(tmp_path)}},
+            }
+        },
+        teacher={},
+        loss_fn=DistillationLossConfig(),
+        distillation=DistillationConfig.model_construct(),
+        data={},
+        logger={},
+        cluster={},
+        checkpointing={},
+    )
+    with (
+        patch.object(distil_mod, "Policy") as policy,
+        pytest.raises(NotImplementedError, match="only by GRPO, not distillation"),
+    ):
+        distil_mod.setup(master_config, MagicMock(), MagicMock(), None)
+    policy.assert_not_called()

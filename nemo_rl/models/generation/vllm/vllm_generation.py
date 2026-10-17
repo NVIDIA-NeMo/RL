@@ -1729,6 +1729,22 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
+    def reload_weights(self, weights_path: str) -> None:
+        """Reload the same HF export on every live generation engine."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        method = (
+            "reload_weights_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "reload_weights"
+        )
+        futures = [
+            getattr(worker, method).remote(weights_path)
+            for worker in self._refit_leader_workers()
+        ]
+        if not all(ray.get(futures)):
+            raise RuntimeError("Failed to reload every vLLM engine")
+
     def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:

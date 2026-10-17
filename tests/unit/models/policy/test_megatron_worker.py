@@ -5847,3 +5847,28 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def test_megatron_export_hf_checkpoint_passes_model_chunk_list(monkeypatch):
+    """Bridge expects the model as a list, including when there is one PP chunk."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = _FakeTrainableModel()
+    worker.megatron_bridge = MagicMock()
+    worker.move_model = MagicMock(return_value=worker.model)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    result = MegatronPolicyWorkerImpl.export_hf_checkpoint(worker, "hf-export")
+
+    worker.megatron_bridge.save_hf_pretrained.assert_called_once_with(
+        [worker.model],
+        "hf-export",
+        show_progress=True,
+        strict=True,
+    )
+    assert result == "hf-export"

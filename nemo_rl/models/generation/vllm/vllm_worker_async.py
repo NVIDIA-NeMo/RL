@@ -2210,6 +2210,15 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
+    async def reload_weights_async(self, weights_path: str) -> bool:
+        """Reload a published HF checkpoint on every TP/PP engine worker."""
+        if self.llm is None:
+            raise RuntimeError("vLLM engine is not initialized")
+        await self.llm.collective_rpc(
+            "reload_weights", kwargs={"weights_path": weights_path}
+        )
+        return True
+
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))

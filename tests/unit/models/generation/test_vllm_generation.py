@@ -663,6 +663,40 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
         generation.resume_generation_after_refit()
 
 
+def test_hf_reload_reaches_each_dp_engine_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.dp_size = 2
+    generation._refit_membership = None
+    generation.worker_group = MagicMock()
+    workers = [MagicMock() for _ in range(4)]
+    generation.worker_group.workers = workers
+    monkeypatch.setattr(ray, "get", lambda futures: [True] * len(futures))
+
+    generation.reload_weights("/shared/version_00000001")
+
+    for index in (0, 2):
+        workers[index].reload_weights_async.remote.assert_called_once_with(
+            "/shared/version_00000001"
+        )
+    for index in (1, 3):
+        workers[index].reload_weights_async.remote.assert_not_called()
+
+
+def test_hf_reload_rejects_partial_engine_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    generation.dp_size = 2
+    generation._refit_membership = None
+    generation.worker_group = MagicMock()
+    generation.worker_group.workers = [MagicMock(), MagicMock()]
+    monkeypatch.setattr(ray, "get", lambda futures: [True, False])
+    with pytest.raises(RuntimeError, match="reload every vLLM engine"):
+        generation.reload_weights("/shared/version_00000001")
+
+
 def test_sampling_params_preserve_bad_words():
     worker = object.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {
@@ -1489,7 +1523,9 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["_draft_weights_from_refit"] is False
 
 
-@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+@pytest.mark.parametrize(
+    "transport", ["vllm_s3_sparse", "vllm_zmq_sparse", "hf_checkpoint"]
+)
 def test_configure_generation_config_uses_real_delta_baseline(transport: str):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["refit_transport"] = transport

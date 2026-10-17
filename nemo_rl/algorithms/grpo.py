@@ -1660,7 +1660,10 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
-        elif refit_transport is not None and refit_transport != "nccl_reshard":
+        elif refit_transport is not None and refit_transport not in (
+            "nccl_reshard",
+            "hf_checkpoint",
+        ):
             # nccl_reshard is handled below via nccl_reshard_refit_enabled,
             # not via checkpoint-engine.
             checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
@@ -1902,6 +1905,7 @@ def setup(
         and backend != "sglang"
         and remote_transport is None
         and checkpoint_engine_config is None
+        and refit_transport != "hf_checkpoint"
     ):
         t0 = time.perf_counter()
         # init collective
@@ -1955,6 +1959,20 @@ def setup(
         )
         policy_generation.weight_synchronizer.init_communicator()
         setup_timing_metrics.extras[f"vllm_{remote_transport}_sparse_init_time_s"] = (
+            time.perf_counter() - t0
+        )
+    elif refit_transport == "hf_checkpoint":
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        setup_timing_metrics.extras["hf_checkpoint_init_time_s"] = (
             time.perf_counter() - t0
         )
     elif checkpoint_engine_config is not None:

@@ -167,7 +167,11 @@ def configure_generation_config(
                 )
 
         # set load_format
-        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+        if (
+            config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+            or config.get("refit_transport") == "hf_checkpoint"
+        ):
+            # Disk refit needs a real checkpoint loader; dummy has no weight iterator.
             config["vllm_cfg"]["load_format"] = "auto"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:

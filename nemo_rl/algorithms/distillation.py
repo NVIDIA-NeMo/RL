@@ -261,6 +261,11 @@ def setup(
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
         refit_transport = vllm_config.get("refit_transport")
+        if refit_transport == "hf_checkpoint":
+            raise NotImplementedError(
+                "HF-checkpoint refit is currently supported only by GRPO, "
+                "not distillation."
+            )
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             raise ValueError(
                 "Remote sparse refit is currently supported only by GRPO; "
