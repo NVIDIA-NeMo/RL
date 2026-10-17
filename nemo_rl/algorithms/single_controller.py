@@ -171,6 +171,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GymCheckpointCommitResult,
     GymCheckpointCoordinator,
+    GymCheckpointOperationError,
     is_transient_gym_checkpoint_failure,
     load_gym_checkpoint_manifest,
     staging_keys_of,
@@ -1305,13 +1306,25 @@ class SingleControllerActor:
                         load_gym_checkpoint_manifest,
                         self._last_checkpoint_path,
                     )
-                    expected_inventory = self._gym_checkpoint_inventory(coordinator)
-                    if manifest.instances != expected_inventory:
+                    expected_inventory = {
+                        instance_id: set(episodes)
+                        for instance_id, episodes in self._gym_checkpoint_inventory(
+                            coordinator
+                        ).items()
+                    }
+                    # Restarts are not restored: prepare_for_restart starts every
+                    # episode Gym did not restore over from its task.
+                    saved_inventory = {
+                        instance_id: set(episodes)
+                        | set(manifest.restarts.get(instance_id, ()))
+                        for instance_id, episodes in manifest.instances.items()
+                    }
+                    if saved_inventory != expected_inventory:
                         differing = sorted(
                             instance_id
-                            for instance_id in manifest.instances.keys()
+                            for instance_id in saved_inventory.keys()
                             | expected_inventory.keys()
-                            if manifest.instances.get(instance_id)
+                            if saved_inventory.get(instance_id)
                             != expected_inventory.get(instance_id)
                         )
                         raise ValueError(
@@ -4787,11 +4800,65 @@ class SingleControllerActor:
         """
         ledger = self._rollout_recovery_ledger
         retirements = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
-        if not any(retirements.values()):
+        if any(retirements.values()):
+            await coordinator.retire(checkpoint_id, retirements)
+            # Only what was retired: a drop recorded meanwhile stays for next time.
+            ledger.mark_gym_retired(retirements)
+        await self._forget_finished_gym_rollouts(coordinator, checkpoint_id)
+
+    async def _forget_finished_gym_rollouts(
+        self,
+        coordinator: GymCheckpointCoordinator,
+        checkpoint_id: str,
+    ) -> None:
+        """Let Gym drop its marks for rollouts RL will never send again.
+
+        Gym refuses a retired or restored rollout by ID until it is forgotten,
+        so each finished one would otherwise stay on every participant for the
+        rest of the run. Gym refuses a forget while a checkpoint is open, so this
+        runs right after the retire. A deployment that refuses, for example
+        because a retire has not finished freeing a rollout, gets the retire
+        again and then the forget. Forget is best effort: a mark costs one small
+        entry, so a deployment that still refuses keeps its rollouts queued for
+        the next snapshot instead of failing this one.
+        """
+        ledger = self._rollout_recovery_ledger
+        forgets = ledger.gym_checkpoint_forgets(coordinator.instance_ids)
+        if not any(forgets.values()):
             return
-        await coordinator.retire(checkpoint_id, retirements)
-        # Only what was retired: a drop recorded meanwhile stays for next time.
-        ledger.mark_gym_retired(retirements)
+        try:
+            await coordinator.forget(checkpoint_id, forgets)
+        except GymCheckpointOperationError as error:
+            refused = {
+                instance_id: forgets[instance_id] for instance_id in error.failures
+            }
+            ledger.mark_gym_forgotten(
+                {
+                    instance_id: episodes
+                    for instance_id, episodes in forgets.items()
+                    if instance_id not in refused
+                }
+            )
+            try:
+                await coordinator.retire(
+                    checkpoint_id,
+                    {
+                        instance_id: refused.get(instance_id, ())
+                        for instance_id in coordinator.instance_ids
+                    },
+                )
+                await coordinator.forget(checkpoint_id, refused)
+            except GymCheckpointOperationError as retry_error:
+                warnings.warn(
+                    "Gym could not forget finished rollouts on "
+                    f"{sorted(retry_error.failures)!r}; they stay queued for the next "
+                    f"snapshot: {retry_error}",
+                    stacklevel=2,
+                )
+                return
+            ledger.mark_gym_forgotten(refused)
+            return
+        ledger.mark_gym_forgotten(forgets)
 
     async def _drain_non_exported_gym_candidates(
         self,
@@ -4799,10 +4866,15 @@ class SingleControllerActor:
         candidates: dict[str, tuple[GymCheckpointEpisode, ...]],
         commit: GymCheckpointCommitResult,
     ) -> None:
-        """Wait for on-wire replies that Gym did not retain in its checkpoint."""
+        """Wait for on-wire replies that Gym did not retain in its checkpoint.
+
+        A restart is still running in Gym, parked until resume, so it is not
+        waited for: the snapshot records it as starting over.
+        """
         pending = {
             instance_id: set(candidates[instance_id])
             - set(commit.manifest.instances[instance_id])
+            - set(commit.manifest.restarts[instance_id])
             for instance_id in coordinator.instance_ids
         }
         if not any(pending.values()):
@@ -4817,9 +4889,10 @@ class SingleControllerActor:
         }
         if any(stranded.values()):
             raise RuntimeError(
-                "Gym checkpoint holds parked sessions that no environment or legacy "
-                "agent participant exported, so they can neither be restored nor "
-                f"finish while the deployment is prepared: stranded={stranded!r}"
+                "Gym checkpoint holds parked agent sessions that are neither an "
+                "agent's own /run episode nor exported by their environment server, "
+                "so they can neither be restored nor finish while the deployment is "
+                f"prepared: stranded={stranded!r}"
             )
 
         deadline = time.monotonic() + coordinator.control_timeout_s
@@ -4864,16 +4937,28 @@ class SingleControllerActor:
         dropped = self._queued_gym_retirements(coordinator)
         mismatches = {}
         kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        kept_restarts: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
         for instance_id in coordinator.instance_ids:
             owned = set(actual[instance_id])
             exported = set(expected[instance_id])
-            if owned - exported or not exported - owned <= dropped[instance_id]:
+            restarted = set(commit.manifest.restarts[instance_id])
+            if (
+                owned - exported - restarted
+                or not exported - owned <= dropped[instance_id]
+            ):
                 mismatches[instance_id] = {
                     "expected": sorted(exported, key=repr),
+                    "restarts": sorted(restarted, key=repr),
                     "actual": sorted(owned, key=repr),
                 }
             kept[instance_id] = tuple(
                 episode for episode in expected[instance_id] if episode in owned
+            )
+            # A restart that finished during the snapshot is no longer RL's.
+            kept_restarts[instance_id] = tuple(
+                episode
+                for episode in commit.manifest.restarts[instance_id]
+                if episode in owned
             )
         if mismatches:
             raise RuntimeError(
@@ -4886,11 +4971,16 @@ class SingleControllerActor:
             )
             for instance_id in coordinator.instance_ids
         }
-        if kept != expected:
+        if kept != expected or kept_restarts != commit.manifest.restarts:
             await asyncio.to_thread(
                 write_gym_checkpoint_manifest,
                 Path(checkpoint_path),
-                replace(commit.manifest, instances=kept, staging_keys=staging_keys),
+                replace(
+                    commit.manifest,
+                    instances=kept,
+                    staging_keys=staging_keys,
+                    restarts=kept_restarts,
+                ),
             )
 
         expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
@@ -4939,21 +5029,35 @@ class SingleControllerActor:
                 # it is still idle; dispatch is already closed, so nothing new
                 # races in.
                 await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
-                async with coordinator.prepared(checkpoint_id):
+                async with coordinator.prepared(checkpoint_id) as restarts:
                     candidates = self._gym_checkpoint_inventory(coordinator)
                     # A row dropped since that retire is still running in Gym,
                     # which exports it; naming it keeps the export in scope, and
                     # the cut leaves it out of the saved manifest.
                     dropped = self._queued_gym_retirements(coordinator)
+                    # Gym refuses a commit that names an episode it cannot
+                    # capture; those start over after a crash instead.
                     scope = {
-                        instance_id: episodes
-                        + tuple(sorted(dropped[instance_id] - set(episodes)))
+                        instance_id: tuple(
+                            episode
+                            for episode in episodes
+                            + tuple(sorted(dropped[instance_id] - set(episodes)))
+                            if episode not in restarts[instance_id]
+                        )
                         for instance_id, episodes in candidates.items()
                     }
                     commit = await coordinator.commit(
                         checkpoint_id,
                         Path(checkpoint_path),
                         scope,
+                        restarts={
+                            instance_id: tuple(
+                                episode
+                                for episode in episodes
+                                if episode in restarts[instance_id]
+                            )
+                            for instance_id, episodes in candidates.items()
+                        },
                     )
                     await self._drain_non_exported_gym_candidates(
                         coordinator,
