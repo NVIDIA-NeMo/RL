@@ -1622,7 +1622,11 @@ def ppo_train(
 
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
+                            # Prompt-history assistant turns have no generation logprobs.
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -2656,12 +2660,14 @@ def async_ppo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    # PPO's inline loss-mask setup (unmask all assistant messages),
-                    # matching sync ppo_train — deliberately NOT GRPO's helper,
-                    # which only unmasks generated assistant messages.
+                    # Match sync PPO and GRPO: only generated assistant turns
+                    # contribute to loss, not assistant turns in prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
