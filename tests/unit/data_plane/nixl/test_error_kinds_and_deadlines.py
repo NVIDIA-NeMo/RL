@@ -25,7 +25,7 @@ import pytest
 
 from nemo_rl.data_plane.adapters import tq_nixl
 from nemo_rl.data_plane.nixl import blobstore, control, nixl_io
-from nemo_rl.data_plane.nixl.blobstore import LostBlobs, TransferFailed, UnitSlabStore
+from nemo_rl.data_plane.nixl.blobstore import LostBlobs, TransferFailed
 from nemo_rl.data_plane.nixl.bufpool import PoolExhausted, PoolTimeout
 from nemo_rl.data_plane.nixl.errors import (
     DataPlaneBusy,
@@ -37,6 +37,9 @@ from nemo_rl.data_plane.nixl.errors import (
     UnitFull,
 )
 from nemo_rl.data_plane.nixl.nixl_io import Graveyard, NixlEndpoint
+from tests.unit.data_plane._nixl_helpers import StubCtl as _Ctl
+from tests.unit.data_plane._nixl_helpers import StubEp as _Ep
+from tests.unit.data_plane._nixl_helpers import stub_store as _store
 
 
 # ------------------------------------------------------------------ wire (§6)
@@ -167,69 +170,6 @@ def test_no_retryable_error_counts_as_data_loss():
 
 
 # ------------------------------------------------------------------ store classification
-class _Ctl:
-    """UnitClient stub: scripted alloc / resolve replies, records notifies."""
-
-    timeout_ms = 30_000
-
-    def __init__(self, replies):
-        self.replies = replies
-        self.calls = []
-        self.notified = []
-
-    def call(self, address, op, *, timeout_s=None, **args):
-        self.calls.append(op)
-        r = self.replies[op](address)
-        if isinstance(r, Exception):
-            raise r
-        return r
-
-    def notify(self, address, op, **args):
-        self.notified.append((op, args))
-
-
-class _Ep:
-    def __init__(self, fail=None):
-        self.fail = fail
-
-    def has_remote(self, name):
-        return True
-
-    def transfer(self, op, local, remote, agent, *, timeout_s):
-        if self.fail is not None:
-            raise self.fail
-
-
-class _Placement:
-    def order(self, units, *, node_id, nbytes):
-        return units
-
-
-def _store(ctl, ep=None, dead=False, monkeypatch=None):
-    s = object.__new__(UnitSlabStore)
-    s.ep = ep or _Ep()
-    s.ctl = ctl
-    s.timeout_s = 5.0
-    s.placement = _Placement()
-    s.node_id = "n"
-    s.namespace = "ns"
-    s._epoch = 1
-    s._units = {
-        u: {
-            "unit_id": u,
-            "zmq": f"tcp://u{u}",
-            "agent_name": f"unit-{u}-abc",
-            "slab_base": 0,
-        }
-        for u in (0, 1)
-    }
-    s._blob_unit = {"b": 0}
-    s.stats = {"slow_reads": 0, "fast_reads": 0, "tag_mismatch": 0, "unit_refresh": 0}
-    s._refresh_units = lambda: None
-    s._unit_dead = lambda unit_id: dead
-    return s
-
-
 @pytest.mark.parametrize("dead, expected", [(False, TransferFailed), (True, LostBlobs)])
 def test_unanswered_resolve_is_loss_only_if_the_unit_is_dead(dead, expected):
     ctl = _Ctl({"resolve": lambda a: TransferError("did not answer resolve")})
