@@ -103,9 +103,11 @@ def _wanted_engine_env() -> dict[str, str]:
 
 
 def configure_engine_env(cfg: DataPlaneConfig) -> None:
-    """Set the mooncake knobs that must be identical in every process.
+    """Set the engine knobs that must be identical in every process.
 
-    No-op unless the backend is ``mooncake_cpu``; ``simple`` has no engine.
+    ``nixl``: default ``UCX_TLS`` to an RDMA-only list, which the NIXL data
+    plane requires (it never runs over tcp). ``mooncake_cpu``: the MC_* knobs
+    below. ``simple`` has no engine.
     Values already present in the environment are left alone, so a launcher can
     override any of them — except ``MC_ENABLE_DEST_DEVICE_AFFINITY``, which
     mooncake reads presence-only, so a launcher trying to override it to
@@ -120,6 +122,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
     """
+    if cfg["backend"] == "nixl":
+        os.environ.setdefault("UCX_TLS", "rc,self,sm")
+        return
     if cfg["backend"] != "mooncake_cpu":
         return
 
