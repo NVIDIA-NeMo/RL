@@ -1000,6 +1000,58 @@ def test_nemo_gym_metric_namespace_supports_task_source_only_rows(
     assert _nemo_gym_metric_namespace(row) == expected
 
 
+@pytest.mark.parametrize(
+    ("first_prompts", "distinct_count"),
+    [
+        ([[1, 5, 7], [1, 5, 7]], 1),
+        ([[1, 5, 7], [1, 5, 9]], 2),
+        ([[1, 5], [1, 5, 7]], 2),
+        (None, None),
+    ],
+)
+def test_nemo_gym_rollout_first_prompt_metrics(
+    monkeypatch, caplog, first_prompts, distinct_count
+):
+    from nemo_rl.utils.timer import Timer
+
+    impl = _nemo_gym_impl(True)
+    impl._tokenizer = SimpleNamespace(pad_token_id=0)
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": object()}
+    if first_prompts is None:
+        results_to_stream = [_mask_gate_receipt_result() for _ in range(2)]
+        for result in results_to_stream:
+            result["input_message_log"] = []
+    else:
+        results_to_stream = []
+        for prompt in first_prompts:
+            result = _reward_penalty_result([])
+            result["input_message_log"] = [{"role": "user", "token_ids": prompt}]
+            results_to_stream.append(result)
+
+    async def stream_rows(_env, _pending, results, *_args, **_kwargs):
+        results[:] = results_to_stream
+        return None
+
+    monkeypatch.setattr(impl, "_stream_rows", stream_rows)
+    rows = [{"_rowidx": index, "agent_ref": {"name": "agent"}} for index in range(2)]
+    completions, _, metrics = _run(impl._run_rollouts(rows, Timer(), "timing/test"))
+
+    assert len(completions) == 2
+    if distinct_count is None:
+        assert "baseline_groups/distinct_first_prompts" not in metrics
+        assert "baseline_groups/logical_groups" not in metrics
+        assert "baseline_groups/samples" not in metrics
+    else:
+        assert metrics["baseline_groups/distinct_first_prompts"] == distinct_count
+        # Each dispatched group is one logical prompt group on this path.
+        assert metrics["baseline_groups/logical_groups"] == 1
+        assert metrics["baseline_groups/samples"] == 2
+    assert not any(
+        "distinct first prompts" in record.message for record in caplog.records
+    )
+
+
 def _mask_gate_result():
     return {
         "message_log": [
