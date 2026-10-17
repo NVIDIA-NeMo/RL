@@ -196,6 +196,29 @@ def test_exit_on_max_steps(mock_components):
     assert final_timing_call.kwargs["step_finished"] is True
 
 
+def test_failed_checkpoint_finalization_stops_before_training(mock_components):
+    """A failed background checkpoint finalization stops the loop before it trains."""
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.raise_if_finalization_failed.side_effect = RuntimeError(
+        "Background checkpoint finalization failed"
+    )
+
+    with pytest.raises(RuntimeError, match="Background checkpoint finalization failed"):
+        sft_train(
+            mock_components["policy"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["master_config"],
+            mock_components["logger"],
+            checkpointer,
+            _initial_sft_save_state(),
+        )
+
+    mock_components["policy"].train.assert_not_called()
+
+
 def test_exit_on_max_epochs(mock_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
