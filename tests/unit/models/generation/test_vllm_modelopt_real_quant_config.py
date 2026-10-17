@@ -67,7 +67,8 @@ def _install_fake_vllm_worker(monkeypatch):
     gpu_worker_module = types.ModuleType("vllm.v1.worker.gpu_worker")
 
     class FakeVllmWorker:
-        pass
+        def load_model(self, *, load_dummy_weights: bool = False) -> None:
+            raise AssertionError("Tests must replace the fake worker's load_model")
 
     gpu_worker_module.Worker = FakeVllmWorker
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", gpu_worker_module)

@@ -75,30 +75,6 @@ class IPCWeightManifestError(RuntimeError):
     """An IPC transfer did not match the prepared state-dict manifest."""
 
 
-def _detach_pending_layerwise_weights(
-    model: torch.nn.Module, source_storage_ptrs: set[int]
-) -> None:
-    """Clone deferred reload weights that still alias a transport buffer.
-
-    vLLM 0.25.1 replays deferred weight-loader arguments during layerwise
-    finalization, after NeMo-RL may have reused the source transport buffer.
-    """
-    if not source_storage_ptrs:
-        return
-
-    # Keep reload internals off the normal non-layerwise weight-loading path.
-    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
-
-    for module in model.modules():
-        info = get_layerwise_info(module)
-        for _, arguments in info.loaded_weights:
-            loaded_weight = arguments.arguments.get("loaded_weight")
-            if not isinstance(loaded_weight, torch.Tensor):
-                continue
-            if loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs:
-                arguments.arguments["loaded_weight"] = loaded_weight.clone()
-
-
 def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
     """Rebuild kernel-specific state omitted by vLLM's layerwise finalizer.
 
@@ -438,7 +414,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _load_full_hf_weights(
         self, policy_weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str] | None:
-        """Load HF weights and detach any deferred reload tensors from transport storage.
+        """Load HF weights with owned inputs when native reload can defer loading.
 
         Returns the set of weight names vLLM reported as loaded, or ``None``
         when the model's ``load_weights`` does not report one.
@@ -446,35 +422,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not getattr(self, "_nrl_layerwise_reload_active", False):
             return self.model_runner.model.load_weights(weights=policy_weights)
 
-        source_storage_ptrs: set[int] = set()
-
-        def track_source_storage() -> Iterator[tuple[str, torch.Tensor]]:
-            for name, tensor in policy_weights:
-                source_storage_ptrs.add(tensor.untyped_storage().data_ptr())
-                yield name, tensor
-
-        load_error: Exception | None = None
-        try:
-            return self.model_runner.model.load_weights(weights=track_source_storage())
-        except Exception as error:
-            load_error = error
-            raise
-        finally:
-            try:
-                # Native layerwise reload may defer weight_loader calls until all
-                # shards for a layer have arrived. NCCL/IPC weights are views into
-                # reusable receive buffers that subsequent transfers may overwrite,
-                # so clone any pending tensors that alias the current buffer and
-                # preserve them until deferred replay consumes them.
-                _detach_pending_layerwise_weights(
-                    self.model_runner.model, source_storage_ptrs
-                )
-            except Exception:
-                if load_error is None:
-                    raise
-                logger.exception(
-                    "Failed to detach deferred weights after a weight load failure"
-                )
+        # Native loaders may retain inputs or views until a later batch completes
+        # the layer. Own each input before loading so transport buffers can be
+        # reused without rescanning every module's pending loader arguments.
+        owned_weights = ((name, tensor.clone()) for name, tensor in policy_weights)
+        return self.model_runner.model.load_weights(weights=owned_weights)
 
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         from nemo_rl.models.generation.vllm.quantization import fp8
