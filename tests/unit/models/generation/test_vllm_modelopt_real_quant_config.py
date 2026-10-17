@@ -675,7 +675,7 @@ def test_real_quant_model_detection_uses_native_vllm_method(
 def test_real_quant_load_uses_canonical_hf_loader(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.device = torch.device("cpu")
+    extension.device = torch.device("cuda:0")
     extension.model_runner = types.SimpleNamespace(
         vllm_config=types.SimpleNamespace(
             model_config=types.SimpleNamespace(quantization="modelopt")
@@ -684,10 +684,16 @@ def test_real_quant_load_uses_canonical_hf_loader(monkeypatch):
     source = torch.tensor([1.0, 2.0])
     loaded = []
 
+    def load_canonical_weights(
+        _self: object, weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        assert torch.get_default_device().type == "cpu"
+        loaded.extend(weights)
+
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_load_full_hf_weights",
-        lambda _self, weights: loaded.extend(weights),
+        load_canonical_weights,
     )
 
     extension._load_weights([("model.weight", source)])

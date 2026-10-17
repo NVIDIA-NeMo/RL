@@ -128,8 +128,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
     def _load_weights(self, weights):
         if self._is_real_quant_model():
-            with torch.device(self.device):
-                self._load_full_hf_weights(list(weights))
+            # Native reload owns placement. A default-device mode here also
+            # dispatches every metadata operation through Python.
+            self._load_full_hf_weights(list(weights))
             return
 
         weights = route_moe_input_quantizer_amax(
