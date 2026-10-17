@@ -45,6 +45,7 @@ def packed_broadcast_producer(
     *,
     buffer_size_bytes: int | None = None,
     num_buffers: int | None = None,
+    use_legacy_packing: bool = False,
 ):
     """Broadcast a list of tensors in a packed manner.
 
@@ -55,6 +56,8 @@ def packed_broadcast_producer(
         post_iter_func: function to apply to each tensor before packing, should return a tensor
         buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
         num_buffers: number of alternating CUDA buffers. Uses the default when unset.
+        use_legacy_packing: pack an oversized tensor with the ones before it, as
+            vLLM's own consumer expects, instead of sending it in its own broadcast.
 
     Returns:
         None
@@ -107,7 +110,8 @@ def packed_broadcast_producer(
                         tensor = pending_tensor
                         pending_tensor = None
                     if (
-                        packing_tensor_list[buffer_idx]
+                        not use_legacy_packing
+                        and packing_tensor_list[buffer_idx]
                         and tensor.numel() > target_packed_tensor_size
                     ):
                         pending_tensor = tensor
