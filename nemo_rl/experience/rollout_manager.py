@@ -2253,6 +2253,7 @@ class RolloutManager:
                     # Forest selections are request-local until checkpoint recovery
                     # persists them. Drop this abandoned group through the usual
                     # bounded policy; do not redispatch and lose sealed selections.
+                    # Retry support: https://github.com/NVIDIA-NeMo/RL/pull/4200.
                     if self._forest_training:
                         break
                     if infra_attempts >= policy.max_infra_attempts:
@@ -2288,6 +2289,12 @@ class RolloutManager:
                 f"max_consecutive_dropped_prompts="
                 f"{policy.max_consecutive_dropped_prompts}; last failure was "
                 f"{reason}: {last_infra_error}"
+                + (
+                    " Forest training does not retry failed groups; accepted-call "
+                    "recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200."
+                    if self._forest_training
+                    else ""
+                )
             ) from last_infra_error
         self._stats.record_infra_drop(reason, self._consecutive_infra_drops)
         print(

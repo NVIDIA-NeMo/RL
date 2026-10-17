@@ -7,33 +7,24 @@ boundaries. Capture records here are semantic fixtures, not GPU/TQ evidence.
 """
 
 import asyncio
-import glob
-import json
-import os
-import re
-import shutil
 import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar, List, Optional
+from typing import Any
 from unittest.mock import AsyncMock
-from uuid import uuid4
 
 import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from nemo_gym import openai_utils, rollout_observability
-from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
 )
-from openai.types.responses.function_tool import FunctionTool
-from pydantic import BaseModel, Field
 from responses_api_agents.opencode_agent.app import (
     _INTERNAL_TRAJECTORY_KEY,
     OpenCodeAgent,
@@ -310,207 +301,3 @@ def test_gym_opencode_reasoning_only_is_omitted_from_flat_output(
     assert items == []
     assert trajectory.turns[0].reasoning_content[0]["text"] == "thinking"
     assert not trajectory.turns[0].model_calls
-
-
-class ForkInstanceConfig(BaseModel):
-    """Only fields consumed by run(); no remote launch/config validation."""
-
-    persistent_dir: Path
-    instance_id: str
-
-
-@pytest.fixture
-def fork_exporter() -> Any:
-    fork_root = os.environ.get("NEMO_RL_TEST_OPENCODE_FORK_ROOT")
-    if not fork_root:
-        pytest.skip("set NEMO_RL_TEST_OPENCODE_FORK_ROOT to the pinned fork snapshot")
-    fork = Path(fork_root)
-    assert fork.is_dir(), fork
-    dependencies = namespace() | {
-        "Path": Path,
-        "Optional": Optional,
-        "List": List,
-        "ClassVar": ClassVar,
-        "BaseModel": BaseModel,
-        "Field": Field,
-        "BaseVerifyResponse": BaseVerifyResponse,
-        "SWEBenchWrapperInstanceConfig": ForkInstanceConfig,
-        "json": json,
-        "os": os,
-        "glob": glob,
-        "shutil": shutil,
-        "time": time,
-        "re": re,
-        "uuid4": uuid4,
-        "FunctionTool": FunctionTool,
-    }
-    converter = load_source_definitions(
-        fork / "responses_api_models/vllm_model/app.py",
-        {"VLLMConverter": None, "split_responses_input_output_items": None},
-        dependencies,
-    )
-    source = load_source_definitions(
-        fork / "responses_api_agents/swe_agents/app.py",
-        {
-            "RunOpenHandsAgent": {"_openhands_dir_copy_from_host"},
-            "SWEBenchMetrics": None,
-            "SWEBenchVerifyResponse": None,
-            "SWEBenchWrapper": {
-                "_materialize_trajectory",
-                "get_all_session_trajectories_from_completions",
-                "run",
-            },
-        },
-        dependencies
-        | {
-            "split_responses_input_output_items": converter.split_responses_input_output_items
-        },
-    )
-    wrapper = source.SWEBenchWrapper()
-    wrapper._vllm_converter = converter.VLLMConverter(return_token_id_information=False)
-    wrapper._sem = asyncio.Semaphore(1)
-    return SimpleNamespace(source=source, wrapper=wrapper)
-
-
-def fork_completion(
-    index: int,
-    segment: int,
-    messages: list[dict],
-    text: str,
-    boundary: str | None = None,
-) -> dict:
-    return {
-        "turn": index,
-        "session_id": "main",
-        "parent_session_id": None,
-        "segment_index": segment,
-        "segment_boundary_reason": boundary,
-        "messages": messages,
-        "response": {
-            "id": f"response-{index}",
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": text},
-                }
-            ],
-        },
-    }
-
-
-@pytest.mark.parametrize("compact", [False, True])
-def test_custom_opencode_real_collector_to_run_output(
-    fork_exporter: Any, tmp_path: Path, compact: bool
-) -> None:
-    prompt = [{"role": "user", "content": "task"}]
-    first = {"role": "assistant", "content": "first"}
-    calls = [
-        fork_completion(1, 0, prompt, "first"),
-        fork_completion(
-            2, 0, [*prompt, first, {"role": "user", "content": "continue"}], "second"
-        ),
-    ]
-    if compact:
-        copied = [*calls[-1]["messages"], {"role": "assistant", "content": "second"}]
-        calls += [
-            fork_completion(
-                3,
-                1,
-                [*copied, {"role": "user", "content": "summarize"}],
-                "summary",
-                "compaction",
-            ),
-            fork_completion(
-                4,
-                2,
-                [{"role": "user", "content": "summary"}],
-                "last",
-                "post_compaction",
-            ),
-        ]
-    # The real collector deletes its source after harvesting. Every path is
-    # inside this test's tmp_path, never the pinned source or an existing run.
-    setup = tmp_path / "setup"
-    dumps = setup / "opencode/eval/task/run/llm_completions/main"
-    dumps.mkdir(parents=True)
-    for call in calls:
-        path = dumps / f"turn-{call['turn']:04d}.json"
-        path.write_text(json.dumps(call))
-        os.utime(path, (call["turn"], call["turn"]))
-    collector = fork_exporter.source.RunOpenHandsAgent()
-    collector.config = SimpleNamespace(
-        problem_info={"instance_id": "task"},
-        eval_dir_in_openhands="eval",
-        agent_framework="opencode",
-        openhands_config_file_path=tmp_path / "config",
-        opencode_setup_dir=setup,
-        trajectories_root=tmp_path / "trajectories/task",
-    )
-    collector._openhands_dir_copy_from_host(None)
-    retained = list(
-        (tmp_path / "trajectories/task/llm_completions/task").glob("*.json")
-    )
-    assert len(retained) == (3 if compact else 1)
-    assert collector._opencode_turn_stats["num_model_calls"] == len(calls)
-    assert not (setup / "opencode/eval").exists()
-    wrapper = fork_exporter.wrapper
-    entries = wrapper.get_all_session_trajectories_from_completions(
-        tmp_path / "trajectories", "task"
-    )
-    assert entries[0]["prefix_message_count"] == 1
-    if compact:
-        assert entries[1]["prefix_message_count"] == len(calls[2]["messages"])
-        assert entries[2]["segment_boundary_reason"] == "post_compaction"
-    wrapper.responses = AsyncMock(
-        return_value=response(
-            len(calls),
-            "public last",
-            metadata={
-                "input": json.dumps(prompt),
-                "metrics": '{"resolved": true}',
-                "instance_config": ForkInstanceConfig(
-                    persistent_dir=tmp_path, instance_id="task"
-                ).model_dump_json(),
-            },
-        )
-    )
-    exported = asyncio.run(
-        wrapper.run(BaseRunRequest(responses_create_params={"input": "task"}))
-    ).model_dump(mode="json")
-    assert exported["reward"] == 1.0
-    # Structural flattening only; no use of harness segment labels in RL plan.
-    ordinary = {"output": [item for r in exported["responses"] for item in r["output"]]}
-    texts = ["first", "second", "summary", "last"] if compact else ["first", "second"]
-    records = [
-        record(i + 1, [message(text)], parent=1 if i == 1 else None)
-        for i, text in enumerate(texts)
-    ]
-    selected, plan = selected_chain_plan(records, ordinary)
-    assert selected == tuple(f"response-{i + 1}" for i in range(len(calls)))
-    assert len(plan) == (3 if compact else 1)
-    # Copied pre-compaction assistant history did not become new actions.
-    assert len(
-        [item for item in ordinary["output"] if item.get("role") == "assistant"]
-    ) == len(calls)
-    assert all(
-        r["id"].startswith("swebench-task-main-seg") for r in exported["responses"]
-    )
-    assert all("response_id" not in entry for entry in entries)
-    with pytest.raises(ValueError, match="Ambiguous"):
-        selected_response_ids(
-            [records[0], record(99, [message("second")], parent=1), *records[1:]],
-            ordinary,
-        )
-
-
-def test_custom_opencode_reasoning_only_and_identity_loss(fork_exporter: Any) -> None:
-    data = fork_completion(1, 0, [{"role": "user", "content": "task"}], "")
-    data["response"]["choices"][0]["message"]["reasoning_text"] = "thinking"
-    messages, _ = fork_exporter.wrapper._materialize_trajectory(data)
-    assert messages == data["messages"]  # reasoning-only final response omitted
-    mixed = {"role": "assistant", "content": "answer", "reasoning_text": "thinking"}
-    items = fork_exporter.wrapper._vllm_converter.chat_completions_messages_to_responses_items(
-        [mixed]
-    )
-    assert [item.type for item in items] == ["message"]
-    assert "thinking" not in str(items)

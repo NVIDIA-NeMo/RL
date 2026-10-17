@@ -13,23 +13,14 @@
 # limitations under the License.
 """Validate complete logical owners before the existing GRPO estimator runs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import LogicalRowTag, forest_segment_id
 
-_OWNER_TAGS = frozenset(
-    {
-        "dispatch_group_id",
-        "logical_rollout_id",
-        "logical_slot",
-        "logical_group_size",
-        "segment_index",
-        "segment_count",
-        "is_execution_padding",
-    }
-)
+_OWNER_TAGS = frozenset(field.name for field in fields(LogicalRowTag))
 
 
 def has_logical_owners(meta: KVBatchMeta) -> bool:
@@ -122,7 +113,7 @@ def build_logical_owner_batch(
             or type(count) is not int
             or not 0 <= segment < count
             or tag["logical_rollout_id"] != f"{group}_g{slot}"
-            or meta.sample_ids[row] != f"{group}_g{slot}_s{segment}"
+            or meta.sample_ids[row] != forest_segment_id(f"{group}_g{slot}", segment)
         ):
             raise ValueError("Forest owner/segment identity is invalid")
         slots.setdefault(slot, []).append(row)

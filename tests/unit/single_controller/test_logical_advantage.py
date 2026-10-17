@@ -649,6 +649,9 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     ],
 )
 def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
+    setting = ("grpo." + next(iter(grpo))) if grpo else ("loss_fn." + next(iter(loss)))
+    with pytest.raises(ValueError, match=setting):
+        validate_forest_objective(GRPOConfig(**grpo), ClippedPGLossConfig(**loss))
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     ctrl = _controller(meta, data, grpo=grpo, loss=loss)
     with pytest.raises(ValueError, match="Forest"):

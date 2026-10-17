@@ -72,6 +72,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     forest_execution_row_multiple,
     is_ppo_run,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
@@ -2099,16 +2100,7 @@ def setup_single_controller(
             forest_execution_row_multiple(
                 trainer.cfg,
                 dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                logprobs_required=(
-                    not (
-                        master_config.loss_fn.force_on_policy_ratio
-                        and algo_cfg.seq_logprob_error_threshold is None
-                    )
-                    or (
-                        master_config.loss_fn.reference_policy_kl_penalty > 0
-                        and not algo_cfg.skip_reference_policy_logprobs_calculation
-                    )
-                ),
+                logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
             )
             if token_capture_cfg.forest_training
             else 1

@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -52,6 +52,9 @@ from nemo_rl.data_plane.schema import (
     MASK_SAMPLE,
     ROUTE_PLAN_TAG,
     TRUNCATED,
+    LogicalRowTag,
+    forest_row_ids,
+    forest_segment_id,
 )
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
@@ -970,13 +973,23 @@ class RolloutReassembler:
                     dropped=True,
                     drop_reason="Forest group has no verified input layout for dummy rows",
                 )
-            padding_count = (-real_row_count) % execution_row_multiple
+            planned_ids = forest_row_ids(
+                group_id,
+                canonical_sample_ids,
+                [
+                    tag["segment_count"]
+                    for tag in logical.tags
+                    if tag["segment_index"] == 0
+                ],
+                execution_row_multiple=execution_row_multiple,
+            )
+            padding_count = len(planned_ids) - real_row_count
             dummy_layout = valid_rows[0]
             for ordinal in range(padding_count):
                 rows.append(
                     replace(
                         dummy_layout,
-                        rollout_id=f"{group_id}_pad{ordinal}",
+                        rollout_id=planned_ids[real_row_count + ordinal],
                         valid=False,
                         reward=0.0,
                         staging_keys=[],
@@ -986,14 +999,18 @@ class RolloutReassembler:
                 logical.mask_sample.append(True)
                 logical.truncated.append(False)
                 logical.tags.append(
-                    {
-                        "dispatch_group_id": group_id,
-                        "logical_group_size": len(rollout_ids),
-                        "logical_rollout_id": None,
-                        "logical_slot": None,
-                        "segment_index": None,
-                        "segment_count": 0,
-                        "is_execution_padding": True,
+                    asdict(
+                        LogicalRowTag(
+                            dispatch_group_id=group_id,
+                            logical_group_size=len(rollout_ids),
+                            logical_rollout_id=None,
+                            logical_slot=None,
+                            segment_index=None,
+                            segment_count=0,
+                            is_execution_padding=True,
+                        )
+                    )
+                    | {
                         "num_invalid_tool_calls": 0,
                         "num_malformed_thinking": 0,
                         "num_assistant_messages": 0,
@@ -1157,6 +1174,8 @@ class RolloutReassembler:
             )
         else:
             sample_ids = [row.rollout_id for row in rows]
+            if tuple(sample_ids) != planned_ids:
+                raise ValueError("Forest publication IDs differ from the cleanup plan")
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
@@ -1362,7 +1381,10 @@ class RolloutReassembler:
         No publication or cleanup happens before this method completes.
         """
         # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
-        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,
+            staging_key,
+        )
 
         n = len(rollout_ids)
         if not n or len(logical_segments) != n:
@@ -1391,7 +1413,7 @@ class RolloutReassembler:
             scored_call = RolloutReceipt.model_validate(
                 receipts[slot]
             ).terminal_model_call_id
-            reward_row = None
+            reward_row: FinalizedRollout | None = None
             parsed_receipts = []
             owner_valid = True
             owner_records = {}
@@ -1409,7 +1431,8 @@ class RolloutReassembler:
                 )
                 if parsed is not None:
                     if parsed.rollout_id != expected_id or any(
-                        record.staging_key != f"{expected_id}/{record.model_call_id}"
+                        record.staging_key
+                        != staging_key(expected_id, record.model_call_id)
                         for record in parsed.manifest
                     ):
                         raise ValueError("foreign receipt/staging ownership")
@@ -1538,7 +1561,7 @@ class RolloutReassembler:
                 rebuilt = [
                     replace(
                         first,
-                        rollout_id=f"{owner_id}_s0",
+                        rollout_id=forest_segment_id(owner_id, 0),
                         valid=False,
                         rejection_reason="logical_owner_invalid",
                         token_ids=[],
@@ -1562,21 +1585,27 @@ class RolloutReassembler:
                     )
                     if response_id in owned_responses[ordinal]
                 )
-                prepared.rows.append(replace(row, rollout_id=f"{owner_id}_s{ordinal}"))
+                prepared.rows.append(
+                    replace(row, rollout_id=forest_segment_id(owner_id, ordinal))
+                )
                 prepared.prompt_ids.append(original_prompt)
                 prepared.mask_sample.append(owner_mask)
                 prepared.truncated.append(
                     any(segment.truncated for segment in segments)
                 )
                 prepared.tags.append(
-                    {
-                        "dispatch_group_id": group_id,
-                        "logical_rollout_id": owner_id,
-                        "logical_slot": slot,
-                        "logical_group_size": n,
-                        "segment_index": ordinal,
-                        "segment_count": len(rebuilt),
-                        "is_execution_padding": False,
+                    asdict(
+                        LogicalRowTag(
+                            dispatch_group_id=group_id,
+                            logical_rollout_id=owner_id,
+                            logical_slot=slot,
+                            logical_group_size=n,
+                            segment_index=ordinal,
+                            segment_count=len(rebuilt),
+                            is_execution_padding=False,
+                        )
+                    )
+                    | {
                         "num_invalid_tool_calls": sum(
                             flag.invalid_tool_call for flag in flags
                         ),

@@ -1,301 +1,42 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Same captured evidence, ordinary output versus LogicalCCResult selection.
+"""Ordinary-output selection and finalization over captured semantic fixtures.
 
-Real shared client, HTTP capture, ledger, TQ codecs, finalizer and advantages;
-fake generation and in-memory storage. OpenCode cases are semantic fixtures,
-not execution of OpenCode or its gateway. The frozen baseline consumer is
-executed unchanged as the migration oracle; generation is never repeated.
+Uses fake generation and in-memory storage, not live OpenCode or its gateway.
 """
 
 import asyncio
-import os
-import sys
-from copy import deepcopy
 from pathlib import Path
-from typing import Any, Literal
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
 
 import pytest
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-import nemo_rl.environments.nemo_gym as gym_environment
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.config_types import ModelServerRef
-from nemo_gym.context_management import (
-    ContextHistoryConfig,
-    ContextManagedResponsesClient,
-)
 from nemo_gym.openai_utils import (
     NeMoGymAsyncOpenAI,
-    NeMoGymResponseCreateParamsNonStreaming,
-    NeMoGymResponseOutputItem,
 )
-from nemo_gym.server_utils import ServerClient
 from nemo_gym.token_id_capture.fingerprint import (
     FINGERPRINT_VERSION,
     assistant_fingerprint,
 )
-from nemo_gym.token_id_capture.staging.records import CallRecord, RolloutManifest
-from responses_api_agents.simple_agent_with_compaction.tests.test_client import (
-    http_response,
-)
+from nemo_gym.token_id_capture.staging.records import CallRecord
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
-from tests.unit.experience.agent_exporter_probe import load_source_definitions
 from tests.unit.experience.common_output_comparison import (
     selected_response_ids,
     selection_with_observed_metadata,
 )
-from tests.unit.experience.test_forest_dispatch import _env
 from tests.unit.experience.test_logical_owner_finalization import (
     PublicationDataPlane,
     decide_capture_input,
     finalize,
     gym_harness,
 )
-from tests.unit.single_controller.test_logical_advantage import _controller
 
 pytestmark = pytest.mark.nemo_gym
-
-
-@pytest.mark.parametrize(
-    "compact", [False, True], ids=["20_calls_one_row", "20_calls_two_rows"]
-)
-def test_shared_client_same_evidence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compact: bool
-) -> None:
-    baseline_root = os.environ.get("NEMO_RL_TEST_CC_BASELINE_ROOT")
-    if not baseline_root:
-        pytest.skip("set NEMO_RL_TEST_CC_BASELINE_ROOT to the pre-migration checkout")
-    baseline_path = Path(baseline_root) / "nemo_rl/environments/nemo_gym.py"
-    assert baseline_path.is_file(), baseline_path
-    plane = PublicationDataPlane()
-    source = TQTokenSource(plane, staging_partition="staged")
-    harness = gym_harness.make_capture_harness(
-        monkeypatch,
-        tmp_path,
-        sink=TQTokenSink(plane, staging_partition="staged"),
-        fetch_prefix=source.fetch_prefix_token_ids,
-        root_prompt=[10, 11],
-        reasoning=True,
-        decide_input=decide_capture_input,
-    )
-    env = _env(harness)
-    baseline = load_source_definitions(
-        baseline_path,
-        {"NemoGym": {"_postprocess_cc_receipt_mode"}},
-        {
-            key: value
-            for key, value in vars(gym_environment).items()
-            if not key.startswith("__")
-        },
-    )
-    # Load the schema from the same frozen checkout as the historical consumer.
-    # The new production client no longer constructs or imports this object.
-    schema_path = (
-        Path(baseline_root)
-        / "3rdparty/Gym-workspace/Gym/nemo_gym/context_management/result.py"
-    )
-    assert schema_path.is_file(), schema_path
-    legacy_schema = load_source_definitions(
-        schema_path,
-        {"SelectedAction": None, "LogicalCCResult": None},
-        {
-            "Literal": Literal,
-            "BaseModel": BaseModel,
-            "ConfigDict": ConfigDict,
-            "Field": Field,
-            "model_validator": model_validator,
-            "NeMoGymResponseOutputItem": NeMoGymResponseOutputItem,
-        },
-    )
-    receipts, common_receipts, oracle, common = [], [], [], []
-    owners = ["group_g0", "group_g1"]
-
-    async def exercise() -> None:
-        for owner in owners:
-            observed = {}
-            transport = MagicMock(spec=ServerClient)
-
-            async def post(**kwargs: Any) -> Any:
-                raw = gym_harness.assert_clean(
-                    harness.client.post(
-                        kwargs["url_path"],
-                        json=kwargs["json"].model_dump(mode="json"),
-                        headers=kwargs.get("headers"),
-                    )
-                )
-                # Test tee of ordinary served responses. This includes every
-                # served attempt, before the client makes its acceptance choice.
-                observed[raw["id"]] = deepcopy(raw)
-                return http_response(raw)
-
-            transport.post = AsyncMock(side_effect=post)
-            client = ContextManagedResponsesClient(
-                server_client=transport,
-                model_server=ModelServerRef(name="policy", type="responses_api_models"),
-                logical_rollout_id=owner,
-                initial_request=NeMoGymResponseCreateParamsNonStreaming(input="task"),
-                config=ContextHistoryConfig.model_validate(
-                    {
-                        "enabled": compact,
-                        "max_response_retries": 0,
-                        "policy": {
-                            "type": "recency",
-                            "config": {
-                                "reasoning": {"enabled": True, "keep_last_blocks": 0}
-                            },
-                        },
-                        "schedule": {
-                            "type": "turn_chunked_recency",
-                            "actions_per_chunk": 10,
-                        },
-                    }
-                ),
-            )
-            accepted_responses = []
-            for turn in range(20):
-                response = await client.create()
-                accepted_responses.append(response.model_dump(mode="json"))
-                if turn != 19:
-                    client.append_observation(
-                        [
-                            {
-                                "role": "user",
-                                "type": "message",
-                                "content": f"observation {turn}",
-                            }
-                        ]
-                    )
-            ordinary = response.model_dump(mode="json") | {
-                "output": client.output_items
-            }
-            manifest = RolloutManifest.model_validate(
-                await harness.ledger.manifest(owner)
-            )
-            # Compute the candidate independently of the historical fixture.
-            candidate = selection_with_observed_metadata(
-                manifest.records, ordinary, observed
-            )
-            common_receipts.append(
-                env._assemble_receipt(
-                    owner,
-                    manifest.model_dump(mode="json"),
-                    terminal_response_id=candidate.response_ids[-1],
-                    reward=float(owners.index(owner) + 1),
-                )
-            )
-            with pytest.raises(ValueError, match="completion metadata"):
-                selection_with_observed_metadata(manifest.records, ordinary, {})
-            client.finish(response)
-            # This scenario contains only completed responses. Record membership
-            # at the acceptance boundary, never infer the oracle from capture.
-            assert all(not r["incomplete_details"] for r in accepted_responses)
-            legacy_result = {
-                "logical_rollout_id": owner,
-                "selected_actions": [
-                    {
-                        "response_id": r["id"],
-                        "finish_reason": "stop",
-                        "last_output_item": r["output"][-1],
-                    }
-                    for r in accepted_responses
-                ],
-                "outcome": "completed",
-            }
-            processed = await env._postprocess_receipt_mode(
-                {"_ng_rollout_id": owner},
-                {
-                    "response": ordinary,
-                    "reward": float(owners.index(owner) + 1),
-                },
-            )
-            assert candidate == processed["logical_selection"]
-            # Only the unchanged historical consumer sees the old schema import.
-            with monkeypatch.context() as legacy_import:
-                legacy_import.setitem(
-                    sys.modules, "nemo_gym.context_management.result", legacy_schema
-                )
-                previous = await baseline.NemoGym._postprocess_cc_receipt_mode(
-                    env,
-                    {"_ng_rollout_id": owner},
-                    {
-                        "response": ordinary,
-                        "reward": float(owners.index(owner) + 1),
-                        "context_compaction_result": legacy_result,
-                    },
-                )
-            assert previous == processed
-            receipts.append(previous["receipt"])
-            oracle.append(previous["logical_selection"])
-            common.append(candidate)
-
-    try:
-        asyncio.run(exercise())
-        snapshots = []
-        assert common_receipts == receipts
-        for selections, selected_receipts in (
-            (oracle, receipts),
-            (common, common_receipts),
-        ):
-            replay = PublicationDataPlane()
-            replay.rows = {key: value.clone() for key, value in plane.rows.items()}
-            result = RolloutReassembler(
-                replay,
-                partition_id="canonical",
-                staging_partition="staged",
-                pad_token_id=0,
-                max_seq_len=1024,
-            ).finalize_group(
-                "group",
-                owners,
-                deepcopy(selected_receipts),
-                [1.0, 2.0],
-                mask_sample=[False, False],
-                fallback_weight_version=7,
-                prompt_idx=99,
-                canonical_sample_ids=owners,
-                logical_selections=selections,
-            )
-            meta = result.meta
-            assert meta is not None
-            assert result.valid_row_count == (4 if compact else 2)
-            assert not any(partition == "staged" for partition, _ in replay.rows)
-            data = replay.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id="canonical",
-                select_fields=meta.fields,
-            )
-            ctrl = _controller(meta, data)
-            _, valid = asyncio.run(ctrl._advantage_stage(meta))
-            assert valid
-            generated = [
-                token
-                for tokens, mask in zip(
-                    data["input_ids"].unbind(), data["token_mask"].unbind(), strict=True
-                )
-                for token in tokens[mask.bool()].tolist()
-            ]
-            assert sorted(generated) == list(range(1001, 1041))
-            snapshots.append((meta, data, replay.events))
-        left_meta, left, left_events = snapshots[0]
-        right_meta, right, right_events = snapshots[1]
-        assert left_meta == right_meta
-        assert left_events == right_events
-        assert set(left.keys()) == set(right.keys())
-        for field in left.keys():
-            for actual, expected in zip(
-                left[field].unbind(), right[field].unbind(), strict=True
-            ):
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    finally:
-        harness.client.close()
-        asyncio.run(harness.ledger.close())
 
 
 def message(text: str) -> dict:

@@ -48,7 +48,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    logprob_passes_required,
+)
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
     has_logical_owners,
@@ -127,6 +130,9 @@ class AdvantageStageConfig:
         is_ppo = is_ppo_run(master_config)
         algo_cfg = algo_config(master_config)
         loss_cfg = master_config.loss_fn
+        policy_logprobs, reference_logprobs = logprob_passes_required(
+            master_config, algo_cfg
+        )
         return cls(
             filtering_on=need_top_k_or_top_p_filtering(
                 TrainingSamplingParams(
@@ -137,16 +143,8 @@ class AdvantageStageConfig:
             advantage=AdvantageConfig(),
             algo=algo_cfg,
             is_ppo=is_ppo,
-            policy_logprobs_required=not (
-                loss_cfg.force_on_policy_ratio
-                and algo_cfg.seq_logprob_error_threshold is None
-            ),
-            # _build_trainer initializes the reference model only for a positive
-            # KL penalty, so this must use the same gate before requesting it.
-            reference_logprobs_required=bool(
-                loss_cfg.reference_policy_kl_penalty > 0
-                and not algo_cfg.skip_reference_policy_logprobs_calculation
-            ),
+            policy_logprobs_required=policy_logprobs,
+            reference_logprobs_required=reference_logprobs,
             teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
             message_level_advantage_penalties_enabled=(
                 algo_cfg.invalid_tool_call_advantage is not None

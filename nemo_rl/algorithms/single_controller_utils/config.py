@@ -669,7 +669,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Reconstruct selected capture paths as rows of one logical rollout.
     # Forest groups are single-attempt; ordinary capture keeps its retry policy.
     # Initially requires unit dataset loss weights and disables both trainer and
-    # rollout checkpointing; ordinary capture retains those capabilities.
+    # rollout checkpointing; support is in https://github.com/NVIDIA-NeMo/RL/pull/4200.
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
@@ -884,23 +884,45 @@ class MasterConfig(BaseModel, extra="allow"):
 
 def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
     """Keep the initial Forest objective identical at startup and before fanout."""
-    if (
-        grpo.adv_estimator.name != "grpo"
-        or not loss.token_level_loss
-        or loss.sequence_level_importance_ratios
-        or loss.truncated_importance_sampling_type == "seq-mask-tis"
-        or loss.use_kl_in_reward
-        or loss.positive_example_nll_weight != 0
-        or grpo.use_dynamic_sampling
-        or grpo.reward_shaping.enabled
-        or grpo.reward_scaling.enabled
-        or grpo.calculate_advantages_on_gpu
-        or grpo.invalid_tool_call_advantage is not None
-        or grpo.malformed_thinking_advantage is not None
-    ):
+    unsupported = {
+        "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
+        "loss_fn.token_level_loss": not loss.token_level_loss,
+        "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
+        "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
+        == "seq-mask-tis",
+        "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
+        "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
+        "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
+        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
+        "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
+        "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
+        is not None,
+        "grpo.malformed_thinking_advantage": grpo.malformed_thinking_advantage
+        is not None,
+    }
+    bad = [name for name, enabled in unsupported.items() if enabled]
+    if bad:
         raise ValueError(
-            "Forest requires standard token-level GRPO without advantage overrides"
+            "Forest training (token_capture.forest_training) requires standard token-level GRPO; "
+            f"unsupported settings: {', '.join(bad)}"
         )
+
+
+def logprob_passes_required(
+    master_config: MasterConfig, algo_cfg: GRPOConfig | PPOConfig
+) -> tuple[bool, bool]:
+    """Return policy/reference forward requirements for both setup and execution."""
+    return (
+        not (
+            master_config.loss_fn.force_on_policy_ratio
+            and algo_cfg.seq_logprob_error_threshold is None
+        ),
+        bool(
+            master_config.loss_fn.reference_policy_kl_penalty > 0
+            and not algo_cfg.skip_reference_policy_logprobs_calculation
+        ),
+    )
 
 
 def forest_execution_row_multiple(
@@ -1514,10 +1536,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError("forest training requires min_step_batch_fraction=1")
         validate_forest_objective(master_config.grpo, master_config.loss_fn)
         if master_config.checkpointing["enabled"]:
-            raise ValueError("Forest checkpoint/resume is not supported initially")
+            raise ValueError(
+                "Forest checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
+            )
         if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
             raise ValueError(
-                "Forest rollout checkpoint/resume is not supported initially"
+                "Forest rollout checkpoint/resume is not supported initially; accepted-call recovery is in https://github.com/NVIDIA-NeMo/RL/pull/4200"
             )
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(

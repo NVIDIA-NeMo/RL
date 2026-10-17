@@ -7,7 +7,7 @@ Strict xfails document deferred provider shapes, not required forest behavior.
 
 import asyncio
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -771,3 +771,19 @@ def test_forest_shaping_and_observations_are_per_owner(
         ].item()
         == 0
     )
+
+
+def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
+    records, _ = forest.capture([None, 0, None])
+    original = forest.finalizer._finalize_logical_rows
+
+    def corrupt_ids(*args, **kwargs):
+        prepared = original(*args, **kwargs)
+        prepared.rows[0] = replace(prepared.rows[0], rollout_id="wrong")
+        return prepared
+
+    monkeypatch.setattr(forest.finalizer, "_finalize_logical_rows", corrupt_ids)
+    before = set(forest.plane.rows)
+    with pytest.raises(ValueError, match="publication IDs differ"):
+        publish(forest, records, records)
+    assert set(forest.plane.rows) == before

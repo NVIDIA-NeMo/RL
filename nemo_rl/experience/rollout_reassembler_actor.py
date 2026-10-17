@@ -22,6 +22,7 @@ import ray
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import forest_row_ids
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
@@ -105,22 +106,14 @@ class ReassemblyRequest:
         if self.logical_selections is None:
             return self.canonical_sample_ids
         _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
-        if (
-            type(self.execution_row_multiple) is not int
-            or self.execution_row_multiple < 1
-        ):
-            raise ValueError("execution_row_multiple must be a positive integer")
         plans = RolloutReassembler._plan_selected_calls(
             list(self.rollout_ids), list(self.receipts), list(self.logical_selections)
         )
-        real_ids = tuple(
-            f"{owner_id}_s{ordinal}"
-            for owner_id, segments in zip(self.canonical_sample_ids, plans, strict=True)
-            for ordinal in range(len(segments))
-        )
-        return real_ids + tuple(
-            f"{self.group_id}_pad{i}"
-            for i in range(-len(real_ids) % self.execution_row_multiple)
+        return forest_row_ids(
+            self.group_id,
+            self.canonical_sample_ids,
+            [len(segments) for segments in plans],
+            execution_row_multiple=self.execution_row_multiple,
         )
 
 

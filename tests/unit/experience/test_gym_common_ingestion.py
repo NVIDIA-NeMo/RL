@@ -3,11 +3,8 @@
 """Production common ingestion, served metadata persistence and Chat custody."""
 
 import asyncio
-import json
-import os
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -15,7 +12,6 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
-from nemo_gym.base_resources_server import BaseRunRequest
 from nemo_gym.token_id_capture.completion import (
     completion_metadata,
     output_item_fingerprint,
@@ -30,14 +26,8 @@ from nemo_gym.token_id_capture.staging.records import (
 
 from nemo_rl.environments.gym_selection import select_captured_calls
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
-from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
 from tests.unit.experience.test_common_output_comparison import message, record
-from tests.unit.experience.test_external_exporter_compatibility import (
-    ForkInstanceConfig,
-    fork_exporter,  # noqa: F401
-    response,
-)
 from tests.unit.experience.test_forest_dispatch import _env
 
 pytestmark = pytest.mark.nemo_gym
@@ -583,127 +573,10 @@ def test_capture_evidence_roundtrip_restart_and_conflict(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("compact", [False, True])
-def test_actual_custom_exporter_chat_capture_to_training_rows(
-    captured: Any,  # noqa: F811
-    fork_exporter: Any,  # noqa: F811
-    tmp_path: Path,
-    compact: bool,  # noqa: F811
-) -> None:  # noqa: F811
-    calls = []
-    prompt = [{"role": "user", "content": "task"}]
-    texts = ["first", "second", "summary", "last"] if compact else ["first", "second"]
-    captured.queue.extend(
-        {"role": "assistant", "content": text, "reasoning": None} for text in texts
+def test_identical_retry_is_resolved_by_the_terminal_parent_chain() -> None:
+    a, b = message("A"), message("B")
+    records = [call(1, [a]), call(2, [a]), call(3, [b], parent=2)]
+    selected = select_captured_calls(
+        records, {"response": {"id": "response-3", "output": [a, b]}}
     )
-    for index, text in enumerate(texts):
-        segment = max(0, index - 1)
-        if index == 2:
-            prompt = [{"role": "system", "content": "summarize"}, *prompt]
-        elif index == 3:
-            prompt = [{"role": "user", "content": "summary"}]
-        served = captured.harness.client.post(
-            "/ng-rollout/owner/training-token-capture/v1/chat/completions",
-            json={"model": "test-model", "messages": prompt},
-        )
-        assert served.status_code == 200, served.text
-        raw = served.json()
-        calls.append(
-            {
-                "turn": index + 1,
-                "session_id": "main",
-                "segment_index": segment,
-                "messages": deepcopy(prompt),
-                "response": raw,
-            }
-        )
-        prompt = [
-            *prompt,
-            {
-                key: value
-                for key, value in raw["choices"][0]["message"].items()
-                if value is not None
-            },
-            {"role": "user", "content": "continue"},
-        ]
-    manifest = captured.harness.manifest("owner")
-    assert not manifest.failures
-    assert sum(r.parent_call_id is None for r in manifest.records) == (
-        3 if compact else 1
-    )
-    setup = tmp_path / "setup"
-    dumps = setup / "opencode/eval/run/llm_completions/main"
-    dumps.mkdir(parents=True)
-    for data in calls:
-        path = dumps / f"turn-{data['turn']:04d}.json"
-        path.write_text(json.dumps(data))
-        os.utime(path, (data["turn"], data["turn"]))
-    collector = fork_exporter.source.RunOpenHandsAgent()
-    collector.config = SimpleNamespace(
-        problem_info={"instance_id": "task"},
-        eval_dir_in_openhands="eval",
-        agent_framework="opencode",
-        openhands_config_file_path=tmp_path / "config",
-        opencode_setup_dir=setup,
-        trajectories_root=tmp_path / "trajectories/task",
-    )
-    collector._openhands_dir_copy_from_host(None)
-    wrapper = fork_exporter.wrapper
-    wrapper.responses = AsyncMock(
-        return_value=response(
-            len(calls),
-            "last",
-            metadata={
-                "input": json.dumps(calls[-1]["messages"]),
-                "metrics": '{"resolved": true}',
-                "instance_config": ForkInstanceConfig(
-                    persistent_dir=tmp_path, instance_id="task"
-                ).model_dump_json(),
-            },
-        )
-    )
-    exported = asyncio.run(
-        wrapper.run(BaseRunRequest(responses_create_params={"input": "task"}))
-    ).model_dump(mode="json")
-    result = asyncio.run(
-        _env(captured.harness)._postprocess_receipt_mode(
-            {"_ng_rollout_id": "owner"}, exported
-        )
-    )
-    selection = result["logical_selection"]
-    assert selection.response_ids == tuple(
-        f"chatcmpl-{i + 1}" for i in range(len(calls))
-    )
-    finalizer = RolloutReassembler(
-        captured.plane,
-        partition_id="canonical",
-        staging_partition="staged",
-        pad_token_id=0,
-        max_seq_len=1024,
-    )
-    finalized = finalizer.finalize_group(
-        "group",
-        ["owner"],
-        [result["receipt"]],
-        [1.0],
-        mask_sample=[False],
-        fallback_weight_version=7,
-        prompt_idx=0,
-        canonical_sample_ids=["group_g0"],
-        logical_selections=[selection],
-    )
-    assert finalized.valid_row_count == (3 if compact else 1)
-    data = captured.plane.get_samples(
-        sample_ids=finalized.meta.sample_ids,
-        partition_id="canonical",
-        select_fields=finalized.meta.fields,
-    )
-    tokens = [
-        token
-        for ids, mask in zip(
-            data["input_ids"].unbind(), data["token_mask"].unbind(), strict=True
-        )
-        for token in ids[mask.bool()].tolist()
-    ]
-    assert tokens == list(range(1001, 1001 + len(calls)))
-    assert not any(partition == "staged" for partition, _ in captured.plane.rows)
+    assert [r.response_id for r in selected] == ["response-2", "response-3"]

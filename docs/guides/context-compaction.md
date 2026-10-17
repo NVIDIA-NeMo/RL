@@ -174,7 +174,7 @@ unset, errors are diagnostic only. Sequence-error metrics describe the per-row
 check before whole-rollout mask propagation; they do not count all rows excluded
 by that propagation.
 
-Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping and message-level advantage overrides remain unsupported for forest training.
+Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 Checkpoint/resume is separate work in [#4200](https://github.com/NVIDIA-NeMo/RL/pull/4200), tracked by [#4558](https://github.com/NVIDIA-NeMo/RL/issues/4558). The current path rejects trainer checkpoints and rollout snapshots rather than resuming without the accepted-call selection metadata.
 
