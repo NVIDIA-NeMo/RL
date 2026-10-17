@@ -169,6 +169,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -268,6 +269,9 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -431,6 +435,32 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    # Prefill/decode disaggregation: split each rollout replica into context
+    # (prefill) and generation (decode) engines, fronted by servers that expose
+    # the URLs the rollout client talks to.
+    disaggregation:
+      enabled: false
+      # Engines per replica; the two are independent, so the P:D ratio is free.
+      # The replica *count* is not configured -- it follows from the inference
+      # cluster's size, like the DP-shard count does without disaggregation.
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      # Frontend workers per replica. Each is its own CPU-only actor with a
+      # distinct URL, and the rollout client's per-session affinity shards
+      # conversations across them, so one frontend's CPU stops being the
+      # replica's turn-throughput ceiling. replicas * workers must be <= 256.
+      num_frontend_workers: 1
+      # Render the chat template and tokenize on the frontends instead of in
+      # the prefill engine's adapter. Rendering cost grows with conversation
+      # length and the adapter is one thread per prefill engine, which can
+      # only be scaled by adding GPUs; frontends are CPU-only, which is what
+      # makes num_frontend_workers worth raising.
+      frontend_tokenize: false
+      # Base port for the frontends' deterministic ports
+      # (base + replica_idx * num_frontend_workers + frontend_idx). Like every
+      # service port they must stay below 9000, the ephemeral floor on some
+      # DGX/GB200 nodes; [8300, 8556) is their band in virtual_cluster.py.
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.
@@ -483,6 +513,7 @@ policy:
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
@@ -619,6 +650,12 @@ data_plane:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    # Keep large field values on node-local SSD instead of host memory. Needs
+    # no shared filesystem; data is temporary (removed on tq.close()).
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      threshold_bytes: 1048576       # values >= this encoded size go to SSD
   mooncake_cpu:
     # Per client process — see MooncakeCpuConfig before raising these.
     global_segment_size: 68719476736 # 64 GiB/process

@@ -452,6 +452,10 @@ data_plane:
     storage_capacity: 1000000          # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null       # all, or cluster names like [inference]; null = TQ SPREAD
+    ssd_offload:                       # simple backend only (not mooncake_cpu)
+      enabled: false                   # true: large field values go to local SSD
+      path: null                       # absolute node-local dir; required if enabled
+      threshold_bytes: 1048576         # encoded size >= this goes to SSD
   mooncake_cpu:
     global_segment_size: 68719476736   # 64 GiB/process (ignored when storage units are on)
     local_buffer_size:   2147483648    # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
@@ -1047,7 +1051,9 @@ exercise save, process restart, load, and read on the intended training topology
 The adapter internally enables hard-pinned memory replicas and disables Mooncake
 offload for runs that save or resume checkpoints; these are not additional user
 configuration knobs. Workers inherit this storage mode from TQ's controller.
-Other jobs keep TQ's storage defaults. This version supports NeMo-RL's HTTP
+Other jobs keep TQ's storage defaults. A checkpoint saved with
+`simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises
+at load otherwise); `path` and `threshold_bytes` may change. This version supports NeMo-RL's HTTP
 metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
 exact storage-process matching.
