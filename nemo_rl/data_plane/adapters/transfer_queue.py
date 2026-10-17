@@ -53,6 +53,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
+from nemo_rl.data_plane.adapters.tq_kv_meta_patch import configure_controller_patch
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
@@ -1019,6 +1020,7 @@ def _init_tq(
 
     conf = OmegaConf.merge(base, overlay)
 
+    configure_controller_patch()
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
