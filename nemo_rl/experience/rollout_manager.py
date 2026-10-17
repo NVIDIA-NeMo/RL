@@ -84,6 +84,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_group_metrics,
     _nemo_gym_rollout_config,
     _tensorize_by_key,
     apply_nemo_gym_rollout_metrics_hook,
@@ -1483,6 +1484,10 @@ class AsyncNemoGymRolloutImpl:
                     result.get("full_result") or {} for result in completed_results
                 ],
             )
+            # Receipt metrics come from their manifests, not token-bearing results.
+            receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
+            if not receipt_mode:
+                rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(

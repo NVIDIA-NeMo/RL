@@ -1711,27 +1711,41 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         Wraps the ``(vllm_param, merged_slice)`` resolution from
         ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
-        - direct (slice ``None``): ``base`` is the live vLLM param; receive in place.
-        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocates
-          a receive buffer for this component's ``region`` slice, and ``post`` copies
-          it back (the region is recomputed each refit to track live storage).
-        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local BF16 storage,
+        - ordinary storage: unmerged params matching the wire dtype receive in
+          place; otherwise ``pre`` stages a buffer and ``post`` copies it back.
+        - FP8 storage: ``post`` quantizes the received component and commits its value
+          and scale together before the backend's final layout conversion.
+        - TRTLLM grouped experts: ``pre`` allocates canonical EP-local wire storage,
           and ``post`` sends each expert through vLLM's native weight loader.
         """
 
-        def _merged_param_spec(vllm_param, merged_slice):
+        def _default_param_spec(
+            vllm_param: torch.Tensor,
+            merged_slice: tuple[slice, ...] | None,
+            wire_dtype: torch.dtype,
+        ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
-                region = vllm_param.data[merged_slice]
-                return RefitCtx(buf=torch.empty_like(region), extra={"region": region})
+                region = (
+                    vllm_param.data
+                    if merged_slice is None
+                    else vllm_param.data[merged_slice]
+                )
+                return RefitCtx(
+                    buf=torch.empty_like(region, dtype=wire_dtype),
+                    extra={"region": region},
+                )
 
             def post(ctx: RefitCtx) -> None:
                 ctx.extra["region"].copy_(ctx.buf)
 
-            return LocalParamSpec(base=vllm_param, pre=pre, post=post)
+            return LocalParamSpec(
+                base=vllm_param, pre=pre, post=post, wire_dtype=wire_dtype
+            )
 
         def _trtllm_grouped_expert_spec(
             param_info: dict[str, Any],
             vllm_param: torch.Tensor,
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             from torch.distributed._tensor import Shard
 
@@ -1808,18 +1822,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 registered_vllm_name,
                 registered_vllm_name.replace(".routed_experts.", "."),
             }
-            dtype_value = param_info.get("dtype")
-            dtype = _STR_TO_DTYPE.get(str(dtype_value))
-            if dtype is None:
-                raise ValueError(
-                    "BF16 FlashInfer TRTLLM nccl_reshard refit got an "
-                    f"unsupported wire dtype {dtype_value!r} for "
-                    f"{param_info['name']!r}"
-                )
 
             def pre(_base: None) -> RefitCtx:
                 return RefitCtx(
-                    buf=torch.empty(local_shape, dtype=dtype, device=self.device)
+                    buf=torch.empty(local_shape, dtype=wire_dtype, device=self.device)
                 )
 
             def post(ctx: RefitCtx) -> None:
@@ -1844,12 +1850,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"vLLM reported {sorted(loaded_names)!r}"
                     )
 
-            return LocalParamSpec(base=None, pre=pre, post=post)
+            return LocalParamSpec(base=None, pre=pre, post=post, wire_dtype=wire_dtype)
 
-        def _bf16_to_mxfp8_receiver_quant_spec(
+        def _mxfp8_receiver_quant_spec(
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
+            wire_dtype: torch.dtype,
         ) -> LocalParamSpec:
             def pre(_base: torch.Tensor) -> RefitCtx:
                 value_region = (
@@ -1863,11 +1870,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     else scale_param.data[merged_slice]
                 )
                 return RefitCtx(
-                    buf=torch.empty_like(value_region, dtype=torch.bfloat16),
+                    buf=torch.empty_like(value_region, dtype=wire_dtype),
                     extra={"value_region": value_region, "scale_region": scale_region},
                 )
 
             def post(ctx: RefitCtx) -> None:
+                # Load the optional vLLM quantizer only for MXFP8 storage.
                 from nemo_rl.models.generation.vllm.quantization.fp8 import (
                     quantize_mxfp8_weight,
                 )
@@ -1876,7 +1884,70 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
-            return LocalParamSpec(base=value_param.data, pre=pre, post=post)
+            return LocalParamSpec(
+                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+            )
+
+        def _blockwise_fp8_receiver_quant_spec(
+            value_param: torch.Tensor,
+            scale_param: torch.Tensor,
+            merged_slice: tuple[slice, ...] | None,
+            block_size: tuple[int, int],
+            wire_dtype: torch.dtype,
+        ) -> LocalParamSpec:
+            scale_slice = None
+            if merged_slice is not None:
+                # Example: w13_weight [E=8, 2048, 4096], blocks [128, 128],
+                # and gate slice [:, 0:1024, :] into scales [8, 16, 32].
+                axis = value_param.ndim - 2  # 3 - 2 = 1: intermediate dimension.
+                rows = merged_slice[axis]  # Weight rows 0:1024.
+                scale_slices = list(merged_slice)  # [:, 0:1024, :].
+                scale_slices[axis] = slice(
+                    rows.start // block_size[0], rows.stop // block_size[0]
+                )  # Scale rows 0:8 (up uses 8:16).
+                scale_slice = tuple(scale_slices)  # [:, 0:8, :], shape [8, 8, 32].
+
+            def pre(_base: torch.Tensor) -> RefitCtx:
+                value_region = (
+                    value_param.data
+                    if merged_slice is None
+                    else value_param.data[merged_slice]
+                )
+                scale_region = (
+                    scale_param.data
+                    if scale_slice is None
+                    else scale_param.data[scale_slice]
+                )
+                return RefitCtx(
+                    buf=torch.empty_like(value_region, dtype=wire_dtype),
+                    extra={"value_region": value_region, "scale_region": scale_region},
+                )
+
+            def post(ctx: RefitCtx) -> None:
+                # Load the optional vLLM quantizer only for blockwise FP8 storage.
+                from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                    cast_tensor_to_fp8_blockwise,
+                )
+
+                if ctx.buf.ndim == 2:
+                    value, scale = cast_tensor_to_fp8_blockwise(ctx.buf, block_size)
+                    scale = scale.squeeze(-1)
+                else:  # ndim == 3: grouped experts.
+                    # Blocks never straddle experts, so one cast covers the group.
+                    num_experts, rows, cols = ctx.buf.shape
+                    value, scale = cast_tensor_to_fp8_blockwise(
+                        ctx.buf.reshape(num_experts * rows, cols), block_size
+                    )
+                    value = value.reshape(num_experts, rows, cols)
+                    scale = scale.reshape(
+                        num_experts, rows // block_size[0], cols // block_size[1]
+                    )
+                ctx.extra["value_region"].copy_(value)
+                ctx.extra["scale_region"].copy_(scale)
+
+            return LocalParamSpec(
+                base=value_param.data, pre=pre, post=post, wire_dtype=wire_dtype
+            )
 
         # Get dict of vllm_param and merged_slice for each hf_name
         vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
@@ -1887,28 +1958,30 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         }
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
+        vllm_modules = dict(self.model_runner.model.named_modules())
         unquantized_trtllm_param_ids = self._unquantized_flashinfer_trtllm_param_ids()
         specs = {}
         for hf_name, (vllm_param, merged_slice) in vllm_param_map_and_slices.items():
             param_info = param_info_by_name[hf_name]
-            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
-                "grouped_expert_proj"
-            ):
-                specs[hf_name] = _trtllm_grouped_expert_spec(param_info, vllm_param)
-                continue
-
             wire_dtype_value = param_info.get("dtype")
-            wire_dtype = (
-                wire_dtype_value
-                if isinstance(wire_dtype_value, torch.dtype)
-                else _STR_TO_DTYPE.get(wire_dtype_value)
-            )
-            if wire_dtype is None:
+            wire_dtype = _STR_TO_DTYPE.get(str(wire_dtype_value))
+            if wire_dtype is None or wire_dtype not in (
+                torch.bfloat16,
+                torch.float16,
+                torch.float32,
+            ):
                 raise ValueError(
                     f"build_hf_to_local_param_map: unsupported wire dtype "
                     f"{wire_dtype_value!r} for {hf_name!r}"
                 )
-            if wire_dtype == torch.bfloat16 and vllm_param.dtype == torch.float8_e4m3fn:
+            if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
+                "grouped_expert_proj"
+            ):
+                specs[hf_name] = _trtllm_grouped_expert_spec(
+                    param_info, vllm_param, wire_dtype
+                )
+                continue
+            if vllm_param.dtype == torch.float8_e4m3fn:
                 vllm_name = vllm_names_by_id.get(id(vllm_param))
                 if vllm_name is None:
                     raise ValueError(
@@ -1918,6 +1991,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 scale_names = (
                     vllm_name + "_scale_from_checkpoint",
                     vllm_name + "_scale",
+                    vllm_name + "_scale_inv",
                 )
                 scale_name = next(
                     (name for name in scale_names if name in vllm_params), None
@@ -1927,50 +2001,99 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 )
                 if scale_param is None:
                     raise ValueError(
-                        f"build_hf_to_local_param_map: MXFP8 target {vllm_name!r} "
+                        f"build_hf_to_local_param_map: FP8 target {vllm_name!r} "
                         f"for {hf_name!r} has no scale parameter among "
                         f"{scale_names!r}"
                     )
-                value_region = (
-                    vllm_param if merged_slice is None else vllm_param[merged_slice]
-                )
-                scale_region = (
-                    scale_param if merged_slice is None else scale_param[merged_slice]
-                )
-                if value_region.shape[-1] % 32 != 0:
-                    raise ValueError(
-                        f"build_hf_to_local_param_map: MXFP8 target for {hf_name!r} "
-                        f"must have K divisible by 32, got {tuple(value_region.shape)}"
+                block_size = None
+                if scale_name.endswith("_scale_inv"):  # Blockwise FP8.
+                    module_name = vllm_name.rsplit(".", 1)[0]
+                    module = vllm_modules.get(module_name)
+                    if module is None:
+                        raise ValueError(
+                            f"Blockwise FP8 target {vllm_name!r} has no owning module"
+                        )
+                    # vLLM MoE layers may refine the scale grid when the per-rank
+                    # intermediate size is not a multiple of weight_block_size.
+                    block_size = getattr(module.quant_method, "moe_block_shape", None)
+                    if block_size is None:
+                        block_size = getattr(module, "weight_block_size", None)
+                    if block_size is None:
+                        block_size = module.quant_method.quant_config.weight_block_size
+                    block_size = tuple(block_size)
+                    if len(block_size) != 2 or any(size <= 0 for size in block_size):
+                        raise ValueError(
+                            f"Unsupported FP8 weight block size {block_size}"
+                        )
+                    scale_region = scale_param
+                    # Blockwise FP8 has one scale per 2D weight block.
+                    expected_scale_shape = (
+                        *vllm_param.shape[:-2],
+                        (vllm_param.shape[-2] + block_size[0] - 1) // block_size[0],
+                        (vllm_param.shape[-1] + block_size[1] - 1) // block_size[1],
                     )
-                expected_scale_shape = (
-                    *value_region.shape[:-1],
-                    value_region.shape[-1] // 32,
-                )
+                    expected_scale_dtype = torch.float32
+                else:  # MXFP8.
+                    value_region = (
+                        vllm_param if merged_slice is None else vllm_param[merged_slice]
+                    )
+                    scale_region = (
+                        scale_param
+                        if merged_slice is None
+                        else scale_param[merged_slice]
+                    )
+                    if value_region.shape[-1] % 32 != 0:
+                        raise ValueError(
+                            f"build_hf_to_local_param_map: MXFP8 target for {hf_name!r} "
+                            f"must have K divisible by 32, got {tuple(value_region.shape)}"
+                        )
+                    expected_scale_shape = (
+                        *value_region.shape[:-1],
+                        value_region.shape[-1] // 32,
+                    )
+                    expected_scale_dtype = torch.uint8
                 if tuple(scale_region.shape) != expected_scale_shape:
                     raise ValueError(
-                        f"build_hf_to_local_param_map: MXFP8 scale target "
+                        f"build_hf_to_local_param_map: FP8 scale target "
                         f"{scale_name!r} for {hf_name!r} has shape "
                         f"{tuple(scale_region.shape)}, expected {expected_scale_shape}"
                     )
-                if scale_param.dtype != torch.uint8:
+                if scale_param.dtype != expected_scale_dtype:
                     raise ValueError(
-                        f"build_hf_to_local_param_map: MXFP8 scale target "
-                        f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
+                        f"build_hf_to_local_param_map: FP8 scale target "
+                        f"{scale_name!r} has dtype {scale_param.dtype}, expected {expected_scale_dtype}"
                     )
-                specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
-                    vllm_param, scale_param, merged_slice
-                )
-            elif wire_dtype != vllm_param.dtype:
-                raise ValueError(
-                    f"build_hf_to_local_param_map: wire dtype {wire_dtype} does not "
-                    f"match target dtype {vllm_param.dtype} for {hf_name!r}"
-                )
+                if block_size is None:
+                    specs[hf_name] = _mxfp8_receiver_quant_spec(
+                        vllm_param, scale_param, merged_slice, wire_dtype
+                    )
+                else:
+                    specs[hf_name] = _blockwise_fp8_receiver_quant_spec(
+                        vllm_param,
+                        scale_param,
+                        merged_slice,
+                        block_size,
+                        wire_dtype,
+                    )
             else:
-                specs[hf_name] = (
-                    LocalParamSpec(base=vllm_param.data)
-                    if merged_slice is None
-                    else _merged_param_spec(vllm_param, merged_slice)
-                )
+                if vllm_param.dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                    torch.float32,
+                ):
+                    raise ValueError(
+                        f"Unsupported refit destination dtype {vllm_param.dtype} "
+                        f"for {hf_name!r}"
+                    )
+                if merged_slice is None and vllm_param.dtype == wire_dtype:
+                    # Canonical storage in the wire dtype receives in place.
+                    specs[hf_name] = LocalParamSpec(
+                        base=vllm_param.data, wire_dtype=wire_dtype
+                    )
+                else:
+                    specs[hf_name] = _default_param_spec(
+                        vllm_param, merged_slice, wire_dtype
+                    )
         return HFToLocalParamMap(specs=specs)
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
@@ -2130,11 +2253,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         sequence and a hang can be in either.
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``, built
         during prepare or after PP communicator setup for TRTLLM experts) provides
-        the dst buffer:
-        for a direct param xferdtensor receives straight into the live vLLM
-        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
-        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
-        slice back into the live merged param.
+        a canonical receive buffer in the advertised wire dtype. When needed,
+        its ``post`` hook casts or quantizes into the live destination.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -2162,12 +2282,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
-        built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
-        for a direct param xferdtensor receives straight into the live vLLM
-        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
-        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
-        slice back into the live merged param. TRTLLM grouped experts instead
-        receive into canonical local tensors and load through vLLM's native path.
+        built once in ``prepare_nccl_reshard_refit_info``) receives the canonical
+        shard in the advertised wire dtype, staging and committing in ``post``
+        when needed. TRTLLM grouped experts use vLLM's native weight loader.
         """
         import os
         from collections import OrderedDict
@@ -2184,9 +2301,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             )
             # spec.pre/post run on the caller's current stream (this stage's
             # stream); xferdtensor should use the same stream.
-            ctx = (
-                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
-            )
+            ctx = spec.materialize()
             dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,

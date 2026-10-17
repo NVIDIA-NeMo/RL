@@ -44,6 +44,10 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.router_replay import (
+    microbatch_replay_context,
+    router_replay_gates,
+)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
@@ -61,7 +65,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -367,6 +371,18 @@ class AutomodelPolicyWorkerImpl(
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
+        # R3: the policy's replayable MoE gates, fixed for the model's lifetime.
+        self._router_replay_gates = (
+            router_replay_gates(self.model) if router_replay_enabled(config) else None
+        )
+        if self._router_replay_gates == []:
+            raise RuntimeError(
+                "policy.router_replay.enabled but the model has no RouterReplay gates. R3 "
+                "needs an MoE model whose Automodel class builds its gates from "
+                "moe_overrides (enable_routing_replay), with "
+                "automodel_kwargs.backend.fake_balanced_gate off."
+            )
+
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
         # reference stays anchored to the same policy across resumes.
@@ -520,6 +536,7 @@ class AutomodelPolicyWorkerImpl(
                     num_global_batches=num_global_batches,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    router_replay_gates=self._router_replay_gates,
                 )
 
                 # Extract losses and metrics from results
@@ -593,11 +610,16 @@ class AutomodelPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
-        Uses the configured logprob_batch_size to do microbatching.
+        Uses the configured logprob_batch_size to do microbatching. With
+        ``policy.router_replay.enabled``, the rollout ``routed_experts`` are replayed (R3)
+        unless ``require_router_replay`` is False (e.g. for the reference model).
 
         Input data is assumed to be right-padded. The method internally converts to
         left-padded format for computation, and returns outputs in right-padded format.
@@ -650,7 +672,15 @@ class AutomodelPolicyWorkerImpl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
-                with prepared.model_context_factory(), self._autocast_context():
+                replay_context = microbatch_replay_context(
+                    self._router_replay_gates if require_router_replay else None,
+                    processed_mb,
+                )
+                with (
+                    replay_context,
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
@@ -1041,11 +1071,8 @@ class AutomodelPolicyWorkerImpl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(
-        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
