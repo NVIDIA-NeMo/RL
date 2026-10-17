@@ -281,13 +281,24 @@ def test_a_row_naming_an_unhosted_route_names_the_routes_that_are_hosted():
         _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
 
 
+def _no_marker_expected(row_index, detail):
+    raise AssertionError(f"unexpected failure marker for row {row_index}: {detail}")
+
+
 async def _drain(buckets):
-    return [
-        (rowidx, timing, shard_name)
-        async for rowidx, _, _, timing, shard_name in _merge_nemo_gym_instance_streams(
-            buckets, timer_prefix="timing/rollout"
+    """Drain the merge; return the yielded ``(rowidx, instance_label)`` pairs and
+    the timing payloads it recorded, keyed by stream label."""
+    timings: dict[str, dict] = {}
+    rows = [
+        (rowidx, shard_name)
+        async for rowidx, _, _, shard_name in _merge_nemo_gym_instance_streams(
+            buckets,
+            timer_prefix="timing/rollout",
+            record_infra_failure=_no_marker_expected,
+            record_timing=timings.__setitem__,
         )
     ]
+    return rows, timings
 
 
 def test_the_merge_drains_every_shard_and_tags_each_row_with_its_own():
@@ -297,12 +308,12 @@ def test_the_merge_drains_every_shard_and_tags_each_row_with_its_own():
         ("right", right, _rows(["beta"], num_generations=3)),
     ]
 
-    drained = asyncio.run(_drain(buckets))
+    drained, timings = asyncio.run(_drain(buckets))
 
-    assert sorted(rowidx for rowidx, _, _ in drained) == [0, 0, 1, 1, 2]
-    assert {shard for _, _, shard in drained} == {"left", "right"}
-    # Timing arrives once per shard, on that shard's last row.
-    assert sum(timing is not None for _, timing, _ in drained) == 2
+    assert sorted(rowidx for rowidx, _ in drained) == [0, 0, 1, 1, 2]
+    assert {shard for _, shard in drained} == {"left", "right"}
+    # Timing arrives once per shard, recorded under that shard's own label.
+    assert set(timings) == {"left", "right"}
 
 
 def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
@@ -316,7 +327,10 @@ def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
 
     async def drain_until_failure():
         async for result in _merge_nemo_gym_instance_streams(
-            buckets, timer_prefix="timing/rollout"
+            buckets,
+            timer_prefix="timing/rollout",
+            record_infra_failure=_no_marker_expected,
+            record_timing=lambda _label, _timing: None,
         ):
             drained.append(result)
 
