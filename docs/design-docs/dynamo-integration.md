@@ -95,9 +95,12 @@ before the drain would sit on the paused decode engine without pulling. The
 prefill engine's KV lease (30 s by default) would then expire and its blocks
 would be freed and cleared, and after resume decode would read those blocks;
 NIXL does not check a lease on a normal read. So prefill engines pause first,
-while decode is still running. Decode engines pause next, which drains every
-handed-off request. Resume runs decode first, so no new handoff waits on a
-paused decode engine.
+while decode is still running. vLLM's `wait` drain also counts only running
+requests and starts no waiting one, so a decode request still receiving its
+prompt KV would keep its blocks and fail the cache reset. Decode engines are
+therefore paused only once each reports `vllm:num_requests_waiting` of zero on
+its `/metrics`; with prefill paused, that queue only empties. Resume runs decode
+first, so no new handoff waits on a paused decode engine.
 
 Caches are cleared through `pause_generation(clear_cache=True)`, which fails
 loudly when vLLM cannot reset its prefix cache. Dynamo's `flush_cache` route

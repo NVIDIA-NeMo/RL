@@ -5,6 +5,8 @@ policy:
     name: Qwen/Qwen3-0.6B
   generation:
     refit_transport: nccl_reshard
+    vllm_kwargs:
+      max_num_seqs: 64
     disaggregation:
       enabled: true
     colocated:

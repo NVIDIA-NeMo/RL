@@ -192,7 +192,8 @@ path, which you can tune through `vllm_cfg.env_vars` (`UCX_TLS`,
 Refit gives every engine of both roles the full weights. The drain before each
 refit pauses prefill engines first, so the decode engines are still running
 when they pull the KV for requests that prefill already finished. Decode
-engines are paused next, and resume runs in reverse order. Run the three-GPU
+engines are paused once they have started every handed-off request, and resume
+runs in reverse order. Run the three-GPU
 smoke (one training GPU, one prefill engine, one decode engine) with
 `examples/configs/grpo_math_1B_dynamo_disagg.yaml`.
 
