@@ -347,3 +347,10 @@ def test_video_config_rejects_unknown_sampling_fields():
 
     with pytest.raises(ValueError, match="sampling_stlye"):
         resolve_vllm_video_config(generation)
+
+
+def test_resolve_vllm_video_config_rejects_legacy_video_loader_key():
+    generation = {"vllm_cfg": {"video_loader": {"backend": "torchcodec"}}}
+
+    with pytest.raises(ValueError, match="video_loader is not supported"):
+        resolve_vllm_video_config(generation)
