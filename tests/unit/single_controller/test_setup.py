@@ -144,6 +144,8 @@ def _make_master_config(
         "backend": backend,
         "colocated": {"enabled": colocated, "resources": {}},
     }
+    if backend == "vllm":
+        generation_config["vllm_cfg"] = {}
     policy_config: dict = {
         "train_global_batch_size": num_prompts_per_step * 2,
         "max_total_sequence_length": 32,
@@ -339,6 +341,14 @@ def test_build_generation_passes_sglang_config():
         "Qwen/Qwen3-0.6B"
     )
     generation.finish_generation.assert_called_once_with()
+
+
+def test_single_controller_rejects_discard_weights_on_sleep() -> None:
+    master_config = _make_master_config(colocated=True, backend="vllm")
+    master_config.policy["generation"]["vllm_cfg"]["discard_weights_on_sleep"] = True
+
+    with pytest.raises(NotImplementedError, match="#4659"):
+        validate_single_controller_config(master_config)
 
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):

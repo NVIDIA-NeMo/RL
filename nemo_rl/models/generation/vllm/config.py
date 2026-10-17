@@ -63,6 +63,9 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Release the vLLM weight storage while colocated workers sleep. Enable
+    # only when the trainer guarantees a full refit before the next generation.
+    discard_weights_on_sleep: NotRequired[bool]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]

@@ -134,6 +134,21 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
+def _raise_if_discard_weights_on_sleep_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Reject vLLM weight-discard sleeps on the data-plane sync trainer."""
+    generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and generation_config["vllm_cfg"].get("discard_weights_on_sleep") is True
+    ):
+        raise NotImplementedError(
+            "generation.vllm_cfg.discard_weights_on_sleep is not supported with "
+            "data_plane.enabled=true. See #4659."
+        )
+
+
 def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
     """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
     return tuple(
@@ -531,6 +546,7 @@ def grpo_train_sync(
             "want TransferQueue."
         )
     _raise_if_message_level_advantage_penalties_enabled(master_config)
+    _raise_if_discard_weights_on_sleep_enabled(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
