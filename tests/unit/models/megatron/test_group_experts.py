@@ -52,10 +52,10 @@ pytestmark = pytest.mark.mcore
 
 
 def _source(
-    tensor: torch.Tensor, hf_view: LocalHFParamSpec | None = None
+    tensor: torch.Tensor, hf_spec: LocalHFParamSpec | None = None
 ) -> LocalParamSpec:
     return MegatronReshardParamSpecCollection._default_param_spec(
-        tensor, hf_view if hf_view is not None else LocalHFParamSpec("weight")
+        tensor, hf_spec if hf_spec is not None else LocalHFParamSpec("weight")
     )
 
 

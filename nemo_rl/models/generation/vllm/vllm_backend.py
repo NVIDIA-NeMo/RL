@@ -21,6 +21,7 @@ from typing import Any, Literal, Optional, Protocol
 
 import torch
 import zmq
+from torch.distributed._tensor import Shard
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
@@ -441,12 +442,58 @@ class VllmReshardParamSpecCollection:
         param_info: dict[str, Any],
         wire_dtype: torch.dtype,
         *,
-        rank: int,
+        refit_comm_groups: dict[int, Any] | None,
         device: torch.device,
-        registered_vllm_name: str,
+        registered_vllm_name: str | None,
         load_weights: Callable[[Iterable[tuple[str, torch.Tensor]]], set[str] | None],
     ) -> LocalParamSpec:
         """Stage EP-local expert weights for the native vLLM weight loader."""
+        unsupported_shards = [
+            placement.dim
+            for placement in param_info["dst_placements"]
+            if isinstance(placement, Shard) and placement.dim != 0
+        ]
+        if unsupported_shards:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                "expert-parallel destination shards; unsupported tensor shard "
+                f"dimensions {unsupported_shards} for {param_info['name']!r}"
+            )
+
+        dst_mesh = param_info["dst_mesh_info"]
+        mesh_tensor = getattr(dst_mesh, "mesh", None)
+        if mesh_tensor is None:
+            mesh_tensor = getattr(dst_mesh, "_mesh", None)
+        if mesh_tensor is None:
+            raise ValueError(
+                "Destination DeviceMesh does not expose mesh ranks for "
+                f"{param_info['name']!r}"
+            )
+        ep_size = 1
+        for mesh_dim, placement in enumerate(param_info["dst_placements"]):
+            if isinstance(placement, Shard) and placement.dim == 0:
+                ep_size *= int(mesh_tensor.shape[mesh_dim])
+        num_global_experts = int(param_info["global_shape"][0])
+        # The staged expert range uses torch.chunk semantics while vLLM
+        # places experts with a balanced split; the two agree only when
+        # the expert count divides evenly, so reject the uneven case
+        # instead of silently loading experts onto the wrong ranks.
+        if ep_size > 0 and num_global_experts % ep_size != 0:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
+                "the global expert count to divide evenly across EP ranks; "
+                f"got {num_global_experts} experts over {ep_size} ranks for "
+                f"{param_info['name']!r}"
+            )
+
+        # prepare defers this factory until refit communicators are initialized.
+        assert refit_comm_groups is not None
+        rank = refit_comm_groups[param_info.get("pp_stage", 0)].rank
+        if registered_vllm_name is None:
+            raise ValueError(
+                "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
+                f"unregistered vLLM parameter for {param_info['name']!r}"
+            )
         local_slices = _local_shard_slices(param_info, rank)
         local_shape = tuple(
             global_size
@@ -1942,72 +1989,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             if id(vllm_param) in unquantized_trtllm_param_ids and param_info.get(
                 "grouped_expert_proj"
             ):
-                from torch.distributed._tensor import Shard
-
-                unsupported_shards = [
-                    placement.dim
-                    for placement in param_info["dst_placements"]
-                    if isinstance(placement, Shard) and placement.dim != 0
-                ]
-                if unsupported_shards:
-                    raise ValueError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
-                        "expert-parallel destination shards; unsupported tensor shard "
-                        f"dimensions {unsupported_shards} for {param_info['name']!r}"
-                    )
-
-                dst_mesh = param_info["dst_mesh_info"]
-                mesh_tensor = getattr(dst_mesh, "mesh", None)
-                if mesh_tensor is None:
-                    mesh_tensor = getattr(dst_mesh, "_mesh", None)
-                if mesh_tensor is None:
-                    raise ValueError(
-                        "Destination DeviceMesh does not expose mesh ranks for "
-                        f"{param_info['name']!r}"
-                    )
-                ep_size = 1
-                for mesh_dim, placement in enumerate(param_info["dst_placements"]):
-                    if isinstance(placement, Shard) and placement.dim == 0:
-                        ep_size *= int(mesh_tensor.shape[mesh_dim])
-                num_global_experts = int(param_info["global_shape"][0])
-                # The staged expert range uses torch.chunk semantics while vLLM
-                # places experts with a balanced split; the two agree only when
-                # the expert count divides evenly, so reject the uneven case
-                # instead of silently loading experts onto the wrong ranks.
-                if ep_size > 0 and num_global_experts % ep_size != 0:
-                    raise ValueError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit requires "
-                        "the global expert count to divide evenly across EP ranks; "
-                        f"got {num_global_experts} experts over {ep_size} ranks for "
-                        f"{param_info['name']!r}"
-                    )
-
-                pp_stage = param_info.get("pp_stage", 0)
-                pp_comm_groups = self.pp_comm_groups
-                if pp_comm_groups is None:
-                    raise RuntimeError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit mapping was built "
-                        "before the per-PP-stage groups were initialized"
-                    )
-                if pp_stage not in pp_comm_groups:
-                    raise RuntimeError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit has no "
-                        f"communicator for PP stage {pp_stage}"
-                    )
-                rank = pp_comm_groups[pp_stage].rank
-                registered_vllm_name = vllm_names_by_id.get(id(vllm_param))
-                if registered_vllm_name is None:
-                    raise ValueError(
-                        "BF16 FlashInfer TRTLLM nccl_reshard refit resolved an "
-                        f"unregistered vLLM parameter for {param_info['name']!r}"
-                    )
                 specs[hf_name] = (
                     VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
                         param_info,
                         wire_dtype,
-                        rank=rank,
+                        refit_comm_groups=self.pp_comm_groups,
                         device=self.device,
-                        registered_vllm_name=registered_vllm_name,
+                        registered_vllm_name=vllm_names_by_id.get(id(vllm_param)),
                         load_weights=self._load_full_hf_weights,
                     )
                 )

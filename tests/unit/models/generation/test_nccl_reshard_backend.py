@@ -650,7 +650,7 @@ def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
 
 
 def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
-    """A missing NCCL communicator fails before staged expert placement."""
+    """TRTLLM staging is built only after refit communicator initialization."""
     expert_name = "model.layers.0.mlp.experts.down_proj.weight"
     refit_info = {
         "gen_tp_size": 1,
@@ -675,7 +675,7 @@ def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
     ext.pp_comm_groups = None
     _enable_trtllm_staging(ext)
 
-    with pytest.raises(RuntimeError, match="before.*per-PP-stage groups"):
+    with pytest.raises(AssertionError):
         ext.build_hf_to_local_param_map(refit_info)
 
 
@@ -699,12 +699,13 @@ def test_trtllm_grouped_expert_spec_loads_local_experts(
         "grouped_expert_proj": "down_proj",
         "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
         "dst_placements": [Shard(0)],
+        "pp_stage": 1,
     }
     load_weights = MagicMock(return_value=loaded_names)
     spec = VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
         param_info,
         torch.bfloat16,
-        rank=9,
+        refit_comm_groups={0: SimpleNamespace(rank=8), 1: SimpleNamespace(rank=9)},
         device=torch.device("cpu"),
         registered_vllm_name="model.layers.0.mlp.experts.routed_experts.w2_weight",
         load_weights=load_weights,
@@ -731,36 +732,34 @@ def test_trtllm_grouped_expert_spec_loads_local_experts(
         torch.testing.assert_close(loaded_weights[1][1], ctx.buf[1])
 
 
-def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
-    """TRTLLM expert staging supports expert-parallel destination shards only."""
-    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
-    refit_info = {
-        "gen_tp_size": 2,
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {
-            "model.layers.0": [
-                {
-                    "name": expert_name,
-                    "global_shape": [4, 32, 16],
-                    "dtype": "torch.bfloat16",
-                    "grouped_expert_proj": "gate_proj",
-                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
-                    "dst_placements": [Shard(1)],
-                }
-            ]
-        },
+@pytest.mark.parametrize(
+    "num_experts, placement, message",
+    [
+        (4, Shard(1), "unsupported tensor shard dimensions"),
+        (5, Shard(0), "global expert count to divide evenly"),
+    ],
+)
+def test_trtllm_grouped_expert_spec_rejects_unsupported_sharding(
+    num_experts, placement, message
+):
+    """The factory rejects layouts that vLLM cannot load onto the same experts."""
+    param_info = {
+        "name": "model.layers.0.mlp.experts.gate_proj.weight",
+        "global_shape": [num_experts, 32, 16],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "gate_proj",
+        "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+        "dst_placements": [placement],
     }
-    ext = _make_ext(
-        {
-            "model.layers.0.mlp.experts.routed_experts.w13_weight": torch.empty(
-                128, 16, 24, 64
-            ),
-        }
-    )
-    _enable_trtllm_staging(ext)
-
-    with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
-        ext.build_hf_to_local_param_map(refit_info)
+    with pytest.raises(ValueError, match=message):
+        VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
+            param_info,
+            torch.bfloat16,
+            refit_comm_groups={0: SimpleNamespace(rank=9)},
+            device=torch.device("cpu"),
+            registered_vllm_name="model.layers.0.mlp.experts.routed_experts.w13_weight",
+            load_weights=MagicMock(),
+        )
 
 
 def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypatch):

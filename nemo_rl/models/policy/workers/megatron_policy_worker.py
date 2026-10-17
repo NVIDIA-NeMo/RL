@@ -359,7 +359,7 @@ class _RefitSource:
     """Live parameter and its HF selector, before any precision conversion."""
 
     tensor: torch.Tensor
-    hf_view: LocalHFParamSpec
+    hf_spec: LocalHFParamSpec
 
 
 def _dequantize_refit_source_group(
@@ -501,20 +501,20 @@ class MegatronReshardParamSpecCollection:
 
     @staticmethod
     def _default_param_spec(
-        tensor: torch.Tensor, hf_view: LocalHFParamSpec
+        tensor: torch.Tensor, hf_spec: LocalHFParamSpec
     ) -> LocalParamSpec:
         """Convert the current full parameter to logical weights before HF slicing."""
 
         def pre(base: _RefitSource) -> RefitCtx:
             logical = _dequantize_refit_source(base.tensor)
             # Select this HF projection's local shard, splitting fused gate/up if needed.
-            return RefitCtx(buf=base.hf_view.select(logical).contiguous())
+            return RefitCtx(buf=base.hf_spec.select(logical).contiguous())
 
         wire_dtype = (
             torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
         )
         return LocalParamSpec(
-            base=_RefitSource(tensor, hf_view), pre=pre, wire_dtype=wire_dtype
+            base=_RefitSource(tensor, hf_spec), pre=pre, wire_dtype=wire_dtype
         )
 
     @staticmethod
@@ -540,17 +540,17 @@ class MegatronReshardParamSpecCollection:
         sources = tuple(member.base for member in members)
         shape = sources[0].tensor.shape
 
-        def grouped_view(source: _RefitSource) -> LocalHFParamSpec:
-            view = source.hf_view
+        def grouped_spec(source: _RefitSource) -> LocalHFParamSpec:
+            spec = source.hf_spec
             # Preserve the source axis when prepending the expert dimension,
             # including mappings that describe the split with a positive axis.
-            if view.split_dim is not None:
-                view = replace(view, split_dim=view.split_dim % len(shape) + 1)
-            return replace(view, name=grouped_name)
+            if spec.split_dim is not None:
+                spec = replace(spec, split_dim=spec.split_dim % len(shape) + 1)
+            return replace(spec, name=grouped_name)
 
-        hf_view = grouped_view(sources[0])
+        hf_spec = grouped_spec(sources[0])
         if any(
-            source.tensor.shape != shape or grouped_view(source) != hf_view
+            source.tensor.shape != shape or grouped_spec(source) != hf_spec
             for source in sources
         ):
             raise ValueError(
@@ -561,7 +561,7 @@ class MegatronReshardParamSpecCollection:
             logical = _dequantize_refit_source_group(
                 tuple(source.tensor for source in base)
             )
-            return RefitCtx(buf=hf_view.select(logical).contiguous())
+            return RefitCtx(buf=hf_spec.select(logical).contiguous())
 
         return LocalParamSpec(base=sources, pre=pre, wire_dtype=wire_dtype)
 
