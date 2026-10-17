@@ -37,6 +37,15 @@ def _decode_json_object(body: bytes) -> dict[str, Any]:
     return decoded
 
 
+def http_get_text(url: str, timeout_s: float) -> str | None:
+    """GET a text body, or ``None`` when the server cannot be reached."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            return response.read().decode("utf-8", "replace")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return None
+
+
 def http_post_json(
     url: str, payload: dict[str, Any], timeout_s: float
 ) -> dict[str, Any]:

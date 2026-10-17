@@ -16,11 +16,10 @@
 
 import logging
 import threading
-import urllib.error
-import urllib.request
 from collections.abc import Sequence
 from typing import Any
 
+from nemo_rl.models.generation.dynamo.http_client import http_get_text
 from nemo_rl.models.generation.dynamo.refit import DynamoWorkerEndpoint
 
 LOGGER = logging.getLogger(__name__)
@@ -58,14 +57,6 @@ CANONICAL_LOGGER_ALIASES = {
         "vllm_generation_tokens",
     ],
 }
-
-
-def _http_get_text(url: str, timeout_s: float) -> str | None:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout_s) as response:
-            return response.read().decode("utf-8", "replace")
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
-        return None
 
 
 def parse_prometheus_metrics(
@@ -169,7 +160,7 @@ class DynamoMetricsSampler:
         self._stop.wait(min(2.0, self._interval_s))
         while not self._stop.is_set():
             for ordinal, worker in enumerate(self._workers):
-                text = _http_get_text(
+                text = http_get_text(
                     f"{worker.system_url}/metrics",
                     timeout_s=self._interval_s + 2.0,
                 )
