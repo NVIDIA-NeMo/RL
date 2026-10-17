@@ -1221,13 +1221,7 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_id,
             deadline_ts=deadline_ts,
         )
-        return GymCheckpointPrepareSummary(
-            prepared=result.prepared,
-            blockers={
-                server: tuple(blockers)
-                for server, blockers in result.blockers().items()
-            },
-        )
+        return GymCheckpointPrepareSummary.from_result(result)
 
     async def checkpoint_renew(
         self,
@@ -1252,6 +1246,20 @@ Depending on your data shape, you may want to change these values."""
         await self._require_checkpoint_adapter().retire(
             checkpoint_id,
             episodes,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids: tuple[str, ...],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Stop refusing these finished rollouts' retired attempts."""
+        await self._require_checkpoint_adapter().forget(
+            checkpoint_id,
+            rollout_ids,
             deadline_ts=deadline_ts,
         )
 

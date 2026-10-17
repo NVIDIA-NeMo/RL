@@ -125,6 +125,7 @@ from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
+from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
 from tests.unit.single_controller.test_setup import (
     _native_tq_metadata,
     patched_factories,  # noqa: F401
@@ -1673,6 +1674,37 @@ class TestPeriodicRolloutCheckpoint:
         assert bool(parked_warnings) is warns
         if warns:
             assert "snapshot_attempt_interval_s=0.5s" in parked_warnings[0]
+
+    def test_a_resume_lost_after_gym_committed_keeps_the_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        """Gym resumes before the snapshot is published; a failed resume does not
+        discard a snapshot whose Gym commit and TQ capture both succeeded."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        gym = FakeGymActor(resume_errors=(ConnectionError("reply lost"),) * 2)
+        coordinator = gym_coordinator(gym)
+
+        @contextlib.asynccontextmanager
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+            async with coordinator.prepared(checkpoint_id):
+                yield object()
+
+        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
+            return None
+
+        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        try:
+            with pytest.warns(UserWarning, match="resume failed"):
+                result = asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result == _RolloutCheckpointSaveResult(saved=True, reason="completed")
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert [path.name for path in snapshots.iterdir()] == ["snapshot_000001"]
+        assert gym.operations() == ["prepare", "renew", "resume", "resume"]
 
     @pytest.mark.parametrize("stale_commit_event", [False, True])
     def test_a_train_step_committing_stops_the_gym_phase(

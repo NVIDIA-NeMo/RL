@@ -325,10 +325,31 @@ the subset of candidate episodes it still owns into the checkpoint's
 `gym-instances/` tree. Candidate replies already on the wire drain through the
 ordinary RL/TQ completion path. SC then acquires the exclusive data-plane
 barrier, verifies that the remaining Gym-owned episodes and their TQ staging
-keys match the Gym commit, and captures TQ plus the rollout ledger. If a
-candidate is neither exported by Gym nor drained before the deadline, the
-checkpoint aborts. Gym leases are renewed throughout and all deployments are
-resumed after the cut succeeds or aborts.
+keys match the Gym commit, and captures TQ plus the rollout ledger. Gym reports
+as restarts the episodes a participant cannot capture, such as rollouts on a
+restart-only resources server or on an agent without checkpoint support. SC
+leaves them out of the commit, does not wait for them, and records them in
+`gym_checkpoint.json`; they keep running, and after a crash they start over from
+their tasks. If any other candidate is neither exported by Gym nor drained before
+the deadline, the checkpoint aborts and every deployment is resumed.
+
+Gym leases are renewed throughout. Gym resumes as soon as the cut is captured,
+before SC writes its sidecars and publishes the snapshot, so new rollouts wait
+only for the Gym commit and the TQ capture, not for the publish. Gym's own
+coordination guide publishes first and resumes after; resuming first is safe
+because every Gym commit is already written and resume only reopens admission. A
+resume that still fails after a successful cut is logged as a warning instead of
+failing the snapshot: that deployment reopens on its own once its lease grace,
+`3 * token_capture.control_timeout_s`, runs out.
+
+Gym keeps a rollout it retired, or continued through a restore, refused by ID
+on every participant until the controller forgets it. Before each prepare,
+while Gym is idle, SC retires the episodes it dropped since the last snapshot
+and then forgets them, together with restored rollouts whose continued attempt
+has since sealed; RL never sends those rollout IDs again. A deployment that
+refuses the forget gets the retire again and then the forget. Forgetting is
+best effort: a deployment that still refuses keeps its rollouts queued for the
+next snapshot, since each costs one small entry, and the snapshot goes ahead.
 
 `rollout_recovery.gym_prepare_timeout_s` (default 300 seconds) bounds how long
 Gym gets to park its in-flight steps; raise it for long agent or environment
@@ -344,10 +365,12 @@ Gym state is saved only in rollout snapshots. A trainer checkpoint never pauses
 Gym, so a slow or unavailable Gym cannot fail it. It wakes the snapshot loop,
 which captures Gym anchored to it as soon as the checkpoint is durable.
 
-On restart, SC validates that `gym_checkpoint.json` names exactly the episodes
-owned by the rollout ledger and that the saved Gym actor topology matches the
-live one. It restores Gym before starting rollout dispatch, advances each
-restored episode to its next attempt, and routes it back to the same Gym actor.
+On restart, SC validates that the episodes `gym_checkpoint.json` saves, together
+with those it records as restarts, are exactly the episodes owned by the rollout
+ledger, and that the saved Gym actor topology matches the live one. It restores
+Gym before starting rollout dispatch, advances each restored episode to its next
+attempt, and routes it back to the same Gym actor; recorded restarts start over
+from their tasks.
 If one shard replica fails restore, every replica conservatively retires its
 replacement attempts before the outer restore fails. This also covers a lost
 Ray reply where the remote restore may actually have succeeded, so a partially
