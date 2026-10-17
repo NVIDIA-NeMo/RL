@@ -61,6 +61,12 @@ def test_checkpointing_capability_defaults_to_unsupported(
     assert data_plane_supports_checkpointing(_cfg(backend)) is expected
 
 
+@pytest.mark.parametrize("ssd_on", [False, True])
+def test_nixl_checkpoints_only_with_its_ssd_tier_off(ssd_on: bool) -> None:
+    cfg = _cfg("nixl", nixl={"ssd": {"enabled": ssd_on}})
+    assert data_plane_supports_checkpointing(cfg) is (not ssd_on)
+
+
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
