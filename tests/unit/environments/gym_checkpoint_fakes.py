@@ -66,6 +66,7 @@ class FakeGymActor:
         forget_errors: Raised by the first forget calls, one per call.
         restart_only_servers: Participants whose status says their rollouts
             start over after a crash.
+        participants: The server names of the participants a commit reports.
     """
 
     def __init__(
@@ -85,6 +86,7 @@ class FakeGymActor:
         restarts: tuple[GymCheckpointEpisode, ...] = (),
         forget_errors: tuple[BaseException, ...] = (),
         restart_only_servers: tuple[str, ...] = (),
+        participants: tuple[str, ...] = ("tools-agent", "tools-model"),
     ) -> None:
         self.prepared = prepared
         self.resume_errors = list(resume_errors)
@@ -100,6 +102,7 @@ class FakeGymActor:
         self.restarts = restarts
         self.forget_errors = list(forget_errors)
         self.restart_only_servers = list(restart_only_servers)
+        self.participants = participants
         # Between a prepare that parked Gym and the resume that reopens it.
         self.checkpoint_open = False
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -160,6 +163,7 @@ class FakeGymActor:
             episodes = args[2]
         return GymCheckpointCommitSummary(
             exported_episodes=episodes,
+            participants=self.participants,
             staging_keys=tuple(
                 sorted(
                     {k for keys in self.staging_keys_by_episode.values() for k in keys}
