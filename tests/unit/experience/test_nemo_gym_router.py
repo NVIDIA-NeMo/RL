@@ -26,6 +26,7 @@ from ray import cloudpickle
 
 from nemo_rl.environments.nemo_gym import NemoGymShardSet, as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_shards import ShardSetupError
+from nemo_rl.experience.failures import GymRowFailure, GymTransportError
 from nemo_rl.experience.rollouts import (
     _bucket_nemo_gym_rows_by_instance,
     _merge_nemo_gym_instance_streams,
@@ -324,6 +325,39 @@ def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
         asyncio.run(drain_until_failure())
 
     assert [rowidx for rowidx, *_ in drained] == [0, 1]
+
+
+def test_a_failed_row_still_fails_the_batch_and_names_its_instance():
+    """The sync path retries batches, not rows, so a yielded failure still ends it."""
+    healthy, broken = _FakeActor("healthy"), _FakeActor("broken")
+    broken_rows = _rows(["beta"], num_generations=2)
+
+    class _FailingStream:
+        async def __aiter__(self):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(
+                GymRowFailure(broken_rows[0]["_rowidx"], GymTransportError("HTTP 503"))
+            )
+            yield future
+
+    broken.run_rollouts.remote = lambda *args, **kwargs: _FailingStream()
+    buckets = [
+        ("healthy", healthy, _rows(["alpha"], num_generations=2)),
+        ("broken", broken, broken_rows),
+    ]
+
+    async def drain():
+        return [
+            result
+            async for result in _merge_nemo_gym_instance_streams(
+                buckets, timer_prefix="timing/rollout"
+            )
+        ]
+
+    with pytest.raises(RuntimeError, match="instance 'broken' failed") as raised:
+        asyncio.run(drain())
+
+    assert isinstance(raised.value.__cause__, GymTransportError)
 
 
 def test_a_failing_replica_names_the_instance_not_just_the_shard():
