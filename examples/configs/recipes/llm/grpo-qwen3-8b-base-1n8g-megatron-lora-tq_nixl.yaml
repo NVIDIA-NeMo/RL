@@ -1,0 +1,4 @@
+defaults: grpo-qwen3-8b-base-1n8g-megatron-lora.yaml
+data_plane:
+  enabled: true
+  backend: nixl
