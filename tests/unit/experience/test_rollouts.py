@@ -2672,6 +2672,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "completion_count": 2,
         "agent": "agent",
         "remote_time": 2.0,
+        "nemo_gym_infra_redispatches": 0,
         "timing/test/routing/group_share/nemo_gym": 1,
     }
 
@@ -3047,6 +3048,8 @@ def test_run_async_nemo_gym_rollout(
             "total_reward/histogram": None,
             "natural_termination_rate": None,
             "truncation_rate": None,
+            # Reported on every rollout, zero when no row was dispatched again.
+            "nemo_gym_infra_redispatches": 0,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
             "example_multi_step_simple_agent/accuracy/histogram": None,
