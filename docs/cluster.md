@@ -186,6 +186,16 @@ sbatch ray.sub \
     subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
     `fuse-overlayfs` for starting a `.sqsh` image directly). With
     `tools/launch`, pass the variable through `EXTRA_ENV`.
+* - `DRIVER_EXIT_GRACE_S=180`
+  - Only used when `COMMAND` is set. After the driver exits, the head srun
+    normally ends within seconds (with `LOKI_PUSH_URL` set, up to roughly a
+    minute more while the Alloy sidecar drains). If it is still running this
+    many seconds later (for example, teardown blocked on an unresponsive
+    filesystem), `ray.sub` logs a warning, touches `ENDED` so the per-node
+    sidecars stop, and exits with the driver's exit code, which ends the job
+    instead of holding the allocation until the time limit. Set to `0` to
+    disable. Any value other than a non-negative integer is rejected when the
+    batch script starts.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `LOKI_PUSH_URL`
