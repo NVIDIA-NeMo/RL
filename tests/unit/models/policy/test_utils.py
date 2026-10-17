@@ -139,6 +139,111 @@ class _FakeIpcSocket:
         return 0
 
 
+@pytest.mark.parametrize("empty_first_tensor", [False, True])
+def test_stream_weights_drains_group_before_requesting_next(
+    monkeypatch, empty_first_tensor
+):
+    events = []
+    allocations = []
+    buffer_refs = []
+    original_empty = torch.empty
+
+    def tracking_empty(size, **kwargs):
+        if len(allocations) == 2:
+            assert events[-1] == "group_1"
+            assert all(ref() is None for ref in buffer_refs)
+        buffer = original_empty(size, **kwargs)
+        allocations.append(size)
+        buffer_refs.append(weakref.ref(buffer))
+        return buffer
+
+    class OrderingSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                events.append("complete")
+            else:
+                events.append(("send", payload[1]))
+            super().send_pyobj(payload)
+
+        def recv(self):
+            events.append("ack")
+            return super().recv()
+
+    def param_groups():
+        events.append("leading_empty_group")
+        yield ()
+        events.append("group_0")
+        tensor = torch.ones(0 if empty_first_tensor else 1)
+        tensor_ref = weakref.ref(tensor)
+        group = (("weight_0", tensor),)
+        yield group
+        del group, tensor
+        assert tensor_ref() is None
+        events.append("group_0_released")
+
+        events.append("group_1")
+        yield ((f"weight_{index}", torch.ones(1)) for index in range(1, 4))
+
+        events.append("group_2")
+        yield (
+            ("oversized_weight", torch.ones(300)),
+            ("weight_4", torch.ones(1)),
+        )
+
+        events.append("small_group")
+        yield (("weight_5", torch.ones(1)),)
+
+        events.append("empty_group")
+        yield ()
+
+    monkeypatch.setattr(torch, "empty", tracking_empty)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=param_groups(),
+        buffer_size_bytes=2048,
+        zmq_socket=OrderingSocket(),
+        rank=0,
+        worker_name="test_worker",
+        drain_between_groups=True,
+    )
+
+    assert events == [
+        "leading_empty_group",
+        "group_0",
+        ("send", ["weight_0"]),
+        "ack",
+        "group_0_released",
+        "group_1",
+        ("send", ["weight_1", "weight_2"]),
+        "ack",
+        ("send", ["weight_3"]),
+        "ack",
+        "group_2",
+        ("send", ["oversized_weight"]),
+        "ack",
+        ("send", ["weight_4"]),
+        "ack",
+        "small_group",
+        ("send", ["weight_5"]),
+        "ack",
+        "empty_group",
+        "complete",
+        "ack",
+    ]
+    assert allocations == [512, 512, 1024, 1024, 1536, 1024, 1024]
+    assert all(ref() is None for ref in buffer_refs)
+
+
 def test_stream_weights_releases_buffers_before_complete_without_full_gc(
     monkeypatch,
 ):
