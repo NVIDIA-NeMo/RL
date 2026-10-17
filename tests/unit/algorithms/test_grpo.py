@@ -20,7 +20,8 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, call as mock_call, patch
+from unittest.mock import MagicMock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 import ray
