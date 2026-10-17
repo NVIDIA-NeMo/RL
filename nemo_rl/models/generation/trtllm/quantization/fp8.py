@@ -167,8 +167,7 @@ def validate_fused_expert_layout(
             )
 
 
-# TODO(TRT-LLM issue): TRT-LLM has no HF-name -> engine-module lookup at this pin.
-# Replace this Qwen3.5 mapping when it does.
+# TODO: replace with a TRT-LLM-provided HF-name -> engine-module lookup.
 def engine_module_names(hf_module_name: str) -> list[str]:
     """Candidate TRT-LLM module names (without the ``llm.`` root) for an HF module."""
     name = re.sub(r"^model\.language_model\.", "model.", hf_module_name)
