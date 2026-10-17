@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import gc
 import os
 from collections import defaultdict
@@ -66,6 +67,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.setup import (
+    _distributed_timeout_minutes,
     finalize_megatron_setup,
     handle_model_import,
     make_policy_like_config,
@@ -284,10 +286,17 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         )
         all_dp_ranks = my_replica_ranks_t.tolist()
 
+        timeout_minutes = _distributed_timeout_minutes(self.cfg)
         groups: dict[int, Any] = {}
         for dp in sorted(set(all_dp_ranks)):
             ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
-            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            grp = torch.distributed.new_group(
+                ranks=ranks,
+                backend="nccl",
+                timeout=None
+                if timeout_minutes is None
+                else datetime.timedelta(minutes=timeout_minutes),
+            )
             groups[dp] = grp
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
