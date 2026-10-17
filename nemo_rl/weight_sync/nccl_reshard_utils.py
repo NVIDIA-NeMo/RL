@@ -1045,8 +1045,8 @@ def build_nccl_reshard_refit_info(
 
         # Propagate the grouped-expert projection tag (gate_proj/up_proj/
         # down_proj) so the train side stacks the matching per-expert tensors
-        # (_group_experts) and the gen backend maps the grouped HF param into
-        # its own fused layout (w13/w2).
+        # (MegatronReshardParamSpecCollection._grouped_expert_spec) and the gen
+        # backend maps the grouped HF param into its own fused layout (w13/w2).
         if "grouped_expert_proj" in meta:
             info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 

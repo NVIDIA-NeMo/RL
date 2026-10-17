@@ -1374,7 +1374,7 @@ def test_receiver_quantizes_blockwise_fused_weights(
         assert not torch.any(scales == 9)
 
 
-@pytest.mark.parametrize("block_size", [32, 64])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
     block_size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1386,7 +1386,8 @@ def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
     monkeypatch.setattr(fp8, "cast_tensor_to_fp8_blockwise", quantize_spy)
 
     # vLLM refines a checkpoint's 128x128 grid for an intermediate shard
-    # aligned to 32 or 64 rows, but not to 128 rows.
+    # aligned to 32 or 64 rows, but not to 128 rows. The 128-row case uses
+    # only the module's weight_block_size fallback.
     experts, hidden_size, intermediate_size = 2, 256, 3 * block_size
     prefix = "model.layers.0.mlp.experts"
     gate_up = torch.full(
@@ -1415,9 +1416,13 @@ def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
             prefix,
             SimpleNamespace(
                 weight_block_size=(128, 128),
-                quant_method=SimpleNamespace(
-                    moe_block_shape=(block_size, block_size),
-                    quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+                quant_method=(
+                    SimpleNamespace(
+                        moe_block_shape=(block_size, block_size),
+                        quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+                    )
+                    if block_size != 128
+                    else SimpleNamespace()
                 ),
             ),
         )
