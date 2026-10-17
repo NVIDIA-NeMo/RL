@@ -1089,7 +1089,7 @@ def test_distillation_setup_non_colocated_smoke(
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
         def offload_after_refit(self):
@@ -1111,9 +1111,6 @@ def test_distillation_setup_non_colocated_smoke(
 
         def prepare_refit_info(self, *args, **kwargs):
             return None
-
-        def get_refit_payload_mode(self):
-            return "hf_export"
 
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
@@ -1166,6 +1163,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
             "policy": {
                 "model_name": "test-student",
                 "quant_cfg": "/tmp/modelopt.yaml",
+                "offload_policy_before_refit": False,
                 "hf_config_overrides": {"architectures": ["TestStudent"]},
                 "automodel_cfg": {"enabled": False},
                 "megatron_cfg": {
@@ -1240,8 +1238,7 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
         def prepare_for_training(self):
             events.append("restore")
 
-        def prepare_refit_info(self, *, refit_payload_mode: str):
-            assert refit_payload_mode == "hf_export"
+        def prepare_refit_info(self):
             return {}
 
     class DummyVllmGeneration:
@@ -1256,9 +1253,6 @@ def test_real_quant_distillation_setup_builds_vllm_from_student_config(monkeypat
 
         def finish_generation(self):
             events.append("finish")
-
-        def get_refit_payload_mode(self) -> str:
-            return "hf_export"
 
         def prepare_refit_info(self, _state):
             pass
@@ -1388,7 +1382,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
     class DummyVllmGeneration:
@@ -1414,9 +1408,6 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
 
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
-
-        def get_refit_payload_mode(self):
-            return "hf_export"
 
     nemo_gym_actor = MagicMock()
 

@@ -388,7 +388,10 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
         lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales())
+    with pytest.raises(NotImplementedError, match="filtered conversion tasks"):
+        list(worker._iter_params_with_optional_kv_scales(conversion_tasks=[]))
+
+    output = list(worker._iter_params_with_optional_kv_scales(include_draft=False))
 
     assert output[0][0] == "real.weight"
     torch.testing.assert_close(output[0][1], torch.ones(1))
@@ -431,15 +434,36 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "TensorQuantizer",
         FakeTensorQuantizer,
     )
+    selected_tasks = worker.refit_conversion_tasks.copy()
+    worker.refit_conversion_tasks.append(
+        SimpleNamespace(
+            param_name="unselected.weight",
+            global_param_name="unselected.weight",
+            param_weight=torch.ones(2, 2),
+            megatron_module=FakeQuantModule(),
+            mapping=SimpleNamespace(hf_param="unselected.weight"),
+        )
+    )
+
+    def export_selected(
+        self, kv_scales=None, conversion_tasks=None, include_draft=True
+    ):
+        assert conversion_tasks == selected_tasks
+        assert not include_draft
+        assert len(self.refit_conversion_tasks) == 2
+        return iter([("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))])
+
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
         "_iter_params_with_optional_kv_scales",
-        lambda self, kv_scales=None: iter(
-            [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
-        ),
+        export_selected,
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales())
+    output = list(
+        worker._iter_params_with_optional_kv_scales(
+            conversion_tasks=selected_tasks, include_draft=False
+        )
+    )
 
     assert [name for name, _ in output] == [
         "model.layers.0.mlp.down_proj.weight",
@@ -483,8 +507,10 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         lambda *_args: FailingQuantizer(),
     )
 
-    def access_refit_task_weights(self, kv_scales=None):
-        for refit_task in self.refit_conversion_tasks:
+    def access_refit_task_weights(
+        self, kv_scales=None, conversion_tasks=None, include_draft=True
+    ):
+        for refit_task in conversion_tasks:
             yield refit_task.param_name, refit_task.param_weight
 
     monkeypatch.setattr(
@@ -1106,8 +1132,10 @@ class TestFindWeightQuantizer:
         ]
         worker.refit_conversion_tasks = tasks
 
-        def export_weights(self, kv_scales=None):
-            for task in self.refit_conversion_tasks:
+        def export_weights(
+            self, kv_scales=None, conversion_tasks=None, include_draft=True
+        ):
+            for task in conversion_tasks:
                 yield task.param_name, task.param_weight
 
         monkeypatch.setattr(

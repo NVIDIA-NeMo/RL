@@ -652,7 +652,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if name not in existing_names:
                     yield name, amax
 
-    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: dict[str, float] | None = None,
+        conversion_tasks=None,
+        include_draft: bool = True,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
         Wraps each conversion task so that reading task.param_weight returns
@@ -665,6 +670,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 with context about which parameter caused the failure.
         """
         if self._use_real_quant_refit():
+            if conversion_tasks is not None:
+                raise NotImplementedError(
+                    "ModelOpt real-quant refit does not support filtered conversion tasks"
+                )
             yield from self._iter_real_quant_refit_params(kv_scales)
             return
 
@@ -691,9 +700,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             def __getattr__(self, name):
                 return getattr(self._task, name)
 
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
         folded_tasks = []
         skipped_fold = []
-        for task in self.refit_conversion_tasks:
+        for task in conversion_tasks:
             matched_wq = self._find_weight_quantizer(
                 task.megatron_module, task.param_weight
             )
@@ -715,17 +726,19 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 f"that share a module with weight_quantizer: {skipped_fold[:5]}"
             )
 
-        original_tasks = self.refit_conversion_tasks
-        self.refit_conversion_tasks = folded_tasks
         try:
             yielded_names = set()
-            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+            for name, tensor in super()._iter_params_with_optional_kv_scales(
+                kv_scales,
+                conversion_tasks=folded_tasks,
+                include_draft=include_draft,
+            ):
                 if "weight_quantizer" in name:
                     continue
                 yielded_names.add(name)
                 yield name, tensor
             yield from self._iter_input_quantizer_amax_params(
-                original_tasks,
+                conversion_tasks,
                 yielded_names,
             )
         except RuntimeError:
@@ -737,5 +750,3 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 f"{skipped_fold[:5] if skipped_fold else 'none'}. "
                 f"Cause: {e}"
             ) from e
-        finally:
-            self.refit_conversion_tasks = original_tasks

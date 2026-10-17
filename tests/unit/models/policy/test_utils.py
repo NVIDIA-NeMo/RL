@@ -240,7 +240,7 @@ def test_stream_weights_drains_group_before_requesting_next(
         "complete",
         "ack",
     ]
-    assert allocations == [512, 512, 1024, 1024, 1536]
+    assert allocations == [512, 512, 1024, 1024, 1536, 1024, 1024]
     assert all(ref() is None for ref in buffer_refs)
 
 

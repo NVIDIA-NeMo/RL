@@ -3710,7 +3710,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
         def init_collective(self, *_args, **_kwargs):
             return []
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
     def policy_factory(
@@ -3746,9 +3746,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
 
         def prepare_refit_info(self, _state):
             pass
-
-        def get_refit_payload_mode(self):
-            return "hf_export"
 
         def init_collective(self, *_args, **_kwargs):
             return []
@@ -3862,8 +3859,7 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self, *, refit_payload_mode: str):
-            assert refit_payload_mode == "hf_export"
+        def prepare_refit_info(self):
             return {}
 
     class DummyVllmGeneration:
@@ -3878,9 +3874,6 @@ def test_real_quant_setup_builds_vllm_from_policy_config(
 
         def finish_generation(self):
             events.append("finish")
-
-        def get_refit_payload_mode(self) -> str:
-            return "hf_export"
 
         def prepare_refit_info(self, _state):
             pass
@@ -4000,7 +3993,7 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def print_node_ip_and_gpu_id(self):
             pass
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
     class DummyTrtllmGeneration:
@@ -4013,10 +4006,10 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         def prepare_refit_info(self, _state):
             pass
 
-        def get_refit_payload_mode(self):
-            return "hf_export"
+    # is_sharded=False is what an unsharded job returns, and it lets the real
+    # agent-coverage check take its early return instead of scanning a mock dataset.
+    nemo_gym_shard_set = MagicMock(is_sharded=False)
 
-    nemo_gym_shard_set = MagicMock()
     build_nemo_gym_actors = MagicMock(return_value=nemo_gym_shard_set)
     monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
     monkeypatch.setattr(
@@ -6786,6 +6779,14 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["agent-a/truncation_rate"] == pytest.approx(0.5)
         assert result["agent-b/truncation_rate"] == pytest.approx(0.5)
+
+    def test_group_std_metrics_are_summarized(self):
+        result = aggregate_rollout_metrics(
+            {"reward_score_raw/std_in_group": [0.1, 0.2, 0.3]}
+        )
+        assert result["reward_score_raw/std_in_group/mean"] == pytest.approx(0.2)
+        assert result["reward_score_raw/std_in_group/p05"] == pytest.approx(0.11)
+        assert result["reward_score_raw/std_in_group/p95"] == pytest.approx(0.29)
 
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}

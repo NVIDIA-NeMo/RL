@@ -28,7 +28,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
     agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
@@ -391,10 +390,6 @@ class MegatronGeneration(GenerationInterface):
     def uses_native_refit(self) -> bool:
         """Whether non-colocated refit uses Megatron Core's native mechanism."""
         return self.cfg.get("refit_transport") == "mcore"
-
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Megatron inference receives logical weights on every refit path."""
-        return "logical_weights"
 
     @property
     def worker_group(self) -> "RayWorkerGroup":
