@@ -4,7 +4,7 @@ policy:
     context_parallel_size: 2
   generation:
     vllm_cfg:
-      # Kept eager: the parent's CUDA-graph setting was A/B-tested on H100 only, not on this GB200 variant (see the rollout-perf skill, #4556).
+      # Kept eager: CUDA graphs were only A/B-tested on H100, not on this GB200 variant.
       enforce_eager: true
 checkpointing:
   checkpoint_dir: results/dapo-qwen2.5-7b-16n4g-automodel-cp2
