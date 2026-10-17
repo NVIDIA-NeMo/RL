@@ -26,7 +26,15 @@ def test_subagent_launchers_bound_observations_without_changing_training_horizon
         text = launcher.read_text()
         assert "AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES:-400" in text
         assert "AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES:-8192" in text
-        assert "exactly two labeled overview JPEGs total" in text
+        assert "no more than four labeled overview JPEGs" in text
         assert "at most 1280 by 720 pixels" in text
         assert "ffmpeg -hide_banner -loglevel error -nostats" in text
         assert "MAX_STEPS:-1000000" in text
+
+
+def test_subagent_launchers_make_child_artifacts_scoreable_before_return() -> None:
+    for launcher in LAUNCHERS:
+        text = launcher.read_text()
+        assert "Delegate the complete video assembly task to the general subagent" in text
+        assert "create both required deliverables before returning" in text
+        assert "do not repeat its visual analysis" in text
