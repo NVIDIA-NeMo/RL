@@ -117,6 +117,35 @@ env:
 
 See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
+### Cut off slow rollouts in synchronous training
+
+A synchronous GRPO step waits for the slowest rollout of its batch. With long agentic sessions a single slow rollout (a sandbox that hangs, an agent that runs to its own timeout) can hold every GPU of the step idle long after the rest of the batch has returned. `env.nemo_gym.straggler_cutoff` bounds that tail:
+
+```yaml
+env:
+  nemo_gym:
+    straggler_cutoff:
+      enabled: true         # default false; the block is ignored without it
+      done_fraction: 0.95   # arm once this fraction of the batch has returned...
+      min_elapsed_s: 1800   # ...and at least this long after dispatch
+      grace_s: 300          # then wait this much longer before cutting
+      max_wall_s: 2700      # optional hard cap; null = none
+```
+
+When the cutoff fires, the NeMo Gym actor calls `aclose_and_drain()` on the iterator that Gym's `RolloutCollectionHelper.run_examples` returned. This stops admission before saving completed, unconsumed outcomes and cancelling unfinished client tasks. The actor consumes those saved outcomes and any result already claimed by its one outstanding completion waiter before creating placeholders; queued successes remain real results and queued errors propagate normally. The actor also calls `aclose()` on normal exhaustion, a rollout or postprocessing error, consumer closure, and task cancellation. `aclose()` waits for the rollout tasks in the actor to end; it does not wait for server-side cancellation or sandbox cleanup. Closing a `/run` request lets Gym's `ClientDisconnectCancellationMiddleware` observe the disconnect and cancel the server handler later. Resource savings depend on the agent's cancellation support: local CLI agents, Ray-based agents, and `terminus_2_sandboxed` can keep their underlying work running after cancellation. NeMo RL dispatches every row of the call up front (it does not pass Gym's `max_resident_tasks`); `max_resident_rollout_tasks` under `env.nemo_gym` does not bound this path.
+
+Each cut rollout is returned as a placeholder: the row's prompt rendered as text (media dropped) plus one EOS token with logprob 0 and reward 0. Its `full_result` contains the RL-owned marker `_nrl_straggler_cut: true`, `failure_kind: trainer_cutoff`, and a human-readable `failure_reason`. This records a trainer-enforced time limit separately from Gym's `cancelled` and genuine rollout failures. The RL-owned `_nrl_straggler_cutoff` event records `deadline` (`done_fraction_grace` or `max_wall_s`), `deadline_s` and `elapsed_s` measured from batch dispatch, `armed_at_s` (null if never armed), and the resolved `config` (`done_fraction`, `grace_s`, `min_elapsed_s`, `max_wall_s`). For a grace cutoff, `deadline_s` equals `armed_at_s + grace_s`; for an absolute cutoff, it equals `max_wall_s`. Existing Gym results and failures retain their original classification.
+
+The `straggler_cutoff/*` rollout metrics report how many rollouts were cut (`num_cut`), whether and when the cutoff armed (`armed`, `armed_at_s`), and when and why it fired (`cut_at_s`, `done_fraction_at_cut`, `cut_by_max_wall`). With sharded NeMo Gym, `num_cut` is the total over shards and `armed` / `cut_by_max_wall` are set if any shard tripped; timestamps and `done_fraction_at_cut` are reported per shard only, under `straggler_cutoff/shard/<instance>/`.
+
+**Cut rows and statistics.** A cut row has `loss_multiplier = 0` regardless of `env.should_mask_flagged_samples`; when that flag is on it is also ORed into `mask_sample`. It is excluded from per-agent `full_result` means and token/truncation metrics, the `reward_penalties` checks and rates, and effort shaping. `grpo.length_penalty` leaves it untouched because it only adjusts positive-reward rows; the cut row still counts as a wrong row in its group's pass rate.
+
+**Baseline bias and RL #4490 dependency.** Zero loss does not exclude the placeholder's zero reward from the group baseline or standard deviation. Both synchronous trainers on this branch use an all-ones baseline `valid_mask`. For example, rewards `[1, 1, cut]` produce a mean of `2/3` rather than `1` over the completed rows, so the cutoff shifts their advantages even though the cut row itself never trains. The selection can be systematically biased: the slowest rollouts may also be the hardest. Excluding placeholders from those statistics depends on [RL #4490](https://github.com/NVIDIA-NeMo/RL/pull/4490) or equivalent handling of `mask_sample` and `loss_multiplier == 0` in both legacy `grpo.py` and data-plane `grpo_sync.py`, including CPU/GPU and leave-one-out paths. A legacy-only implementation is insufficient; the equivalent data-plane mask must land too. This PR does not implement that algorithm change or establish convergence neutrality. The motivating timing replay estimates wall time saved and rows cut, not training quality.
+
+**Scope.** The cutoff applies only to synchronous GRPO training rollouts (legacy and data-plane trainers). Validation rollouts, async GRPO, distillation, PPO and SingleController never cut. With sharded NeMo Gym, the block stays in every shard's configuration (it is a NeMo RL setting, not a Gym overlay a shard claims) and each actor instance applies `done_fraction` and the timers to its own share of the batch. In token-capture (receipt) mode the actor logs a warning once and runs uncut: a cancelled rollout has no receipt for the finalizer to rebuild.
+
+**NeMo Gym dependency.** The cutoff needs the iterator returned by `run_examples` to have async `aclose_and_drain()` and `aclose()` methods, which NVIDIA-NeMo/Gym#4029 adds (for both of Gym's iterator modes; NeMo RL uses the unbounded one). The NeMo Gym pinned in `3rdparty/Gym-workspace/Gym` (`17abf2dd`) returns a plain `map` without it, so with the pinned Gym the actor logs a warning once and runs every batch uncut. Versions with only `aclose()` also run uncut because closing them can discard completed outcomes. The pin moves to a Gym with `aclose_and_drain()` once that change is on Gym `main`; until then enabling the block has no effect beyond the warning. `tests/unit/environments/test_nemo_gym_straggler_cutoff_interop.py` drives the committed cutoff loop against the installed Gym's real `run_examples` and skips until that Gym's iterator has `aclose_and_drain()`, so the pin bump makes the cutoff path run in the `nemo_gym` CI shard.
+
 ### Version Requirements
 
 NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and Python versions must be used in both environments.
