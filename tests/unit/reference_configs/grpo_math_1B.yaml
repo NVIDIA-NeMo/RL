@@ -104,11 +104,19 @@ loss_fn:
   use_importance_sampling_correction: false
   # "tis"          – clamp IS weights to [min, max], where min defaults to 0
   # "icepop"       – zero out tokens with IS weight outside [min, max]
+  # "adaptive-ppo-clip" – advantage-aware token filtering with an entropy-adaptive upper bound
   # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
-  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / seq-mask-tis.
+  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / adaptive-ppo-clip / seq-mask-tis.
   truncated_importance_sampling_ratio_min: null
+  # adaptive-ppo-clip only; ignored otherwise. The A > 0 upper bound is truncated_importance_sampling_ratio + k.
+  # After each step, k rises by k_step if approx_entropy is below the target and falls by k_step if above,
+  # clamped to [0, k_max]. Tokens with IS weight above outer_bound are dropped.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
