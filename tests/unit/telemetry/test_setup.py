@@ -27,6 +27,7 @@ from nemo_rl.telemetry.setup import (
     instrument_aiohttp_client,
     shutdown_telemetry,
     telemetry_enabled_in_env,
+    telemetry_metrics_exporting,
     traced_worker_init,
     vllm_native_tracing_requested,
 )
@@ -249,6 +250,34 @@ def test_init_driver_returns_none_when_disabled():
     )
     assert handle is None
     assert get_telemetry_handle() is None
+    assert not telemetry_metrics_exporting()
+
+
+@pytest.mark.parametrize("metrics_enabled", [False, True])
+@pytest.mark.parametrize("worker", [False, True])
+def test_runtime_diagnostics_follow_resolved_metrics_switch(
+    monkeypatch, metrics_enabled, worker
+):
+    if worker:
+        monkeypatch.setenv("NEMO_RL_OTEL_ENABLED", "1")
+        monkeypatch.setenv(
+            "NEMO_RL_OTEL_METRICS_ENABLED", "1" if metrics_enabled else "0"
+        )
+        monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
+        handle = init_telemetry_worker()
+    else:
+        handle = init_telemetry_driver(
+            _FakeMasterConfig(
+                TelemetryConfig(
+                    enabled=True, metrics_enabled=metrics_enabled, exporter="console"
+                )
+            ),
+            "grpo",
+        )
+    assert handle is not None
+    assert telemetry_metrics_exporting() is metrics_enabled
+    shutdown_telemetry()
+    assert not telemetry_metrics_exporting()
 
 
 def test_init_driver_returns_none_when_no_telemetry_block():

@@ -62,6 +62,7 @@ _F = TypeVar("_F", bound=Callable[..., Any])
 # lens is absent or telemetry is disabled.
 _TELEMETRY_HANDLE: Optional["TelemetryHandle"] = None
 _TELEMETRY_INITIALISED = False
+_METRICS_ENABLED = False
 
 # Env-var prefix for NeMo-RL. ``NemoLensConfig.from_env`` reads
 # ``NEMO_RL_OTEL_<KEY>`` first, then falls back to ``NEMO_LENS_<KEY>``.
@@ -451,7 +452,7 @@ def init_telemetry_driver(
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled.
     Idempotent.
     """
-    global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED
+    global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED, _METRICS_ENABLED
     if _TELEMETRY_INITIALISED:
         return _TELEMETRY_HANDLE
 
@@ -508,6 +509,7 @@ def init_telemetry_driver(
     # error. Lens leaves its own guard clear on that path, so a retry is safe.
     _TELEMETRY_INITIALISED = True
     _TELEMETRY_HANDLE = handle
+    _METRICS_ENABLED = config.metrics_enabled
 
     if config.logs_enabled and handle.is_exporting:
         # Unguarded: the user asked for logs, so failing to install the bridge
@@ -623,7 +625,7 @@ def init_telemetry_worker(
     Returns the :class:`TelemetryHandle`, or ``None`` if telemetry is disabled
     or setup failed. Idempotent per process.
     """
-    global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED
+    global _TELEMETRY_HANDLE, _TELEMETRY_INITIALISED, _METRICS_ENABLED
     if _TELEMETRY_INITIALISED:
         return _TELEMETRY_HANDLE
     _TELEMETRY_INITIALISED = True
@@ -673,6 +675,7 @@ def init_telemetry_worker(
         return None
     else:
         _TELEMETRY_HANDLE = handle
+        _METRICS_ENABLED = config.metrics_enabled
         return handle
 
 
@@ -782,6 +785,12 @@ def get_telemetry_handle() -> Optional["TelemetryHandle"]:
     return _TELEMETRY_HANDLE
 
 
+def telemetry_metrics_exporting() -> bool:
+    """Whether this process exports metrics, including the metrics-only switch."""
+    handle = _TELEMETRY_HANDLE
+    return _METRICS_ENABLED and handle is not None and handle.is_exporting
+
+
 def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     """Flush and shut down telemetry providers, returning within *timeout_ms*.
 
@@ -820,7 +829,7 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
 
     stop_host_memory_monitoring()
 
-    global _TELEMETRY_HANDLE
+    global _TELEMETRY_HANDLE, _METRICS_ENABLED
     handle = _TELEMETRY_HANDLE
     if handle is None:
         return
@@ -828,6 +837,7 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     # rather than queue behind an export that is already overrunning, and the
     # handle's own _shutdown_done guards the underlying providers.
     _TELEMETRY_HANDLE = None
+    _METRICS_ENABLED = False
 
     def _flush() -> None:
         try:

@@ -122,6 +122,15 @@ RUN_WINDOW = "run"
 RL_SETUP_DURATION_METRIC = "rl.setup.duration"
 RL_SETUP_PHASE_ATTR = "rl.setup.phase"
 
+# Executor and event-loop diagnostics recorded by ``nemo_rl.telemetry.runtime``.
+# Declared here rather than in that module so they are part of the group before
+# registration freezes it, whichever module a process imports first.
+RL_EXECUTOR_QUEUE_WAIT_METRIC = "rl.executor.queue_wait"
+RL_EXECUTOR_EXECUTION_METRIC = "rl.executor.execution"
+RL_EXECUTOR_RESULT_DELIVERY_METRIC = "rl.executor.result_delivery"
+RL_EXECUTOR_PENDING_METRIC = "rl.executor.pending"
+RL_EVENT_LOOP_LAG_METRIC = "rl.event_loop.lag"
+
 # Keys that ``print_efficiency_summary`` puts in the Logger dict.
 _EFFICIENCY_KEY_PREFIX = "efficiency/"
 _EFFICIENCY_SECONDS_SUFFIX = "_s"
@@ -142,6 +151,11 @@ RL_METRIC_GROUP = "rl"
 _EFFICIENCY_SECONDS_KEY = registry_key(RL_EFFICIENCY_SECONDS_METRIC)
 _EFFICIENCY_PCT_KEY_REGISTRY = registry_key(RL_EFFICIENCY_PCT_METRIC)
 _SETUP_DURATION_KEY = registry_key(RL_SETUP_DURATION_METRIC)
+EXECUTOR_QUEUE_WAIT_KEY = registry_key(RL_EXECUTOR_QUEUE_WAIT_METRIC)
+EXECUTOR_EXECUTION_KEY = registry_key(RL_EXECUTOR_EXECUTION_METRIC)
+EXECUTOR_RESULT_DELIVERY_KEY = registry_key(RL_EXECUTOR_RESULT_DELIVERY_METRIC)
+EXECUTOR_PENDING_KEY = registry_key(RL_EXECUTOR_PENDING_METRIC)
+EVENT_LOOP_LAG_KEY = registry_key(RL_EVENT_LOOP_LAG_METRIC)
 
 # Registration is process-global in lens, so it has to happen once per process
 # and in every process that records -- driver and workers alike. Doing it lazily
@@ -210,6 +224,41 @@ def _metric_specs() -> list[MetricSpec]:
             description=(
                 "Wall clock spent in one startup phase, named by the "
                 "rl.setup.phase attribute."
+            ),
+        )
+    )
+    specs.extend(
+        MetricSpec(registry_key(name), name, kind, unit=unit, description=description)
+        for name, kind, unit, description in (
+            (
+                RL_EXECUTOR_QUEUE_WAIT_METRIC,
+                "histogram",
+                "ms",
+                "Offload submission to thread start, by bounded call site.",
+            ),
+            (
+                RL_EXECUTOR_EXECUTION_METRIC,
+                "histogram",
+                "ms",
+                "Thread execution wall time, including any blocking I/O.",
+            ),
+            (
+                RL_EXECUTOR_RESULT_DELIVERY_METRIC,
+                "histogram",
+                "ms",
+                "Successful thread completion to awaiting coroutine resumption.",
+            ),
+            (
+                RL_EXECUTOR_PENDING_METRIC,
+                "up_down_counter",
+                "{task}",
+                "Instrumented offloads queued or running; not total executor occupancy.",
+            ),
+            (
+                RL_EVENT_LOOP_LAG_METRIC,
+                "histogram",
+                "ms",
+                "Scheduling lateness of a one-second event-loop probe.",
             ),
         )
     )
