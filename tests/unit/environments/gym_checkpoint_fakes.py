@@ -61,6 +61,9 @@ class FakeGymActor:
         block_commit: Hold each commit until ``release_commit`` is set;
             ``commit_started`` is set when one arrives.
         while_prepared: Awaited once a prepare has parked Gym.
+        restarts: Episodes a prepare reports as restarts. A commit that names
+            one is refused, as Gym does, and a commit never exports one.
+        forget_errors: Raised by the first forget calls, one per call.
     """
 
     def __init__(
@@ -77,6 +80,8 @@ class FakeGymActor:
         unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = (),
         block_commit: bool = False,
         while_prepared: Optional[Callable[[], Awaitable[Any]]] = None,
+        restarts: tuple[GymCheckpointEpisode, ...] = (),
+        forget_errors: tuple[BaseException, ...] = (),
     ) -> None:
         self.prepared = prepared
         self.resume_errors = list(resume_errors)
@@ -89,6 +94,8 @@ class FakeGymActor:
         self.commit_started = asyncio.Event() if block_commit else None
         self.release_commit = asyncio.Event() if block_commit else None
         self.while_prepared = while_prepared
+        self.restarts = restarts
+        self.forget_errors = list(forget_errors)
         # Between a prepare that parked Gym and the resume that reopens it.
         self.checkpoint_open = False
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -98,6 +105,7 @@ class FakeGymActor:
         self.checkpoint_commit = _RemoteMethod(self._commit)
         self.checkpoint_restore = _RemoteMethod(self._restore)
         self.checkpoint_resume = _RemoteMethod(self._resume)
+        self.checkpoint_forget = _RemoteMethod(self._forget)
 
     def operations(self) -> list[str]:
         """The control operations received, in order."""
@@ -121,6 +129,7 @@ class FakeGymActor:
         return GymCheckpointPrepareSummary(
             prepared=self.prepared,
             blockers={} if self.prepared else {"agent": ("rollout-1",)},
+            restarts=self.restarts,
         )
 
     async def _renew(self, *args, **kwargs) -> None:
@@ -128,11 +137,14 @@ class FakeGymActor:
 
     async def _commit(self, *args, **kwargs) -> GymCheckpointCommitSummary:
         await self._record("commit", args, kwargs)
+        restarted = set(args[2]) & set(self.restarts)
+        if restarted:
+            raise RuntimeError(f"restart_in_scope: {sorted(restarted)!r}")
         if self.commit_started is not None and self.release_commit is not None:
             self.commit_started.set()
             await self.release_commit.wait()
         if self.live is not None:
-            episodes = tuple(sorted(self.live))
+            episodes = tuple(sorted(self.live - set(self.restarts)))
         elif self.exported_episodes is not None:
             episodes = self.exported_episodes
         else:
@@ -157,6 +169,11 @@ class FakeGymActor:
             # whose calls wait for resume, so it refuses a retire mid-checkpoint.
             raise RuntimeError("cannot retire while a checkpoint is open; resume first")
         self.live.difference_update(args[1])
+
+    async def _forget(self, *args, **kwargs) -> None:
+        await self._record("forget", args, kwargs)
+        if self.forget_errors:
+            raise self.forget_errors.pop(0)
 
     async def _restore(self, *args, **kwargs) -> None:
         await self._record("restore", args, kwargs)
