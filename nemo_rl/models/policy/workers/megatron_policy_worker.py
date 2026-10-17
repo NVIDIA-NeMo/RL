@@ -3485,6 +3485,7 @@ class MegatronPolicyWorkerImpl(
         # Yield the original parameters first.
         for name, tensor in base_iter:
             yield name, tensor
+            del tensor
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -3766,6 +3767,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication.
 
@@ -3786,6 +3788,7 @@ class MegatronPolicyWorkerImpl(
                 kv_scales=kv_scales,
                 buffer_size_bytes=buffer_size_bytes,
                 num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
             )
         if guard.fired:
             # The aborted collective returned cleanly, so this is the only signal there is.
@@ -3800,6 +3803,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
@@ -3809,6 +3813,7 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
 
     def _build_layer_to_pp_stage(

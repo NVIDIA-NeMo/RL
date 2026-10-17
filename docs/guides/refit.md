@@ -67,6 +67,105 @@ workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
+### TensorRT-LLM Routed-Expert FP8
+
+TensorRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
+training remains in BF16, and this setting does not change optimizer-state
+precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
+blocks and FP32 scales. By default only the routed-expert weights are converted;
+attention, routers, shared experts, embeddings, and the output head remain in
+BF16 (see [Quantized scope](#quantized-scope) to change this).
+
+This path starts from a BF16 policy checkpoint. Direct loading of a
+pre-quantized ModelOpt FP8 checkpoint is outside its scope.
+
+Enable the path with:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+```
+
+The path is not gated on model type. It quantizes routed-expert weights, either
+fused (`mlp.experts.gate_up_proj` / `down_proj`, the Qwen3.5 layout) or per-expert
+(`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout). With the
+default scope, setup fails if no routed-expert weight is found, or if the model
+has dense MLP weights that would stay BF16.
+
+#### Quantized scope
+
+Set `quantization_ignore_patterns` under `trtllm_cfg` (the same key as
+`vllm_cfg`) to choose which modules stay BF16. Patterns are matched against
+module names with `fnmatch` or a `re:` regex, and a module is ignored if it or any
+ancestor matches. A list replaces the default scope: every 2-D linear weight and
+routed expert that is not ignored is quantized. `lm_head`, embeddings, routers
+(`mlp.gate`, `mlp.shared_expert_gate`), and linear-attention `in_proj_*` always stay
+BF16. Patterns are HF module names (on Qwen3.5, `model.language_model.layers.*`).
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      quantization_ignore_patterns:
+        - model.language_model.layers.*.linear_attn*  # keep linear attention in BF16
+```
+
+This quantizes attention, shared experts, and the routed experts of a Qwen3.5 MoE
+model, and keeps linear attention and the always-BF16 modules in BF16.
+
+Unlike `vllm_cfg.quantization_ignore_patterns`, the default scope is routed experts
+only (vLLM quantizes every linear layer and the experts), and a list replaces that
+default instead of being appended to vLLM's ignore set. For example,
+`["*attn*"]` quantizes everything except attention and the always-BF16 modules,
+including shared experts, unless they are also listed. The key is accepted for
+both block-FP8 and MXFP8 (vLLM requires MXFP8).
+
+List shared experts, vision, or MTP modules explicitly to keep them in BF16 for
+models that have them. Setup fails if the patterns ignore every weight.
+
+Tested models:
+
+| Model | Status |
+| --- | --- |
+| Qwen3.5 MoE | Verified |
+| Qwen3 MoE | Verified (Qwen3-30B-A3B, block-FP8 and MXFP8; attention + experts scope with block-FP8) |
+
+NeMo RL initializes the TensorRT-LLM model with `load_format` set
+to `dummy`, then populates it from the first BF16 policy refit. By default
+(`is_mx: false`), the TensorRT-LLM MoE backend (`moe_config.backend: TRTLLM`)
+is required to preserve FP32 block scales; MXFP8/E8M0 scales are not used.
+
+#### MXFP8 variant
+
+Set `is_mx: true` to quantize routed experts to MXFP8 (E4M3 weights with
+UE8M0 1x32 block scales) instead of 128x128 block-FP8 with FP32 scales:
+
+```yaml
+policy:
+  generation:
+    trtllm_cfg:
+      precision: fp8
+      is_mx: true
+```
+
+This selects the CUTLASS MoE backend (the default) or the CuTe DSL backend
+(`moe_config.backend: CUTEDSL`, for Rubin) instead of the `TRTLLM` backend that
+block-FP8 uses; any other backend fails at setup. MXFP8 also constrains which
+GPUs it can run on: TensorRT-LLM's
+CUTLASS MoE gates `QuantAlgo.MXFP8` on `sm_constraint in {100, 103}`, so it does
+not run everywhere the default block-FP8 path does.
+
+The installed TensorRT-LLM must provide the incremental-refit lifecycle APIs
+`begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
+`WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
+the three model-loader hooks is missing; `finalize_weight_update` is called
+directly and is not checked up front. Supporting another model architecture
+with a different expert layout requires extending the weight-name patterns in
+`quantization/fp8.py`.
+
 ## Minimal Configuration
 
 Colocated vLLM and SGLang refit need no transport configuration:
@@ -110,8 +209,9 @@ policy:
 ```
 
 This option requires the Megatron policy backend. It applies to non-colocated
-vLLM collective and `nccl_reshard` transports, plus non-colocated Megatron
-generation. Unsupported combinations fail during synchronizer setup. It is
+vLLM collective and `nccl_reshard` transports, non-colocated TensorRT-LLM
+collective refit, plus non-colocated Megatron generation. Unsupported
+combinations fail during synchronizer setup. It is
 disabled by default because CPU offload adds transfer overhead when the export
 already fits in trainer GPU memory.
 
