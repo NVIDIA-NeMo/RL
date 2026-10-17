@@ -188,7 +188,6 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         train_world_size: int,
         rank_offset: int = 0,
-        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         pass
 

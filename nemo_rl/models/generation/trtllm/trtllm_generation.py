@@ -35,6 +35,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitFleetShape,
     reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.trtllm.config import (
@@ -761,6 +762,13 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
     #  GenerationInterface
     # ------------------------------------------------------------------ #
+
+    def get_refit_fleet_shape(self) -> RefitFleetShape:
+        """Return the DP shards of this backend's worker group."""
+        return RefitFleetShape(
+            dp_size=self.worker_group.dp_size,
+            total_gen_workers=len(self.worker_group.workers),
+        )
 
     def init_collective(
         self,

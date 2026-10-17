@@ -28,7 +28,20 @@ _MANAGED_FLAGS = {
     "--model-name",
     "--model-path",
     "--endpoint",
+    # Refit loads NeMo RL's vLLM worker extension and addresses each engine's
+    # ranks as TP x PP; extra_cli_args must not replace or reshape either.
+    "--worker-extension-cls",
+    "--weight-transfer-config",
+    "--data-parallel-size",
+    "--data-parallel-size-local",
+    "--distributed-executor-backend",
 }
+
+# NeMo RL's vLLM worker extension, which every managed engine loads so the driver
+# can drive refit through Dynamo's /engine/* RL routes.
+DYNAMO_WORKER_EXTENSION_CLS = (
+    "nemo_rl.models.generation.vllm.dynamo_worker_extension.DynamoWorkerExtension"
+)
 
 _CREDENTIAL_FLAGS = {
     "--access-token",
@@ -128,8 +141,8 @@ def build_dynamo_vllm_argv(
     builder.add("--event-plane", "nats", source="managed runtime")
     builder.add("--enable-rl", source="managed runtime")
     builder.add(
-        "--weight-transfer-config",
-        {"backend": "nccl"},
+        "--worker-extension-cls",
+        DYNAMO_WORKER_EXTENSION_CLS,
         source="managed runtime",
     )
     builder.add("--trust-remote-code", source="managed runtime")
@@ -194,12 +207,10 @@ def build_dynamo_vllm_argv(
     for key, value in vllm_kwargs.items():
         if value is None:
             continue
-        if key == "speculative_config":
-            raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
-            )
+        # num_speculative_tokens=0 is how a launch script turns speculative decoding
+        # off without deleting the block; vLLM rejects it, so drop the block.
+        if key == "speculative_config" and value.get("num_speculative_tokens") == 0:
+            continue
         flag = _flag_for_key(key)
         normalised = _normalise_flag(flag)
         source = f"vllm_kwargs.{key}"

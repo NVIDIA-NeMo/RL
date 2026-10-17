@@ -14,7 +14,7 @@
 
 """Two independent concerns that share this module.
 
-Peer protocol: which NCCL metadata and warmup a receiver expects, "nemo" or "vllm".
+Bootstrap: the NCCL metadata and warmup every receiver expects.
 
 Lifecycle of the refit process group: elastic recovery rebuilds this group whenever the
 generation fleet's membership changes, so it runs many times per job rather than once.
@@ -27,11 +27,8 @@ a stub communicator. The runtime behaviour of abort() against a genuinely dead p
 verified separately on 2xA6000 (design doc 8.4.1).
 """
 
-import ctypes
-import pickle
-import sys
 import types
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Optional
 
 import pytest
@@ -40,63 +37,6 @@ import torch
 from nemo_rl.distributed import stateless_process_group as spg
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
-
-
-@contextmanager
-def _vllm_unique_id_type():
-    module_names = [
-        "vllm",
-        "vllm.distributed",
-        "vllm.distributed.device_communicators",
-        spg._VLLM_NCCL_MODULE,
-    ]
-    previous_modules = {name: sys.modules.get(name) for name in module_names}
-    modules = {name: types.ModuleType(name) for name in module_names}
-    for name in module_names[:-1]:
-        modules[name].__path__ = []
-
-    modules["vllm"].distributed = modules["vllm.distributed"]
-    modules["vllm.distributed"].device_communicators = modules[
-        "vllm.distributed.device_communicators"
-    ]
-    modules["vllm.distributed.device_communicators"].pynccl_wrapper = modules[
-        spg._VLLM_NCCL_MODULE
-    ]
-    unique_id_type = type(
-        "ncclUniqueId",
-        (ctypes.Structure,),
-        {
-            "__module__": spg._VLLM_NCCL_MODULE,
-            "_fields_": [("internal", ctypes.c_byte * 128)],
-        },
-    )
-    modules[spg._VLLM_NCCL_MODULE].ncclUniqueId = unique_id_type
-
-    try:
-        sys.modules.update(modules)
-        yield unique_id_type
-    finally:
-        for name, previous_module in previous_modules.items():
-            if previous_module is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = previous_module
-
-
-def test_vllm_unique_id_pickle_unpickles_as_vllm_ctypes_type():
-    unique_id_bytes = bytes(range(128))
-    payload = spg._pickle_vllm_unique_id(unique_id_bytes)
-
-    with _vllm_unique_id_type() as unique_id_type:
-        unique_id = pickle.loads(payload)
-
-    assert isinstance(unique_id, unique_id_type)
-    assert bytes(unique_id) == unique_id_bytes
-
-
-def test_vllm_unique_id_pickle_requires_nccl_id_size():
-    with pytest.raises(ValueError, match="128-byte NCCL unique ID"):
-        spg._pickle_vllm_unique_id(b"too short")
 
 
 class _Store:
@@ -148,35 +88,7 @@ def _make_process_group(monkeypatch):
     return group, store, stream, communicator, unique_id_bytes
 
 
-def test_vllm_peer_uses_vllm_metadata_and_allreduce_warmup(monkeypatch):
-    # Coupled to vLLM 0.28.0's stateless process-group wire protocol. Reverify
-    # this literal whenever the isolated Dynamo vLLM pin changes.
-    assert spg._VLLM_UNIQUE_ID_KEY == "broadcast_from/0/0"
-    group, store, stream, communicator, unique_id_bytes = _make_process_group(
-        monkeypatch
-    )
-    warmup_tensor = object()
-    monkeypatch.setattr(spg.torch, "zeros", lambda *_args, **_kwargs: warmup_tensor)
-
-    group.init_nccl_communicator(device=0, peer="vllm")
-
-    assert store.data[spg._NEMO_UNIQUE_ID_KEY] == unique_id_bytes
-    with _vllm_unique_id_type():
-        stored_unique_id = pickle.loads(store.data[spg._VLLM_UNIQUE_ID_KEY])
-    assert bytes(stored_unique_id) == unique_id_bytes
-    assert communicator.allreduce_calls == [
-        {
-            "sendbuf": warmup_tensor,
-            "recvbuf": warmup_tensor,
-            "op": spg.SUM,
-            "stream": 123,
-        }
-    ]
-    assert communicator.broadcast_calls == []
-    assert stream.synchronized
-
-
-def test_nemo_peer_preserves_broadcast_warmup(monkeypatch):
+def test_bootstrap_publishes_raw_id_and_warms_up_with_a_broadcast(monkeypatch):
     group, store, stream, communicator, unique_id_bytes = _make_process_group(
         monkeypatch
     )
@@ -461,12 +373,11 @@ class _RecordingGroup:
         self.aborts = 0
         _RecordingGroup.instances.append(self)
 
-    def init_nccl_communicator(self, device, *, peer: str = "nemo") -> None:
-        # Mirrors the real signature including ``peer``, which init_collective now
-        # forwards. A stub that omits a kwarg its caller sends fails at the call with a
-        # TypeError, which is the same shape of break this branch has hit three times in
-        # the product code -- worth not reproducing in the fakes as well.
-        del device, peer
+    def init_nccl_communicator(self, device) -> None:
+        # Mirrors the real signature. A stub that omits a kwarg its caller sends fails
+        # at the call with a TypeError, which is the same shape of break this branch has
+        # hit three times in the product code -- worth not reproducing in the fakes.
+        del device
 
     def abort(self) -> None:
         self.aborts += 1
