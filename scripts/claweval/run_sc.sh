@@ -53,6 +53,24 @@ case $CLAW_EVAL_BACKEND in
       echo "ERROR: ClawEval Docker client missing: $CLAW_EVAL_DOCKER_CLI_DIR/docker" >&2
       exit 1
     }
+    (
+      set -a
+      # shellcheck disable=SC1090
+      source "$CLAW_EVAL_BACKEND_DIR/client.env"
+      set +a
+      export DOCKER_CERT_PATH=$CLAW_EVAL_BACKEND_DIR PATH=$CLAW_EVAL_DOCKER_CLI_DIR:$PATH DOCKER_CONFIG=$CLAW_EVAL_DOCKER_CLI_DIR
+      docker info --format '{{.ServerVersion}}' >/dev/null || {
+        echo 'ERROR: ClawEval task backend is unreachable from this host' >&2
+        exit 1
+      }
+      mapfile -t existing_containers < <(docker ps -q)
+      if (( ${#existing_containers[@]} != 0 )); then
+        echo "ERROR: ClawEval task backend is not empty: ${#existing_containers[@]} running container(s) at $CLAW_EVAL_BACKEND_DIR" >&2
+        docker ps --format '{{.ID}} {{.Names}} {{.Status}}' >&2
+        echo 'Use a dedicated empty backend or validate and clean stale containers before submission.' >&2
+        exit 1
+      fi
+    )
     ;;
   podman) ;;
   *)

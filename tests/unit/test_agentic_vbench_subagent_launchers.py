@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_SC = ROOT / "scripts" / "agentic_vbench" / "run_sc.sh"
+CLAW_RUN_SC = ROOT / "scripts" / "claweval" / "run_sc.sh"
 LAUNCHERS = (
     ROOT / "scripts" / "agentic_vbench" / "debug_subagents_sync_8n.sh",
     ROOT / "scripts" / "agentic_vbench" / "debug_subagents_async_16n.sh",
@@ -45,4 +46,11 @@ def test_agentic_submission_rejects_an_occupied_task_backend() -> None:
     text = RUN_SC.read_text()
     assert "mapfile -t existing_containers < <(docker ps -q)" in text
     assert "Task backend is not empty:" in text
+    assert "Use a dedicated empty backend" in text
+
+
+def test_claweval_submission_rejects_an_occupied_task_backend() -> None:
+    text = CLAW_RUN_SC.read_text()
+    assert "mapfile -t existing_containers < <(docker ps -q)" in text
+    assert "ClawEval task backend is not empty:" in text
     assert "Use a dedicated empty backend" in text
