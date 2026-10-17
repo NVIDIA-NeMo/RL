@@ -212,7 +212,7 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu", "nixl"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
