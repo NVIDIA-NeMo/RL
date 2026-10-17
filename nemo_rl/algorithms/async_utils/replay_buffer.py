@@ -392,10 +392,31 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         max_size: int,
         drop_incomplete_targets_on_restore: bool,
+        fifo_target_assignment: bool = False,
+        num_prompts_per_step: int | None = None,
+        max_age_steps: int | None = None,
     ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
+        if fifo_target_assignment and (
+            num_prompts_per_step is None or num_prompts_per_step <= 0
+        ):
+            raise ValueError(
+                "fifo_target_assignment requires a positive num_prompts_per_step, "
+                f"got {num_prompts_per_step}"
+            )
+        if fifo_target_assignment and (max_age_steps is None or max_age_steps <= 0):
+            raise ValueError(
+                "fifo_target_assignment requires a positive max_age_steps, "
+                f"got {max_age_steps}"
+            )
         self.max_size = max_size
+        # When set, an arriving group is stamped onto the earliest live target
+        # step that still lacks a full batch instead of the target its rollout
+        # batch was reserved for (see _fifo_target).
+        self._fifo_target_assignment = fifo_target_assignment
+        self._num_prompts_per_step = num_prompts_per_step
+        self._fifo_max_age_steps = max_age_steps
         # True discards partial restored rows. The dataloader is not rewound,
         # so replacement rollouts come from subsequent prompts.
         self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
@@ -426,6 +447,46 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             return float(rm["turns_per_sample/mean"])
         return None
 
+    def _fifo_target(self, weight_version: int, reserved_target: int) -> int:
+        """Return the target step an arriving group should be stamped with.
+
+        Target stamps are per-batch reservations made when a rollout batch is
+        dispatched. Once prompt groups stream in as they finish, the earliest
+        complete groups of a step may belong to a later reservation while the
+        step's own batch still waits on its slowest sample. Stamping FIFO keeps
+        ``has_complete_batch`` / ``sample`` consistent with arrival order: the
+        group goes to the lowest target step that (a) training has not consumed
+        yet, (b) lies inside the group's age window, i.e.
+        ``weight_version <= target <= weight_version + max_age_steps`` exactly as
+        :meth:`_is_valid_for_target` requires, and (c) still lacks a full batch
+        of age-valid groups (counted with :meth:`_count_for_target`, the same
+        count ``has_complete_batch`` uses). The search covers the reservation
+        and every step already present in the buffer plus one, so a straggler
+        whose reserved step filled up meanwhile moves on to the next open step
+        instead of over-filling its own. When no such step exists the group keeps
+        its reservation (or the first unconsumed step if the reservation was
+        already consumed), and the existing age eviction handles it as today.
+
+        Must be called while holding ``self._lock``.
+        """
+        assert self._num_prompts_per_step is not None
+        assert self._fifo_max_age_steps is not None
+        floor = max(self.last_target_weight_already_generated + 1, weight_version, 0)
+        ceiling = weight_version + self._fifo_max_age_steps
+        highest_known = max([reserved_target, *self.target_weight_versions])
+        upper = min(highest_known + 1, ceiling)
+        for target in range(floor, upper + 1):
+            count = self._count_for_target(target, self._fifo_max_age_steps)
+            if count < self._num_prompts_per_step:
+                if target != reserved_target:
+                    print(
+                        f"   ↪ FIFO target assignment: group reserved for step "
+                        f"{reserved_target} fills step {target} "
+                        f"({count + 1}/{self._num_prompts_per_step})"
+                    )
+                return target
+        return max(floor, reserved_target)
+
     def add(
         self,
         trajectory: dict[str, Any],
@@ -437,11 +498,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         Args:
             trajectory: data dict
             weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
+            target_weight_version: version of the model weights this trajectory is intended for training.
+                With ``fifo_target_assignment`` this is the batch reservation and may be
+                lowered to the earliest live step that still lacks a full batch.
         """
         with self._lock:
             if len(self.trajectories) >= self.max_size:
                 return "full"
+
+            if self._fifo_target_assignment:
+                target_weight_version = self._fifo_target(
+                    weight_version, target_weight_version
+                )
 
             print("🔍 ReplayBuffer.add: Adding trajectory")
             self.trajectories.append(trajectory)

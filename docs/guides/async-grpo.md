@@ -118,6 +118,7 @@ The async GRPO implementation consists of three main components:
 - Tracks weight versions for both generation and intended training use
 - Implements age-based filtering to prevent stale trajectories
 - Provides sampling interface for training steps
+- Optionally (`fifo_target_assignment: true`) stamps an arriving prompt group onto the earliest not-yet-consumed step inside the group's age window (`weight_version <= target <= weight_version + max_trajectory_age_steps`) that still lacks a full batch of age-valid groups, instead of the step its rollout batch was reserved for; the collector's gap-filling then tops up the later reservation. Groups that finish out of batch order thus form the next step in arrival order. Use `max_trajectory_age_steps: 2` or more: with an age window of 1 a group can only ever be stamped for its own reservation. With the default generation lead of one step, the collector may idle briefly once FIFO fills its only reservable step until the trainer advances.
 
 ### Weight Version Tracking
 
