@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ pytestmark = pytest.mark.nemo_gym
 _FakeGymActor = FakeGymActor
 _NO_RESTARTS = {"tools/replica-0": ()}
 _NO_RESTARTS_TWO = {"tools/replica-0": (), "tools/replica-1": ()}
+_NO_PARTICIPANTS = {"tools/replica-0": ()}
 
 
 def _coordinator(*actors: FakeGymActor) -> GymCheckpointCoordinator:
@@ -89,6 +91,7 @@ def test_manifest_rejects_duplicate_episode_identity() -> None:
             instances={"tools/replica-0": (episode, episode)},
             staging_keys={"tools/replica-0": ()},
             restarts={"tools/replica-0": ()},
+            participants={"tools/replica-0": ()},
         )
 
 
@@ -98,9 +101,10 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
     first = _FakeGymActor(
         staging_keys_by_episode={
             GymCheckpointEpisode("rollout-0", 0): ("rollout-0/call-0",)
-        }
+        },
+        participants=("agent", "policy"),
     )
-    second = _FakeGymActor()
+    second = _FakeGymActor(participants=("env", "policy"))
     coordinator = _coordinator(first, second)
     inventory = {
         "tools/replica-0": (GymCheckpointEpisode("rollout-0", 0),),
@@ -125,6 +129,11 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
         manifest = load_gym_checkpoint_manifest(tmp_path)
         assert manifest.checkpoint_id == "save-1"
         assert manifest.instances == inventory
+        # Each instance's committed participants, so a restore can require them.
+        assert manifest.participants == {
+            "tools/replica-0": first.participants,
+            "tools/replica-1": second.participants,
+        }
         assert manifest.staging_keys == {
             "tools/replica-0": ("rollout-0/call-0",),
             "tools/replica-1": (),
@@ -150,6 +159,7 @@ def test_coordinator_commits_and_restores_each_instance_inventory(
         commit_args = actor.calls[2][1]
         assert commit_args[0] == "save-1"
         assert commit_args[2] == inventory[f"tools/replica-{replica}"]
+        assert actor.calls[5][2]["participants"] == actor.participants
         retire_args = actor.calls[-2][1]
         assert retire_args[0] == "restore-1"
         assert retire_args[1] == tuple(
@@ -228,6 +238,24 @@ def test_coordinator_uses_environment_exported_subset_as_manifest(
     assert load_gym_checkpoint_manifest(tmp_path).instances == {"tools/replica-0": ()}
 
 
+def test_a_manifest_from_an_older_schema_names_its_version(tmp_path: Path) -> None:
+    """A schema-1 manifest predates participants; refuse it by version, not field."""
+    (tmp_path / "gym_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "checkpoint_id": "save-1",
+                "instances": {"tools/replica-0": []},
+                "staging_keys": {"tools/replica-0": []},
+                "restarts": {"tools/replica-0": []},
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="unsupported Gym checkpoint schema version 1"):
+        load_gym_checkpoint_manifest(tmp_path)
+
+
 def test_manifest_keeps_only_the_staging_keys_of_episodes_gym_saved(
     tmp_path: Path,
 ) -> None:
@@ -278,6 +306,7 @@ def test_a_summary_must_attribute_every_staging_key() -> None:
         GymCheckpointCommitSummary(
             exported_episodes=(),
             staging_keys=("orphan/call-0",),
+            participants=(),
         )
 
 
@@ -315,6 +344,7 @@ def test_restore_failure_discards_every_actor_under_uncertain_outcome() -> None:
             "tools/replica-1": (),
         },
         restarts=_NO_RESTARTS_TWO,
+        participants={"tools/replica-0": (), "tools/replica-1": ()},
     )
 
     with pytest.raises(GymCheckpointOperationError, match="restore failed"):
@@ -403,6 +433,7 @@ def _restore_manifest() -> GymCheckpointManifest:
         instances={"tools/replica-0": (GymCheckpointEpisode("rollout-0", 0),)},
         staging_keys={"tools/replica-0": ()},
         restarts=_NO_RESTARTS,
+        participants=_NO_PARTICIPANTS,
     )
 
 
@@ -503,6 +534,7 @@ def test_every_control_operation_is_bounded(operation: str, tmp_path: Path) -> N
         instances=episodes,
         staging_keys={"tools/replica-0": ()},
         restarts=_NO_RESTARTS,
+        participants=_NO_PARTICIPANTS,
     )
     calls = {
         "commit": lambda: coordinator.commit(
