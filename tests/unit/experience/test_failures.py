@@ -39,6 +39,7 @@ from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     NoHealthyShards,
     RolloutDataFailure,
@@ -459,6 +460,36 @@ class TestGymFailureRowsKeepTheirRow:
         assert item.timing_metrics is not None
         assert "timing/t/await_results" in item.timing_metrics
         assert "timing/t/postprocess_results_pct" not in item.timing_metrics
+
+    def test_a_failed_row_is_yielded_and_the_stream_goes_on(self):
+        """Raising would end the stream while the other rows still run in Gym."""
+        actor = object.__new__(NemoGym.__ray_metadata__.modified_class)
+        actor._require_spinup = lambda: None
+        actor._tokenizer = object()
+        actor.cfg = {}
+        actor.head_server_config = None
+        actor._token_capture_enabled = False
+        rows = [{"_rowidx": index, "agent_ref": {"name": "agent"}} for index in (0, 1)]
+
+        async def failed(row, status):
+            return row, _gym_failure_row(status=status)
+
+        actor.rch = SimpleNamespace(
+            run_examples=lambda **_: [failed(rows[0], 503), failed(rows[1], 400)]
+        )
+
+        async def stream() -> list:
+            return [item async for item in actor._stream_rollouts(rows, "timing/t")]
+
+        first, last = asyncio.run(stream())
+
+        assert isinstance(first, GymRowFailure) and isinstance(last, GymRowFailure)
+        assert (first.rowidx, last.rowidx) == (0, 1)
+        assert isinstance(first.error, GymTransportError)
+        assert isinstance(last.error, RolloutDataFailure)
+        # The run's timing rides on its last row, failed or not.
+        assert first.timing_metrics is None
+        assert last.timing_metrics is not None
 
     def test_a_row_that_ran_is_not_a_failure(self):
         assert _gym_failure_row_error({"_rowidx": 0}, {"reward": 1.0}) is None

@@ -64,6 +64,7 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -2509,7 +2510,15 @@ async def _merge_nemo_gym_instance_streams(
                 instance_label = iterators[iterator]
                 try:
                     future = task.result()
-                    row_index, resolved_agent_ref, result, timing_metrics = await future
+                    item = await future
+                    if isinstance(item, GymRowFailure):
+                        # This path retries the whole batch, not one row, so a
+                        # failed row still ends its instance's stream.
+                        stream = streams_by_iterator[iterator]
+                        if isinstance(stream, ray.ObjectRefGenerator):
+                            ray.cancel(stream)
+                        raise item.error
+                    row_index, resolved_agent_ref, result, timing_metrics = item
                 except StopAsyncIteration:
                     active_iterators.remove(iterator)
                     continue
