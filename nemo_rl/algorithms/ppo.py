@@ -156,15 +156,8 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     warmup_generation_lead_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
-    # In-flight refits: preempt in-flight requests and recompute their KV with the
-    # new weights (also clears the prefix cache). False keeps their pre-update KV
-    # (Magistral-style) AND leaves the prefix cache stale across weight updates,
-    # which grows train-vs-rollout mismatch when prompts share prefixes; the
-    # collector warns in that case on vLLM. Drained refits ask the backend to
-    # invalidate its caches regardless of this flag. Note: the shipped exemplar
-    # ppo_math_1B.yaml pins false, so recipes inheriting it keep false unless
-    # they set the key themselves.
-    recompute_kv_cache_after_weight_updates: bool = True
+    # Recomputes the KV cache after weight updates.
+    recompute_kv_cache_after_weight_updates: bool = False
     # Drops partial restored targets; replacement rollouts use subsequent prompts.
     drop_incomplete_targets_on_restore: bool = False
 

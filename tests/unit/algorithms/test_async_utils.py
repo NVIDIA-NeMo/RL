@@ -19,7 +19,6 @@ import threading
 import time
 import unittest.mock as mock
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import ray
@@ -39,10 +38,8 @@ from nemo_rl.algorithms.async_utils import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
-    _prefix_caching_may_be_enabled,
     _stamped_task_indices,
     _unanimous_task_index,
-    _warn_stale_prefix_cache_once,
 )
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
@@ -2752,7 +2749,6 @@ class TestAsyncTrajectoryCollector:
         the legacy contract: invalidate after the update only when the flag asks
         for it. The vLLM stale-prefix-cache warning must not fire for it."""
         _warn_unsupported_in_flight_refit_pause_once.cache_clear()
-        _warn_stale_prefix_cache_once.cache_clear()
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "megatron",
@@ -2786,7 +2782,6 @@ class TestAsyncTrajectoryCollector:
         assert output.count("has no native generation pause/resume support") == 1
         assert "prefix cache is NOT invalidated" not in output
         _warn_unsupported_in_flight_refit_pause_once.cache_clear()
-        _warn_stale_prefix_cache_once.cache_clear()
 
     def test_resume_failure_after_successful_pause_keeps_collection_paused(
         self,
@@ -2836,74 +2831,6 @@ class TestAsyncTrajectoryCollector:
         collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
         assert collector._refit_pause_cleared.is_set()
 
-    def test_in_flight_refit_without_recompute_keeps_cache_and_warns_once(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        """With in-flight updates and recompute disabled the cache is kept
-        (Magistral-style) and the collector warns once that the prefix cache
-        will go stale across weight updates."""
-        _warn_stale_prefix_cache_once.cache_clear()
-        collector = self.create_local_collector()
-        collector.master_config.policy["generation"] = {
-            "backend": "vllm",
-            "vllm_cfg": {"async_engine": True},  # enable_prefix_caching unset -> on
-        }
-        async_cfg = collector.master_config.grpo.async_grpo
-        async_cfg.in_flight_weight_updates = True
-        async_cfg.recompute_kv_cache_after_weight_updates = False
-        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=True)
-
-        for _ in range(2):
-            collector.prepare_for_refit()
-            collector.resume_after_refit()
-
-        collector.policy_generation.invalidate_kv_cache.assert_not_called()
-        assert collector.policy_generation.pause_generation_for_refit_calls == [
-            False,
-            False,
-        ]
-        output = capsys.readouterr().out
-        assert (
-            output.count("prefix cache is NOT invalidated across weight updates") == 1
-        )
-        _warn_stale_prefix_cache_once.cache_clear()
-
-    def test_in_flight_refit_without_recompute_does_not_warn_when_prefix_caching_off(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        _warn_stale_prefix_cache_once.cache_clear()
-        collector = self.create_local_collector()
-        collector.master_config.policy["generation"] = {
-            "backend": "vllm",
-            "vllm_cfg": {"async_engine": True, "enable_prefix_caching": False},
-        }
-        async_cfg = collector.master_config.grpo.async_grpo
-        async_cfg.in_flight_weight_updates = True
-        async_cfg.recompute_kv_cache_after_weight_updates = False
-
-        collector.prepare_for_refit()
-        collector.resume_after_refit()
-
-        assert "prefix cache is NOT invalidated" not in capsys.readouterr().out
-
-    @pytest.mark.parametrize(
-        ("generation_cfg", "expected"),
-        [
-            ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
-            ({"backend": "vllm", "vllm_cfg": {"enable_prefix_caching": True}}, True),
-            ({"backend": "vllm", "vllm_cfg": {"enable_prefix_caching": False}}, False),
-            ({"backend": "megatron"}, False),
-            ({"backend": "sglang", "use_async_rollouts": True}, False),
-            ({"backend": "trtllm", "trtllm_cfg": {"async_engine": True}}, False),
-        ],
-    )
-    def test_stale_prefix_cache_guard_is_vllm_only(
-        self, generation_cfg: dict[str, Any], expected: bool
-    ) -> None:
-        """The guard reads the vLLM knob only; other backends own their caches
-        elsewhere and must never be told to edit ``vllm_cfg``."""
-        assert _prefix_caching_may_be_enabled(generation_cfg) is expected
-
     @pytest.mark.parametrize(
         ("recompute_kv_cache", "expected_marker", "absent_marker"),
         [
@@ -2950,6 +2877,25 @@ class TestAsyncTrajectoryCollector:
         output = capsys.readouterr().out
         assert expected_marker in output
         assert absent_marker not in output
+
+    @pytest.mark.parametrize("backend", ["vllm", "sglang"])
+    def test_drained_refit_warns_when_backend_cache_reset_fails(
+        self, capsys: pytest.CaptureFixture[str], backend: str
+    ) -> None:
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {"backend": backend}
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = False
+        collector.master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = False
+        collector.policy_generation.invalidate_kv_cache = mock.Mock(return_value=False)
+        collector.wait_for_pending_generations = mock.Mock()
+
+        collector.prepare_for_refit()
+        collector.resume_after_refit()
+
+        collector.policy_generation.invalidate_kv_cache.assert_called_once_with()
+        output = capsys.readouterr().out
+        assert "⚠️ KV cache invalidation" in output
+        assert "ℹ️ Generation backend kept its KV caches" not in output
 
     def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
         collector = self.create_local_collector()

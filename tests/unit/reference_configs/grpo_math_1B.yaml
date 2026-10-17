@@ -73,15 +73,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    # Class default (AsyncGRPOConfig) is true: in-flight requests are preempted and
-    # re-prefilled with the new weights and the vLLM prefix cache is cleared on each
-    # refit. Pinned false here so recipes inheriting this file keep Magistral-style
-    # in-flight refits (in-flight requests keep their pre-update KV). With
-    # in_flight_weight_updates: true and vLLM prefix caching on, false also leaves the
-    # prefix cache stale across refits (the collector warns once): set true, or set
-    # policy.generation.vllm_cfg.enable_prefix_caching: false. Drained refits
-    # (in_flight_weight_updates: false) invalidate the caches regardless of this flag.
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

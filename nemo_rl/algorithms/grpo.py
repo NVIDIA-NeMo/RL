@@ -295,17 +295,8 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
-    # In-flight refits: preempt in-flight requests and recompute their KV with the
-    # new weights (also clears the prefix cache). False keeps their pre-update KV
-    # (Magistral-style) AND leaves the prefix cache stale across weight updates,
-    # which grows train-vs-rollout mismatch when prompts share prefixes; the
-    # collector warns in that case on vLLM. Drained refits ask the backend to
-    # invalidate its caches regardless of this flag. With the Megatron generation
-    # backend an unset flag is derived from mcore_generation_config.
-    # kv_cache_management_mode at setup (recompute -> true, else false); an
-    # explicit disagreement errors. Note: the shipped exemplar YAMLs pin false,
-    # so recipes inheriting them keep false unless they set the key themselves.
-    recompute_kv_cache_after_weight_updates: bool = True
+    # Recomputes the KV cache after weight updates.
+    recompute_kv_cache_after_weight_updates: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -472,42 +463,20 @@ def _get_grpo_save_state(
     return GRPOSaveState(**state_values)
 
 
-def _reconcile_megatron_recompute_kv_cache_flag(
-    async_grpo_config: Optional[AsyncGRPOConfig],
+def _check_megatron_recompute_kv_cache_flag(
+    async_grpo_config: AsyncGRPOConfig,
     generation_config: GenerationConfig,
 ) -> None:
-    """Align ``recompute_kv_cache_after_weight_updates`` with Megatron generation.
-
-    Megatron generation expresses recompute-after-refit engine-side via
-    ``mcore_generation_config.kv_cache_management_mode="recompute"``; the
-    loop-level flag must agree. The flag's class default (true) is chosen for
-    vLLM, where it also governs prefix-cache invalidation, so when the user left
-    the flag unset it is derived from the engine mode instead of erroring. Note
-    that ``model_fields_set`` reflects the merged YAML, exemplar included: a
-    recipe that inherits ``grpo_math_1B.yaml`` carries that file's explicit
-    value and never reaches the derivation.
+    """Check the async loop's recompute flag against Megatron's cache mode.
 
     Args:
-        async_grpo_config: ``grpo.async_grpo``; mutated in place when the flag
-            is derived. ``None`` means the legacy sync path, which has no flag.
+        async_grpo_config: Enabled ``grpo.async_grpo`` configuration.
         generation_config: ``policy.generation`` with ``backend == "megatron"``.
 
     Raises:
-        ValueError: when an explicitly set flag disagrees with the engine mode.
+        ValueError: If the recompute flag disagrees with the engine's cache mode.
     """
-    if (
-        async_grpo_config is not None
-        and "recompute_kv_cache_after_weight_updates"
-        not in async_grpo_config.model_fields_set
-    ):
-        async_grpo_config.recompute_kv_cache_after_weight_updates = (
-            generation_config["mcore_generation_config"]["kv_cache_management_mode"]
-            == "recompute"
-        )
-    recompute_kv_cache = bool(
-        async_grpo_config is not None
-        and async_grpo_config.recompute_kv_cache_after_weight_updates
-    )
+    recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
     kv_cache_mode = generation_config["mcore_generation_config"][
         "kv_cache_management_mode"
     ]
@@ -518,7 +487,7 @@ def _reconcile_megatron_recompute_kv_cache_flag(
             f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
             "with policy.generation.backend='megatron' the two must agree. "
             "Either set the flag to true with kv_cache_management_mode="
-            "'recompute', or leave the flag false with 'persist'/'offload'."
+            "'recompute', or set the flag to false with 'persist'/'offload'."
         )
 
 
@@ -790,10 +759,13 @@ def setup(
             "full-vocabulary reverse KL."
         )
 
-    # Reconcile the loop-level recompute flag with Megatron generation before the
-    # config is logged or checkpointed, so every consumer sees the derived value.
-    if generation_config["backend"] == "megatron":
-        _reconcile_megatron_recompute_kv_cache_flag(
+    # Check the async loop's recompute flag before logging or allocating Ray resources.
+    if (
+        generation_config["backend"] == "megatron"
+        and grpo_config.async_grpo is not None
+        and grpo_config.async_grpo.enabled
+    ):
+        _check_megatron_recompute_kv_cache_flag(
             grpo_config.async_grpo, generation_config
         )
 
