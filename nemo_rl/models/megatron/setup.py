@@ -44,6 +44,7 @@ from megatron.bridge.training.config import (
     DistributedInitConfig,
     LoggerConfig,
     OptimizerConfig,
+    RNGConfig,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -1790,6 +1791,10 @@ def _apply_precision_config(
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
+    if "deterministic_mode" in config["megatron_cfg"]:
+        model_cfg.deterministic_mode = config["megatron_cfg"]["deterministic_mode"]
+    if config["megatron_cfg"].get("deterministic_mode"):
+        model_cfg.cross_entropy_loss_fusion = False
 
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
@@ -2139,6 +2144,13 @@ def _create_megatron_config(
 
     return ConfigContainer(
         model=model_cfg,
+        rng=RNGConfig(
+            **(
+                {"seed": config["megatron_cfg"]["seed"]}
+                if "seed" in config["megatron_cfg"]
+                else {}
+            )
+        ),
         checkpoint=checkpoint_config,
         logger=LoggerConfig(logging_level=0),
         dist=dist_cfg,

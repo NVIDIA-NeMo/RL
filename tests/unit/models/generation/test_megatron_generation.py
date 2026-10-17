@@ -735,6 +735,7 @@ def test_direct_megatron_multimodal_generate_round_trip(
 
     worker = object.__new__(MegatronGenerationMixin)
     worker.cfg = {
+        "megatron_cfg": {},
         "generation": {
             "temperature": 1.0,
             "top_k": None,
@@ -742,7 +743,7 @@ def test_direct_megatron_multimodal_generate_round_trip(
             "max_new_tokens": 2,
             "stop_strings": None,
             "mcore_generation_config": {},
-        }
+        },
     }
     worker.tokenizer = SimpleNamespace(pad_token_id=0)
     worker.megatron_tokenizer = SimpleNamespace(eod=2)
