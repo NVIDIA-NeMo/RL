@@ -57,9 +57,9 @@ dependencies = [
   "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Keep the base range compatible with every backend-specific pin (5.5.4 through
+  # 5.16.1). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.16.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -217,7 +217,8 @@ mcore = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "transformers==5.12.1",
+  # Within Megatron-Bridge's supported range (>=5.15,<5.20); Megatron-Bridge itself locks 5.19.0.
+  "transformers==5.16.1",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
