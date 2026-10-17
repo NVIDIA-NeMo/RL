@@ -1,0 +1,5 @@
+# Pair of the masked-reward-include config: differs only in grpo.masked_reward_policy.
+defaults: ../grpo_math_1B.yaml
+
+grpo:
+  masked_reward_policy: exclude
