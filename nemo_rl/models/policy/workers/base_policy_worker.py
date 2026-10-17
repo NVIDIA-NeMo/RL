@@ -18,7 +18,6 @@ import torch
 import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -165,8 +164,6 @@ class AbstractPolicyWorker:
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: Optional[RefitPayloadMode] = None,
     ) -> dict[str, Any]:
         """Prepare parameter metadata for NCCL reshard refit."""
         # This is a placeholder implementation.
