@@ -42,7 +42,7 @@ an actor are converted to a picklable member of this taxonomy *before* they cros
 from __future__ import annotations
 
 import enum
-from typing import Final, Optional
+from typing import Any, Final, Optional
 
 import ray.exceptions
 
@@ -107,6 +107,33 @@ class NoHealthyShards(RolloutInfraFailure):
 
 class GymTransportError(RolloutInfraFailure):
     """NeMo-Gym failed at the transport layer rather than returning a rollout."""
+
+
+class GymAdmissionClosed(RolloutInfraFailure):
+    """NeMo-Gym refused a new ``/run`` because a checkpoint has admission closed.
+
+    Gym refuses before it records anything for the episode, so the attempt is
+    unwound and re-dispatched once dispatch admission reopens. The NemoGym actor
+    yields it per row instead of raising, so rows Gym did admit keep streaming.
+    It is INFRA only as a fallback: a caller without a dispatch recorder that
+    raises it retries the row instead of charging the prompt a data failure.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        rowidx: int,
+        timing_metrics: Optional[dict[str, Any]] = None,
+    ) -> None:
+        # Every value rides in ``args`` so the exception pickles across Ray.
+        super().__init__(detail, rowidx, timing_metrics)
+        self.detail = detail
+        self.rowidx = rowidx
+        # The ``/run`` timing, when this refusal was the run's last row.
+        self.timing_metrics = timing_metrics
+
+    def __str__(self) -> str:
+        return self.detail
 
 
 class RolloutDataFailure(RolloutFailure):

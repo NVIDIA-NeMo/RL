@@ -45,6 +45,7 @@ ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES: tuple[RolloutCheckpointAttemptOutcome, ...]
 
 RolloutCheckpointAttemptReason = Literal[
     "completed",
+    "gym_unavailable",
     "invariant_error",
     "io_error",
     "missing_trainer_anchor",
@@ -89,6 +90,7 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "policy.optimizer",
         "policy.scheduler",
         "rollout_checkpointing",
+        "rollout_recovery.gym_prepare_timeout_s",
         "token_capture.capture_dir",
         "token_capture.control_auth_token",
         "token_capture.control_timeout_s",
