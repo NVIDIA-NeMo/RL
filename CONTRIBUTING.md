@@ -8,7 +8,7 @@ Thanks for your interest in contributing to NeMo RL!
 
 1. **Build and run the Docker container**:
 ```sh
-docker buildx build -t nemo-rl:latest -f Dockerfile .
+docker buildx build -t nemo-rl:latest -f docker/Dockerfile .
 ```
 
 To start a shell in the container to interactively run/develop:
