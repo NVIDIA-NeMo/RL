@@ -1,0 +1,12 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-automodel.v3.yaml
+data_plane:
+  enabled: true
+  simple:
+    # Nightly coverage for SimpleStorage SSD offload. A 1 KiB threshold sends
+    # every per-token field (512 tokens x >= 4 B) to SSD. The wrapper script
+    # overrides `path` with a fresh per-run dir and asserts files appear in it;
+    # the value here only has to be a valid absolute path.
+    ssd_offload:
+      enabled: true
+      path: /tmp/nrl_tq_ssd_offload
+      threshold_bytes: 1024
