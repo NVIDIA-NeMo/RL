@@ -738,6 +738,20 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
+    def drain_for_weight_update(self) -> None:
+        """Finish running requests and hold the rest before a weight update.
+
+        Unlike :meth:`pause_generation_for_refit`, which freezes in-flight requests
+        so they continue on the new weights, this lets requests the engine is
+        running complete on the current weights; queued and new requests wait and
+        run on the new weights. Backends whose weight update is unsafe while any
+        request runs override it (managed Dynamo's layerwise reload). The default
+        is a no-op, for engines that take weight updates with requests in flight.
+        """
+
+    def resume_after_weight_update(self) -> None:
+        """Resume serving after :meth:`drain_for_weight_update`."""
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

@@ -463,6 +463,12 @@ class _FakeGeneration:
     def wake_carries_weight_updates(self) -> bool:
         return True
 
+    def drain_for_weight_update(self) -> None:
+        pass
+
+    def resume_after_weight_update(self) -> None:
+        pass
+
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         self._events.append("finish_generation")  # type: ignore[union-attr]
         return True

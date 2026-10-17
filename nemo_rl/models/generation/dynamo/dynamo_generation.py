@@ -15,7 +15,7 @@
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -40,6 +40,9 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -143,6 +146,53 @@ def _parse_dynamo_completion_response(
 
 class DynamoGeneration(GenerationInterface):
     """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController settings the managed Dynamo backend cannot honor."""
+        fleet_health = master_config.async_rl.generation_fleet_health
+        if fleet_health.enabled:
+            # The Dynamo frontend routes every request across its worker fleet, so
+            # there are no NeMo RL-selected shards for fleet health to track.
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
+                "routing. Set async_rl.generation_fleet_health.enabled=false."
+            )
+        if fleet_health.refit_timeout_s is not None:
+            # Dynamo workers cannot abort their refit collective, so a deadline would
+            # be refused at the first weight update; fail before anything builds.
+            raise ValueError(
+                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
+                "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
+                "refit deadline."
+            )
+        if master_config.async_rl.recompute_kv_cache_after_weight_updates:
+            # The pre-refit drain already clears every worker's cache, and nothing
+            # runs until resume, so a post-refit flush only adds a second drain.
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates must be false with "
+                "policy.generation.backend='dynamo'; the pre-refit drain already "
+                "clears every worker's KV and prefix cache."
+            )
+        # Setup has already normalized this through DynamoConfig.
+        generation = cast(dict[str, Any], master_config.policy["generation"])
+        dynamo_cfg = generation["dynamo_cfg"]
+        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
+            raise ValueError(
+                "policy.generation.dynamo_cfg.control_timeout_s "
+                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
+                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
+                "which waits for running requests to finish."
+            )
+        if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
+            # Only the legacy GRPO loop reads and clears the driver's sampler; here
+            # it would accumulate samples for the whole run.
+            raise ValueError(
+                "policy.generation.vllm_cfg.enable_vllm_metrics_logger must be false "
+                "with policy.generation.backend='dynamo' under the SingleController; "
+                "nothing reads the Dynamo metrics sampler on this path."
+            )
 
     def __init__(
         self,
@@ -310,8 +360,9 @@ class DynamoGeneration(GenerationInterface):
         """Serialize only HTTP clients needed by Ray rollout actors.
 
         Driver-owned subprocesses, threads, and Ray worker handles are excluded.
-        The endpoint-only refit channel is retained so AREAL-style cache
-        invalidation still reaches every managed worker after deserialization.
+        The refit channel's client copy is retained so weight updates and
+        AREAL-style cache invalidation still reach every managed worker after
+        deserialization.
         """
         refit_channel = self._refit_channel
         return {
@@ -651,3 +702,17 @@ class DynamoGeneration(GenerationInterface):
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.flush_cache()
+
+    def drain_for_weight_update(self) -> None:
+        """Drain and pause every worker; layerwise reload is unsafe mid-request."""
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.pause()
+
+    def resume_after_weight_update(self) -> None:
+        """Resume every worker after a weight update."""
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.resume()

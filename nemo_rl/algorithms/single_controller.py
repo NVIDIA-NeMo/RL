@@ -5430,15 +5430,19 @@ class SingleControllerActor:
         """Pause new rollout dispatches, synchronize weights, resume.
 
         SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
-        A colocated engine is instead already stood down: the synchronizer's sync is the wake,
-        and step 4 resumes dispatch.
+        Managed Dynamo cannot, so it drains around the transfer (steps 4 and 6). A colocated
+        engine is instead already stood down: the synchronizer's sync is the wake, and step 7
+        resumes dispatch.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. weight_synchronizer.sync_weights(kv_scales=...)
-          5. _rollout_permitted.set()   — resume
+          4. generation.drain_for_weight_update()  — no-op except managed Dynamo
+          5. weight_synchronizer.sync_weights(kv_scales=...), retried once if recovery
+             rebuilds the group
+          6. generation.resume_after_weight_update()  — in finally, so also after a failed update
+          7. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -5502,6 +5506,11 @@ class SingleControllerActor:
         with self._timer.time("prepare_for_generation/sync_policy_params"):
             await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
+        # A no-op for engines that serve through the refit. Backends whose weight
+        # update is unsafe while any request runs (managed Dynamo) drain here, before
+        # the trainer starts broadcasting, so the collective never waits on a peer
+        # that is still finishing requests. Held across a retry; released in finally.
+        await asyncio.to_thread(self._gen.drain_for_weight_update)
         try:
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
@@ -5548,6 +5557,8 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
+        finally:
+            await asyncio.to_thread(self._gen.resume_after_weight_update)
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

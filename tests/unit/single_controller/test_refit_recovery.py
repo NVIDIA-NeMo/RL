@@ -138,6 +138,8 @@ def _make_controller(
     ctrl._gen = SimpleNamespace(
         requires_kv_scale_sync=False,
         invalidate_kv_cache=MagicMock(),
+        drain_for_weight_update=MagicMock(),
+        resume_after_weight_update=MagicMock(),
         # The probe asks by shard index; the shard-to-worker layout stays in the backend.
         shard_liveness_ref=_liveness,
     )

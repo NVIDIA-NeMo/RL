@@ -14,8 +14,12 @@
 
 """Validate a resolved ``dynamo.vllm`` argv without starting an engine."""
 
+import dataclasses
 import json
 import sys
+
+# Fields NeMo RL sends in each ``update_weights`` round (see refit.py).
+_UPDATE_INFO_FIELDS = {"names", "dtype_names", "shapes"}
 
 
 def main() -> None:
@@ -36,9 +40,11 @@ def main() -> None:
         vllm.platforms.current_platform = CpuPlatform()
 
     from dynamo.vllm.args import parse_args
-    from vllm.distributed.weight_transfer.packed_tensor import (
-        DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-        DEFAULT_PACKED_NUM_BUFFERS,
+    from vllm.distributed.weight_transfer.nccl_common import (
+        NCCLWeightTransferInitInfo,
+    )
+    from vllm.distributed.weight_transfer.nccl_engine import (
+        NCCLWeightTransferUpdateInfo,
     )
 
     argv = json.loads(sys.argv[1])
@@ -46,21 +52,33 @@ def main() -> None:
         raise TypeError("resolved Dynamo argv must be a JSON list of strings")
     parse_args(argv)
 
-    expected = json.loads(sys.argv[2])
-    actual_geometry = (
-        DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-        DEFAULT_PACKED_NUM_BUFFERS,
-    )
-    expected_geometry = (
-        expected["buffer_size_bytes"],
-        expected["num_buffers"],
-    )
-    if actual_geometry != expected_geometry:
+    # NeMo RL declares the packed geometry in the init info and sends only
+    # per-round tensor metadata in the update info. Fail before engine startup
+    # if the installed vLLM weight-transfer API no longer accepts that shape.
+    geometry = json.loads(sys.argv[2])
+    try:
+        NCCLWeightTransferInitInfo(
+            master_address="127.0.0.1",
+            master_port=1,
+            rank_offset=1,
+            world_size=2,
+            packed=True,
+            packed_buffer_size_bytes=geometry["buffer_size_bytes"],
+            packed_num_buffers=geometry["num_buffers"],
+        )
+    except TypeError as error:
         raise SystemExit(
-            "vLLM packed-transfer geometry changed: "
-            f"engine has {actual_geometry}, NeMo RL sends {expected_geometry}. "
-            "Update the Dynamo CollectiveSenderSpec and the Dynamo "
-            "VLLM_PACKED_* constants."
+            "vLLM NCCLWeightTransferInitInfo does not accept NeMo RL's packed "
+            f"init info: {error}. Update the Dynamo refit protocol in refit.py."
+        ) from error
+    update_fields = {
+        field.name for field in dataclasses.fields(NCCLWeightTransferUpdateInfo)
+    }
+    if update_fields != _UPDATE_INFO_FIELDS:
+        raise SystemExit(
+            "vLLM NCCLWeightTransferUpdateInfo fields changed: engine has "
+            f"{sorted(update_fields)}, NeMo RL sends {sorted(_UPDATE_INFO_FIELDS)}. "
+            "Update the Dynamo refit protocol in refit.py."
         )
 
 
