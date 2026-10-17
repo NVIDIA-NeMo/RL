@@ -642,7 +642,7 @@ Each step logs `agent_loss_weights/<agent>/{weight,effective_weight,num_samples,
 
 Weights multiply `sample_mask`, so they affect the policy gradient and other losses that consume that mask, including reference KL and MTP. They leave baselines, advantages, dynamic sampling and the pre-training sequence-error filter unchanged. The in-loss filter uses each row's original probability error; loss-side diagnostics such as KL and `token_mult_prob_error` become weighted averages.
 
-Weights are normalized within each optimizer step to preserve its valid-token mass before in-loss filtering, provided at least one trained row has positive weight. Only relative weights matter, up to floating-point rounding. An all-zero-weight step has zero valid tokens. With `loss_fn.seq_logprob_error_in_loss`, rejected rows change the surviving weighted token mass and hence the final auxiliary-gradient scale; see the implementation docstring for details.
+Weights are normalized within each optimizer step to preserve its valid-token mass before in-loss filtering. At least one trained row in each nonempty step must retain positive weight; otherwise training raises an error before the policy update. This prevents an empty weighted loss from leaving auxiliary losses active with a zero token denominator. Already-masked steps are unchanged. Only relative weights matter, up to floating-point rounding. With `loss_fn.seq_logprob_error_in_loss`, rejected rows change the surviving weighted token mass and hence the final auxiliary-gradient scale; see the implementation docstring for details.
 
 The option requires `env.should_use_nemo_gym: true` and applies to `grpo_train` and `async_grpo_train`. Data-plane and SingleController trainers reject it.
 

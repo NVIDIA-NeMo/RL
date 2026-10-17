@@ -552,8 +552,42 @@ class TestAgentLossWeights:
         # Step 0: c = 220 / (200 + 4 * 20) = 220 / 280; both ranks' masses moved.
         assert after_local[0] == pytest.approx([200 * 220 / 280, 80 * 220 / 280])
 
-    def test_fully_zero_weighted_step_stays_zero_without_nan(self):
-        train_data = self._train_data([10, 10], [1.0, 1.0])
+    @pytest.mark.parametrize(
+        "trained_tokens,sample_mask,names,global_batch_size,empty_step",
+        [
+            ([10, 10], [1.0, 1.0], ["a", "a"], 2, 0),
+            ([10, 10, 10, 10], [1.0] * 4, ["b", "b", "a", "a"], 2, 1),
+            ([10, 10], [1.0, 0.0], ["a", "b"], 2, 0),
+            ([10, 0], [1.0, 1.0], ["a", "b"], 2, 0),
+        ],
+        ids=[
+            "all-zero",
+            "later-step",
+            "masked-positive-agent",
+            "tokenless-positive-agent",
+        ],
+    )
+    def test_weights_cannot_remove_all_trained_tokens_from_an_optimizer_step(
+        self, trained_tokens, sample_mask, names, global_batch_size, empty_step
+    ):
+        train_data = self._train_data(trained_tokens, sample_mask)
+        original_mask = train_data["sample_mask"].clone()
+
+        with pytest.raises(
+            ValueError,
+            match=f"removes all trained tokens from optimizer step {empty_step}",
+        ):
+            _apply_agent_loss_weights(
+                train_data,
+                [{"name": name} for name in names],
+                {"a": 0.0},
+                train_global_batch_size=global_batch_size,
+            )
+
+        torch.testing.assert_close(train_data["sample_mask"], original_mask)
+
+    def test_already_masked_step_stays_masked(self):
+        train_data = self._train_data([10, 10], [0.0, 0.0])
         agent_refs = [{"name": "a"}, {"name": "a"}]
 
         metrics = _apply_agent_loss_weights(

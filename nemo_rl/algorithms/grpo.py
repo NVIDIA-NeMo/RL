@@ -382,8 +382,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     overlong_filtering: bool = False
     # NeMo-Gym loss weights keyed by resolved agent_ref.name. Values must be
     # finite and >= 0; unlisted agents keep 1, and zero excludes a row's loss.
-    # Weights are relative and normalized per optimizer step; the guide explains
-    # the all-zero and in-loss-filter cases. Baselines and advantages are unchanged.
+    # Each nonempty optimizer step must retain a positive-weight trained row.
+    # Weights are relative; baselines and advantages are unchanged.
     # Legacy synchronous/asynchronous GRPO only; None disables.
     agent_loss_weights: dict[str, float] | None = None
     # whether to enable dynamic sampling, i.e.
@@ -2672,11 +2672,13 @@ def _apply_agent_loss_weights(
     ``grpo.agent_loss_weights[agent_ref.name]`` (agents not listed keep 1.0;
     already-masked rows stay 0), then rescales the product within every
     optimizer-step global batch so that ``sum(token_mask[:, 1:] * sample_mask)``
-    is unchanged when some trained row retains positive weight. An all-zero
-    weighted batch has zero valid tokens. A global batch is each consecutive
-    ``train_global_batch_size``
-    rows of ``train_data``: that is how ``Policy.train`` splits the batch
-    (``BatchedDataDict.shard_by_batch_size``) before every worker computes
+    is unchanged. A nonempty step whose trained rows all have weight 0 raises
+    before changing the mask or reaching the policy update: an empty weighted
+    loss must not leave auxiliary losses active with a zero token denominator.
+    Already-masked steps are unchanged. A global batch is each consecutive
+    ``train_global_batch_size`` rows of ``train_data``. ``Policy.train`` uses
+    ``BatchedDataDict.shard_by_batch_size`` to split these batches before each
+    worker computes
     ``global_valid_toks`` over it (``process_global_batch``).
 
     The policy loss divides its ``sample_mask``-weighted numerator by that same
@@ -2731,14 +2733,21 @@ def _apply_agent_loss_weights(
         train_data["token_mask"][:, 1:].sum(dim=-1).to(sample_mask.dtype) * sample_mask
     )
     # Per optimizer step, rescale so the weighted token mass equals the raw one.
-    # A step whose trained rows all have weight 0 has nothing to preserve and
-    # keeps its zero mask.
+    # Reject newly empty steps: auxiliary losses can remain active even when
+    # every sample's loss mask is zero.
     normalizer = torch.ones_like(sample_mask)
     for start in range(0, num_samples, train_global_batch_size):
         rows = slice(start, start + train_global_batch_size)
+        original_mass = trained_tokens[rows].sum()
         weighted_mass = (trained_tokens[rows] * weights[rows]).sum()
         if weighted_mass > 0:
-            normalizer[rows] = trained_tokens[rows].sum() / weighted_mass
+            normalizer[rows] = original_mass / weighted_mass
+        elif original_mass > 0:
+            raise ValueError(
+                "grpo.agent_loss_weights removes all trained tokens from optimizer "
+                f"step {start // train_global_batch_size}; keep a positive weight "
+                "for at least one agent with trained tokens in every nonempty step."
+            )
     effective_weights = weights * normalizer
     train_data["sample_mask"] = sample_mask * effective_weights
 
