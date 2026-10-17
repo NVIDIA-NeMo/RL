@@ -463,11 +463,13 @@ class _FakeGeneration:
     def pause_generation_for_refit(
         self, *, clear_cache: bool, timeout_s: float | None = None
     ) -> bool:
+        # Model native pause/clear support; unsupported backends are covered in
+        # test_single_controller_actor.py rather than these checkpoint tests.
         del clear_cache, timeout_s
-        return False
+        return True
 
     def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
-        return False
+        return True
 
     def invalidate_kv_cache(self) -> bool:
         return False

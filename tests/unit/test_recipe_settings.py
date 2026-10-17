@@ -16,6 +16,7 @@ import shlex
 from pathlib import Path
 
 import pytest
+from omegaconf import DictConfig, OmegaConf
 
 from nemo_rl.utils.config import (
     load_config,
@@ -24,36 +25,89 @@ from nemo_rl.utils.config import (
 )
 
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
-
-
-@pytest.mark.parametrize(
-    "script_name",
-    [
-        "grpo_megatron_generation_gym_single_controller.sh",
-        "grpo_megatron_generation_colocated_reshard_gym_single_controller.sh",
-    ],
+FUNCTIONAL_ROOT = Path(__file__).parents[2] / "tests/functional"
+MEGATRON_FUNCTIONAL_SCRIPTS = sorted(
+    {
+        path.name
+        for path in FUNCTIONAL_ROOT.glob("*.sh")
+        if "policy.generation.backend=megatron" in path.read_text()
+    }
+    | {"grpo_megatron_generation_gym_single_controller.sh"}
 )
-def test_megatron_single_controller_gym_scripts_recompute_kv(script_name: str) -> None:
+
+
+def _load_megatron_functional_config(script_name: str) -> tuple[DictConfig, bool]:
     register_omegaconf_resolvers()
     project_root = Path(__file__).parents[2]
-    script = (project_root / "tests/functional" / script_name).read_text()
-    command = next(
-        line
+    script = (FUNCTIONAL_ROOT / script_name).read_text()
+    commands = [
+        shlex.split(line)
         for line in script.replace("\\\n", " ").splitlines()
-        if line.startswith("uv run coverage run ")
+        if line.lstrip().startswith("uv run ")
+        and any(name in line for name in ("run_grpo", "run_vlm_grpo", "$SC_ENTRYPOINT"))
+    ]
+    arguments = next(
+        args
+        for args in commands
+        if any(
+            "run_grpo" in arg or "run_vlm_grpo" in arg or arg == "$SC_ENTRYPOINT"
+            for arg in args
+        )
     )
-    arguments = shlex.split(command)
-    config_path = arguments[arguments.index("--config") + 1].replace(
-        "$PROJECT_ROOT", str(project_root)
-    )
+    if "--config" in arguments:
+        config_path = arguments[arguments.index("--config") + 1].replace(
+            "$PROJECT_ROOT", str(project_root)
+        )
+    else:
+        assert any(arg.endswith("run_grpo_sliding_puzzle.py") for arg in arguments)
+        config_path = str(project_root / "examples/configs/grpo_sliding_puzzle.yaml")
     overrides = [
         argument
         for argument in arguments
-        if argument.lstrip("+").startswith(("policy.generation.", "async_rl."))
+        if argument.lstrip("+").startswith(
+            (
+                "policy.generation.backend=",
+                "policy.generation.mcore_generation_config.kv_cache_management_mode=",
+                "async_rl.",
+                "grpo.async_grpo.",
+            )
+        )
     ]
     config = parse_hydra_overrides(load_config(config_path), overrides)
+    single_controller = any(
+        "run_grpo_single_controller" in arg or arg == "$SC_ENTRYPOINT"
+        for arg in arguments
+    )
+    return config, single_controller
+
+
+@pytest.mark.parametrize("script_name", MEGATRON_FUNCTIONAL_SCRIPTS)
+def test_megatron_functional_scripts_keep_kv_settings_consistent(
+    script_name: str,
+) -> None:
+    # Load algorithm schemas only for these tests; other recipe tests need no Ray/Torch.
+    from nemo_rl.algorithms.grpo import AsyncGRPOConfig
+    from nemo_rl.algorithms.single_controller_utils.config import AsyncRLConfig
+
+    config, single_controller = _load_megatron_functional_config(script_name)
     assert config.policy.generation.backend == "megatron"
-    assert (
+    async_path = "async_rl" if single_controller else "grpo.async_grpo"
+    raw_async_config = OmegaConf.select(config, async_path)
+    async_values = (
+        OmegaConf.to_container(raw_async_config, resolve=True)
+        if raw_async_config is not None
+        else {}
+    )
+    if single_controller:
+        async_config = AsyncRLConfig.model_validate(async_values)
+    else:
+        if raw_async_config is None:
+            return
+        async_config = AsyncGRPOConfig.model_validate(async_values)
+        if not async_config.enabled:
+            return
+    # Preserve intentional persist/offload opt-outs as well as the recompute default.
+    assert async_config.recompute_kv_cache_after_weight_updates == (
         config.policy.generation.mcore_generation_config.kv_cache_management_mode
         == "recompute"
     )

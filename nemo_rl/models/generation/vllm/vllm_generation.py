@@ -939,8 +939,8 @@ class VllmGeneration(GenerationInterface):
         """
         self._refit_membership = membership
 
-    def _refit_leader_workers(self) -> list[Any]:
-        """DP leaders that should receive refit calls, in rank order.
+    def _refit_leaders_by_shard(self) -> list[tuple[int, int, Any]]:
+        """Snapshot (shard index, leader index, worker) in refit rank order.
 
         Falls back to every leader when no membership has been recorded, which is the
         state for the entire life of a run that never loses a shard.
@@ -951,17 +951,24 @@ class VllmGeneration(GenerationInterface):
         membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
-            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+            shard_indices = range(self.dp_size)
+        else:
+            per_shard = membership.workers_per_shard
+            shard_indices = membership.shard_prefixes
         leaders = []
-        for shard_idx in membership.shard_prefixes:
-            leader_idx = shard_idx * membership.workers_per_shard
+        for shard_idx in shard_indices:
+            leader_idx = shard_idx * per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
                     f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
                     f"{len(workers)} workers"
                 )
-            leaders.append(workers[leader_idx])
+            leaders.append((shard_idx, leader_idx, workers[leader_idx]))
         return leaders
+
+    def _refit_leader_workers(self) -> list[Any]:
+        """DP leaders that should receive refit calls, in rank order."""
+        return [worker for _, _, worker in self._refit_leaders_by_shard()]
 
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
@@ -1767,19 +1774,8 @@ class VllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        membership = self._refit_membership
-        shard_indices = (
-            list(membership.shard_prefixes)
-            if membership is not None
-            else list(range(self.dp_size))
-        )
-        per_shard = (
-            membership.workers_per_shard
-            if membership is not None
-            else len(self.worker_group.workers) // self.dp_size
-        )
-        leaders = self._refit_leader_workers()
-        futures = [worker.resume_generation_async.remote() for worker in leaders]
+        leaders = self._refit_leaders_by_shard()
+        futures = [worker.resume_generation_async.remote() for _, _, worker in leaders]
         # Settle all calls within one budget before inspecting failures. A dead leader
         # must not prevent us from waiting for the surviving engines to resume.
         _, pending = ray.wait(futures, num_returns=len(futures), timeout=timeout_s)
@@ -1787,14 +1783,14 @@ class VllmGeneration(GenerationInterface):
             raise RefitAborted(
                 f"vLLM generation resume did not return within {timeout_s}s"
             )
-        for shard_idx, worker, future in zip(shard_indices, leaders, futures):
+        for (shard_idx, leader_idx, worker), future in zip(leaders, futures):
             try:
                 resumed = ray.get(future)
             except ray.exceptions.ActorDiedError as exc:
                 if self.fleet_monitor is None:
                     raise
                 # A late error from an old actor must not condemn its replacement.
-                if self.worker_group.workers[shard_idx * per_shard] is worker:
+                if self.worker_group.workers[leader_idx] is worker:
                     self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
                 continue
             if not resumed:

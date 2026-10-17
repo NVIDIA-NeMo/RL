@@ -622,8 +622,8 @@ def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock(workers=[object(), object()])
     leaders = [MagicMock(), MagicMock()]
+    generation.worker_group = MagicMock(workers=leaders)
     pause_futures = [object(), object()]
     resume_futures = [object(), object()]
     for worker, pause_future, resume_future in zip(
@@ -631,7 +631,6 @@ def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     ):
         worker.pause_generation_async.remote.return_value = pause_future
         worker.resume_generation_async.remote.return_value = resume_future
-    generation._refit_leader_workers = MagicMock(return_value=leaders)
     generation._refit_membership = None
     generation.dp_size = 2
     generation.fleet_monitor = None
@@ -661,9 +660,8 @@ def test_vllm_generation_refit_pause_and_resume_raise_on_timeout(
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock(workers=[object()])
     worker = MagicMock()
-    generation._refit_leader_workers = MagicMock(return_value=[worker])
+    generation.worker_group = MagicMock(workers=[worker])
     generation._refit_membership = None
     generation.dp_size = 1
     ray_get = MagicMock(side_effect=ray.exceptions.GetTimeoutError("timed out"))
@@ -691,9 +689,8 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock(workers=[object(), object()])
     leaders = [MagicMock(), MagicMock()]
-    generation._refit_leader_workers = MagicMock(return_value=leaders)
+    generation.worker_group = MagicMock(workers=leaders)
     generation._refit_membership = None
     generation.dp_size = 2
     monkeypatch.setattr(ray, "wait", MagicMock(return_value=([], [])))

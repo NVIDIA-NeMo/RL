@@ -75,12 +75,17 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+    SGLangColocatedWeightSynchronizer,
+    SGLangDisaggregatedWeightSynchronizer,
+)
 
 
 class FakeWeightSynchronizer:
@@ -879,6 +884,101 @@ async def test_sync_weights_honors_recompute_kv_cache_config(
         *(["invalidate"] if expected_invalidation_calls else []),
     ]
     assert ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@pytest.mark.parametrize("recompute_kv_cache", [False, True])
+def test_sync_weights_sglang_flushes_only_while_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+    recompute_kv_cache: bool,
+) -> None:
+    """Use the real hooks and synchronizer; a flush after resume must fail."""
+    events: list[str] = []
+    paused = False
+
+    def pause(*, mode: str) -> None:
+        nonlocal paused
+        assert mode == "retract"
+        paused = True
+        events.append("pause")
+
+    def flush() -> None:
+        events.append("flush")
+        if not paused:
+            raise RuntimeError("SGLang refuses flush_cache with running requests")
+
+    def resume() -> None:
+        nonlocal paused
+        paused = False
+        events.append("resume")
+
+    def transfer(**_: Any) -> list:
+        assert paused
+        assert events[-1] == "begin"
+        events.append("transfer")
+        return []
+
+    engine = MagicMock()
+    engine.pause_generation.remote.side_effect = pause
+    engine.invalidate_kv_cache.remote.side_effect = flush
+    engine.continue_generation.remote.side_effect = resume
+    engine.begin_weight_update.remote.side_effect = lambda: events.append("begin")
+    engine.end_weight_update.remote.side_effect = lambda: events.append("end")
+    monkeypatch.setattr("ray.get", lambda refs: refs)
+
+    gen = object.__new__(SGLangGeneration)
+    # No server/router was started; avoid resource cleanup in __del__.
+    gen.shutdown = MagicMock()
+    gen.all_engines = [engine]
+    gen.num_new_engines = 0
+    gen.num_gpus_per_engine = 1
+    gen.num_gpus_per_node = 1
+    gen.gpu_offset = 0
+    gen.pause_generation_mode = "retract"
+    gen.needs_offload = False
+    gen._health_monitor = None
+    gen.rollout_engine_lock = None
+    gen.sglang_cfg = {
+        "sglang_cfg": {
+            "quantization": {"scheme": "bf16"},
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+        }
+    }
+    trainer = MagicMock()
+    trainer.update_weights_to_sglang_colocated.side_effect = transfer
+    trainer.update_weights_to_sglang_distributed.side_effect = transfer
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(
+        recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._gen = gen
+    ctrl._trainer = trainer
+    ctrl._weight_synchronizer = synchronizer_cls(trainer, gen, refit_buffer_size_gb=1)
+    ctrl._timer = Timer()
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
+
+    assert asyncio.run(ctrl._sync_weights()) == 0
+
+    assert events == ["pause", "flush", "begin", "transfer", "end", "resume"]
+    engine.invalidate_kv_cache.remote.assert_called_once_with()
+    assert ctrl._rollout_permitted.is_set()
+    assert not paused
 
 
 def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:

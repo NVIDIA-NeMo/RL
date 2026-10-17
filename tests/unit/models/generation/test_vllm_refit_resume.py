@@ -99,6 +99,52 @@ def test_late_resume_error_does_not_condemn_replacement(
     assert monitor.serving_shards() == [2]
 
 
+@pytest.mark.parametrize("membership_shards", [None, (2, 0)])
+def test_resume_maps_leader_failures_to_the_original_shard(
+    generation: VllmGeneration,
+    monkeypatch: pytest.MonkeyPatch,
+    membership_shards: tuple[int, ...] | None,
+) -> None:
+    if membership_shards is None:
+        generation._refit_membership = None
+        generation.fleet_monitor = GenerationFleetHealth(
+            shard_count=3, policy=FleetHealthPolicy(min_healthy_shards=1)
+        )
+        expected_shards = (0, 1, 2)
+    else:
+        generation._refit_membership.shard_prefixes = {
+            shard_idx: rank * 2 for rank, shard_idx in enumerate(membership_shards)
+        }
+        expected_shards = membership_shards
+
+    workers = generation.worker_group.workers
+    futures = [
+        workers[shard_idx * 2].resume_generation_async.remote.return_value
+        for shard_idx in expected_shards
+    ]
+    dead_future = workers[4].resume_generation_async.remote.return_value
+
+    def result(ref: object) -> bool:
+        if ref is dead_future:
+            raise ray.exceptions.ActorDiedError()
+        return True
+
+    monkeypatch.setattr(ray, "get", MagicMock(side_effect=result))
+
+    assert generation.resume_generation_after_refit(timeout_s=0.25)
+
+    ray.wait.assert_called_once_with(futures, num_returns=len(futures), timeout=0.25)
+    for worker_idx, worker in enumerate(workers):
+        if worker_idx in {shard_idx * 2 for shard_idx in expected_shards}:
+            worker.resume_generation_async.remote.assert_called_once_with()
+        else:
+            worker.resume_generation_async.remote.assert_not_called()
+    assert generation.fleet_monitor.state_of(2) is ShardState.DEAD
+    assert generation.fleet_monitor.serving_shards() == sorted(
+        shard_idx for shard_idx in expected_shards if shard_idx != 2
+    )
+
+
 def test_resume_fails_if_the_remaining_fleet_is_exhausted(
     generation: VllmGeneration, monkeypatch: pytest.MonkeyPatch
 ) -> None:

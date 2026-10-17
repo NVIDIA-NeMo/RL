@@ -188,7 +188,7 @@ class _FakeAdvEstimator:
 
 
 class _FakeGeneration:
-    """Unsupported generation backend for this training-pump-only test."""
+    """Generation stand-in with native pause/clear support for the training pump."""
 
     def blocks_training(self) -> bool:
         return False
@@ -203,10 +203,10 @@ class _FakeGeneration:
         self, *, clear_cache: bool, timeout_s: float | None = None
     ) -> bool:
         del clear_cache, timeout_s
-        return False
+        return True
 
     def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
-        return False
+        return True
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover

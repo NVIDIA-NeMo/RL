@@ -725,13 +725,16 @@ class GenerationInterface(ABC):
     def pause_generation_for_refit(
         self, *, clear_cache: bool, timeout_s: Optional[float] = None
     ) -> bool:
-        """Pause in-flight generation while preserving request state.
+        """Arrange a safe generation pause around the upcoming weight refit.
 
         Backends with native in-flight refit support override this hook. The default
         implementation warns once per backend type and lets the refit continue with
-        the backend's existing in-flight behavior. On supported backends, in-flight
-        requests are frozen rather than aborted and resume from
-        :meth:`resume_generation_after_refit`; new requests queue until then.
+        the backend's existing in-flight behavior. Native pause implementations
+        freeze requests until :meth:`resume_generation_after_refit`. A backend
+        may instead acknowledge a lifecycle owned by its weight synchronizer,
+        which must pause and handle the requested cache clearing before transfer
+        and resume before returning. Such backends document their request handling
+        and timeout semantics; for example, SGLang may retract or abort requests.
 
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
@@ -739,8 +742,9 @@ class GenerationInterface(ABC):
             timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
 
         Returns:
-            True if every engine paused; False when the backend has no native pause
-            support. Backends with native support raise when pausing fails.
+            True if every engine paused or the weight synchronizer guarantees the
+            lifecycle above; False when neither is supported. Pause failures raise
+            from this hook or the synchronizer that owns the pause.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
@@ -758,9 +762,10 @@ class GenerationInterface(ABC):
             timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
 
         Returns:
-            True if every surviving engine resumed; False when the backend has no
-            native resume support. With fleet health, confirmed dead engines may be
-            excluded if enough survivors remain. Other resume failures raise.
+            True if every surviving engine resumed, including when the weight
+            synchronizer already performed the resume; False when neither path is
+            supported. With fleet health, confirmed dead engines may be excluded
+            if enough survivors remain. Other resume failures raise.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False

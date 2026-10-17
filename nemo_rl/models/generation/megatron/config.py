@@ -170,9 +170,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
-    # - "persist": cache stays allocated; CUDA graphs remain valid (default)
+    # - "persist": cache stays allocated; CUDA graphs remain valid
     # - "offload": cache is moved off-GPU between iterations
-    # - "recompute": cache is dropped and rebuilt on resume
+    # - "recompute": cache is dropped and rebuilt on resume (default)
     kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
