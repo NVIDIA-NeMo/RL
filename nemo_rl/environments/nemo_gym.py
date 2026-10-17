@@ -1149,6 +1149,7 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_root: str,
         episodes: tuple[GymCheckpointEpisode, ...],
         *,
+        participants: tuple[str, ...],
         source_checkpoint_id: str,
         deadline_ts: float,
     ) -> None:
@@ -1157,6 +1158,7 @@ Depending on your data shape, you may want to change these values."""
             checkpoint_id,
             checkpoint_root,
             episodes,
+            participants=participants,
             source_checkpoint_id=source_checkpoint_id,
             deadline_ts=deadline_ts,
         )

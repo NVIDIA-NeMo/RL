@@ -39,7 +39,8 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
-GYM_CHECKPOINT_SCHEMA_VERSION = 1
+# 2: records the participants that committed each instance.
+GYM_CHECKPOINT_SCHEMA_VERSION = 2
 # Upper bound on how long past a call's deadline RL waits for Gym's reply. Gym
 # answers by the deadline once it runs the call, so this only covers the reply
 # crossing Ray; a call still unanswered after it was never run.
@@ -124,12 +125,11 @@ class GymCheckpointManifest:
     instances: dict[str, tuple[GymCheckpointEpisode, ...]]
     staging_keys: dict[str, tuple[str, ...]]
     restarts: dict[str, tuple[GymCheckpointEpisode, ...]]
+    # The server names of the Gym participants that committed each instance.
+    participants: dict[str, tuple[str, ...]]
 
     def __post_init__(self) -> None:
-        if self.schema_version != GYM_CHECKPOINT_SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported Gym checkpoint schema version {self.schema_version!r}"
-            )
+        _require_schema_version(self.schema_version)
         if not self.checkpoint_id:
             raise ValueError("Gym checkpoint_id must not be empty")
         if not self.instances:
@@ -154,6 +154,10 @@ class GymCheckpointManifest:
         if set(self.restarts) != set(self.instances):
             raise ValueError(
                 "Gym checkpoint restart topology must match its episode topology"
+            )
+        if set(self.participants) != set(self.instances):
+            raise ValueError(
+                "Gym checkpoint participant topology must match its episode topology"
             )
         for instance_id, restarts in self.restarts.items():
             if len(tuple(restarts)) != len(set(restarts)):
@@ -197,11 +201,17 @@ class GymCheckpointManifest:
                 instance_id: [asdict(episode) for episode in episodes]
                 for instance_id, episodes in sorted(self.restarts.items())
             },
+            "participants": {
+                instance_id: list(names)
+                for instance_id, names in sorted(self.participants.items())
+            },
         }
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> GymCheckpointManifest:
         """Parse a manifest RL wrote; __post_init__ checks what it means."""
+        # Before any field: an older manifest lacks fields this version requires.
+        _require_schema_version(raw.get("schema_version"))
         return cls(
             schema_version=raw["schema_version"],
             checkpoint_id=raw["checkpoint_id"],
@@ -211,6 +221,19 @@ class GymCheckpointManifest:
                 for instance_id, keys in raw["staging_keys"].items()
             },
             restarts=_episodes_by_instance(raw["restarts"]),
+            participants={
+                instance_id: tuple(names)
+                for instance_id, names in raw["participants"].items()
+            },
+        )
+
+
+def _require_schema_version(version: Any) -> None:
+    if version != GYM_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported Gym checkpoint schema version {version!r}: this NeMo RL "
+            f"reads version {GYM_CHECKPOINT_SCHEMA_VERSION}. Resume with the NeMo RL "
+            "that wrote the checkpoint, or start without the Gym checkpoint."
         )
 
 
@@ -473,6 +496,10 @@ class GymCheckpointCoordinator:
                 for instance_id, summary in summaries.items()
             },
             restarts=restarted,
+            participants={
+                instance_id: summary.participants
+                for instance_id, summary in summaries.items()
+            },
         )
         await asyncio.to_thread(
             write_gym_checkpoint_manifest,
@@ -565,6 +592,7 @@ class GymCheckpointCoordinator:
                         restore_id,
                         str(checkpoint_root),
                         episodes,
+                        participants=manifest.participants[instance_id],
                         source_checkpoint_id=manifest.checkpoint_id,
                         deadline_ts=deadline_ts,
                     )
