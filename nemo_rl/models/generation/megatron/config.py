@@ -120,10 +120,6 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # Soft per-rank staging limit for native MCore refit. None uses the same
     # dynamic packed-buffer target as NeMo-RL's existing collective refit.
     refit_execution_batch_bytes: int | None
-    # Move training gradients and optimizer state to CPU around a non-colocated
-    # refit when extra GPU headroom is needed for transfer staging. The
-    # recommended default is False.
-    offload_policy_before_refit: bool
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
@@ -188,6 +184,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Megatron Bridge provider fields without a first-class NeMo-RL setting.
+    model_overrides: NotRequired[dict[str, Any]]
 
 
 class MCoreGenerationConfig(GenerationConfig):

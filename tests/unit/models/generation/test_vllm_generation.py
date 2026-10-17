@@ -21,6 +21,8 @@ import sys
 import threading
 import types
 import warnings
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ import pytest
 import ray
 import requests
 import torch
+from fastapi import FastAPI, Request
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -405,6 +408,23 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_vllm_worker_gpu_profiling_awaits_collective_rpc(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda.profiler, "start", MagicMock())
+    monkeypatch.setattr(torch.cuda.profiler, "stop", MagicMock())
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+
+    await worker.start_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("start_gpu_profiling", args=())
+
+    worker.llm.collective_rpc.reset_mock()
+    await worker.stop_gpu_profiling()
+    worker.llm.collective_rpc.assert_awaited_once_with("stop_gpu_profiling", args=())
+
+
+@pytest.mark.asyncio
 async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     engine_loop = asyncio.get_running_loop()
     engine_thread = threading.get_ident()
@@ -745,6 +765,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
+        "vllm.entrypoints.serve.utils",
         "vllm.reasoning",
         "vllm.renderers",
         "vllm.tool_parsers",
@@ -774,12 +795,41 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
 
+    ChatCompletionResponse = type("ChatCompletionResponse", (), {})
+
+    class ErrorResponse:
+        """The shape the route reads back: ``.error.code`` and ``model_dump()``."""
+
+        def __init__(self, message: str = "", code: int = 400):
+            self.error = types.SimpleNamespace(message=message, code=code)
+
+        def model_dump(self):
+            return {"error": vars(self.error)}
+
     class OpenAIServingChat:
         instances = []
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.return_tokens_as_token_ids = kwargs.get("return_tokens_as_token_ids")
             self.instances.append(self)
+
+        async def chat_completion_full_generator(
+            self, request, result_generator, *args, **kwargs
+        ):
+            """Drain the engine generator the way vLLM 0.29 does.
+
+            vLLM catches the CancelledError of a cancelled handler task and
+            returns ``ErrorResponse("Client disconnected")`` instead of
+            re-raising it (``OpenAIServingChat.chat_completion_full_generator``
+            in ``vllm/entrypoints/openai/chat_completion/serving.py``).
+            """
+            try:
+                async for _ in result_generator:
+                    pass
+            except asyncio.CancelledError:
+                return ErrorResponse("Client disconnected")
+            return ChatCompletionResponse()
 
     class ServingTokenization:
         instances = []
@@ -824,7 +874,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
-        ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
+        ChatCompletionResponse=ChatCompletionResponse,
     )
     make_module(
         "vllm.entrypoints.openai.chat_completion.serving",
@@ -832,12 +882,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.openai.engine.protocol",
-        ErrorResponse=type("ErrorResponse", (), {}),
+        ErrorResponse=ErrorResponse,
     )
     # vLLM 0.29 location of the engine protocol (vllm-project/vllm#54492).
     make_module(
         "vllm.entrypoints.serve.engine.protocol",
-        ErrorResponse=type("ErrorResponse", (), {}),
+        ErrorResponse=ErrorResponse,
     )
     make_module(
         "vllm.entrypoints.openai.models.protocol",
@@ -856,6 +906,15 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     make_module(
         "vllm.renderers.online_renderer",
         OnlineRenderer=OnlineRenderer,
+    )
+
+    def with_cancellation(handler):
+        handler.cancels_on_disconnect = True
+        return handler
+
+    make_module(
+        "vllm.entrypoints.serve.utils.api_utils",
+        with_cancellation=with_cancellation,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
@@ -934,9 +993,41 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
-def _setup_fake_vllm_chat_handler(monkeypatch):
-    """Build the /v1/chat/completions handler against the fake vLLM modules."""
-    _, _, openai_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+def _setup_fake_vllm_chat_handler(
+    monkeypatch,
+    *,
+    with_cancellation: Callable[..., Any] | None = None,
+    openai_serving_chat: type | None = None,
+):
+    """Build the /v1/chat/completions handler against the fake vLLM modules.
+
+    Args:
+        monkeypatch: The pytest fixture used to install the fake module tree.
+        with_cancellation: Route decorator to use instead of the stub, e.g. the
+            real pinned vLLM one. The stub only tags the handler.
+        openai_serving_chat: ``OpenAIServingChat`` base class to use instead of
+            the stub, e.g. the real pinned one with a stub constructor. It must
+            record its instances in a class-level ``instances`` list like the
+            stub does.
+
+    Returns:
+        The worker, the OpenAIServingChat instance, and the route handler.
+    """
+    _, _, fake_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
+    if with_cancellation is not None:
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.serve.utils.api_utils"],
+            "with_cancellation",
+            with_cancellation,
+        )
+    serving_chat_cls = fake_serving_chat
+    if openai_serving_chat is not None:
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.openai.chat_completion.serving"],
+            "OpenAIServingChat",
+            openai_serving_chat,
+        )
+        serving_chat_cls = openai_serving_chat
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {
@@ -960,7 +1051,7 @@ def _setup_fake_vllm_chat_handler(monkeypatch):
     chat_handler = next(
         handler for path, handler in app.routes if path == "/v1/chat/completions"
     )
-    return worker, openai_serving_chat.instances[0], chat_handler
+    return worker, serving_chat_cls.instances[0], chat_handler
 
 
 def _fake_chat_request():
@@ -970,6 +1061,11 @@ def _fake_chat_request():
         temperature=1.0,
         max_tokens=1,
         max_completion_tokens=None,
+        # Read by NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+        stream=False,
+        return_tokens_as_token_ids=None,
+        logprobs=False,
+        top_logprobs=None,
     )
 
 
@@ -978,6 +1074,48 @@ def _track_request_capture(worker, request):
     worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
     worker.token_capture = MagicMock()
     return worker.token_capture
+
+
+def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
+    """Engine result generator for a generation that never finishes.
+
+    Sets ``started`` once awaited and ``cancelled`` when the awaiting task is
+    cancelled, then re-raises the way ``AsyncLLM.generate`` does.
+    """
+
+    async def generate():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield  # pragma: no cover - unreachable; makes this an async generator
+
+    return generate()
+
+
+def _route_through_full_generator(serving_chat, result_generator) -> None:
+    """Point create_chat_completion straight at chat_completion_full_generator.
+
+    Skips vLLM's request rendering and engine scheduling, so only the engine
+    result generator is stubbed: the request still goes through the RL mixin's
+    ``chat_completion_full_generator`` and the serving base class beneath it,
+    which is where a disconnect cancellation lands mid-generation.
+    """
+
+    async def create_chat_completion(request, _raw_request):
+        return await serving_chat.chat_completion_full_generator(
+            request,
+            result_generator,
+            request_id="chatcmpl-test",
+            model_name="served-model",
+            conversation=[],
+            tokenizer=MagicMock(),
+            request_metadata=MagicMock(),
+        )
+
+    serving_chat.create_chat_completion = create_chat_completion
 
 
 @pytest.mark.asyncio
@@ -1073,6 +1211,178 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
     error = json.loads(response.body)["error"]
     assert error["code"] == "retained_media_changed"
     assert error["param"] == "messages"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logprobs", [False, True])
+async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logprobs):
+    """A client disconnect cancels the chat handler and releases its capture state.
+
+    The fake serving layer mirrors vLLM 0.29: it swallows the cancellation and
+    returns ``ErrorResponse("Client disconnected")``. The RL mixin re-raises
+    it, so the route labels the capture ``client_disconnect`` rather than
+    ``error_response`` and the handler task finishes cancelled.
+    """
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    # The route is wrapped with vLLM's with_cancellation (the stub tags it).
+    assert getattr(chat_handler, "cancels_on_disconnect", False)
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    _route_through_full_generator(
+        serving_chat, _stalled_engine_generator(started, cancelled)
+    )
+    request = _fake_chat_request()
+    request.logprobs = logprobs
+    request.return_tokens_as_token_ids = True
+    request.top_logprobs = 0
+    token_capture = _track_request_capture(worker, request)
+    task = asyncio.create_task(chat_handler(request, MagicMock()))
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        # with_cancellation cancels the handler task on http.disconnect.
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert cancelled.is_set()
+        token_capture.fail_call.assert_called_once_with(
+            "call", reason="client_disconnect"
+        )
+        assert id(request) not in worker._capture_calls
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_chat_disconnect_releases_capture_queued_for_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnect releases capture when the executor has not started staging."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    response_type = sys.modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionResponse
+    serving_chat.create_chat_completion = AsyncMock(return_value=response_type())
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "model_dump_chat_response_with_dynamic_message_fields",
+        lambda _response: {"choices": []},
+    )
+    finish_capture = MagicMock()
+    monkeypatch.setattr(worker, "_finish_request_capture", finish_capture)
+    request = _fake_chat_request()
+    token_capture = _track_request_capture(worker, request)
+
+    async def exercise() -> None:
+        # Use a separate loop so its executor cannot affect other async tests.
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        busy = asyncio.Event()
+        release = threading.Event()
+
+        def occupy_executor() -> None:
+            loop.call_soon_threadsafe(busy.set)
+            release.wait()
+
+        blocker = loop.run_in_executor(None, occupy_executor)
+        task = None
+        try:
+            await asyncio.wait_for(busy.wait(), 5)
+            task = asyncio.create_task(chat_handler(request, MagicMock()))
+            # The serving stub completes synchronously; the handler's first
+            # suspension queues real asyncio.to_thread work behind the blocker.
+            await asyncio.sleep(0)
+            serving_chat.create_chat_completion.assert_awaited_once()
+            assert not task.done()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            token_capture.fail_call.assert_called_once_with(
+                "call", reason="client_disconnect"
+            )
+            assert id(request) not in worker._capture_calls
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            release.set()
+            await blocker
+        finish_capture.assert_not_called()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+@pytest.mark.parametrize("logprobs", [False, True])
+async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnect(
+    monkeypatch,
+    logprobs,
+):
+    """A real http.disconnect cancels the route through the pinned serving layer.
+
+    Contract check against the two pinned vLLM pieces that decide the outcome:
+    ``with_cancellation``, fed a real Starlette Request carrying the
+    disconnect, and ``OpenAIServingChat.chat_completion_full_generator``,
+    which swallows the cancellation and returns
+    ``ErrorResponse("Client disconnected")``. The RL mixin re-raises it, so
+    the engine generator is cancelled and the capture state is released with
+    reason ``client_disconnect``. The engine itself stays stubbed, so this does
+    not show that the request is aborted in the engine.
+    """
+    # Deferred imports: the real vLLM package is only present in the vllm
+    # extra, and they must run before the fake module tree is installed.
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.serve.utils.api_utils import with_cancellation
+
+    class PinnedServingChat(OpenAIServingChat):
+        """The pinned serving layer with no engine behind it."""
+
+        instances: list = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.return_tokens_as_token_ids = kwargs["return_tokens_as_token_ids"]
+            self.instances.append(self)
+
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(
+        monkeypatch,
+        with_cancellation=with_cancellation,
+        openai_serving_chat=PinnedServingChat,
+    )
+    # functools.wraps exposes the route's own signature, which is how FastAPI
+    # still injects `raw_request: Request` through the wrapper.
+    assert chat_handler.__wrapped__.__name__ == "create_chat_completion"
+    # The RL mixin sits above the pinned serving class, as in the worker.
+    assert OpenAIServingChat in type(serving_chat).__mro__
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    _route_through_full_generator(
+        serving_chat, _stalled_engine_generator(started, cancelled)
+    )
+    request = _fake_chat_request()
+    request.logprobs = logprobs
+    request.return_tokens_as_token_ids = True
+    request.top_logprobs = 0
+    token_capture = _track_request_capture(worker, request)
+    released = asyncio.Event()
+    token_capture.fail_call.side_effect = lambda *_args, **_kwargs: released.set()
+
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    raw_request = Request({"type": "http", "app": FastAPI()}, receive=receive_queue.get)
+    task = asyncio.create_task(chat_handler(request, raw_request))
+    await asyncio.wait_for(started.wait(), 1)
+    await receive_queue.put({"type": "http.disconnect"})
+
+    # The wrapper returns None once the disconnect listener wins, as in vLLM's
+    # own routes; the handler task is cancelled behind it.
+    assert await asyncio.wait_for(task, 1) is None
+    await asyncio.wait_for(released.wait(), 1)
+    assert cancelled.is_set()
+    token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
+    assert id(request) not in worker._capture_calls
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
@@ -1703,6 +2013,8 @@ def get_basic_megatron_test_config(
         "logprob_batch_size": 2,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         "automodel_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -1775,7 +2087,7 @@ def get_basic_megatron_test_config(
             },
         },
         "draft": Eagle3DraftConfig(enabled=False),
-        "optimizer": None,  # Remove default FSDP optimizer
+        "optimizer": None,  # Remove default Automodel optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,
         "generation": deepcopy(basic_vllm_test_config),
@@ -2131,7 +2443,7 @@ async def test_vllm_policy_generation_async(
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -2232,7 +2544,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     automodel_config = basic_automodel_test_config
     lm_policy = Policy(cluster, automodel_config, tokenizer)
 
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2530,7 +2842,7 @@ async def run_hf_train_process(
 async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
-    """This test validates that DTensor policy can work together with colocated vLLM policy."""
+    """This test validates that Automodel policy can work together with colocated vLLM policy."""
     if vllm_precision == "fp8":
         skip_fp8_known_failures()
 
@@ -2547,7 +2859,7 @@ async def test_vllm_generation_with_hf_training_colocated(
     vllm_policy.finish_generation()
 
     # Create Policy
-    print("Creating DTensor policy...")
+    print("Creating Automodel policy...")
     automodel_config = deepcopy(basic_automodel_test_config)
     automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
     automodel_config["automodel_cfg"]["lora_cfg"] = deepcopy(basic_lora_test_config)
@@ -2557,7 +2869,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Prepare refit info
     print("Preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -2601,7 +2913,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     if vllm_precision == "fp8":
         skip_fp8_known_failures()
 
-    """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
+    """This test validates that Automodel policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
 
     # Create VllmGeneration Policy
@@ -2622,7 +2934,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
         "LoRA is not supported with FP8"
     )
     # Create Policy
-    print("Creating DTensor policy...")
+    print("Creating Automodel policy...")
     automodel_config = deepcopy(basic_automodel_test_config)
     automodel_config["generation"]["colocated"]["enabled"] = False
     automodel_config["automodel_cfg"]["cpu_offload"] = cpu_offload
@@ -2646,7 +2958,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -3298,14 +3610,14 @@ def test_vllm_weight_update_and_prefix_cache_reset(
     vllm_policy = None
     lm_policy = None
     try:
-        print(f"Creating DTensor policy for TP={tensor_parallel_size}...")
+        print(f"Creating Automodel policy for TP={tensor_parallel_size}...")
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print(f"Creating vLLM policy for TP={tensor_parallel_size}...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
@@ -3384,9 +3696,9 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         torch.cuda.empty_cache()
 
 
-# megatron still holds little memory after refit, so we only test dtensor now
+# megatron still holds little memory after refit, so we only test automodel now
 @pytest.mark.automodel
-@pytest.mark.parametrize("train_backend", ["dtensor"])
+@pytest.mark.parametrize("train_backend", ["automodel"])
 def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     """Test that vLLM streaming weight update and can save memory."""
     from nemo_rl.models.policy.lm_policy import Policy
@@ -3409,7 +3721,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     vllm_policy.finish_generation()
 
     print("Creating Training Policy...")
-    if train_backend == "dtensor":
+    if train_backend == "automodel":
         train_config = deepcopy(basic_automodel_test_config)
     elif train_backend == "megatron":
         train_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
@@ -3418,7 +3730,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -3487,12 +3799,12 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         # set to sleep first if not in eval mode
         vllm_generation.finish_generation()
 
-        print("Creating DTensor policy...")
+        print("Creating Automodel policy...")
         automodel_config = basic_automodel_test_config
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -3561,7 +3873,7 @@ def test_vllm_non_divisible_batch_handling(policy):
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize(
-    "policy_type", ["dtensor", pytest.param("megatron", marks=[pytest.mark.mcore])]
+    "policy_type", ["automodel", pytest.param("megatron", marks=[pytest.mark.mcore])]
 )
 async def test_vllm_refit_non_colocated_update_weights(
     policy_cluster_separate,
@@ -3588,7 +3900,7 @@ async def test_vllm_refit_non_colocated_update_weights(
         )
 
     # Get policy config
-    if policy_type == "dtensor":
+    if policy_type == "automodel":
         lm_config = deepcopy(basic_automodel_test_config)
     else:
         assert policy_type == "megatron"
@@ -3631,7 +3943,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -3648,7 +3960,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     output_ids = outputs["output_ids"]
     generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
-    if policy_type == "dtensor":
+    if policy_type == "automodel":
         expected_texts = [
             "Hello, my name is Lina. I'm",
             "The capital of France is Paris. The capital of",
@@ -3754,9 +4066,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -3918,9 +4228,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -4046,7 +4354,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = megatron_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = megatron_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("Refitting vLLM policy with Megatron...")
@@ -4162,9 +4470,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
@@ -4230,9 +4536,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation = VllmGeneration(cluster, vllm_config)
 
         # prepare refit info
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")

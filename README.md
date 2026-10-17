@@ -27,7 +27,7 @@
 * [04/06/2026] New Model Support
     * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
     * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
-    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
+    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml), [grpo-glm47-flash-4n8g-automodel-ep32.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel-ep32.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
@@ -43,8 +43,8 @@
     * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
     * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
-        * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
-        * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
+        * [sft-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml)
+        * [grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
    
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
@@ -159,8 +159,6 @@ For detailed information on backend selection, configuration, and examples, see 
     <p></p>
 
   - [Evaluation](#evaluation)
-    - [Convert Model Format (Optional)](#convert-model-format-optional)
-    - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
   - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
@@ -305,7 +303,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > ```sh
 > export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
 > export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
-> # Verify (should match nvidia-cudnn-cu13 version in pyproject.toml, currently 9.20.0):
+> # Verify (should match the nvidia-cudnn-cu13 pin in pyproject.toml):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
 > See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
@@ -695,70 +693,21 @@ sbatch \
 
 ## Evaluation
 
-We provide evaluation tools to assess model capabilities.
+For general model and agent evaluation, use [NeMo Gym](https://docs.nvidia.com/nemo/gym/). NeMo Gym supports repeatable benchmarks and custom evaluations with environments that can also produce rollouts and rewards for RL training. Follow the [evaluation overview](docs/about/evaluation.md) to choose a benchmark, run it against a model, and analyze the results.
 
-### Convert Model Format (Optional)
-
-If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
+NeMo RL also includes a convenient [built-in evaluator](examples/run_eval.py) for quickly checking a Hugging Face-format checkpoint against a selection of bundled benchmarks. It runs vLLM directly from the NeMo RL configuration, making it useful for quick checks within an existing NeMo RL setup. For broader benchmark coverage and custom evaluations, use NeMo Gym.
 
 ```sh
-# Example for a GRPO checkpoint at step 170
-uv run python examples/converters/convert_dcp_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
-    --hf-ckpt-path results/grpo/hf
+uv run python examples/run_eval.py generation.model_name=/path/to/hugging-face-checkpoint
 ```
 
-If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires Megatron Core, so make sure you launch with the mcore extra:
+If the checkpoint is not in Hugging Face format, convert it first:
 
-```sh
-# Example for a GRPO checkpoint at step 170
-uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --megatron-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
-    --hf-ckpt-path results/grpo/hf
-```
+- [Automodel DCP checkpoints](docs/design-docs/checkpointing.md#converting-torch-distributed-checkpoints-to-hugging-face-format)
+- [Megatron checkpoints](docs/design-docs/checkpointing.md#converting-megatron-checkpoints-to-hugging-face-format)
+- [Megatron LoRA adapter checkpoints](docs/design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format)
 
-If you trained with **LoRA on the Megatron backend**, use the LoRA merger to fold the adapter weights into the base model and export a standalone Hugging Face checkpoint:
-
-```sh
-uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
-    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
-    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
-    --hf-model-name <huggingface_model_name> \
-    --hf-ckpt-path results/lora_merged_hf
-```
-
-> **Note:** Adjust the paths according to your training output directory structure.
-
-For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/design-docs/checkpointing.md).
-
-### Run Evaluation
-
-Run the evaluation script with the converted model:
-
-```sh
-uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
-```
-
-Run the evaluation script with custom settings:
-
-```sh
-# Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
-#          Pass@1 accuracy averaged over 16 samples for each problem
-uv run python examples/run_eval.py \
-    --config examples/configs/evals/math_eval.yaml \
-    generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
-    generation.temperature=0.6 \
-    generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=math500 \
-    eval.num_tests_per_prompt=16 \
-    cluster.gpus_per_node=8
-```
-> **Note:** Evaluation results may vary slightly due to various factors, such as sampling parameters, random seed, inference engine version, and inference engine settings.
-
-Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
+See `examples/configs/evals/eval.yaml` for the available configuration options.
 
 ## Set Up Clusters
 

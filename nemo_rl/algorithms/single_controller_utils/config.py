@@ -1391,10 +1391,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if master_config.loss_fn.force_on_policy_ratio:
+        if (
+            master_config.loss_fn.force_on_policy_ratio
+            and not master_config.loss_fn.use_cispo
+        ):
             raise ValueError(
                 "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no

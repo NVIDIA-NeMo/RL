@@ -59,6 +59,9 @@ class NcclExtension(WorkerExtension):
     #  Collective initialisation (called once during setup)
     # ------------------------------------------------------------------ #
 
+    # Park the executor loop while the refit group is built: its NCCL collectives
+    # deadlock against the blocking ncclCommInitRank (seen as a 600 s watchdog kill).
+    @control_action_decorator
     def init_collective(
         self,
         rank_prefix: int,

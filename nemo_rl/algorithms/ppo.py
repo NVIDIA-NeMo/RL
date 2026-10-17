@@ -104,14 +104,20 @@ from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.telemetry.vocabulary import (
+    INIT_TOTAL_CATEGORY,
+    TeedMetric,
+    register_teed_metrics,
+)
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -127,7 +133,10 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 
 # ===============================================================================
 # Configuration
@@ -521,6 +530,16 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     if not colocated_inference and backend != "vllm":
         raise NotImplementedError(
             "Non-colocated PPO generation currently supports only vLLM; "
@@ -909,7 +928,7 @@ def setup(
             )
             # FP8 KV cache compatibility checks
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
@@ -975,6 +994,19 @@ def setup(
         worker_init_timing_metrics["sglang_weight_sync_init_time_s"] = (
             time.perf_counter() - t0
         )
+    elif not colocated_inference and offload_policy_before_refit:
+        assert policy_generation is not None
+        t0 = time.perf_counter()
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=False,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
     elif not colocated_inference:
         assert policy_generation is not None
         t0 = time.perf_counter()
@@ -996,9 +1028,7 @@ def setup(
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     if backend != "sglang":
-        state_dict_info = policy.prepare_refit_info(
-            refit_payload_mode=policy_generation.get_refit_payload_mode()
-        )
+        state_dict_info = policy.prepare_refit_info()
         if policy_generation is not None:
             policy_generation.prepare_refit_info(state_dict_info)
 
@@ -1403,12 +1433,13 @@ def ppo_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.ppo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -1764,7 +1795,6 @@ def ppo_train(
                             RLSpanGroup.POLICY_UPDATE,
                             "rl.ppo.value_training",
                             tracer=_tracer,
-                            **{"rl.iteration": total_steps + 1},
                         ),
                     ):
                         value_results = value_model.train(
@@ -1803,7 +1833,6 @@ def ppo_train(
                                 RLSpanGroup.POLICY_UPDATE,
                                 "rl.ppo.policy_training",
                                 tracer=_tracer,
-                                **{"rl.iteration": total_steps + 1},
                             ),
                         ):
                             train_results = policy.train(
@@ -2491,7 +2520,7 @@ def async_ppo_train(
         print("📦 Started continuous background trajectory collection")
 
         print(f"⏳ Waiting for replay buffer to be ready for step {step}...")
-        timer.start("init/total")
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             current_step_ready = ray.get(
@@ -2534,7 +2563,7 @@ def async_ppo_train(
             _raise_if_collector_stopped("waiting for the initial replay batch")
             wait_iterations += 1
             time.sleep(1.0)
-        timer.stop("init/total")
+        timer.stop(INIT_TOTAL_CATEGORY)
         print(f"✅ Buffer ready for step {step}! Starting async PPO training loop...")
     except Exception:
         _shutdown_workers(propagate_checkpoint_error=False)
@@ -3148,7 +3177,7 @@ def async_ppo_train(
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
                 for cat in [
-                    "init/total",
+                    INIT_TOTAL_CATEGORY,
                     "idle/buffer_starvation",
                     "idle/refit_bubble",
                     "idle/validation",
@@ -3216,7 +3245,7 @@ def validate(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("ppo"),
+        evaluate_span("ppo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 

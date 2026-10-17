@@ -133,6 +133,10 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
+from nemo_rl.models.generation.trtllm.config import (
+    replica_width,
+    resolve_disagg_layout,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -151,15 +155,18 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     current_trace_carrier,
     efficiency_span,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -184,7 +191,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -598,6 +608,19 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def _uses_managed_noncolocated_refit(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    offload_policy_before_refit: bool,
+) -> bool:
+    """Whether non-colocated setup must attach a weight synchronizer."""
+    return (
+        nccl_reshard_refit_enabled
+        or generation_backend == "dynamo"
+        or offload_policy_before_refit
+    )
+
+
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -679,6 +702,30 @@ def setup(
         )
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
+
+    # generation.disaggregation is written in backend-agnostic terms, but only
+    # the TRT-LLM backend implements it today: every other backend would
+    # silently ignore the block and serve aggregated, so refuse to start.
+    if (
+        resolve_disagg_layout(generation_config).enabled
+        and generation_config["backend"] != "trtllm"
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled is only supported for "
+            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
+            "false, or switch the backend."
+        )
+    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
+    # the whole fleet would come up and fail at the first rollout instead.
+    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
+        master_config
+    ):
+        raise ValueError(
+            "policy.generation.disaggregation.enabled requires NeMo-Gym "
+            "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
+            "through the NeMo-Gym entrypoint."
+        )
+
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
     _validate_agent_loss_weights(master_config)
@@ -939,11 +986,13 @@ def setup(
     )
     nemo_gym_actor = None
 
-    def _spinup_nemo_gym(base_urls, model_name):
+    def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
         """Spin up the NeMo Gym stack against the given generation server URLs.
 
         Returns a shard set, which is the one actor of an unsharded job as much
-        as it is the K of a sharded one.
+        as it is the K of a sharded one. ``policy_api_key`` is the bearer token
+        the generation server requires on its OpenAI routes (the vLLM backend's
+        ``http_server_api_key``), or None when the server checks none.
         """
         t0 = time.perf_counter()
         shard_set = build_nemo_gym_actors(
@@ -953,6 +1002,7 @@ def setup(
             tokenizer=tokenizer,
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+            policy_api_key=policy_api_key,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -1193,10 +1243,11 @@ def setup(
                         "pipeline_parallel_size", 1
                     )
                 elif generation_config["backend"] == "trtllm":
-                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
-                    gpus_per_instance = trtllm_cfg[
-                        "tensor_parallel_size"
-                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
+                    # Under PD disaggregation the unit to keep inside one NVLink
+                    # domain is the whole replica, not one engine.
+                    gpus_per_instance = replica_width(
+                        cast(TrtllmConfig, generation_config)
+                    )
                 elif generation_config["backend"] == "dynamo":
                     gpus_per_instance = DynamoConfig.model_validate(
                         generation_config
@@ -1313,6 +1364,16 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1664,7 +1725,7 @@ def setup(
             )
         if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "DTensor backend is not supported with kv cache fp8 enabled."
+                "Automodel backend is not supported with kv cache fp8 enabled."
             )
             assert not should_use_async_rollouts(generation_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
@@ -1711,6 +1772,7 @@ def setup(
                 return _spinup_nemo_gym(
                     deferred_vllm.dp_openai_server_base_urls,
                     generation_config["model_name"],
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
 
             # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
@@ -1889,7 +1951,11 @@ def setup(
     ):
         t0 = time.perf_counter()
         # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
+        if _uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+            offload_policy_before_refit=offload_policy_before_refit,
+        ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -1977,9 +2043,7 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info(
-                refit_payload_mode=policy_generation.get_refit_payload_mode()
-            )
+            state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
                 policy_generation.prepare_refit_info(state_dict_info)
 
@@ -3402,12 +3466,13 @@ def _grpo_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -4017,7 +4082,6 @@ def _grpo_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -4568,7 +4632,7 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with (
         timer.time("total_validation_time"),
-        evaluate_span("grpo", **{"rl.step": step}),
+        evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -5154,7 +5218,7 @@ def async_grpo_train(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
-            "NRL_WORKER_GROUP": "trajectory_collector",
+            WORKER_GROUP_ENV: "trajectory_collector",
         },
     )
 
@@ -5330,8 +5394,8 @@ def async_grpo_train(
     # rather than only as a scalar. Unbucketed by construction (see
     # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
     # window, and its spans join this trace.
-    with efficiency_span("init/total", tracer=_tracer):
-        timer.start("init/total")
+    with efficiency_span(INIT_TOTAL_CATEGORY, tracer=_tracer):
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -5395,7 +5459,7 @@ def async_grpo_train(
 
         # Retained because the per-step timer.reset() below discards it; the
         # efficiency snapshot re-supplies it every step.
-        init_total_s = timer.stop("init/total")
+        init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -5412,12 +5476,12 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with (
+                iteration_scope(step + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": step + 1},
                 ),
             ):
                 num_mask_sample_filtered = 0
@@ -5853,7 +5917,6 @@ def async_grpo_train(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": step + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -6366,7 +6429,7 @@ def async_grpo_train(
             # at the end of every step drops it -- so re-supply the captured
             # value, or the series reports the real startup cost at step 1 and
             # zero for the rest of the run.
-            driver_efficiency["init/total"] = init_total_s
+            driver_efficiency[INIT_TOTAL_CATEGORY] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur

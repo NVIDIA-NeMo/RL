@@ -62,6 +62,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    validate_single_controller_config,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -2117,20 +2118,24 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
         "reference_logprobs_required",
         "expected_policy_calls",
         "expected_reference_calls",
+        "single_forward_cispo",
     ),
     [
-        (False, False, 0, 0),
-        (True, False, 1, 0),
-        (False, True, 0, 1),
-        (True, True, 1, 1),
+        (False, False, 0, 0, False),
+        (True, False, 1, 0, False),
+        (False, True, 0, 1, False),
+        (True, True, 1, 1, False),
+        pytest.param(False, False, 0, 0, True, id="single-forward-cispo-ready-first"),
     ],
 )
 def test_train_pump_requests_and_fetches_only_required_logprobs(
     monkeypatch,
+    tmp_path,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
     expected_policy_calls: int,
     expected_reference_calls: int,
+    single_forward_cispo: bool,
 ) -> None:
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -2141,6 +2146,25 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
         tags=_one_group_tags(2),
     )
     ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    if single_forward_cispo:
+        cfg = _grpo_master_config(tmp_path)
+        cfg.policy["generation"]["backend"] = "vllm"
+        cfg.async_rl.sampler = ReadyFirstSamplerConfig()
+        cfg.loss_fn = ClippedPGLossConfig(
+            use_cispo=True,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="tis",
+            truncated_importance_sampling_ratio=5.0,
+            ratio_clip_min=1.0,
+            ratio_clip_max=4.0,
+            reference_policy_kl_penalty=0.0,
+        )
+        validate_single_controller_config(cfg)
+        ctrl._loss_fn = ClippedPGLossFn(cfg.loss_fn)
+        stage_cfg = AdvantageStageConfig.from_master_config(cfg)
+        policy_logprobs_required = stage_cfg.policy_logprobs_required
+        reference_logprobs_required = stage_cfg.reference_logprobs_required
     ctrl._policy_logprobs_required = policy_logprobs_required
     ctrl._reference_logprobs_required = reference_logprobs_required
     ctrl._train_fields = single_controller._train_fields_for_step(

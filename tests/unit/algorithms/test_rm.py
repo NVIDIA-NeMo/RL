@@ -154,8 +154,8 @@ def mock_components():
     }
 
 
-def test_context_parallel_rejected_for_dtensor_rm():
-    """Test that context_parallel_size > 1 raises ValueError for DTensor RM training.
+def test_context_parallel_rejected_for_automodel_rm():
+    """Test that context_parallel_size > 1 raises ValueError for Automodel RM training.
 
     TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove when CP is supported for RM.
     """
@@ -186,7 +186,7 @@ def test_context_parallel_rejected_for_dtensor_rm():
 
 
 def test_context_parallel_allowed_when_one():
-    """Test that context_parallel_size=1 does not raise for DTensor RM training.
+    """Test that context_parallel_size=1 does not raise for Automodel RM training.
 
     We verify the CP check passes by confirming the error comes from a later
     setup stage, not from our validation.

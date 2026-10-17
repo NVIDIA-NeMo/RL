@@ -65,7 +65,7 @@ This script requires Megatron-Core, so make sure to launch with the `mcore` extr
 
 ### Option A — Merged checkpoint
 
-Loads the base model, applies the LoRA adapter weights on top, and saves the merged result in HuggingFace format. The output can be used directly with `AutoModelForCausalLM.from_pretrained` or passed to the [evaluation pipeline](../guides/eval.md).
+Loads the base model, applies the LoRA adapter weights on top, and saves the merged result in HuggingFace format. The output can be used directly with `AutoModelForCausalLM.from_pretrained` or served with vLLM using the [evaluation workflow](../about/evaluation.md).
 
 **Example:**
 

@@ -1516,6 +1516,8 @@ def _make_noncolocated_setup_config(
             "model_name": "fake-model",
             "train_global_batch_size": 1,
             "train_micro_batch_size": 1,
+            "offload_policy_before_refit": False,
+            "offload_optimizer_for_refit": True,
             "automodel_cfg": {"enabled": True},
             "megatron_cfg": {"enabled": False},
             "generation": {
@@ -1658,7 +1660,6 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy.init_collective.return_value = ["policy-future"]
     value_model = MagicMock()
     generation = MagicMock()
-    generation.get_refit_payload_mode.return_value = "hf_export"
     generation.init_collective.return_value = ["generation-future"]
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
@@ -2154,8 +2155,37 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     value_model = result[2]
     value_model.finish_training.assert_called_once_with()
     policy.prepare_for_training.assert_called_once_with()
-    policy.prepare_refit_info.assert_called_once_with(refit_payload_mode="hf_export")
+    policy.prepare_refit_info.assert_called_once_with()
     generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
+
+
+def test_noncolocated_vllm_offload_before_refit_uses_weight_synchronizer(monkeypatch):
+    config = _make_noncolocated_setup_config(
+        total_gpus_per_node=8,
+        inference_gpus_per_node=2,
+    )
+    config.policy["automodel_cfg"]["enabled"] = False
+    config.policy["megatron_cfg"]["enabled"] = True
+    config.policy["offload_policy_before_refit"] = True
+
+    (
+        _,
+        _,
+        policy,
+        generation,
+        _,
+        _,
+        generation_factory,
+        _,
+    ) = _run_noncolocated_setup(monkeypatch, config)
+
+    weight_sync_factory = generation_factory.weight_sync_factory
+    weight_sync = generation_factory.weight_sync
+    weight_sync_factory.assert_called_once()
+    weight_sync.init_communicator.assert_called_once_with()
+    assert generation.weight_synchronizer is weight_sync
+    policy.init_collective.assert_not_called()
+    generation.init_collective.assert_not_called()
 
 
 @pytest.mark.parametrize(
