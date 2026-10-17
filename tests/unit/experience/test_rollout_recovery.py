@@ -1517,6 +1517,89 @@ def test_turn_restart_without_gym_state_starts_a_restored_attempt_over() -> None
     assert current.status is RolloutAttemptStatus.ABANDONED
 
 
+def _dispatched_g7_episode(ledger: RolloutRecoveryLedger) -> GymCheckpointEpisode:
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=RecoveryTargetLevel.TURN,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+    return ledger.get_group("g7").gym_episode(0)
+
+
+def _seal_g7(ledger: RolloutRecoveryLedger) -> None:
+    gate_id = ledger.get_group("g7").gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt=None,
+            reward=1.0,
+            mask_sample=False,
+        )
+    )
+
+
+def test_a_retired_gym_rollout_is_queued_for_forget_until_gym_forgets_it() -> None:
+    ledger = RolloutRecoveryLedger()
+    episode = _dispatched_g7_episode(ledger)
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    instances = frozenset({"tools/replica-0"})
+    retired = ledger.gym_checkpoint_retirements(instances)
+    assert retired == {"tools/replica-0": (episode,)}
+    # Nothing to forget until Gym has retired it.
+    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+
+    ledger.mark_gym_retired(retired)
+
+    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": (episode,)}
+    ledger.mark_gym_forgotten({"tools/replica-0": (episode,)})
+    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_a_restored_gym_rollout_is_queued_for_forget_once_it_seals(
+    restored: bool,
+) -> None:
+    """Gym's restore refuses the replaced attempt until RL forgets the rollout."""
+    ledger = RolloutRecoveryLedger()
+    episode = _dispatched_g7_episode(ledger)
+    if restored:
+        _mutate(
+            lambda cut: ledger.prepare_for_restart(
+                cut,
+                restored_gym_episodes={
+                    ("tools/replica-0", episode.rollout_id, episode.attempt)
+                },
+            )
+        )
+        _mutate(
+            lambda cut: ledger.mark_group_dispatched(
+                cut, "g7", gym_instance_id="tools/replica-0"
+            )
+        )
+    instances = frozenset({"tools/replica-0"})
+    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+
+    _seal_g7(ledger)
+
+    expected = (episode.next_attempt(),) if restored else ()
+    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": expected}
+
+
 def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(

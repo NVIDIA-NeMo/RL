@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 import time
 import uuid
@@ -29,6 +30,7 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointAdapter,
     GymCheckpointEpisode,
     GymCheckpointInstance,
+    GymCheckpointPrepareSummary,
     GymCheckpointUnavailable,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -47,7 +49,7 @@ pytestmark = pytest.mark.nemo_gym
 
 @pytest.mark.parametrize("gym_attempt", [0, 1, 17])
 def test_rollout_capture_key_matches_gym_episode_identity(gym_attempt: int) -> None:
-    """Fail loudly if RL's legacy string carrier drifts from Gym's codec."""
+    """Fail loudly if the string form RL gives a Gym episode drifts from Gym's codec."""
     from nemo_gym.episode_types import EpisodeId
 
     group = PromptGroupRecoveryRecord(
@@ -171,8 +173,10 @@ def test_checkpoint_instance_rejects_unsafe_identity(
 _CONTROL_TOKEN = "control-token"
 
 
-def _in_process_gym(ledger_dir: Path):
+def _in_process_gym(ledger_dir: Path, *, restart_only_agent: Any = None):
     """A policy model and an agent running Gym's real checkpoint participants.
+
+    ``restart_only_agent`` adds a second agent server with that participant.
 
     Control calls go to in-process ASGI apps through Gym's own control routes,
     so the adapter sees exactly the replies Gym's participants build. Server
@@ -233,6 +237,13 @@ def _in_process_gym(ledger_dir: Path):
         "policy": PolicyModelParticipant(FileLineageStore(ledger_dir)),
         "agent": agent,
     }
+    servers = {
+        "policy": {"responses_api_models": {"policy": {}}},
+        "agent": {"responses_api_agents": {"agent": {}}},
+    }
+    if restart_only_agent is not None:
+        participants["restart_only"] = restart_only_agent
+        servers["restart_only"] = {"responses_api_agents": {"restart_only": {}}}
     apps = {}
     for name, participant in participants.items():
         apps[name] = FastAPI()
@@ -245,12 +256,7 @@ def _in_process_gym(ledger_dir: Path):
         )
     client = _InProcessClient(
         head_server_config=BaseServerConfig(host="head", port=1),
-        global_config_dict=OmegaConf.create(
-            {
-                "policy": {"responses_api_models": {"policy": {}}},
-                "agent": {"responses_api_agents": {"agent": {}}},
-            }
-        ),
+        global_config_dict=OmegaConf.create(servers),
         apps=apps,
     )
     adapter = GymCheckpointAdapter(
@@ -274,7 +280,8 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         source, agent, _ = _in_process_gym(tmp_path / "ledger-before")
         await source.discover()
 
-        # A legacy /run inside a replayable verify step: parked for the checkpoint.
+        # The agent's own /run episode, inside a replayable verify step: parked for
+        # the checkpoint.
         in_verify = asyncio.Event()
         release = asyncio.Event()
 
@@ -299,7 +306,7 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         release.set()
         await asyncio.wait_for(run, timeout=5)
 
-        # The agent's legacy session owns the episode; nothing else is live.
+        # The agent's own /run episode is exported; nothing else is live.
         assert summary.exported_episodes == (episode,)
         assert summary.unowned_live_episodes == ()
         assert summary.staging_keys == ()
@@ -321,6 +328,81 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         assert [(s.session_key, s.episode_id, s.session) for s in hooks.restored] == [
             ("run:rollout-1", replacement, {"turns": 1})
         ]
+
+        # The restore refuses the attempt it replaced, and a retire refuses its
+        # rollout, on every participant until RL forgets them.
+        await restored.retire(
+            "retire-1",
+            [GymCheckpointEpisode("rollout-2", 0)],
+            deadline_ts=time.time() + 5,
+        )
+        assert await _retired_rollouts(restored) == {"policy": 2, "agent": 2}
+        await restored.forget(
+            "forget-1", ["rollout-1", "rollout-2"], deadline_ts=time.time() + 5
+        )
+        assert await _retired_rollouts(restored) == {"policy": 0, "agent": 0}
+
+    asyncio.run(exercise())
+
+
+async def _retired_rollouts(adapter: GymCheckpointAdapter) -> dict[str, int]:
+    """Each participant's count of rollouts it still refuses, from its /status."""
+    counts = {}
+    for server_name in ("policy", "agent"):
+        reply = await adapter._client.request(
+            server_name,
+            "/ng-control/v1/checkpoint/status",
+            "GET",
+            headers={"Authorization": f"Bearer {_CONTROL_TOKEN}"},
+        )
+        assert reply.status == 200
+        counts[server_name] = json.loads(await reply.read())["retired_rollouts"]
+    return counts
+
+
+def test_a_rollout_gym_cannot_capture_is_reported_as_a_restart(tmp_path: Path) -> None:
+    """RL reads the restarts of Gym's real coordination and leaves them out."""
+    from nemo_gym._checkpoint.agent import RestartOnlyAgentParticipant
+
+    restart = GymCheckpointEpisode("rollout-1", 0)
+
+    async def exercise() -> None:
+        restart_only = RestartOnlyAgentParticipant()
+        adapter, _, _ = _in_process_gym(tmp_path, restart_only_agent=restart_only)
+        await adapter.discover()
+
+        release = asyncio.Event()
+        in_call = asyncio.Event()
+
+        async def call() -> None:
+            async with restart_only.track(restart.capture_key):
+                in_call.set()
+                await release.wait()
+
+        tracked = asyncio.create_task(call())
+        await asyncio.wait_for(in_call.wait(), timeout=5)
+
+        # Gym refuses a commit that names the restart; the controller resumes
+        # and prepares again under a new checkpoint ID.
+        await adapter.prepare("save-0", deadline_ts=time.time() + 5)
+        with pytest.raises(GymCheckpointUnavailable, match="restart_in_scope"):
+            await adapter.commit(
+                "save-0", tmp_path / "refused", [restart], deadline_ts=time.time() + 5
+            )
+        await adapter.resume("save-0", deadline_ts=time.time() + 5)
+
+        result = await adapter.prepare("save-1", deadline_ts=time.time() + 5)
+        summary = GymCheckpointPrepareSummary.from_result(result)
+        assert summary.prepared
+        assert summary.restarts == (restart,)
+        committed = await adapter.commit(
+            "save-1", tmp_path / "checkpoint", [], deadline_ts=time.time() + 5
+        )
+        await adapter.resume("save-1", deadline_ts=time.time() + 5)
+        release.set()
+        await asyncio.wait_for(tracked, timeout=5)
+
+        assert committed.exported_episodes == ()
 
     asyncio.run(exercise())
 
@@ -565,36 +647,15 @@ def test_staging_keys_gym_does_not_attribute_fail_the_commit(
         )
 
 
-def _commit_with_agent_records(
+def _commit_with_agent_session(
     monkeypatch,
-    tmp_path,
     *,
     environment_keys: list[str],
-    agent_records: list[dict[str, object]],
-    tamper_agent_digest: bool = False,
+    own_run_episode_ids: list[str],
 ):
-    """Commit one episode against real agent records written by Gym's store."""
+    """Commit one agent session, as Gym's agent participant replies for it."""
     from nemo_gym._checkpoint import coordination
-    from nemo_gym._checkpoint.store import write_participant_state
-    from nemo_gym.episode_types import EpisodeId
 
-    instance = GymCheckpointInstance("deployment", 0)
-    checkpoint_root = tmp_path / "step-1"
-    agent_manifest = write_participant_state(
-        instance.checkpoint_dir(checkpoint_root),
-        kind="agent",
-        instance="workplace-agent",
-        checkpoint_id="save-1",
-        records=agent_records,
-    )
-    if tamper_agent_digest:
-        agent_manifest = {**agent_manifest, "records_sha256": "f" * 64}
-    agent_keys = sorted(
-        {
-            EpisodeId.model_validate(record["episode_id"]).capture_key
-            for record in agent_records
-        }
-    )
     client = object()
     participants = SimpleNamespace(
         client=client,
@@ -621,22 +682,23 @@ def _commit_with_agent_records(
                     staging_keys_by_episode={},
                 ),
                 "agent": {
-                    "phase": "committed",
-                    "manifest": agent_manifest,
-                    "episode_ids": agent_keys,
+                    **_commit_reply("deployment", "agent", ["rollout-1"]),
+                    "run_episode_ids": own_run_episode_ids,
                 },
             }
         ),
     )
     adapter = GymCheckpointAdapter(
-        instance=instance, client=client, auth_token="secret"
+        instance=GymCheckpointInstance("deployment", 0),
+        client=client,
+        auth_token="secret",
     )
 
     async def exercise():
         await adapter.discover()
         return await adapter.commit(
             "save-1",
-            checkpoint_root,
+            "/unused",
             [GymCheckpointEpisode("rollout-1", 0)],
             deadline_ts=10.0,
         )
@@ -644,70 +706,45 @@ def _commit_with_agent_records(
     return asyncio.run(exercise())
 
 
-def _agent_record(*, legacy: bool) -> dict[str, object]:
-    return {
-        "episode_id": {"rollout_id": "rollout-1", "attempt": 0},
-        "session_key": "session-1",
-        "session": {"messages": []},
-        "boundary": None,
-        "episode": {"next_step": 2} if legacy else None,
-    }
-
-
-def test_adapter_assigns_legacy_relay_episode_to_its_agent(
-    monkeypatch, tmp_path
-) -> None:
-    """A legacy_agent environment relays /run, so the agent session owns it."""
-    summary = _commit_with_agent_records(
-        monkeypatch,
-        tmp_path,
-        environment_keys=[],
-        agent_records=[_agent_record(legacy=True)],
+def test_adapter_assigns_a_relayed_run_episode_to_its_agent(monkeypatch) -> None:
+    """A legacy_agent environment server relays /run: the agent's own episode."""
+    summary = _commit_with_agent_session(
+        monkeypatch, environment_keys=[], own_run_episode_ids=["rollout-1"]
     )
 
     assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
     assert summary.unowned_live_episodes == ()
 
 
-def test_adapter_keeps_environment_ownership_of_native_agent_session(
-    monkeypatch, tmp_path
+def test_adapter_keeps_environment_server_ownership_of_its_agent_session(
+    monkeypatch,
 ) -> None:
-    summary = _commit_with_agent_records(
-        monkeypatch,
-        tmp_path,
-        environment_keys=["rollout-1"],
-        agent_records=[_agent_record(legacy=False)],
+    summary = _commit_with_agent_session(
+        monkeypatch, environment_keys=["rollout-1"], own_run_episode_ids=[]
     )
 
     assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
     assert summary.unowned_live_episodes == ()
 
 
-def test_adapter_reports_native_agent_session_without_an_owner(
-    monkeypatch, tmp_path
+def test_adapter_reports_an_environment_server_agent_session_without_an_owner(
+    monkeypatch,
 ) -> None:
     """A parked session nobody can restore must not be mistaken for an export."""
-    summary = _commit_with_agent_records(
-        monkeypatch,
-        tmp_path,
-        environment_keys=[],
-        agent_records=[_agent_record(legacy=False)],
+    summary = _commit_with_agent_session(
+        monkeypatch, environment_keys=[], own_run_episode_ids=[]
     )
 
     assert summary.exported_episodes == ()
     assert summary.unowned_live_episodes == (GymCheckpointEpisode("rollout-1", 0),)
 
 
-def test_adapter_rejects_agent_records_that_differ_from_the_commit_reply(
-    monkeypatch, tmp_path
-) -> None:
-    with pytest.raises(RuntimeError, match="agent records on disk do not match"):
-        _commit_with_agent_records(
+def test_adapter_rejects_a_run_episode_the_agent_did_not_export(monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match="names /run episodes it did not export"):
+        _commit_with_agent_session(
             monkeypatch,
-            tmp_path,
             environment_keys=[],
-            agent_records=[_agent_record(legacy=True)],
-            tamper_agent_digest=True,
+            own_run_episode_ids=["rollout-1", "rollout-2"],
         )
 
 

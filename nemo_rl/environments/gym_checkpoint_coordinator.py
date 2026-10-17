@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import time
+import warnings
 from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -38,7 +39,7 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import FailureClass, classify_rollout_failure
 
 GYM_CHECKPOINT_MANIFEST_FILENAME = "gym_checkpoint.json"
-GYM_CHECKPOINT_SCHEMA_VERSION = 2
+GYM_CHECKPOINT_SCHEMA_VERSION = 3
 # Upper bound on how long past a call's deadline RL waits for Gym's reply. Gym
 # answers by the deadline once it runs the call, so this only covers the reply
 # crossing Ray; a call still unanswered after it was never run.
@@ -112,12 +113,17 @@ def is_transient_gym_checkpoint_failure(error: BaseException) -> bool:
 
 @dataclass(frozen=True)
 class GymCheckpointManifest:
-    """Durable mapping from Gym actor instances to continued episodes."""
+    """Durable mapping from Gym actor instances to continued episodes.
+
+    ``restarts`` are the episodes RL still owned that Gym could not capture: a
+    restore leaves them out and starts them over from their tasks.
+    """
 
     schema_version: int
     checkpoint_id: str
     instances: dict[str, tuple[GymCheckpointEpisode, ...]]
     staging_keys: dict[str, tuple[str, ...]]
+    restarts: dict[str, tuple[GymCheckpointEpisode, ...]]
 
     def __post_init__(self) -> None:
         if self.schema_version != GYM_CHECKPOINT_SCHEMA_VERSION:
@@ -145,6 +151,23 @@ class GymCheckpointManifest:
             raise ValueError(
                 "Gym checkpoint staging-key topology must match its episode topology"
             )
+        if set(self.restarts) != set(self.instances):
+            raise ValueError(
+                "Gym checkpoint restart topology must match its episode topology"
+            )
+        for instance_id, restarts in self.restarts.items():
+            if len(tuple(restarts)) != len(set(restarts)):
+                raise ValueError(
+                    "Gym checkpoint instance "
+                    f"{instance_id!r} contains duplicate restarts"
+                )
+            continued = set(restarts) & set(self.instances[instance_id])
+            if continued:
+                raise ValueError(
+                    "Gym checkpoint instance "
+                    f"{instance_id!r} both continues and restarts "
+                    f"{sorted(continued)!r}"
+                )
         for instance_id, keys in self.staging_keys.items():
             if any(not key for key in keys):
                 raise ValueError(
@@ -170,6 +193,10 @@ class GymCheckpointManifest:
                 instance_id: list(keys)
                 for instance_id, keys in sorted(self.staging_keys.items())
             },
+            "restarts": {
+                instance_id: [asdict(episode) for episode in episodes]
+                for instance_id, episodes in sorted(self.restarts.items())
+            },
         }
 
     @classmethod
@@ -179,6 +206,7 @@ class GymCheckpointManifest:
             "checkpoint_id",
             "instances",
             "staging_keys",
+            "restarts",
         }
         if unknown:
             raise ValueError(
@@ -188,6 +216,7 @@ class GymCheckpointManifest:
         checkpoint_id = raw.get("checkpoint_id")
         raw_instances = raw.get("instances")
         raw_staging_keys = raw.get("staging_keys")
+        raw_restarts = raw.get("restarts")
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise ValueError("Gym checkpoint schema_version must be an integer")
         if not isinstance(checkpoint_id, str):
@@ -196,36 +225,11 @@ class GymCheckpointManifest:
             raise ValueError("Gym checkpoint instances must be a mapping")
         if not isinstance(raw_staging_keys, dict):
             raise ValueError("Gym checkpoint staging_keys must be a mapping")
+        if not isinstance(raw_restarts, dict):
+            raise ValueError("Gym checkpoint restarts must be a mapping")
 
-        instances: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-        for instance_id, raw_episodes in raw_instances.items():
-            if not isinstance(instance_id, str):
-                raise ValueError("Gym checkpoint instance IDs must be strings")
-            if not isinstance(raw_episodes, list):
-                raise ValueError(
-                    f"Gym checkpoint episodes for {instance_id!r} must be a list"
-                )
-            episodes = []
-            for raw_episode in raw_episodes:
-                if not isinstance(raw_episode, dict):
-                    raise ValueError("Gym checkpoint episode must be a mapping")
-                if set(raw_episode) != {"rollout_id", "attempt"}:
-                    raise ValueError(
-                        "Gym checkpoint episode must contain exactly rollout_id "
-                        "and attempt"
-                    )
-                rollout_id = raw_episode["rollout_id"]
-                attempt = raw_episode["attempt"]
-                if not isinstance(rollout_id, str):
-                    raise ValueError(
-                        "Gym checkpoint episode rollout_id must be a string"
-                    )
-                if not isinstance(attempt, int) or isinstance(attempt, bool):
-                    raise ValueError(
-                        "Gym checkpoint episode attempt must be an integer"
-                    )
-                episodes.append(GymCheckpointEpisode(rollout_id, attempt))
-            instances[instance_id] = tuple(episodes)
+        instances = _episodes_by_instance(raw_instances, "episodes")
+        restarts = _episodes_by_instance(raw_restarts, "restarts")
         staging_keys: dict[str, tuple[str, ...]] = {}
         for instance_id, raw_keys in raw_staging_keys.items():
             if not isinstance(instance_id, str):
@@ -244,7 +248,39 @@ class GymCheckpointManifest:
             checkpoint_id=checkpoint_id,
             instances=instances,
             staging_keys=staging_keys,
+            restarts=restarts,
         )
+
+
+def _episodes_by_instance(
+    raw: Mapping[Any, Any], name: str
+) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+    """Parse one manifest mapping from Gym instance IDs to episode lists."""
+    episodes_by_instance: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+    for instance_id, raw_episodes in raw.items():
+        if not isinstance(instance_id, str):
+            raise ValueError("Gym checkpoint instance IDs must be strings")
+        if not isinstance(raw_episodes, list):
+            raise ValueError(
+                f"Gym checkpoint {name} for {instance_id!r} must be a list"
+            )
+        episodes = []
+        for raw_episode in raw_episodes:
+            if not isinstance(raw_episode, dict):
+                raise ValueError("Gym checkpoint episode must be a mapping")
+            if set(raw_episode) != {"rollout_id", "attempt"}:
+                raise ValueError(
+                    "Gym checkpoint episode must contain exactly rollout_id and attempt"
+                )
+            rollout_id = raw_episode["rollout_id"]
+            attempt = raw_episode["attempt"]
+            if not isinstance(rollout_id, str):
+                raise ValueError("Gym checkpoint episode rollout_id must be a string")
+            if not isinstance(attempt, int) or isinstance(attempt, bool):
+                raise ValueError("Gym checkpoint episode attempt must be an integer")
+            episodes.append(GymCheckpointEpisode(rollout_id, attempt))
+        episodes_by_instance[instance_id] = tuple(episodes)
+    return episodes_by_instance
 
 
 @dataclass(frozen=True)
@@ -430,8 +466,23 @@ class GymCheckpointCoordinator:
         checkpoint_id: str,
         checkpoint_root: str | Path,
         episodes_by_instance: Mapping[str, tuple[GymCheckpointEpisode, ...]],
+        *,
+        restarts: Mapping[str, tuple[GymCheckpointEpisode, ...]],
     ) -> GymCheckpointCommitResult:
+        """Save ``episodes_by_instance`` and record ``restarts`` as starting over.
+
+        Gym refuses a commit whose scope names an episode it reported as a
+        restart, so the two must not overlap.
+        """
         inventory = self._validate_inventory(episodes_by_instance)
+        restarted = self._validate_inventory(restarts)
+        overlap = {
+            instance_id: sorted(set(inventory[instance_id]) & set(episodes))
+            for instance_id, episodes in restarted.items()
+            if set(inventory[instance_id]) & set(episodes)
+        }
+        if overlap:
+            raise ValueError(f"Gym checkpoint commit scope names restarts: {overlap!r}")
         deadline_ts = self._deadline()
         raw_summaries = await self._collect(
             "commit",
@@ -478,6 +529,7 @@ class GymCheckpointCoordinator:
                 instance_id: staging_keys_of(summary, summary.exported_episodes)
                 for instance_id, summary in summaries.items()
             },
+            restarts=restarted,
         )
         await asyncio.to_thread(
             write_gym_checkpoint_manifest,
@@ -506,6 +558,36 @@ class GymCheckpointCoordinator:
                     deadline_ts=deadline_ts,
                 )
                 for instance_id, episodes in inventory.items()
+            },
+            deadline_ts=deadline_ts,
+        )
+
+    async def forget(
+        self,
+        checkpoint_id: str,
+        episodes_by_instance: Mapping[str, tuple[GymCheckpointEpisode, ...]],
+    ) -> None:
+        """Let Gym stop refusing these rollouts: RL will never send them again.
+
+        One call per deployment with anything to forget, naming each rollout once.
+        """
+        unknown = set(episodes_by_instance) - set(self._handles)
+        if unknown:
+            raise ValueError(
+                "Gym forget names instances outside the live actor topology: "
+                f"unknown={sorted(unknown)!r}"
+            )
+        deadline_ts = self._deadline()
+        await self._collect(
+            "forget",
+            {
+                instance_id: self._handles[instance_id].checkpoint_forget.remote(
+                    checkpoint_id,
+                    tuple(sorted({episode.rollout_id for episode in episodes})),
+                    deadline_ts=deadline_ts,
+                )
+                for instance_id, episodes in episodes_by_instance.items()
+                if episodes
             },
             deadline_ts=deadline_ts,
         )
@@ -668,10 +750,20 @@ class GymCheckpointCoordinator:
                 return
 
     @asynccontextmanager
-    async def prepared(self, checkpoint_id: str) -> AsyncIterator[None]:
-        """Prepare every deployment, renew its lease, and always release it."""
+    async def prepared(
+        self, checkpoint_id: str
+    ) -> AsyncIterator[dict[str, frozenset[GymCheckpointEpisode]]]:
+        """Prepare every deployment, renew its lease, and always release it.
+
+        Yields each instance's restarts: the episodes a commit must leave out.
+        Gym resumes when the body exits, before the caller publishes, so new
+        rollouts wait only for Gym's own commit. Once the body succeeded every
+        commit is written and resume only reopens admission: a resume that
+        still fails is reported, not raised, since Gym's lease reopens that
+        deployment on its own and the checkpoint stays valid.
+        """
         try:
-            await self.prepare(checkpoint_id)
+            summaries = await self.prepare(checkpoint_id)
             # A prepare may use most of its original deadline. Refresh once before
             # the outer controller begins disk I/O, then keep the lease alive.
             await self.renew(checkpoint_id)
@@ -681,7 +773,10 @@ class GymCheckpointCoordinator:
             )
             body_error: BaseException | None = None
             try:
-                yield
+                yield {
+                    instance_id: frozenset(summary.restarts)
+                    for instance_id, summary in summaries.items()
+                }
             except BaseException as error:
                 body_error = error
                 raise
@@ -708,7 +803,15 @@ class GymCheckpointCoordinator:
                 )
             raise
         else:
-            await self.resume(checkpoint_id)
+            try:
+                await self.resume(checkpoint_id)
+            except GymCheckpointOperationError as error:
+                warnings.warn(
+                    f"Gym checkpoint {checkpoint_id!r} is saved, but resume failed on "
+                    f"{sorted(error.failures)!r}; those deployments stay closed until "
+                    f"their lease expires: {error}",
+                    stacklevel=2,
+                )
 
 
 def _cancel_remote(reference: Any) -> None:

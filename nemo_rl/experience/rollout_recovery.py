@@ -308,7 +308,7 @@ class PromptGroupRecoveryRecord:
         return f"{self.group_id}_g{generation_index}"
 
     def gate_rollout_id(self, generation_index: int) -> str:
-        """Return the legacy string carrier for one structured Gym episode.
+        """Return the string form of one Gym episode, as a ``/run`` row carries it.
 
         Durable checkpoint state uses :meth:`gym_episode`; this is its capture
         key, which RL's ``test_rollout_capture_key_matches_gym_episode_identity``
@@ -522,6 +522,10 @@ class RolloutRecoveryLedger:
         # Gym instance. In memory only: they belong to this process's Gym
         # executions and must be retired before the next checkpoint commit.
         self._gym_retirements: dict[str, set[GymCheckpointEpisode]] = {}
+        # Finished rollouts Gym still refuses by rollout ID, by owning Gym
+        # instance: retired ones, and restored ones whose continued attempt
+        # sealed. Gym's marks live in its processes, so these stay in memory too.
+        self._gym_forgets: dict[str, set[GymCheckpointEpisode]] = {}
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -817,14 +821,62 @@ class RolloutRecoveryLedger:
     def mark_gym_retired(
         self, retired: Mapping[str, Iterable[GymCheckpointEpisode]]
     ) -> None:
-        """Forget episodes Gym has retired; later drops stay pending."""
+        """Queue episodes Gym has retired for forget; later drops stay pending.
+
+        RL never sends a dropped attempt's rollout ID again, so once its retire
+        has completed nothing of it can still run.
+        """
         for instance_id, episodes in retired.items():
+            episodes = set(episodes)
+            if episodes:
+                self._gym_forgets.setdefault(instance_id, set()).update(episodes)
             pending = self._gym_retirements.get(instance_id)
             if pending is None:
                 continue
             pending.difference_update(episodes)
             if not pending:
                 del self._gym_retirements[instance_id]
+
+    def _record_gym_forget_if_restored(
+        self, record: PromptGroupRecoveryRecord, generation_index: int
+    ) -> None:
+        """Queue a restored rollout for forget once its continued attempt sealed.
+
+        Gym's restore refuses the attempts it replaced until RL forgets the
+        rollout; a dropped one reaches the queue through its retire instead.
+        """
+        attempt = self._require_sibling(record, generation_index).current_attempt
+        if attempt.gym_attempt > 0 and attempt.gym_instance_id is not None:
+            self._gym_forgets.setdefault(attempt.gym_instance_id, set()).add(
+                record.gym_episode(generation_index)
+            )
+
+    def gym_checkpoint_forgets(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return finished rollouts Gym still refuses, to forget while it is idle."""
+        unknown = set(self._gym_forgets) - set(instance_ids)
+        if unknown:
+            raise RuntimeError(
+                f"finished rollouts reference unavailable Gym instances {sorted(unknown)!r}"
+            )
+        return {
+            instance_id: tuple(sorted(self._gym_forgets.get(instance_id, ())))
+            for instance_id in instance_ids
+        }
+
+    def mark_gym_forgotten(
+        self, forgotten: Mapping[str, Iterable[GymCheckpointEpisode]]
+    ) -> None:
+        """Drop rollouts Gym has forgotten; ones queued meanwhile stay pending."""
+        for instance_id, episodes in forgotten.items():
+            pending = self._gym_forgets.get(instance_id)
+            if pending is None:
+                continue
+            pending.difference_update(episodes)
+            if not pending:
+                del self._gym_forgets[instance_id]
 
     def prepare_incomplete_retry(
         self,
@@ -1034,6 +1086,7 @@ class RolloutRecoveryLedger:
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
+        self._record_gym_forget_if_restored(record, generation_index)
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
             for item in record.siblings
@@ -1112,7 +1165,7 @@ class RolloutRecoveryLedger:
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
         record.resolved_agent_name = resolved_agent_name
-        for attempt, result, staging_keys in validated:
+        for generation_index, (attempt, result, staging_keys) in enumerate(validated):
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.logical_selection = copy.deepcopy(result.logical_selection)
             attempt.reward = float(result.reward)
@@ -1121,6 +1174,7 @@ class RolloutRecoveryLedger:
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
+            self._record_gym_forget_if_restored(record, generation_index)
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
     @staticmethod
