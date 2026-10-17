@@ -33,6 +33,14 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+    # Driver-side reliability knobs, read by the rollout loop in
+    # nemo_rl/experience/rollouts.py (synchronous GRPO, the asynchronous
+    # trajectory collector, PPO, distillation) and never forwarded to Gym. The
+    # single-controller rollout manager does not read them: it bounds a rollout
+    # with rollout_timeout_s and re-dispatches rows under max_row_attempts.
+    # Both are off by default: no polling, one dispatch per row.
+    health_check_interval_seconds: null  # poll Gym's servers after this long without a completed row
+    max_infra_attempts_per_rollout: 1    # dispatches one row may use after a /run infrastructure failure
 
 logger:
   wandb:
@@ -40,6 +48,30 @@ logger:
     # result payloads can produce many large W&B Table artifacts.
     log_nemo_gym_full_result_tables: false
 ```
+
+`max_infra_attempts_per_rollout` is the number of dispatches one row may use. A
+`/run` that failed at the infrastructure level comes back from NeMo Gym's
+collector as a failure marker; the row is sent again as a fresh session while
+the other rows keep running, and the same failure ends the step once the budget
+is spent. A re-dispatch picks its engine the way the first dispatch did, by
+hashing a fresh session id in NeMo Gym's `vllm_model`, so pair a budget above
+one with `route_around_failing_endpoints: true` in that server's configuration.
+Without it every retry lands on a failed engine with probability one in the
+number of engines, and a step with many rows on a dead engine still fails. An
+engine that refuses connections produces no failure marker at all: NeMo Gym's
+internal client retries a refused connection without bound unless an
+`endpoint_file` is configured, and its session sets no total deadline, so such a
+row never arrives and the rollout's deadline, not this budget, ends the step.
+`health_check_interval_seconds` ends it sooner: after that long without a
+completed row, every Gym actor's `health_check` runs with a bounded probe, and a
+dead or unresponsive actor fails the rollout with a transport error.
+
+Both settings belong to the rollout loop in `nemo_rl/experience/rollouts.py`,
+which synchronous GRPO, the asynchronous trajectory collector, PPO and
+distillation share. The single-controller rollout manager
+(`AsyncNemoGymRolloutImpl`) reads neither: it bounds a prompt group with
+`rollout_timeout_s` and re-dispatches failed rows under `max_row_attempts`, both
+under its own `rollout_failure` configuration.
 
 When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
 the per-agent `full_result` Tables. This prevents those payloads from entering
