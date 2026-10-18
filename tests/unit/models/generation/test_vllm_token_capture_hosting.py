@@ -1423,6 +1423,95 @@ def test_generation_cut_refuses_media_captured_without_digests(caplog):
     assert state.frozen_cut is None
 
 
+def _worker_with_active_text_prefix(sink: _MemorySink):
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    state = worker._capture_calls[id(request)]
+    state.effective_output_limit = 8
+    state.observe([20], [-0.1])
+    return worker, state
+
+
+@pytest.mark.parametrize(
+    ("media", "cuts"),
+    [(False, 1), (True, 1), (True, 2)],
+    ids=["text", "image_one_cut", "image_two_cuts"],
+)
+def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
+    media: bool, cuts: int
+):
+    sink = _MemorySink()
+    if media:
+        worker, _, state, _ = _worker_with_active_media_prefix(sink)
+    else:
+        worker, state = _worker_with_active_text_prefix(sink)
+    for index in range(cuts):
+        if index:
+            state.observe([21], [-0.2])
+        receipt = worker._checkpoint_generation_cut(
+            _single_generation_cut_inventory(f"checkpoint-{index + 1}")
+        )
+    (ack,) = receipt.prefixes
+    records = dict(
+        zip(
+            sink.generation_prefix_keys,
+            (record for _, record in sink.generation_prefix_records),
+            strict=True,
+        )
+    )
+    assert list(records) == list(ack.staging_keys)
+    first = records[ack.staging_keys[0]]
+    assert (MEDIA_TENSOR_DIGESTS_FIELD in (first.extras or {})) is media
+
+    def resolve(staged: dict[str, StagedCallRecord]):
+        resumed = _worker_with_capture(sink)
+        resumed._rollout_weight_version = worker._rollout_weight_version
+        resumed._staging_source = _MemoryPrefixSource({}, records=staged)
+        request = _FakeRequest(
+            ng_capture={
+                "rollout_id": "r0-a1",
+                "model_call_id": "c2",
+                "mode": "text",
+                "generation_cut": {
+                    "source_capture_key": "r0",
+                    "source_model_call_id": "c1",
+                    "staging_keys": list(ack.staging_keys),
+                    "prefix_token_count": ack.prefix_token_count,
+                    "prefix_digest": ack.prefix_digest,
+                    "effective_output_limit": ack.effective_output_limit,
+                },
+            },
+            stream=False,
+        )
+        return resumed._resolve_generation_cut(resumed._capture_admission(request), [])
+
+    # Restore recomputes the cumulative digest from the staged chunks, the
+    # first chunk's media extras included, and must reach the cut's digest:
+    # Gym's begin_call rejects a restored snapshot whose digest differs.
+    assert resolve(records).digest == ack.prefix_digest
+    if media:
+        # The tensor digests are covered: a changed one changes the digest.
+        digests = dict(first.extras[MEDIA_TENSOR_DIGESTS_FIELD])
+        digests["imgs"] = {**digests["imgs"], "sha256": "0" * 64}
+        tampered = first.model_copy(
+            update={"extras": {**first.extras, MEDIA_TENSOR_DIGESTS_FIELD: digests}}
+        )
+        assert (
+            resolve({**records, ack.staging_keys[0]: tampered}).digest
+            != ack.prefix_digest
+        )
+
+
 class _BlockingPrefixSink(_MemorySink):
     def __init__(self) -> None:
         super().__init__()
