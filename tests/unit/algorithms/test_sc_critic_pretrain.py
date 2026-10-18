@@ -29,7 +29,11 @@ from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
     GeneralizedAdvantageEstimator,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    MseValueLossConfig,
+    MseValueLossFn,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_bank import (
     TOKEN_FIELDS,
     BankGroup,
@@ -206,6 +210,73 @@ def test_returns_are_the_reward_on_every_response_token():
     torch.testing.assert_close(returns[0, 1:], torch.tensor([1.0, 1.0]))
 
 
+@pytest.mark.parametrize("normalize_over", ["all_rows", "kept_rows"])
+def test_returns_ignore_the_predictions_wherever_the_loss_looks(normalize_over):
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, gae_gamma=1.0, normalize_over=normalize_over),
+        ClippedPGLossConfig(),
+    )
+    # Multi-turn rows (gaps in the response mask) and one row the loss drops.
+    token_mask = torch.tensor(
+        [[0, 1, 0, 1, 1], [0, 1, 1, 0, 0], [1, 1, 0, 1, 0]], dtype=torch.float32
+    )
+    sample_mask = torch.tensor([1.0, 1.0, 0.0])
+    kwargs = dict(
+        token_mask=token_mask,
+        sample_mask=sample_mask,
+        rewards=torch.tensor([1.0, 0.0, 1.0]),
+    )
+    scored = cp.gae_returns(estimator, values=torch.rand(3, 5), **kwargs)
+    unscored = cp.gae_returns(estimator, values=torch.zeros(3, 5), **kwargs)
+    seen = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    torch.testing.assert_close(unscored[seen], scored[seen])
+
+
+def test_train_scoring_is_redundant_only_for_undiscounted_monte_carlo_returns():
+    def redundant(**gae):
+        return cp.train_scoring_is_redundant(
+            GeneralizedAdvantageEstimator(GAEConfig(**gae), ClippedPGLossConfig())
+        )
+
+    assert redundant(gae_lambda=1.0, gae_gamma=1.0)
+    # The value returns' lambda decides; the policy's may differ.
+    assert redundant(gae_lambda=0.95, gae_lambda_value=1.0, gae_gamma=1.0)
+    assert not redundant(gae_lambda=0.95, gae_gamma=1.0)
+    assert not redundant(gae_lambda=1.0, gae_lambda_value=0.9, gae_gamma=1.0)
+    assert not redundant(gae_lambda=1.0, gae_gamma=0.99)
+
+
+def test_an_inert_value_clip_leaves_the_loss_and_gradient_unchanged():
+    gen = torch.Generator().manual_seed(0)
+    old = torch.rand(3, 6, generator=gen)
+    data = {
+        "token_mask": torch.tensor(
+            [[0, 1, 1, 1, 0, 0], [0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]],
+            dtype=torch.float32,
+        ),
+        "sample_mask": torch.tensor([1.0, 1.0, 0.0]),
+        "returns": torch.rand(3, 6, generator=gen),
+        "values": old,
+    }
+    # The training forward on the scoring weights: v_old up to numerics.
+    prediction = old + 1e-3 * torch.randn(3, 6, generator=gen)
+    out = {}
+    for cliprange in (0.5, None):
+        values = prediction.clone().requires_grad_()
+        loss, metrics = MseValueLossFn(MseValueLossConfig(cliprange=cliprange))(
+            values,
+            data,
+            global_valid_seqs=torch.tensor(2.0),
+            global_valid_toks=torch.tensor(7.0),
+        )
+        loss.backward()
+        out[cliprange] = (loss.detach(), values.grad, metrics)
+    torch.testing.assert_close(out[None][0], out[0.5][0], rtol=0, atol=0)
+    torch.testing.assert_close(out[None][1], out[0.5][1], rtol=0, atol=0)
+    assert out[0.5][2]["vf_clipfrac"] == 0.0
+    assert out[None][2] == out[0.5][2]
+
+
 def test_heldout_stats_legacy_metrics():
     stats = cp.HeldoutStats()
     # One group: two winners (values high late), two losers.
@@ -327,6 +398,10 @@ class _Value:
             "returns": {
                 sid: self.plane.rows[sid]["returns"] for sid in meta.sample_ids
             },
+            "values": {sid: self.plane.rows[sid]["values"] for sid in meta.sample_ids},
+            "token_mask": {
+                sid: self.plane.rows[sid]["token_mask"] for sid in meta.sample_ids
+            },
             "sample_mask": {
                 sid: float(self.plane.rows[sid]["sample_mask"])
                 for sid in meta.sample_ids
@@ -360,7 +435,7 @@ class _CharTokenizer:
         return {"input_ids": torch.tensor([self.encode(text)])}
 
 
-def _trainer(plane, value, *, privileged=False, **cfg):
+def _trainer(plane, value, *, privileged=False, estimator=None, loss_fn=None, **cfg):
     master_config = SimpleNamespace(
         ppo=SimpleNamespace(overlong_filtering=True),
         value={"train_micro_batch_size": 1},
@@ -378,8 +453,8 @@ def _trainer(plane, value, *, privileged=False, **cfg):
         cp.CriticPretrainConfig(bank_dirs=["/b"], **cfg),
         value=value,
         dp_client=plane,
-        estimator=_gae(),
-        loss_fn=object(),
+        estimator=estimator or _gae(),
+        loss_fn=loss_fn or object(),
         privilege_store=store,
         groups_per_step=2,
     )
@@ -403,14 +478,8 @@ def test_train_step_trains_on_everything_when_asked_and_cleans_up():
     torch.testing.assert_close(
         trained["returns"]["s0-A_g0"][2:], torch.tensor([1.0, 1.0, 1.0])
     )
-    assert value.calls == [
-        "prepare_for_inference",
-        "get_values",
-        "finish_inference",
-        "prepare_for_training",
-        "train",
-        "finish_training",
-    ]
+    # gamma = lambda = 1: no scoring pass before the update.
+    assert value.calls == ["prepare_for_training", "train", "finish_training"]
     assert plane.rows == {} and len(plane.cleared) == 4
     assert metrics["num_samples"] == 4.0 and metrics["num_rollouts"] == 3.0
     assert metrics["env_masked_rows"] == 1.0 and metrics["truncated_rows"] == 1.0
@@ -450,6 +519,65 @@ def test_train_step_masks_like_legacy_by_default():
     assert metrics["trained_rows"] == 1.0 and metrics["pad_rows"] == 1.0
 
 
+def _one_step(**trainer_kwargs):
+    plane = _Plane()
+    value = _Value(plane, prediction=0.4)
+    trainer = _trainer(
+        plane,
+        value,
+        train_on_env_masked=True,
+        train_on_truncated=True,
+        **trainer_kwargs,
+    )
+    metrics = trainer.train_step(
+        [
+            _group("A", 2, rewards=[1.0, 0.0], subagent=(1,), env_masked=(0,)),
+            _group("B", 1, rewards=[0.0], truncated=(0,)),
+        ]
+    )
+    trainer.close()
+    return trainer, value, metrics
+
+
+def test_train_step_skips_the_redundant_scoring_pass_without_changing_the_update():
+    clipped = MseValueLossFn(MseValueLossConfig(cliprange=0.5))
+    skip, skipped, skip_metrics = _one_step(loss_fn=clipped)
+    keep, kept, keep_metrics = _one_step(loss_fn=clipped, train_scoring="always")
+
+    assert skip.skip_train_scoring and not keep.skip_train_scoring
+    assert skipped.calls == ["prepare_for_training", "train", "finish_training"]
+    assert kept.calls[:3] == ["prepare_for_inference", "get_values", "finish_inference"]
+    # Every row trains here; the targets agree on every token the loss sees.
+    assert skipped.trained["sample_mask"] == kept.trained["sample_mask"]
+    assert set(kept.trained["sample_mask"].values()) == {1.0}
+    for sid, returns in kept.trained["returns"].items():
+        seen = kept.trained["token_mask"][sid].bool()
+        torch.testing.assert_close(skipped.trained["returns"][sid][seen], returns[seen])
+    assert skip_metrics == keep_metrics
+    # No v_old: zero placeholder values, an unclipped training loss, and the
+    # configured loss left alone.
+    assert not any(v.any() for v in skipped.trained["values"].values())
+    assert skip.loss_fn.cliprange is None and keep.loss_fn.cliprange == 0.5
+    assert clipped.cliprange == 0.5
+
+
+def test_train_step_scores_when_the_returns_bootstrap():
+    plane = _Plane()
+    value = _Value(plane)
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=0.95, gae_gamma=1.0), ClippedPGLossConfig()
+    )
+    trainer = _trainer(plane, value, estimator=estimator)
+    assert not trainer.skip_train_scoring
+    trainer.train_step([_group("A", 2)])
+    trainer.close()
+    assert value.calls[:3] == [
+        "prepare_for_inference",
+        "get_values",
+        "finish_inference",
+    ]
+
+
 def test_privileged_prefixes_come_from_the_banked_env_info():
     plane = _Plane()
     value = _Value(plane)
@@ -483,6 +611,8 @@ def test_evaluate_applies_the_legacy_masks_and_scores_groups():
         _group("C", 1),
     ]
     m = trainer.evaluate(groups)
+    # Held-out batches score even when training steps skip it.
+    assert trainer.skip_train_scoring and "get_values" in value.calls
     assert m["num_heldout_samples"] == 5.0
     # Constant predictions: no ranking information.
     assert m["critic/within_group_auc_q1"] == pytest.approx(0.5)
@@ -550,7 +680,9 @@ def test_resume_uses_the_rolling_full_checkpoint_only_for_the_latest_step(tmp_pa
 
 
 def test_optimizer_state_setting():
-    assert cp.CriticPretrainConfig(bank_dirs=["b"]).optimizer_state == "every_checkpoint"
+    assert (
+        cp.CriticPretrainConfig(bank_dirs=["b"]).optimizer_state == "every_checkpoint"
+    )
     latest = cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="latest_only")
     assert latest.optimizer_state == "latest_only"
     with pytest.raises(ValueError):

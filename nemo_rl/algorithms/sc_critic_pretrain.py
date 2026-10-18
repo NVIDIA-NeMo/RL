@@ -30,6 +30,10 @@ driver fits the PPO critic to them, value model only. Per step:
    gate: the bank holds no trainer logprobs, and legacy had none either.
 4. One ``train_from_meta`` update, clipped against the step's own predictions.
 
+With ``gae_gamma`` = ``gae_lambda`` = 1 neither 3 nor 4 depends on the step-2
+predictions, so training steps skip that forward (``train_scoring``,
+``train_scoring_is_redundant``); held-out batches always score.
+
 Held out, as legacy: whole tasks (``heldout_mod``) and, with K =
 ``heldout_responses_per_group`` > 0, the last K responses of donor prompts that
 otherwise train (``validation_response/*``: fresh responses to a seen prompt, the
@@ -43,6 +47,7 @@ The output ``step_N/value/weights`` + ``config.yaml`` is what
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -129,6 +134,10 @@ class CriticPretrainConfig(BaseModel, extra="forbid"):
     # PPO warm start loads) and one rolling full checkpoint, rewritten at every save
     # under <checkpoint_dir>/resume_state/current, resumes the run.
     optimizer_state: Literal["every_checkpoint", "latest_only"] = "every_checkpoint"
+    # The forward-only scoring pass before each training update (~1 of the ~4
+    # forward-equivalents a step costs). "auto": skip it when its predictions
+    # cannot change the update (train_scoring_is_redundant); "always": keep it.
+    train_scoring: Literal["auto", "always"] = "auto"
 
     @model_validator(mode="after")
     def validate_settings(self) -> "CriticPretrainConfig":
@@ -532,6 +541,21 @@ def gae_returns(
     return returns
 
 
+def train_scoring_is_redundant(estimator: GeneralizedAdvantageEstimator) -> bool:
+    """Whether a training step's scoring pass can change its update.
+
+    The pass predicts v_old for two consumers. The GAE returns: with gamma =
+    lambda (for the value returns) = 1 they are the reward-to-go on every token
+    of the estimator mask, which holds every trained token, whatever v_old is.
+    The value clip: ``train_step`` makes one ``train_from_meta`` call with gbs =
+    every row of the step, so one optimizer step after a single forward on the
+    weights that scored. Its predictions are v_old up to numerics, so the clip
+    to v_old +- cliprange never binds: the loss and gradient match the unclipped
+    ones. The training-step ``critic/*`` metrics come from that forward's loss.
+    """
+    return estimator.gae_gamma == 1.0 and estimator._resolve_lambda_value() == 1.0
+
+
 def _rank_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
     """Mann-Whitney AUC with tie correction; NaN unless both classes are present."""
     labels = labels.bool()
@@ -711,6 +735,13 @@ class _CriticPretrainer:
         self.value = value
         self.dp_client = dp_client
         self.estimator = estimator
+        self.skip_train_scoring = (
+            cfg.train_scoring == "auto" and train_scoring_is_redundant(estimator)
+        )
+        if self.skip_train_scoring and getattr(loss_fn, "cliprange", None):
+            # No v_old to clip against; the clip never binds anyway.
+            loss_fn = copy.copy(loss_fn)
+            loss_fn.cliprange = None
         self.loss_fn = loss_fn
         self.privilege_store = privilege_store
         self.overlong_filtering = bool(master_config.ppo.overlong_filtering)
@@ -787,10 +818,17 @@ class _CriticPretrainer:
         return {"privilege_prefixes": self.privilege_store.prefixes_for(meta)}
 
     def _score(self, meta: KVBatchMeta, *, train: bool) -> dict[str, torch.Tensor]:
-        """Critic forward, then the masks and GAE returns for the rows."""
-        self.value.prepare_for_inference()
-        self.value.get_values_from_meta(meta, **self._privilege_kwargs(meta))
-        self.value.finish_inference()
+        """Critic forward, then the masks and GAE returns for the rows.
+
+        A training step skips the forward when ``skip_train_scoring``: its
+        ``values`` are zeros, which the returns do not depend on there and the
+        unclipped training loss never reads.
+        """
+        forward = not (train and self.skip_train_scoring)
+        if forward:
+            self.value.prepare_for_inference()
+            self.value.get_values_from_meta(meta, **self._privilege_kwargs(meta))
+            self.value.finish_inference()
         data = self.dp_client.get_samples(
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
@@ -800,11 +838,15 @@ class _CriticPretrainer:
                 "mask_sample",
                 "truncated",
                 "total_reward",
-                "values",
+                *(["values"] if forward else []),
             ],
         )
         token_mask = tensor_field(data, "token_mask").float()
-        values = _fit_width(tensor_field(data, "values").float(), token_mask.shape[1])
+        values = (
+            _fit_width(tensor_field(data, "values").float(), token_mask.shape[1])
+            if forward
+            else torch.zeros_like(token_mask)
+        )
         rewards = squeeze_trailing_unit_dim(tensor_field(data, "total_reward")).float()
         flags = {
             name: squeeze_trailing_unit_dim(tensor_field(data, name))
@@ -850,16 +892,17 @@ class _CriticPretrainer:
         meta, staged = self._put(groups, id_prefix="s")
         try:
             scored = self._score(meta, train=True)
+            fields = {
+                "returns": scored["returns"],
+                "sample_mask": scored["sample_mask"],
+            }
+            if self.skip_train_scoring:
+                # The value worker reads a values field; unclipped, nothing uses it.
+                fields["values"] = scored["values"]
             self.dp_client.put_samples(
                 sample_ids=meta.sample_ids,
                 partition_id=meta.partition_id,
-                fields=fields_for_put(
-                    meta,
-                    {
-                        "returns": scored["returns"],
-                        "sample_mask": scored["sample_mask"],
-                    },
-                ),
+                fields=fields_for_put(meta, fields),
             )
             self.value.prepare_for_training()
             result = self.value.train_from_meta(
@@ -1253,6 +1296,15 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             else None
         ),
         groups_per_step=gps,
+    )
+    print(
+        "⏩ Training steps skip the critic's scoring pass: gamma = lambda = 1 "
+        "returns and a one-update step make it redundant (value clip off)"
+        if trainer.skip_train_scoring
+        else f"🔎 Training steps score before the update (train_scoring="
+        f"{cfg.train_scoring}, gamma={estimator.gae_gamma}, "
+        f"lambda_value={estimator._resolve_lambda_value()})",
+        flush=True,
     )
     logger = Logger(master_config.logger)
     logger.log_hyperparams(master_config.model_dump())
