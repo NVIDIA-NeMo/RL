@@ -5254,9 +5254,21 @@ def async_grpo_train(
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
 
+    # Rollout lifecycle JSONL for the collect-training-timeline skill; defaults
+    # to rollout_lifecycle.jsonl beside the training timeline when only that is set.
+    rollout_lifecycle_path = os.environ.get("NRL_ROLLOUT_LIFECYCLE_FPATH")
+    if rollout_lifecycle_path is None:
+        training_timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
+        if training_timeline_path and os.environ.get("NRL_TRAINING_TIMELINE") == "1":
+            rollout_lifecycle_path = os.path.join(
+                os.path.dirname(training_timeline_path),
+                "rollout_lifecycle.jsonl",
+            )
+
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         drop_incomplete_targets_on_restore=False,
+        lifecycle_log_path=rollout_lifecycle_path,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()

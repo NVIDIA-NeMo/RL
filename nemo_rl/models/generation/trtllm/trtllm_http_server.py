@@ -173,6 +173,115 @@ _TOKENIZE_SHADOW_RATE = float(
     os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
 )
 
+# Per-request timeline fields for the collect-training-timeline skill
+# (nemo_llm_* on every chat response, plus nemo_ctx_* on a context leg).
+# Under PD disaggregation they ride as top-level extras: the disagg server
+# relays worker output as RelayedChatCompletionResponse (extra="allow"), so
+# they survive the hop. Set NRL_TRTLLM_EMIT_TIMELINE_FIELDS=0 to suppress them,
+# e.g. against a tensorrt_llm build that still re-validates worker output with
+# the extra="forbid" ChatCompletionResponse.
+_TL_EMIT_TIMELINE_FIELDS = os.environ.get(
+    "NRL_TRTLLM_EMIT_TIMELINE_FIELDS", "1"
+).lower() not in ("0", "false", "no")
+
+
+def _tl_us(delta: Any, offset_s: float) -> int | None:
+    """Convert a TRT-LLM steady-clock timedelta to epoch microseconds."""
+    try:
+        return int((delta.total_seconds() + offset_s) * 1_000_000)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _tl_timing_fields(gen: Any, observed_wall_s: float) -> dict[str, int]:
+    """Best-effort per-request milestones for the timeline skill.
+
+    TRT-LLM reports RequestPerfMetrics.timing_metrics as steady_clock
+    timedeltas, so an epoch origin has to be estimated. It is anchored PER
+    REQUEST on that request's own last_token_time: *observed_wall_s* is read
+    immediately after this request's generation returned, so it is the
+    wall-clock instant just after last_token.
+
+    Per request, not once globally, because a single global offset absorbs the
+    first request's post-generation latency and then reports every later
+    request's last_token that much too late; any later request that
+    post-processes faster than the first then reports last_token AFTER
+    response_ready. Anchoring per request makes the whole chain ordered by
+    construction -- arrival <= queued <= first_scheduled <= first_token <=
+    last_token <= response_ready -- because the frontend interval strictly
+    contains the engine interval the offset is anchored inside. Intra-request
+    deltas are exact: all four engine timestamps share one offset, so it
+    cancels.
+
+    Field-name note: `queued_ts_us` is NOT a native TRT-LLM event -- TRT-LLM
+    has no separate "entered scheduler queue" milestone. It is mapped to
+    `arrival_time`, so `first_scheduled_ts_us - queued_ts_us` is the TRT-LLM
+    request queue interval. `arrival_ts_us` is this HTTP adapter's own receipt
+    time, a strictly earlier and different boundary than vLLM's.
+    """
+    out: dict[str, int] = {}
+    try:
+        metrics = getattr(gen, "request_perf_metrics", None)
+        timing = getattr(metrics, "timing_metrics", None)
+        if timing is None:
+            return out
+        off = observed_wall_s - timing.last_token_time.total_seconds()
+        pairs = (
+            ("nemo_llm_queued_ts_us", timing.arrival_time),
+            ("nemo_llm_first_scheduled_ts_us", timing.first_scheduled_time),
+            ("nemo_llm_first_token_ts_us", timing.first_token_time),
+            ("nemo_llm_last_token_ts_us", timing.last_token_time),
+        )
+        for key, delta in pairs:
+            value = _tl_us(delta, off)
+            if value is not None:
+                out[key] = value
+    except Exception:  # tracing is best effort and must never fail a request
+        return {}
+    return out
+
+
+def _tl_tokens_per_block(llm: Any) -> int:
+    """Resolve the KV pool's block size, needed to convert reuse to tokens."""
+    for path in (
+        ("args", "kv_cache_config", "tokens_per_block"),
+        ("llm_args", "kv_cache_config", "tokens_per_block"),
+        ("_kv_cache_config", "tokens_per_block"),
+    ):
+        obj: Any = llm
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, int) and not isinstance(obj, bool) and obj > 0:
+            return obj
+    return 32  # TRT-LLM's KvCacheConfig default
+
+
+def _tl_cached_tokens(gen: Any, tokens_per_block: int) -> int | None:
+    """Token-level prefix reuse for THIS request, or None if unavailable.
+
+    Per-request reuse lives on RequestPerfMetrics.kv_cache_metrics and is
+    counted in BLOCKS, so it is scaled by the pool's tokens_per_block. Callers
+    that compare it against the prompt must clamp: a partially reused tail
+    block rounds the value past the prompt length.
+    """
+    try:
+        metrics = getattr(gen, "request_perf_metrics", None)
+        if metrics is None:
+            return None
+        cache = getattr(metrics, "kv_cache_metrics", None)
+        if cache is None:
+            # Absent kv_cache_metrics means the engine recorded no cache
+            # activity for this request, i.e. zero reuse -- not "unknown".
+            return 0
+        reused = getattr(cache, "num_reused_blocks", None)
+        if not isinstance(reused, int) or isinstance(reused, bool) or reused < 0:
+            return 0
+        return reused * tokens_per_block
+    except Exception:  # tracing is best effort and must never fail a request
+        return None
+
 
 def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:
     """The engine's ``DisaggregatedParams`` plus the orchestrator's b64 request.
@@ -206,6 +315,9 @@ def _context_leg_response(
     prompt_token_ids: list[int],
     gen: Any,
     return_prompt_token_ids_b64: bool,
+    arrival_ts_us: Optional[int] = None,
+    tokens_per_block: Optional[int] = None,
+    request_output: Any = None,
 ) -> Any:
     """Reply to a ``context_only`` request.
 
@@ -215,6 +327,9 @@ def _context_leg_response(
     the reasoning/tool/stop-token post-processing is skipped entirely.
 
     ``return_prompt_token_ids_b64`` comes from :func:`_parse_disaggregated_params`.
+    ``arrival_ts_us``, ``tokens_per_block`` and ``request_output`` feed the
+    ``nemo_ctx_*`` timeline fields, which the disagg server relays onto the
+    final response.
     """
     from fastapi.responses import JSONResponse
     from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
@@ -258,6 +373,44 @@ def _context_leg_response(
         ).decode("ascii")
     else:
         response["prompt_token_ids"] = prompt_token_ids
+
+    if _TL_EMIT_TIMELINE_FIELDS:
+        # Context-leg stamps, relayed onto the final (generation) response by
+        # the disagg server, so a per-call timeline can split the pre-decode
+        # path: ctx adapter receipt, engine queue entry, first schedule and
+        # prefill completion.
+        if arrival_ts_us:
+            response["nemo_ctx_arrival_ts_us"] = arrival_ts_us
+        timing = _tl_timing_fields(gen, time.time())
+        for src, dst in (
+            ("nemo_llm_queued_ts_us", "nemo_ctx_queued_ts_us"),
+            ("nemo_llm_first_scheduled_ts_us", "nemo_ctx_first_scheduled_ts_us"),
+        ):
+            if timing.get(src):
+                response[dst] = timing[src]
+        response["nemo_ctx_done_ts_us"] = time.time_ns() // 1_000
+        # Context-side prefix reuse for THIS request. The final response's
+        # usage comes from the generation leg, which never prefills under
+        # ctx-first disaggregation, so it cannot stand in for this. Zero is a
+        # meaningful value (a full miss).
+        cached = getattr(gen, "cached_tokens", None)
+        if cached is None and tokens_per_block:
+            cached = _tl_cached_tokens(gen, tokens_per_block)
+        if isinstance(cached, int) and cached >= 0:
+            response["nemo_ctx_cached_tokens"] = cached
+        # The engine's cached_tokens overshoots the real reuse point by a few
+        # blocks; computed tokens and the first chunk's begin are what a reuse
+        # analysis needs. They live on the RequestOutput, not the per-choice
+        # CompletionOutput.
+        computed = getattr(request_output, "ctx_computed_tokens", None)
+        if isinstance(computed, int) and computed > 0:
+            response["nemo_ctx_computed_tokens"] = computed
+        first_begin = getattr(request_output, "ctx_first_begin", None)
+        if isinstance(first_begin, int) and first_begin >= 0:
+            response["nemo_ctx_first_begin"] = first_begin
+        num_chunks = getattr(request_output, "ctx_num_chunks", None)
+        if isinstance(num_chunks, int) and num_chunks > 0:
+            response["nemo_ctx_num_chunks"] = num_chunks
 
     return JSONResponse(content=response)
 
@@ -370,6 +523,8 @@ def create_app(
     )
     _add_eos_token_ids(generation_eos_token_ids)
 
+    _tl_tpb = _tl_tokens_per_block(llm)
+
     app = FastAPI()
 
     @app.get("/health")
@@ -378,6 +533,9 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        # Adapter receipt, before body decode; see _tl_timing_fields for how it
+        # differs from vLLM's arrival.
+        _tl_arrival_ts_us = time.time_ns() // 1_000
         body: dict = await _decode_request_body(request)
         try:
             messages, tools = normalize_chat_inputs(
@@ -515,6 +673,10 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
+        if _TL_EMIT_TIMELINE_FIELDS:
+            # Per-request RequestPerfMetrics feed the timeline fields. Set on
+            # the instance so _build_sampling_params stays shared.
+            sampling.return_perf_metrics = True
 
         try:
             _conv_params = None
@@ -545,7 +707,13 @@ def create_app(
             # the completed generation, so skip it and hand the disagg server
             # just what it needs to build the generation leg.
             return _context_leg_response(
-                model_name, adj_prompt, gen, return_prompt_token_ids_b64
+                model_name,
+                adj_prompt,
+                gen,
+                return_prompt_token_ids_b64,
+                arrival_ts_us=_tl_arrival_ts_us,
+                tokens_per_block=_tl_tpb,
+                request_output=output,
             )
 
         gen_token_ids = list(gen.token_ids)
@@ -644,6 +812,18 @@ def create_app(
             },
         }
 
+        if _TL_EMIT_TIMELINE_FIELDS:
+            response["nemo_llm_arrival_ts_us"] = _tl_arrival_ts_us
+            response.update(_tl_timing_fields(gen, time.time()))
+            cached = _tl_cached_tokens(gen, _tl_tpb)
+            if cached is not None:
+                # Token-level prefix reuse for THIS request, 0 included. Clamp to
+                # the prompt: reuse is block-granular, and Gym drops the whole
+                # cache-metric group when cached_tokens > prompt_tokens.
+                response["usage"]["prompt_tokens_details"] = {
+                    "cached_tokens": min(cached, len(adj_prompt))
+                }
+
         # Generated token ids get their own declared field only on a TRT-LLM
         # build whose ChatCompletionResponseChoice carries one
         # (CompletionResponseChoice already does). Emitting it unconditionally
@@ -683,6 +863,8 @@ def create_app(
                 ]
             }
 
+        if _TL_EMIT_TIMELINE_FIELDS:
+            response["nemo_llm_response_ready_ts_us"] = time.time_ns() // 1_000
         return JSONResponse(content=response)
 
     return app

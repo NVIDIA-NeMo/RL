@@ -1,0 +1,56 @@
+[
+  {
+    "id": "collect-training-timeline-positive-001",
+    "question": "I have training_timeline.jsonl, rollout_lifecycle.jsonl and a nemo_gym result tree from a GRPO run. Render an interactive timeline HTML that includes every rollout.",
+    "expected_skill": "collect-training-timeline",
+    "ground_truth": "The agent loads the collect-training-timeline skill, validates the traces with scripts/validate_timeline.py, then renders with scripts/plot_rl_timeline.py using --zero-at-first-rollout and --include-all-rollouts, and checks the displayed rollout count against the discovered timeline.jsonl files.",
+    "expected_behavior": [
+      "The agent read collect-training-timeline/SKILL.md before acting",
+      "The agent validated the traces before rendering",
+      "The agent rendered with --include-all-rollouts and --zero-at-first-rollout",
+      "The agent did not package or print rollout prompts or responses"
+    ]
+  },
+  {
+    "id": "collect-training-timeline-positive-002",
+    "question": "Our NeMo-RL run writes training_timeline.jsonl but the per-rollout timeline.jsonl files under the Gym results are missing. How do I debug this?",
+    "expected_skill": "collect-training-timeline",
+    "ground_truth": "The agent loads the skill and follows the porting guide's diagnosis: check that the Gym actor creates the rollout trace in the persistent directory before starting the agent container, that NEMO_GYM_TIMELINE_FPATH and NEMO_GYM_ROLLOUT_ID reach the OpenHands process, and that the path is visible inside the agent container.",
+    "expected_behavior": [
+      "The agent read collect-training-timeline/SKILL.md and references/porting-guide.md",
+      "The agent checked the Gym-created container command and path mapping",
+      "The agent did not suggest disabling the existing training trace"
+    ]
+  },
+  {
+    "id": "collect-training-timeline-positive-003",
+    "question": "From a rollout timeline, compute the per-turn prefix-cache hit rate and the decode TPOT for a PD-disaggregated TRT-LLM run.",
+    "expected_skill": "collect-training-timeline",
+    "ground_truth": "The agent loads the skill and uses the model_call fields from the event schema: context-side reuse from ctx_cached_prompt_tokens / ctx_computed_tokens rather than the decode leg's usage, and TPOT from (last_token_ts_us - first_scheduled_ts_us) / (decode_tokens - 1).",
+    "expected_behavior": [
+      "The agent read collect-training-timeline/SKILL.md and references/event-schema.md",
+      "The agent used the context-leg fields for prefix reuse under disaggregation",
+      "The agent treated cached_prompt_tokens == 0 as a valid miss"
+    ]
+  },
+  {
+    "id": "collect-training-timeline-negative-001",
+    "question": "Launch the GRPO recipe on our Kubernetes cluster with nrl-k8s.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the collect-training-timeline skill for launching a job on Kubernetes.",
+    "expected_behavior": [
+      "The agent did not read or activate collect-training-timeline/SKILL.md"
+    ]
+  },
+  {
+    "id": "collect-training-timeline-negative-002",
+    "question": "Fix the copyright header in nemo_rl/utils/timer.py.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the collect-training-timeline skill for a copyright header fix.",
+    "expected_behavior": [
+      "The agent did not read or activate collect-training-timeline/SKILL.md"
+    ]
+  }
+]

@@ -32,6 +32,8 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _make_parse_tool_calls,
     _parse_disaggregated_params,
     _resolve_tool_parser_name,
+    _tl_cached_tokens,
+    _tl_timing_fields,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -434,3 +436,89 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
 
     assert response.status_code == 400
     assert [list(tool) for tool in rendered["tools"]] == [["type", "function"]]
+
+
+def _perf_gen(*, reused_blocks=None):
+    """A generation result carrying RequestPerfMetrics, as TRT-LLM returns it."""
+    from datetime import timedelta
+
+    timing = SimpleNamespace(
+        arrival_time=timedelta(seconds=100.000),
+        first_scheduled_time=timedelta(seconds=100.010),
+        first_token_time=timedelta(seconds=100.050),
+        last_token_time=timedelta(seconds=100.500),
+    )
+    cache = (
+        None
+        if reused_blocks is None
+        else SimpleNamespace(num_reused_blocks=reused_blocks)
+    )
+    return SimpleNamespace(
+        disaggregated_params=object(),
+        finish_reason="length",
+        request_perf_metrics=SimpleNamespace(
+            timing_metrics=timing, kv_cache_metrics=cache
+        ),
+    )
+
+
+def test_timing_fields_anchor_last_token_on_the_observed_wall_clock():
+    fields = _tl_timing_fields(_perf_gen(), observed_wall_s=2_000.0)
+
+    # The steady-clock offset is anchored per request on last_token_time, so
+    # last_token lands exactly on the observed instant and the intra-request
+    # deltas are preserved.
+    assert fields["nemo_llm_last_token_ts_us"] == 2_000_000_000
+    assert fields["nemo_llm_queued_ts_us"] == 2_000_000_000 - 500_000
+    assert fields["nemo_llm_first_scheduled_ts_us"] == 2_000_000_000 - 490_000
+    assert fields["nemo_llm_first_token_ts_us"] == 2_000_000_000 - 450_000
+
+
+def test_timing_fields_are_empty_without_perf_metrics():
+    assert _tl_timing_fields(SimpleNamespace(), observed_wall_s=1.0) == {}
+
+
+def test_cached_tokens_scale_reused_blocks_and_read_absence_as_zero():
+    assert _tl_cached_tokens(_perf_gen(reused_blocks=3), tokens_per_block=32) == 96
+    assert _tl_cached_tokens(_perf_gen(), tokens_per_block=32) == 0
+    assert _tl_cached_tokens(SimpleNamespace(), tokens_per_block=32) is None
+
+
+def test_the_context_leg_emits_its_timeline_fields(stub_to_disaggregated_params):
+    gen = _perf_gen(reused_blocks=2)
+    output = SimpleNamespace(ctx_computed_tokens=7, ctx_first_begin=0, ctx_num_chunks=1)
+
+    body = json.loads(
+        _context_leg_response(
+            "m",
+            [1, 2, 3],
+            gen,
+            False,
+            arrival_ts_us=123,
+            tokens_per_block=32,
+            request_output=output,
+        ).body
+    )
+
+    assert body["nemo_ctx_arrival_ts_us"] == 123
+    assert body["nemo_ctx_queued_ts_us"] <= body["nemo_ctx_first_scheduled_ts_us"]
+    assert body["nemo_ctx_first_scheduled_ts_us"] <= body["nemo_ctx_done_ts_us"]
+    assert body["nemo_ctx_cached_tokens"] == 64
+    # Zero is a real value for the first chunk's begin (a full miss).
+    assert body["nemo_ctx_first_begin"] == 0
+    assert body["nemo_ctx_computed_tokens"] == 7
+    assert body["nemo_ctx_num_chunks"] == 1
+
+
+def test_the_context_leg_omits_timeline_fields_when_disabled(
+    stub_to_disaggregated_params, monkeypatch
+):
+    import nemo_rl.models.generation.trtllm.trtllm_http_server as server
+
+    monkeypatch.setattr(server, "_TL_EMIT_TIMELINE_FIELDS", False)
+
+    body = json.loads(
+        _context_leg_response("m", [1, 2, 3], _perf_gen(), False, arrival_ts_us=1).body
+    )
+
+    assert not [key for key in body if key.startswith("nemo_")]

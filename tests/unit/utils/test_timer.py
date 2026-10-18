@@ -674,3 +674,33 @@ class TestTimeoutChecker:
         checker.mark_iteration()
         assert len(checker.iteration_times) == 1
         assert checker.iteration_times[0] > 0
+
+
+class TestTimelineEvents:
+    def test_stop_appends_a_chrome_complete_event(self, tmp_path, monkeypatch):
+        import json
+
+        path = tmp_path / "training_timeline.jsonl"
+        monkeypatch.setenv("NRL_TRAINING_TIMELINE", "1")
+        monkeypatch.setenv("NRL_TRAINING_TIMELINE_FPATH", str(path))
+
+        timer = Timer()
+        timer.start("total_step_time")
+        timer.stop("total_step_time")
+
+        [event] = [json.loads(line) for line in path.read_text().splitlines()]
+        assert event["name"] == "total_step_time"
+        assert event["cat"] == "training_timer"
+        assert event["ph"] == "X"
+        assert event["ts"] > 0 and event["dur"] >= 0
+
+    def test_nothing_is_written_without_the_opt_in(self, tmp_path, monkeypatch):
+        path = tmp_path / "training_timeline.jsonl"
+        monkeypatch.delenv("NRL_TRAINING_TIMELINE", raising=False)
+        monkeypatch.setenv("NRL_TRAINING_TIMELINE_FPATH", str(path))
+
+        timer = Timer()
+        timer.start("total_step_time")
+        timer.stop("total_step_time")
+
+        assert not path.exists()
