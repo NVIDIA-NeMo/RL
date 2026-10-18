@@ -15,6 +15,7 @@
 import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,9 @@ _SPEC.loader.exec_module(_HELPER)
 _SNAPSHOT_HELPER_PATH = (
     Path(__file__).parents[2] / "functional" / "_gym_prefix_recovery_snapshot.py"
 )
+# The snapshot helper imports its shared sibling module by name, as it does
+# when the functional scripts run it.
+sys.path.insert(0, str(_SNAPSHOT_HELPER_PATH.parent))
 _SNAPSHOT_SPEC = importlib.util.spec_from_file_location(
     "gym_prefix_recovery_snapshot", _SNAPSHOT_HELPER_PATH
 )
