@@ -23,12 +23,12 @@ from __future__ import annotations
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.opd import TeacherResourceConfig
+from nemo_rl.algorithms.opd import TeacherResourceConfig, mopd_fp32_lm_head_mode
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,
@@ -57,6 +57,9 @@ class TeacherConfig:
     precision: str
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    # Explicit per-teacher fp32 LM head setting (false or "tf32"). Never
+    # inherited from the student; setup validates it matches the student.
+    fp32_lm_head: bool | Literal["tf32"] = False
 
 
 def create_teacher_configs_from_opd_config(
@@ -106,6 +109,7 @@ def create_teacher_configs_from_opd_config(
                 precision=res.precision,
                 micro_batch_size=res.micro_batch_size,
                 megatron_cfg_overrides=all_overrides,
+                fp32_lm_head=res.fp32_lm_head,
             )
         )
 
@@ -154,6 +158,13 @@ class TeacherWorkerGroup:
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+        # The fp32 LM head is configured per teacher. Overwrite whatever the
+        # deep-copied student config carried so the student's value never leaks
+        # onto the teacher (setup separately requires the two to match); the
+        # worker then applies the TF32 head itself for "tf32".
+        cfg["megatron_cfg"]["fp32_lm_head"] = mopd_fp32_lm_head_mode(
+            teacher_cfg.fp32_lm_head, key=f"fp32_lm_head of OPD teacher {self.alias!r}"
+        )
 
         # A teacher's MODEL comes from its own checkpoint: only keys the user
         # explicitly wrote for this teacher may be applied onto its model
