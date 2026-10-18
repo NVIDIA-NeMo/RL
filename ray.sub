@@ -308,7 +308,11 @@ fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
-COMMON_SRUN_ARGS+=" --mpi=pmix"
+# NRL_SRUN_MPI (default pmix): Ray needs no PMI, but with --mpi=pmix a PMIx server runs in every slurmstepd of the
+# step. When one node stalls for tens of seconds (I/O or CPU saturation at a rollout dispatch wave) the peers' PMIx
+# error handler fires (status -61, unreachable) and slurmstepd aborts the WHOLE step: every ray-worker task is
+# SIGKILLed and the job dies. NRL_SRUN_MPI=none turns PMIx off for the Ray sruns.
+COMMON_SRUN_ARGS+=" --mpi=${NRL_SRUN_MPI:-pmix}"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
@@ -1173,7 +1177,7 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
     --container-image="$SANDBOX_CONTAINER" \
     --container-mounts="$SANDBOX_MOUNTS" \
     --no-container-mount-home \
-    --mpi=pmix \
+    --mpi="${NRL_SRUN_MPI:-pmix}" \
     -A "$SLURM_JOB_ACCOUNT" \
     -p "$SLURM_JOB_PARTITION" \
     --wait=60 \
