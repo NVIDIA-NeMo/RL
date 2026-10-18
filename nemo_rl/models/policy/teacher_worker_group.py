@@ -44,6 +44,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
+from nemo_rl.utils.fp32_lm_head import Fp32LmHeadSetting
 
 
 @dataclass
@@ -61,6 +62,9 @@ class TeacherConfig:
     precision: str
     micro_batch_size: int
     megatron_cfg_overrides: dict[str, Any]
+    # Explicit per-teacher fp32 LM head setting ("tf32" is an alias of true).
+    # Never inherited from the student; setup validates it matches the student.
+    fp32_lm_head: Fp32LmHeadSetting = False
 
 
 def create_teacher_configs_from_opd_config(
@@ -108,6 +112,7 @@ def create_teacher_configs_from_opd_config(
                 precision=res.precision,
                 micro_batch_size=res.micro_batch_size,
                 megatron_cfg_overrides=all_overrides,
+                fp32_lm_head=res.fp32_lm_head,
             )
         )
 
@@ -162,6 +167,10 @@ class TeacherWorkerGroup:
         # Apply any additional megatron config overrides from teacher config.
         for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
+        # The fp32 LM head is configured per teacher. Overwrite whatever the
+        # deep-copied student config carried so the student's value never leaks
+        # onto the teacher (setup separately requires the two to match).
+        cfg["megatron_cfg"]["fp32_lm_head"] = teacher_cfg.fp32_lm_head
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
