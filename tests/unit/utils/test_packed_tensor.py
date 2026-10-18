@@ -342,3 +342,60 @@ def test_packed_broadcast_preflight_failure_stops_before_payload():
             ),
         )
     assert consumer_group.current_index == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_checked_skips_readiness_token():
+    params = [
+        ("layer1.weight", torch.randn(4, 4, device="cuda")),
+        ("layer1.bias", torch.randn(4, device="cuda")),
+    ]
+
+    default_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=default_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+    )
+
+    checked_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=checked_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+        preflight_checked=True,
+    )
+
+    # The caller already sent the token, so a second one would shift every frame.
+    assert checked_group.broadcast_count == default_group.broadcast_count - 1
+    assert all(t.dtype == torch.uint8 for t in checked_group.broadcasted_tensors)
+
+    consumer_group = MockConsumerCommunicationGroup(checked_group.broadcasted_tensors)
+    unpacked = {}
+    packed_broadcast_consumer(
+        iterator=iter(create_mock_state_dict_info(params).items()),
+        group=consumer_group,
+        src=0,
+        post_unpack_func=lambda batch: unpacked.update(batch),
+        preflight_checked=True,
+    )
+    assert consumer_group.current_index == checked_group.broadcast_count
+    for name, tensor in params:
+        assert torch.equal(unpacked[name], tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_preflight_checked_error_raises_without_broadcast():
+    group = MockCommunicationGroup()
+    with pytest.raises(RuntimeError, match="^local draft export failed$"):
+        packed_broadcast_producer(
+            iterator=iter([("weight", torch.ones(1, device="cuda"))]),
+            group=group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            preflight_error=ValueError("local draft export failed"),
+            preflight_checked=True,
+        )
+    assert group.broadcast_count == 0

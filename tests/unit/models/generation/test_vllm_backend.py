@@ -347,6 +347,54 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_nccl_reshard_refit_watchdog_abort_raises_refit_aborted(monkeypatch):
+    from nemo_rl.distributed import refit_watchdog
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class _FiredWatchdog:
+        fired = True
+
+        def __init__(self, groups, timeout_s):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext.model_update_group = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(refit_watchdog, "RefitAbortWatchdog", _FiredWatchdog)
+
+    def aborted_preflight(_group, _src):
+        raise RuntimeError("communicator aborted")
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", aborted_preflight
+    )
+
+    # An abort by the watchdog is fatal even when weight update errors are not.
+    monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: False)
+    with pytest.raises(refit_watchdog.RefitAborted) as excinfo:
+        ext.nccl_reshard_refit(refit_timeout_s=1.0)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "communicator aborted" in str(excinfo.value.__cause__)
+
+
+@pytest.mark.vllm
 def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
