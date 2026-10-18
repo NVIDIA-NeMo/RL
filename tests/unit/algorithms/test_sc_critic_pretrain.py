@@ -292,9 +292,12 @@ class _Plane:
 class _Value:
     """Writes a constant prediction, records the train call's view of the batch."""
 
-    def __init__(self, plane: _Plane, prediction: float = 0.25) -> None:
+    def __init__(
+        self, plane: _Plane, prediction: float = 0.25, grad_norm_groups=None
+    ) -> None:
         self.plane = plane
         self.prediction = prediction
+        self.grad_norm_groups = grad_norm_groups
         self.sharding_annotations = SimpleNamespace(get_axis_size=lambda axis: 2)
         self.trained: dict | None = None
         self.calls: list[str] = []
@@ -333,6 +336,7 @@ class _Value:
         return {
             "loss": torch.tensor(0.1),
             "grad_norm": torch.tensor(1.0),
+            "grad_norm_groups": self.grad_norm_groups or {},
             "all_mb_metrics": {
                 "returns_mean": [0.5],
                 "values_mean": [0.25],
@@ -411,6 +415,20 @@ def test_train_step_trains_on_everything_when_asked_and_cleans_up():
     assert metrics["num_samples"] == 4.0 and metrics["num_rollouts"] == 3.0
     assert metrics["env_masked_rows"] == 1.0 and metrics["truncated_rows"] == 1.0
     assert metrics["trained_rows"] == 4.0
+
+
+def test_train_step_logs_the_grad_norm_split_by_network_part():
+    plane = _Plane()
+    value = _Value(plane, grad_norm_groups={"attention": 3.0, "moe": 4.0})
+    trainer = _trainer(plane, value)
+    metrics = trainer.train_step([_group("A", 2)])
+    trainer.close()
+
+    assert metrics["critic/gnorm/attention"] == 3.0
+    assert metrics["critic/gnorm/moe"] == 4.0
+    # Shares of the total norm^2, which is what the global clip sees.
+    assert metrics["critic/gnorm_frac/attention"] == pytest.approx(9 / 25)
+    assert metrics["critic/gnorm_frac/moe"] == pytest.approx(16 / 25)
 
 
 def test_train_step_masks_like_legacy_by_default():

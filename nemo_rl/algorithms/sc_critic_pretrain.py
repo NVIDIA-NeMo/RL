@@ -797,12 +797,17 @@ class _CriticPretrainer:
             )
             self.value.finish_training()
             # Deferred: ppo pulls in the legacy training stack.
+            from nemo_rl.algorithms.legacy_ppo_diagnostics import critic_gnorm_metrics
             from nemo_rl.algorithms.ppo import _compute_critic_metrics
 
             metrics = {
                 key: float(np.sum(value)) if isinstance(value, np.ndarray) else value
                 for key, value in _compute_critic_metrics(result).items()
             }
+            # Pre-clip gradient norm per network part (attention / mamba / moe / mlp /
+            # value_head / embedding / other) and its share of the total norm^2, as PPO
+            # logs them: critic/gnorm/* and critic/gnorm_frac/*.
+            metrics.update(critic_gnorm_metrics(result.get("grad_norm_groups")))
             if self.privilege_store is not None:
                 metrics.update(self.privilege_store.step_metrics([meta]))
             real = staged.real_rows()
