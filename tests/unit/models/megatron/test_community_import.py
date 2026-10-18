@@ -275,3 +275,20 @@ def test_conversion_requires_all_metadata_referenced_shards(
     else:
         (iteration / "__0_0.distcp").write_bytes(b"")
     assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def test_conversion_requires_every_referenced_shard(monkeypatch, tmp_path):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    (iteration / ".metadata").write_bytes(
+        pickle.dumps(
+            SimpleNamespace(
+                storage_data={
+                    "weight": SimpleNamespace(relative_path="__0_0.distcp"),
+                    "bias": SimpleNamespace(relative_path="__1_0.distcp"),
+                }
+            )
+        )
+    )
+    assert not module.megatron_conversion_is_complete(str(tmp_path))
