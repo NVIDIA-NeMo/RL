@@ -26,12 +26,15 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -43,6 +46,7 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GENERATION_CUT_ROUTE,
     GenerationCutInventory,
     GenerationCutPrefix,
+    GenerationCutPrefixAck,
 )
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     CaptureError,
@@ -74,15 +78,21 @@ from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
+    _ResolvedGenerationCut,
     _TokenCaptureSnapshotGate,
+)
+from nemo_rl.models.generation.vllm.utils import (  # noqa: E402
+    attach_routed_experts_to_chat_response_choices,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
+    _build_restored_prefix_terminal_output,
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
     _generation_cut_blockers,
+    _restored_prefix_terminal_routes,
     _RestoredPrefixTerminal,
 )
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
@@ -140,7 +150,9 @@ class _ByteTokenizer:
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     """The attribute surface setup_token_capture touches, minus the engine."""
     worker = SimpleNamespace(
-        cfg={},
+        # The vLLM worker's router-replay surface, off unless a test sets it.
+        _return_routed_experts_enabled=lambda: False,
+        routed_experts_dtype=torch.int16,
         is_model_owner=is_model_owner,
         token_capture=None,
         _rollout_weight_version=0,
@@ -364,7 +376,11 @@ def test_prefix_capture_setup_requires_control_token(monkeypatch):
         )
 
 
-def test_prefix_capture_enables_active_vllm_routes_for_router_replay(monkeypatch):
+@pytest.mark.parametrize("http_client", ["missing", "unsupported_vllm"])
+def test_prefix_capture_with_router_replay_fails_at_setup_without_route_state(
+    monkeypatch, http_client: str
+):
+    """A cut reads an active request's routes through the HTTP client."""
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(name="dp_client"),
@@ -376,20 +392,25 @@ def test_prefix_capture_enables_active_vllm_routes_for_router_replay(monkeypatch
     worker = _fake_worker()
     worker.llm = MagicMock(name="llm")
     worker._return_routed_experts_enabled = lambda: True
-    worker._http_engine_client = MagicMock(name="http_engine_client")
-
-    media_columns = asyncio.run(
-        VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker,
-            {},
-            "rollout_staging",
-            generation_prefix_cuts_enabled=True,
-            generation_cut_control_token="secret",
+    if http_client == "missing":
+        match = "requires the vLLM HTTP client"
+    else:
+        match = "verified on vLLM"
+        worker._http_engine_client = MagicMock(name="http_engine_client")
+        worker._http_engine_client.check_route_snapshot_support.side_effect = (
+            RuntimeError("router-replay prefix recovery ... verified on vLLM 0.29.0")
         )
-    )
 
-    assert media_columns is None
-    worker._http_engine_client.enable_active_route_capture.assert_called_once_with()
+    with pytest.raises(RuntimeError, match=match):
+        asyncio.run(
+            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                worker,
+                {},
+                "rollout_staging",
+                generation_prefix_cuts_enabled=True,
+                generation_cut_control_token="secret",
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -2106,208 +2127,66 @@ def _route_fetched_call(
     )
 
 
-def test_router_replay_survives_repeated_prefix_cuts_and_resume() -> None:
-    sink = _MemorySink()
-    original_worker = _worker_with_capture(sink)
-    original_worker._return_routed_experts_enabled = lambda: True
-    original_worker.routed_experts_dtype = torch.int16
-    original_worker._rollout_weight_version = 7
-    original_request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": "c1",
-            "mode": "text",
-        },
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        original_worker, original_request, [10, 11]
-    )
-    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        original_worker,
-        original_request,
-        SimpleNamespace(
-            outputs=[
-                SimpleNamespace(
-                    token_ids=[12, 13],
-                    logprobs=[
-                        {12: SimpleNamespace(logprob=-0.1)},
-                        {13: SimpleNamespace(logprob=-0.2)},
-                    ],
-                )
-            ],
-        ),
-        routed_expert_chunk_count=1,
-        routed_expert_chunks=[torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int16)],
-    )
-    prefix = GenerationCutPrefix(
-        ticket_id="ticket-1",
-        rollout_id="r0",
-        attempt=0,
-        model_call_id="c1",
-        admitted_at=1.0,
-    )
-    first_receipt = original_worker._checkpoint_generation_cut(
-        GenerationCutInventory.build(
-            checkpoint_id="checkpoint-1",
-            server_name="policy_model",
-            active_prefixes=[prefix],
-        )
-    )
-    assert len(first_receipt.prefixes[0].staging_keys) == 1
-    first_record = sink.generation_prefix_records[-1][1]
-    assert decode_routed_experts(
-        first_record.extras["routed_experts"], torch.int16
-    ).flatten().tolist() == [1, 2, 3, 0]
+# Router replay: one layer and top-1, so each route row is a single expert ID.
+_ROUTER_REPLAY_CALL = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
 
-    # vLLM outputs are cumulative; the route chunks are the new ones only.
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        original_worker,
-        original_request,
-        SimpleNamespace(
-            outputs=[
-                SimpleNamespace(
-                    token_ids=[12, 13, 14],
-                    logprobs=[
-                        {12: SimpleNamespace(logprob=-0.1)},
-                        {13: SimpleNamespace(logprob=-0.2)},
-                        {14: SimpleNamespace(logprob=-0.3)},
-                    ],
-                )
-            ]
-        ),
-        routed_expert_chunk_count=2,
-        routed_expert_chunks=[torch.tensor([[[4]]], dtype=torch.int16)],
-    )
-    second_receipt = original_worker._checkpoint_generation_cut(
-        GenerationCutInventory.build(
-            checkpoint_id="checkpoint-2",
-            server_name="policy_model",
-            active_prefixes=[prefix.model_copy(update={"ticket_id": "ticket-2"})],
-        )
-    )
-    second_record = sink.generation_prefix_records[-1][1]
-    assert decode_routed_experts(
-        second_record.extras["routed_experts"], torch.int16
-    ).flatten().tolist() == [4]
 
-    cut_keys = list(second_receipt.prefixes[0].staging_keys)
-    chunks = [
-        _route_fetched_call(cut_keys[0], first_record),
-        _route_fetched_call(cut_keys[1], second_record),
-    ]
-    resumed_worker = _worker_with_capture(sink)
-    resumed_worker._return_routed_experts_enabled = lambda: True
-    resumed_worker.routed_experts_dtype = torch.int16
-    resumed_worker._rollout_weight_version = 9
-    request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0-a1",
-            "model_call_id": "c2",
-            "mode": "text",
-            "generation_cut": {
-                "source_capture_key": "r0",
-                "source_model_call_id": "c1",
-                "staging_keys": cut_keys,
-                "prefix_token_count": 3,
-                "prefix_digest": second_receipt.prefixes[0].prefix_digest,
-                "effective_output_limit": 128,
-            },
-        },
-        stream=False,
-    )
-    admission = resumed_worker._capture_admission(request)
-    resolved = resumed_worker._resolve_generation_cut(admission, [], chunks)
-    assert resolved is not None
-    assert resolved.routed_experts is not None
-    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 4, 0]
+def _routes(*experts: int) -> torch.Tensor:
+    return torch.tensor(experts, dtype=torch.int16).view(-1, 1, 1)
 
-    corrupted = chunks[0]
-    assert corrupted.fragment is not None
-    bad_routes = corrupted.fragment.routes.clone()
-    bad_routes[0, 0, 0] = 99
-    with pytest.raises(RuntimeError, match="failed integrity check"):
-        resumed_worker._resolve_generation_cut(
-            admission,
-            [],
-            [
-                FetchedStagedCall(
-                    staging_key=corrupted.staging_key,
-                    snapshot=corrupted.snapshot,
-                    routed_len=corrupted.routed_len,
-                    fragment=RouteFragment(
-                        routes=bad_routes,
-                        encoding=corrupted.fragment.encoding,
-                        extras_metadata_json=(corrupted.fragment.extras_metadata_json),
-                    ),
-                    extras=corrupted.extras,
-                ),
-                chunks[1],
-            ],
-        )
 
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        resumed_worker,
-        request,
-        [10, 11, 12, 13, 14],
-        admission=admission,
-        prefix_token_ids=[],
-        generation_cut=resolved.snapshot,
-        generation_cut_routed_experts=resolved.routed_experts,
-        resumed_generation_token_ids=[12, 13, 14],
-    )
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        resumed_worker,
-        request,
-        SimpleNamespace(
-            outputs=[
-                SimpleNamespace(
-                    token_ids=[15],
-                    logprobs=[{15: SimpleNamespace(logprob=-0.4)}],
-                )
-            ],
-        ),
-        routed_expert_chunk_count=1,
-        routed_expert_chunks=[
-            torch.tensor([[[90]], [[91]], [[92]], [[93]], [[5]]], dtype=torch.int16)
-        ],
-    )
-    content = _served_content([15], [-0.4])
-    content["choices"][0]["message"]["routed_experts"] = encode_routed_experts(
-        torch.tensor(
-            [[[90]], [[91]], [[92]], [[93]], [[5]], [[0]]],
-            dtype=torch.int16,
-        )
-    )
-    VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        resumed_worker, request, content
-    )
-    final_routes = decode_routed_experts(
-        sink.records[-1].extras["routed_experts"], torch.int16
-    )
-    assert final_routes.flatten().tolist() == [1, 2, 3, 4, 5, 0]
-    assert sink.records[-1].weight_version == 7
+def _staged_routes(record: StagedCallRecord) -> list[int]:
+    return decode_routed_experts(record.extras["routed_experts"]).flatten().tolist()
+
+
+class _EngineRoutes:
+    """vLLM's active per-request routes, as a generation cut reads them."""
+
+    def __init__(self) -> None:
+        self.by_request: dict[str, torch.Tensor] = {}
+        self.reads: list[str] = []
+        self.error: Exception | None = None
+
+    def __call__(
+        self, engine_request_id: str, *, timeout_s: float | None
+    ) -> torch.Tensor | None:
+        self.reads.append(engine_request_id)
+        if self.error is not None:
+            raise self.error
+        return self.by_request.get(engine_request_id)
 
 
 def _router_replay_worker(
-    sink: _MemorySink,
-) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest]:
+    sink: _MemorySink, *, weight_version: int
+) -> VllmAsyncGenerationWorkerImpl:
     worker = _worker_with_capture(sink)
     worker._return_routed_experts_enabled = lambda: True
     worker.routed_experts_dtype = torch.int16
-    worker._rollout_weight_version = 7
-    request = _FakeRequest(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
-        stream=False,
-    )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    worker._rollout_weight_version = weight_version
+    return worker
+
+
+def _router_replay_call(
+    sink: _MemorySink,
+    *,
+    ng_capture: dict[str, Any] = _ROUTER_REPLAY_CALL,
+    prompt: tuple[int, ...] = (10, 11),
+) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _EngineRoutes]:
+    """An active router-replay call whose cuts read ``_EngineRoutes``."""
+    worker = _router_replay_worker(sink, weight_version=7)
+    engine_routes = _EngineRoutes()
+    worker._snapshot_engine_routed_experts = engine_routes
+    request = _FakeRequest(ng_capture=dict(ng_capture), stream=False)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, list(prompt))
     worker._capture_calls[id(request)].effective_output_limit = 128
-    return worker, request
+    return worker, request, engine_routes
 
 
-def _cumulative_output(token_ids: list[int]) -> SimpleNamespace:
+def _cumulative_output(
+    token_ids: list[int], *, request_id: str = "engine-request"
+) -> SimpleNamespace:
     return SimpleNamespace(
+        request_id=request_id,
         outputs=[
             SimpleNamespace(
                 token_ids=token_ids,
@@ -2315,72 +2194,388 @@ def _cumulative_output(token_ids: list[int]) -> SimpleNamespace:
                     {token_id: SimpleNamespace(logprob=-0.1)} for token_id in token_ids
                 ],
             )
+        ],
+    )
+
+
+def _observe(
+    worker: VllmAsyncGenerationWorkerImpl,
+    request: _FakeRequest,
+    token_ids: list[int],
+    *,
+    request_id: str = "engine-request",
+) -> None:
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        worker, request, _cumulative_output(token_ids, request_id=request_id)
+    )
+
+
+def _cut(
+    worker: VllmAsyncGenerationWorkerImpl,
+    checkpoint_id: str,
+    *,
+    model_call_id: str = "c1",
+) -> GenerationCutPrefixAck:
+    (ack,) = worker._checkpoint_generation_cut(
+        _single_generation_cut_inventory(checkpoint_id, model_call_id=model_call_id)
+    ).prefixes
+    return ack
+
+
+def _staged_route_chunks(
+    sink: _MemorySink, staging_keys: tuple[str, ...]
+) -> list[FetchedStagedCall]:
+    records = {
+        key: record
+        for key, (_, record) in zip(
+            sink.generation_prefix_keys, sink.generation_prefix_records, strict=True
+        )
+    }
+    return [_route_fetched_call(key, records[key]) for key in staging_keys]
+
+
+def _resume(
+    sink: _MemorySink,
+    ack: GenerationCutPrefixAck,
+    *,
+    source: dict[str, Any] = _ROUTER_REPLAY_CALL,
+    prefix_token_ids: tuple[int, ...] = (),
+) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _ResolvedGenerationCut]:
+    """Restore a cut on a new worker and begin its resumed call."""
+    worker = _router_replay_worker(sink, weight_version=9)
+    request = _FakeRequest(
+        ng_capture={
+            **source,
+            "rollout_id": f"{source['rollout_id']}-a1",
+            "model_call_id": f"{source['model_call_id']}-resumed",
+            "generation_cut": {
+                "source_capture_key": source["rollout_id"],
+                "source_model_call_id": source["model_call_id"],
+                "staging_keys": list(ack.staging_keys),
+                "prefix_token_count": ack.prefix_token_count,
+                "prefix_digest": ack.prefix_digest,
+                "effective_output_limit": ack.effective_output_limit,
+                "terminal_finish_reason": ack.terminal_finish_reason,
+            },
+        },
+        stream=False,
+    )
+    admission = worker._capture_admission(request)
+    resolved = worker._resolve_generation_cut(
+        admission,
+        list(prefix_token_ids),
+        _staged_route_chunks(sink, ack.staging_keys),
+    )
+    cut = resolved.snapshot
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker,
+        request,
+        [*prefix_token_ids, *cut.token_ids_delta],
+        admission=admission,
+        prefix_token_ids=list(prefix_token_ids),
+        generation_cut=cut,
+        generation_cut_routed_experts=resolved.routed_experts,
+        resumed_generation_token_ids=[
+            token_id
+            for token_id, mask in zip(
+                cut.token_ids_delta, cut.token_mask_delta, strict=True
+            )
+            if mask == 1.0
+        ],
+    )
+    return worker, request, resolved
+
+
+def _finish_with_routes(
+    worker: VllmAsyncGenerationWorkerImpl,
+    request: _FakeRequest,
+    generated_token_ids: list[int],
+    routes: torch.Tensor | str | None,
+) -> StagedCallRecord:
+    content = _served_content(generated_token_ids, [-0.4] * len(generated_token_ids))
+    if routes is not None:
+        content["choices"][0]["message"]["routed_experts"] = (
+            routes if isinstance(routes, str) else encode_routed_experts(routes)
+        )
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, request, content)
+    return worker._capture_sink.records[-1]
+
+
+def test_router_replay_survives_repeated_prefix_cuts_and_resume(caplog) -> None:
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    # vLLM routes both prompt tokens and the first generated one.
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3)
+    assert len(_cut(worker, "checkpoint-1").staging_keys) == 1
+    # vLLM outputs are cumulative, and so are its routes.
+    _observe(worker, request, [12, 13, 14])
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3, 4)
+    ack = _cut(worker, "checkpoint-2")
+    # The first chunk carries the full routes and the final placeholder; the
+    # next one route per new token, replacing that placeholder.
+    assert [_staged_routes(record) for _, record in sink.generation_prefix_records] == [
+        [1, 2, 3, -1],
+        [4],
+    ]
+
+    with caplog.at_level(logging.INFO):
+        resumed, resumed_request, resolved = _resume(sink, ack)
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 4, -1]
+
+    first, second = _staged_route_chunks(sink, ack.staging_keys)
+    tampered = first.fragment.routes.clone()
+    tampered[0, 0, 0] = 99
+    with pytest.raises(RuntimeError, match="failed integrity check"):
+        resumed._resolve_generation_cut(
+            resumed._capture_admission(resumed_request),
+            [],
+            [replace(first, fragment=replace(first.fragment, routes=tampered)), second],
+        )
+
+    with caplog.at_level(logging.INFO):
+        staged = _finish_with_routes(
+            resumed, resumed_request, [15], _routes(90, 91, 92, 93, 5, 0)
+        )
+    # The restored prefix keeps the routes it was sampled under.
+    assert _staged_routes(staged) == [1, 2, 3, 4, 5, 0]
+    assert staged.weight_version == 7
+    # Restore and completion log the same kept rows: the generated prefix
+    # tokens' routes except the last, whose route the resumed prefill computes.
+    kept_sha = hashlib.sha256(
+        torch.tensor([[[3]], [[4]]], dtype=torch.int32).numpy().tobytes()
+    ).hexdigest()
+    logged = re.findall(
+        r"generation prefix (restored|completed): .*prefix_routes_sha256=(\S+)",
+        caplog.text,
+    )
+    assert logged == [("restored", kept_sha), ("completed", kept_sha)]
+
+
+def test_router_replay_cut_reads_routes_once_after_freezing_its_tokens() -> None:
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    state = worker._capture_calls[id(request)]
+    _observe(worker, request, [12, 13])
+    # Decoding observes no routes; only a cut reads them.
+    assert engine_routes.reads == []
+
+    def read_while_decoding(engine_request_id, *, timeout_s):
+        # The token count is frozen and the state lock released, so decoding
+        # has moved on: vLLM routed two more tokens than the cut froze.
+        assert not state.lock.locked()
+        assert state.frozen_cut == ("checkpoint-1", 2)
+        return _routes(1, 2, 3, 4, 5)
+
+    worker._snapshot_engine_routed_experts = read_while_decoding
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
+    (_, record) = sink.generation_prefix_records[0]
+    # Prompt rows, the first generated token's row, then the final placeholder.
+    assert _staged_routes(record) == [1, 2, 3, -1]
+
+
+@pytest.mark.parametrize(
+    "engine_failure",
+    ["request_left_vllm", "engine_loop_timeout"],
+)
+def test_router_replay_cut_without_engine_routes_fails_only_that_call(
+    engine_failure: str,
+) -> None:
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12])
+    if engine_failure == "engine_loop_timeout":
+        engine_routes.error = TimeoutError()
+    # Otherwise vLLM finished the request before the cut read its routes, and
+    # the HTTP layer had not yet observed the final output.
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
+    assert engine_routes.reads == ["engine-request"]
+    assert sink.generation_prefix_records == []
+    state = worker._capture_calls[id(request)]
+    assert state.frozen_cut is None
+    assert state.staged_token_count == 0
+
+
+def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_on() -> (
+    None
+):
+    sink = _MemorySink()
+    worker, bad_request, engine_routes = _router_replay_call(sink)
+    good_request = _FakeRequest(
+        ng_capture={"rollout_id": "r1", "model_call_id": "c2", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, good_request, [10, 11])
+    worker._capture_calls[id(good_request)].effective_output_limit = 128
+    _observe(worker, bad_request, [12], request_id="bad")
+    _observe(worker, good_request, [12], request_id="good")
+    # Not [tokens, layers, topk]: a route error, not a caller bug.
+    engine_routes.by_request["bad"] = torch.tensor([1, 2], dtype=torch.int16)
+    engine_routes.by_request["good"] = _routes(1, 2)
+
+    def cut(checkpoint_id: str) -> dict[str, str]:
+        receipt = worker._checkpoint_generation_cut(
+            GenerationCutInventory.build(
+                checkpoint_id=checkpoint_id,
+                server_name="policy_model",
+                active_prefixes=[
+                    GenerationCutPrefix(
+                        ticket_id=f"{checkpoint_id}-{model_call_id}",
+                        rollout_id=rollout_id,
+                        attempt=0,
+                        model_call_id=model_call_id,
+                        admitted_at=1.0,
+                    )
+                    for rollout_id, model_call_id in (("r0", "c1"), ("r1", "c2"))
+                ],
+            )
+        )
+        return {ack.model_call_id: ack.disposition for ack in receipt.prefixes}
+
+    assert cut("checkpoint-1") == {"c1": "durable_failure", "c2": "durable_prefix"}
+    # The bad call is not poisoned: the next checkpoint tries it again.
+    engine_routes.by_request["bad"] = _routes(1, 2)
+    _observe(worker, good_request, [12, 13], request_id="good")
+    engine_routes.by_request["good"] = _routes(1, 2, 3)
+    assert cut("checkpoint-2") == {"c1": "durable_prefix", "c2": "durable_prefix"}
+
+
+def test_vllm_route_chunks_with_mismatched_shapes_are_a_route_error() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._http_engine_client = SimpleNamespace(
+        snapshot_routed_experts=lambda request_id, *, timeout_s: [
+            torch.zeros((2, 4, 2), dtype=torch.int16),
+            torch.zeros((1, 3, 2), dtype=torch.int16),
         ]
     )
 
-
-def test_router_replay_observes_only_tokens_its_route_chunks_cover() -> None:
-    worker, request = _router_replay_worker(_MemorySink())
-    state = worker._capture_calls[id(request)]
-
-    # vLLM appended token 14 to its live list after the route chunk was read.
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        worker,
-        request,
-        _cumulative_output([12, 13, 14]),
-        routed_expert_chunk_count=1,
-        routed_expert_chunks=[torch.tensor([[[1]], [[2]], [[3]]], dtype=torch.int16)],
-        routed_expert_token_count=2,
-    )
-    assert state.generated_token_ids == [12, 13]
-
-    # The next output's chunk covers it, so a cut stays aligned.
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        worker,
-        request,
-        _cumulative_output([12, 13, 14]),
-        routed_expert_chunk_count=2,
-        routed_expert_chunks=[torch.tensor([[[4]]], dtype=torch.int16)],
-        routed_expert_token_count=3,
-    )
-    assert state.generated_token_ids == [12, 13, 14]
-    assert state.observation_error is None
+    with pytest.raises(ValueError, match="must share shape"):
+        worker._snapshot_engine_routed_experts("request", timeout_s=1.0)
 
 
-def test_router_replay_route_mismatch_fails_only_that_calls_cut() -> None:
+def test_router_replay_short_engine_routes_fail_the_cut_instead_of_padding() -> None:
+    """Padding missing rows would put routes on the wrong tokens, and a later
+    cut would stage rows that no longer line up, failing the restore digest."""
     sink = _MemorySink()
-    worker, request = _router_replay_worker(sink)
-    # Two prompt rows plus one decode row cover one generated token; five do not.
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        worker,
-        request,
-        _cumulative_output([12]),
-        routed_expert_chunk_count=1,
-        routed_expert_chunks=[
-            torch.tensor([[[1]], [[2]], [[3]], [[4]], [[5]]], dtype=torch.int16)
-        ],
-        routed_expert_token_count=1,
-    )
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    # Two prompt rows and the first generated token's row are needed.
+    engine_routes.by_request["engine-request"] = _routes(1, 2)
 
-    receipt = worker._checkpoint_generation_cut(
-        GenerationCutInventory.build(
-            checkpoint_id="checkpoint-1",
-            server_name="policy_model",
-            active_prefixes=[
-                GenerationCutPrefix(
-                    ticket_id="ticket-1",
-                    rollout_id="r0",
-                    attempt=0,
-                    model_call_id="c1",
-                    admitted_at=1.0,
-                )
-            ],
-        )
-    )
-
-    assert receipt.prefixes[0].disposition == "durable_failure"
+    assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
     assert sink.generation_prefix_records == []
-    assert worker._capture_calls[id(request)].frozen_cut is None
+
+    # Once vLLM's routes cover the frozen tokens, the call is cut again, and
+    # each later cut's chunks rebuild exactly the digest it advertised.
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3)
+    first = _cut(worker, "checkpoint-2")
+    assert _resume(sink, first)[2].snapshot.digest == first.prefix_digest
+    _observe(worker, request, [12, 13, 14])
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3, 4)
+    second = _cut(worker, "checkpoint-3")
+    assert len(second.staging_keys) == 2
+    assert _resume(sink, second)[2].snapshot.digest == second.prefix_digest
+
+
+@pytest.mark.parametrize("served_routes", ["missing", "other_model_dims"])
+def test_router_replay_resumed_call_with_unfit_routes_still_finishes(
+    served_routes: str, caplog
+) -> None:
+    """Like routes the delta alignment rejects, routes the restored prefix
+    cannot be merged into are dropped, not raised: the handler stages after
+    its abort path has closed, so a raise would fail the call and leak it."""
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3)
+    resumed, resumed_request, _ = _resume(sink, _cut(worker, "checkpoint-1"))
+    # The right length, so the delta alignment keeps it, but two layers where
+    # the restored prefix has one: only the merge can reject it.
+    routes = (
+        torch.zeros((5, 2, 1), dtype=torch.int16)
+        if served_routes == "other_model_dims"
+        else None
+    )
+
+    with caplog.at_level(logging.WARNING):
+        staged = _finish_with_routes(resumed, resumed_request, [14], routes)
+
+    assert staged.model_call_id == "c1-resumed"
+    assert "routed_experts" not in (staged.extras or {})
+    assert resumed._capture_calls == {}
+    assert (
+        "restored prefix does not fit"
+        if served_routes == "other_model_dims"
+        else "staged no routed_experts"
+    ) in caplog.text
+
+
+def test_router_replay_prefix_cut_after_the_final_token_resumes_with_routes(
+    monkeypatch,
+) -> None:
+    """A restored prefix that is already finished never reaches the engine;
+    its built output must still carry routes, or router replay fails the call."""
+    # vLLM's output types, minus vLLM: CompletionOutput has routed_experts.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.outputs",
+        SimpleNamespace(
+            CompletionOutput=lambda **kwargs: SimpleNamespace(**kwargs),
+            RequestOutput=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    )
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    # The cut lands after vLLM's final token, before terminal staging.
+    final_output = _cumulative_output([12, 13])
+    final_output.outputs[0].finish_reason = "length"
+    final_output.outputs[0].stop_reason = None
+    final_output.prompt_routed_experts = _routes(1, 2)
+    final_output.outputs[0].routed_experts = _routes(3)
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        worker, request, final_output
+    )
+    ack = _cut(worker, "checkpoint-1")
+    # The final output carried the routes; the engine was not asked.
+    assert engine_routes.reads == []
+    assert ack.terminal_finish_reason == "length"
+
+    resumed, resumed_request, resolved = _resume(sink, ack)
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+    terminal = replace(
+        _classify_restored_prefix_terminal(
+            prompt_token_ids=[10, 11, 12, 13],
+            prefix_token_count=2,
+            requested_output_tokens=ack.effective_output_limit,
+            model_max_tokens=4096,
+            terminal_finish_reason="length",
+        ),
+        routed_experts=_restored_prefix_terminal_routes(
+            resolved.routed_experts, prev_len=0
+        ),
+    )
+    choice = SimpleNamespace(index=0, message=SimpleNamespace(routed_experts=None))
+    attach_routed_experts_to_chat_response_choices(
+        SimpleNamespace(choices=[choice]),
+        _build_restored_prefix_terminal_output("request", terminal),
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+    )
+    # The restored prefix's routes, and no route for the final token, as an
+    # uninterrupted call's response has.
+    assert decode_routed_experts(choice.message.routed_experts).flatten().tolist() == [
+        1,
+        2,
+        3,
+        -1,
+    ]
+
+    staged = _finish_with_routes(
+        resumed, resumed_request, [], choice.message.routed_experts
+    )
+    assert _staged_routes(staged) == [1, 2, 3, -1]
 
 
 def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
@@ -2400,132 +2595,41 @@ def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
         "required_prefix_token_ids": [10, 11, 12],
         "parent_chain_hash": "1" * 64,
     }
-    original_worker = _worker_with_capture(sink)
-    original_worker._return_routed_experts_enabled = lambda: True
-    original_worker.routed_experts_dtype = torch.int16
-    original_worker._rollout_weight_version = 7
-    original_request = _FakeRequest(ng_capture=ng_capture, stream=False)
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        original_worker, original_request, [10, 11, 12, 20, 21]
+    worker, request, engine_routes = _router_replay_call(
+        sink, ng_capture=ng_capture, prompt=(10, 11, 12, 20, 21)
     )
-    original_worker._capture_calls[id(original_request)].effective_output_limit = 128
     # Engine rows cover positions 0..5; the parent's last token (position 2)
     # is routed by this call's prefill, but the delta starts at position 3.
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        original_worker,
-        original_request,
-        SimpleNamespace(
-            outputs=[
-                SimpleNamespace(
-                    token_ids=[22, 23],
-                    logprobs=[
-                        {22: SimpleNamespace(logprob=-0.1)},
-                        {23: SimpleNamespace(logprob=-0.2)},
-                    ],
-                )
-            ],
-        ),
-        routed_expert_chunk_count=1,
-        routed_expert_chunks=[torch.arange(1, 7, dtype=torch.int16).view(6, 1, 1)],
-    )
-    prefix = GenerationCutPrefix(
-        ticket_id="ticket-1",
-        rollout_id="r0",
-        attempt=0,
-        model_call_id="c2",
-        admitted_at=1.0,
-    )
-    original_worker._checkpoint_generation_cut(
-        GenerationCutInventory.build(
-            checkpoint_id="checkpoint-1",
-            server_name="policy_model",
-            active_prefixes=[prefix],
-        )
-    )
-    VllmAsyncGenerationWorkerImpl._observe_request_capture(
-        original_worker,
-        original_request,
-        _cumulative_output([22, 23, 24]),
-        routed_expert_chunk_count=2,
-        routed_expert_chunks=[torch.tensor([[[7]]], dtype=torch.int16)],
-    )
-    receipt = original_worker._checkpoint_generation_cut(
-        GenerationCutInventory.build(
-            checkpoint_id="checkpoint-2",
-            server_name="policy_model",
-            active_prefixes=[prefix.model_copy(update={"ticket_id": "ticket-2"})],
-        )
-    )
+    _observe(worker, request, [22, 23])
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3, 4, 5, 6)
+    _cut(worker, "checkpoint-1", model_call_id="c2")
+    _observe(worker, request, [22, 23, 24])
+    engine_routes.by_request["engine-request"] = _routes(1, 2, 3, 4, 5, 6, 7)
+    ack = _cut(worker, "checkpoint-2", model_call_id="c2")
     cut_records = [record for _, record in sink.generation_prefix_records]
     assert [record.prev_len for record in cut_records] == [3, 3]
-    assert [
-        decode_routed_experts(record.extras["routed_experts"], torch.int16)
-        .flatten()
-        .tolist()
-        for record in cut_records
-    ] == [[4, 5, 6, 0], [7]]
+    assert [_staged_routes(record) for record in cut_records] == [[4, 5, 6, -1], [7]]
     for sequence, record in enumerate(cut_records):
         assert validating_sink.stage_generation_prefix(
             record, checkpoint_id="checkpoint", chunk_sequence=sequence
         ).ok
 
-    cut_keys = list(receipt.prefixes[0].staging_keys)
-    chunks = [
-        _route_fetched_call(key, record)
-        for key, record in zip(cut_keys, cut_records, strict=True)
-    ]
-    resumed_worker = _worker_with_capture(sink)
-    resumed_worker._return_routed_experts_enabled = lambda: True
-    resumed_worker.routed_experts_dtype = torch.int16
-    resumed_worker._rollout_weight_version = 9
-    request = _FakeRequest(
-        ng_capture={
-            **ng_capture,
-            "rollout_id": "r0-a1",
-            "model_call_id": "c3",
-            "generation_cut": {
-                "source_capture_key": "r0",
-                "source_model_call_id": "c2",
-                "staging_keys": cut_keys,
-                "prefix_token_count": 3,
-                "prefix_digest": receipt.prefixes[0].prefix_digest,
-                "effective_output_limit": 128,
-            },
-        },
-        stream=False,
+    resumed, resumed_request, resolved = _resume(
+        sink, ack, source=ng_capture, prefix_token_ids=(10, 11, 12)
     )
-    admission = resumed_worker._capture_admission(request)
-    resolved = resumed_worker._resolve_generation_cut(admission, [10, 11, 12], chunks)
-    assert resolved is not None
-    assert resolved.routed_experts.flatten().tolist() == [4, 5, 6, 7, 0]
+    assert resolved.routed_experts.flatten().tolist() == [4, 5, 6, 7, -1]
 
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        resumed_worker,
-        request,
-        [10, 11, 12, 20, 21, 22, 23, 24],
-        admission=admission,
-        prefix_token_ids=[10, 11, 12],
-        generation_cut=resolved.snapshot,
-        generation_cut_routed_experts=resolved.routed_experts,
-        resumed_generation_token_ids=[22, 23, 24],
-    )
-    content = _served_content([25], [-0.4])
     # Current-policy routes for positions 0..7 plus the unrouted final token.
-    content["choices"][0]["message"]["routed_experts"] = encode_routed_experts(
-        torch.tensor([90, 91, 92, 93, 94, 95, 96, 97, 0], dtype=torch.int16).view(
-            9, 1, 1
-        )
+    staged = _finish_with_routes(
+        resumed,
+        resumed_request,
+        [25],
+        _routes(90, 91, 92, 93, 94, 95, 96, 97, 0),
     )
-    VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        resumed_worker, request, content
-    )
-    terminal = sink.records[-1]
     # Parent boundary (position 2) and the generated tail come from this
     # call; the restored prefix keeps the routes it was sampled under.
-    assert decode_routed_experts(
-        terminal.extras["routed_experts"], torch.int16
-    ).flatten().tolist() == [92, 4, 5, 6, 7, 97, 0]
-    assert validating_sink.stage(terminal).ok
+    assert _staged_routes(staged) == [92, 4, 5, 6, 7, 97, 0]
+    assert validating_sink.stage(staged).ok
 
 
 def test_request_capture_token_in_prev_len_chains():

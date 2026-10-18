@@ -14,6 +14,7 @@
 
 import asyncio
 import contextlib
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -569,14 +570,32 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_vllm_http_client_snapshots_only_new_route_chunks() -> None:
+async def test_async_vllm_http_client_snapshots_route_chunks_on_the_engine_loop() -> (
+    None
+):
     engine_loop = asyncio.get_running_loop()
     first = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
     second = torch.tensor([[[3]]], dtype=torch.int16)
-    request_state = types.SimpleNamespace(routed_experts_chunks=[first, second])
+    chunks = [first, second]
+    read_on: list[asyncio.AbstractEventLoop] = []
+
+    class RequestStates(dict):
+        def get(self, key, default=None):
+            read_on.append(asyncio.get_running_loop())
+            return super().get(key, default)
+
     output_processor = types.SimpleNamespace(
-        external_req_ids={"external-request": ["internal-request"]},
-        request_states={"internal-request": request_state},
+        external_req_ids={
+            "external-request": ["internal-request"],
+            "forked-request": ["internal-a", "internal-b"],
+            "renamed-request": ["internal-renamed"],
+        },
+        request_states=RequestStates(
+            {
+                "internal-request": types.SimpleNamespace(routed_experts_chunks=chunks),
+                "internal-renamed": types.SimpleNamespace(),
+            }
+        ),
     )
 
     class FakeEngine:
@@ -589,60 +608,62 @@ async def test_async_vllm_http_client_snapshots_only_new_route_chunks() -> None:
             self.output_processor = output_processor
 
     client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
-    chunk_count, chunks = await client.snapshot_new_routed_expert_chunks(
-        "external-request", after_chunk=1
-    )
 
-    assert chunk_count == 2
-    assert len(chunks) == 1
-    assert torch.equal(chunks[0], second)
-    assert chunks[0] is not second
-    with pytest.raises(RuntimeError, match="cursor is outside"):
-        await client.snapshot_new_routed_expert_chunks(
-            "external-request", after_chunk=3
+    # A generation cut calls from its own thread, never the engine loop.
+    snapshot = await asyncio.to_thread(
+        client.snapshot_routed_experts, "external-request", timeout_s=5
+    )
+    assert read_on == [engine_loop]
+    assert snapshot == [first, second]
+    # vLLM keeps appending to its list; the snapshot does not grow with it.
+    assert snapshot is not chunks
+    # A request that already left vLLM has no active routes.
+    assert (
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "finished-request", timeout_s=5
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="exactly one active vLLM request"):
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "forked-request", timeout_s=5
+        )
+    # A renamed field fails only that call's cut, not the whole cut.
+    with pytest.raises(ValueError, match="no routed_experts_chunks"):
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "renamed-request", timeout_s=5
         )
 
 
-@pytest.mark.asyncio
-async def test_async_vllm_http_client_attaches_active_route_delta() -> None:
-    engine_loop = asyncio.get_running_loop()
-    routed = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
-    request_state = types.SimpleNamespace(routed_experts_chunks=[routed])
-    output_processor = types.SimpleNamespace(
-        external_req_ids={"request": ["internal-request"]},
-        request_states={"internal-request": request_state},
+@pytest.mark.parametrize(
+    ("installed", "output_processor", "match"),
+    [
+        ("0.29.0", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.29.0+cu129", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.30.0", {"external_req_ids": {}, "request_states": {}}, "vLLM 0.30.0"),
+        ("0.29.0", {"external_req_ids": {}}, "OutputProcessor.request_states"),
+    ],
+    ids=["verified", "local_build", "other_release", "renamed_field"],
+)
+def test_async_vllm_http_client_checks_it_can_read_vllm_route_state(
+    monkeypatch, installed: str, output_processor: dict, match: str | None
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: installed)
+    engine = types.SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        output_processor=types.SimpleNamespace(**output_processor),
     )
-    token_ids = [7, 8]
-    output = types.SimpleNamespace(
-        request_id="request",
-        outputs=[types.SimpleNamespace(finish_reason=None, token_ids=token_ids)],
-    )
+    # The check runs at setup, off the engine loop.
+    client = _AsyncLLMHTTPClient(engine, MagicMock(name="engine_loop"))
 
-    class FakeEngine:
-        model_config = None
-        renderer = None
-        input_processor = None
-        vllm_config = None
-
-        def __init__(self) -> None:
-            self.output_processor = output_processor
-
-        async def generate(self, *args, **kwargs):
-            yield output
-            # vLLM keeps appending to the live list after the output is read.
-            token_ids.append(9)
-
-    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
-    client.enable_active_route_capture()
-
-    (captured,) = [item async for item in client.generate(None, None, "request")]
-
-    assert not hasattr(captured, "nemo_rl_routed_expert_error")
-    # The token count the chunks cover is read with them, not afterwards.
-    assert captured.nemo_rl_routed_expert_token_count == 2
-    assert captured.nemo_rl_routed_expert_chunk_count == 1
-    assert len(captured.nemo_rl_routed_expert_chunks) == 1
-    assert torch.equal(captured.nemo_rl_routed_expert_chunks[0], routed)
+    if match is None:
+        client.check_route_snapshot_support()
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            client.check_route_snapshot_support()
 
 
 @pytest.mark.parametrize(

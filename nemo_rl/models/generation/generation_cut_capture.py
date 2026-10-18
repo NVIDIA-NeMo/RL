@@ -25,7 +25,10 @@ from typing import Any, Literal
 
 import torch
 
-from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    verify_route_fragment_integrity,
+)
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 LOGGER = logging.getLogger(__name__)
@@ -35,6 +38,42 @@ LOGGER = logging.getLogger(__name__)
 # evicting fresh evidence merely because a large deployment completed more
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
+
+
+def _final_route_placeholder(
+    layers: int, topk: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """The route row staged for a prefix's last token, which no step has routed.
+
+    A cut builds it when staging and a restore rebuilds it when joining
+    chunks; both must use this helper, or every resumed call fails the
+    digest check. It holds ``ROUTE_MISSING_SENTINEL``, as the final row of an
+    uncut call's routes does.
+    """
+    return torch.full((1, layers, topk), ROUTE_MISSING_SENTINEL, dtype=dtype)
+
+
+def _prefix_routes_sha256(
+    delta_routes: torch.Tensor | None, *, generated_prefix_tokens: int
+) -> str:
+    """Hash the routes a resumed call keeps for its restored generated prefix.
+
+    ``delta_routes`` holds one row per prefix delta token. The kept rows are
+    the generated prefix tokens' except the last, whose route the resumed
+    call's own prefill computes. Restore and completion both log this, so the
+    staged row can be checked against the routes restored from TQ.
+
+    Returns:
+        A SHA-256 hex digest over the kept rows as int32, or ``"none"`` when
+        the call carries no routes.
+    """
+    if delta_routes is None:
+        return "none"
+    end = int(delta_routes.shape[0])
+    kept = delta_routes[end - generated_prefix_tokens : end - 1]
+    return hashlib.sha256(
+        kept.to(torch.int32).contiguous().numpy().tobytes()
+    ).hexdigest()
 
 
 @dataclass
@@ -52,9 +91,15 @@ class _RequestCaptureState:
 
     call: Any
     prompt_token_ids: list[int]
+    # Router replay: a cut reads the engine's routes once, after it freezes
+    # the token count; see ``frozen_cut_routed_experts``.
     capture_routed_experts: bool = False
     routed_experts_dtype: torch.dtype = torch.int16
     restored_routed_experts: torch.Tensor | None = None
+    # The engine's ID for this request, from its first output.
+    engine_request_id: str | None = None
+    # Full-sequence routes from the request's final output.
+    terminal_routed_experts: torch.Tensor | None = None
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
     # generation-prefix row carries its tensor digests across recovery.
@@ -75,21 +120,11 @@ class _RequestCaptureState:
     terminal_started: bool = False
     generated_token_ids: list[int] = field(default_factory=list)
     generated_logprobs: list[float] = field(default_factory=list)
-    # Raw vLLM route chunks past the rows parent lineage or a restored cut
-    # owns. A cut aligns them with the token count it freezes.
-    generated_routed_experts: list[torch.Tensor] = field(default_factory=list)
-    terminal_routed_experts: torch.Tensor | None = None
-    engine_routed_expert_chunk_count: int = 0
-    engine_routed_expert_row_count: int = 0
     # Tokens already written to TQ by sealed cuts.
     staged_token_count: int = 0
-    # Rows in the cumulative route tensor the last sealed cut advertised.
-    staged_route_count: int | None = None
     generation_cut_staging_keys: list[str] = field(default_factory=list)
     # The cut in progress: its checkpoint and the token count it froze.
     frozen_cut: tuple[str, int] | None = None
-    # Rows in the cumulative route tensor the cut in progress advertises.
-    frozen_route_count: int | None = None
     # Names each frozen chunk, so a rolled-back cut never reuses a TQ key.
     next_chunk_sequence: int = 0
 
@@ -101,182 +136,29 @@ class _RequestCaptureState:
         self,
         generated_token_ids: list[int],
         generated_logprobs: list[float],
-        *,
-        routed_expert_chunks: list[Any] | None = None,
-        routed_expert_chunk_count: int | None = None,
-        complete_routed_experts: Any | None = None,
     ) -> None:
-        """Append the tokens, and any route chunks, one vLLM step added."""
+        """Append the tokens one vLLM step added."""
         if len(generated_token_ids) != len(generated_logprobs):
             self.observation_error = (
                 "generated token IDs and log probabilities must have equal lengths"
             )
             return
-        if self.capture_routed_experts and self.observation_error is None:
-            try:
-                self._observe_routed_experts(
-                    routed_expert_chunks=routed_expert_chunks,
-                    routed_expert_chunk_count=routed_expert_chunk_count,
-                    complete_routed_experts=complete_routed_experts,
-                )
-            except (TypeError, ValueError) as error:
-                # The call can no longer be cut; its tokens are still served.
-                self.observation_error = f"{type(error).__name__}: {error}"
         self.generated_token_ids.extend(generated_token_ids)
         self.generated_logprobs.extend(generated_logprobs)
 
-    def _observe_routed_experts(
-        self,
-        *,
-        routed_expert_chunks: list[Any] | None,
-        routed_expert_chunk_count: int | None,
-        complete_routed_experts: Any | None,
-    ) -> None:
-        """Retain new engine-owned route chunks without copying old progress.
+    def _cumulative_route_count(self, generated_token_count: int) -> int:
+        """Rows in the delta-aligned routes of the first generated tokens.
 
-        vLLM 0.29 accumulates prompt and decode routes internally and exposes
-        them on ``CompletionOutput`` only when the request finishes. The HTTP
-        host therefore snapshots only the newly appended internal chunks while
-        the request is active. They are kept raw here and aligned with the
-        observed token count only when a checkpoint freezes it.
+        One row per delta token: the prompt tokens past ``prev_len`` and the
+        generated ones, the last being the final-position placeholder.
         """
-
-        def tensor(value: Any, *, name: str) -> torch.Tensor:
-            result = torch.as_tensor(value, dtype=self.routed_experts_dtype).cpu()
-            if result.dim() != 3:
-                raise ValueError(f"{name} must have shape [tokens, layers, topk]")
-            if result.shape[1] < 1 or result.shape[2] < 1:
-                raise ValueError(f"{name} must have non-empty model dimensions")
-            return result.contiguous()
-
-        chunks = list(routed_expert_chunks or ())
-        if routed_expert_chunk_count is None:
-            routed_expert_chunk_count = self.engine_routed_expert_chunk_count + len(
-                chunks
-            )
-        if routed_expert_chunk_count < self.engine_routed_expert_chunk_count:
-            raise ValueError(
-                "vLLM routed-expert chunk cursor moved backwards: "
-                f"old={self.engine_routed_expert_chunk_count} "
-                f"new={routed_expert_chunk_count}"
-            )
-        expected_new_chunks = (
-            routed_expert_chunk_count - self.engine_routed_expert_chunk_count
-        )
-        if expected_new_chunks != len(chunks):
-            raise ValueError(
-                "vLLM routed-expert chunk cursor skipped progress: "
-                f"expected={expected_new_chunks} received={len(chunks)}"
-            )
-        normalized = [tensor(value, name="routed_experts") for value in chunks]
-        if normalized:
-            model_shape = self._route_model_shape(normalized[0])
-            if any(tuple(chunk.shape[1:]) != model_shape for chunk in normalized):
-                raise ValueError("routed experts changed model dimensions")
-            skip_rows = self._engine_route_skip_rows()
-            for chunk in normalized:
-                chunk_start = self.engine_routed_expert_row_count
-                self.engine_routed_expert_row_count += int(chunk.shape[0])
-                local_start = max(skip_rows - chunk_start, 0)
-                if local_start < chunk.shape[0]:
-                    self.generated_routed_experts.append(
-                        chunk[local_start:].contiguous()
-                    )
-        if complete_routed_experts is not None:
-            complete = tensor(complete_routed_experts, name="complete_routed_experts")
-            model_shape = self._route_model_shape(complete)
-            if tuple(complete.shape[1:]) != model_shape:
-                raise ValueError("completed routed experts changed model dimensions")
-            self.terminal_routed_experts = complete[
-                self._engine_route_skip_rows() :
-            ].contiguous()
-        self.engine_routed_expert_chunk_count = routed_expert_chunk_count
-
-    def _engine_route_skip_rows(self) -> int:
-        """Rows already owned by parent lineage or a restored durable cut."""
-        skip_rows = self.call.admission.prev_len
         if self.restored_routed_experts is not None:
-            skip_rows += max(int(self.restored_routed_experts.shape[0]) - 1, 0)
-        return skip_rows
-
-    def _route_model_shape(
-        self, generated: torch.Tensor | None = None
-    ) -> tuple[int, int]:
-        candidates = [
-            generated,
-            self.restored_routed_experts,
-            self.terminal_routed_experts,
-            *self.generated_routed_experts,
-        ]
-        for candidate in candidates:
-            if candidate is not None:
-                return int(candidate.shape[1]), int(candidate.shape[2])
-        raise ValueError("vLLM did not return routed experts for the captured prefix")
-
-    def _default_final_route(self, model_shape: tuple[int, int]) -> torch.Tensor:
-        layers, topk = model_shape
+            return int(self.restored_routed_experts.shape[0]) + generated_token_count
         return (
-            torch.arange(topk, dtype=self.routed_experts_dtype)
-            .view(1, 1, topk)
-            .expand(1, layers, topk)
-            .clone()
-        )
-
-    def cumulative_routed_experts(
-        self, generated_token_count: int
-    ) -> torch.Tensor | None:
-        """Build the delta-aligned route tensor for the first generated tokens.
-
-        Its last row is the unused final-position placeholder: the last
-        generated token has no route until a later step prefills it.
-        """
-        if not self.capture_routed_experts:
-            return None
-        raw = self.terminal_routed_experts
-        if raw is None and self.generated_routed_experts:
-            raw = torch.cat(self.generated_routed_experts, dim=0)
-        restored = self.restored_routed_experts
-        if raw is None:
-            if restored is not None and generated_token_count == 0:
-                return restored.clone()
-            if generated_token_count == 0:
-                return None
-            if restored is None:
-                raise ValueError(
-                    "vLLM did not return routed experts for the captured prefix"
-                )
-            raw = torch.empty(
-                (0, restored.shape[1], restored.shape[2]),
-                dtype=self.routed_experts_dtype,
-            )
-        model_shape = self._route_model_shape(raw)
-        final = self._default_final_route(model_shape)
-        expected_raw_len = max(
-            0,
-            generated_token_count
-            if restored is not None
-            else len(self.prompt_token_ids)
+            len(self.prompt_token_ids)
             - self.call.admission.prev_len
             + generated_token_count
-            - 1,
         )
-        if raw.shape[0] > expected_raw_len + 1:
-            raise ValueError(
-                "vLLM returned too many routed experts for the captured prefix: "
-                f"routes={raw.shape[0]} expected_at_most={expected_raw_len + 1}"
-            )
-        if raw.shape[0] < expected_raw_len:
-            missing = torch.full(
-                (expected_raw_len - raw.shape[0], *model_shape),
-                -1,
-                dtype=self.routed_experts_dtype,
-            )
-            raw = torch.cat((raw, missing), dim=0)
-        if restored is None:
-            return torch.cat((raw[:expected_raw_len], final), dim=0)
-        if tuple(restored.shape[1:]) != model_shape:
-            raise ValueError("restored routed experts changed model dimensions")
-        return torch.cat((restored[:-1], raw[:expected_raw_len], final), dim=0)
 
     def freeze_for_checkpoint(
         self, checkpoint_id: str
@@ -301,57 +183,84 @@ class _RequestCaptureState:
         )
 
     def frozen_cut_routed_experts(
-        self,
+        self, engine_routed_experts: Any | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return the routes of the cut in progress: its chunk's, then the prefix's.
 
+        ``engine_routed_experts`` are the request's full-sequence routes, read
+        from the engine after the freeze; ``None`` once the request has left
+        the engine. Rows decoding added after the freeze are dropped. vLLM only
+        appends routes, so earlier rows never change and every cut stages rows
+        that line up with what earlier cuts staged. The final output's routes
+        are used when the request has finished.
+
         The chunk has one row per chunk token; the prefix's cumulative routes
-        end with a final placeholder row. Call under ``lock`` in the same hold
-        as ``freeze_for_checkpoint``, before later steps add routes.
+        end with a final placeholder row.
 
         Raises:
-            ValueError: vLLM's routes do not line up with the frozen tokens.
+            ValueError: the routes are malformed, or do not cover every
+                frozen token.
         """
         if self.frozen_cut is None:
             raise RuntimeError("no generation cut is in progress")
+        if not self.capture_routed_experts:
+            return None, None
         frozen = self.frozen_cut[1]
         staged = self.staged_token_count
-        cumulative = self.cumulative_routed_experts(frozen)
-        if cumulative is None:
-            return None, None
-        chunk = None
-        if frozen > staged:
-            previous_route_count = self.staged_route_count
-            if (
-                previous_route_count is None
-                and self.restored_routed_experts is not None
-            ):
-                previous_route_count = int(self.restored_routed_experts.shape[0])
-            if previous_route_count is None:
-                chunk = cumulative
-            else:
-                # The previous placeholder row becomes this chunk's first route.
-                chunk = cumulative[previous_route_count - 1 : -1]
-                if chunk.shape[0] != frozen - staged:
-                    raise ValueError(
-                        "routed-expert checkpoint delta does not match token delta"
-                    )
-        self.frozen_route_count = int(cumulative.shape[0])
-        return chunk, cumulative
+        restored = self.restored_routed_experts
+        if frozen == 0:
+            # Nothing decoded since the restore: the prefix is the restored one.
+            return None, None if restored is None else restored.clone()
+        raw = self.terminal_routed_experts
+        if raw is None:
+            raw = engine_routed_experts
+        if raw is None:
+            raise ValueError(
+                "the request left vLLM before its routes were read for the cut"
+            )
+        raw = torch.as_tensor(raw, dtype=self.routed_experts_dtype).cpu()
+        if raw.dim() != 3 or raw.shape[1] < 1 or raw.shape[2] < 1:
+            raise ValueError("routed experts must have shape [tokens, layers, topk]")
+        layers, topk = int(raw.shape[1]), int(raw.shape[2])
+        # Rows parent lineage or the restored cut already own.
+        skip = self.call.admission.prev_len
+        if restored is not None:
+            if tuple(restored.shape[1:]) != (layers, topk):
+                raise ValueError("restored routed experts changed model dimensions")
+            skip += int(restored.shape[0]) - 1
+        # The last frozen token is not routed until a later step prefills it.
+        needed = self._cumulative_route_count(frozen) - 1
+        if restored is not None:
+            needed -= int(restored.shape[0]) - 1
+        routes = raw[skip : skip + needed]
+        if routes.shape[0] < needed:
+            # vLLM can omit route rows (prefix caching with chunked prefill).
+            # Padding would shift later rows onto the wrong tokens, and a later
+            # cut would see different rows than this one staged.
+            raise ValueError(
+                "vLLM returned fewer routed experts than the frozen tokens need: "
+                f"routes={routes.shape[0]} needed={needed}"
+            )
+        final = _final_route_placeholder(layers, topk, self.routed_experts_dtype)
+        parts = [routes, final] if restored is None else [restored[:-1], routes, final]
+        cumulative = torch.cat(parts, dim=0).contiguous()
+        if frozen == staged:
+            return None, cumulative
+        if staged == 0 and restored is None:
+            return cumulative, cumulative
+        # The previous placeholder row becomes this chunk's first route.
+        start = self._cumulative_route_count(staged) - 1
+        return cumulative[start:-1], cumulative
 
     def seal_frozen_cut(self, checkpoint_id: str) -> None:
         """Count a successfully staged cut's tokens as written to TQ."""
         self.staged_token_count = self._require_frozen_cut(checkpoint_id)
-        if self.frozen_route_count is not None:
-            self.staged_route_count = self.frozen_route_count
         self.frozen_cut = None
-        self.frozen_route_count = None
 
     def rollback_frozen_cut(self, checkpoint_id: str) -> None:
         """Abandon a failed cut; its tokens stay unstaged for the next one."""
         self._require_frozen_cut(checkpoint_id)
         self.frozen_cut = None
-        self.frozen_route_count = None
 
     def _require_frozen_cut(self, checkpoint_id: str) -> int:
         if self.frozen_cut is None or self.frozen_cut[0] != checkpoint_id:
@@ -468,12 +377,13 @@ class GenerationCutCaptureMixin:
     """
 
     # Initialized by the vLLM worker; declared so type checkers can see the
-    # insertion-ordered dicts this mixin evicts from.
+    # insertion-ordered dicts this mixin evicts from and the route dtype.
     _completed_capture_calls: dict[str, _CompletedCaptureState]
     _generation_cut_receipts: dict[tuple[str, str], Any]
     _generation_cut_tokenizer: Any
     _restored_generation_prefix_calls: int
     _restored_generation_prefix_tokens: int
+    routed_experts_dtype: torch.dtype
 
     def _generation_cut_record_payload(
         self, state: _RequestCaptureState
@@ -487,8 +397,19 @@ class GenerationCutCaptureMixin:
         return None
 
     def _return_routed_experts_enabled(self) -> bool:
-        """Whether calls carry router-replay routes; the vLLM worker overrides this."""
-        return False
+        """Whether calls carry router-replay routes; the host implements this."""
+        raise NotImplementedError
+
+    def _snapshot_engine_routed_experts(
+        self, engine_request_id: str, *, timeout_s: float | None
+    ) -> Any | None:
+        """Return an active request's full-sequence routes from the engine.
+
+        ``None`` once the request has left the engine. Backends that serve
+        router replay override this.
+        """
+        del engine_request_id, timeout_s
+        raise NotImplementedError("this backend cannot read routes for a cut")
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -600,11 +521,10 @@ class GenerationCutCaptureMixin:
                 continue
             if tuple(fragment_routes.shape[1:]) != tuple(routes.shape[1:]):
                 raise RuntimeError("generation-cut route model dimensions changed")
-            final = (
-                torch.arange(fragment_routes.shape[2], dtype=fragment_routes.dtype)
-                .view(1, 1, -1)
-                .expand(1, fragment_routes.shape[1], fragment_routes.shape[2])
-                .clone()
+            final = _final_route_placeholder(
+                int(fragment_routes.shape[1]),
+                int(fragment_routes.shape[2]),
+                fragment_routes.dtype,
             )
             routes = torch.cat((routes[:-1], fragment_routes, final), dim=0)
 
@@ -742,7 +662,8 @@ class GenerationCutCaptureMixin:
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
             "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
-            "weight_version_span=[%d,%d] prefix_ids_sha256=%s",
+            "weight_version_span=[%d,%d] prefix_ids_sha256=%s "
+            "prefix_routes_sha256=%s",
             admission.rollout_id,
             admission.model_call_id,
             continuation.source_model_call_id,
@@ -751,6 +672,9 @@ class GenerationCutCaptureMixin:
             weight_versions[0],
             weight_versions[-1],
             prefix_ids_sha256,
+            _prefix_routes_sha256(
+                routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
+            ),
         )
         return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
 
@@ -976,11 +900,41 @@ class GenerationCutCaptureMixin:
         )
         return GenerationCutPrefixAck.failure(prefix)
 
+    def _frozen_cut_engine_routed_experts(
+        self, state: _RequestCaptureState, *, deadline: float | None
+    ) -> Any | None:
+        """Read the engine's routes for a frozen cut that needs them.
+
+        Runs after the freeze, without ``state.lock``, so decoding continues.
+
+        Raises:
+            TimeoutError: the engine did not answer before ``deadline``.
+            ValueError: the engine cannot name the request's routes.
+        """
+        with state.lock:
+            needs_engine_routes = (
+                state.capture_routed_experts
+                and state.frozen_cut is not None
+                and state.frozen_cut[1] > 0
+                and state.terminal_routed_experts is None
+            )
+            engine_request_id = state.engine_request_id
+        if not needs_engine_routes:
+            return None
+        if engine_request_id is None:
+            raise ValueError("no vLLM output has named the request yet")
+        timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        return self._snapshot_engine_routed_experts(
+            engine_request_id, timeout_s=timeout_s
+        )
+
     def _checkpoint_active_generation_cut(
         self,
         prefix: Any,
         state: _RequestCaptureState,
         checkpoint_id: str,
+        *,
+        deadline: float | None = None,
     ) -> Any | None:
         """Cut one live call, or return ``None`` if abort won the race."""
         from nemo_gym._checkpoint.generation_cut import (
@@ -1032,14 +986,6 @@ class GenerationCutCaptureMixin:
                         generated_token_ids,
                         generated_logprobs,
                     ) = state.freeze_for_checkpoint(checkpoint_id)
-                    try:
-                        (
-                            chunk_routed_experts,
-                            cumulative_routed_experts,
-                        ) = state.frozen_cut_routed_experts()
-                    except ValueError as error:
-                        state.rollback_frozen_cut(checkpoint_id)
-                        observation_error = f"{type(error).__name__}: {error}"
             if uncuttable_reason is not None:
                 # Expected for this request; the worker warned when it was set.
                 LOGGER.debug(
@@ -1108,19 +1054,41 @@ class GenerationCutCaptureMixin:
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
+            try:
+                engine_routed_experts = self._frozen_cut_engine_routed_experts(
+                    state, deadline=deadline
+                )
+                with state.lock:
+                    (
+                        chunk_routed_experts,
+                        cumulative_routed_experts,
+                    ) = state.frozen_cut_routed_experts(engine_routed_experts)
+            except (TimeoutError, TypeError, ValueError) as error:
+                # Only this call regenerates; the rest of the inventory is cut,
+                # and the next checkpoint tries this call again.
+                with state.lock:
+                    state.rollback_frozen_cut(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: routed experts: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_failure",
+                )
+
             staged_key = None
             try:
-                call_extras = self._generation_cut_record_payload(state)
-                cumulative_extras = (
-                    call_extras
-                    if cumulative_routed_experts is None
-                    else {
-                        **(call_extras or {}),
+                cumulative_extras = self._generation_cut_record_payload(state)
+                if cumulative_routed_experts is not None:
+                    cumulative_extras = {
+                        **(cumulative_extras or {}),
                         "routed_experts": encode_routed_experts(
                             cumulative_routed_experts
                         ),
                     }
-                )
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
@@ -1246,7 +1214,7 @@ class GenerationCutCaptureMixin:
             try:
                 acknowledgement = (
                     self._checkpoint_active_generation_cut(
-                        prefix, state, inventory.checkpoint_id
+                        prefix, state, inventory.checkpoint_id, deadline=deadline
                     )
                     if state is not None
                     else None
