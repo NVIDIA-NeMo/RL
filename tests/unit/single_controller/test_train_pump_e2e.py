@@ -43,8 +43,8 @@ from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
 from tests.unit.single_controller._dp_fakes import _PARTITION_ID
 from tests.unit.test_utils import SimpleLossFn
