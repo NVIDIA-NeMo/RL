@@ -237,7 +237,9 @@ def test_prefix_completion_retires_old_keys() -> None:
     )
 
 
-def _dump_restored_run(tmp_path: Path, *, live_keys: list[str]) -> argparse.Namespace:
+def _dump_restored_run(
+    tmp_path: Path, *, live_keys: list[str], phase2_log_text: str | None = None
+) -> argparse.Namespace:
     """A phase-two trainer dump, log, and selection for ``verify-completion``."""
     from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -284,12 +286,14 @@ def _dump_restored_run(tmp_path: Path, *, live_keys: list[str]) -> argparse.Name
         )
     )
     phase2_log = tmp_path / "phase2.log"
-    phase2_log.write_text(_completion_log("call-a"))
+    phase2_log.write_text(phase2_log_text or _completion_log("call-a"))
     return argparse.Namespace(
         selection_file=str(selection),
         recovery_log_dir=str(log_dir),
         recovery_staging_keys=str(staging_keys),
         phase2_log=str(phase2_log),
+        require_routes=False,
+        kl_type="k3",
     )
 
 
@@ -650,3 +654,66 @@ def test_cut_coverage_counts_distinct_prompt_groups() -> None:
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=1, min_cut_groups=3)
     with pytest.raises(AssertionError, match="need 4 in 1"):
         _SNAPSHOT_HELPER._require_cut_coverage(candidates, min_cuts=4, min_cut_groups=1)
+
+
+def _with_route_hashes(log: str, *, restored: str, completed: str) -> str:
+    """Append router replay's prefix route hashes to restore and completion lines."""
+    return "".join(
+        f"{line} prefix_routes_sha256="
+        f"{restored if 'prefix restored:' in line else completed}\n"
+        for line in log.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("completed", "match"),
+    [
+        ("a" * 64, None),
+        ("b" * 64, "does not carry its restored prefix routes"),
+        ("none", "carried no routes"),
+    ],
+    ids=["staged", "recomputed", "dropped"],
+)
+def test_restored_prefix_routes_must_be_the_ones_staged_for_training(
+    completed: str, match: str | None
+) -> None:
+    selection = {"cuts": [_cut("call-a", 0, 5)]}
+    log = _with_route_hashes(
+        _completion_log("call-a"), restored="a" * 64, completed=completed
+    )
+
+    if match is None:
+        _SNAPSHOT_HELPER._assert_restored_routes_staged(selection, log)
+    else:
+        with pytest.raises(AssertionError, match=match):
+            _SNAPSHOT_HELPER._assert_restored_routes_staged(selection, log)
+
+
+def test_restored_prefix_routes_must_be_logged_on_restore_and_completion() -> None:
+    # A run without router replay logs no route hashes at all.
+    with pytest.raises(AssertionError, match="expected one each"):
+        _SNAPSHOT_HELPER._assert_restored_routes_staged(
+            {"cuts": [_cut("call-a", 0, 5)]}, _completion_log("call-a")
+        )
+
+
+def test_verify_completion_reports_gen_kl_error_by_span(tmp_path: Path, capsys):
+    args = _dump_restored_run(
+        tmp_path,
+        live_keys=[],
+        phase2_log_text=_with_route_hashes(
+            _completion_log("call-a"), restored="a" * 64, completed="a" * 64
+        ),
+    )
+    args.require_routes = True
+
+    _SNAPSHOT_HELPER.verify_completion(args)
+
+    report = json.loads(
+        capsys.readouterr().out.split("gen_kl_error: ", 1)[1].splitlines()[0]
+    )
+    # The five restored prefix tokens, then the tail's trained tokens (one of
+    # its seven positions is masked); the dump's logprobs agree exactly.
+    assert report["restored_prefix"] == {"tokens": 5, "mean": 0.0, "max": 0.0}
+    assert report["resumed_tail"] == {"tokens": 6, "mean": 0.0, "max": 0.0}
+    assert report["other_rows"]["tokens"] == 0

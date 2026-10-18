@@ -36,6 +36,23 @@ def test_round_trip_preserves_values_and_wire_dtype(dtype):
     assert torch.equal(decoded, routes.to(torch.int32))
 
 
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+def test_decode_without_a_dtype_keeps_the_wire_dtype(dtype):
+    routes = torch.tensor([[[1, -1]], [[3, 4]]], dtype=dtype)
+
+    decoded = decode_routed_experts(encode_routed_experts(routes))
+
+    assert decoded.dtype == dtype
+    assert torch.equal(decoded, routes)
+    # Empty envelopes keep it too.
+    empty = decode_routed_experts(encode_routed_experts(routes[:0]))
+    assert empty.dtype == dtype and empty.shape == (0, 1, 2)
+
+
+def test_decode_without_a_dtype_reads_legacy_lists_as_int16():
+    assert decode_routed_experts([[[1, 2]]]).dtype == torch.int16
+
+
 def test_decode_accepts_legacy_nested_lists():
     decoded = decode_routed_experts([[[1, 2]], [[3, 4]]], dtype=torch.int16)
     assert decoded.dtype == torch.int16

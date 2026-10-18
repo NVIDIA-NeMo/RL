@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -339,6 +340,123 @@ def verify_restore(args: argparse.Namespace) -> None:
             raise AssertionError(f"train step {step} appeared {len(matches)} times")
 
 
+# Router replay: the worker hashes a restored call's kept prefix routes once
+# when it rebuilds them from TQ and again from the row it stages for training.
+_PREFIX_ROUTES_LINE = re.compile(
+    r"generation prefix (?P<event>restored|completed): .*?"
+    r"source_model_call_id=(?P<source_model_call_id>\S+) "
+    r"prefix_tokens=(?P<prefix_tokens>\d+) .*?"
+    r"prefix_routes_sha256=(?P<routes_sha256>[0-9a-f]{64}|none)"
+)
+
+
+def _assert_restored_routes_staged(
+    selection: dict[str, Any], recovery_log: str
+) -> None:
+    """Require each restored call to stage, for training, the routes it restored.
+
+    A call that dropped its routes, or replaced its prefix's routes with ones
+    recomputed after the restart, logs a different hash at completion.
+    """
+    logged: dict[tuple[str, str, int], list[str]] = {}
+    for match in _PREFIX_ROUTES_LINE.finditer(recovery_log):
+        key = (
+            match["event"],
+            match["source_model_call_id"],
+            int(match["prefix_tokens"]),
+        )
+        logged.setdefault(key, []).append(match["routes_sha256"])
+    for cut in selection["cuts"]:
+        source = cut["model_call_id"]
+        prefix_tokens = int(cut["prefix_token_count"])
+        restored = logged.get(("restored", source, prefix_tokens), [])
+        completed = logged.get(("completed", source, prefix_tokens), [])
+        if len(restored) != 1 or len(completed) != 1:
+            raise AssertionError(
+                f"restored call {source!r} logged {len(restored)} restored and "
+                f"{len(completed)} completed route hashes, expected one each"
+            )
+        if "none" in (restored[0], completed[0]):
+            raise AssertionError(f"restored call {source!r} carried no routes")
+        if restored != completed:
+            raise AssertionError(
+                f"row staged for {source!r} does not carry its restored prefix routes"
+            )
+
+
+def _generation_kl_by_span(
+    selection: dict[str, Any],
+    records: list[dict[str, Any]],
+    starts: dict[tuple[str, int], int],
+    *,
+    kl_type: str,
+) -> dict[str, dict[str, float]]:
+    """Report the trainer's ``gen_kl_error``, split by where the tokens came from.
+
+    Restored prefix tokens were sampled before the crash and are trained with
+    their restored routes; a resumed call's tail and every other row are
+    sampled and trained as usual. Wrong prefix routes would make the training
+    logprobs of the restored prefix disagree with the ones it was sampled
+    with.
+    """
+    # Deferred: loads the trainer's loss stack, which only router-replay
+    # verification needs.
+    import torch
+
+    from nemo_rl.algorithms.utils import calculate_kl
+
+    prefix_tokens = {
+        (cut["group_id"], int(cut["generation_index"])): int(cut["prefix_token_count"])
+        for cut in selection["cuts"]
+    }
+    spans: dict[str, list[float]] = {
+        "restored_prefix": [],
+        "resumed_tail": [],
+        "other_rows": [],
+    }
+    for batch in records:
+        for row in batch["rows"]:
+            if "prev_logprobs" not in row:
+                raise AssertionError("the trainer dump has no prev_logprobs")
+            # The dump writes non-finite values as null.
+            prev = [math.nan if v is None else v for v in row["prev_logprobs"]]
+            generated = [
+                math.nan if v is None else v for v in row["generation_logprobs"]
+            ]
+            kl = calculate_kl(
+                logprobs=torch.tensor(generated),
+                logprobs_reference=torch.tensor(prev),
+                kl_type=kl_type,
+                input_clamp_value=None,
+                output_clamp_value=None,
+            ).tolist()
+            key = (row["group_id"], int(row["generation_index"]))
+            start = starts.get(key)
+            for position, keep in enumerate(row["token_loss_mask"]):
+                if not keep:
+                    continue
+                if start is None:
+                    span = "other_rows"
+                elif position < start + prefix_tokens[key]:
+                    span = "restored_prefix"
+                else:
+                    span = "resumed_tail"
+                spans[span].append(kl[position])
+    report = {
+        name: {
+            "tokens": len(values),
+            "mean": sum(values) / len(values) if values else float("nan"),
+            "max": max(values, default=float("nan")),
+        }
+        for name, values in spans.items()
+    }
+    if not spans["restored_prefix"]:
+        raise AssertionError("no trained restored-prefix tokens to report")
+    if not all(math.isfinite(value) for values in spans.values() for value in values):
+        raise AssertionError(f"gen_kl_error is not finite: {report!r}")
+    return report
+
+
 def verify_completion(args: argparse.Namespace) -> None:
     """Without a reference run, require every restored prefix to finish and train.
 
@@ -357,6 +475,16 @@ def verify_completion(args: argparse.Namespace) -> None:
     )
     _assert_retired_prefix_keys(selection, records)
     print(f"restored prefixes completed and trained: {sorted(starts)!r}", flush=True)
+    if args.require_routes:
+        recovery_log = Path(args.phase2_log).read_text()
+        _assert_restored_routes_staged(selection, recovery_log)
+        report = _generation_kl_by_span(
+            selection, records, starts, kl_type=args.kl_type
+        )
+        print(
+            f"restored prefix routes staged; gen_kl_error: {json.dumps(report)}",
+            flush=True,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -392,6 +520,9 @@ def _parser() -> argparse.ArgumentParser:
     completion.add_argument("recovery_log_dir")
     completion.add_argument("recovery_staging_keys")
     completion.add_argument("phase2_log")
+    # Router replay: also require the restored routes and report gen_kl_error.
+    completion.add_argument("--require-routes", action="store_true")
+    completion.add_argument("--kl-type", default="k3")
     completion.set_defaults(func=verify_completion)
     return parser
 

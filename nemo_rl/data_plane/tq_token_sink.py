@@ -69,6 +69,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_LEN_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -638,26 +639,12 @@ class TQTokenSink:
             routed_encoding = ROUTE_ENCODING_NONE
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
-                    from nemo_rl.utils.routed_experts_codec import (
-                        decode_routed_experts,
-                    )
-
-                    dtype_name = routed.split(":", 3)[1]
-                    dtype = {
-                        "int8": torch.int8,
-                        "int16": torch.int16,
-                        "int32": torch.int32,
-                    }.get(dtype_name)
-                    if dtype is None:
-                        raise ValueError(
-                            f"unsupported routed_experts dtype {dtype_name!r}"
-                        )
-                    experts = decode_routed_experts(routed, dtype)
-                    routed_encoding = ROUTE_ENCODING_ENVELOPE
-                else:
-                    experts = torch.tensor(routed, dtype=torch.int16)
-                    routed_encoding = ROUTE_ENCODING_LIST
+                experts = decode_routed_experts(routed)
+                routed_encoding = (
+                    ROUTE_ENCODING_ENVELOPE
+                    if isinstance(routed, str)
+                    else ROUTE_ENCODING_LIST
+                )
                 expected_len = delta_len + (
                     0 if generation_cut_chunk else boundary_route_rows(record.prev_len)
                 )
