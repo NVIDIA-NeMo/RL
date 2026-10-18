@@ -64,7 +64,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh
 # Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
 # the process, restore that exact prefix, and generate only its remaining tail.
-# This is intentionally full-tier because it performs two long-generation runs.
+# This is intentionally full-tier because it performs three long-generation
+# runs: an uninterrupted reference, the interrupted run, and the recovery.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests

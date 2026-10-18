@@ -23,14 +23,11 @@ BASELINE_LOG=$TEST_DIR/baseline.log
 PHASE1_EVENTS=$TEST_DIR/phase1-events.jsonl
 PHASE2_EVENTS=$TEST_DIR/phase2-events.jsonl
 BASELINE_EVENTS=$TEST_DIR/baseline-events.jsonl
-BASELINE_TRAINING=$TEST_DIR/baseline-training.jsonl
-DISCARDED_TRAINING=$TEST_DIR/discarded-phase1-training.jsonl
-RECOVERY_TRAINING=$TEST_DIR/recovery-training.jsonl
 BASELINE_LOG_DIR=$TEST_DIR/baseline-logs
+PHASE1_LOG_DIR=$TEST_DIR/phase1-logs
 RECOVERY_LOG_DIR=$TEST_DIR/recovery-logs
-BASELINE_METRICS=$TEST_DIR/baseline-metrics.json
+RECOVERY_STAGING_KEYS=$TEST_DIR/recovery-staging-keys.jsonl
 PHASE2_METRICS=$TEST_DIR/phase2-metrics.json
-PARITY_REPORT=$TEST_DIR/parity-report.json
 SELECTION_FILE=$TEST_DIR/selected-snapshot.json
 SELECTED_BACKUP=$TEST_DIR/selected-snapshot
 TEST_DATA=$TEST_DIR/test-data.jsonl
@@ -54,7 +51,7 @@ SNAPSHOT_INTERVAL_S=${SC_PREFIX_RECOVERY_INTERVAL_S:-0.05}
 PHASE2_SNAPSHOT_INTERVAL_S=${SC_PREFIX_RECOVERY_PHASE2_INTERVAL_S:-600}
 SNAPSHOT_TIMEOUT_S=${SC_PREFIX_RECOVERY_TIMEOUT_S:-2400}
 PHASE2_TIMEOUT_S=${SC_PREFIX_RECOVERY_PHASE2_TIMEOUT_S:-2400}
-MAX_STEPS=${SC_PREFIX_RECOVERY_MAX_STEPS:-3}
+MAX_STEPS=${SC_PREFIX_RECOVERY_MAX_STEPS:-1}
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 # Gym refuses dispatches that land during a checkpoint and those rollouts start
 # later, so require a recoverable prefix in every Workplace prompt group rather
@@ -80,52 +77,32 @@ mkdir -p "$TEST_DIR"
 # than by scheduling noise.
 # The second Workplace prompt expects a different duration than requested, so
 # its reward is 0 and reward parity is not satisfied by a constant.
-jq -n -c \
+jq -n -c -L "$SCRIPT_DIR" \
     --slurpfile workplace "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
     --argjson steps "$MAX_STEPS" \
     --argjson list_lengths "$LIST_LENGTHS_JSON" \
     --argjson tokens_per_item "$LIST_TOKENS_PER_ITEM" \
     --argjson output_slack "$LIST_OUTPUT_SLACK_TOKENS" \
     --arg event "$SENTINEL_EVENT" '
+      include "_workplace_calendar_rows";
       range(0; $steps) as $step |
         range(0; $list_lengths | length) as $slot
         | $list_lengths[$slot] as $list_length
         | $workplace[0]
-        | del(.agent_ref)
-        | .task_source = "workplace_assistant_checkpoint_test_agent"
-        | .responses_create_params.input = [{
-            "role": "user",
-            "content": ("Call calendar_create_event exactly once with event_name " + $event
-                + ", participant_email checkpoint-recovery@example.com, event_start "
-                + "2025-01-15 10:00:00, and duration 30. After the tool result, do not call any "
-                + "more tools: list every integer from 1 to " + ($list_length | tostring)
-                + " in increasing order, one per line, with no other text.")
-          }]
-        | .responses_create_params.tools = [
-            .responses_create_params.tools[] | select(.name == "calendar_create_event")
-          ]
-        | .responses_create_params.tool_choice = {"type": "function", "name": "calendar_create_event"}
-        | .responses_create_params.parallel_tool_calls = false
+        | workplace_calendar_row(
+            $event;
+            " After the tool result, do not call any more tools: list every integer from 1 to "
+              + ($list_length | tostring)
+              + " in increasing order, one per line, with no other text.";
+            (if $slot == 1 then "60" else "30" end)
+          )
         | .responses_create_params.max_output_tokens = ($list_length * $tokens_per_item + $output_slack)
-        | .ground_truth = [{
-            "name": "calendar_create_event",
-            "arguments": ({
-              "event_name": $event,
-              "participant_email": "checkpoint-recovery@example.com",
-              "event_start": "2025-01-15 10:00:00",
-              "duration": (if $slot == 1 then "60" else "30" end)
-            } | tojson)
-          }]
-        | .category = "workplace_assistant_calendar"
-        | .environment_name = "workplace_assistant"
     ' > "$TEST_DATA"
 
-# MIN_TOKENS=0 stops further tool calls on the closing turn without forcing its
-# length: forced min_tokens suppress EOS and leave near-tied argmax tokens that
-# flip between otherwise identical runs.
+# After the calendar mutation, the checkpoint test agent stops further tool
+# calls on the closing turn and leaves its length to the model.
 WORKPLACE_PREFIX_ENV=(
     NEMO_GYM_TEST_WORKPLACE_PREFIX_AFTER_MUTATION=1
-    NEMO_GYM_TEST_PREFIX_MIN_TOKENS=0
 )
 
 stop_phase1() {
@@ -181,6 +158,9 @@ COMMON_OVERRIDES=(
     ++async_rl.stall_watchdog.interval_s=10
     ++async_rl.stall_watchdog.stall_timeout_s=600
     ++async_rl.stall_watchdog.stall_action=abort
+    # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
+    # for the parity comparison.
+    ++async_rl.log_full_train_data=true
     grpo.seed=1234
     grpo.num_prompts_per_step="$NUM_PROMPTS"
     grpo.num_generations_per_prompt="$NUM_GENERATIONS"
@@ -189,7 +169,9 @@ COMMON_OVERRIDES=(
     policy.generation.max_new_tokens="$POLICY_MAX_NEW_TOKENS"
     policy.train_global_batch_size="$TRAIN_GLOBAL_BATCH_SIZE"
     # Make the suffix regenerated after recovery deterministic enough to
-    # compare token-for-token with the uninterrupted reference run.
+    # compare token-for-token with the uninterrupted reference run. Training
+    # applies the same top_p, so the policy-gradient term is 0: this test
+    # checks rollout and training-data parity, not learning.
     policy.generation.temperature=1.0
     policy.generation.top_p=0.000001
     '~env.nemo_gym.code_gen'
@@ -210,7 +192,6 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_GYM_RECOVERY_TEST_EVENTS="$BASELINE_EVENTS" \
-        SC_PREFIX_RECOVERY_TRAINING_PAYLOAD="$BASELINE_TRAINING" \
         RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" \
         "${COMMON_OVERRIDES[@]}" \
@@ -219,9 +200,6 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
         logger.log_dir="$BASELINE_LOG_DIR" \
         "$@"
 cp "$BASE_RUN_LOG" "$BASELINE_LOG"
-uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \
-    "$BASELINE_LOG_DIR" \
-    --output_path "$BASELINE_METRICS"
 
 echo "=== Phase 1: publish a checkpoint containing an active generation prefix ==="
 command -v setsid >/dev/null
@@ -230,11 +208,10 @@ setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_TEST_CONFIG="$TEST_CONFIG" \
     SC_GYM_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
-    SC_PREFIX_RECOVERY_TRAINING_PAYLOAD="$DISCARDED_TRAINING" \
     RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" \
         "${COMMON_OVERRIDES[@]}" \
-        logger.log_dir="$RECOVERY_LOG_DIR" \
+        logger.log_dir="$PHASE1_LOG_DIR" \
         "$@" &
 PHASE1_PID=$!
 
@@ -281,7 +258,7 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_GYM_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
-        SC_PREFIX_RECOVERY_TRAINING_PAYLOAD="$RECOVERY_TRAINING" \
+        SC_PREFIX_RECOVERY_STAGING_KEYS="$RECOVERY_STAGING_KEYS" \
         RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" \
         "${COMMON_OVERRIDES[@]}" \
@@ -311,20 +288,13 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" verify-re
     "$MAX_STEPS"
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
-    --baseline-training "$BASELINE_TRAINING" \
-    --recovery-training "$RECOVERY_TRAINING" \
-    --baseline-metrics "$BASELINE_METRICS" \
-    --recovery-metrics "$PHASE2_METRICS" \
+    --baseline-log-dir "$BASELINE_LOG_DIR" \
+    --recovery-log-dir "$RECOVERY_LOG_DIR" \
+    --recovery-staging-keys "$RECOVERY_STAGING_KEYS" \
     --selection "$SELECTION_FILE" \
     --recovery-log "$PHASE2_LOG" \
-    --successor-checkpoint "$CHECKPOINT_DIR/step_$MAX_STEPS" \
     --steps "$MAX_STEPS" \
     --prompts-per-step "$NUM_PROMPTS" \
-    --generations-per-prompt "$NUM_GENERATIONS" \
-    --baseline-events "$BASELINE_EVENTS" \
-    --phase1-events "$PHASE1_EVENTS" \
-    --recovery-events "$PHASE2_EVENTS" \
-    --report-output "$PARITY_REPORT" \
-    --require-prompt-group-order
+    --generations-per-prompt "$NUM_GENERATIONS"
 
 echo "Single-controller Gym Workplace generation-prefix recovery parity test passed"

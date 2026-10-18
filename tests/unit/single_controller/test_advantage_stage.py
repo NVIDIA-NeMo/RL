@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
@@ -43,7 +44,10 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    MasterConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -52,6 +56,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -812,3 +817,33 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+@pytest.mark.parametrize("log_full_train_data", [False, True])
+def test_stage_config_reads_the_dump_dir_from_the_logger_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, log_full_train_data: bool
+) -> None:
+    """The dump dir comes from LoggerConfig, which is a model, not a dict."""
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    recipe = Path(__file__).resolve().parents[3] / (
+        "examples/configs/recipes/llm/"
+        "grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml"
+    )
+    overrides = OmegaConf.from_dotlist(
+        [
+            f"logger.log_dir={tmp_path}",
+            f"async_rl.log_full_train_data={str(log_full_train_data).lower()}",
+        ]
+    )
+    resolved = OmegaConf.to_container(
+        OmegaConf.merge(load_config(recipe), overrides), resolve=True
+    )
+    assert isinstance(resolved, dict)
+
+    config = AdvantageStageConfig.from_master_config(
+        MasterConfig.model_validate(resolved)
+    )
+
+    expected = str(tmp_path) if log_full_train_data else None
+    assert config.train_data_dump_dir == expected
