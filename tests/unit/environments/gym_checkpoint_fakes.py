@@ -80,6 +80,8 @@ class FakeGymActor:
         restart_only_servers: Participants whose status says their rollouts
             start over after a crash.
         participants: The server names of the participants a commit reports.
+        generation_cut_counts: Gym's ``cut``/``cut_failed``/``cut_skipped``
+            counts a prepare reports.
     """
 
     def __init__(
@@ -100,6 +102,7 @@ class FakeGymActor:
         forget_errors: tuple[BaseException, ...] = (),
         restart_only_servers: tuple[str, ...] = (),
         participants: tuple[str, ...] = ("tools-agent", "tools-model"),
+        generation_cut_counts: Optional[dict[str, int]] = None,
     ) -> None:
         self.prepared = prepared
         self.resume_errors = list(resume_errors)
@@ -113,6 +116,7 @@ class FakeGymActor:
         self.release_commit = asyncio.Event() if block_commit else None
         self.while_prepared = while_prepared
         self.restarts = restarts
+        self.generation_cut_counts = generation_cut_counts or {}
         self.forget_errors = list(forget_errors)
         self.restart_only_servers = list(restart_only_servers)
         self.participants = participants
@@ -151,6 +155,7 @@ class FakeGymActor:
             prepared=self.prepared,
             blockers={} if self.prepared else {"agent": ("rollout-1",)},
             restarts=self.restarts,
+            generation_cut_counts=dict(self.generation_cut_counts),
         )
 
     async def _renew(self, *args, **kwargs) -> None:
