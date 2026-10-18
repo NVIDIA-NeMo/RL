@@ -56,8 +56,8 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutRecoveryState,
 )
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollout_manager import (

@@ -55,8 +55,8 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def has_gloo() -> bool:
