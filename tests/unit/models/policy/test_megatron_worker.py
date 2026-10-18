@@ -2745,7 +2745,7 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
 
     worker._iter_params_with_optional_kv_scales = _iter_params
 
-    info = worker._prepare_source_refit_info("hf_export")
+    info = worker._prepare_source_refit_info()
 
     assert worker._refit_prequant_names == set()
     assert info[name] == (torch.Size([2, 64]), torch.bfloat16)
