@@ -259,7 +259,7 @@ teachers:
   #       fused: false
 
 collator:
-  # Collator mode. "text" (default) = raw-text KD; "chat" = per-assistant-message
+  # Collator mode. "text" (default) = raw-text KD; "chat" = final-assistant-message
   # alignment over each side's rendered chat template (SFT/instruct data).
   mode: "text"
   # Include reasoning text and closing think markers in assistant loss masks.

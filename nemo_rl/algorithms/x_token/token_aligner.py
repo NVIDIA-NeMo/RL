@@ -399,8 +399,8 @@ class TokenAligner:
                 within assistant content regions.
             teacher_asst_mask: Optional ``[B, T_t]`` counterpart.
             student_eot_indices: Optional per-sample, per-turn EOT positions.
-                Use ``-1`` when truncation removed a turn's terminator. If
-                omitted, locate EOT by the end of the content span.
+                Use ``-1`` when the render has no terminator token after the
+                content. If omitted, locate EOT by the end of the content span.
             teacher_eot_indices: Counterpart for the teacher tokens.
             student_alignment_regions: Optional per-sample, per-turn named
                 reasoning, close, and answer character spans.
