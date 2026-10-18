@@ -1342,7 +1342,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             process_weights_after_loading,
         )
 
-        self._require_refit_usable()
+        if self._refit_unusable_reason is not None:
+            # A full refit replaces every weight, so retry instead of failing:
+            # the refit recovery path reuses these actors after an abort.
+            logger.warning(
+                "Retrying refit on a worker that holds partial weights: %s",
+                self._refit_unusable_reason,
+            )
 
         def finalize() -> None:
             with set_current_vllm_config(self.model_runner.vllm_config):
@@ -1360,6 +1366,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         except BaseException as error:
             self._mark_refit_unusable(error)
             raise
+        self._refit_unusable_reason = None
 
     def _new_model_update_coverage(self) -> ModelUpdateCoverage | None:
         manifest = self._model_update_manifest
@@ -1381,13 +1388,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.model_runner.vllm_config.speculative_config.draft_model_config
         )
         process_weights_after_loading(adapter.model, draft_model_config, self.device)
-
-    def _require_refit_usable(self) -> None:
-        if self._refit_unusable_reason is not None:
-            raise SpeculatorRuntimeError(
-                "generation worker is unusable after a partial refit: "
-                f"{self._refit_unusable_reason}"
-            )
 
     def _mark_refit_unusable(self, error: BaseException) -> None:
         reason = f"{type(error).__name__}: {error}"
@@ -2396,10 +2396,26 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             *(self.pp_comm_groups or {}).values(),
             self.model_update_group,
         ]
-        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
-            hold_refit_for_fault_injection()
-            with self._weight_update_lifecycle("nccl_reshard") as finalize:
-                result = self._nccl_reshard_refit_impl(finalize)
+        guard = RefitAbortWatchdog(groups, refit_timeout_s)
+        try:
+            with guard:
+                hold_refit_for_fault_injection()
+                with self._weight_update_lifecycle("nccl_reshard") as finalize:
+                    result = self._nccl_reshard_refit_impl(finalize)
+        except Exception as error:
+            if guard.fired:
+                raise RefitAborted(
+                    f"refit nccl_reshard receive exceeded {refit_timeout_s}s and "
+                    "was aborted; this engine now holds partial weights and must "
+                    "not serve until refit"
+                ) from error
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",
+                error,
+            )
+            return False
         if guard.fired:
             raise RefitAborted(
                 f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "

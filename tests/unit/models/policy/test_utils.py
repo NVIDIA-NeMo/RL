@@ -237,12 +237,9 @@ def test_stream_weights_collects_oversized_ipc_handle_before_empty_cache(
         worker_name="test_worker",
     )
 
-    assert events == [
-        "ipc_collect",
-        "empty_cache",
-        "ipc_collect",
-        "empty_cache",
-    ]
+    # An oversized-only stream never allocates the regular staging pair, so
+    # only the oversized transfer releases CUDA IPC storage.
+    assert events == ["ipc_collect", "empty_cache"]
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
