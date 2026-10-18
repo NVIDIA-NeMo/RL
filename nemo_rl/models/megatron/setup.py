@@ -298,34 +298,6 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             "FP32 masters (HybridDeviceOptimizer)"
         )
 
-    return applied
-
-
-def _sync_model_params_from_loaded_optimizer(optimizer) -> bool:
-    """Refresh quantized compute weights from restored FP32 optimizer masters.
-
-    Prefer a wrapper's synchronization API so it coordinates parameter staging
-    and gathering across its children. Descend only when a wrapper lacks it.
-    """
-    pending = [optimizer]
-    visited = set()
-    applied = False
-    while pending:
-        candidate = pending.pop()
-        if id(candidate) in visited:
-            continue
-        visited.add(id(candidate))
-        sync = getattr(
-            candidate, "quantize_and_sync_model_params_from_main_params", None
-        )
-        if callable(sync):
-            sync()
-            applied = True
-        else:
-            for collection in ("chained_optimizers", "_active_optimizers"):
-                pending.extend(getattr(candidate, collection, ()))
-    return applied
-
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -2712,8 +2684,7 @@ def setup_model_and_optimizer(
             if megatron_cfg.checkpoint.finetune:
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
             elif resume_checkpoint_exists and megatron_cfg.checkpoint.load_optim:
-                if not _force_sync_model_from_optimizer_fp32(optimizer):
-                    _sync_model_params_from_loaded_optimizer(optimizer)
+                _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)
