@@ -186,14 +186,33 @@ def test_compare_training_rows_rejects_prefix_boundary_token_difference() -> Non
         )
 
 
-def _trained_records(generated: int, *, group_id: str = "g") -> list[dict[str, Any]]:
-    """One trained row whose closing call generated ``generated`` tokens."""
+def _trained_records(
+    generated: int, *, group_id: str = "g", masked: frozenset[int] = frozenset()
+) -> list[dict[str, Any]]:
+    """One trained row: a two-token prompt, then a closing call of ``generated``.
+
+    The call's tokens are 100, 101, ...; ``masked`` lists call positions the
+    trainer dropped from the loss (e.g. top-k/top-p ``-inf`` logprobs).
+    """
     row = {
         "group_id": group_id,
         "generation_index": 0,
-        "token_loss_mask": [0.0, 0.0] + [1.0] * generated,
+        "token_ids": [1, 2] + list(range(100, 100 + generated)),
+        "token_loss_mask": [0.0, 0.0]
+        + [0.0 if index in masked else 1.0 for index in range(generated)],
     }
     return [{"train_step": 1, "rows": [row]}]
+
+
+def _completion_log(
+    source: str, *, prefix_tokens: int = 5, tail_tokens: int = 7, total: int = 12
+) -> str:
+    """Restore and completion lines for a call whose prefix is 100, 101, ...."""
+    return _restored_log(source, list(range(100, 100 + prefix_tokens))) + (
+        "generation prefix completed: rollout_id=r model_call_id=continued "
+        f"source_model_call_id={source} prefix_tokens={prefix_tokens} "
+        f"tail_tokens={tail_tokens} total_generation_tokens={total}\n"
+    )
 
 
 def test_prefix_completion_retires_old_keys() -> None:
@@ -208,12 +227,10 @@ def test_prefix_completion_retires_old_keys() -> None:
             }
         ]
     }
-    log = (
-        "generation prefix completed: rollout_id=r model_call_id=continued "
-        "source_model_call_id=source-call prefix_tokens=5 tail_tokens=7 "
-        "total_generation_tokens=12"
-    )
-    _HELPER._assert_prefix_boundary(selection, log, _trained_records(12))
+    log = _completion_log("source-call")
+    assert _HELPER._assert_prefix_boundary(selection, log, _trained_records(12)) == {
+        ("g", 0): 2
+    }
     _HELPER._assert_retired_prefix_keys(
         selection, [{"staging_sample_ids": ["new-active-key"], "rows": []}]
     )
@@ -232,12 +249,20 @@ def test_restored_prefix_keys_must_not_be_live_when_training_begins() -> None:
         )
 
 
-@pytest.mark.parametrize("trained", [11, 13])
+@pytest.mark.parametrize(
+    ("trained", "match"),
+    [
+        (11, "does not start its closing call"),
+        (13, "does not end with its 12 generated tokens"),
+    ],
+    ids=["dropped", "duplicated"],
+)
 def test_prefix_completion_rejects_trained_row_that_dropped_or_duplicated_a_token(
-    trained: int,
+    trained: int, match: str
 ) -> None:
     # The worker's own total always equals prefix + tail; only the trained row
-    # can expose a dropped or duplicated token.
+    # can expose a dropped or duplicated token, which moves where counting back
+    # from the row's end puts the call.
     selection = {
         "cuts": [
             {
@@ -248,14 +273,33 @@ def test_prefix_completion_rejects_trained_row_that_dropped_or_duplicated_a_toke
             }
         ]
     }
-    log = (
-        "generation prefix completed: rollout_id=r model_call_id=continued "
-        "source_model_call_id=source-call prefix_tokens=5 tail_tokens=7 "
-        "total_generation_tokens=12"
+    log = _completion_log("source-call")
+
+    with pytest.raises(AssertionError, match=match):
+        _HELPER._assert_prefix_boundary(selection, log, _trained_records(trained))
+
+
+def test_prefix_completion_counts_back_past_positions_the_trainer_masked() -> None:
+    # Masked call positions, including the call's first token, must not be
+    # mistaken for the start of the call.
+    selection = {"cuts": [_cut("source-call", 0, 5) | {"group_id": "g"}]}
+
+    starts = _HELPER._assert_prefix_boundary(
+        selection,
+        _completion_log("source-call"),
+        _trained_records(12, masked=frozenset({0, 6})),
     )
 
-    with pytest.raises(AssertionError, match="trained=" + str(trained)):
-        _HELPER._assert_prefix_boundary(selection, log, _trained_records(trained))
+    assert starts == {("g", 0): 2}
+
+
+def test_prefix_completion_rejects_token_accounting_with_a_gap() -> None:
+    selection = {"cuts": [_cut("source-call", 0, 5) | {"group_id": "g"}]}
+
+    with pytest.raises(AssertionError, match="gap or overlap"):
+        _HELPER._assert_prefix_boundary(
+            selection, _completion_log("source-call", total=13), _trained_records(12)
+        )
 
 
 def test_reward_signal_rejects_constant_rewards() -> None:
@@ -331,6 +375,22 @@ def _diverged(
     cuts: list[dict[str, Any]],
     log: str,
 ) -> frozenset[tuple[int, int, int]]:
+    # Each restored call closes its recovery row, after the five tokens that
+    # _generated_row puts before the closing call.
+    for cut in cuts:
+        (row,) = [
+            row
+            for row in recovery_rows
+            if row["generation_index"] == cut["generation_index"]
+        ]
+        total = len(row["token_ids"]) - 5
+        prefix_tokens = cut["prefix_token_count"]
+        log += (
+            "generation prefix completed: rollout_id=r model_call_id=x "
+            f"source_model_call_id={cut['model_call_id']} "
+            f"prefix_tokens={prefix_tokens} tail_tokens={total - prefix_tokens} "
+            f"total_generation_tokens={total}\n"
+        )
     return _HELPER._rows_diverged_before_cut(
         {"cuts": cuts},
         log,
@@ -377,7 +437,7 @@ def test_restored_row_must_start_with_the_restored_tokens() -> None:
     baseline = [_generated_row(0, [0, 1, 2, 3, 4, 10, 11, 12])]
     recovery = [_generated_row(0, [0, 1, 2, 3, 4, 20, 99, 22])]
 
-    with pytest.raises(AssertionError, match="does not start with its 2 restored"):
+    with pytest.raises(AssertionError, match="with its 2 restored prefix tokens"):
         _diverged(
             baseline,
             recovery,
@@ -436,11 +496,7 @@ def test_every_restored_prefix_must_complete_exactly_once() -> None:
             {"model_call_id": "call-b", "prefix_token_count": 3},
         ]
     }
-    log = (
-        "generation prefix completed: rollout_id=r model_call_id=x "
-        "source_model_call_id=call-a prefix_tokens=5 tail_tokens=7 "
-        "total_generation_tokens=12"
-    )
+    log = _completion_log("call-a")
 
     with pytest.raises(AssertionError, match="call-b"):
         _HELPER._assert_prefix_boundary(selection, log, _trained_records(12))
