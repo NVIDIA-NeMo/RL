@@ -1248,7 +1248,7 @@ class TestSetup:
         tmp_path: Path,
         patched_factories,
     ):
-        mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc = _make_master_config(colocated=False, backend="vllm")
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -1267,7 +1267,7 @@ class TestSetup:
             }
         )
         mc.token_capture.enabled = True
-        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
@@ -1284,21 +1284,73 @@ class TestSetup:
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
                 "create_rollout_reassembler_actors",
                 return_value=fake_finalizers,
             ),
         ):
-            tokenizer = MagicMock(pad_token_id=0)
             actor_args, _ = setup_single_controller(
+                mc,
+                MagicMock(pad_token_id=0),
+            )
+
+        assert actor_args.finalizer_actors == fake_finalizers
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
+
+    def test_prefix_recovery_accepts_multimodal_capture(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer")],
+            ),
+        ):
+            tokenizer = MagicMock(pad_token_id=0)
+            setup_single_controller(
                 mc,
                 tokenizer,
                 processor=MagicMock(tokenizer=tokenizer),
             )
 
-        assert actor_args.finalizer_actors == fake_finalizers
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args

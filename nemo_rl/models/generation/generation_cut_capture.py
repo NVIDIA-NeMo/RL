@@ -49,7 +49,7 @@ class _RequestCaptureState:
     prompt_token_ids: list[int]
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
-    # generation-prefix row durably carries it across recovery.
+    # generation-prefix row carries its tensor digests across recovery.
     media: Any | None = None
     resumed_generation_token_ids: list[int] = field(default_factory=list)
     effective_output_limit: int | None = None
@@ -246,6 +246,17 @@ class GenerationCutCaptureMixin:
     _restored_generation_prefix_calls: int
     _restored_generation_prefix_tokens: int
 
+    def _generation_cut_record_payload(
+        self, state: _RequestCaptureState
+    ) -> dict[str, Any] | None:
+        """Return the backend's extras for a call's first generation-prefix row.
+
+        Text-only hosts have none; the vLLM worker overrides this with media
+        metadata.
+        """
+        del state
+        return None
+
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
             state = self._capture_calls.pop(id(request), None)
@@ -299,10 +310,9 @@ class GenerationCutCaptureMixin:
                 "_staging_source not initialized; call setup_token_capture() first"
             )
         staging_keys = list(continuation.staging_keys)
-        fetch = getattr(self._staging_source, "fetch_generation_cut", None)
-        if fetch is None:
-            fetch = self._staging_source.fetch
-        chunks = fetch(staging_keys)
+        # The finalization read also returns each row's extras, which carry a
+        # media call's spans and tensor digests; plain ``fetch`` does not.
+        chunks = self._staging_source.fetch_for_finalization(staging_keys)
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         if not chunks:
@@ -313,8 +323,8 @@ class GenerationCutCaptureMixin:
         self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
     ) -> Any:
         """Rebuild and verify the cumulative staged prefix from its fetched chunks."""
-        snapshots = [getattr(chunk, "snapshot", chunk) for chunk in chunks]
-        extras_by_chunk = [getattr(chunk, "extras", None) for chunk in chunks]
+        snapshots = [chunk.snapshot for chunk in chunks]
+        extras_by_chunk = [chunk.extras for chunk in chunks]
         if any(extras is not None for extras in extras_by_chunk[1:]):
             raise RuntimeError(
                 "only the first generation-cut chunk may carry call extras"
@@ -784,10 +794,7 @@ class GenerationCutCaptureMixin:
                 )
             staged_key = None
             try:
-                payload = getattr(self, "_generation_cut_record_payload", None)
-                extras, attachments = (
-                    payload(state) if payload is not None else (None, None)
-                )
+                extras = self._generation_cut_record_payload(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
@@ -809,12 +816,6 @@ class GenerationCutCaptureMixin:
                         chunk_record,
                         checkpoint_id=checkpoint_id,
                         chunk_sequence=chunk_sequence,
-                        # Only the call's first durable row owns its media.
-                        attachments=(
-                            attachments
-                            if not state.generation_cut_staging_keys
-                            else None
-                        ),
                     )
                     staged_key = result.staging_key
                     if not result.ok:
