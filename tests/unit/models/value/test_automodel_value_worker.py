@@ -198,6 +198,65 @@ def test_value_worker_init_rejects_cp_scoring_before_setup(monkeypatch):
     apply_transformer_engine_patch.assert_not_called()
 
 
+def test_value_worker_sets_seed_before_model_setup(monkeypatch):
+    from nemo_rl.distributed import numa_utils
+    from nemo_rl.models.value.workers import automodel_value_worker
+
+    class ModelSetupReached(RuntimeError):
+        pass
+
+    events = []
+    distributed_manager = MagicMock()
+    distributed_manager.device_mesh = {
+        "dp": MagicMock(),
+        "tp": MagicMock(),
+        "cp": MagicMock(),
+    }
+    distributed_manager.dp_size = 1
+    distributed_manager.tp_size = 1
+    distributed_manager.cp_size = 1
+
+    monkeypatch.setattr(
+        automodel_value_worker, "apply_transformer_engine_patch", lambda: None
+    )
+    monkeypatch.setattr(automodel_value_worker.ray, "get_gpu_ids", lambda: [0])
+    monkeypatch.setattr(numa_utils, "bind_to_gpu_numa", lambda _: None)
+    monkeypatch.setattr(automodel_value_worker, "init_telemetry_worker", lambda: None)
+    monkeypatch.setattr(
+        automodel_value_worker,
+        "validate_and_prepare_config",
+        lambda **_: MagicMock(),
+    )
+    monkeypatch.setattr(
+        automodel_value_worker,
+        "setup_distributed",
+        lambda **_: distributed_manager,
+    )
+    monkeypatch.setattr(automodel_value_worker.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        automodel_value_worker,
+        "set_seed",
+        lambda seed: events.append(("seed", seed)),
+    )
+
+    def stop_at_model_setup(*args, **kwargs):
+        events.append(("model_setup", None))
+        raise ModelSetupReached
+
+    monkeypatch.setattr(
+        automodel_value_worker, "build_checkpoint_config", stop_at_model_setup
+    )
+
+    with pytest.raises(ModelSetupReached):
+        automodel_value_worker.AutomodelValueWorkerImpl(
+            config=_create_value_test_config(model_name="unused"),
+            tokenizer=MagicMock(),
+            seed=123,
+        )
+
+    assert events == [("seed", 123), ("model_setup", None)]
+
+
 def _load_dcp_state(checkpoint_dir: Path, output_path: Path) -> dict[str, Any]:
     """Consolidate a small test DCP checkpoint into a logical state dict."""
     dcp_to_torch_save(checkpoint_dir, output_path)
