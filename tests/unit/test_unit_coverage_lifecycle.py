@@ -31,13 +31,15 @@ import pytest
 def test_session_coverage_after_collection(tmp_path: Path, mode: str) -> None:
     pytest.importorskip("pytest_cov")
     # Load the actual hooks, isolating only Ray/GPU setup from this subprocess.
+    # pytest_sessionfinish reads the shard options, so register them too.
     tree = ast.parse(Path(__file__).with_name("conftest.py").read_text())
     hooks = ast.Module(
         body=[
             node
             for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name in {"session_data", "pytest_sessionfinish"}
+            and node.name
+            in {"pytest_addoption", "session_data", "pytest_sessionfinish"}
         ],
         type_ignores=[],
     )
@@ -143,6 +145,7 @@ def test_session_finish_preserves_coverage_total(
     namespace = {
         "json": json,
         "os": os,
+        "pytest": pytest,
         "UNIT_RESULTS_FILE": str(result_path),
         "UNIT_RESULTS_FILE_DATED": str(tmp_path / "dated/results.json"),
     }
@@ -153,6 +156,7 @@ def test_session_finish_preserves_coverage_total(
     plugin = SimpleNamespace(cov_total=total)
     config = SimpleNamespace(
         _unit_test_data={"coverage": "[n/a]"},
+        getoption=lambda name: False,
         pluginmanager=SimpleNamespace(getplugin=lambda name: plugin),
     )
     namespace["pytest_sessionfinish"](SimpleNamespace(config=config), 0)
