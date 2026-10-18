@@ -1134,14 +1134,8 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    @pytest.mark.parametrize(
-        ("feature", "match"),
-        [
-            ("router_replay", "does not yet support router replay"),
-            ("multimodal", "does not yet support multimodal capture"),
-        ],
-    )
-    def test_prefix_recovery_rejects_unsupported_features(self, feature, match):
+    def test_prefix_recovery_rejects_router_replay(self):
+        # Multimodal capture is accepted: test_prefix_recovery_accepts_multimodal_capture.
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
@@ -1152,14 +1146,12 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        processor = None
-        if feature == "router_replay":
-            mc.policy["router_replay"] = {"enabled": True}
-        else:
-            processor = MagicMock()
+        mc.policy["router_replay"] = {"enabled": True}
 
-        with pytest.raises(NotImplementedError, match=match):
-            setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
+        with pytest.raises(
+            NotImplementedError, match="does not yet support router replay"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     @pytest.mark.parametrize(
         ("overrides", "error", "match"),
