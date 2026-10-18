@@ -3005,6 +3005,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
                     "role": "assistant",
                     "content": f"response_{i}",
                     "token_ids": torch.arange(length, dtype=torch.long),
+                    "generation_logprobs": torch.zeros(length, dtype=torch.float32),
                 },
             ]
         )
