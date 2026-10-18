@@ -23,35 +23,13 @@ from torch import nn
 
 from nemo_rl.algorithms.loss.dspark import (
     DSparkObjectiveStats,
+    _dtype_code,
     dspark_tiled_objective,
 )
 from nemo_rl.models.megatron.draft.dspark import (
     DSparkConfidenceHead,
     DSparkMarkovHead,
 )
-
-
-def _dtype_code(dtype: torch.dtype) -> int:
-    dtype_names = (
-        "bool",
-        "uint8",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "float16",
-        "bfloat16",
-        "float32",
-        "float64",
-    )
-    return next(
-        (
-            index
-            for index, name in enumerate(dtype_names)
-            if dtype == getattr(torch, name, None)
-        ),
-        -1,
-    )
 
 
 def _provider_tensor_descriptor(

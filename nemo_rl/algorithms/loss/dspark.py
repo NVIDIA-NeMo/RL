@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from nemo_rl.algorithms.loss.draft import (
+    _DTYPE_HEADER_CODES,
     _tile_distributions,
     _tile_log_normalizers,
 )
@@ -32,29 +33,9 @@ _VOCAB_GRADIENT_CHUNK_SIZE = 4096
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
-    dtype_names = (
-        "bool",
-        "uint8",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "float16",
-        "bfloat16",
-        "float32",
-        "float64",
-        "complex32",
-        "complex64",
-        "complex128",
-    )
-    return next(
-        (
-            index
-            for index, name in enumerate(dtype_names)
-            if dtype == getattr(torch, name, None)
-        ),
-        -1,
-    )
+    # Do not raise here: every TP rank must reach the agreement collective.
+    # The table covers every torch dtype, so distinct dtypes never share a code.
+    return _DTYPE_HEADER_CODES.get(dtype, -1)
 
 
 def _tensor_contract(tensor: torch.Tensor | None) -> list[int]:
