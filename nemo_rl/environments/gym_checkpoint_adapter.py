@@ -121,6 +121,10 @@ class GymCheckpointEpisode:
         return GymCheckpointEpisode(self.rollout_id, self.attempt + 1)
 
 
+# Gym's model participants report these in each prepare reply's ``counts``.
+GENERATION_CUT_COUNT_NAMES = ("cut", "cut_failed", "cut_skipped")
+
+
 @dataclass(frozen=True)
 class GymCheckpointPrepareSummary:
     """Serializable result of preparing one actor's Gym deployment.
@@ -132,9 +136,18 @@ class GymCheckpointPrepareSummary:
     prepared: bool
     blockers: dict[str, tuple[str, ...]]
     restarts: tuple[GymCheckpointEpisode, ...]
+    # Gym's per-checkpoint generation-cut outcome, summed over participants:
+    # calls cut, calls the worker could not cut, and calls never cut (their
+    # decoding is constrained). The last two regenerate after a restore.
+    generation_cut_counts: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_result(cls, result: PrepareResult) -> GymCheckpointPrepareSummary:
+        counts = {name: 0 for name in GENERATION_CUT_COUNT_NAMES}
+        for reply in result.replies.values():
+            reported = (reply.get("report") or {}).get("counts") or {}
+            for name in GENERATION_CUT_COUNT_NAMES:
+                counts[name] += int(reported.get(name, 0))
         return cls(
             prepared=result.prepared,
             blockers={
@@ -147,6 +160,7 @@ class GymCheckpointPrepareSummary:
                     for episode in result.restarts()
                 )
             ),
+            generation_cut_counts=counts,
         )
 
 

@@ -413,6 +413,34 @@ def test_a_rollout_gym_cannot_capture_is_reported_as_a_restart(tmp_path: Path) -
     asyncio.run(exercise())
 
 
+def test_prepare_summary_sums_gym_generation_cut_counts() -> None:
+    from nemo_gym._checkpoint.coordination import PrepareResult
+
+    def reply(counts: dict[str, int]) -> dict:
+        return {"phase": "prepared", "report": {"ready": True, "counts": counts}}
+
+    summary = GymCheckpointPrepareSummary.from_result(
+        PrepareResult(
+            prepared=True,
+            replies={
+                "policy_model": reply(
+                    {"inflight": 4, "cut": 2, "cut_failed": 1, "cut_skipped": 1}
+                ),
+                "judge_model": reply({"inflight": 1, "cut": 1}),
+                # Agents and environments report no cut counts.
+                "tools_agent": reply({"inflight": 4}),
+                "tools_env": {"phase": "prepared"},
+            },
+        )
+    )
+
+    assert summary.generation_cut_counts == {
+        "cut": 3,
+        "cut_failed": 1,
+        "cut_skipped": 1,
+    }
+
+
 def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) -> None:
     from nemo_gym._checkpoint import coordination
 

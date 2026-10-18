@@ -33,34 +33,16 @@ _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 
 
 @dataclass
-class _RequestCaptureBuffer:
-    """One append-only generation segment owned by an in-flight request."""
-
-    sequence: int
-    generated_token_ids: list[int] = field(default_factory=list)
-    generated_logprobs: list[float] = field(default_factory=list)
-
-
-@dataclass
-class _FrozenRequestCaptureBuffer:
-    """An active buffer detached for a checkpoint write."""
-
-    checkpoint_id: str
-    buffer: _RequestCaptureBuffer
-
-
-@dataclass
 class _RequestCaptureState:
-    """Append-only token buffers for one in-flight captured request.
+    """Append-only generated tokens for one in-flight captured request.
 
-    vLLM publishes delta progress. ``observe`` appends each delta to the current
-    active buffer exactly once. A checkpoint swaps the active buffer under
-    ``lock`` and performs its blocking TQ write after releasing the lock, so
-    later observations can continue in a fresh buffer.
+    ``observe`` appends each step's new tokens exactly once. A checkpoint
+    freezes the current length under ``lock`` and performs its blocking TQ
+    write after releasing it, so decoding keeps appending meanwhile.
 
-    Each successful cut stages only the detached buffer. The ordered TQ keys
-    remain in Gym lineage, while the sealed token arrays are retained locally
-    only to compute the cumulative digest advertised by the latest cut.
+    Each successful cut stages only the tokens past ``staged_token_count``.
+    The ordered TQ keys remain in Gym lineage; the full list is kept locally to
+    compute the cumulative digest advertised by the latest cut.
     """
 
     call: Any
@@ -75,82 +57,81 @@ class _RequestCaptureState:
     terminal_finish_reason: Literal["stop", "length"] | None = None
     terminal_stop_reason: str | int | None = None
     observation_error: str | None = None
+    # Set when the request's sampling settings would not carry across a cut,
+    # so the call regenerates after a restore instead of resuming its prefix.
+    uncuttable_reason: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     # Serializes lifecycle-changing TQ operations for this call. Token
     # observation deliberately uses ``lock`` instead so decoding can continue
     # while a detached generation chunk is staged.
     lifecycle_lock: threading.Lock = field(default_factory=threading.Lock)
     terminal_started: bool = False
-    sealed_generated_token_ids: list[int] = field(default_factory=list)
-    sealed_generated_logprobs: list[float] = field(default_factory=list)
+    generated_token_ids: list[int] = field(default_factory=list)
+    generated_logprobs: list[float] = field(default_factory=list)
+    # Tokens already written to TQ by sealed cuts.
+    staged_token_count: int = 0
     generation_cut_staging_keys: list[str] = field(default_factory=list)
-    active_buffer: _RequestCaptureBuffer = field(
-        default_factory=lambda: _RequestCaptureBuffer(sequence=0)
-    )
-    frozen_buffer: _FrozenRequestCaptureBuffer | None = None
-    observed_generation_token_count: int = 0
-    next_buffer_sequence: int = 1
+    # The cut in progress: its checkpoint and the token count it froze.
+    frozen_cut: tuple[str, int] | None = None
+    # Names each frozen chunk, so a rolled-back cut never reuses a TQ key.
+    next_chunk_sequence: int = 0
+
+    @property
+    def observed_generation_token_count(self) -> int:
+        return len(self.generated_token_ids)
 
     def observe(
         self,
         generated_token_ids: list[int],
         generated_logprobs: list[float],
     ) -> None:
-        """Append one immutable vLLM output delta."""
+        """Append the tokens one vLLM step added."""
         if len(generated_token_ids) != len(generated_logprobs):
             self.observation_error = (
                 "generated token IDs and log probabilities must have equal lengths"
             )
             return
-        self.active_buffer.generated_token_ids.extend(generated_token_ids)
-        self.active_buffer.generated_logprobs.extend(generated_logprobs)
-        self.observed_generation_token_count += len(generated_token_ids)
+        self.generated_token_ids.extend(generated_token_ids)
+        self.generated_logprobs.extend(generated_logprobs)
 
     def freeze_for_checkpoint(
         self, checkpoint_id: str
     ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
-        """Swap the active buffer and return its delta plus the stable prefix."""
-        if self.frozen_buffer is not None:
+        """Freeze the current length; return the unstaged chunk and the prefix."""
+        if self.frozen_cut is not None:
             raise RuntimeError(
                 "cannot start a generation cut while another cut is in progress"
             )
-        buffer = self.active_buffer
-        self.active_buffer = _RequestCaptureBuffer(sequence=self.next_buffer_sequence)
-        self.next_buffer_sequence += 1
-        self.frozen_buffer = _FrozenRequestCaptureBuffer(
-            checkpoint_id=checkpoint_id,
-            buffer=buffer,
-        )
+        frozen = len(self.generated_token_ids)
+        sequence = self.next_chunk_sequence
+        self.next_chunk_sequence += 1
+        self.frozen_cut = (checkpoint_id, frozen)
+        staged = self.staged_token_count
         return (
-            f"active/{checkpoint_id}/{buffer.sequence}",
-            buffer.sequence,
-            list(buffer.generated_token_ids),
-            list(buffer.generated_logprobs),
-            self.sealed_generated_token_ids + buffer.generated_token_ids,
-            self.sealed_generated_logprobs + buffer.generated_logprobs,
+            f"active/{checkpoint_id}/{sequence}",
+            sequence,
+            self.generated_token_ids[staged:frozen],
+            self.generated_logprobs[staged:frozen],
+            self.generated_token_ids[:frozen],
+            self.generated_logprobs[:frozen],
         )
 
-    def seal_frozen_buffer(self, checkpoint_id: str) -> None:
-        """Adopt a successfully staged frozen buffer into the live prefix."""
-        frozen = self._require_frozen_buffer(checkpoint_id)
-        self.sealed_generated_token_ids.extend(frozen.generated_token_ids)
-        self.sealed_generated_logprobs.extend(frozen.generated_logprobs)
-        self.frozen_buffer = None
+    def seal_frozen_cut(self, checkpoint_id: str) -> None:
+        """Count a successfully staged cut's tokens as written to TQ."""
+        self.staged_token_count = self._require_frozen_cut(checkpoint_id)
+        self.frozen_cut = None
 
-    def rollback_frozen_buffer(self, checkpoint_id: str) -> None:
-        """Restore a failed cut ahead of progress collected after its swap."""
-        frozen = self._require_frozen_buffer(checkpoint_id)
-        self.active_buffer.generated_token_ids[:0] = frozen.generated_token_ids
-        self.active_buffer.generated_logprobs[:0] = frozen.generated_logprobs
-        self.frozen_buffer = None
+    def rollback_frozen_cut(self, checkpoint_id: str) -> None:
+        """Abandon a failed cut; its tokens stay unstaged for the next one."""
+        self._require_frozen_cut(checkpoint_id)
+        self.frozen_cut = None
 
-    def _require_frozen_buffer(self, checkpoint_id: str) -> _RequestCaptureBuffer:
-        frozen = self.frozen_buffer
-        if frozen is None or frozen.checkpoint_id != checkpoint_id:
+    def _require_frozen_cut(self, checkpoint_id: str) -> int:
+        if self.frozen_cut is None or self.frozen_cut[0] != checkpoint_id:
             raise RuntimeError(
-                f"generation cut {checkpoint_id!r} does not own the frozen buffer"
+                f"generation cut {checkpoint_id!r} does not own the frozen cut"
             )
-        return frozen.buffer
+        return self.frozen_cut[1]
 
 
 @dataclass(frozen=True)
@@ -255,6 +236,8 @@ class GenerationCutCaptureMixin:
     _completed_capture_calls: dict[str, _CompletedCaptureState]
     _generation_cut_receipts: dict[tuple[str, str], Any]
     _generation_cut_tokenizer: Any
+    _restored_generation_prefix_calls: int
+    _restored_generation_prefix_tokens: int
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -393,39 +376,8 @@ class GenerationCutCaptureMixin:
             chain_hash=chain_hash,
             cumulative_hash=cumulative_hash,
         )
-        prefix_token_count = sum(mask == 1.0 for mask in token_mask_delta)
-        if prefix_token_count != continuation.prefix_token_count:
-            message = (
-                "generation-cut token count mismatch: "
-                f"expected={continuation.prefix_token_count} "
-                f"actual={prefix_token_count} "
-                f"source_capture_key={continuation.source_capture_key!r} "
-                f"source_model_call_id={continuation.source_model_call_id!r}"
-            )
-            LOGGER.error("%s", message)
-            raise RuntimeError(message)
-        if digest != continuation.prefix_digest:
-            parent_chain_hash_prefix = (
-                admission.parent_chain_hash[:12]
-                if admission.parent_chain_hash is not None
-                else None
-            )
-            message = (
-                "generation-cut digest mismatch: "
-                f"expected={continuation.prefix_digest} actual={digest} "
-                f"source_capture_key={continuation.source_capture_key!r} "
-                f"source_model_call_id={continuation.source_model_call_id!r} "
-                f"parent_call_id={admission.parent_call_id!r} "
-                f"mode={admission.mode!r} prev_len={admission.prev_len} "
-                f"delta_len={delta_len} cum_len={cum_len} "
-                f"weight_version={weight_version} "
-                f"schema_version={admission.schema_version} "
-                f"parent_chain_hash_prefix={parent_chain_hash_prefix!r} "
-                f"chain_hash_prefix={chain_hash[:12]!r} "
-                f"cumulative_hash_prefix={cumulative_hash[:12]!r}"
-            )
-            LOGGER.error("%s", message)
-            raise RuntimeError(message)
+        # Gym's begin_call checks this snapshot's digest and generated-token
+        # count against the admission before the call is served.
         snapshot = StagedCallBaseSnapshot(
             rollout_id=continuation.source_capture_key,
             model_call_id=continuation.source_model_call_id,
@@ -475,29 +427,50 @@ class GenerationCutCaptureMixin:
         continuation = admission.generation_cut
         if continuation is None:
             return None
-        # Class-qualified so a host that borrows this method alone (tests bind the
-        # worker's methods onto plain namespaces) needs nothing else.
-        snapshots = GenerationCutCaptureMixin._fetch_generation_cut_chunks(
-            self, continuation
-        )
-        return GenerationCutCaptureMixin._rebuild_generation_cut_snapshot(
-            self, admission, prefix_token_ids, snapshots
+        snapshots = self._fetch_generation_cut_chunks(continuation)
+        return self._rebuild_generation_cut_snapshot(
+            admission, prefix_token_ids, snapshots
         )
 
-    def _abort_request_capture(self, request: Any, *, reason: str) -> None:
-        """Drop the in-flight capture state for a request that errored."""
+    def get_generation_prefix_restore_counts(self) -> dict[str, int]:
+        """Calls resumed from a restored generation prefix since this process started.
+
+        Returns:
+            ``restored_calls`` and their total ``restored_prefix_tokens``.
+        """
+        with self._capture_registry_lock:
+            return {
+                "restored_calls": self._restored_generation_prefix_calls,
+                "restored_prefix_tokens": self._restored_generation_prefix_tokens,
+            }
+
+    def _abort_request_capture(
+        self, request: Any, *, reason: str, blocking: bool = True
+    ) -> bool:
+        """Drop the in-flight capture state for a request that errored.
+
+        A generation cut or a terminal write holds the call's lifecycle lock
+        across a TQ round trip. With ``blocking=False`` the abort does not wait
+        for it and returns False instead; it returns True once the call needs
+        no abort.
+        """
         state = self._get_request_capture(request)
         if state is None:
-            return
-        with state.lifecycle_lock:
-            if state.terminal_started:
-                return
-            state.terminal_started = True
-            popped = self._pop_request_capture(request)
-            if popped is not state or self.token_capture is None:
-                return
-            coords = self.token_capture.fail_call(state.call, reason=reason)
-            self._remember_completed_capture(state.call.model_call_id, coords, 0)
+            return True
+        if not state.lifecycle_lock.acquire(blocking=blocking):
+            return False
+        try:
+            if not state.terminal_started:
+                state.terminal_started = True
+                popped = self._pop_request_capture(request)
+                if popped is state and self.token_capture is not None:
+                    coords = self.token_capture.fail_call(state.call, reason=reason)
+                    self._remember_completed_capture(
+                        state.call.model_call_id, coords, 0
+                    )
+        finally:
+            state.lifecycle_lock.release()
+        return True
 
     async def _run_generation_cut_control(
         self,
@@ -516,15 +489,13 @@ class GenerationCutCaptureMixin:
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
-        from nemo_gym.token_id_capture.staging.records import staging_key
+        from nemo_gym.episode_types import EpisodeId
 
         with self._capture_registry_lock:
             completed = self._completed_capture_calls.get(prefix.model_call_id)
-        expected_capture_key = (
-            prefix.rollout_id
-            if prefix.attempt == 0
-            else f"{prefix.rollout_id}-a{prefix.attempt}"
-        )
+        expected_capture_key = EpisodeId(
+            rollout_id=prefix.rollout_id, attempt=prefix.attempt
+        ).capture_key
         if (
             completed is not None
             and completed.coords.rollout_id != expected_capture_key
@@ -551,41 +522,8 @@ class GenerationCutCaptureMixin:
                 terminal_finish_reason=completed.terminal_finish_reason,
                 terminal_stop_reason=completed.terminal_stop_reason,
             )
-        # The in-memory cache is only an optimization. Its durable canonical
-        # row remains authoritative if the race evidence aged out before a
-        # delayed checkpoint inventory arrived.
-        if completed is None and self._staging_source is not None:
-            canonical_key = staging_key(expected_capture_key, prefix.model_call_id)
-            try:
-                snapshots = self._staging_source.fetch([canonical_key])
-            except KeyError:
-                snapshots = []
-            if snapshots:
-                if len(snapshots) != 1:
-                    raise RuntimeError(
-                        "terminal completion lookup returned an unexpected row count"
-                    )
-                snapshot = snapshots[0]
-                if (
-                    snapshot.rollout_id != expected_capture_key
-                    or snapshot.model_call_id != prefix.model_call_id
-                ):
-                    raise RuntimeError(
-                        "generation-prefix inventory identity does not match the "
-                        f"durable terminal row: model_call_id={prefix.model_call_id!r}"
-                    )
-                # The canonical token row proves completion, but it predates
-                # the recovery contract's effective budget and finish reason.
-                # Without those fields we cannot reproduce the same terminal
-                # API result, so restart this attempt from its prior boundary.
-                LOGGER.warning(
-                    "terminal completion row lacks recovery metadata: model_call_id=%s",
-                    prefix.model_call_id,
-                )
-        return GenerationCutPrefixAck(
-            **prefix.model_dump(mode="json"),
-            disposition="durable_failure",
-        )
+        # Evidence for this completion aged out; restart it from its prior boundary.
+        return GenerationCutPrefixAck.failure(prefix)
 
     def _checkpoint_active_generation_cut(
         self,
@@ -597,6 +535,7 @@ class GenerationCutCaptureMixin:
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
+        from nemo_gym.episode_types import EpisodeId
 
         capture = self.token_capture
         sink = self._capture_sink
@@ -612,11 +551,9 @@ class GenerationCutCaptureMixin:
             if current is not state or state.terminal_started:
                 return None
 
-            expected_capture_key = (
-                prefix.rollout_id
-                if prefix.attempt == 0
-                else f"{prefix.rollout_id}-a{prefix.attempt}"
-            )
+            expected_capture_key = EpisodeId(
+                rollout_id=prefix.rollout_id, attempt=prefix.attempt
+            ).capture_key
             if state.call.rollout_id != expected_capture_key:
                 raise RuntimeError(
                     "generation-prefix inventory identity does not match the "
@@ -626,11 +563,12 @@ class GenerationCutCaptureMixin:
                 )
 
             with state.lock:
+                uncuttable_reason = state.uncuttable_reason
                 observation_error = state.observation_error
                 effective_output_limit = state.effective_output_limit
                 terminal_finish_reason = state.terminal_finish_reason
                 terminal_stop_reason = state.terminal_stop_reason
-                if observation_error is None:
+                if uncuttable_reason is None and observation_error is None:
                     (
                         frozen_buffer_id,
                         chunk_sequence,
@@ -639,6 +577,17 @@ class GenerationCutCaptureMixin:
                         generated_token_ids,
                         generated_logprobs,
                     ) = state.freeze_for_checkpoint(checkpoint_id)
+            if uncuttable_reason is not None:
+                # Expected for this request; the worker warned when it was set.
+                LOGGER.debug(
+                    "not cutting model call %s: %s",
+                    prefix.model_call_id,
+                    uncuttable_reason,
+                )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_failure",
+                )
             if observation_error is not None:
                 # A dropped delta leaves the buffer short of what vLLM decoded.
                 # Only this call regenerates; the rest of the inventory is cut.
@@ -667,7 +616,7 @@ class GenerationCutCaptureMixin:
                 )
             ):
                 with state.lock:
-                    state.rollback_frozen_buffer(checkpoint_id)
+                    state.rollback_frozen_cut(checkpoint_id)
                 return GenerationCutPrefixAck(
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
@@ -731,14 +680,14 @@ class GenerationCutCaptureMixin:
                     # Validate the complete acknowledgement before adopting the
                     # staged chunk. A failed acknowledgement must leave the
                     # frozen buffer available for rollback.
-                    state.seal_frozen_buffer(checkpoint_id)
+                    state.seal_frozen_cut(checkpoint_id)
                     if staged_key is not None:
                         state.generation_cut_staging_keys.append(staged_key)
             except Exception:
                 with state.lock:
-                    frozen = state.frozen_buffer
-                    if frozen is not None and frozen.checkpoint_id == checkpoint_id:
-                        state.rollback_frozen_buffer(checkpoint_id)
+                    frozen = state.frozen_cut
+                    if frozen is not None and frozen[0] == checkpoint_id:
+                        state.rollback_frozen_cut(checkpoint_id)
                 if staged_key is not None:
                     try:
                         sink.clear([staged_key])

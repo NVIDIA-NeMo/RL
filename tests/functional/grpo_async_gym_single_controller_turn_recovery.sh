@@ -163,7 +163,8 @@ PHASE1_PID=$!
 # Select only a fully published bootstrap (pre-step-1) snapshot whose Gym
 # manifest, RL ledger, Workplace resource export and TQ references all describe
 # the same episode.
-uv run --directory "$PROJECT_ROOT" --no-sync python - \
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \
     "$SELECTION_FILE" \
     "$PHASE1_PID" \
@@ -181,6 +182,10 @@ import uuid
 from pathlib import Path
 
 import torch
+from _gym_recovery_snapshot_helpers import (
+    ledger_episode_index,
+    participant_records,
+)
 
 root = Path(sys.argv[1])
 selection_path = Path(sys.argv[2])
@@ -194,47 +199,11 @@ if expected_gym_instances < 1:
     raise ValueError("expected Gym instance count must be positive")
 
 
-def ledger_episode_index(path: Path) -> dict[tuple[str, int], dict]:
-    state = torch.load(path, weights_only=True)
-    result = {}
-    for group in state["groups"]:
-        for sibling in group["siblings"]:
-            attempt = sibling["attempts"][-1]
-            generation_index = sibling["generation_index"]
-            rollout_id = (
-                f"{group['group_id']}_g{generation_index}_a"
-                f"{uuid.UUID(bytes=attempt['attempt_uuid']).hex}"
-            )
-            result[(rollout_id, attempt["gym_attempt"])] = {
-                "group_id": group["group_id"],
-                "generation_index": generation_index,
-                "target_step": group["target_step"],
-                "restore_level": group["restore_level"],
-                "status": attempt["status"],
-                "gym_instance_id": attempt["gym_instance_id"],
-            }
-    return result
-
-
 def sentinel_count(state: dict) -> int:
     """Count calendar rows the held turn wrote before the crash."""
     columns = state["calendar"]["_calendar_events"]["columns"]
     names = next(column["values"] for column in columns if column["name"] == "event_name")
     return sum(str(name).lower() == sentinel_event.lower() for name in names)
-
-
-def participant_records(snapshot: Path, kind: str) -> list[tuple[Path, dict]]:
-    records = []
-    pattern = f"gym-instances/*/replica-*/gym/{kind}/*/manifest.json"
-    for manifest_path in snapshot.glob(pattern):
-        manifest = json.loads(manifest_path.read_text())
-        if manifest.get("kind") != kind or manifest.get("record_count", 0) <= 0:
-            continue
-        records_path = manifest_path.parent / manifest["records_file"]
-        for line in records_path.read_text().splitlines():
-            if line:
-                records.append((manifest_path, json.loads(line)))
-    return records
 
 
 while time.monotonic() < deadline:
@@ -383,13 +352,16 @@ uv run --directory "$PROJECT_ROOT" --no-sync tests/check_metrics.py "$PHASE2_MET
     'max(data["train/finalize/invalid_row_rate"]) == 0' \
     'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
 
-uv run --directory "$PROJECT_ROOT" --no-sync python - \
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$SELECTION_FILE" "$PHASE1_EVENTS" "$PHASE2_EVENTS" "$PHASE2_LOG" \
     "$CHECKPOINT_DIR/step_$MAX_STEPS/training_info.json" "$MAX_STEPS" <<'PY'
 import json
 import re
 import sys
 from pathlib import Path
+
+from _gym_recovery_snapshot_helpers import matching_siblings
 
 selection = json.loads(Path(sys.argv[1]).read_text())
 phase1 = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines()]
@@ -399,22 +371,7 @@ training_info = json.loads(Path(sys.argv[5]).read_text())
 max_steps = int(sys.argv[6])
 
 
-def matching_siblings(events: list[dict], event_name: str) -> list[dict]:
-    found = []
-    for event in events:
-        if event["event"] != event_name or event["group_id"] != selection["group_id"]:
-            continue
-        siblings = event.get("siblings") or [event.get("sibling")]
-        found.extend(
-            sibling
-            for sibling in siblings
-            if sibling is not None
-            and sibling["gym_rollout_id"] == selection["gym_rollout_id"]
-        )
-    return found
-
-
-phase1_dispatch = matching_siblings(phase1, "dispatch")
+phase1_dispatch = matching_siblings(phase1, selection, "dispatch")
 assert phase1_dispatch, "selected Gym episode was not observed in phase-one dispatches"
 assert all(
     sibling["gym_instance_id"] == selection["gym_instance_id"]
@@ -432,16 +389,16 @@ assert {
     "gym_attempt": selection["gym_attempt"],
 } in restores[0]["episodes"], (selection, restores)
 
-phase2_dispatch = matching_siblings(phase2, "dispatch")
+phase2_dispatch = matching_siblings(phase2, selection, "dispatch")
 # A submission Gym refused at checkpoint admission never ran; it is re-sent.
-phase2_refused = matching_siblings(phase2, "refused")
+phase2_refused = matching_siblings(phase2, selection, "refused")
 assert len(phase2_dispatch) - len(phase2_refused) == 1, (phase2_dispatch, phase2_refused)
 restored = phase2_dispatch[-1]
 assert restored["gym_instance_id"] == selection["gym_instance_id"], restored
 assert restored["gym_attempt"] == selection["gym_attempt"] + 1, restored
 assert restored["generation_index"] == selection["generation_index"], restored
 
-phase2_completion = matching_siblings(phase2, "completion")
+phase2_completion = matching_siblings(phase2, selection, "completion")
 assert phase2_completion, "restored Gym episode never completed"
 assert any(
     sibling["gym_instance_id"] == selection["gym_instance_id"]
