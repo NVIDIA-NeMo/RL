@@ -577,6 +577,38 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     )
 
 
+@pytest.mark.parametrize(
+    ("draft_tensor", "message"),
+    [
+        (torch.empty(2, 3), None),
+        (torch.empty(3, 2), "changed after prepare"),
+        (torch.empty(2, 3, dtype=torch.float16), "changed after prepare"),
+    ],
+)
+def test_draft_refit_metadata_drift_compares_prepared_misc_meta(
+    draft_tensor: torch.Tensor, message: Optional[str]
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.nccl_reshard_refit_info = {
+        "misc_meta": {"draft.fc.weight": {"shape": [2, 3], "dtype": str(torch.float32)}}
+    }
+
+    error = worker._draft_refit_metadata_drift((("draft.fc.weight", draft_tensor),))
+    if message is None:
+        assert error is None
+    else:
+        assert message in str(error)
+
+    unknown = worker._draft_refit_metadata_drift(
+        (("draft.unknown.weight", torch.empty(1)),)
+    )
+    assert "is not in the prepared refit metadata" in str(unknown)
+
+
 def test_refit_destination_uses_common_worker_interface(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

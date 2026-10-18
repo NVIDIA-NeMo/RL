@@ -4568,8 +4568,33 @@ class MegatronPolicyWorkerImpl(
             )
         return result
 
+    def _draft_refit_metadata_drift(
+        self, draft_weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Exception | None:
+        """Compare draft weights with the misc metadata sent at prepare time."""
+        # The consumer sizes its buffers from misc_meta, so drift must fail
+        # through the preflight token, not as a mismatched packed broadcast.
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        for name, tensor in draft_weights:
+            meta = misc_meta.get(name)
+            if meta is None:
+                return RuntimeError(
+                    f"draft refit weight {name!r} is not in the prepared refit metadata"
+                )
+            if list(meta["shape"]) != list(tensor.shape) or meta["dtype"] != str(
+                tensor.dtype
+            ):
+                return RuntimeError(
+                    f"draft refit weight {name!r} changed after prepare: "
+                    f"expected shape={list(meta['shape'])} dtype={meta['dtype']}, "
+                    f"got shape={list(tensor.shape)} dtype={tensor.dtype}"
+                )
+        return None
+
     def _nccl_reshard_refit(self, kv_scales=None, refit_timeout_s=None):
         draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
+        if preflight_error is None:
+            preflight_error = self._draft_refit_metadata_drift(draft_weights)
         packed_broadcast_preflight_producer(
             self.model_update_group,
             0,
