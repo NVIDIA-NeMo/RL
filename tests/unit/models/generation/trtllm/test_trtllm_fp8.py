@@ -468,6 +468,8 @@ def test_pattern_mode_quantizes_what_the_engine_holds_as_fp8(tmp_path, kind, is_
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 
+    if is_mx and kind == "moe" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("TRT-LLM MXFP8 MoE needs SM100+")
     quantization_config = build_quant_config(is_mx, ["*lm_head*"])
     (tmp_path / "config.json").write_text(
         json.dumps(_config(kind, quantization_config))
