@@ -136,6 +136,36 @@ def test_prepare_nccl_reshard_refit_info_builds_draft_manifest(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_prepare_refit_info_rejects_trtllm_draft_before_first_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: object(),
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    monkeypatch.setattr(ext, "_uses_unquantized_flashinfer_trtllm", lambda: True)
+    monkeypatch.setattr(ext, "_mtp_drafter_refit_enabled", lambda: False)
+
+    with pytest.raises(RuntimeError, match="does not yet support a co-trained draft"):
+        ext.prepare_refit_info(
+            {
+                "model.weight": ((2,), torch.float32),
+                "draft.model.weight": ((2,), torch.float32),
+            }
+        )
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
 def test_common_speculator_refit_drops_tied_alias_then_finalizes_target_and_draft(
     monkeypatch, speculator_type
@@ -234,7 +264,7 @@ def test_common_speculator_refit_drops_tied_alias_then_finalizes_target_and_draf
 
 
 @pytest.mark.vllm
-def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
+def test_partial_refit_failure_is_recovered_by_next_refit(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -249,18 +279,22 @@ def test_partial_refit_failure_makes_worker_fail_closed(monkeypatch):
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
     )
+    process_weights = MagicMock(side_effect=[RuntimeError("conversion failed"), None])
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        MagicMock(side_effect=RuntimeError("conversion failed")),
+        process_weights,
     )
 
     with pytest.raises(RuntimeError, match="conversion failed"):
         with ext._weight_update_lifecycle("collective") as finalize:
             finalize()
+    assert "conversion failed" in ext._refit_unusable_reason
 
-    with pytest.raises(RuntimeError, match="unusable after a partial refit"):
-        with ext._weight_update_lifecycle("collective"):
-            pass
+    # Refit recovery retries on the same actor; a complete refit clears the mark.
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+    assert ext._refit_unusable_reason is None
+    assert process_weights.call_count == 2
 
 
 @pytest.mark.vllm
@@ -297,13 +331,19 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     )
 
     # A failure inside the bulk receive must not propagate (nonfatal contract,
-    # matching ipc/collective) but must poison the worker.
+    # matching ipc/collective) but must mark the worker as holding partial weights.
     assert ext.nccl_reshard_refit() is False
     assert ext._refit_unusable_reason is not None
     assert "bulk receive failed" in ext._refit_unusable_reason
 
-    # Poisoned worker never reports success again.
+    # A retry that fails again keeps the mark and still reports failure.
     assert ext.nccl_reshard_refit() is False
+    assert "bulk receive failed" in ext._refit_unusable_reason
+
+    # Paths that cannot recover in place keep the fatal contract.
+    monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: True)
+    with pytest.raises(RuntimeError, match="^bulk receive failed$"):
+        ext.nccl_reshard_refit()
 
 
 @pytest.mark.vllm
@@ -339,7 +379,7 @@ def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch)
 
 
 @pytest.mark.vllm
-def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
+def test_fp8_kv_postprocess_failure_is_recovered_by_next_refit(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
@@ -365,10 +405,12 @@ def test_fp8_kv_postprocess_failure_makes_worker_fail_closed(monkeypatch):
     with pytest.raises(RuntimeError, match="KV scale conversion failed"):
         with ext._weight_update_lifecycle("collective") as finalize:
             finalize()
+    assert "KV scale conversion failed" in ext._refit_unusable_reason
 
-    with pytest.raises(RuntimeError, match="unusable after a partial refit"):
-        with ext._weight_update_lifecycle("collective"):
-            pass
+    ext._maybe_process_fp8_kv_cache = MagicMock()
+    with ext._weight_update_lifecycle("collective") as finalize:
+        finalize()
+    assert ext._refit_unusable_reason is None
 
 
 @pytest.mark.vllm

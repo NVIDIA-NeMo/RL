@@ -407,6 +407,9 @@ def test_cp2_non_owner_payload_failure_reaches_every_lane_rank(
 
 
 class _EmptyBridge:
+    def get_conversion_tasks(self, *_args: object, **_kwargs: object) -> list[object]:
+        return []
+
     def export_hf_weights(self, *_args: object, **_kwargs: object):
         return iter(())
 
@@ -703,7 +706,7 @@ def _run_cp_lane_manifest_mismatch(rank: int, world_size: int) -> None:
     worker = _draft_refit_worker(draft_model=draft_model)
     worker._calculate_refit_param_info = lambda: []
 
-    class _MetadataBridge:
+    class _MetadataBridge(_EmptyBridge):
         def export_hf_weights(self, *_args: object, **_kwargs: object):
             return iter(
                 [

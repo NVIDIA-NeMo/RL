@@ -25,9 +25,11 @@ import torch
 import zmq
 
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     IPCProtocol,
     aggregate_per_sample_handles,
     calculate_aligned_size,
+    enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
@@ -235,12 +237,9 @@ def test_stream_weights_collects_oversized_ipc_handle_before_empty_cache(
         worker_name="test_worker",
     )
 
-    assert events == [
-        "ipc_collect",
-        "empty_cache",
-        "ipc_collect",
-        "empty_cache",
-    ]
+    # An oversized-only stream never allocates the regular staging pair, so
+    # only the oversized transfer releases CUDA IPC storage.
+    assert events == ["ipc_collect", "empty_cache"]
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
@@ -672,3 +671,29 @@ class TestEnsureTeacherIpcBuffer:
         assert s2 is s and h2 is h
         s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
         assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+def test_enable_deterministic_algorithms_sets_torch_flags():
+    prev = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    try:
+        enable_deterministic_algorithms()
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.is_deterministic_algorithms_warn_only_enabled()
+        assert torch.backends.cudnn.deterministic
+        assert not torch.backends.cudnn.benchmark
+    finally:
+        torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
+        torch.backends.cudnn.deterministic = prev[2]
+        torch.backends.cudnn.benchmark = prev[3]
+
+
+def test_deterministic_env_vars_pin_cublas_and_transformer_engine():
+    assert DETERMINISTIC_ENV_VARS == {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    }
