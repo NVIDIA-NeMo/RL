@@ -28,6 +28,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from types import SimpleNamespace
@@ -54,12 +55,15 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 )
 
 from nemo_rl.data.captured_media import (  # noqa: E402
+    MEDIA_TENSOR_DIGESTS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
     MediaColumnSpec,
+    media_tensor_digests,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
+    FetchedStagedCall,
     StagedPrefix,
 )
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
@@ -723,9 +727,19 @@ class _MemoryPrefixSource:
             expanded=[token for key in staging_keys for token in self.deltas[key]]
         )
 
-    def fetch(self, staging_keys: list[str]) -> list[StagedCallRecord]:
+    def fetch_for_finalization(
+        self, staging_keys: list[str]
+    ) -> list[FetchedStagedCall]:
         self.calls.append(list(staging_keys))
-        return [self.records[key] for key in staging_keys]
+        return [
+            FetchedStagedCall(
+                staging_key=key,
+                snapshot=self.records[key],
+                routed_len=0,
+                extras=self.records[key].extras,
+            )
+            for key in staging_keys
+        ]
 
 
 def _served_content(gen_ids, logprobs):
@@ -1096,6 +1110,11 @@ def test_uncuttable_sampling_settings_warn_once_per_reason(monkeypatch, caplog):
 
 
 def _captured_image_media() -> CapturedMedia:
+    tensors = {
+        "imgs": torch.ones(1, 2, 3),
+        "imgs_sizes": torch.tensor([[1, 2]], dtype=torch.int32),
+    }
+    # As _capture_request_media returns it when prefix cuts are enabled.
     return CapturedMedia(
         items=(
             CapturedMediaItem(
@@ -1110,10 +1129,8 @@ def _captured_image_media() -> CapturedMedia:
                 imgs_sizes=((1, 2),),
             ),
         ),
-        tensors={
-            "imgs": torch.ones(1, 2, 3),
-            "imgs_sizes": torch.tensor([[1, 2]], dtype=torch.int32),
-        },
+        tensors=tensors,
+        tensor_digests=media_tensor_digests(tensors),
     )
 
 
@@ -1157,7 +1174,7 @@ def _worker_with_active_media_prefix(sink: _MemorySink):
     return worker, request, state, media
 
 
-def test_generation_cut_stages_media_only_with_first_prefix_row():
+def test_generation_cut_stages_media_digests_only_with_first_prefix_row():
     sink = _MemorySink()
     worker, _, state, media = _worker_with_active_media_prefix(sink)
 
@@ -1170,9 +1187,13 @@ def test_generation_cut_stages_media_only_with_first_prefix_row():
     )
 
     first, second = [record for _, record in sink.generation_prefix_records]
-    assert first.extras == {"media_spans": [media.items[0].to_dict()]}
+    assert first.extras == {
+        "media_spans": [media.items[0].to_dict()],
+        MEDIA_TENSOR_DIGESTS_FIELD: media.tensor_digests,
+    }
     assert second.extras is None
-    assert sink.generation_prefix_attachments == [media.tensors, None]
+    # Prefix rows never hold pixels; only the terminal row stages them.
+    assert sink.generation_prefix_attachments == [None, None]
     assert second_receipt.prefixes[0].staging_keys == (
         *first_receipt.prefixes[0].staging_keys,
         sink.generation_prefix_keys[-1],
@@ -1181,6 +1202,20 @@ def test_generation_cut_stages_media_only_with_first_prefix_row():
         second_receipt.prefixes[0].staging_keys
     )
     assert not sink.cleared_generation_prefix_keys
+
+
+def test_generation_cut_refuses_media_captured_without_digests():
+    sink = _MemorySink()
+    worker, _, state, _ = _worker_with_active_media_prefix(sink)
+    state.media = replace(state.media, tensor_digests=None)
+
+    with pytest.raises(RuntimeError, match="without tensor digests"):
+        worker._checkpoint_generation_cut(
+            _single_generation_cut_inventory("checkpoint-1")
+        )
+
+    assert not sink.generation_prefix_records
+    assert state.frozen_cut is None
 
 
 class _BlockingPrefixSink(_MemorySink):
@@ -1225,7 +1260,7 @@ def test_media_terminal_completion_waits_for_prefix_cut_then_replaces_it():
 
     assert receipt.prefixes[0].disposition == "durable_prefix"
     assert content["ng_commit_coords"]["disposition"] == "staged"
-    assert sink.generation_prefix_attachments[0] is media.tensors
+    assert sink.generation_prefix_attachments == [None]
     assert sink.attachments[0] is media.tensors
     assert sink.cleared_generation_prefix_keys == list(receipt.prefixes[0].staging_keys)
 
