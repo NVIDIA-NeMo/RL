@@ -1435,6 +1435,11 @@ class TestSetup:
                 "defer_routed_experts_to_policy requires",
             ),
             (
+                "deferred_routes_on_automodel_policy",
+                NotImplementedError,
+                "only wired for the Megatron",
+            ),
+            (
                 "prompt_group_recovery_without_capture",
                 ValueError,
                 "non-default rollout_recovery policies require",
@@ -1470,6 +1475,10 @@ class TestSetup:
             mc.async_rl.max_buffered_rollouts = 7
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
+            mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "deferred_routes_on_automodel_policy":
+            mc = _make_master_config()
+            mc.token_capture.enabled = True
             mc.token_capture.defer_routed_experts_to_policy = True
         elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(

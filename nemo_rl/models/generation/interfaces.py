@@ -14,7 +14,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -22,12 +22,6 @@ from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
-
-# The universal contract is hf_export: the source exports an HF-named,
-# backend-independent representation that each destination converts locally.
-# logical_weights is a Megatron-to-Megatron exception, read only by the Megatron
-# policy worker; new backends should not inherit that coupling implicitly.
-RefitPayloadMode = Literal["hf_export", "logical_weights"]
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -625,10 +619,6 @@ class GenerationInterface(ABC):
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
         return None
-
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Return the backend's required representation for transferred weights."""
-        return "hf_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""

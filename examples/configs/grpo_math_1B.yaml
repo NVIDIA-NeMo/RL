@@ -269,6 +269,9 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).

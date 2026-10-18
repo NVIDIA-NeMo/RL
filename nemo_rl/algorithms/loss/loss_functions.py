@@ -396,10 +396,11 @@ class ClippedPGLossFn(LossFunction):
                 "use_cispo is incompatible with disable_ppo_ratio; "
                 "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
             )
-            assert not self.force_on_policy_ratio, (
-                "use_cispo is incompatible with force_on_policy_ratio; "
-                "forcing ratio=1 removes the clipped IS-weight that CISPO optimizes"
-            )
+            if self.force_on_policy_ratio:
+                assert (
+                    self.use_importance_sampling_correction
+                    and self.truncated_importance_sampling_type == "tis"
+                ), "CISPO with force_on_policy_ratio requires IS correction with TIS"
             assert not self.sequence_level_importance_ratios, (
                 "use_cispo is incompatible with sequence_level_importance_ratios; "
                 "CISPO uses token-level importance weights"

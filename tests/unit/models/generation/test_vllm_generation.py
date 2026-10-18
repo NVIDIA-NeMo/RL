@@ -2443,7 +2443,7 @@ async def test_vllm_policy_generation_async(
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -2544,7 +2544,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     automodel_config = basic_automodel_test_config
     lm_policy = Policy(cluster, automodel_config, tokenizer)
 
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2869,7 +2869,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Prepare refit info
     print("Preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -2958,7 +2958,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -3617,7 +3617,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
@@ -3730,7 +3730,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -3804,7 +3804,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -3943,7 +3943,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -4066,9 +4066,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -4230,9 +4228,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -4358,7 +4354,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = megatron_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = megatron_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("Refitting vLLM policy with Megatron...")
@@ -4474,9 +4470,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
@@ -4542,9 +4536,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation = VllmGeneration(cluster, vllm_config)
 
         # prepare refit info
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
