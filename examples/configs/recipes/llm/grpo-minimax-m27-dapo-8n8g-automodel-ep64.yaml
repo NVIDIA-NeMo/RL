@@ -39,10 +39,17 @@ policy:
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
       lr: 2.0e-06
       weight_decay: 0.1
-      foreach: false
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      # Keep the second moment in fp32: with beta2=0.999 the per-step decay (0.1%) is
+      # below half a bf16 ulp, so a bf16 exp_avg_sq never decays and shrinks the
+      # effective LR as gradients get smaller.
+      exp_avg_sq_dtype: torch.float32
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
