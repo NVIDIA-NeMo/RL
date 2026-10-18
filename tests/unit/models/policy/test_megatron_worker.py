@@ -2478,6 +2478,9 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
     class _PrequantCheckpointWorker(MegatronCheckpointEngineSendMixin):
         enable_refit_prequantize = MegatronPolicyWorkerImpl.enable_refit_prequantize
         _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
+        _generation_needs_logical_weights = (
+            MegatronPolicyWorkerImpl._generation_needs_logical_weights
+        )
         _iter_params_with_optional_kv_scales = (
             MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
         )
