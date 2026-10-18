@@ -1,20 +1,7 @@
 ---
 name: review-pr-team
-description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting.
-when_to_use: Deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1.
-argument-hint: "<pr-number>"
-allowed-tools:
-  - AskUserQuestion
-  - Bash
-  - Read
-  - Glob
-  - Grep
-  - Agent
-  - TaskCreate
-  - TaskList
-  - TaskGet
-  - TaskUpdate
-  - SendMessage
+description: Agent-team-based parallel code review for NVIDIA-NeMo/RL pull requests. Spawns specialized agents (RL expert, submodule experts, bug finder, design reviewer, test agent, devil's advocate, comment reviewer) that coordinate via shared task list and direct messaging. Leader orchestrates, collates ALL findings, and presents to user for approval before posting. Use for deep multi-agent review of a PR; '/review-pr-team <number>'; 'team review PR', 'thorough parallel review'. Takes the pull-request number as its argument.
+allowed-tools: AskUserQuestion Bash Read Glob Grep Agent TaskCreate TaskList TaskGet TaskUpdate SendMessage
 ---
 
 # Agent Team PR Review — NVIDIA-NeMo/RL
