@@ -32,7 +32,6 @@ SELECTION_FILE=$TEST_DIR/selected-snapshot.json
 SELECTED_BACKUP=$TEST_DIR/selected-snapshot
 TEST_DATA=$TEST_DIR/test-data.jsonl
 GYM_ROOT=$PROJECT_ROOT/3rdparty/Gym-workspace/Gym
-PHASE1_PID=""
 SENTINEL_EVENT="NeMo RL prefix recovery parity sentinel"
 
 # Cuttable Workplace prompts per step, one per list length.
@@ -105,36 +104,8 @@ WORKPLACE_PREFIX_ENV=(
     NEMO_GYM_TEST_WORKPLACE_PREFIX_AFTER_MUTATION=1
 )
 
-stop_phase1() {
-    if [[ -z "$PHASE1_PID" ]]; then
-        return
-    fi
-    kill -KILL -- "-$PHASE1_PID" 2>/dev/null || true
-    wait "$PHASE1_PID" 2>/dev/null || true
-    PHASE1_PID=""
-    # Ray actors outlive the driver until their raylet notices the crash. Do
-    # not start phase two while the old controller can still write snapshots.
-    local deadline=$((SECONDS + 120))
-    while pgrep -f "^ray::SingleControllerActor" >/dev/null; do
-        if ((SECONDS >= deadline)); then
-            echo "[ERROR] phase-one SingleControllerActor outlived its driver"
-            return 1
-        fi
-        sleep 1
-    done
-}
-
-cleanup() {
-    local status=$?
-    stop_phase1
-    if [[ "$status" -eq 0 && "${SC_PREFIX_RECOVERY_KEEP_CHECKPOINTS:-0}" != "1" ]]; then
-        rm -rf "$CHECKPOINT_DIR" "$BASELINE_CHECKPOINT_DIR" "$SELECTED_BACKUP"
-    else
-        echo "Preserving prefix-recovery artifacts for inspection: $TEST_DIR"
-    fi
-    return "$status"
-}
-trap cleanup EXIT
+source "$SCRIPT_DIR/_gym_prefix_recovery_phases.sh"
+install_phase_cleanup "$CHECKPOINT_DIR" "$BASELINE_CHECKPOINT_DIR" "$SELECTED_BACKUP"
 
 COMMON_OVERRIDES=(
     policy.model_name="$MODEL_NAME"
