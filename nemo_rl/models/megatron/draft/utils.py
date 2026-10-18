@@ -1009,7 +1009,7 @@ def broadcast_draft_weights_from_pp_owner(
         specs_by_dtype.setdefault(spec.dtype, []).append(spec)
 
     buckets: list[tuple[list[DraftRefitTensorSpec], Tensor]] = []
-    payload_ready = 0
+    payload_failed = 0
     try:
         for dtype_specs in specs_by_dtype.values():
             if global_rank == lane.owner_global_rank:
@@ -1031,11 +1031,13 @@ def broadcast_draft_weights_from_pp_owner(
                     device=bucket_device,
                 )
             buckets.append((dtype_specs, bucket))
-    except (KeyError, RuntimeError, TypeError, ValueError):
-        payload_ready = 1
+    except Exception:
+        # Any local failure must reach the PP consensus below. A rank that
+        # leaves early would hang its peers in the PP all_reduce.
+        payload_failed = 1
 
     readiness_minimum, readiness_maximum = _reduce_lane_consensus(
-        [payload_ready, len(buckets), digest],
+        [payload_failed, len(buckets), digest],
         pp_group=pp_group,
         device=device,
     )
