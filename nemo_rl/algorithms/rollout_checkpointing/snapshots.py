@@ -748,11 +748,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
             restarted_rollouts = 0
+            environment_metrics: dict[str, float] = {}
             if environment_snapshot is not None:
                 restarted_rollouts = environment_snapshot.restarted_rollouts
-                checkpoint_metrics.update(
-                    environment_snapshot.metrics(environment_paused_seconds)
+                environment_metrics = environment_snapshot.metrics(
+                    environment_paused_seconds
                 )
+                checkpoint_metrics.update(environment_metrics)
                 _warn_if_environment_paused_past_interval(
                     environment_paused_seconds,
                     self._master_config.rollout_checkpointing.snapshot_attempt_interval_s,
@@ -770,7 +772,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 f"restarted_rollouts={restarted_rollouts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
-                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
+                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f}"
+                # The environment's own figures, e.g. a prefix cut's fence hold.
+                + "".join(
+                    f", {name}={value:.2f}"
+                    for name, value in environment_metrics.items()
+                )
+                + ")",
                 flush=True,
             )
             return RolloutCheckpointSaveResult(saved=True, reason="completed")

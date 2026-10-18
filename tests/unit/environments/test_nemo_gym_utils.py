@@ -1219,11 +1219,11 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         enable_router_replay=False,
         use_fastokens=False,
         turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
             "control_auth_token": "secret",
-            "generation_prefix_cuts_enabled": True,
         },
     )
 
@@ -1231,6 +1231,54 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         "responses_api_models"
     ]["vllm_model"]
     assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
+
+
+@pytest.mark.nemo_gym
+def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
+    """Gym accepts unknown config keys, so a renamed field would silently turn cuts off."""
+    # Deferred: Gym's model servers ship with the optional nemo_gym extra.
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert set(model) - set(VLLMModelConfig.model_fields) == set()
+    checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
+    assert set(model["checkpoint"]) == {"policy", "generation_cuts"}
+    assert set(model["checkpoint"]) <= set(checkpoint_config.model_fields)
+
+
+def test_generation_prefix_cuts_require_turn_checkpointing(detected_uv_dirs):
+    with pytest.raises(ValueError, match="require Gym turn checkpointing"):
+        build_nemo_gym_config(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=True,
+            token_capture={
+                "enabled": True,
+                "capture_dir": "/capture",
+                "control_auth_token": "secret",
+            },
+        )
 
 
 def test_checkpointing_requires_token_capture(detected_uv_dirs):
