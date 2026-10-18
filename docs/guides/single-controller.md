@@ -115,6 +115,7 @@ reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
   penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
   token_ids:
     unwanted: [12345]  # Replace with IDs from your model's tokenizer.
 env:
@@ -134,6 +135,12 @@ checked across all selected generated spans, including terminal tokens; prompt,
 tool, and abandoned-branch tokens do not count. The final-function-call exception
 for empty answers is preserved. Token IDs, logprobs, and training masks keep their
 existing behavior.
+
+The malformed think-tag check runs on each generated span. When each tag is a single
+token, the tag counts must match the thinking mode set by the prompt; the decoded text
+must also contain no open tag and at most one close tag. Gym's message-level
+`has_malformed_thinking` flag is not used with capture. Non-finite generation logprobs
+are rejected at staging, and the rollout is masked as `capture_poisoned`.
 
 Both paths share the classification, text checks, token membership check, and
 shaping formula. For low-effort prompts:
@@ -166,8 +173,8 @@ reward substituted after shaping and penalties. This retains one reward
 observation per valid row, plus optional table data, in pending checkpoint state.
 Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
 measures the shaped reward before penalties. Pending statistics survive recovery
-and are consumed once. Malformed-thinking penalties and message-level advantage
-overrides remain unsupported with capture and fail at setup.
+and are consumed once. Message-level advantage overrides remain unsupported with
+capture and fail at setup.
 
 ## Checkpointing and Replay Recovery
 

@@ -1588,6 +1588,60 @@ def test_penalties_use_only_verified_selected_generations(
         assert row.penalty_counts["unwanted_token"] == int(expected_reward == 0.0)
 
 
+class _TagTokenizer:
+    """Decodes every generation to ``text``; records what it was asked to decode."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.decoded: list[list[int]] = []
+
+    def decode(self, token_ids, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens is False
+        self.decoded.append(list(token_ids))
+        return self.text
+
+
+@pytest.mark.parametrize(
+    "decoded_text,expected_reward", [("plain answer", -2.0), ("<think>", 0.0)]
+)
+def test_malformed_think_tag_penalty_decodes_each_generation(
+    tq_client, partitions, decoded_text, expected_reward
+):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+
+    receipt, expected = _stage_fixture(tq_client, "worked_example", rollout_id="r")
+    tokenizer = _TagTokenizer(decoded_text)
+    finalizer = _finalizer(
+        tq_client,
+        reward_penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        tokenizer=tokenizer,
+        thinking_tags=("<think>", "</think>"),
+    )
+    row = finalizer.finalize_rollout("r", receipt, reward=-2.0)
+    assert row.valid, row.rejection_reason
+    assert row.reward == expected_reward
+    assert row.penalty_counts["malformed_think_tag"] == int(expected_reward == 0.0)
+    # Only generated spans are decoded, never the carried prompt tokens.
+    generated = {
+        token for token, mask in zip(expected.token_ids, expected.token_mask) if mask
+    }
+    assert tokenizer.decoded
+    assert all(set(ids) <= generated for ids in tokenizer.decoded)
+
+
+def test_malformed_think_tag_penalty_requires_a_tokenizer(tq_client, partitions):
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+
+    with pytest.raises(ValueError, match="requires a tokenizer"):
+        _finalizer(
+            tq_client,
+            reward_penalty_config=RewardPenaltyConfig(
+                penalize_malformed_think_tag=True
+            ),
+            thinking_tags=("<think>", "</think>"),
+        )
+
+
 def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     tq_client, partitions
 ):

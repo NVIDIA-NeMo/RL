@@ -2234,6 +2234,15 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                tokenizer_config=(
+                    policy_config["tokenizer"]
+                    if master_config.reward_penalties.penalize_malformed_think_tag
+                    else None
+                ),
+                # Set by the resolver only when the think-tag penalty is on.
+                thinking_tags=(resolved_reward_penalty_config or {}).get(
+                    "thinking_tags"
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

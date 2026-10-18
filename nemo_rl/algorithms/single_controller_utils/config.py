@@ -1630,13 +1630,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         )
     if (
         token_capture_config.enabled
-        and master_config.reward_penalties.penalize_malformed_think_tag
-    ):
-        raise ValueError(
-            "token_capture.enabled does not support reward_penalties.penalize_malformed_think_tag"
-        )
-    if (
-        token_capture_config.enabled
         and async_config.rollout_failure.max_skipped_prompts
     ):
         warnings.warn(

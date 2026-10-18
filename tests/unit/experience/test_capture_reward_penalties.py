@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Capture reward parity with the standard path, without token decoding."""
+"""Capture reward parity with the standard path (think-tag checks use a stub decoder)."""
 
 import json
 from itertools import product
 
 import pytest
+import torch
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.experience.reward_penalties import (
@@ -30,6 +31,7 @@ from nemo_rl.experience.reward_penalties import (
     finalize_capture_reward,
     has_duplicated_reasoning,
     has_empty_final_answer,
+    has_malformed_think_tag,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -145,6 +147,115 @@ def test_generated_spans_only_including_each_terminal(ids, expected):
     )
     assert reward == (0.0 if expected else -1.0)
     assert counts["unwanted_token"] == int(expected)
+
+
+THINK_OPEN, THINK_CLOSE = 1, 2
+_THINK_VOCAB = {THINK_OPEN: "<think>", THINK_CLOSE: "</think>"}
+
+
+def _decode(token_ids) -> str:
+    return "".join(_THINK_VOCAB.get(token, f"t{token} ") for token in token_ids)
+
+
+# (turn-1 prompt, turn-1 generation, turn-2 prompt, turn-2 generation)
+THINK_TURNS = [
+    # thinking on: trailing open tag in the prompt, one close tag generated
+    ([10, 1], [11, 2, 12], [13, 1], [14, 2, 15]),
+    # thinking off: balanced tags in the prompt, no tags generated
+    ([10, 1, 2], [11], [13, 1, 2], [14]),
+    # a second close tag in one turn
+    ([10, 1], [11, 2, 12], [13, 1], [14, 2, 2]),
+    # an open tag generated
+    ([10, 1], [11, 2, 12], [13, 1], [1, 14, 2]),
+    # thinking on but the close tag never generated
+    ([10, 1], [11], [13], [14]),
+    # unexpected prompt pattern
+    ([1, 1, 10], [11, 2], [13], [14]),
+]
+
+
+@pytest.mark.parametrize("with_ids", [True, False])
+@pytest.mark.parametrize("turns", THINK_TURNS)
+def test_malformed_think_tag_parity(turns, with_ids):
+    """Capture spans hit the echo path's per-turn ID and string checks."""
+    prompt_1, gen_1, prompt_2, gen_2 = turns
+    penalties: dict = {
+        "penalize_malformed_think_tag": True,
+        "thinking_tags": ["<think>", "</think>"],
+    }
+    if with_ids:
+        penalties["token_ids"] = {"think_open": THINK_OPEN, "think_close": THINK_CLOSE}
+    result = {
+        "full_result": {
+            "reward": 1.0,
+            "response": {
+                "output": [
+                    {"type": "message", "generation_str": _decode(gen_1)},
+                    {"type": "message", "generation_str": _decode(gen_2)},
+                ]
+            },
+        },
+        "message_log": [
+            {"role": "user", "token_ids": torch.tensor(prompt_1)},
+            {"role": "assistant", "token_ids": torch.tensor(gen_1)},
+            {"role": "user", "token_ids": torch.tensor(prompt_2)},
+            {"role": "assistant", "token_ids": torch.tensor(gen_2)},
+        ],
+    }
+    expected = apply_reward_penalties([result], penalties)
+    reward, counts, _ = finalize_capture_reward(
+        1.0,
+        checks=None,
+        penalty_config=RewardPenaltyConfig.model_validate(penalties),
+        effort_config=None,
+        token_ids=[*prompt_1, *gen_1, *prompt_2, *gen_2],
+        link_spans=[
+            ("c1", len(prompt_1), len(gen_1)),
+            ("c2", len(prompt_2), len(gen_2)),
+        ],
+        decode=_decode,
+        thinking_tags=penalties["thinking_tags"],
+    )
+    assert counts["malformed_think_tag"] == expected["malformed_think_tag"]
+    assert reward == result["full_result"]["reward"]
+
+
+def test_malformed_think_tag_string_check_catches_spelled_out_tags():
+    """Ordinary tokens that decode to a tag bypass the ID check but not the string check."""
+    vocab = {30: "</th", 31: "ink>"}
+    assert has_malformed_think_tag(
+        [10, THINK_OPEN],
+        [11, THINK_CLOSE, 30, 31],
+        think_tag_ids=(THINK_OPEN, THINK_CLOSE),
+        thinking_tags=["<think>", "</think>"],
+        decode=lambda ids: "".join(
+            vocab.get(token, _THINK_VOCAB.get(token, "x")) for token in ids
+        ),
+    )
+
+
+def test_malformed_think_tag_requires_decode():
+    reward, counts, _ = finalize_capture_reward(
+        1.0,
+        checks=None,
+        penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        effort_config=None,
+        token_ids=[10, 11],
+        link_spans=[("c1", 1, 1)],
+        decode=_decode,
+        thinking_tags=["<think>", "</think>"],
+    )
+    assert (reward, counts["malformed_think_tag"]) == (1.0, 0)
+    with pytest.raises(ValueError, match="needs_decode"):
+        finalize_capture_reward(
+            1.0,
+            checks=None,
+            penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+            effort_config=None,
+            token_ids=[10, 11],
+            link_spans=[("c1", 1, 1)],
+            thinking_tags=["<think>", "</think>"],
+        )
 
 
 def _observations(*rewards: float) -> list[FinalizedReward]:
@@ -367,6 +478,10 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
             "effort.low_ub",
         ),
         ({"effort": None}, "effort.enabled"),
+        (
+            {"penalties": {"penalize_malformed_think_tag": True}},
+            "penalize_malformed_think_tag",
+        ),
     ],
 )
 def test_reward_settings_reject_semantic_changes_with_field_names(change, expected):

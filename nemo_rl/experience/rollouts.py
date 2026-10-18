@@ -2170,6 +2170,13 @@ def resolve_reward_penalty_config(
                 if inferred_close is not None:
                     token_ids["think_close"] = inferred_close
 
+    if resolved.get("penalize_malformed_think_tag") and (
+        ("think_open" in token_ids) != ("think_close" in token_ids)
+    ):
+        raise ValueError(
+            "reward_penalties.token_ids.think_open and "
+            "reward_penalties.token_ids.think_close must both be set"
+        )
     if token_ids:
         resolved["token_ids"] = token_ids
 
