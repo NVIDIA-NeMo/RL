@@ -32,7 +32,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
@@ -111,6 +111,7 @@ def _controller(actor: object) -> Any:
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
+    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = {}
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
@@ -164,6 +165,38 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         extra_env_info=None,
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
+
+
+def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
+    """A capture group's rollout metrics reach the replay sidecar the train pump reads."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+        extra_info={"existing": 1},
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    metrics = {"agent/rollout_time_taken/mean": 12.5}
+    ctrl._rollout_manager.pop_capture_rollout_metrics.return_value = metrics
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    ctrl._rollout_manager.pop_capture_rollout_metrics.assert_called_once_with("group")
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info == {"existing": 1, ROLLOUT_METRICS: [metrics]}
+    # The finalizer's own meta is not mutated.
+    assert meta.extra_info == {"existing": 1}
 
 
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "missing_route"])

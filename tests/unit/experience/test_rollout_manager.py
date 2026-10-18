@@ -2076,6 +2076,7 @@ def _receipt_record(
     *,
     loss_multiplier=1.0,
     verify_fields=None,
+    rollout_metrics=None,
 ):
     """``instance_configs`` nests each entry under ``instance_config``;
     ``verify_fields`` spreads each entry's verify-response fields (such as the
@@ -2106,7 +2107,7 @@ def _receipt_record(
         extra_env_info={},
         metadata={"task_name": "nemo_gym"},
         completions=completions,
-        rollout_metrics={},
+        rollout_metrics=dict(rollout_metrics or {}),
         loss_multiplier=loss_multiplier,
     )
 
@@ -2141,6 +2142,7 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._capture_rollout_metrics = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -2189,6 +2191,7 @@ def _make_capture_manager(
                 instance_configs=selected_configs,
                 loss_multiplier=float(_sample.get("loss_multiplier", 1.0)),
                 verify_fields=selected_fields,
+                rollout_metrics={"agent/rollout_time_taken/mean": 12.5},
             )
             if on_completion is not None:
                 for generation_index, completion in zip(indices, record.completions):
@@ -2296,6 +2299,11 @@ class TestGenerateForFinalizationFlow:
         assert request.mask_sample == (False, False)
         assert request.loss_multiplier == 0.25
         assert request.fallback_weight_version == 7
+        # The group's rollout metrics wait for the controller and are popped once.
+        assert mgr.pop_capture_rollout_metrics(group_id) == {
+            "agent/rollout_time_taken/mean": 12.5
+        }
+        assert mgr.pop_capture_rollout_metrics(group_id) == {}
         # Finalization and commit are exclusively owned by the controller's
         # actor-pool path; the manager leaves the reservation unready.
         assert buf.commit_calls == []
@@ -2310,6 +2318,19 @@ class TestGenerateForFinalizationFlow:
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+
+    def test_failure_after_rollout_drops_the_groups_rollout_metrics(self, monkeypatch):
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf)
+
+        def _boom(group_id):
+            raise RuntimeError("ledger exploded")
+
+        monkeypatch.setattr(mgr._recovery_ledger, "finalization_inputs", _boom)
+        with pytest.raises(RuntimeError, match="ledger exploded"):
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+        assert len(buf.abort_calls) == 1
+        assert mgr._capture_rollout_metrics == {}
 
     def test_exhausted_capture_cleans_internally_owned_recovery_group(self, capsys):
         buf = _FakeCaptureBuffer()

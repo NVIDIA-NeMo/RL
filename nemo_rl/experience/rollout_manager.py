@@ -1841,6 +1841,9 @@ class RolloutManager:
         # deliberately: the question it answers -- "is the fleet still answering
         # anyone?" -- is about the fleet, not about one prompt's history.
         self._consecutive_infra_drops: int = 0
+        # Token capture: per-group rollout_metrics, held until the controller
+        # attaches them to the finalized meta (capture rows have no PromptGroupRecord).
+        self._capture_rollout_metrics: dict[str, dict[str, Any]] = {}
 
     @property
     def execution_row_multiple(self) -> int:
@@ -1859,6 +1862,17 @@ class RolloutManager:
     def resume_request_deadlines(self) -> None:
         """Resume live request-deadline clocks when a colocated engine exits training mode."""
         self._request_deadlines.resume()
+
+    def pop_capture_rollout_metrics(self, group_id: str) -> dict[str, Any]:
+        """Return and forget a token-capture group's rollout metrics.
+
+        Args:
+            group_id: Replay group id of the finalization request.
+
+        Returns:
+            The group's rollout metrics, or an empty dict when none were recorded.
+        """
+        return self._capture_rollout_metrics.pop(group_id, {})
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:
@@ -2560,12 +2574,15 @@ class RolloutManager:
                             group_id,
                             generation_indices=pending_indices,
                         )
-                    await self.run_rollout(
+                    record = await self.run_rollout(
                         attempt_input_sample,
                         rollout_ids=list(rollout_ids),
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
+                    )
+                    self._capture_rollout_metrics[group_id] = dict(
+                        record.rollout_metrics
                     )
             finally:
                 if inflight_registry is not None:
@@ -2618,6 +2635,7 @@ class RolloutManager:
             # run end (there is no prefix-clear primitive in the data plane
             # yet). Their ledger files are inert — failure rows or missing
             # terminal rows keep any later read fail-closed.
+            self._capture_rollout_metrics.pop(group_id, None)
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation() as cut:
                 # Intentional staleness aborts discard the ledger owner before
