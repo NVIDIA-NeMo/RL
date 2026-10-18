@@ -413,7 +413,6 @@ env:
     score_weight: 1.0
     ranking_weight: 1.0
     use_binary_reward: false
-    reasoning_split_word: null
 
 # Logger configuration
 logger:
