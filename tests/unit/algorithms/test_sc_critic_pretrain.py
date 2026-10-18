@@ -488,3 +488,70 @@ def test_evaluate_applies_the_legacy_masks_and_scores_groups():
     assert m["critic/within_group_auc_q1"] == pytest.approx(0.5)
     assert m["critic/n_mixed_groups"] == 1.0
     assert plane.rows == {}
+
+
+class _Checkpointer:
+    """CheckpointManager's checkpoint_dir + get_resume_paths, without the IO."""
+
+    def __init__(self, checkpoint_dir: Path) -> None:
+        self.checkpoint_dir = Path(checkpoint_dir)
+
+    @staticmethod
+    def get_resume_paths(path, *, model_component):
+        component = Path(path) / model_component
+        return component / "weights", component / "optimizer"
+
+
+def test_rolling_resume_checkpoint_rotates_and_records_its_step(tmp_path):
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    assert cp.rolling_resume_step(tmp_path) is None
+    tmp.mkdir(parents=True)
+    (tmp / "shard").write_text("step 20")
+    cp.promote_rolling_resume(tmp_path, 20)
+    assert cp.rolling_resume_step(tmp_path) == 20
+    assert (current / "shard").read_text() == "step 20" and not tmp.exists()
+
+    tmp.mkdir()
+    (tmp / "shard").write_text("step 30")
+    cp.promote_rolling_resume(tmp_path, 30)
+    # Only one full checkpoint is ever kept.
+    assert cp.rolling_resume_step(tmp_path) == 30
+    assert (current / "shard").read_text() == "step 30"
+    assert not tmp.exists() and not current.with_name("old").exists()
+
+
+def test_resume_uses_the_rolling_full_checkpoint_only_for_the_latest_step(tmp_path):
+    ckpt = _Checkpointer(tmp_path)
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    tmp.mkdir(parents=True)
+    cp.promote_rolling_resume(tmp_path, 30)
+
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_30", 30, "latest_only"
+    )
+    assert source == str(current)
+    assert weights == current / "value" / "weights"
+    assert optimizer == current / "value" / "optimizer"
+
+    # Crash between finalizing step_40 and promoting its rolling checkpoint: the
+    # weights-only step_40 resumes (get_resume_paths finds no optimizer there).
+    weights, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_40", 40, "latest_only"
+    )
+    assert source == str(tmp_path / "step_40")
+    assert weights == tmp_path / "step_40" / "value" / "weights"
+
+    # The default keeps resuming from step_N itself.
+    _, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_30", 30, "every_checkpoint"
+    )
+    assert source == str(tmp_path / "step_30")
+    assert cp.critic_resume_paths(ckpt, None, 0, "latest_only") == (None, None, None)
+
+
+def test_optimizer_state_setting():
+    assert cp.CriticPretrainConfig(bank_dirs=["b"]).optimizer_state == "every_checkpoint"
+    latest = cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="latest_only")
+    assert latest.optimizer_state == "latest_only"
+    with pytest.raises(ValueError):
+        cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="never")

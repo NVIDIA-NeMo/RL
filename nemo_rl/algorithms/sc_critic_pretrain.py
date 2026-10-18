@@ -48,10 +48,11 @@ import json
 import os
 import random
 import re
+import shutil
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 
 import numpy as np
 import torch
@@ -122,6 +123,12 @@ class CriticPretrainConfig(BaseModel, extra="forbid"):
     response_split_redraw: bool = False
     # Data-plane partition the driver stages its rows in.
     partition_id: str = "critic_pretrain"
+    # Where the critic's optimizer state lives. Megatron embeds it in value/weights,
+    # and for an Adam critic it is ~5/6 of a checkpoint. "every_checkpoint": every
+    # step_N is a full checkpoint. "latest_only": step_N holds weights only (what a
+    # PPO warm start loads) and one rolling full checkpoint, rewritten at every save
+    # under <checkpoint_dir>/resume_state/current, resumes the run.
+    optimizer_state: Literal["every_checkpoint", "latest_only"] = "every_checkpoint"
 
     @model_validator(mode="after")
     def validate_settings(self) -> "CriticPretrainConfig":
@@ -137,6 +144,72 @@ class CriticPretrainConfig(BaseModel, extra="forbid"):
                 "enable the response-level held-out split, or both left at 0."
             )
         return self
+
+
+# ── rolling resume checkpoint (optimizer_state="latest_only") ─────────────────
+
+RESUME_STATE_DIRNAME = "resume_state"
+RESUME_STEP_FILENAME = "step.json"
+
+
+def resume_state_dirs(checkpoint_dir: str | os.PathLike) -> tuple[Path, Path]:
+    """(current, tmp): the rolling full checkpoint and the one being written."""
+    root = Path(checkpoint_dir) / RESUME_STATE_DIRNAME
+    return root / "current", root / "tmp"
+
+
+def rolling_resume_step(checkpoint_dir: str | os.PathLike) -> Optional[int]:
+    """The step the rolling full checkpoint was saved at, or None if there is none."""
+    current, _ = resume_state_dirs(checkpoint_dir)
+    try:
+        return int(json.loads((current / RESUME_STEP_FILENAME).read_text())["step"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return None
+
+
+def promote_rolling_resume(checkpoint_dir: str | os.PathLike, step: int) -> None:
+    """Make the just-written resume_state/tmp the rolling full checkpoint for ``step``.
+
+    Called after step_N is finalized, so a crash in between leaves the previous
+    rolling checkpoint, which no longer matches the latest step; resuming then
+    falls back to step_N's weights with a fresh optimizer.
+    """
+    current, tmp = resume_state_dirs(checkpoint_dir)
+    (tmp / RESUME_STEP_FILENAME).write_text(json.dumps({"step": step}))
+    old = current.with_name("old")
+    shutil.rmtree(old, ignore_errors=True)
+    if current.exists():
+        os.replace(current, old)
+    os.replace(tmp, current)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def critic_resume_paths(
+    checkpointer: Any,
+    last_checkpoint_path: Optional[str | os.PathLike],
+    last_step: int,
+    optimizer_state: str,
+) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
+    """(weights_path, optimizer_path, source) to resume the critic from."""
+    if last_checkpoint_path is None:
+        return None, None, None
+    if optimizer_state == "latest_only":
+        current, _ = resume_state_dirs(checkpointer.checkpoint_dir)
+        rolling = rolling_resume_step(checkpointer.checkpoint_dir)
+        if rolling == last_step:
+            weights, optimizer = checkpointer.get_resume_paths(
+                current, model_component="value"
+            )
+            return weights, optimizer, str(current)
+        print(
+            f"⚠️ No rolling full checkpoint for step {last_step} (found {rolling}); "
+            f"resuming from {last_checkpoint_path}'s weights with a fresh optimizer.",
+            flush=True,
+        )
+    weights, optimizer = checkpointer.get_resume_paths(
+        last_checkpoint_path, model_component="value"
+    )
+    return weights, optimizer, str(last_checkpoint_path)
 
 
 # ── split / order (pure, unit-tested) ───────────────────────────────────────
@@ -1112,8 +1185,13 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     value_config["megatron_cfg"]["train_iters"] = planned_steps
 
     if last_checkpoint_path is not None:
-        weights_path, optimizer_path = checkpointer.get_resume_paths(
-            last_checkpoint_path, model_component="value"
+        weights_path, optimizer_path, source = critic_resume_paths(
+            checkpointer, last_checkpoint_path, step, cfg.optimizer_state
+        )
+        print(
+            f"♻️ Resuming the critic from {source} "
+            f"({'with' if optimizer_path is not None else 'without'} optimizer state)",
+            flush=True,
         )
     elif master_config.ppo.warm_start_value_checkpoint is not None:
         warm_start = master_config.ppo.warm_start_value_checkpoint
@@ -1249,19 +1327,33 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 checkpoint_path = checkpointer.init_tmp_checkpoint(
                     step, save_state, master_config
                 )
+                rolling = (
+                    cfg.optimizer_state == "latest_only" and checkpointer.save_optimizer
+                )
                 value.prepare_for_training()
                 value.save_checkpoint(
                     weights_path=os.path.join(checkpoint_path, "value", "weights"),
                     optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
-                    if checkpointer.save_optimizer
+                    if checkpointer.save_optimizer and not rolling
                     else None,
                     tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
                     is_final_checkpoint=is_last,
                 )
+                if rolling:
+                    _, resume_tmp = resume_state_dirs(checkpointer.checkpoint_dir)
+                    shutil.rmtree(resume_tmp, ignore_errors=True)
+                    value.save_checkpoint(
+                        weights_path=str(resume_tmp / "value" / "weights"),
+                        optimizer_path=str(resume_tmp / "value" / "optimizer"),
+                        tokenizer_path=str(resume_tmp / "value" / "tokenizer"),
+                        is_final_checkpoint=is_last,
+                    )
                 value.finish_training()
                 with open(os.path.join(checkpoint_path, FILE_LIST_NAME), "w") as f:
                     json.dump(files_record, f)
                 checkpointer.finalize_checkpoint(checkpoint_path)
+                if rolling:
+                    promote_rolling_resume(checkpointer.checkpoint_dir, step)
             if save_by_timeout:
                 print(
                     "⏰ Walltime budget reached; stopping after the save.", flush=True
