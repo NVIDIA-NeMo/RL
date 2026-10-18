@@ -32,6 +32,7 @@ from nemo_rl.environments.checkpointing import build_environment_checkpoint
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
 from nemo_rl.environments.checkpointing.nemo_gym import (
     GenerationCutFence,
+    GenerationCutStats,
     GymEnvironmentCheckpoint,
     _summarize_gym_episodes,
 )
@@ -574,6 +575,172 @@ def test_prefix_checkpoint_fences_terminal_writes_through_tq_cut(
         )
 
     asyncio.run(exercise())
+
+
+def test_prefix_snapshot_metrics_report_the_fence_hold_and_cut_outcome(
+    tmp_path: Path,
+) -> None:
+    """A prefix snapshot logs its fence hold and Gym's cut counts."""
+
+    async def exercise() -> dict[str, float]:
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            _dispatched_turn_group(ledger, cut, generations=1)
+
+        class FakeGeneration:
+            def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+                return True
+
+            def end_token_capture_snapshot_fence(self, *, timeout_s=None):
+                return True
+
+        gym = gym_environment_checkpoint(
+            gym_coordinator(
+                FakeGymActor(
+                    generation_cut_counts={"cut": 3, "cut_failed": 1, "cut_skipped": 2}
+                )
+            ),
+            ledger,
+            generation_fence=GenerationCutFence(FakeGeneration(), None),
+        )
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
+        # The hold ends after Gym resumes, so read the metrics once it has.
+        return snapshot.metrics(paused_seconds=2.0)
+
+    metrics = asyncio.run(exercise())
+
+    assert metrics["generation_cut_fence_hold_seconds"] >= 0.0
+    assert metrics["generation_cut_calls"] == 3.0
+    assert metrics["generation_cut_failed_calls"] == 1.0
+    assert metrics["generation_cut_skipped_calls"] == 2.0
+
+
+def test_turn_snapshot_metrics_leave_out_generation_cuts(tmp_path: Path) -> None:
+    async def exercise() -> dict[str, float]:
+        ledger = RolloutRecoveryLedger()
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            _dispatched_turn_group(ledger, cut, generations=1)
+        gym = gym_environment_checkpoint(gym_coordinator(FakeGymActor()), ledger)
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
+        return snapshot.metrics(paused_seconds=2.0)
+
+    metrics = asyncio.run(exercise())
+
+    assert not any(name.startswith("generation_") for name in metrics)
+
+
+def test_prefix_snapshot_sums_cut_counts_over_gym_instances(tmp_path: Path) -> None:
+    async def exercise() -> dict[str, float]:
+        gym = gym_environment_checkpoint(
+            gym_coordinator(
+                FakeGymActor(
+                    generation_cut_counts={"cut": 2, "cut_failed": 1, "cut_skipped": 0}
+                ),
+                FakeGymActor(
+                    generation_cut_counts={"cut": 1, "cut_failed": 0, "cut_skipped": 3}
+                ),
+            ),
+            RolloutRecoveryLedger(),
+        )
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
+        return snapshot.metrics(paused_seconds=1.0)
+
+    metrics = asyncio.run(exercise())
+
+    assert metrics["generation_cut_calls"] == 3.0
+    assert metrics["generation_cut_failed_calls"] == 1.0
+    assert metrics["generation_cut_skipped_calls"] == 3.0
+    # No fence without prefix recovery.
+    assert "generation_cut_fence_hold_seconds" not in metrics
+
+
+@pytest.mark.parametrize("failure", ["fence", "checkpoint"])
+def test_prefix_snapshot_releases_the_fence_when_it_fails(
+    tmp_path: Path, failure: str
+) -> None:
+    """A failed fence or Gym checkpoint must still reopen every vLLM worker."""
+    actor = FakeGymActor()
+
+    class FakeGeneration:
+        def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+            actor.mark("generation-fence")
+            if failure == "fence":
+                raise RuntimeError("fence timed out on worker 1")
+            return True
+
+        def end_token_capture_snapshot_fence(self, *, timeout_s=None):
+            actor.mark("generation-release")
+            return True
+
+    gym = gym_environment_checkpoint(
+        gym_coordinator(actor),
+        RolloutRecoveryLedger(),
+        generation_fence=GenerationCutFence(FakeGeneration(), 17.0),
+    )
+
+    async def exercise() -> None:
+        async with gym.snapshot(tmp_path, checkpoint_id="save-prefix-1"):
+            raise RuntimeError("TQ cut failed")
+
+    with pytest.raises(RuntimeError, match="fence timed out|TQ cut failed"):
+        asyncio.run(exercise())
+    operations = actor.operations()
+    assert operations[0] == "generation-fence"
+    assert operations[-1] == "generation-release"
+    assert operations.count("generation-release") == 1
+
+
+class _FailingFenceGeneration:
+    def __init__(self, *, begin_error=None, end_error=None) -> None:
+        self.calls: list[str] = []
+        self.begin_error = begin_error
+        self.end_error = end_error
+
+    def begin_token_capture_snapshot_fence(self, *, timeout_s=None):
+        self.calls.append("begin")
+        if self.begin_error is not None:
+            raise self.begin_error
+        return True
+
+    def end_token_capture_snapshot_fence(self, *, timeout_s=None):
+        self.calls.append("end")
+        if self.end_error is not None:
+            raise self.end_error
+        return True
+
+
+def test_failed_fence_begin_still_releases_partially_fenced_workers() -> None:
+    begin_error = RuntimeError("fence timed out on one worker")
+    generation = _FailingFenceGeneration(begin_error=begin_error)
+    stats = GenerationCutStats()
+
+    async def exercise() -> None:
+        async with GenerationCutFence(generation, 17.0).held(stats):
+            raise AssertionError("the body must not run")
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(exercise())
+    assert error.value is begin_error
+    assert generation.calls == ["begin", "end"]
+    assert stats.fence_hold_seconds is None
+
+
+def test_failed_fence_release_keeps_the_checkpoint_error_as_context() -> None:
+    body_error = RuntimeError("Gym commit failed")
+    release_error = RuntimeError("worker did not release")
+    generation = _FailingFenceGeneration(end_error=release_error)
+
+    async def exercise() -> None:
+        async with GenerationCutFence(generation, 17.0).held(GenerationCutStats()):
+            raise body_error
+
+    with pytest.raises(RuntimeError) as error:
+        asyncio.run(exercise())
+    assert error.value is release_error
+    assert error.value.__context__ is body_error
 
 
 class TestGymCheckpointPausesRolloutDeadlines:

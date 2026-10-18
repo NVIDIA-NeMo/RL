@@ -29,7 +29,7 @@ import time
 import uuid
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -61,6 +61,16 @@ _GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
 _GYM_EPISODE_SAMPLE_SIZE = 5
 
 
+@dataclass
+class GenerationCutStats:
+    """What one snapshot's generation cut cost and achieved."""
+
+    # From the terminal-capture fence's acquisition to its release.
+    fence_hold_seconds: Optional[float] = None
+    # Gym's ``cut`` / ``cut_failed`` / ``cut_skipped`` counts.
+    counts: dict[str, int] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class GenerationCutFence:
     """Holds terminal token-capture writes on every generation worker.
@@ -73,12 +83,15 @@ class GenerationCutFence:
     timeout_s: Optional[float]
 
     @contextlib.asynccontextmanager
-    async def held(self) -> AsyncIterator[None]:
+    async def held(self, stats: GenerationCutStats) -> AsyncIterator[None]:
+        """Fence for the context; record the hold time in ``stats`` on release."""
+        acquired: Optional[float] = None
         try:
             await asyncio.to_thread(
                 self.generation.begin_token_capture_snapshot_fence,
                 timeout_s=self.timeout_s,
             )
+            acquired = time.monotonic()
             yield
         finally:
             # Idempotent, so it also releases workers a failed begin had
@@ -88,6 +101,8 @@ class GenerationCutFence:
                 self.generation.end_token_capture_snapshot_fence,
                 timeout_s=self.timeout_s,
             )
+            if acquired is not None:
+                stats.fence_hold_seconds = time.monotonic() - acquired
 
 
 def _summarize_gym_episodes(
@@ -168,6 +183,8 @@ class GymEnvironmentSnapshot:
     checkpoint: GymEnvironmentCheckpoint
     commit: GymCheckpointCommitResult
     checkpoint_path: Path
+    # Filled in while the snapshot runs; the fence hold ends after Gym resumes.
+    generation_cut: GenerationCutStats = field(default_factory=GenerationCutStats)
 
     @property
     def restarted_rollouts(self) -> int:
@@ -255,11 +272,18 @@ class GymEnvironmentSnapshot:
         return expected_staging_keys
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
-        return {
+        metrics = {
             "gym_parked_seconds": paused_seconds,
             # Episodes Gym could not capture; they start over after a crash.
             "gym_restarted_episodes": float(self.restarted_rollouts),
         }
+        if self.generation_cut.fence_hold_seconds is not None:
+            metrics["generation_cut_fence_hold_seconds"] = (
+                self.generation_cut.fence_hold_seconds
+            )
+        for name, count in self.generation_cut.counts.items():
+            metrics[f"generation_{name}_calls"] = float(count)
+        return metrics
 
 
 class GymEnvironmentCheckpoint:
@@ -500,8 +524,9 @@ class GymEnvironmentCheckpoint:
             else f"rollout-{uuid.uuid4().hex}"
         )
         coordinator = self.coordinator
+        generation_cut = GenerationCutStats()
         async with (
-            self._generation_fence.held()
+            self._generation_fence.held(generation_cut)
             if self._generation_fence is not None
             else contextlib.nullcontext(),
             self.admission_gate.checkpoint(),
@@ -517,7 +542,9 @@ class GymEnvironmentCheckpoint:
                 # it is still idle; dispatch is already closed, so nothing new
                 # races in.
                 await self._retire_dropped_episodes(checkpoint_id)
-                async with coordinator.prepared(checkpoint_id) as restarts:
+                async with coordinator.prepared(checkpoint_id) as prepared:
+                    restarts = prepared.restarts
+                    generation_cut.counts = dict(prepared.generation_cut_counts)
                     candidates = self.inventory()
                     # A row dropped since that retire is still running in Gym,
                     # which exports it; naming it keeps the export in scope, and
@@ -552,6 +579,7 @@ class GymEnvironmentCheckpoint:
                         checkpoint=self,
                         commit=commit,
                         checkpoint_path=Path(checkpoint_path),
+                        generation_cut=generation_cut,
                     )
             finally:
                 self._rollout_manager.resume_request_deadlines(

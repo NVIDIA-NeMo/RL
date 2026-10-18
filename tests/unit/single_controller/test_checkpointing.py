@@ -170,8 +170,9 @@ class _FakeEnvironmentSnapshot:
     def __init__(self) -> None:
         self.checked_cuts: list[Any] = []
 
-    async def check_against_cut(self, cut: Any) -> None:
+    async def check_against_cut(self, cut: Any) -> frozenset[str]:
         self.checked_cuts.append(cut)
+        return frozenset()
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {"environment_paused_seconds": paused_seconds}

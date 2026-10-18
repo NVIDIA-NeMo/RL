@@ -833,19 +833,6 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    # Capture transport config includes the generation request's candidate count.
-    token_capture = (
-        {
-            **master_config.token_capture.model_dump(),
-            "top_logprobs": generation_config["top_logprobs"],
-        }
-        if master_config.token_capture.enabled
-        else None
-    )
-    if token_capture is not None:
-        token_capture["generation_prefix_cuts_enabled"] = (
-            master_config.rollout_recovery.generation_prefix_cuts_enabled
-        )
     shard_set = build_nemo_gym_actors(
         master_config.env,
         base_urls=base_urls,
@@ -857,8 +844,18 @@ def _spinup_gym(
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
         ),
-        # Ledger config rides into Gym's policy model server.
-        token_capture=token_capture,
+        generation_prefix_cuts_enabled=(
+            master_config.rollout_recovery.generation_prefix_cuts_enabled
+        ),
+        # Capture transport config includes the generation request's candidate count.
+        token_capture=(
+            {
+                **master_config.token_capture.model_dump(),
+                "top_logprobs": generation_config["top_logprobs"],
+            }
+            if master_config.token_capture.enabled
+            else None
+        ),
     )
     return shard_set, time.perf_counter() - t0
 

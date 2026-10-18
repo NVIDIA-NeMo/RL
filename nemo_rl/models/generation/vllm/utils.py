@@ -69,9 +69,18 @@ G_ROUTED_EXPERTS_RANGE_CHECKED = False
 
 
 def _extract_selected_token_logprobs(
-    generation_token_ids: list[int], generation_logprob_details: list[Any]
+    generation_token_ids: list[int],
+    generation_logprob_details: list[Any],
+    *,
+    where: str = "",
 ) -> list[float]:
-    """Extract the sampled token's log probability at every output position."""
+    """Extract the sampled token's log probability at every output position.
+
+    Args:
+        generation_token_ids: The sampled token at each output position.
+        generation_logprob_details: vLLM's per-position logprob mapping.
+        where: Context prepended to the token in a missing-token error.
+    """
     selected_logprobs: list[float] = []
     for token_id, position_logprobs in zip(
         generation_token_ids, generation_logprob_details, strict=True
@@ -80,7 +89,7 @@ def _extract_selected_token_logprobs(
         if selected is None:
             raise RuntimeError(
                 "vLLM generation log probabilities did not include the selected "
-                f"token: token_id={token_id}"
+                f"token: {where}token_id={token_id}"
             )
         selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
     return selected_logprobs

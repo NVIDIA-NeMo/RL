@@ -27,6 +27,7 @@ module tree, inspect consumer configuration, and exercise captured raw responses
 
 import asyncio
 import sys
+import threading
 import types
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -164,7 +165,9 @@ def _install_fake_vllm(monkeypatch):
     module("vllm.renderers.hf", HfRenderer=placeholder("HfRenderer"))
     module(
         "vllm.sampling_params",
-        RequestOutputKind=type("RequestOutputKind", (), {"DELTA": "delta"}),
+        RequestOutputKind=type(
+            "RequestOutputKind", (), {"DELTA": "delta", "CUMULATIVE": "cumulative"}
+        ),
     )
 
     class ValidationError(ValueError):
@@ -254,6 +257,23 @@ async def test_captured_chat_logprobs_bypass(
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl,
+        "_capture_registry_lock",
+        threading.Lock(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_generation_prefix_cuts_enabled",
+        False,
+        raising=False,
+    )
+    # The admitted marker below is a placeholder, not capture state to observe.
+    for method in ("_observe_request_capture", "_restore_response_prefix"):
+        monkeypatch.setattr(
+            VllmAsyncGenerationWorkerImpl, method, lambda *_args, **_kwargs: None
+        )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
         "_return_routed_experts_enabled",
         lambda _self: False,
     )
@@ -262,6 +282,9 @@ async def test_captured_chat_logprobs_bypass(
         stream=stream,
         logprobs=logprobs,
         top_logprobs=0,
+        # NeMoRLChatCompletionRequest's defaults for a call with no restored prefix.
+        _restored_generation_token_ids=(),
+        _restored_prefix_terminal=None,
         return_tokens_as_token_ids=token_ids,
     )
     _, chats, _ = _build_server(
