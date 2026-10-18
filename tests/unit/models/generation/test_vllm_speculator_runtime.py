@@ -174,6 +174,26 @@ def test_model_update_coverage_requires_every_input_exactly_once() -> None:
         coverage.record_loaded(("model.weight", "model.weight"))
 
 
+def test_model_update_coverage_require_covered_checks_only_named_subset() -> None:
+    manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.weight": ((2,), torch.float32),
+            "draft.model.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+    coverage = ModelUpdateCoverage(manifest, rank=0)
+
+    with pytest.raises(SpeculatorRuntimeError, match="missing keys"):
+        coverage.require_covered(("draft.model.weight",))
+
+    coverage.record_loaded(("draft.model.weight",))
+    coverage.require_covered(("draft.model.weight",))
+    with pytest.raises(SpeculatorRuntimeError, match="missing keys"):
+        coverage.require_complete()
+
+
 def test_non_owner_records_draft_skip_but_still_requires_transport_coverage() -> None:
     manifest = ModelUpdateManifest.from_state_dict_info(
         {

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 import torch
 
@@ -151,6 +151,14 @@ class ModelUpdateCoverage:
                 f"unexpected {component} owner skips: {sorted(invalid)[:8]}"
             )
         self._record(names)
+
+    def require_covered(self, names: Iterable[str]) -> None:
+        """Require coverage for the names that one transport stream carries."""
+        missing = set(names) - self._covered
+        if missing:
+            raise SpeculatorRuntimeError(
+                f"missing keys ({len(missing)}): {sorted(missing)[:8]}"
+            )
 
     def require_complete(self) -> None:
         missing = self._expected - self._covered

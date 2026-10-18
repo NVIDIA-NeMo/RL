@@ -2567,13 +2567,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             for name, meta in misc_meta.items()
         }
 
+        # Bulk names never pass through _load_weights on this transport, so the
+        # coverage check is scoped to the misc stream, which carries the draft.
+        coverage = self._new_model_update_coverage()
         packed_broadcast_consumer(
             iterator=iter(misc_state_dict_info.items()),
             group=self.model_update_group,
             src=0,
-            post_unpack_func=self._load_weights,
+            post_unpack_func=lambda weights: self._load_weights(
+                weights, coverage=coverage
+            ),
             preflight_checked=True,
         )
+        if coverage is not None:
+            coverage.require_covered(misc_state_dict_info)
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

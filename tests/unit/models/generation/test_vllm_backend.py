@@ -347,6 +347,58 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
 
 
 @pytest.mark.vllm
+@pytest.mark.parametrize("deliver_draft", [True, False])
+def test_nccl_reshard_misc_stream_requires_draft_coverage(monkeypatch, deliver_draft):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        ModelUpdateManifest,
+        SpeculatorRuntimeError,
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    misc_meta = {
+        "model.norm.weight": {"shape": [2], "dtype": str(torch.float32)},
+        "draft.fc.weight": {"shape": [2], "dtype": str(torch.float32)},
+    }
+    ext.nccl_reshard_refit_info = {"misc_meta": misc_meta}
+    ext.model_update_group = object()
+    ext._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.layers.0.weight": ((2,), torch.float32),
+            "model.norm.weight": ((2,), torch.float32),
+            "draft.fc.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+
+    def load_weights(weights, *, coverage):
+        coverage.record_loaded(tuple(name for name, _ in weights))
+
+    monkeypatch.setattr(ext, "_load_weights", load_weights)
+
+    def consumer(*, iterator, post_unpack_func, **_kwargs):
+        names = [name for name, _ in iterator]
+        if not deliver_draft:
+            names.remove("draft.fc.weight")
+        post_unpack_func([(name, torch.zeros(2)) for name in names])
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consumer)
+
+    # Bulk target names are absent from this stream, so only misc names count.
+    if deliver_draft:
+        ext._receive_and_load_misc_params()
+    else:
+        with pytest.raises(SpeculatorRuntimeError, match="draft.fc.weight"):
+            ext._receive_and_load_misc_params()
+
+
+@pytest.mark.vllm
 def test_nccl_reshard_refit_watchdog_abort_raises_refit_aborted(monkeypatch):
     from nemo_rl.distributed import refit_watchdog
     from nemo_rl.models.generation.vllm import vllm_backend
