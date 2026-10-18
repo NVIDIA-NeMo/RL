@@ -649,13 +649,14 @@ def test_router_replay_worker_guard_requires_routed_experts_when_expected():
         stage="reference-logprob",
         require=False,
     )
-    with pytest.raises(RuntimeError, match="requires routed_experts for prev-logprob"):
-        _should_use_router_replay(
-            enabled=True,
-            data=data,
-            stage="prev-logprob",
-            require=True,
-        )
+    # A routeless fetched batch (pre-R3 checkpoint rows, token-free groups) falls
+    # back to native routing instead of failing the run.
+    assert not _should_use_router_replay(
+        enabled=True,
+        data=data,
+        stage="prev-logprob",
+        require=True,
+    )
 
     data["routed_experts"] = torch.zeros(2, 4, 3, 2, dtype=torch.int32)
     assert _should_use_router_replay(
