@@ -166,7 +166,11 @@ def test_worker_generate_text_passes_lora_request(native_lora_request):
     worker.SamplingParams = MagicMock(return_value=object())
     worker._native_lora_request = native_lora_request
     output = SimpleNamespace(outputs=[SimpleNamespace(text="response")])
-    worker.llm = SimpleNamespace(generate=MagicMock(return_value=[output]))
+    tokenizer = SimpleNamespace(bos_token=None)
+    worker.llm = SimpleNamespace(
+        generate=MagicMock(return_value=[output]),
+        renderer=SimpleNamespace(get_tokenizer=MagicMock(return_value=tokenizer)),
+    )
 
     result = worker.generate_text(BatchedDataDict({"prompts": ["prompt"]}))
 
