@@ -27,8 +27,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
 )
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 @pytest.fixture

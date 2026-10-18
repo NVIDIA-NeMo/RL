@@ -1124,7 +1124,7 @@ class SingleControllerActor:
         )
         await self._validate_replay_inventory(buffer_state)
 
-        if self._master_config.checkpointing.get("load_replay_buffer") is False:
+        if self._master_config.checkpointing.load_replay_buffer is False:
             # Validate and load the native snapshot before discarding it. This keeps
             # replay-free resume fail-closed: a mismatched/corrupt checkpoint must
             # not silently turn into a different training stream.

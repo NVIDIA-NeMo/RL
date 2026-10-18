@@ -89,13 +89,13 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 class FakeWeightSynchronizer:
@@ -137,18 +137,18 @@ class _InitRolloutManager:
         self.checkpoint_barrier = barrier
 
 
-def _checkpointing_config(tmp_path) -> dict:
+def _checkpointing_config(tmp_path) -> CheckpointingConfig:
     """Minimal checkpointing block for actors built through __init__."""
-    return {
-        "enabled": False,
-        "checkpoint_dir": str(tmp_path / "checkpoints"),
-        "metric_name": None,
-        "higher_is_better": True,
-        "keep_top_k": None,
-        "save_period": 10,
-        "save_optimizer": True,
-        "checkpoint_must_save_by": None,
-    }
+    return CheckpointingConfig.model_construct(
+        enabled=False,
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        metric_name=None,
+        higher_is_better=True,
+        keep_top_k=None,
+        save_period=10,
+        save_optimizer=True,
+        checkpoint_must_save_by=None,
+    )
 
 
 def _grpo_master_config(tmp_path) -> MasterConfig:
@@ -409,7 +409,8 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
-    master_config.checkpointing.update(enabled=True, save_data_plane=True)
+    master_config.checkpointing.enabled = True
+    master_config.checkpointing.save_data_plane = True
     workers = [object() for _ in range(10)]
 
     def group(members: list[object], leaders: tuple[int, ...] = ()) -> SimpleNamespace:
@@ -3771,7 +3772,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         ctrl, metas, calls = _streaming_ppo_controller(monkeypatch)
     else:
         ctrl, metas, calls = _full_batch_ppo_controller(monkeypatch, policy_epochs=3)
-    ctrl._master_config.checkpointing["enabled"] = True
+    ctrl._master_config.checkpointing.enabled = True
 
     async def save_checkpoint(metrics: dict, **kwargs: bool) -> None:
         assert kwargs == {

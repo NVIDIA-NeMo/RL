@@ -28,8 +28,8 @@ from nemo_rl.algorithms.rm import (
     setup,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def test_get_rm_save_state_handles_legacy_checkpoint_and_filters_metrics():
