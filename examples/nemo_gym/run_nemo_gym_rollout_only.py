@@ -32,6 +32,16 @@ def parse_args() -> argparse.Namespace:
         "come from the recipe.",
     )
     parser.add_argument("--profile-step", type=int)
+    parser.add_argument(
+        "--train-time-s",
+        type=float,
+        default=0.0,
+        help="Seconds each step holds where training's policy.train() would "
+        "run, between sampling the batch and the refit stand-in, so the "
+        "collector paces as in an e2e run. The hold ends early once no rollout "
+        "is in flight, and the skipped seconds are reported (default 0: no "
+        "training stand-in).",
+    )
     return parser.parse_args()
 
 
@@ -39,6 +49,8 @@ def validate_args(args: argparse.Namespace) -> None:
     for name in ("num_steps", "num_nodes"):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.train_time_s < 0:
+        raise ValueError("--train-time-s must be non-negative")
     if args.profile_step is not None and not 1 <= args.profile_step <= args.num_steps:
         raise ValueError("--profile-step must be within --num-steps")
 
@@ -277,6 +289,42 @@ def iter_training_batches(dataloader, num_steps: int):  # noqa: ANN001, ANN201
         epoch += 1
 
 
+def simulate_training(
+    train_time_s: float,
+    timeline_timer,  # noqa: ANN001
+    check_health=None,  # noqa: ANN001
+    rollouts_idle=None,  # noqa: ANN001
+) -> float:
+    """Stand in for policy.train(): hold the step for up to train_time_s seconds.
+
+    Recorded as policy_training, the span an e2e step records. check_health,
+    when given, is polled so a dead collector fails the step instead of
+    surfacing only after the wait.
+
+    The wait only matters while rollouts run beside training. Once
+    rollouts_idle() reports that nothing is generating, the rest of the wait
+    is idle on both sides and a rollout-only run continues identically after
+    it, so it is skipped.
+
+    Returns:
+        The seconds of training time skipped as idle.
+    """
+    if train_time_s <= 0:
+        return 0.0
+    timeline_timer.start("policy_training")
+    try:
+        deadline = time.perf_counter() + train_time_s
+        while (remaining := deadline - time.perf_counter()) > 0:
+            if rollouts_idle is not None and rollouts_idle():
+                return remaining
+            time.sleep(min(remaining, 5.0))
+            if check_health is not None:
+                check_health()
+        return 0.0
+    finally:
+        timeline_timer.stop("policy_training")
+
+
 def run_sync_rollout_steps(
     master_config,  # noqa: ANN001
     generation,  # noqa: ANN001
@@ -286,12 +334,15 @@ def run_sync_rollout_steps(
     num_steps: int,
     profile_step: int | None,
     timeline_timer,  # noqa: ANN001
+    train_time_s: float = 0.0,
 ) -> None:
     """Run grpo_train's rollout step by step: one whole batch per step.
 
     Each step sends num_prompts_per_step x num_generations_per_prompt rows
     through run_nemo_gym_rollout_sync, the call GRPO's synchronous NeMo-Gym
     training step makes, and waits for all of them before the next step.
+    train_time_s is where grpo_train trains; nothing generates then, so it is
+    skipped whole and reported, keeping e2e step time = elapsed + skipped.
     """
     from nemo_rl.experience.rollouts import (
         get_effort_config,
@@ -332,43 +383,49 @@ def run_sync_rollout_steps(
 
         started = time.perf_counter()
         timeline_timer.start("total_step_time")
-        timeline_timer.start("exposed_generation")
         try:
-            # The call GRPO's synchronous NeMo-Gym training step makes (grpo.py).
-            rollout_result = run_nemo_gym_rollout_sync(
-                policy_generation=generation,
-                input_batch=repeated_batch,
-                tokenizer=tokenizer,
-                task_to_env=task_to_env,
-                max_seq_len=master_config.policy["max_total_sequence_length"],
-                generation_config=rollout_generation_config,
-                num_generations_per_prompt=num_generations_per_prompt,
-                log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                    wandb_enabled=master_config.logger.wandb_enabled,
-                    wandb_config=master_config.logger.wandb,
-                ),
-                max_rollout_turns=None,
-                greedy=False,
-                effort_config=get_effort_config(master_config.env),
-                reward_penalty_config=master_config.reward_penalties,
-                length_penalty_config=master_config.grpo.length_penalty,
-                thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
-                mask_env_flagged_samples=should_mask_flagged_samples(
-                    master_config.env
-                ),
-                deduplicate_multimodal_data=(
-                    master_config.grpo.deduplicate_multimodal_data
-                ),
-                debug_payload_metrics=master_config.grpo.debug_payload_metrics,
+            timeline_timer.start("exposed_generation")
+            try:
+                # The call GRPO's synchronous NeMo-Gym training step makes (grpo.py).
+                rollout_result = run_nemo_gym_rollout_sync(
+                    policy_generation=generation,
+                    input_batch=repeated_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    generation_config=rollout_generation_config,
+                    num_generations_per_prompt=num_generations_per_prompt,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger.wandb_enabled,
+                        wandb_config=master_config.logger.wandb,
+                    ),
+                    max_rollout_turns=None,
+                    greedy=False,
+                    effort_config=get_effort_config(master_config.env),
+                    reward_penalty_config=master_config.reward_penalties,
+                    length_penalty_config=master_config.grpo.length_penalty,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                    mask_env_flagged_samples=should_mask_flagged_samples(
+                        master_config.env
+                    ),
+                    deduplicate_multimodal_data=(
+                        master_config.grpo.deduplicate_multimodal_data
+                    ),
+                    debug_payload_metrics=master_config.grpo.debug_payload_metrics,
+                )
+            finally:
+                # Stop in the existing finally so an exception still closes the
+                # spans; tracing must never change control flow.
+                timeline_timer.stop("exposed_generation")
+                if should_profile:
+                    generation.stop_gpu_profiling()
+                    print(f"Stopped TP-worker Nsight capture after rollout step {step}")
+            # Synchronous GRPO runs no rollout while it trains.
+            skipped = simulate_training(
+                train_time_s, timeline_timer, rollouts_idle=lambda: True
             )
         finally:
-            # Stop in the existing finally so an exception still closes the
-            # spans; tracing must never change control flow.
-            timeline_timer.stop("exposed_generation")
             timeline_timer.stop("total_step_time")
-            if should_profile:
-                generation.stop_gpu_profiling()
-                print(f"Stopped TP-worker Nsight capture after rollout step {step}")
 
         elapsed = time.perf_counter() - started
         if vllm_metrics_enabled:
@@ -389,7 +446,9 @@ def run_sync_rollout_steps(
         turns = rollout_result.rollout_metrics.get("turns_per_sample/mean")
         print(
             f"Rollout step {step}/{num_steps}: {rows} trajectory row(s), "
-            f"reward_mean={reward}, turns_mean={turns}, elapsed={elapsed:.2f}s",
+            f"reward_mean={reward}, turns_mean={turns}, elapsed={elapsed:.2f}s, "
+            f"simulated_training={train_time_s:.0f}s "
+            f"(idle_skipped={skipped:.1f}s, e2e_step={elapsed + skipped:.2f}s)",
             flush=True,
         )
 
@@ -403,6 +462,7 @@ def run_async_rollout_steps(
     num_steps: int,
     profile_step: int | None,
     timeline_timer,  # noqa: ANN001
+    train_time_s: float = 0.0,
 ) -> None:
     """Drive async GRPO's own collector and replay buffer with no trainer.
 
@@ -410,9 +470,16 @@ def run_async_rollout_steps(
     async_grpo_train runs (grpo.py), so prompt groups stream into the buffer
     and up to max_trajectory_age_steps + 1 batches are in flight. This loop
     stands in for the trainer: it samples step v's groups the way training
-    does, then advances the weight version (prepare_for_refit ->
-    set_weight_version -> resume_after_refit) without a training step or a
-    weight transfer, which releases the collector's next target.
+    does, holds the step train_time_s seconds where policy.train() would run
+    (generation keeps going, as with non-colocated training), then advances
+    the weight version (prepare_for_refit -> set_weight_version ->
+    resume_after_refit) without a weight transfer, which releases the
+    collector's next target.
+
+    The hold ends early once every target the age window allows has a full
+    batch in the buffer: the collector is then paused on its generation
+    limit and no rollout is in flight, so waiting out the rest changes
+    nothing. The skipped seconds are reported, e2e step = step + skipped.
     """
     import ray
 
@@ -427,12 +494,13 @@ def run_async_rollout_steps(
     num_generations_per_prompt = int(master_config.grpo.num_generations_per_prompt)
     max_age_steps = master_config.grpo.async_grpo.max_trajectory_age_steps
 
-    # Same buffer sizing as async_grpo_train.
+    # Same buffer sizing and lifecycle log as async_grpo_train.
     replay_buffer = ReplayBuffer.options(
         runtime_env=make_actor_runtime_env("nemo_rl.algorithms.async_utils.ReplayBuffer")
     ).remote(
         max_size=num_prompts_per_step * max_age_steps * 2,
         drop_incomplete_targets_on_restore=False,
+        lifecycle_log_path=os.environ.get("NRL_ROLLOUT_LIFECYCLE_FPATH"),
     )
     collector = AsyncTrajectoryCollector.options(
         runtime_env=make_actor_runtime_env(
@@ -456,6 +524,7 @@ def run_async_rollout_steps(
             flush=True,
         )
         step_started = time.perf_counter()
+        total_skipped = 0.0
         for weight_version in range(num_steps):
             step = weight_version + 1
             should_profile = step == profile_step and hasattr(
@@ -499,13 +568,56 @@ def run_async_rollout_steps(
                 group["rollout_metrics"].get("trajectory_duration_s", 0.0)
                 for group in groups
             )
+            # The reward a training step would see: total_reward per trajectory.
+            rewards = [
+                float(reward)
+                for group in groups
+                for reward in group["batch"]["total_reward"].tolist()
+            ]
+            reward_mean = sum(rewards) / len(rewards)
+            num_solved = sum(reward > 0 for reward in rewards)
+            # Every group has num_generations_per_prompt rows, so the mean of
+            # the per-group means is the step mean.
+            group_turns = [
+                group["rollout_metrics"]["turns_per_sample/mean"]
+                for group in groups
+                if "turns_per_sample/mean" in group["rollout_metrics"]
+            ]
+            turns_mean = (
+                sum(group_turns) / len(group_turns) if group_turns else float("nan")
+            )
+
+            # The collector targets v+1..v+max_age while step v trains.
+            def rollouts_idle() -> bool:
+                return all(
+                    ray.get(
+                        replay_buffer.has_complete_batch.remote(
+                            target, num_prompts_per_step, max_age_steps
+                        )
+                    )
+                    for target in range(
+                        weight_version + 1, weight_version + max_age_steps + 1
+                    )
+                )
 
             # Stand-in for the refit: the same collector calls training makes
             # around refit_policy_generation, with no weights moved.
+            skipped = 0.0
             try:
+                skipped = simulate_training(
+                    train_time_s,
+                    timeline_timer,
+                    check_health=lambda: ray.get(collector.check_health.remote()),
+                    rollouts_idle=rollouts_idle,
+                )
+                total_skipped += skipped
                 ray.get(collector.prepare_for_refit.remote())
+                # An in-flight refit keeps the reusable prefix cache unless KV
+                # is recomputed (vLLM's pause clear_cache, TRT-LLM's
+                # finish_weight_update), so reset it only in that case.
                 if (
                     master_config.policy["generation"]["backend"] == "trtllm"
+                    and master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates
                     and not generation.invalidate_kv_cache()
                 ):
                     raise RuntimeError(
@@ -523,6 +635,12 @@ def run_async_rollout_steps(
                 f"Rollout step {step}/{num_steps}: {len(groups)} group(s), "
                 f"{rows} trajectory row(s), step={now - step_started:.2f}s, "
                 f"exposed_generation={exposed:.2f}s, "
+                f"simulated_training={train_time_s:.0f}s "
+                f"(idle_skipped={skipped:.1f}s, "
+                f"e2e_step={now - step_started + skipped:.2f}s), "
+                f"reward_mean={reward_mean:.4f}, "
+                f"solved={num_solved}/{len(rewards)}, "
+                f"turns_mean={turns_mean:.1f}, "
                 f"avg_trajectory_age={sample['avg_trajectory_age']:.2f}, "
                 f"group_duration_s(min/median/max)="
                 f"{durations[0]:.1f}/{durations[len(durations) // 2]:.1f}/"
@@ -530,6 +648,12 @@ def run_async_rollout_steps(
                 flush=True,
             )
             step_started = now
+        if train_time_s > 0:
+            print(
+                f"GEN_ONLY_TRAIN_IDLE_SKIPPED_S {total_skipped:.1f} "
+                f"(of {num_steps} x {train_time_s:.0f}s simulated training)",
+                flush=True,
+            )
     finally:
         # Groups for later targets are still in flight; drop them with the
         # collector, as async_grpo_train does at the end of a run.
@@ -741,7 +865,8 @@ def main() -> None:
         # Step spans through NeMo-RL's Timer, so a rollout-only run can be read
         # with the same training-timeline tooling as an e2e run. There is no
         # trainer, optimizer or refit phase here, so the step-level trace is
-        # total_step_time / exposed_generation only. The Timer's timeline
+        # total_step_time / exposed_generation, plus policy_training when
+        # --train-time-s stands in for training. The Timer's timeline
         # output is a no-op unless NRL_TRAINING_TIMELINE=1 and
         # NRL_TRAINING_TIMELINE_FPATH are both set.
         from nemo_rl.utils.timer import Timer as _TimelineTimer
@@ -762,6 +887,7 @@ def main() -> None:
                 args.num_steps,
                 args.profile_step,
                 timeline_timer,
+                args.train_time_s,
             )
         else:
             run_sync_rollout_steps(
@@ -773,6 +899,7 @@ def main() -> None:
                 args.num_steps,
                 args.profile_step,
                 timeline_timer,
+                args.train_time_s,
             )
 
         print(
