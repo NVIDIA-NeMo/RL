@@ -80,7 +80,7 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import forward_pretrained_checkpoint, set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -1224,9 +1224,9 @@ def setup_single_controller(
             "Use the legacy controller for multimodal MOPD."
         )
 
-    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+    forward_pretrained_checkpoint(
+        checkpointing_config=master_config.checkpointing, policy_config=policy_config
+    )
 
     # Token capture: validate the supported combination loudly at setup
     # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with

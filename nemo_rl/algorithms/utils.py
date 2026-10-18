@@ -31,12 +31,13 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
     should_use_deepseek_v4_chat_template,
 )
-from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.telemetry.vocabulary import (
     EFFICIENCY_PCT_KEY,
     EFFICIENCY_PCT_PER_STEP_KEY,
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
 )
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
@@ -350,6 +351,28 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def forward_pretrained_checkpoint(
+    *, checkpointing_config: CheckpointingConfig, policy_config: PolicyConfig
+) -> None:
+    """Copy ``checkpointing.pretrained_checkpoint`` onto the policy config.
+
+    The Megatron policy worker reads its starting checkpoint from
+    ``policy.pretrained_checkpoint``, not from ``checkpointing``. Every algorithm
+    ``setup`` must call this before it builds the policy; one that skips it
+    silently starts from the Hugging Face weights in ``policy.model_name``.
+
+    If ``checkpointing.pretrained_checkpoint`` is unset or null, the policy
+    config is left unchanged.
+
+    Args:
+        checkpointing_config: The run's ``checkpointing`` config.
+        policy_config: The policy config to update in place.
+    """
+    pretrained_checkpoint = checkpointing_config.get("pretrained_checkpoint")
+    if pretrained_checkpoint is not None:
+        policy_config["pretrained_checkpoint"] = pretrained_checkpoint
 
 
 def get_tokenizer(

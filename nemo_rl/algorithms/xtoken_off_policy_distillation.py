@@ -48,7 +48,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     CrossTokenizerDistillationLossConfig,
     CrossTokenizerDistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import forward_pretrained_checkpoint, set_seed
 from nemo_rl.algorithms.x_token import TokenAligner
 from nemo_rl.algorithms.x_token.utils import (
     assert_teacher_student_batch_grid,
@@ -241,6 +241,10 @@ def setup(
     data_config = master_config.data
     logger_config = master_config.logger
     cluster_config = master_config.cluster
+
+    forward_pretrained_checkpoint(
+        checkpointing_config=master_config.checkpointing, policy_config=policy_config
+    )
 
     assert len(teacher_tokenizers) == len(teachers), (
         f"expected one tokenizer per teacher; got {len(teacher_tokenizers)} "

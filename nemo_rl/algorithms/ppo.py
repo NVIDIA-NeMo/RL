@@ -56,6 +56,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import (
+    forward_pretrained_checkpoint,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -366,6 +367,10 @@ def setup(
     data_config = master_config.data
     logger_config = master_config.logger
     cluster_config = master_config.cluster
+
+    forward_pretrained_checkpoint(
+        checkpointing_config=master_config.checkpointing, policy_config=policy_config
+    )
 
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(

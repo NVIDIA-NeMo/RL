@@ -25,7 +25,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss import DPOLossFn
-from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
+from nemo_rl.algorithms.utils import (
+    forward_pretrained_checkpoint,
+    maybe_pad_last_batch,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -193,9 +197,9 @@ def setup(
     checkpointing_config = master_config.checkpointing
     _validate_stop_after_step(dpo_config, algorithm_config_name)
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+    forward_pretrained_checkpoint(
+        checkpointing_config=checkpointing_config, policy_config=policy_config
+    )
 
     # Make sure we are not using dynamic batching or sequence packing.
     # Anything that changes the order of data within a batch is currently incompatible with DPO.

@@ -32,7 +32,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
 from nemo_rl.algorithms.sft import SFTConfig
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import forward_pretrained_checkpoint, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.energon.config import EnergonSourceConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
@@ -456,6 +456,10 @@ def setup_sft_v2(
 ) -> SFTV2ActorArgs:
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
     set_seed(master_config.sft.seed)
+    forward_pretrained_checkpoint(
+        checkpointing_config=master_config.checkpointing,
+        policy_config=master_config.policy,
+    )
     if master_config.data.get("backend") != "energon":
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:
