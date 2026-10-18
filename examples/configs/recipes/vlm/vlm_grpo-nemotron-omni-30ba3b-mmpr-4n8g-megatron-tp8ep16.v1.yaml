@@ -37,7 +37,6 @@ policy:
       gpu_memory_utilization: 0.6
     vllm_kwargs:
       compilation_config:
-        # Restore vLLM's default; the parent disables this fusion only for its own A/B-tested setting.
         pass_config:
           fuse_allreduce_rms: true
       max_num_batched_tokens: 32768

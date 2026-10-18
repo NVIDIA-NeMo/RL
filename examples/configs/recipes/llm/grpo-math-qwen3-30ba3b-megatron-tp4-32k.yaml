@@ -37,7 +37,7 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
-      # CUDA graphs (PIECEWISE) instead of enforce_eager: generation/step -74%, wall 123 -> 57 min. FULL_AND_PIECEWISE was 3% faster but spiked token_mult_prob_error at step 1 (1.30). Logprob gates unchanged (same-window A/B on cw_dfw H100, see the rollout-perf skill).
+      # PIECEWISE CUDA graphs instead of enforce_eager (~4x faster generation), see #4569
     vllm_kwargs:
       compilation_config:
         cudagraph_mode: PIECEWISE

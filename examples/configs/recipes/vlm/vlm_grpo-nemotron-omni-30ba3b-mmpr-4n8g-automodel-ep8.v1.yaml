@@ -78,7 +78,7 @@ policy:
     - <so_end>
     vllm_cfg:
       tensor_parallel_size: 8
-      # CUDA graphs (vLLM default FULL_AND_PIECEWISE) instead of enforce_eager: generation/step -73%, wall 81 -> 41 min. Logprob gates unchanged (same-window A/B on cw_dfw H100, see the rollout-perf skill).
+      # CUDA graphs instead of enforce_eager (~3.7x faster generation), see #4569
       cap_max_tokens_to_context: true
       logprobs_mode: raw_logprobs
       gpu_memory_utilization: 0.5

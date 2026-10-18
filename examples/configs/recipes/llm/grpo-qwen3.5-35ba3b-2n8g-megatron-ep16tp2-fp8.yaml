@@ -38,7 +38,7 @@ policy:
       - visual
     vllm_kwargs:
       compilation_config:
-        # PIECEWISE instead of the parent's FULL_AND_PIECEWISE: FULL graphs left 833 Mamba cache blocks for max_num_seqs 1024 and vLLM failed at startup. With PIECEWISE: generation/step -85%, wall 174 -> 79 min, logprob gates unchanged.
+        # PIECEWISE instead of the parent's FULL_AND_PIECEWISE, see #4569
         cudagraph_mode: PIECEWISE
 logger:
   wandb:
