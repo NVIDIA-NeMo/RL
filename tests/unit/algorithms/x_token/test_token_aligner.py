@@ -320,7 +320,16 @@ def test_per_asst_whole_message_plus_eot():
     t_off = [(0, 8), (8, 13), (13, 19), (19, 25)]
 
     pairs = aligner.align_one_offset_per_asst(
-        s_ids, s_off, [(10, 21)], t_ids, t_off, [(8, 19)]
+        s_ids,
+        s_off,
+        [(10, 21)],
+        t_ids,
+        t_off,
+        [(8, 19)],
+        student_asst_mask=[0, 1, 1, 1],
+        teacher_asst_mask=[0, 1, 1, 1],
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
     )
     assert all(isinstance(pair, AlignmentPair) for pair in pairs)
     positions = [(p.s_start, p.s_end, p.t_start, p.t_end) for p in pairs]
@@ -349,6 +358,10 @@ def test_per_asst_uses_shared_strict_decoded_matcher():
             [20, 98],
             [(20, 21), (21, 22)],
             [(20, 21)],
+            student_asst_mask=[1, 1],
+            teacher_asst_mask=[1, 1],
+            student_eot_indices=[1],
+            teacher_eot_indices=[1],
         )
 
     helper.assert_called_once_with(
@@ -388,6 +401,10 @@ def test_per_asst_drop_first_content_pair():
         t_ids,
         t_off,
         [(8, 19)],
+        student_asst_mask=[0, 1, 1, 1],
+        teacher_asst_mask=[0, 1, 1, 1],
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
         drop_first_content_pair=True,
     )
     positions = [(p.s_start, p.s_end, p.t_start, p.t_end) for p in pairs]
@@ -418,6 +435,8 @@ def test_per_asst_native_regions_and_included_regions():
         t_ids,
         t_off,
         [(2, 8)],
+        student_asst_mask=[0, 1, 1, 1],
+        teacher_asst_mask=[0, 1, 1, 1],
         student_alignment_regions=s_regions,
         teacher_alignment_regions=t_regions,
         student_eot_indices=[3],
@@ -437,6 +456,8 @@ def test_per_asst_native_regions_and_included_regions():
         t_ids,
         t_off,
         [(2, 8)],
+        student_asst_mask=[0, 1, 1, 1],
+        teacher_asst_mask=[0, 1, 1, 1],
         student_alignment_regions=s_regions,
         teacher_alignment_regions=t_regions,
         student_eot_indices=[3],
@@ -491,6 +512,8 @@ def test_align_chat_batches_multiple_turns_with_different_template_offsets(
             [[0, 1, 1, 1, 0, 1, 1, 0], [0, 1, 1, 0, 0, 0, 0, 0]]
         ),
         teacher_asst_mask=torch.tensor([[0, 1, 1, 0, 1, 1, 0], [0, 1, 1, 0, 0, 0, 0]]),
+        student_eot_indices=[[3, 6], [2]],
+        teacher_eot_indices=[[2, 5], [2]],
         drop_first_content_pair=drop_first,
     )
 
@@ -549,6 +572,10 @@ def test_align_chat_explicit_eot_skips_whitespace_and_handles_missing_eot(
         teacher_offsets=teacher_offsets,
         student_asst_char_spans=[[(5, 7)]],
         teacher_asst_char_spans=[[(9, 11)]],
+        student_asst_mask=torch.tensor([[0, 1, 0, 1]]),
+        teacher_asst_mask=torch.tensor(
+            [[0, 1, 0]] if teacher_missing_eot else [[0, 1, 0, 1]]
+        ),
         student_eot_indices=[[3]],
         teacher_eot_indices=[[-1 if teacher_missing_eot else 3]],
     )
@@ -576,6 +603,8 @@ def test_align_chat_routes_semantic_regions_and_excludes_attention_masked_tokens
         teacher_offsets=offsets,
         student_asst_char_spans=[[(3, 10)]],
         teacher_asst_char_spans=[[(3, 10)]],
+        student_asst_mask=torch.tensor([[1, 1, 1]]),
+        teacher_asst_mask=torch.tensor([[1, 1, 1]]),
         student_alignment_regions=[[{"reasoning": (3, 4), "answer": (9, 10)}]],
         teacher_alignment_regions=[[{"reasoning": (3, 4), "answer": (9, 10)}]],
         student_eot_indices=[[2]],
@@ -610,4 +639,80 @@ def test_align_chat_preserves_per_turn_validation():
             teacher_offsets=offsets,
             student_asst_char_spans=[[(0, 2)]],
             teacher_asst_char_spans=[[]],
+            student_asst_mask=torch.tensor([[1]]),
+            teacher_asst_mask=torch.tensor([[0]]),
+            student_eot_indices=[[-1]],
+            teacher_eot_indices=[[]],
+        )
+
+
+@pytest.mark.parametrize("side", ["student", "teacher"])
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("asst_mask", torch.tensor([1]), "{side}_asst_mask must have shape"),
+        ("asst_mask", torch.tensor([[1, 1]]), "{side}_asst_mask must have shape"),
+        ("eot_indices", [[]], "EOT index count must match assistant turns"),
+        (
+            "eot_indices",
+            [[-2]],
+            "{side} EOT indices must be -1 or valid token positions",
+        ),
+        (
+            "eot_indices",
+            [[1]],
+            "{side} EOT indices must be -1 or valid token positions",
+        ),
+    ],
+    ids=["mask-rank", "mask-length", "eot-count", "eot-negative", "eot-range"],
+)
+def test_align_chat_rejects_invalid_required_metadata(
+    side: str,
+    field: str,
+    value: torch.Tensor | list[list[int]],
+    error: str,
+) -> None:
+    """Malformed masks and EOT positions fail before tokens can be misaligned."""
+    aligner = _chat_aligner({1: "Hi"}, {1: "Hi"})
+    ids = torch.tensor([[1]])
+    offsets = torch.tensor([[(0, 2)]])
+    metadata = {
+        "student_asst_mask": torch.tensor([[1]]),
+        "teacher_asst_mask": torch.tensor([[1]]),
+        "student_eot_indices": [[-1]],
+        "teacher_eot_indices": [[-1]],
+    }
+    metadata[f"{side}_{field}"] = value
+    with pytest.raises(ValueError, match=error.format(side=side)):
+        aligner.align_chat(
+            ids,
+            ids,
+            student_offsets=offsets,
+            teacher_offsets=offsets,
+            student_asst_char_spans=[[(0, 2)]],
+            teacher_asst_char_spans=[[(0, 2)]],
+            **metadata,
+        )
+
+
+@pytest.mark.parametrize("side", ["student", "teacher"])
+@pytest.mark.parametrize("mask", [[], [1, 1]], ids=["too-short", "too-long"])
+def test_per_asst_rejects_mask_length_mismatch(side: str, mask: list[int]) -> None:
+    """Direct per-sample callers must supply one mask value for every token."""
+    aligner = _chat_aligner({1: "Hi"}, {1: "Hi"})
+    masks = {"student_asst_mask": [1], "teacher_asst_mask": [1]}
+    masks[f"{side}_asst_mask"] = mask
+    with pytest.raises(
+        ValueError, match=f"{side}_asst_mask must have one entry per token"
+    ):
+        aligner.align_one_offset_per_asst(
+            [1],
+            [(0, 2)],
+            [(0, 2)],
+            [1],
+            [(0, 2)],
+            [(0, 2)],
+            student_eot_indices=[-1],
+            teacher_eot_indices=[-1],
+            **masks,
         )

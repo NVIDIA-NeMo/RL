@@ -43,6 +43,10 @@ def test_native_part_coalesces_nfc_offsets_without_changing_token_ids(structured
         [7],
         [(0, 1)],
         [(0, 2)],
+        student_asst_mask=[1, 1],
+        teacher_asst_mask=[1],
+        student_eot_indices=[-1],
+        teacher_eot_indices=[-1],
         student_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
         teacher_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
         student_answer_parts=[[part]] if structured_parts else None,
@@ -76,6 +80,10 @@ def test_native_inline_content_coalesces_nested_checkmark_offsets():
         [0],
         [(0, 2)],
         [(0, 2)],
+        student_asst_mask=[1, 1],
+        teacher_asst_mask=[1],
+        student_eot_indices=[-1],
+        teacher_eot_indices=[-1],
         student_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
         teacher_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
         student_rendered_text=" ✓",
@@ -113,6 +121,10 @@ def test_native_part_consumes_all_unicode_byte_tokens(text):
         [0, 1],
         [(0, 1)] * 2,
         [(0, 1)],
+        student_asst_mask=[1] * len(encoded),
+        teacher_asst_mask=[1, 1],
+        student_eot_indices=[-1],
+        teacher_eot_indices=[-1],
         student_alignment_regions=[NativeAlignmentRegions(answer=(0, 1))],
         teacher_alignment_regions=[NativeAlignmentRegions(answer=(0, 1))],
         student_answer_parts=[[part]],
@@ -384,6 +396,8 @@ def test_text_and_chat_use_identical_strict_decoded_matching(
         teacher_offsets=offsets + 20,
         student_asst_char_spans=[[(10, 11)]],
         teacher_asst_char_spans=[[(20, 21)]],
+        student_asst_mask=torch.tensor([[1]]),
+        teacher_asst_mask=torch.tensor([[1]]),
         student_eot_indices=[[-1]],
         teacher_eot_indices=[[-1]],
     )
@@ -415,6 +429,10 @@ def test_native_unicode_repair_rejects_equal_replacement_decodes(source):
             teacher_offsets=torch.tensor([[(0, 1)]]),
             student_asst_char_spans=[[(0, 1)]],
             teacher_asst_char_spans=[[(0, 1)]],
+            student_asst_mask=torch.tensor([[1]]),
+            teacher_asst_mask=torch.tensor([[1]]),
+            student_eot_indices=[[-1]],
+            teacher_eot_indices=[[-1]],
             student_alignment_regions=[[NativeAlignmentRegions(answer=(0, 1))]],
             teacher_alignment_regions=[[NativeAlignmentRegions(answer=(0, 1))]],
             student_rendered_texts=[source],
@@ -435,6 +453,10 @@ def test_native_unicode_repair_preserves_whitespace():
             [1],
             [(0, 2)],
             [(0, 2)],
+            student_asst_mask=[1],
+            teacher_asst_mask=[1],
+            student_eot_indices=[-1],
+            teacher_eot_indices=[-1],
             student_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
             teacher_alignment_regions=[NativeAlignmentRegions(answer=(0, 2))],
             student_rendered_text=" x",
@@ -454,6 +476,8 @@ def test_public_native_api_repairs_unicode_and_preserves_original_indices():
         teacher_offsets=torch.tensor([[(0, 4), (4, 5), (6, 9)]]),
         student_asst_char_spans=[[(2, 4)]],
         teacher_asst_char_spans=[[(4, 6)]],
+        student_asst_mask=torch.tensor([[0, 1, 1, 1]]),
+        teacher_asst_mask=torch.tensor([[0, 1, 1]]),
         student_alignment_regions=[[NativeAlignmentRegions(answer=(2, 4))]],
         teacher_alignment_regions=[[NativeAlignmentRegions(answer=(4, 6))]],
         student_answer_parts=[
@@ -489,6 +513,8 @@ def test_public_native_api_repairs_unicode_and_preserves_original_indices():
 def test_public_native_api_validates_every_metadata_batch_size(field):
     tokenizer = _OffsetTokenizer({1: "x"})
     aligner = TokenAligner(tokenizer, tokenizer, "/unused")
+    metadata = {"student_eot_indices": [[-1]], "teacher_eot_indices": [[-1]]}
+    metadata[field] = []
     with pytest.raises(ValueError, match=f"{field} must have one entry"):
         aligner.align_chat(
             torch.tensor([[1]]),
@@ -497,7 +523,9 @@ def test_public_native_api_validates_every_metadata_batch_size(field):
             teacher_offsets=torch.tensor([[(0, 1)]]),
             student_asst_char_spans=[[(0, 1)]],
             teacher_asst_char_spans=[[(0, 1)]],
-            **{field: []},
+            student_asst_mask=torch.tensor([[1]]),
+            teacher_asst_mask=torch.tensor([[1]]),
+            **metadata,
         )
 
 
@@ -525,6 +553,8 @@ def test_synthetic_eot_requires_surface_equality_or_both_eos(
         [1],
         [(0, 1)],
         [(0, 0)],
+        student_asst_mask=[1],
+        teacher_asst_mask=[1],
         student_eot_indices=[0],
         teacher_eot_indices=[0],
     )
@@ -580,6 +610,10 @@ def test_native_scalar_differences_are_limited_to_same_boolean_or_null(
         teacher_ids=[1],
         teacher_offsets=[(0, len(teacher_text))],
         teacher_asst_char_spans=[(0, len(teacher_text))],
+        student_asst_mask=[1],
+        teacher_asst_mask=[1],
+        student_eot_indices=[-1],
+        teacher_eot_indices=[-1],
         student_alignment_regions=[
             NativeAlignmentRegions(answer=(0, len(student_text)))
         ],
@@ -631,6 +665,10 @@ def test_native_answer_parts_must_match_rendered_source():
             [1],
             [(0, 1)],
             [(0, 1)],
+            student_asst_mask=[1],
+            teacher_asst_mask=[1],
+            student_eot_indices=[-1],
+            teacher_eot_indices=[-1],
             student_alignment_regions=[NativeAlignmentRegions(answer=(0, 1))],
             teacher_alignment_regions=[NativeAlignmentRegions(answer=(0, 1))],
             student_answer_parts=[[part]],

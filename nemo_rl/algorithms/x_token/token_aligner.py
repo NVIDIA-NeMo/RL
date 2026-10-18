@@ -365,12 +365,12 @@ class TokenAligner:
         teacher_offsets: torch.Tensor,
         student_asst_char_spans: list[list[tuple[int, int]]],
         teacher_asst_char_spans: list[list[tuple[int, int]]],
+        student_asst_mask: torch.Tensor,
+        teacher_asst_mask: torch.Tensor,
+        student_eot_indices: list[list[int]],
+        teacher_eot_indices: list[list[int]],
         student_attention_mask: torch.Tensor | None = None,
         teacher_attention_mask: torch.Tensor | None = None,
-        student_asst_mask: torch.Tensor | None = None,
-        teacher_asst_mask: torch.Tensor | None = None,
-        student_eot_indices: list[list[int]] | None = None,
-        teacher_eot_indices: list[list[int]] | None = None,
         student_alignment_regions: list[list[NativeAlignmentRegions]] | None = None,
         teacher_alignment_regions: list[list[NativeAlignmentRegions]] | None = None,
         student_answer_parts: list[list[list[NativeAlignmentPart] | None]]
@@ -392,16 +392,16 @@ class TokenAligner:
             student_asst_char_spans: Per-sample assistant content spans in the
                 student renders. Turns must correspond to the teacher spans.
             teacher_asst_char_spans: Counterpart in the teacher renders.
+            student_asst_mask: ``[B, T_s]`` mask selecting tokens
+                within assistant content regions.
+            teacher_asst_mask: ``[B, T_t]`` counterpart.
+            student_eot_indices: Per-sample, per-turn EOT positions.
+                Use ``-1`` when the render has no terminator token after the
+                content.
+            teacher_eot_indices: Counterpart for the teacher tokens.
             student_attention_mask: Optional ``[B, T_s]`` real-token mask.
                 Padding is excluded from the returned chunk IDs.
             teacher_attention_mask: Optional ``[B, T_t]`` counterpart.
-            student_asst_mask: Optional ``[B, T_s]`` mask selecting tokens
-                within assistant content regions.
-            teacher_asst_mask: Optional ``[B, T_t]`` counterpart.
-            student_eot_indices: Optional per-sample, per-turn EOT positions.
-                Use ``-1`` when the render has no terminator token after the
-                content. If omitted, locate EOT by the end of the content span.
-            teacher_eot_indices: Counterpart for the teacher tokens.
             student_alignment_regions: Optional per-sample, per-turn named
                 reasoning, close, and answer character spans.
             teacher_alignment_regions: Counterpart for the teacher renders.
@@ -444,17 +444,19 @@ class TokenAligner:
         ):
             if offsets.shape != (*ids.shape, 2):
                 raise ValueError(f"{name}_offsets must have shape [B, T, 2]")
-            for mask_name, mask in (
-                ("attention_mask", attention_mask),
-                ("asst_mask", asst_mask),
-            ):
-                if mask is not None and mask.shape != ids.shape:
-                    raise ValueError(f"{name}_{mask_name} must have shape [B, T]")
+            if attention_mask is not None and attention_mask.shape != ids.shape:
+                raise ValueError(f"{name}_attention_mask must have shape [B, T]")
+            if asst_mask.shape != ids.shape:
+                raise ValueError(f"{name}_asst_mask must have shape [B, T]")
         for name, values in (
             ("student_asst_char_spans", student_asst_char_spans),
             ("teacher_asst_char_spans", teacher_asst_char_spans),
             ("student_eot_indices", student_eot_indices),
             ("teacher_eot_indices", teacher_eot_indices),
+        ):
+            if len(values) != b:
+                raise ValueError(f"{name} must have one entry per batch sample ({b})")
+        for name, values in (
             ("student_alignment_regions", student_alignment_regions),
             ("teacher_alignment_regions", teacher_alignment_regions),
             ("student_answer_parts", student_answer_parts),
@@ -476,26 +478,10 @@ class TokenAligner:
                         teacher_ids[i].tolist(),
                         [tuple(offset) for offset in teacher_offsets[i].tolist()],
                         teacher_asst_char_spans[i],
-                        student_asst_mask=(
-                            student_asst_mask[i].tolist()
-                            if student_asst_mask is not None
-                            else None
-                        ),
-                        teacher_asst_mask=(
-                            teacher_asst_mask[i].tolist()
-                            if teacher_asst_mask is not None
-                            else None
-                        ),
-                        student_eot_indices=(
-                            student_eot_indices[i]
-                            if student_eot_indices is not None
-                            else None
-                        ),
-                        teacher_eot_indices=(
-                            teacher_eot_indices[i]
-                            if teacher_eot_indices is not None
-                            else None
-                        ),
+                        student_asst_mask=student_asst_mask[i].tolist(),
+                        teacher_asst_mask=teacher_asst_mask[i].tolist(),
+                        student_eot_indices=student_eot_indices[i],
+                        teacher_eot_indices=teacher_eot_indices[i],
                         student_alignment_regions=(
                             student_alignment_regions[i]
                             if student_alignment_regions is not None
@@ -671,12 +657,12 @@ class TokenAligner:
         teacher_offsets: List[Tuple[int, int]],
         teacher_asst_char_spans: List[Tuple[int, int]],
         *,
-        student_asst_mask: List[int] | None = None,
-        teacher_asst_mask: List[int] | None = None,
+        student_asst_mask: List[int],
+        teacher_asst_mask: List[int],
+        student_eot_indices: List[int],
+        teacher_eot_indices: List[int],
         student_alignment_regions: List[NativeAlignmentRegions] | None = None,
         teacher_alignment_regions: List[NativeAlignmentRegions] | None = None,
-        student_eot_indices: List[int] | None = None,
-        teacher_eot_indices: List[int] | None = None,
         student_answer_parts: List[List[NativeAlignmentPart] | None] | None = None,
         teacher_answer_parts: List[List[NativeAlignmentPart] | None] | None = None,
         student_rendered_text: str | None = None,
@@ -698,6 +684,10 @@ class TokenAligner:
         separate native pieces. Template-only separators, differently rendered
         scalar values, and tokens crossing those piece boundaries keep CE but
         are not compared as exact-text KD events.
+
+        Both sides must supply an assistant mask with one entry per token and
+        an EOT index for each assistant turn. Use ``-1`` when a rendered turn
+        has no terminator token after its content.
         """
         if len(student_asst_char_spans) != len(teacher_asst_char_spans):
             raise ValueError(
@@ -712,12 +702,9 @@ class TokenAligner:
             or len(teacher_alignment_regions or []) != len(teacher_asst_char_spans)
         ):
             raise ValueError("alignment-region count must match assistant turns")
-        if (student_eot_indices is None) != (teacher_eot_indices is None):
-            raise ValueError("student/teacher EOT index lists must be paired")
-        if student_eot_indices is not None and (
-            len(student_eot_indices) != len(student_asst_char_spans)
-            or len(teacher_eot_indices or []) != len(teacher_asst_char_spans)
-        ):
+        if len(student_eot_indices) != len(student_asst_char_spans) or len(
+            teacher_eot_indices
+        ) != len(teacher_asst_char_spans):
             raise ValueError("EOT index count must match assistant turns")
         if (student_answer_parts is None) != (teacher_answer_parts is None):
             raise ValueError("student/teacher native answer parts must be paired")
@@ -730,13 +717,13 @@ class TokenAligner:
             raise ValueError("student/teacher rendered native texts must be paired")
         if student_answer_parts is not None and student_alignment_regions is None:
             raise ValueError("native answer parts require semantic alignment regions")
-        for side, indices, ids in (
-            ("student", student_eot_indices, student_ids),
-            ("teacher", teacher_eot_indices, teacher_ids),
+        for side, indices, ids, asst_mask in (
+            ("student", student_eot_indices, student_ids, student_asst_mask),
+            ("teacher", teacher_eot_indices, teacher_ids, teacher_asst_mask),
         ):
-            if indices is not None and any(
-                index < -1 or index >= len(ids) for index in indices
-            ):
+            if len(asst_mask) != len(ids):
+                raise ValueError(f"{side}_asst_mask must have one entry per token")
+            if any(index < -1 or index >= len(ids) for index in indices):
                 raise ValueError(
                     f"{side} EOT indices must be -1 or valid token positions"
                 )
@@ -875,12 +862,9 @@ class TokenAligner:
                     and end > s_region_start
                     and (
                         (start >= s_region_start and end <= s_region_end)
-                        or (
-                            student_alignment_regions is None
-                            and student_asst_mask is not None
-                        )
+                        or student_alignment_regions is None
                     )
-                    and (student_asst_mask is None or student_asst_mask[i] == 1)
+                    and student_asst_mask[i] == 1
                 ]
                 t_indices = [
                     i
@@ -890,12 +874,9 @@ class TokenAligner:
                     and end > t_region_start
                     and (
                         (start >= t_region_start and end <= t_region_end)
-                        or (
-                            teacher_alignment_regions is None
-                            and teacher_asst_mask is not None
-                        )
+                        or teacher_alignment_regions is None
                     )
-                    and (teacher_asst_mask is None or teacher_asst_mask[i] == 1)
+                    and teacher_asst_mask[i] == 1
                 ]
                 if not s_indices or not t_indices:
                     continue
@@ -967,26 +948,8 @@ class TokenAligner:
             include_eot = included is None or "eot" in included
             if not include_eot:
                 continue
-            if student_eot_indices is None:
-                s_eot = next(
-                    (
-                        i
-                        for i, (start, end) in enumerate(student_offsets)
-                        if start == s_end and end > start
-                    ),
-                    -1,
-                )
-                t_eot = next(
-                    (
-                        i
-                        for i, (start, end) in enumerate(teacher_offsets)
-                        if start == t_end and end > start
-                    ),
-                    -1,
-                )
-            else:
-                s_eot = student_eot_indices[turn_i]
-                t_eot = (teacher_eot_indices or [])[turn_i]
+            s_eot = student_eot_indices[turn_i]
+            t_eot = teacher_eot_indices[turn_i]
             if s_eot >= 0 and t_eot >= 0:
                 student_eot_id = int(student_ids[s_eot])
                 teacher_eot_id = int(teacher_ids[t_eot])
