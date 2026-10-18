@@ -84,10 +84,11 @@ def megatron_conversion_is_complete(pretrained_path: str) -> bool:
     storage_data = getattr(metadata, "storage_data", None)
     if not storage_data:
         return False
+    relative_paths = {item.relative_path for item in storage_data.values()}
     return all(
-        os.path.isfile(os.path.join(iteration_path, item.relative_path))
-        and os.path.getsize(os.path.join(iteration_path, item.relative_path)) > 0
-        for item in storage_data.values()
+        os.path.isfile(path := os.path.join(iteration_path, relative_path))
+        and os.path.getsize(path) > 0
+        for relative_path in relative_paths
     )
 
 
