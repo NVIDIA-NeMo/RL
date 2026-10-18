@@ -598,6 +598,32 @@ def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
     )
 
 
+VLLM_CONTEXT_PARALLEL_KEYS = (
+    "decode_context_parallel_size",
+    "prefill_context_parallel_size",
+)
+
+
+def vllm_context_parallel_violations(generation_cfg: dict[str, Any]) -> list[str]:
+    """Return one message for each vLLM context-parallel size that is not 1.
+
+    VllmSpecificArgs has no context-parallel field, so users set these sizes
+    through vllm_kwargs. The check also reads vllm_cfg for configs that set
+    them there.
+    """
+    violations = []
+    for section in ("vllm_cfg", "vllm_kwargs"):
+        section_cfg = generation_cfg.get(section) or {}
+        for key in VLLM_CONTEXT_PARALLEL_KEYS:
+            size = section_cfg.get(key) or 1
+            if size != 1:
+                violations.append(
+                    f"policy.generation.{section}.{key} must be 1 for "
+                    f"nccl_reshard refit (got {size})."
+                )
+    return violations
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -865,7 +891,6 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     if backend == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
-        gen_cp = vllm_cfg.get("context_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
         # Megatron-source ETP has unit coverage but has not been fully tested
         # end to end with a vLLM destination. Keep it disabled until it has.
@@ -885,11 +910,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             violations.append(
                 f"policy.generation.vllm_cfg.pipeline_parallel_size must be 1 (got {gen_pp})."
             )
-        if gen_cp != 1:
-            violations.append(
-                "policy.generation.vllm_cfg.context_parallel_size must be 1 "
-                f"(got {gen_cp})."
-            )
+        violations.extend(vllm_context_parallel_violations(generation))
 
     if violations:
         raise ValueError(

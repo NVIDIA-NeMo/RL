@@ -56,6 +56,7 @@ from nemo_rl.weight_sync.membership import (
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
+    vllm_context_parallel_violations,
 )
 
 
@@ -252,13 +253,10 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         """Build both communicator families and the refit plan, over the whole fleet."""
         generation_cfg = self._policy.cfg["generation"]
         if generation_cfg["backend"] == "vllm":
-            vllm_cfg = generation_cfg.get("vllm_cfg", {})
-            gen_cp_size = vllm_cfg.get("context_parallel_size", 1)
-            if gen_cp_size != 1:
-                raise ValueError(
-                    "policy.generation.vllm_cfg.context_parallel_size must be 1 "
-                    f"(got {gen_cp_size})."
-                )
+            # Reject before any collective, also for callers that skip the setup check.
+            violations = vllm_context_parallel_violations(generation_cfg)
+            if violations:
+                raise ValueError("\n".join(violations))
 
         self._build(
             desired_membership(

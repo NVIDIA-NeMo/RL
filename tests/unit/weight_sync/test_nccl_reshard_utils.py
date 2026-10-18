@@ -119,14 +119,30 @@ def test_check_nccl_reshard_refit_support_accepts_valid_config() -> None:
     check_nccl_reshard_refit_support(_valid_nccl_reshard_config())
 
 
-def test_check_nccl_reshard_refit_support_rejects_generation_context_parallelism() -> (
-    None
-):
+@pytest.mark.parametrize("section", ["vllm_cfg", "vllm_kwargs"])
+@pytest.mark.parametrize(
+    "key", ["decode_context_parallel_size", "prefill_context_parallel_size"]
+)
+def test_check_nccl_reshard_refit_support_rejects_generation_context_parallelism(
+    section: str, key: str
+) -> None:
     config = _valid_nccl_reshard_config()
-    config.policy["generation"]["vllm_cfg"]["context_parallel_size"] = 2
+    config.policy["generation"].setdefault(section, {})[key] = 2
 
-    with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+    with pytest.raises(
+        ValueError, match=rf"policy\.generation\.{section}\.{key} must be 1 .*\(got 2\)"
+    ):
         check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_unit_context_parallelism() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+    }
+
+    check_nccl_reshard_refit_support(config)
 
 
 def test_check_nccl_reshard_refit_support_rejects_megatron_etp_with_vllm() -> None:

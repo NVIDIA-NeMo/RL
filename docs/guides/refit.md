@@ -71,6 +71,8 @@ colocated generation.
 
 With `refit_transport: nccl_reshard`, a Megatron trainer can send draft weights
 from its TP, PP, and CP lanes to vLLM. The vLLM generation layout must use CP1.
+Setup rejects a `decode_context_parallel_size` or `prefill_context_parallel_size`
+value other than 1 in `vllm_kwargs` or `vllm_cfg`.
 This transport support does not, by itself, enable a draft-training layout;
 configure a supported training path separately. The vLLM reload API does not
 support trainer-owned draft weights.

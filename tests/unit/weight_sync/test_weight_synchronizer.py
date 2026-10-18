@@ -853,7 +853,8 @@ class TestNcclReshardWeightSynchronizer:
                 "megatron_cfg": {},
                 "generation": {
                     "backend": "vllm",
-                    "vllm_cfg": {"context_parallel_size": 2},
+                    "vllm_cfg": {},
+                    "vllm_kwargs": {"decode_context_parallel_size": 2},
                 },
             },
         )
@@ -862,7 +863,10 @@ class TestNcclReshardWeightSynchronizer:
             policy, generation, _mock_cluster(), _mock_cluster()
         )
 
-        with pytest.raises(ValueError, match="context_parallel_size must be 1"):
+        with pytest.raises(
+            ValueError,
+            match=r"vllm_kwargs\.decode_context_parallel_size must be 1",
+        ):
             sync.init_communicator()
 
         policy.init_collective.assert_not_called()
