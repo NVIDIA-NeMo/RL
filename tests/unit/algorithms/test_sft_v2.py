@@ -615,3 +615,15 @@ def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    existing = {"format": "megatron_bridge", "path": "/policy-level"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.policy["pretrained_checkpoint"] = existing
+    config.checkpointing["pretrained_checkpoint"] = None
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy["pretrained_checkpoint"] == existing
