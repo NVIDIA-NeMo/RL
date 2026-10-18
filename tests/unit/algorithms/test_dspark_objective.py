@@ -615,6 +615,23 @@ def test_confidence_can_be_disabled_without_changing_ce_or_tv() -> None:
     torch.testing.assert_close(disabled.confidence.counts, torch.zeros(3))
 
 
+def test_confidence_targets_survive_a_permuted_dense_valid_mask() -> None:
+    inputs = _inputs()
+    contiguous = dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
+
+    permuted = _inputs()
+    valid_mask = permuted["valid_mask"]
+    assert isinstance(valid_mask, torch.Tensor)
+    permuted["valid_mask"] = valid_mask.t().contiguous().t()
+    assert not permuted["valid_mask"].is_contiguous()
+    actual = dspark_tiled_objective(**permuted, loss_weights=(1.0, 1.0, 1.0))
+
+    assert contiguous.confidence.numerators.abs().sum() > 0
+    torch.testing.assert_close(
+        actual.confidence.numerators, contiguous.confidence.numerators
+    )
+
+
 def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
     """Match the pinned Speculators selected-logit, renormalized overlap target."""
     full_target_logits = torch.tensor(

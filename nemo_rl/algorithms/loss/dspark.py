@@ -339,8 +339,11 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
             num_bins, dtype=torch.float32, device=draft_hidden.device
         )
         tv_numerators = torch.zeros_like(ce_numerators)
-        acceptance_targets = torch.zeros_like(valid_mask, dtype=torch.float32)
-        flat_acceptance = acceptance_targets.reshape(-1)
+        # Allocate flat so the per-tile writes cannot land in a reshape copy
+        # when valid_mask is dense but permuted.
+        flat_acceptance = torch.zeros(
+            flat_valid.numel(), dtype=torch.float32, device=valid_mask.device
+        )
         log_normalizers = torch.empty(
             (flat_hidden.shape[0], 2),
             dtype=torch.float32,
@@ -429,6 +432,7 @@ class _TiledProjectedHardCEAndTV(torch.autograd.Function):
         ctx.token_chunk_size = token_chunk_size
         ctx.vocab_start = vocab_start  # pyrefly: ignore[implicitly-defined-attribute]
         ctx.tp_group = tp_group  # pyrefly: ignore[implicitly-defined-attribute]
+        acceptance_targets = flat_acceptance.view(valid_mask.shape)
         ctx.mark_non_differentiable(acceptance_targets)
         return ce_numerators, tv_numerators, acceptance_targets
 
