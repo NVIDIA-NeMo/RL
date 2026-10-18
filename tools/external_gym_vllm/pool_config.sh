@@ -15,6 +15,11 @@
 
 # Public shell interface for registering external Gym vLLM pools before sbatch.
 
+# Token a submission command must contain; run_in_allocation.sh replaces it with
+# the Hydra override that gates Gym rollouts on external pool health. Keep in
+# sync with run_in_allocation.sh.
+EXTERNAL_SERVICE_READINESS_PLACEHOLDER="__EXTERNAL_SERVICE_READINESS__"
+
 _external_vllm_set() {
   local pool="$1" suffix="$2" value="$3"
   printf -v "${pool}_${suffix}" '%s' "${value}"
@@ -258,6 +263,10 @@ validate_external_vllm_submission() {
       return 2
     fi
   done
+  if [[ "${command}" != *"${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"* ]]; then
+    echo "ERROR: submission command is missing ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} for the external-service readiness gate" >&2
+    return 2
+  fi
 
   for variable_name in BASE_LOG_DIR EXTERNAL_VLLM_TOOLS_DIR_HOST; do
     path="${!variable_name-}"
@@ -297,4 +306,92 @@ external_vllm_pool_args() {
     return 2
   fi
   _external_vllm_append_lines "${pool}" VLLM_ARGS "$@"
+}
+
+# Persistent pools (run_in_allocation.sh, EXTERNAL_VLLM_MODE=serve). A launcher
+# that registers its pools as above calls these two instead of submitting a
+# heterogeneous job:
+#
+#   pool_job=$(submit_external_vllm_pool_job "${POOL_DIR}" --account=... --time=12:00:00)
+#   submit_external_vllm_attached_job "${POOL_DIR}" "${pool_job}" "${COMMAND}" --account=... --nodes=...
+#
+# The pool job is only submitted when no live job serves POOL_DIR, so the same
+# launcher both starts a cold pool and reattaches to a warm one.
+
+# submit_external_vllm_pool_job POOL_DIR [SBATCH_ARG...]: print the id of the live
+# pool job serving POOL_DIR, submitting one sized to the registered pools if
+# there is none. Needs BASE_LOG_DIR, CONTAINER, MOUNTS and EXTERNAL_VLLM_TOOLS_DIR_HOST.
+submit_external_vllm_pool_job() {
+  local pool_dir="${1:?pool directory required}"
+  shift
+  local live_job submitted
+  if [[ -z "${EXTERNAL_VLLM_POOLS:-}" ]]; then
+    echo "ERROR: no external vLLM pools are registered" >&2
+    return 2
+  fi
+  _external_vllm_require_shared_path EXTERNAL_VLLM_POOL_DIR "${pool_dir}" || return
+  # shellcheck source=pool_dir.sh
+  source "${EXTERNAL_VLLM_TOOLS_DIR_HOST:?EXTERNAL_VLLM_TOOLS_DIR_HOST is required}/pool_dir.sh"
+  if ! live_job=$(external_vllm_pool_dir_live_job "${pool_dir}"); then
+    echo "ERROR: could not query Slurm for the pool job serving ${pool_dir}" >&2
+    return 2
+  fi
+  if [[ -n "${live_job}" ]]; then
+    echo "INFO: reusing live pool job ${live_job} for ${pool_dir}" >&2
+    printf '%s\n' "${live_job}"
+    return 0
+  fi
+  mkdir -p "${pool_dir}"
+  submitted=$(
+    EXTERNAL_VLLM_MODE=serve EXTERNAL_VLLM_POOL_DIR="${pool_dir}" \
+      sbatch --parsable --nodes="${EXTERNAL_VLLM_NUM_NODES}" --exclusive --gres="gpu:${GPUS_PER_NODE:-4}" --export=ALL \
+      "$@" "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/run_in_allocation.sh"
+  ) || return
+  submitted="${submitted%%;*}"
+  # Recorded before the job starts, so a second launch sees it while it is pending.
+  echo "${submitted}" > "${pool_dir}/submitted_job"
+  echo "INFO: submitted pool job ${submitted} for ${pool_dir}" >&2
+  printf '%s\n' "${submitted}"
+}
+
+# submit_external_vllm_attached_job POOL_DIR POOL_JOB COMMAND [SBATCH_ARG...]:
+# submit a NeMo RL job that attaches to POOL_JOB through attach_and_run.sh and
+# print its id. While the pool is not READY yet the job also depends on
+# after:POOL_JOB+EXTERNAL_VLLM_ATTACH_AFTER_MIN (default 15), so it does not hold
+# its nodes idle through the pool's queue wait and model load. Needs RAY_SUB.
+submit_external_vllm_attached_job() {
+  local pool_dir="${1:?pool directory required}" pool_job="${2:?pool job id required}"
+  local command="${3:?command required}"
+  shift 3
+  local pool placeholder_var submitted
+  local -a dependency=() pools=()
+  if [[ -z "${EXTERNAL_VLLM_POOLS:-}" ]]; then
+    echo "ERROR: no external vLLM pools are registered" >&2
+    return 2
+  fi
+  read -r -a pools <<< "${EXTERNAL_VLLM_POOLS}"
+  for pool in "${pools[@]}"; do
+    placeholder_var="${pool}_URL_PLACEHOLDER"
+    if [[ "${command}" != *"${!placeholder_var}"* ]]; then
+      echo "ERROR: submission command is missing ${!placeholder_var} for pool ${pool}" >&2
+      return 2
+    fi
+  done
+  if [[ "${command}" != *"${EXTERNAL_SERVICE_READINESS_PLACEHOLDER}"* ]]; then
+    echo "ERROR: submission command is missing ${EXTERNAL_SERVICE_READINESS_PLACEHOLDER} for the external-service readiness gate" >&2
+    return 2
+  fi
+  if [[ ! -f "${RAY_SUB:-}" ]]; then
+    echo "ERROR: RAY_SUB must point at ray.sub (got '${RAY_SUB:-}')" >&2
+    return 2
+  fi
+  if [[ ! -f "${pool_dir}/READY" ]]; then
+    dependency=(--dependency="after:${pool_job}+${EXTERNAL_VLLM_ATTACH_AFTER_MIN:-15}")
+  fi
+  submitted=$(
+    COMMAND="${command}" EXTERNAL_VLLM_POOL_DIR="${pool_dir}" EXTERNAL_VLLM_POOL_JOB="${pool_job}" \
+      sbatch --parsable --export=ALL "${dependency[@]}" "$@" \
+      "${EXTERNAL_VLLM_TOOLS_DIR_HOST:?EXTERNAL_VLLM_TOOLS_DIR_HOST is required}/attach_and_run.sh"
+  ) || return
+  printf '%s\n' "${submitted%%;*}"
 }

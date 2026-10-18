@@ -167,15 +167,15 @@ def test_worker_coalesces_keys_and_replays_full_tail_and_placeholder() -> None:
     assert client.calls == [["r/c0", "r/c1"]]
     routed = result[ROUTED_EXPERTS_FIELD]
     assert routed.dtype == torch.int16
-    assert routed.shape == (2, 5, 1, 2)
-    assert routed[0, :4, 0].tolist() == [
+    rows = routed.unbind()
+    assert [tuple(row.shape) for row in rows] == [(4, 1, 2), (1, 1, 2)]
+    assert rows[0][:, 0].tolist() == [
         [10, 11],
         [12, 13],
         [-1, -1],
         [22, 23],
     ]
-    assert bool(routed[0, 4].eq(-1).all())
-    assert bool(routed[1].eq(-1).all())
+    assert bool(rows[1].eq(-1).all())
     assert not worker._route_fallback_counts
 
 
@@ -191,7 +191,7 @@ def test_wrong_model_shape_falls_back_for_entire_rollout() -> None:
 
     routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
 
-    assert bool(routed.eq(-1).all())
+    assert bool(routed.values().eq(-1).all())
     assert worker._route_fallback_counts == Counter({"fragment_model_shape": 1})
 
 
@@ -209,5 +209,5 @@ def test_tampered_fragment_falls_back_for_entire_rollout() -> None:
 
     routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
 
-    assert bool(routed.eq(-1).all())
+    assert bool(routed.values().eq(-1).all())
     assert worker._route_fallback_counts == Counter({"fragment_integrity": 1})

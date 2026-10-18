@@ -28,7 +28,7 @@ policy:
   max_total_sequence_length: 512
   sequence_packing:
     enabled: false
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     cpu_offload: false
     activation_checkpointing: false

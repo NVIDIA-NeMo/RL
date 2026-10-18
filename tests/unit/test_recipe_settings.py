@@ -24,10 +24,10 @@ RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 @pytest.mark.parametrize(
     "recipe_name",
     [
-        "llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml",
-        "llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml",
-        "llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml",
-        "llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml",
+        "llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml",
+        "llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml",
+        "llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml",
+        "llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml",
         "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
         "vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml",
     ],
@@ -35,7 +35,7 @@ RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 def test_hybridep_regression_recipes_keep_legacy_deepep(recipe_name: str) -> None:
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / recipe_name)
-    assert config.policy.dtensor_cfg.automodel_kwargs.backend.dispatcher == "deepep"
+    assert config.policy.automodel_cfg.automodel_kwargs.backend.dispatcher == "deepep"
     assert config.policy.make_sequence_length_divisible_by == 1
 
 
@@ -45,10 +45,10 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
 ) -> None:
     register_omegaconf_resolvers()
     config = load_config(
-        RECIPE_ROOT / "llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml"
+        RECIPE_ROOT / "llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml"
     )
-    config.policy.dtensor_cfg.context_parallel_size = context_parallel_size
-    global_alignment = 64 * config.policy.dtensor_cfg.context_parallel_size
+    config.policy.automodel_cfg.context_parallel_size = context_parallel_size
+    global_alignment = 64 * config.policy.automodel_cfg.context_parallel_size
     assert config.policy.make_sequence_length_divisible_by == global_alignment
     assert config.policy.dynamic_batching.sequence_length_round == global_alignment
 
@@ -56,19 +56,19 @@ def test_gemma4_cp_keeps_local_hybridep_inputs_aligned(
 @pytest.mark.parametrize(
     ("recipe_name", "dispatcher", "experts"),
     [
-        ("llm/dpo-nanov3-30B3AB-1n4g-fsdp4ep4-automodel.yaml", "torch", "torch_mm"),
-        ("llm/grpo-glm47-flash-4n8g-automodel.yaml", "hybridep", "torch_mm"),
-        ("llm/grpo-minimax-m27-dapo-8n8g-automodel.yaml", "hybridep", "torch_mm"),
+        ("llm/dpo-nanov3-30B3AB-1n4g-automodel-ep4.yaml", "torch", "torch_mm"),
+        ("llm/grpo-glm47-flash-4n8g-automodel-ep32.yaml", "hybridep", "torch_mm"),
+        ("llm/grpo-minimax-m27-dapo-8n8g-automodel-ep64.yaml", "hybridep", "torch_mm"),
         ("llm/grpo-moonlight-16b-automodel-1n8g-ep8.yaml", "hybridep", "torch_mm"),
         (
             "llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.v2.yaml",
             "hybridep",
             "torch_mm",
         ),
-        ("llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml", "hybridep", "gmm"),
-        ("llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml", "hybridep", "gmm"),
+        ("llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml", "hybridep", "gmm"),
+        ("llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml", "hybridep", "gmm"),
         ("llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml", "hybridep", "gmm"),
-        ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml", "hybridep", "gmm"),
+        ("llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-ep32.yaml", "hybridep", "gmm"),
         (
             "vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml",
             "deepep",
@@ -92,6 +92,22 @@ def test_automodel_recipes_preserve_backend_choices(
 ) -> None:
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / recipe_name)
-    backend = config.policy.dtensor_cfg.automodel_kwargs.backend
+    backend = config.policy.automodel_cfg.automodel_kwargs.backend
     assert backend.dispatcher == dispatcher
     assert backend.experts == experts
+
+
+@pytest.mark.parametrize(
+    ("recipe_name", "expected_async_save"),
+    [
+        ("grpo-deepseek-v3-32n4g.yaml", False),
+        ("grpo-deepseek-v3-64n4g.yaml", True),
+        ("grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml", True),
+    ],
+)
+def test_deepseek_performance_recipes_preserve_checkpoint_save_mode(
+    recipe_name: str, expected_async_save: bool
+) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
+    assert config.policy.megatron_cfg.checkpoint.async_save is expected_async_save

@@ -250,12 +250,12 @@ bash examples/nemo_gym/nemotron-3.5-lightning/lightning35_launch.sh
 
 ## DAPO math RL with the automodel backend
 
-The recipe `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml`
+The recipe `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`
 trains [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
 with DAPO on math data using the DTensor (automodel) training backend and
 colocated vLLM generation. It runs on 4 nodes of 8x H100 80GB and is also
 exercised as a nightly test
-(`tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.sh`).
+(`tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.sh`).
 
 ### Overview
 
@@ -275,7 +275,7 @@ The Lightning checkpoint ships a Multi-Token Prediction (MTP) module
 end-to-end without code changes: the automodel custom NemotronH
 implementation builds only the backbone and LM head, the DCP loader never
 reads the `mtp.*` tensors, and vLLM skips them at load and refit. Keep
-`dtensor_cfg.automodel_kwargs.force_hf` and generation `speculative_config`
+`automodel_cfg.automodel_kwargs.force_hf` and generation `speculative_config`
 unset, otherwise the MTP module is instantiated.
 
 ### Launch training
@@ -284,7 +284,7 @@ From the repository root:
 
 ```bash
 uv run examples/run_grpo.py \
-    --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel.yaml \
+    --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml \
     logger.wandb_enabled=True
 ```
 

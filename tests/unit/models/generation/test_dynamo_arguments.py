@@ -177,6 +177,22 @@ def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     ]
 
 
+def test_config_rejects_a_required_http_server_api_key() -> None:
+    """The managed Dynamo frontend checks no bearer token, so asking for one
+    fails loudly instead of leaving the exposed server open; the exemplar's
+    explicit ``false`` is accepted without an "ignored" warning."""
+    config = _config()
+    config["vllm_cfg"]["http_server_api_key_required"] = True
+    with pytest.raises(ValidationError, match="http_server_api_key_required"):
+        DynamoConfig.model_validate(config)
+
+    config["vllm_cfg"]["http_server_api_key_required"] = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DynamoConfig.model_validate(config)
+    assert caught == []
+
+
 @pytest.mark.parametrize(
     "field",
     [
