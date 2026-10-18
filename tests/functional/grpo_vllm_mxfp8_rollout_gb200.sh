@@ -38,7 +38,7 @@ uv run coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PR
     policy.train_micro_batch_size=1 \
     policy.logprob_batch_size=1 \
     policy.max_total_sequence_length=256 \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.generation.max_new_tokens=128 \
     policy.generation.vllm_cfg.precision=fp8 \

@@ -1661,7 +1661,6 @@ def _run_noncolocated_setup(monkeypatch, config):
     value_model = MagicMock()
     generation = MagicMock()
     generation.prepare_refit_info.return_value = None
-    generation.get_refit_payload_mode.return_value = "hf_export"
     generation.init_collective.return_value = ["generation-future"]
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
@@ -2157,7 +2156,7 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     value_model = result[2]
     value_model.finish_training.assert_called_once_with()
     policy.prepare_for_training.assert_called_once_with()
-    policy.prepare_refit_info.assert_called_once_with(refit_payload_mode="hf_export")
+    policy.prepare_refit_info.assert_called_once_with()
     generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
 
 
