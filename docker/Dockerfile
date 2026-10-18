@@ -78,6 +78,7 @@ apt-get install -y --no-install-recommends \
     vim \
     ccache \
     protobuf-compiler \
+    libzmq3-dev \
 
 # Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
 # the CUDA base image's bundled copy, which is built against an outdated Go
@@ -111,6 +112,9 @@ apt-get autoremove -y
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
+
+# Grafana Alloy (Apache-2.0), started by ray.sub when LOKI_PUSH_URL is set.
+COPY --from=grafana/alloy:v1.18.0 /bin/alloy /usr/local/bin/alloy
 
 # CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
@@ -197,7 +201,6 @@ ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
 ARG RUNTIME_UID
 ARG RUNTIME_GID
-
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
@@ -345,8 +348,11 @@ apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+# Ray bundles an older aiohttp and yarl; remove both so the installed aiohttp
+# uses a compatible yarl instead of Ray's bundled copy.
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -363,6 +369,21 @@ EOF
 # Engine from the preceding layer.
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
+
+# NIXL is only consumed by the TRT-LLM wheel build below, so it is built inside
+# that block rather than in `base`. Keep in sync with the pinned TRT-LLM ref's
+# docker/common/install_nixl.sh; re-check on every [tool.trtllm].ref bump.
+#
+# Declared here rather than with the other ARGs: BuildKit puts ARG and ENV into
+# the environment of every later RUN, so declaring it above the dependency RUN
+# would make a NIXL bump bust that hour-long layer for every image, including
+# SKIP_TRTLLM_BUILD=1 ones.
+ARG NIXL_VERSION=v1.4.0
+# The NGC base image sets ENV NIXL_VERSION=1.0.1, and an ARG only changes the
+# build-time environment. Re-export so the image -- and _backend.py's wheel
+# cache key, since build_wheel.py bundles NIXL into the wheel -- see the
+# version actually built here.
+ENV NIXL_VERSION=${NIXL_VERSION}
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
@@ -382,6 +403,80 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
     exit 0
 fi
+
+# KV cache transceiver (TRT-LLM prefill/decode disaggregation).
+#
+# TensorRT-LLM compiles every non-MPI cache-transceiver backend out of the wheel
+# unless it is built against UCX, and the NIXL backend additionally needs NIXL
+# headers/libs at cmake time (cpp/CMakeLists.txt only runs find_package(NIXL)
+# inside its ENABLE_UCX block). backend=DEFAULT resolves to NIXL, so an image
+# without NIXL can only serve an explicit backend=UCX.
+#
+# Built here rather than in `base` so SKIP_TRTLLM_BUILD images don't pay for it:
+# nothing outside the wheel build below consumes NIXL, and build_wheel.py
+# vendors both UCX and NIXL into the wheel with $ORIGIN rpaths, so the runtime
+# image needs neither on LD_LIBRARY_PATH.
+#
+# UCX itself ships in the NGC base image under /usr/local/ucx, but cmake's
+# find_package(ucx) does not search that prefix on its own -- hence ucx_ROOT.
+# libzmq (apt-installed in `base`) is the UCX wrapper's control plane: a hard
+# cmake requirement to build, and a runtime dependency on every node that runs
+# an engine, since the wrapper is dlopen()ed on the first KV transfer.
+export ucx_ROOT=/usr/local/ucx
+export LD_LIBRARY_PATH="/usr/local/ucx/lib:${LD_LIBRARY_PATH:-}"
+
+if [[ ! -d /usr/local/ucx/lib/cmake/ucx ]]; then
+    echo "UCX missing from the base image; NIXL's UCX plugin cannot build" >&2
+    exit 1
+fi
+
+(
+# NIXL builds with meson/ninja and links Python bindings against pybind11. Like
+# the other from-source builds in this repo (tools/build-custom-flashinfer.sh,
+# tools/build-custom-vllm.sh), the build-time Python deps go into a uv venv
+# rather than the system interpreter -- and this one is thrown away in the same
+# layer, so nothing survives into the runtime environment.
+uv venv /tmp/nixl-build-venv
+uv pip install --python /tmp/nixl-build-venv/bin/python meson ninja pybind11 setuptools
+export PATH="/tmp/nixl-build-venv/bin:${PATH}"
+
+GDS_PATH=/usr/local/cuda/targets/x86_64-linux
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    GDS_PATH=/usr/local/cuda/targets/sbsa-linux
+fi
+# NIXL links against the CUDA driver stub, which does not live on the default
+# loader path inside the build container.
+CUDA_SO=$(find /usr/local -name libcuda.so.1 | head -n1)
+if [[ -z "${CUDA_SO}" ]]; then
+    echo "libcuda.so.1 not found under /usr/local; NIXL cannot link against the CUDA driver" >&2
+    exit 1
+fi
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$(dirname "${CUDA_SO}")"
+
+cd /tmp
+git clone --depth 1 -b "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git
+cd nixl
+meson setup builddir \
+    -Ducx_path=/usr/local/ucx \
+    -Dcudapath_lib=/usr/local/cuda/lib64 \
+    -Dcudapath_inc=/usr/local/cuda/include \
+    -Dgds_path="${GDS_PATH}" \
+    -Dinstall_headers=true \
+    -Ddisable_plugins=POSIX \
+    -Dbuild_tests=false \
+    -Dbuild_examples=false \
+    --buildtype=release
+cd builddir && ninja install
+cd /tmp && rm -rf /tmp/nixl /tmp/nixl-build-venv
+)
+
+test -f /opt/nvidia/nvda_nixl/include/nixl.h
+# ldconfig rather than ENV: this runs inside a conditional block, so the arch
+# dir is discovered rather than hardcoded, and SKIP_TRTLLM_BUILD images get
+# neither the libraries nor the loader entry.
+NIXL_LIB=$(dirname "$(find /opt/nvidia/nvda_nixl -name libnixl.so -print -quit)")
+printf '%s\n' "${NIXL_LIB}" "${NIXL_LIB}/plugins" > /etc/ld.so.conf.d/nixl.conf
+ldconfig
 
 # These settings are build-only and intentionally do not persist in the final
 # NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
@@ -463,7 +558,9 @@ rm -rf /tmp/trtllm-build-venv
 
 # The syncs above can repopulate the shared uv cache, so repeat the security
 # cleanup performed in the preceding dependency layer.
-find "${UV_CACHE_DIR}" -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+find "${UV_CACHE_DIR}" -type d \
+    \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
+       -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
@@ -577,10 +674,10 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.25.1; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.25.1
+ARG NEMO_GYM_VLLM_VERSION=0.29.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
@@ -622,6 +719,12 @@ getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNT
 install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
     "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
 chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+# Sweep up anything still root-owned in the cache and venvs (the arm64 build left
+# nvidia/cusparselt root-owned). The runtime UID must be able to remove and replace files there
+# when it re-syncs offline. Only root-owned entries are touched, so files that already belong to
+# the runtime UID stay as they are and are not copied into this layer.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 # Local build contexts can come from a checkout with umask 0007. COPY preserves those
 # root-owned modes; the runtime UID needs to read source files and traverse directories.
 chmod -R a+rX /opt/nemo-rl

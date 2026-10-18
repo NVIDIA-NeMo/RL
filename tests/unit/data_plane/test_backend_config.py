@@ -21,6 +21,8 @@ size or with the staging pool off, neither of which fails loudly.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pydantic
 import pytest
 from omegaconf import OmegaConf
@@ -30,6 +32,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneConfig,
     MooncakeCpuConfig,
     SimpleStorageConfig,
+    SsdOffloadConfig,
     backend_config,
     data_plane_supports_checkpointing,
 )
@@ -86,7 +89,7 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     """
     resolved = backend_config(_cfg("mooncake_cpu"))
     assert resolved.global_segment_size == 68719476736  # 64 GiB per client process
-    assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
+    assert resolved.local_buffer_size == 2147483648  # 2 GiB = 4 x 512 MiB staging slots
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
     assert resolved.use_gdr is False
@@ -163,6 +166,88 @@ def test_simple_backend_nested_block_is_used() -> None:
     assert resolved.num_storage_units == 3
 
 
+def _simple_overlay(monkeypatch, **simple) -> dict:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg("simple", simple={"num_storage_units": 2, **simple})
+    adapter._init_tq(cfg)
+    conf = OmegaConf.to_container(captured["conf"], resolve=True)
+    return conf["backend"]["SimpleStorage"]
+
+
+def test_simple_storage_units_skip_nodes_without_cpu(monkeypatch) -> None:
+    """A head started with --num-cpus=0 must not get a storage unit.
+
+    TQ places each unit (num_cpus=1) with hard node affinity round-robin over
+    alive nodes, so a CPU-less node would leave its unit unschedulable. The
+    overlay asks TQ for nodes that advertise CPU; check TQ honors that.
+    """
+    import ray
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
+
+    storage = _simple_overlay(monkeypatch)
+    assert storage["required_node_resource"] == "CPU"
+
+    cpu_less = {"NodeID": "a" * 56, "Alive": True, "Resources": {"memory": 1.0}}
+    worker = {"NodeID": "b" * 56, "Alive": True, "Resources": {"CPU": 8.0}}
+    monkeypatch.setattr(ray, "nodes", lambda: [cpu_less, worker])
+    strategies = simple_storage_bootstrap.get_node_round_robin_scheduling_strategies(
+        3, required_node_resource=storage["required_node_resource"]
+    )
+    assert [s.node_id for s in strategies] == [worker["NodeID"]] * 3
+
+
+def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
+    # Whatever TQ's own base config carries, we must not turn it on.
+    storage = _simple_overlay(monkeypatch)
+    assert storage.get("ssd_offload", {}).get("enabled") is not True
+
+
+def test_simple_ssd_offload_reaches_tq_config(monkeypatch) -> None:
+    storage = _simple_overlay(
+        monkeypatch,
+        ssd_offload={"enabled": True, "path": "/local/ssd", "threshold_bytes": 4096},
+    )
+    assert storage["ssd_offload"]["enabled"] is True
+    assert storage["ssd_offload"]["path"] == "/local/ssd"
+    assert storage["ssd_offload"]["threshold_bytes"] == 4096
+
+
+@pytest.mark.parametrize("path", [None, "", "relative/ssd"])
+def test_ssd_offload_requires_absolute_path_when_enabled(path) -> None:
+    """Fails at config load, not later inside driver bootstrap."""
+    with pytest.raises(pydantic.ValidationError, match="ssd_offload.path"):
+        TypeAdapter(DataPlaneConfig).validate_python(
+            _cfg(
+                "simple",
+                simple={
+                    "num_storage_units": 2,
+                    "ssd_offload": {"enabled": True, "path": path},
+                },
+            )
+        )
+
+
+def test_ssd_offload_defaults_are_off_and_path_optional_when_disabled() -> None:
+    absent = backend_config(_cfg("simple", simple={"num_storage_units": 2}))
+    assert absent.ssd_offload == SsdOffloadConfig(
+        enabled=False, path=None, threshold_bytes=1048576
+    )
+    partial = backend_config(
+        _cfg(
+            "simple",
+            simple={"num_storage_units": 2, "ssd_offload": {"path": "/local/ssd"}},
+        )
+    )
+    assert partial.ssd_offload.path == "/local/ssd"
+    assert partial.ssd_offload.enabled is False
+    assert partial.ssd_offload.threshold_bytes == 1048576
+
+
 def test_simple_backend_num_storage_units_has_no_default() -> None:
     """No static default is correct across cluster sizes (see the field's
     docstring), so an absent/incomplete simple: block must raise rather than
@@ -192,3 +277,187 @@ def test_schema_validates_without_any_backend_block() -> None:
     validate, otherwise MasterConfig fails before training starts.
     """
     TypeAdapter(DataPlaneConfig).validate_python(_cfg("simple"))
+
+
+@pytest.fixture
+def simple_units(monkeypatch) -> list[tuple[dict, tuple, dict]]:
+    """Fake SimpleStorageUnit: records (options, args, kwargs) per unit built.
+
+    Also gives TQ's provider a Ray-free default placement and restores it after
+    the test, since _pin_simple_storage_units swaps that hook in place.
+    """
+    from transfer_queue.storage import simple_storage
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
+    from transfer_queue.utils import zmq_utils
+
+    built: list[tuple[dict, tuple, dict]] = []
+
+    def options(**opts):
+        def remote(*args, **kwargs):
+            built.append((opts, args, kwargs))
+            return opts["name"]
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(simple_storage.SimpleStorageUnit, "options", options)
+    monkeypatch.setattr(
+        simple_storage_bootstrap,
+        "get_node_round_robin_scheduling_strategies",
+        lambda num_actors, required_node_resource=None: [
+            SimpleNamespace(node_id="unpinned") for _ in range(num_actors)
+        ],
+    )
+    for module in (simple_storage_bootstrap, zmq_utils):
+        monkeypatch.setattr(module, "process_zmq_server_info", lambda h: dict(h))
+    return built
+
+
+def _simple_conf(units: int, total: int):
+    return OmegaConf.create(
+        {
+            "backend": {
+                "storage_backend": "SimpleStorage",
+                "SimpleStorage": {
+                    "num_data_storage_units": units,
+                    "total_storage_size": total,
+                },
+            }
+        }
+    )
+
+
+def test_simple_storage_units_are_pinned_to_the_resolved_nodes(
+    monkeypatch, simple_units
+) -> None:
+    """simple.storage_unit_placement -> one hard node affinity per unit."""
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    monkeypatch.setattr(adapter.tq, "init", lambda *, conf: None)
+    cfg = _cfg("simple", simple={"storage_capacity": 9, "num_storage_units": 3})
+    n0, n1 = "a" * 56, "b" * 56  # Ray node IDs are 28-byte hex strings
+    adapter._init_tq(cfg, storage_unit_node_ids=[n0, n1, n0])
+    conf = _simple_conf(3, 9)
+    handles = StorageBootstrapProvider.get_provider("SimpleStorage")(conf)
+
+    assert list(handles) == [f"TransferQueueStorageUnit#{i}" for i in range(3)]
+    strategies = [opts["scheduling_strategy"] for opts, _, _ in simple_units]
+    assert [s.node_id for s in strategies] == [n0, n1, n0]
+    assert all(s.soft is False for s in strategies)
+    configs = [kw["config"] for _, _, kw in simple_units]
+    assert all(set(kw) == {"config"} for _, _, kw in simple_units)
+    assert all(
+        c["num_data_storage_units"] == 3 and c["total_storage_size"] == 9
+        for c in configs
+    )
+    assert len({c["_run_id"] for c in configs}) == 1  # one run ID shared by all units
+    assert conf.backend.SimpleStorage.zmq_info == handles
+
+
+def test_pinned_simple_provider_matches_tq_except_placement(simple_units) -> None:
+    """_pin_simple_storage_units swaps only the placement of TQ's own provider.
+
+    Run both against the same conf and compare everything but the scheduling
+    options and the per-run ID, so a TQ bump that changes how units are built
+    or placed fails here.
+    """
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    placement_keys = {
+        "placement_group",
+        "placement_group_bundle_index",
+        "scheduling_strategy",
+    }
+
+    def without_placement(calls):
+        return [
+            (
+                {k: v for k, v in o.items() if k not in placement_keys},
+                a,
+                {
+                    k: {ck: cv for ck, cv in v.items() if ck != "_run_id"}
+                    if k == "config"
+                    else v
+                    for k, v in kw.items()
+                },
+            )
+            for o, a, kw in calls
+        ]
+
+    tq_conf = _simple_conf(3, 10)
+    tq_handles = StorageBootstrapProvider.get_provider("SimpleStorage")(tq_conf)
+    tq_calls = without_placement(simple_units)
+    simple_units.clear()
+
+    adapter._pin_simple_storage_units(["a" * 56, "b" * 56, "a" * 56])
+    ours_conf = _simple_conf(3, 10)
+    ours_handles = StorageBootstrapProvider.get_provider("SimpleStorage")(ours_conf)
+
+    assert ours_handles == tq_handles
+    assert without_placement(simple_units) == tq_calls
+    assert ours_conf == tq_conf
+
+
+def test_pinned_simple_units_keep_ssd_offload(monkeypatch, simple_units) -> None:
+    """TQ's provider still builds pinned units, so ssd_offload reaches each one."""
+    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    captured = {}
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
+    )
+    cfg = _cfg(
+        "simple",
+        simple={
+            "storage_capacity": 9,
+            "num_storage_units": 2,
+            "ssd_offload": {
+                "enabled": True,
+                "path": "/local/ssd",
+                "threshold_bytes": 4096,
+            },
+        },
+    )
+    adapter._init_tq(cfg, storage_unit_node_ids=["a" * 56, "b" * 56])
+    StorageBootstrapProvider.get_provider("SimpleStorage")(captured["conf"])
+
+    assert len(simple_units) == 2
+    for opts, _, kw in simple_units:
+        ssd = kw["config"]["ssd_offload"]
+        assert ssd["enabled"] is True
+        assert ssd["path"] == "/local/ssd"
+        assert ssd["threshold_bytes"] == 4096
+        assert opts["runtime_env"]["env_vars"]["MALLOC_MMAP_THRESHOLD_"]
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        _cfg(
+            "simple",
+            simple={"num_storage_units": 2, "storage_unit_placement": ["inference"]},
+        ),
+        _cfg("mooncake_cpu", mooncake_cpu={"storage_unit_segment_size": 1 << 30}),
+    ],
+    ids=["simple-placement", "mooncake-units"],
+)
+def test_storage_unit_settings_need_the_single_controller_plan(
+    monkeypatch, cfg
+) -> None:
+    """Off the SingleController nothing starts or places units: fail at bootstrap.
+
+    Otherwise mooncake runs with no memory owner (every put fails with -200) and
+    simple placement is silently ignored.
+    """
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    monkeypatch.setattr(
+        adapter.tq, "init", lambda *, conf: pytest.fail("bootstrapped anyway")
+    )
+    with pytest.raises(ValueError, match="only supported by the SingleController"):
+        adapter._init_tq(cfg)

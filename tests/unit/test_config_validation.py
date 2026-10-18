@@ -317,8 +317,8 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
         "grpo-qwen3-32b-4n8g.yaml",
         "grpo-qwen3-32b-8n8g-async-1off.yaml",
-        "grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml",
-        "grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
     ]
     if os.path.basename(config_file) in skip_config_files:
         pytest.skip(
@@ -345,7 +345,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     if config_dict["policy"]["megatron_cfg"]["enabled"]:
         tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
     else:
-        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
 
     train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
     logprob_bs = config_dict["policy"]["logprob_batch_size"]
@@ -384,10 +384,10 @@ def test_no_shipped_config_is_outdated(config_file):
 
 # Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
 DEEPEP_FALLBACK_RECIPES = {
-    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml"),
-    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
 }
@@ -398,15 +398,15 @@ def test_automodel_moe_recipes_use_expected_dispatcher(
     config_file: str,
 ) -> None:
     config = load_config_with_inheritance(config_file)
-    dtensor_cfg = OmegaConf.select(config, "policy.dtensor_cfg")
+    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
     if (
-        dtensor_cfg is None
-        or not dtensor_cfg.enabled
-        or dtensor_cfg.get("expert_parallel_size", 1) <= 1
+        automodel_cfg is None
+        or not automodel_cfg.enabled
+        or automodel_cfg.get("expert_parallel_size", 1) <= 1
     ):
         pytest.skip("Not an AutoModel expert-parallel recipe")
 
-    backend = dtensor_cfg.automodel_kwargs.backend
+    backend = automodel_cfg.automodel_kwargs.backend
     assert "enable_deepep" not in backend
     if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
         assert backend.get("dispatcher") == "deepep"

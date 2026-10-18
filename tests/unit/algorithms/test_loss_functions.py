@@ -720,8 +720,7 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
 
     - disable_ppo_ratio removes the pi_theta / pi_theta_old ratio that CISPO
       uses as the importance weight, so they are mutually exclusive.
-    - force_on_policy_ratio makes every ratio 1.0, removing CISPO's clipped
-      importance-weight behavior.
+    - force_on_policy_ratio requires TIS correction, which this config omits.
     - sequence_level_importance_ratios changes the token-level IS weights that
       CISPO is defined over.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
@@ -734,6 +733,48 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
     )
     with pytest.raises(AssertionError):
         ClippedPGLossFn(cfg)
+
+
+@pytest.mark.parametrize(
+    ("ratio_clip_min", "ratio_clip_max"),
+    [
+        pytest.param(0.5, 1.0, id="matching-tis-bounds"),
+        pytest.param(0.2, 0.2, id="independent-tis-bounds"),
+    ],
+)
+def test_clipped_pg_loss_single_forward_cispo(
+    ratio_clip_min: float, ratio_clip_max: float
+) -> None:
+    data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
+    del data["prev_logprobs"]
+    curr = torch.tensor([[-3.0, -2.0, -1.0]], requires_grad=True)
+    data["advantages"][0, 1:] = torch.tensor([1.0, -2.0, 3.0])
+    data["generation_logprobs"][:, 1:] = curr.detach() - torch.log(
+        torch.tensor([[0.1, 1.0, 10.0]])
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            use_cispo=True,
+            force_on_policy_ratio=True,
+            use_importance_sampling_correction=True,
+            truncated_importance_sampling_type="tis",
+            truncated_importance_sampling_ratio_min=0.5,
+            truncated_importance_sampling_ratio=2.0,
+            ratio_clip_min=ratio_clip_min,
+            ratio_clip_max=ratio_clip_max,
+            reference_policy_kl_penalty=0.0,
+        )
+    )
+    loss, _ = loss_fn(
+        next_token_logprobs=curr,
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(3),
+    )
+    # Weights [0.5, 1, 2] give losses [1.5, -4, 6] and gradients [-0.5, 2, -6].
+    torch.testing.assert_close(loss, torch.tensor(7.0 / 6.0))
+    loss.backward()
+    torch.testing.assert_close(curr.grad, torch.tensor([[-1.0 / 6.0, 2.0 / 3.0, -2.0]]))
 
 
 def test_clipped_pg_loss_cispo():
@@ -951,8 +992,8 @@ def test_calculate_kl_output_clamp_includes_importance_sampling_weight():
         # top_k=1 keeps only the argmax token
         # _create_exact_logits puts the target at logit 0 and one distractor at log(exp(-lp) - 1),
         # so the target is the argmax only where lp > log(0.5): position 0 (lp=0) survives,
-        # positions 1 (lp=-1) and 2 (lp=-2) become -inf and are dropped from token_mask.
-        (1, [0], [[0, 1, 0, 0]], 0.0368),
+        # positions 1 and 2 become -inf for the actor; unfiltered KL keeps all positions.
+        (1, [0, 1, 2], [[0, 1, 1, 1]], 0.0362),
     ],
 )
 def test_clipped_pg_loss_kl_penalty(
@@ -991,7 +1032,7 @@ def test_clipped_pg_loss_kl_penalty(
         kl_term_per_token, torch.tensor([[0.368, 0.0, 0.718]], device=device), rtol=1e-3
     )
 
-    # KL mean 0.362 over all positions or 0.368 over position 0 alone -> loss 0.0362 / 0.0368
+    # Unfiltered reference KL uses all positions regardless of actor support.
     expected_kl_mean = torch.mean(kl_term_per_token[0, kept_positions])
     expected_loss = cfg.reference_policy_kl_penalty * expected_kl_mean
     assert torch.allclose(
@@ -1005,8 +1046,7 @@ def test_clipped_pg_loss_kl_penalty(
     loss_input, data = prepare_loss_input(
         dummy_logits, data, loss_fn, sampling_params=sampling_params
     )
-    # Filtering narrows token_mask where the sampled token left the top-k set, so the
-    # -inf positions drop out of the KL reduction and of global_valid_toks below.
+    # Actor support filtering does not narrow the shared reference-KL mask.
     assert torch.equal(
         data["token_mask"], torch.tensor(expected_token_mask, device=device)
     )
@@ -3068,6 +3108,7 @@ class TestMetricNormalizationAdvertisement:
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
             "num_valid_samples": MetricNormalizer.NONE,
+            "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
         }
@@ -3133,7 +3174,7 @@ class TestMetricNormalizationAdvertisement:
             .float(),
         )
 
-        assert len(stacked_values) == 5
+        assert len(stacked_values) == 6
         assert cpu_calls == 1
 
     @pytest.mark.parametrize("metrics_level", ["full", "minimal"])

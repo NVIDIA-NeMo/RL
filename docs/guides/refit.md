@@ -83,11 +83,37 @@ For non-colocated NCCL, change the topology and leave the selector unset:
 
 ```yaml
 policy:
+  offload_policy_before_refit: false
   generation:
     colocated:
       enabled: false
     refit_transport: null
 ```
+
+Large quantized exports can temporarily need more memory than training itself.
+Set `offload_policy_before_refit: true` to drop completed gradient buffers before
+the collective export. The same lifecycle can also move the optimizer and clear
+Transformer Engine workspaces:
+
+```yaml
+policy:
+  offload_policy_before_refit: true
+  offload_optimizer_for_refit: true
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      force_clear_fp8_caches: true
+  generation:
+    colocated:
+      enabled: false
+    refit_transport: null
+```
+
+This option requires the Megatron policy backend. It applies to non-colocated
+vLLM collective and `nccl_reshard` transports, plus non-colocated Megatron
+generation. Unsupported combinations fail during synchronizer setup. It is
+disabled by default because CPU offload adds transfer overhead when the export
+already fits in trainer GPU memory.
 
 For native MCore refit, select it explicitly:
 
@@ -109,6 +135,10 @@ policy:
       enabled: false
     refit_transport: nccl_reshard
 ```
+
+`offload_policy_before_refit` also works with this transport. The reshard moves
+only parameters, so releasing gradient buffers, optimizer state, and caches
+before transfer is safe.
 
 For sparse delta, select one data plane and configure its scope:
 

@@ -69,7 +69,7 @@ Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy disti
 :link: about/evaluation
 :link-type: doc
 
-Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
+Measure model and agent capabilities with repeatable benchmarks and custom evaluations.
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
@@ -319,6 +319,7 @@ guides/cispo.md
 guides/prorlv2.md
 guides/swe-rl-qwen3.md
 guides/grpo.md
+guides/length-penalty.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
@@ -326,7 +327,6 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
-guides/eval.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md
@@ -379,6 +379,8 @@ design-docs/uv.md
 design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
+design-docs/ppo-colocated-streaming.md
+design-docs/pd-disaggregation-rollout.md
 design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
@@ -392,6 +394,7 @@ design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
+design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
