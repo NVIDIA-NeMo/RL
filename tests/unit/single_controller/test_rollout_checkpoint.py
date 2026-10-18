@@ -46,8 +46,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.data import DataConfig
 from nemo_rl.models.generation.vllm.config import VllmConfig, VllmSpecificArgs
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 class _DumpedConfig:

@@ -96,13 +96,13 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import LoggerConfig, WandbConfig
-from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -1146,7 +1146,8 @@ class TestSetup:
     ) -> None:
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.update(enabled=True, save_data_plane=True)
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
         mc.async_rl.generation_fleet_health.enabled = fleet_health_enabled
         mc.async_rl.generation_fleet_health.restart_dead_shards = True
         mc.token_capture = TokenCaptureConfig(enabled=token_capture_enabled)
@@ -1190,9 +1191,8 @@ class TestSetup:
             )
         )
         mc.data_plane["backend"] = backend
-        mc.checkpointing.update(
-            enabled=checkpointing_enabled, save_data_plane=save_data_plane
-        )
+        mc.checkpointing.enabled = checkpointing_enabled
+        mc.checkpointing.save_data_plane = save_data_plane
         mc.async_rl.generation_fleet_health.enabled = True
         mc.async_rl.generation_fleet_health.restart_dead_shards = restart_dead_shards
         patched_factories["fake_gen"].worker_group.dp_size = 1
@@ -1284,14 +1284,10 @@ class TestSetup:
         patched_factories,
     ):
         mc = _make_master_config(colocated=False, backend="vllm")
-        mc.checkpointing.update(
-            {
-                "checkpoint_dir": str(tmp_path / "checkpoints"),
-                "enabled": True,
-                "save_data_plane": True,
-                "save_period": 2,
-            }
-        )
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save_period = 2
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1394,14 +1390,10 @@ class TestSetup:
     ):
         mc = _make_master_config(colocated=False, backend="vllm")
         checkpoint_dir = tmp_path / "checkpoints"
-        mc.checkpointing.update(
-            {
-                "checkpoint_dir": str(checkpoint_dir),
-                "enabled": True,
-                "save_data_plane": True,
-                "save_period": 1,
-            }
-        )
+        mc.checkpointing.checkpoint_dir = str(checkpoint_dir)
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save_period = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1457,7 +1449,8 @@ class TestSetup:
             )
         )
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.update(enabled=enabled, save_data_plane=save_data_plane)
+        mc.checkpointing.enabled = enabled
+        mc.checkpointing.save_data_plane = save_data_plane
 
         actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1541,9 +1534,9 @@ class TestSetup:
         )
         monkeypatch.setenv("MSC_CONFIG", str(msc_config))
         mc = _make_master_config()
-        mc.checkpointing["enabled"] = True
-        mc.checkpointing["save_data_plane"] = False
-        mc.checkpointing["checkpoint_dir"] = "msc://profile/run"
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = False
+        mc.checkpointing.checkpoint_dir = "msc://profile/run"
         mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
         mc.data_plane["backend"] = "simple"
 
@@ -3461,14 +3454,10 @@ class TestNativeTQRecoverySetup:
 
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.update(
-            {
-                "checkpoint_dir": str(tmp_path / "checkpoints"),
-                "enabled": True,
-                "save_data_plane": True,
-                "save_period": 1,
-            }
-        )
+        mc.checkpointing.checkpoint_dir = str(tmp_path / "checkpoints")
+        mc.checkpointing.enabled = True
+        mc.checkpointing.save_data_plane = True
+        mc.checkpointing.save_period = 1
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",

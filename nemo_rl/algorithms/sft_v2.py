@@ -507,9 +507,13 @@ def setup_sft_v2(
 ) -> SFTV2ActorArgs:
     """Build the V2 cluster, TQPolicy, placement, and resume state."""
     set_seed(master_config.sft.seed)
-    pretrained_checkpoint = master_config.checkpointing.get("pretrained_checkpoint")
+    pretrained_checkpoint = master_config.checkpointing.pretrained_checkpoint
     if pretrained_checkpoint is not None:
-        master_config.policy["pretrained_checkpoint"] = pretrained_checkpoint
+        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
+        # Megatron setup path keeps its key-style access.
+        master_config.policy["pretrained_checkpoint"] = (
+            pretrained_checkpoint.model_dump()
+        )
     if master_config.data.get("backend") != "energon":
         raise ValueError("SFTv2 requires data.backend=energon.")
     if not master_config.policy["megatron_cfg"]["enabled"]:

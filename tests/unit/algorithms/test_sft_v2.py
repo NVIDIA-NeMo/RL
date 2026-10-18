@@ -33,7 +33,7 @@ from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
-from nemo_rl.utils.checkpoint import CheckpointingConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig, PretrainedCheckpointConfig
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -809,7 +809,9 @@ def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
     from nemo_rl.algorithms.sft_v2 import setup_sft_v2
 
     config = _valid_setup_config(data_overrides={"backend": "invalid"})
-    config.checkpointing["pretrained_checkpoint"] = pretrained
+    config.checkpointing.pretrained_checkpoint = (
+        PretrainedCheckpointConfig(**pretrained) if pretrained else None
+    )
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy.get("pretrained_checkpoint") == pretrained
@@ -821,7 +823,7 @@ def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
     existing = {"format": "megatron_bridge", "path": "/policy-level"}
     config = _valid_setup_config(data_overrides={"backend": "invalid"})
     config.policy["pretrained_checkpoint"] = existing
-    config.checkpointing["pretrained_checkpoint"] = None
+    config.checkpointing.pretrained_checkpoint = None
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy["pretrained_checkpoint"] == existing
