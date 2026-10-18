@@ -1004,9 +1004,11 @@ def chat_kd_processor(
 ) -> DatumSpec:
     """Preserve raw chat history and metadata for cross-tokenizer distillation.
 
-    Accepts either ``messages`` or ``conversation``. Historical messages remain
-    in the context even when their ``message_loss_mask`` entry is zero. The
-    collator owns tokenization, length checks, and native template rendering.
+    Accepts either ``messages`` or ``conversation``. Earlier messages remain in
+    the context and are never supervised by the chat collator, regardless of
+    their ``message_loss_mask`` entries. The collator supervises only the final
+    assistant message and owns tokenization, length checks, and native template
+    rendering.
     """
     if "messages" in datum_dict:
         messages = datum_dict["messages"]

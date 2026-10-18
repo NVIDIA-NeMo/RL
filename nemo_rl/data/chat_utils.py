@@ -24,9 +24,11 @@ def normalize_message_loss_mask(
 ) -> list[int]:
     """Validate turn selection, defaulting to all assistant messages.
 
-    A zero excludes the message from supervision; it never removes the message
-    from the rendered conversation. Supplied masks must have one binary integer
-    per message and may select only assistant turns.
+    Supplied masks must have one binary integer per message and may select only
+    assistant turns. This utility preserves earlier assistant selections, but
+    the chat collator supervises only the final assistant message: earlier
+    entries never enable supervision. A zero never removes a message from the
+    rendered conversation.
     """
     if message_loss_mask is None:
         return [int(message.get("role") == "assistant") for message in messages]

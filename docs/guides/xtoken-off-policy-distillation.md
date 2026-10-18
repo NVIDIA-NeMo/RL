@@ -293,8 +293,12 @@ permitted Boolean/null spelling differences retain CE but omit the unequal piece
 from exact-text KD. Missing or transformed required content fails explicitly.
 An empty or whitespace-only final assistant turn is rejected; tool-only final
 turns are supported. Supervising a separate `reasoning_content` field requires native
-alignment. Ordinary chat supports reasoning embedded in `content` and rejects
-requests to supervise a separate reasoning field without native alignment.
+alignment. Ordinary chat supports reasoning embedded in `content` only when the
+chat template renders that content verbatim. For Qwen-style templates that extract
+inline `<think>...</think>` into a separate reasoning block, including the stock
+Qwen3 template and `qwen3_history.jinja`, set
+`collator.native_thinking_alignment=true`. Ordinary chat rejects requests to
+supervise a separate reasoning field without native alignment.
 
 Qwen3-4B's stock template drops historical reasoning when a later user turn
 follows it. To retain that reasoning as context, apply the maintained override to

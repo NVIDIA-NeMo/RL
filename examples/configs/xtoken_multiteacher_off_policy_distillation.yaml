@@ -262,7 +262,7 @@ teachers:
 
 collator:
   # "text" (default) tokenizes raw text; "chat" uses each model's chat template
-  # and aligns assistant messages independently.
+  # and aligns only the final assistant message.
   mode: "text"
   # Include reasoning text and closing think markers in assistant loss masks.
   include_thinking_in_loss: false

@@ -526,11 +526,11 @@ def test_align_chat_batches_multiple_turns_with_different_template_offsets(
     assert torch.equal(batch.pair_is_correct, batch.pair_valid)
 
 
-@pytest.mark.parametrize("teacher_truncated", [False, True])
-def test_align_chat_explicit_eot_skips_whitespace_and_handles_truncation(
-    teacher_truncated: bool,
+@pytest.mark.parametrize("teacher_missing_eot", [False, True])
+def test_align_chat_explicit_eot_skips_whitespace_and_handles_missing_eot(
+    teacher_missing_eot: bool,
 ):
-    """A supplied EOT index avoids the template whitespace after an answer."""
+    """Explicit EOT indices skip template whitespace and handle missing EOTs."""
     aligner = _chat_aligner(
         {1: "<header>", 10: "Hi", 11: " ", 99: "<eot>"},
         {2: "<header>", 20: "Hi", 21: "\n", 98: "<eot>"},
@@ -539,7 +539,7 @@ def test_align_chat_explicit_eot_skips_whitespace_and_handles_truncation(
     teacher_ids = torch.tensor([[2, 20, 21, 98]])
     student_offsets = torch.tensor([[(0, 5), (5, 7), (7, 8), (8, 13)]])
     teacher_offsets = torch.tensor([[(0, 9), (9, 11), (11, 12), (12, 17)]])
-    if teacher_truncated:
+    if teacher_missing_eot:
         teacher_ids = teacher_ids[:, :3]
         teacher_offsets = teacher_offsets[:, :3]
     batch = aligner.align_chat(
@@ -550,15 +550,15 @@ def test_align_chat_explicit_eot_skips_whitespace_and_handles_truncation(
         student_asst_char_spans=[[(5, 7)]],
         teacher_asst_char_spans=[[(9, 11)]],
         student_eot_indices=[[3]],
-        teacher_eot_indices=[[-1 if teacher_truncated else 3]],
+        teacher_eot_indices=[[-1 if teacher_missing_eot else 3]],
     )
     assert batch.student_chunk_id.tolist() == [
-        [-1, 0, -1, -1 if teacher_truncated else 1]
+        [-1, 0, -1, -1 if teacher_missing_eot else 1]
     ]
     assert batch.teacher_chunk_id.tolist() == (
-        [[-1, 0, -1]] if teacher_truncated else [[-1, 0, -1, 1]]
+        [[-1, 0, -1]] if teacher_missing_eot else [[-1, 0, -1, 1]]
     )
-    assert batch.pair_valid.sum().item() == (1 if teacher_truncated else 2)
+    assert batch.pair_valid.sum().item() == (1 if teacher_missing_eot else 2)
 
 
 def test_align_chat_routes_semantic_regions_and_excludes_attention_masked_tokens():
