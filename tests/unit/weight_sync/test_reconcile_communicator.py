@@ -167,7 +167,12 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     policy = SimpleNamespace(
         prepare_refit_info=prepare_refit_info,
         refit_info_requests=refit_info_requests,
-        init_collective=lambda ip, port, world_size, *, train_world_size, nccl_peer=None: (
+        init_collective=lambda ip,
+        port,
+        world_size,
+        *,
+        train_world_size,
+        nccl_peer=None: (
             policy_calls.append(
                 {
                     "ip": ip,
