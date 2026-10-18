@@ -1997,3 +1997,88 @@ def test_student_teacher_kernels_normalize_bf16_logits_in_fp32(
 
     expected_kl, _, _ = _student_teacher_reference(student, teacher)
     torch.testing.assert_close(reverse_kl, expected_kl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("leaf", [False, True])
+def test_chunked_logprob_backward_fp32_grad_reuses_logits_storage(monkeypatch, leaf):
+    """fp32 activation logits take their grad in place; leaves are never overwritten.
+
+    TP=1, so the all-reduces are identities and run without a process group.
+    """
+    from nemo_rl.distributed.model_utils import ChunkedDistributedLogprob
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda t, **_kw: t)
+    monkeypatch.setattr(
+        torch.distributed.nn.functional, "all_reduce", lambda t, **_kw: t
+    )
+    torch.manual_seed(0)
+    batch, seq, vocab = 2, 7, 11
+    base = torch.randn(batch, seq, vocab, requires_grad=True)
+    target = torch.randint(0, vocab, (batch, seq))
+
+    expected = torch.log_softmax(base, dim=-1).gather(-1, target.unsqueeze(-1))
+    expected.sum().backward()
+    expected_grad = base.grad.clone()
+    base.grad = None
+
+    logits = base if leaf else base * 1.0  # non-leaf fp32 activation
+    before = logits.detach().clone()
+    logprobs = ChunkedDistributedLogprob.apply(
+        logits, target, 0, vocab, 3, None, False, True
+    )
+    logprobs.sum().backward()
+
+    torch.testing.assert_close(base.grad, expected_grad)
+    if leaf:
+        torch.testing.assert_close(logits.detach(), before)
+    else:
+        # The grad was written into the logits' own storage.
+        torch.testing.assert_close(logits.detach(), expected_grad)
+
+
+def test_chunked_logprob_fp32_default_grad_with_shared_logits(single_rank_collectives):
+    """Reverse KL and logprob on the same fp32 logits: the default must not reuse them."""
+    torch.manual_seed(1)
+    base = torch.randn(1, 4, 6, requires_grad=True)
+    teacher = torch.randn(1, 4, 6)
+    target = torch.randint(0, 6, (1, 4))
+    ref = base.detach().double().requires_grad_(True)
+    log_p = torch.log_softmax(ref, -1)
+    expected_loss = (
+        log_p.exp() * (log_p - torch.log_softmax(teacher.double(), -1))
+    ).sum()
+    expected_loss = expected_loss + log_p.gather(-1, target.unsqueeze(-1)).sum()
+    (expected,) = torch.autograd.grad(expected_loss, ref)
+
+    logits = base * 1.0
+    kl = ChunkedDistributedReverseKLToFixedLogits.apply(logits, teacher, 2, None, False)
+    lp = ChunkedDistributedLogprob.apply(logits, target, 0, 6, 2, None, False)
+    (kl.sum() + lp.sum()).backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
+
+
+def test_chunked_logprob_fp32_default_grad_with_narrow_views(single_rank_collectives):
+    """Two sequences as narrow views of one packed logits (non-fused packing)."""
+    torch.manual_seed(2)
+    base = torch.randn(1, 6, 5, requires_grad=True)
+    target = torch.randint(0, 5, (1, 6))
+    expected_loss = torch.log_softmax(base.double(), -1).gather(
+        -1, target.unsqueeze(-1)
+    )
+    (expected,) = torch.autograd.grad(expected_loss.sum(), base)
+
+    logits = base * 1.0
+    total = sum(
+        ChunkedDistributedLogprob.apply(
+            logits.narrow(1, start, 3),
+            target[:, start : start + 3],
+            0,
+            5,
+            2,
+            None,
+            False,
+        ).sum()
+        for start in (0, 3)
+    )
+    total.backward()
+    torch.testing.assert_close(base.grad, expected.float(), rtol=1e-5, atol=1e-5)
