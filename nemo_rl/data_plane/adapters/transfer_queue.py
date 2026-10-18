@@ -49,13 +49,13 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
-    MooncakeSsdOffloadConfig,
     backend_config,
     data_plane_supports_checkpointing,
     storage_unit_placement,
@@ -660,7 +660,7 @@ def _patch_mooncake_master_metrics_port(
     """Move mooncake_master's metrics server onto a reserved *port*.
 
     Also appends ``extra_args``: master flags TQ does not expose, such as the
-    SSD offload and eviction flags from :func:`_mooncake_ssd_offload_master_args`.
+    SSD offload flags from :func:`mooncake_ssd_offload.master_args`.
 
     ``MasterAdminServer::Start`` binds the metrics socket before it consults
     ``enable_metric_reporting``, and the master exits non-zero if that bind
@@ -745,89 +745,6 @@ def _patch_mooncake_master_metrics_port(
     StorageBootstrapProvider.register_provider("MooncakeStore")(
         _bootstrap_with_metrics_port
     )
-
-
-def _mooncake_ssd_offload_master_args(
-    ssd: MooncakeSsdOffloadConfig,
-) -> tuple[str, ...]:
-    """mooncake_master flags for ``mooncake_cpu.ssd_offload``.
-
-    In Mooncake, offload happens on eviction: past the high watermark the
-    master moves objects to SSD and frees ``eviction_ratio`` of the memory.
-    These replace the no-eviction flags TQ passes (gflags keeps the last
-    occurrence). ``offload_force_evict=false``: an object whose SSD write
-    failed stays in memory rather than being dropped. TQ's 999999 ms lease
-    would keep every object written in the last ~17 min from being evicted,
-    so it goes back to mooncake's own 10 s default.
-    """
-    return (
-        "--enable_offload=true",
-        "--offload_on_evict=true",
-        "--offload_force_evict=false",
-        f"--eviction_high_watermark_ratio={ssd.offload_threshold}",
-        "--eviction_ratio=0.1",
-        "--default_kv_lease_ttl=10000",
-    )
-
-
-def _install_mooncake_ssd_offload(root: str) -> None:
-    """Make this process's Mooncake client offload its segment to ``root``.
-
-    The master offloads an object only to the SSD of the client owning its
-    segment, so each storage unit runs mooncake's embedded offload itself.
-    TQ's client calls ``setup`` with no offload arguments; this swaps the
-    store class it builds for one that adds them. Each client holds a lock
-    on its own directory, so every process gets a fresh, owner-only
-    ``<root>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``: no run can
-    pick up, or wipe, another's files. Nothing deletes it when the run ends.
-    """
-    import tempfile
-
-    import ray
-    from transfer_queue.storage.clients import mooncake_client as _mc
-
-    base = getattr(_mc, "MooncakeDistributedStore", None)
-    if base is None:
-        raise _tq_shape_drift_error(
-            "storage.clients.mooncake_client no longer imports "
-            "MooncakeDistributedStore",
-            "Mooncake SSD offload could not be enabled on the storage units",
-            "store class",
-        )
-    if hasattr(base, "_nrl_ssd_offload_path"):
-        return
-    # Mooncake's default bucket backend writes nothing until a bucket holds
-    # 256 MB or 500 keys; until then the queued objects stay pinned in memory,
-    # so a unit whose eviction batch is smaller than one bucket fills up and
-    # every put fails. One file per key writes each object as it is queued.
-    # Read from the environment at setup; a launcher may still override it.
-    os.environ.setdefault(
-        "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "file_per_key_storage_backend"
-    )
-    # Disk watermark eviction deletes the SSD copy, which is the only copy of
-    # an object already evicted from memory. The per-key backend's own
-    # eviction (MOONCAKE_OFFLOAD_ENABLE_EVICTION) stays on: in mooncake
-    # 0.3.13 turning it off makes setup fail ("Metadata has not been loaded
-    # yet"); it only deletes files once the disk is 90% full.
-    os.environ.setdefault("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "false")
-    parent = os.path.join(root, "nemo_rl_mooncake_offload")
-    os.makedirs(parent, exist_ok=True)
-    job_id = ray.get_runtime_context().get_job_id()
-    path = tempfile.mkdtemp(prefix=f"{job_id}-{os.getpid()}-", dir=parent)
-
-    class _OffloadingStore(base):  # type: ignore[misc, valid-type]
-        _nrl_ssd_offload_path = path
-
-        def setup(self, *args: Any, **kwargs: Any) -> Any:
-            return super().setup(
-                *args,
-                enable_ssd_offload=True,
-                ssd_offload_path=self._nrl_ssd_offload_path,
-                **kwargs,
-            )
-
-    _mc.MooncakeDistributedStore = _OffloadingStore
-    LOGGER.info("Mooncake SSD offload for this storage unit under %s", path)
 
 
 def _connect_existing() -> None:
@@ -1001,12 +918,16 @@ def _init_tq(
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
-        ssd = mooncake_cfg.ssd_offload
         metadata_port, master_port, metrics_port = _reserve_data_plane_ports(3)
         _patch_mooncake_master_metrics_port(
-            metrics_port,
-            _mooncake_ssd_offload_master_args(ssd) if ssd.enabled else (),
+            metrics_port, mooncake_ssd_offload.master_args(mooncake_cfg)
         )
+        if mooncake_cfg.ssd_offload.enabled:
+            # Stop the run if Mooncake ever deletes an SSD copy for space.
+            mooncake_ssd_offload.watch_master_disk_evictions(
+                f"http://{local_ip}:{metrics_port}/metrics",
+                str(mooncake_cfg.ssd_offload.path),
+            )
         overlay = {
             **controller_overlay,
             "backend": {
@@ -1014,9 +935,7 @@ def _init_tq(
                 "MooncakeStore": {
                     # With storage units on, every client mounts 0; only the
                     # units override it (see mooncake_storage_unit.py).
-                    "global_segment_size": 0
-                    if mooncake_cfg.storage_unit_segment_size
-                    else int(mooncake_cfg.global_segment_size),
+                    "global_segment_size": mooncake_cfg.owned_segment_size(None),
                     "local_buffer_size": int(mooncake_cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
@@ -1032,16 +951,16 @@ def _init_tq(
                 },
             },
         }
-        if checkpointing:
-            # Establish owner-local checkpoint requirements before any client
-            # attaches. Non-checkpointing jobs keep TQ's storage defaults.
+        if checkpointing or mooncake_cfg.ssd_offload.enabled:
+            # Set before any client attaches. SSD offload needs evictable
+            # replicas (checkpoints then copy through native GET); otherwise a
+            # checkpoint reads hard-pinned memory in place. TQ's own offload
+            # client stays off: see mooncake_ssd_offload. Other jobs keep TQ's
+            # storage defaults.
             overlay["backend"]["MooncakeStore"].update(
-                hard_pin=True, offload={"enabled": False}
+                hard_pin=not mooncake_cfg.ssd_offload.enabled,
+                offload={"enabled": False},
             )
-        elif ssd.enabled:
-            # Evictable, so the master can move objects to the storage units'
-            # SSD. TQ's own offload stays off: see MooncakeSsdOffloadConfig.
-            overlay["backend"]["MooncakeStore"]["hard_pin"] = False
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
@@ -1202,6 +1121,8 @@ class TQDataPlaneClient(DataPlaneClient):
             )
 
             install_tq_mooncake_checkpoint_plugin()
+            # Before the store is set up; a no-op unless this process owns memory.
+            mooncake_ssd_offload.install(mooncake_cfg, segment_size)
 
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)

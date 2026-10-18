@@ -161,9 +161,14 @@ def test_mooncake_checkpoint_mode_is_internal(
 _MC_SSD = {"enabled": True, "path": "/local/ssd"}
 
 
-def _mooncake_overlay(monkeypatch, mooncake_cpu, checkpointing=False) -> dict:
+def _mooncake_overlay(
+    monkeypatch, mooncake_cpu, checkpointing=False, watch=lambda url, path: None
+) -> dict:
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload
     from nemo_rl.data_plane.adapters import transfer_queue as adapter
 
+    # A stub by default: no real thread polling a master that does not exist.
+    monkeypatch.setattr(mooncake_ssd_offload, "watch_master_disk_evictions", watch)
     captured = {}
     monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
     monkeypatch.setattr(adapter, "_mooncake_transport_config", lambda: {})
@@ -179,13 +184,16 @@ def _mooncake_overlay(monkeypatch, mooncake_cpu, checkpointing=False) -> dict:
     return conf["backend"]["MooncakeStore"]
 
 
-def test_mooncake_ssd_offload_makes_units_evictable(monkeypatch) -> None:
+@pytest.mark.parametrize("unit_segment_size", [1 << 30, 0])
+def test_mooncake_ssd_offload_makes_objects_evictable(
+    monkeypatch, unit_segment_size
+) -> None:
     from transfer_queue.storage.bootstrap import mooncake_bootstrap
 
     storage = _mooncake_overlay(
         monkeypatch,
         {
-            "storage_unit_segment_size": 1 << 30,
+            "storage_unit_segment_size": unit_segment_size,
             "ssd_offload": {**_MC_SSD, "offload_threshold": 0.2},
         },
     )
@@ -199,6 +207,25 @@ def test_mooncake_ssd_offload_makes_units_evictable(monkeypatch) -> None:
     assert "--default_kv_lease_ttl=10000" in extra
 
 
+@pytest.mark.parametrize("ssd_offload", [False, True])
+def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
+    monkeypatch, ssd_offload
+) -> None:
+    watched = []
+    _mooncake_overlay(
+        monkeypatch,
+        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        watch=lambda url, path: watched.append((url, path)),
+    )
+
+    if not ssd_offload:
+        assert watched == []
+        return
+    ((url, path),) = watched
+    assert url.startswith("http://") and url.endswith("/metrics")
+    assert path == "/local/ssd"
+
+
 def test_mooncake_without_ssd_offload_keeps_tq_master_flags(monkeypatch) -> None:
     from transfer_queue.storage.bootstrap import mooncake_bootstrap
 
@@ -207,13 +234,27 @@ def test_mooncake_without_ssd_offload_keeps_tq_master_flags(monkeypatch) -> None
     assert mooncake_bootstrap.subprocess.extra_args == ()
 
 
-def test_mooncake_ssd_offload_is_not_checkpointable() -> None:
-    # Checkpoints need hard-pinned replicas; offload makes them evictable.
+def test_mooncake_ssd_offload_is_checkpointable() -> None:
+    # Saves read evictable replicas through native GET (tq_mooncake_checkpoint).
     cfg = _cfg(
         "mooncake_cpu",
         mooncake_cpu={"storage_unit_segment_size": 1 << 30, "ssd_offload": _MC_SSD},
     )
-    assert data_plane_supports_checkpointing(cfg) is False
+    assert data_plane_supports_checkpointing(cfg) is True
+
+
+@pytest.mark.parametrize("ssd_offload", [False, True])
+def test_mooncake_checkpointing_pins_replicas_unless_offloading(
+    monkeypatch, ssd_offload
+) -> None:
+    storage = _mooncake_overlay(
+        monkeypatch,
+        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        checkpointing=True,
+    )
+    # Offload must evict; without it, saves borrow hard-pinned memory directly.
+    assert storage["hard_pin"] is (not ssd_offload)
+    assert storage["offload"]["enabled"] is False
 
 
 @pytest.mark.parametrize(
@@ -227,7 +268,6 @@ def test_mooncake_ssd_offload_is_not_checkpointable() -> None:
             },
             "path",
         ),
-        ({"ssd_offload": _MC_SSD}, "storage_unit_segment_size"),
         (
             {
                 "storage_unit_segment_size": 1,
@@ -240,52 +280,6 @@ def test_mooncake_ssd_offload_is_not_checkpointable() -> None:
 def test_mooncake_ssd_offload_config_is_checked_at_load(mooncake_cpu, match) -> None:
     with pytest.raises(pydantic.ValidationError, match=match):
         backend_config(_cfg("mooncake_cpu", mooncake_cpu=mooncake_cpu))
-
-
-def test_storage_unit_store_gets_its_own_offload_dir(monkeypatch, tmp_path) -> None:
-    """Each unit's Mooncake client sets up embedded offload in a fresh dir."""
-    import ray
-    from transfer_queue.storage.clients import mooncake_client
-
-    from nemo_rl.data_plane.adapters import transfer_queue as adapter
-
-    calls = []
-
-    class FakeStore:
-        def setup(self, *args, **kwargs):
-            calls.append((args, kwargs))
-            return 0
-
-    monkeypatch.setattr(mooncake_client, "MooncakeDistributedStore", FakeStore)
-    monkeypatch.setattr(
-        ray,
-        "get_runtime_context",
-        lambda: SimpleNamespace(get_job_id=lambda: "05000000"),
-    )
-    backend_var = "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"
-    eviction_var = "MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION"
-    for var in (backend_var, eviction_var):
-        # setenv first so monkeypatch restores the var even if it was unset.
-        monkeypatch.setenv(var, "")
-        monkeypatch.delenv(var)
-
-    adapter._install_mooncake_ssd_offload(str(tmp_path))
-    adapter._install_mooncake_ssd_offload(str(tmp_path))  # idempotent
-    mooncake_client.MooncakeDistributedStore().setup("h", "m", 1, 2, "tcp", "", "a")
-
-    (unit_dir,) = (tmp_path / "nemo_rl_mooncake_offload").iterdir()
-    assert unit_dir.name.startswith(f"05000000-{adapter.os.getpid()}-")
-    assert unit_dir.stat().st_mode & 0o777 == 0o700
-    assert calls == [
-        (
-            ("h", "m", 1, 2, "tcp", "", "a"),
-            {"enable_ssd_offload": True, "ssd_offload_path": str(unit_dir)},
-        )
-    ]
-    # The bucket backend holds objects in memory until a 256 MB bucket fills.
-    assert adapter.os.environ[backend_var] == "file_per_key_storage_backend"
-    # Disk eviction would delete the only copy of an offloaded object.
-    assert adapter.os.environ[eviction_var] == "false"
 
 
 def test_simple_backend_nested_block_is_used() -> None:

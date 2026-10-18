@@ -98,31 +98,16 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
 
 class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
-    """Mooncake SSD offload: storage units spill DRAM to node-local SSD.
+    """Mooncake SSD offload: segment owners spill DRAM to node-local SSD.
 
-    Mooncake's master offloads an object only to the SSD of the client that
-    owns the segment holding it, so offload runs inside each
-    ``MooncakeStorageUnit`` (the only segment owners when
-    ``storage_unit_segment_size > 0``), each under its own
-    ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``; no shared filesystem
-    is needed. Those directories are left behind when the run ends, so point
-    ``path`` at per-job scratch space or clean it up afterwards.
-    TQ's own ``MooncakeStore.offload`` is not used: its single offload client
-    on the driver owns none of the data, so nothing could be evicted.
-
-    When usage across all units passes ``offload_threshold`` (a share of
-    their memory), the master writes objects to their owner's SSD and drops
-    them from memory, 10% of the memory per round. Reads of an offloaded
-    object go through
-    its owner transparently. An object is only dropped from memory once its
-    SSD copy exists; if SSD writes fail, puts fail once memory is full.
-    Mooncake's disk watermark eviction is turned off, since it would delete
-    the only copy, so SSD files are not reclaimed during a run. Size the disk
-    for the run: Mooncake's per-key backend still deletes the oldest files
-    once the disk is 90% full, and reading those objects then fails.
-
-    Not checkpointable: a data-plane checkpoint needs hard-pinned memory
-    replicas, which this mode turns off.
+    Once memory use across all segments passes ``offload_threshold`` (a share
+    of their total), Mooncake moves objects to the SSD of the process owning
+    them, under its own subdirectory of ``path`` (node-local, absolute).
+    Offload runs in every segment owner: the storage units when they are on,
+    otherwise every client with a segment (see
+    ``nemo_rl.data_plane.adapters.mooncake_ssd_offload``).
+    Operation, cleanup and the full-disk data-loss risk are described under
+    "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
     """
 
     enabled: bool = False
@@ -194,16 +179,16 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
         default_factory=MooncakeSsdOffloadConfig
     )
 
-    @model_validator(mode="after")
-    def _ssd_offload_needs_storage_units(self) -> "MooncakeCpuConfig":
-        # Offload runs inside the storage units; without them every GPU
-        # process owns a segment that nothing could spill.
-        if self.ssd_offload.enabled and not self.storage_unit_segment_size:
-            raise ValueError(
-                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
-                "data_plane.mooncake_cpu.storage_unit_segment_size > 0."
-            )
-        return self
+    def owned_segment_size(self, segment_size: int | None) -> int:
+        """Bytes of Mooncake memory a process owns.
+
+        ``segment_size`` is what the process asked for (a storage unit's size,
+        or 0 for a client that owns nothing); ``None`` takes the controller's
+        default, which is 0 for every client once storage units are on.
+        """
+        if segment_size is not None:
+            return segment_size
+        return 0 if self.storage_unit_segment_size else self.global_segment_size
 
 
 class DataPlaneConfig(TypedDict):
@@ -254,12 +239,8 @@ def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     checkpointing settings decide whether a run saves data-plane state;
     normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
-    known to round-trip through a checkpoint. Mooncake SSD offload is not
-    checkpointable: a checkpoint needs hard-pinned memory replicas, and
-    offload needs evictable ones.
+    known to round-trip through a checkpoint.
     """
-    if cfg["backend"] == "mooncake_cpu" and backend_config(cfg).ssd_offload.enabled:
-        return False
     return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
 
 
