@@ -87,6 +87,36 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
 
 
 @pytest.mark.vllm
+def test_prepare_refit_info_rejects_trtllm_draft_before_first_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: object(),
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    monkeypatch.setattr(ext, "_uses_unquantized_flashinfer_trtllm", lambda: True)
+    monkeypatch.setattr(ext, "_mtp_drafter_refit_enabled", lambda: False)
+
+    with pytest.raises(RuntimeError, match="does not yet support a co-trained draft"):
+        ext.prepare_refit_info(
+            {
+                "model.weight": ((2,), torch.float32),
+                "draft.model.weight": ((2,), torch.float32),
+            }
+        )
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])
 def test_common_speculator_refit_drops_tied_alias_then_finalizes_target_and_draft(
     monkeypatch, speculator_type

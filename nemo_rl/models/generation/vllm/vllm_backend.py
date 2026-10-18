@@ -733,7 +733,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
-        self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
@@ -765,6 +764,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             target_owner_ranks=tuple(range(pp_size)),
             draft_owner_ranks=draft_owner_ranks,
         )
+        # Validate after the manifest exists, so the draft check sees this refit.
+        self._validate_native_layerwise_refit()
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
