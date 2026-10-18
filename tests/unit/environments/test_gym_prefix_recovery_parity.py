@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -234,6 +235,77 @@ def test_prefix_completion_retires_old_keys() -> None:
     _HELPER._assert_retired_prefix_keys(
         selection, [{"staging_sample_ids": ["new-active-key"], "rows": []}]
     )
+
+
+def _dump_restored_run(tmp_path: Path, *, live_keys: list[str]) -> argparse.Namespace:
+    """A phase-two trainer dump, log, and selection for ``verify-completion``."""
+    from nemo_rl.utils.train_data_dump import TrainDataDump
+
+    log_dir = tmp_path / "recovery-logs"
+    token_ids = [1, 2] + list(range(100, 112))
+    dump = TrainDataDump(str(log_dir / "exp_001"))
+    dump.add_chunk(
+        step=0,
+        sample_ids=["group-a_g0"],
+        tags=[{"prompt_idx": 0}],
+        input_lengths=torch.tensor([len(token_ids)]),
+        sequences={
+            "token_ids": torch.tensor([token_ids]),
+            # The trainer masked one position inside the restored call.
+            "token_loss_mask": torch.tensor(
+                [[0.0, 0.0] + [1.0] * 6 + [0.0] + [1.0] * 5]
+            ),
+            "advantages": torch.zeros(1, len(token_ids)),
+            "generation_logprobs": torch.zeros(1, len(token_ids)),
+            "prev_logprobs": torch.zeros(1, len(token_ids)),
+        },
+        scalars={
+            "sample_loss_mask": torch.tensor([1.0]),
+            "rewards": torch.tensor([1.0]),
+        },
+    )
+    dump.finish_step(0, expected_rows=1)
+    staging_keys = tmp_path / "recovery-staging-keys.jsonl"
+    staging_keys.write_text(
+        json.dumps({"train_step": 1, "staging_sample_ids": live_keys}) + "\n"
+    )
+    selection = tmp_path / "selected-snapshot.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "cuts": [
+                    {
+                        **_cut("call-a", 0, 5),
+                        "group_id": "group-a",
+                        "staging_keys": ["prefix-key"],
+                    }
+                ]
+            }
+        )
+    )
+    phase2_log = tmp_path / "phase2.log"
+    phase2_log.write_text(_completion_log("call-a"))
+    return argparse.Namespace(
+        selection_file=str(selection),
+        recovery_log_dir=str(log_dir),
+        recovery_staging_keys=str(staging_keys),
+        phase2_log=str(phase2_log),
+    )
+
+
+def test_verify_completion_checks_a_reference_free_restore(tmp_path: Path, capsys):
+    _SNAPSHOT_HELPER.verify_completion(
+        _dump_restored_run(tmp_path, live_keys=["new-active-key"])
+    )
+
+    assert "('group-a', 0)" in capsys.readouterr().out
+
+
+def test_verify_completion_rejects_a_restored_prefix_still_live(tmp_path: Path):
+    with pytest.raises(AssertionError, match="still live when training began"):
+        _SNAPSHOT_HELPER.verify_completion(
+            _dump_restored_run(tmp_path, live_keys=["prefix-key"])
+        )
 
 
 def test_restored_prefix_keys_must_not_be_live_when_training_begins() -> None:
