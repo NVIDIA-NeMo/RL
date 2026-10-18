@@ -44,6 +44,7 @@ grpo:
     max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
     recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
+    overlap_logprobs: false  # Compute prev-policy logprobs while a step waits for its groups
 ```
 
 ### Complete Example Config
@@ -224,6 +225,8 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. Except for managed Dynamo, the collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain; SGLang is in this group today and instead relies on the pause its own weight synchronizer performs around the transfer. Managed Dynamo always drains active trajectories before refit. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
 
 5. **Recompute KV Cache After Weight Updates**: Set `recompute_kv_cache_after_weight_updates: true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. Other refit paths keep their existing post-update invalidation behavior. When false, in-flight requests retain their pre-update KV cache. On the Megatron generation backend, this must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`; setup errors on a mismatch.
+
+6. **Overlap Logprobs**: With `overlap_logprobs: true`, prev-policy logprobs are computed for each step's groups as they arrive, while the step waits for its last groups, instead of for the whole batch after the wait. The policy weights change only in training, so these are the logprobs the step needs; only the rows that arrive last are left on the critical path. Rows are matched to the training batch by their tokens, and any row that matches nothing is recomputed. Logprobs computed in a different batch can differ at numerical-noise level. The time spent is logged as `timing/train/overlapped_logprobs`, and the rows computed during and after the wait as `train/logprob_rows_overlapped` and `train/logprob_rows_critical_path`; `timing/train/policy_and_reference_logprobs` then covers only the rows computed after the wait. Requires `policy.generation.colocated.enabled: false`, and does not support top-k/top-p filtering, router replay or multimodal data. The [Single-Controller](single-controller.md) path goes further, streaming logprobs and training per chunk of groups; this option brings the logprob part of that to async GRPO.
 
 ## Why Importance Sampling Correction Is Required for Async
 
