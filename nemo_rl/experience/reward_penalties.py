@@ -115,6 +115,38 @@ def has_unwanted_tokens(
     )
 
 
+def has_malformed_think_tag(
+    carry: Sequence[int],
+    generation: Sequence[int],
+    *,
+    think_tag_ids: tuple[int, int] | None,
+    thinking_tags: Sequence[str],
+    decode: Callable[[Sequence[int]], str],
+) -> bool:
+    """One turn of ``apply_reward_penalties``' malformed-think-tag check.
+
+    ``carry`` is the turn's prompt delta and ``generation`` its sampled tokens.
+    With single-token tag IDs, the prompt sets the thinking mode: balanced tags
+    mean thinking off (no tags generated), one trailing open tag means thinking
+    on (exactly one close tag generated); any other prompt is a violation. Tags
+    spelled with ordinary tokens bypass the ID check, so the decoded generation
+    must also hold no open tag and at most one close tag.
+    """
+    if think_tag_ids is not None:
+        think_open, think_close = think_tag_ids
+        prompt_open, prompt_close = carry.count(think_open), carry.count(think_close)
+        if prompt_open == prompt_close:
+            expected = (0, 0)
+        elif prompt_open == prompt_close + 1:
+            expected = (0, 1)
+        else:
+            return True
+        if (generation.count(think_open), generation.count(think_close)) != expected:
+            return True
+    text = decode(generation)
+    return text.count(thinking_tags[0]) > 0 or text.count(thinking_tags[1]) > 1
+
+
 @dataclass(frozen=True)
 class RewardChecks:
     """Scored-text and original-prompt checks saved with a rollout attempt."""
@@ -168,6 +200,13 @@ CAPTURE_PENALTIES = (
         lambda config: config.penalize_unwanted_tokens,
         None,
     ),
+    CapturePenalty(
+        "malformed_think_tag",
+        "penalize_malformed_think_tag",
+        "malformed_think_tag_rate",
+        lambda config: config.penalize_malformed_think_tag,
+        None,
+    ),
 )
 
 
@@ -193,8 +232,6 @@ class CaptureRewardSettings:
     def from_configs(
         cls, penalties: RewardPenaltyConfig, effort: EffortLevelsConfig | None
     ) -> CaptureRewardSettings:
-        if penalties.penalize_malformed_think_tag:
-            raise ValueError("capture does not support penalize_malformed_think_tag")
         unwanted: tuple[int, ...] = ()
         if penalties.penalize_unwanted_tokens:
             assert penalties.token_ids is not None
@@ -361,8 +398,17 @@ def finalize_capture_reward(
     effort_config: EffortLevelsConfig | None,
     token_ids: list[int],
     link_spans: list[tuple[str, int, int]],
+    decode: Callable[[Sequence[int]], str] | None = None,
+    thinking_tags: Sequence[str] | None = None,
 ) -> tuple[float, dict[str, int], dict[str, float]]:
-    """Shape, then penalize. Token IDs and spans must already be verified by Gym."""
+    """Shape, then penalize. Token IDs and spans must already be verified by Gym.
+
+    Token-scoped penalties walk the verified (carry, generation) spans, the
+    capture-path equivalent of the echo path's (user, assistant) message pairs.
+    The malformed-think-tag check needs ``decode`` and the resolved
+    ``thinking_tags``; the echo path's message-level ``has_malformed_thinking``
+    flag has no capture source and is not consulted.
+    """
     counts = {spec.name: 0 for spec in CAPTURE_PENALTIES}
     metrics: dict[str, float] = {}
     shaping = effort_shaping_enabled(effort_config)
@@ -390,20 +436,45 @@ def finalize_capture_reward(
                     counts[spec.name] = int(
                         spec.enabled(penalty_config) and spec.text_match(checks)
                     )
+        unwanted_ids: list[int] | None = None
         if penalty_config.penalize_unwanted_tokens:
             assert penalty_config.token_ids is not None
             unwanted_ids = penalty_config.token_ids.unwanted
             assert unwanted_ids is not None
-            offset = 0
-            for _, carry, generated in link_spans:
-                end = offset + carry + generated
-                if has_unwanted_tokens(
-                    (token_ids[offset + carry : end],),
-                    unwanted_ids,
-                ):
-                    counts["unwanted_token"] = 1
-                    break
-                offset = end
+        think_tags: Sequence[str] | None = None
+        think_tag_ids: tuple[int, int] | None = None
+        if penalty_config.penalize_malformed_think_tag:
+            if decode is None or thinking_tags is None or len(thinking_tags) < 2:
+                raise ValueError("malformed_think_tag_needs_decode_and_tags")
+            think_tags = thinking_tags
+            think_ids = penalty_config.token_ids
+            if (
+                think_ids is not None
+                and think_ids.think_open is not None
+                and think_ids.think_close is not None
+            ):
+                think_tag_ids = (think_ids.think_open, think_ids.think_close)
+        offset = 0
+        for _, carry, generated in link_spans:
+            start = offset + carry
+            end = start + generated
+            generation = token_ids[start:end]
+            if unwanted_ids is not None and has_unwanted_tokens(
+                (generation,), unwanted_ids
+            ):
+                counts["unwanted_token"] = 1
+            if think_tags is not None and not counts["malformed_think_tag"]:
+                assert decode is not None
+                counts["malformed_think_tag"] = int(
+                    has_malformed_think_tag(
+                        token_ids[offset:start],
+                        generation,
+                        think_tag_ids=think_tag_ids,
+                        thinking_tags=think_tags,
+                        decode=decode,
+                    )
+                )
+            offset = end
     return (0.0 if any(counts.values()) else reward), counts, metrics
 
 
