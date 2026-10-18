@@ -25,6 +25,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from _gym_prefix_recovery_parity import (
+    _assert_prefix_boundary,
+    _assert_retired_prefix_keys,
+    _rows_by_identity,
+    load_training_records,
+)
 from _gym_recovery_snapshot_helpers import (
     calendar_sentinel_count,
     ledger_episode_index,
@@ -99,7 +105,7 @@ def _require_cut_coverage(
 
 def inspect_snapshot(
     snapshot: Path,
-    sentinel_event: str,
+    sentinel_event: str | None,
     *,
     min_cuts: int = 1,
     min_cut_groups: int = 1,
@@ -108,7 +114,9 @@ def inspect_snapshot(
 
     The top-level fields describe the longest cut; ``cuts`` lists every one,
     and the snapshot qualifies only if it holds at least ``min_cuts`` of them
-    spread across at least ``min_cut_groups`` prompt groups.
+    spread across at least ``min_cut_groups`` prompt groups. A ``None``
+    ``sentinel_event`` selects a stateless resources server (e.g. CLEVR's
+    string_match), whose episodes export no resources state to check.
     """
 
     required = [
@@ -143,11 +151,17 @@ def inspect_snapshot(
         key = _episode_key(record)
         recovery = ledger.get(key)
         cut = _recoverable_cut(record)
-        resource_entry = resource_index.get(key)
-        if recovery is None or cut is None or resource_entry is None:
+        if recovery is None or cut is None:
             continue
-        resources_manifest, resources_state = resource_entry
-        sentinel_count = calendar_sentinel_count(resources_state, sentinel_event)
+        resources_manifest = None
+        if sentinel_event is not None:
+            resource_entry = resource_index.get(key)
+            if resource_entry is None:
+                continue
+            manifest_path, resources_state = resource_entry
+            if calendar_sentinel_count(resources_state, sentinel_event) != 1:
+                continue
+            resources_manifest = str(manifest_path.relative_to(snapshot))
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
             (episode["rollout_id"], episode["attempt"])
@@ -157,7 +171,6 @@ def inspect_snapshot(
         if (
             key not in checkpointed_episodes
             or key not in agent_keys
-            or sentinel_count != 1
             or recovery["restore_level"] != "prefix"
             or recovery["status"] != "dispatched"
             or not set(cut["staging_keys"]).issubset(retained_keys)
@@ -174,7 +187,7 @@ def inspect_snapshot(
                 "generation_index": recovery["generation_index"],
                 "target_step": recovery["target_step"],
                 "model_manifest": str(model_manifest.relative_to(snapshot)),
-                "resources_manifest": str(resources_manifest.relative_to(snapshot)),
+                "resources_manifest": resources_manifest,
                 "sentinel_event": sentinel_event,
                 **cut,
             }
@@ -204,7 +217,7 @@ def select_snapshot(args: argparse.Namespace) -> None:
             try:
                 selection = inspect_snapshot(
                     snapshot,
-                    args.sentinel_event,
+                    None if args.stateless_resources else args.sentinel_event,
                     min_cuts=args.min_cuts,
                     min_cut_groups=args.min_cut_groups,
                 )
@@ -326,6 +339,26 @@ def verify_restore(args: argparse.Namespace) -> None:
             raise AssertionError(f"train step {step} appeared {len(matches)} times")
 
 
+def verify_completion(args: argparse.Namespace) -> None:
+    """Without a reference run, require every restored prefix to finish and train.
+
+    Each restored call must complete once, close its trained row, and start
+    with the exact prefix the worker restored (``_assert_prefix_boundary``); no
+    row may be trained twice, and no restored prefix row may still be live when
+    training reads the step.
+    """
+    selection = read_json(Path(args.selection_file))
+    records = load_training_records(
+        Path(args.recovery_log_dir), staging_keys=Path(args.recovery_staging_keys)
+    )
+    _rows_by_identity(records)
+    starts = _assert_prefix_boundary(
+        selection, Path(args.phase2_log).read_text(), records
+    )
+    _assert_retired_prefix_keys(selection, records)
+    print(f"restored prefixes completed and trained: {sorted(starts)!r}", flush=True)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -337,7 +370,10 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("phase_log")
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
-    select.add_argument("sentinel_event")
+    select.add_argument("sentinel_event", nargs="?")
+    # Explicit opt-out, so a Workplace caller that drops the sentinel fails
+    # instead of silently skipping the post-mutation resources check.
+    select.add_argument("--stateless-resources", action="store_true")
     select.add_argument("--min-cuts", type=int, default=1)
     select.add_argument("--min-cut-groups", type=int, default=1)
     select.set_defaults(func=select_snapshot)
@@ -350,9 +386,23 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("training_info")
     verify.add_argument("max_steps", type=int)
     verify.set_defaults(func=verify_restore)
+
+    completion = commands.add_parser("verify-completion")
+    completion.add_argument("selection_file")
+    completion.add_argument("recovery_log_dir")
+    completion.add_argument("recovery_staging_keys")
+    completion.add_argument("phase2_log")
+    completion.set_defaults(func=verify_completion)
     return parser
 
 
 if __name__ == "__main__":
-    arguments = _parser().parse_args()
+    parser = _parser()
+    arguments = parser.parse_args()
+    if arguments.command == "select" and (
+        (arguments.sentinel_event is None) != arguments.stateless_resources
+    ):
+        parser.error(
+            "select needs exactly one of sentinel_event or --stateless-resources"
+        )
     arguments.func(arguments)
