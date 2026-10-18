@@ -25,6 +25,9 @@ import torch
 _HELPER_PATH = (
     Path(__file__).parents[2] / "functional" / "_gym_prefix_recovery_parity.py"
 )
+# Both helpers import their shared sibling module by name, as they do when the
+# functional scripts run them.
+sys.path.insert(0, str(_HELPER_PATH.parent))
 _SPEC = importlib.util.spec_from_file_location(
     "gym_prefix_recovery_parity", _HELPER_PATH
 )
@@ -35,9 +38,6 @@ _SPEC.loader.exec_module(_HELPER)
 _SNAPSHOT_HELPER_PATH = (
     Path(__file__).parents[2] / "functional" / "_gym_prefix_recovery_snapshot.py"
 )
-# The snapshot helper imports its shared sibling module by name, as it does
-# when the functional scripts run it.
-sys.path.insert(0, str(_SNAPSHOT_HELPER_PATH.parent))
 _SNAPSHOT_SPEC = importlib.util.spec_from_file_location(
     "gym_prefix_recovery_snapshot", _SNAPSHOT_HELPER_PATH
 )
@@ -79,35 +79,63 @@ def test_calendar_sentinel_count_matches_one_checkpointed_event() -> None:
         }
     }
 
-    assert _SNAPSHOT_HELPER._calendar_sentinel_count(state, "recovery sentinel") == 1
+    assert _SNAPSHOT_HELPER.calendar_sentinel_count(state, "recovery sentinel") == 1
 
 
-def test_serialize_training_batch_trims_padding_and_records_identity() -> None:
-    record = _HELPER.serialize_training_batch(
-        train_step=3,
-        chunk_index=1,
+def test_training_records_load_from_the_trainer_dump(tmp_path: Path) -> None:
+    """Rows come from ``async_rl.log_full_train_data``, written by the real dump."""
+    from nemo_rl.utils.train_data_dump import TrainDataDump
+
+    # The entrypoint writes into a new exp_NNN directory under logger.log_dir.
+    dump = TrainDataDump(str(tmp_path / "exp_001"))
+    dump.add_chunk(
+        step=2,
         sample_ids=["group-a_g0", "group-a_g1"],
         tags=[{"prompt_idx": 11}, {"prompt_idx": 11}],
-        data={
-            "input_ids": torch.tensor([[1, 2, 99], [3, 4, 5]]),
-            "input_lengths": torch.tensor([2, 3]),
-            "token_mask": torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 1.0]]),
-            "sample_mask": torch.tensor([1.0, 0.5]),
-            "total_reward": torch.tensor([1.0, 0.0]),
+        input_lengths=torch.tensor([2, 3]),
+        sequences={
+            "token_ids": torch.tensor([[1, 2, 99], [3, 4, 5]]),
+            "token_loss_mask": torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 1.0]]),
             "advantages": torch.tensor([[0.0, 2.0, 99.0], [0.0, 3.0, 4.0]]),
-            "generation_logprobs": torch.tensor([[0.0, -0.1, 99.0], [0.0, -0.2, -0.3]]),
-            "prev_logprobs": torch.tensor([[0.0, -0.1, 99.0], [0.0, -0.2, -0.3]]),
+            "generation_logprobs": torch.tensor([[0.0, -0.1, 9.0], [0.0, -0.2, -0.3]]),
+            "prev_logprobs": torch.tensor([[0.0, -0.1, 9.0], [0.0, -0.2, -0.3]]),
         },
-        staging_sample_ids=["z", "a"],
+        scalars={
+            "sample_loss_mask": torch.tensor([1.0, 0.5]),
+            "rewards": torch.tensor([1.0, 0.0]),
+        },
     )
+    dump.finish_step(2, expected_rows=2)
+    staging_keys = tmp_path / "staging-keys.jsonl"
+    staging_keys.write_text(
+        json.dumps({"train_step": 3, "staging_sample_ids": ["z"]})
+        + "\n"
+        + json.dumps({"train_step": 3, "staging_sample_ids": ["a"]})
+        + "\n"
+    )
+
+    (record,) = _HELPER.load_training_records(tmp_path, staging_keys=staging_keys)
 
     assert record["train_step"] == 3
     assert record["staging_sample_ids"] == ["a", "z"]
-    assert record["rows"][0]["group_id"] == "group-a"
-    assert record["rows"][0]["prompt_idx"] == 11
-    assert record["rows"][0]["generation_index"] == 0
-    assert record["rows"][0]["token_ids"] == [1, 2]
-    assert record["rows"][0]["advantages"] == [0.0, 2.0]
+    first, second = record["rows"]
+    assert (first["group_id"], first["prompt_idx"], first["generation_index"]) == (
+        "group-a",
+        11,
+        0,
+    )
+    assert first["token_ids"] == [1, 2]
+    assert first["advantages"] == [0.0, 2.0]
+    assert (second["input_length"], second["reward"]) == (3, 0.0)
+    assert second["sample_loss_mask"] == 0.5
+
+
+def test_training_records_require_one_experiment_directory(tmp_path: Path) -> None:
+    (tmp_path / "exp_001").mkdir()
+    (tmp_path / "exp_002").mkdir()
+
+    with pytest.raises(AssertionError, match="expected one experiment directory"):
+        _HELPER.load_training_records(tmp_path)
 
 
 def test_compare_training_rows_is_order_independent_and_tolerates_floats() -> None:
@@ -124,7 +152,7 @@ def test_compare_training_rows_is_order_independent_and_tolerates_floats() -> No
             **baseline_rows[1],
             "group_id": "recovered-group",
             "sample_id": "recovered-group_g1",
-            "prev_logprobs": [-0.1, -0.2, -0.300001],
+            "advantages": [0.0, 0.5, 0.500001],
         },
         {
             **baseline_rows[0],
@@ -168,58 +196,40 @@ def _trained_records(generated: int, *, group_id: str = "g") -> list[dict[str, A
     return [{"train_step": 1, "rows": [row]}]
 
 
-def test_prefix_completion_and_successor_checkpoint_retire_old_keys(
-    tmp_path: Path,
-) -> None:
+def test_prefix_completion_retires_old_keys() -> None:
     selection = {
-        "model_call_id": "source-call",
-        "group_id": "g",
-        "generation_index": 0,
-        "prefix_token_count": 5,
-        "staging_keys": ["prefix-base", "prefix-routes"],
+        "cuts": [
+            {
+                "model_call_id": "source-call",
+                "group_id": "g",
+                "generation_index": 0,
+                "prefix_token_count": 5,
+                "staging_keys": ["prefix-base", "prefix-routes"],
+            }
+        ]
     }
     log = (
         "generation prefix completed: rollout_id=r model_call_id=continued "
         "source_model_call_id=source-call prefix_tokens=5 tail_tokens=7 "
         "total_generation_tokens=12"
     )
-    successor = tmp_path / "step_1"
-    successor.mkdir()
-    (successor / "gym_checkpoint.json").write_text(
-        json.dumps({"staging_keys": {"gym-0": ["new-active-key"]}})
-    )
-
     _HELPER._assert_prefix_boundary(selection, log, _trained_records(12))
     _HELPER._assert_retired_prefix_keys(
-        selection,
-        [{"staging_sample_ids": ["new-active-key"], "rows": []}],
-        successor,
+        selection, [{"staging_sample_ids": ["new-active-key"], "rows": []}]
     )
 
 
-def test_trainer_checkpoint_successor_holds_no_gym_state(tmp_path: Path) -> None:
-    selection = {"model_call_id": "source-call", "staging_keys": ["prefix-base"]}
-    successor = tmp_path / "step_1"
-    successor.mkdir()
+def test_restored_prefix_keys_must_not_be_live_when_training_begins() -> None:
+    selection = {
+        "cuts": [{"model_call_id": "source-call", "staging_keys": ["prefix-base"]}]
+    }
 
-    _HELPER._assert_retired_prefix_keys(selection, [], successor)
+    _HELPER._assert_retired_prefix_keys(selection, [])
 
     with pytest.raises(AssertionError, match="still live when training began"):
         _HELPER._assert_retired_prefix_keys(
-            selection, [{"staging_sample_ids": ["prefix-base"], "rows": []}], successor
+            selection, [{"staging_sample_ids": ["prefix-base"], "rows": []}]
         )
-
-
-def test_prefix_completion_rejects_gap_or_overlap() -> None:
-    selection = {"model_call_id": "source-call", "prefix_token_count": 5}
-    log = (
-        "generation prefix completed: rollout_id=r model_call_id=continued "
-        "source_model_call_id=source-call prefix_tokens=5 tail_tokens=7 "
-        "total_generation_tokens=13"
-    )
-
-    with pytest.raises(AssertionError, match="gap or overlap"):
-        _HELPER._assert_prefix_boundary(selection, log, _trained_records(13))
 
 
 @pytest.mark.parametrize("trained", [11, 13])
@@ -229,10 +239,14 @@ def test_prefix_completion_rejects_trained_row_that_dropped_or_duplicated_a_toke
     # The worker's own total always equals prefix + tail; only the trained row
     # can expose a dropped or duplicated token.
     selection = {
-        "model_call_id": "source-call",
-        "group_id": "g",
-        "generation_index": 0,
-        "prefix_token_count": 5,
+        "cuts": [
+            {
+                "model_call_id": "source-call",
+                "group_id": "g",
+                "generation_index": 0,
+                "prefix_token_count": 5,
+            }
+        ]
     }
     log = (
         "generation prefix completed: rollout_id=r model_call_id=continued "
@@ -242,109 +256,6 @@ def test_prefix_completion_rejects_trained_row_that_dropped_or_duplicated_a_toke
 
     with pytest.raises(AssertionError, match="trained=" + str(trained)):
         _HELPER._assert_prefix_boundary(selection, log, _trained_records(trained))
-
-
-def _completion(step: int, prompt: int, generation: int) -> dict[str, Any]:
-    return {
-        "event": "completion",
-        "target_step": step,
-        "prompt_idx": prompt,
-        "sibling": {"generation_index": generation},
-    }
-
-
-def test_rank_metrics_compare_only_pairs_within_a_step() -> None:
-    baseline = [(0, 0, 0), (0, 1, 0), (1, 2, 0), (1, 3, 0)]
-    recovery = [(0, 1, 0), (0, 0, 0), (1, 2, 0), (1, 3, 0)]
-
-    metrics = _HELPER._within_step_rank_metrics(baseline, recovery)
-
-    assert metrics["comparable_pairs"] == 2
-    assert metrics["discordant_pairs"] == 1
-    assert metrics["kendall_tau"] == 0.0
-    assert not metrics["exact_match"]
-    assert [step["exact_match"] for step in metrics["per_step"]] == [False, True]
-
-
-def test_rank_metrics_reject_different_identities() -> None:
-    with pytest.raises(AssertionError, match="identical logical identities"):
-        _HELPER._within_step_rank_metrics([(0, 0, 0)], [(0, 0, 1)])
-
-
-def test_prompt_group_is_ready_at_its_last_sibling() -> None:
-    order = [(0, 1, 0), (0, 0, 0), (0, 0, 1), (0, 1, 1)]
-
-    assert _HELPER._prompt_group_ready_order(order) == [(0, 0), (0, 1)]
-
-
-def test_recovery_order_keeps_retained_rows_and_uses_redone_arrivals() -> None:
-    phase1 = [(0, 0, 0), (0, 1, 0)]
-    phase2 = [(0, 1, 1), (0, 1, 0), (0, 0, 1)]
-
-    assert _HELPER._effective_recovery_order(phase1, phase2) == [
-        (0, 0, 0),
-        (0, 1, 1),
-        (0, 1, 0),
-        (0, 0, 1),
-    ]
-
-
-def test_ordering_report_ignores_steps_that_were_not_trained() -> None:
-    baseline = [_completion(0, 0, 0), _completion(0, 1, 0), _completion(1, 2, 0)]
-    recovery = [_completion(0, 0, 0), _completion(0, 1, 0)]
-
-    report = _HELPER._ordering_report(
-        baseline_events=baseline,
-        phase1_events=[],
-        recovery_events=recovery,
-        steps=1,
-    )
-
-    assert report["sealed"]["individual"]["exact_match"]
-    assert report["arrived"]["individual"]["comparable_pairs"] == 0
-
-
-def _group_order_report(recovery: list[dict[str, Any]]) -> dict[str, Any]:
-    baseline = [
-        _completion(0, 0, 0),
-        _completion(0, 1, 0),
-        _completion(1, 2, 0),
-        _completion(1, 3, 0),
-    ]
-    return _HELPER._ordering_report(
-        baseline_events=baseline,
-        phase1_events=[],
-        recovery_events=recovery,
-        steps=2,
-    )
-
-
-def test_prompt_group_order_is_required_only_in_restored_steps() -> None:
-    later_step_swapped = _group_order_report(
-        [
-            _completion(0, 0, 0),
-            _completion(0, 1, 0),
-            _completion(1, 3, 0),
-            _completion(1, 2, 0),
-        ]
-    )
-    _HELPER._assert_restored_prompt_group_order(later_step_swapped, {0})
-
-    with pytest.raises(AssertionError, match="differs in a restored step"):
-        _HELPER._assert_restored_prompt_group_order(later_step_swapped, {0, 1})
-
-
-def test_restored_target_steps_resolve_cut_groups_through_events() -> None:
-    selection = {"cuts": [{"group_id": "g-a"}, {"group_id": "g-b"}]}
-    events = [
-        {"event": "dispatch", "group_id": "g-a", "target_step": 0},
-        {"event": "dispatch", "group_id": "g-b", "target_step": 0},
-        {"event": "dispatch", "group_id": "g-c", "target_step": 2},
-    ]
-
-    assert _HELPER._restored_target_steps(selection, events) == {0}
-    with pytest.raises(AssertionError, match="no recorded target step"):
-        _HELPER._restored_target_steps({"cuts": [{"group_id": "g-z"}]}, events)
 
 
 def test_reward_signal_rejects_constant_rewards() -> None:
@@ -359,46 +270,6 @@ def test_reward_signal_rejects_constant_rewards() -> None:
     rows[1]["reward"] = 0.0
     signal = _HELPER._assert_reward_signal([{"train_step": 1, "rows": rows}])
     assert signal["rows_with_nonzero_advantages"] == 2
-
-
-def test_generation_logprob_report_measures_only_generated_tokens() -> None:
-    baseline = _row(token_ids=[1, 2, 3])
-    recovery = {**baseline, "generation_logprobs": [-9.0, -0.2, -0.31]}
-
-    report = _HELPER._generation_logprob_report(
-        [{"train_step": 1, "rows": [baseline]}],
-        [{"train_step": 1, "rows": [recovery]}],
-    )
-
-    pooled = report["pooled"]
-    assert pooled["generated_tokens"] == 2
-    assert pooled["spearman"] == pytest.approx(1.0)
-    assert pooled["bit_identical_fraction"] == 0.5
-    assert pooled["max_abs_diff"] == pytest.approx(0.01)
-
-
-def test_rollout_timeline_is_relative_to_the_first_event() -> None:
-    events = [
-        {
-            "event": "dispatch",
-            "time_s": 100.0,
-            "target_step": 0,
-            "prompt_idx": 0,
-            "generation_indices": [0],
-        },
-        {
-            "event": "completion_arrived",
-            "time_s": 102.5,
-            "target_step": 0,
-            "prompt_idx": 0,
-            "generation_index": 0,
-        },
-        {**_completion(0, 0, 0), "time_s": 103.0},
-    ]
-
-    assert _HELPER._rollout_timeline(events, steps=1) == {
-        "(0, 0, 0)": {"dispatch": 0.0, "completion_arrived": 2.5, "completion": 3.0}
-    }
 
 
 def _generated_row(
@@ -418,130 +289,138 @@ def _generated_row(
     }
 
 
-def _restored_log(prefix_ids: list[int], *, call: str = "source-call") -> str:
-    digest = hashlib.sha256(",".join(map(str, prefix_ids)).encode()).hexdigest()
-    return (
-        "generation prefix restored: rollout_id=r model_call_id=continued "
-        f"source_model_call_id={call} prefix_tokens={len(prefix_ids)} "
-        f"prefix_digest={'0' * 64} weight_version_span=[0,0] "
-        f"prefix_ids_sha256={digest}"
-    )
+def test_restored_row_must_match_exactly_outside_the_cut_turn() -> None:
+    """A changed tool result earlier in a restored row is never excused."""
+    baseline = _generated_row(0, [1, 2, 3, 4, 30, 40, 41, 42])
+    recovery = _generated_row(0, [1, 2, 3, 4, 77, 40, 41, 42])
 
-
-_CUT_SELECTION = {
-    "cuts": [
-        {
-            "model_call_id": "source-call",
-            "group_id": "recovered-group",
-            "generation_index": 0,
-            "prefix_token_count": 2,
-        }
-    ]
-}
-
-
-@pytest.mark.parametrize(
-    ("recovered_tokens", "expected_kind", "expected_diff"),
-    [
-        ([1, 2, 3, 4, 5, 6, 7, 8], "match", None),
-        ([1, 2, 3, 4, 5, 9, 7, 8], "pre_cut", 5),
-        ([1, 2, 3, 4, 5, 6, 7, 9], "post_cut", 7),
-        ([1, 9, 3, 4, 5, 6, 7, 8], "pre_generation", 1),
-    ],
-)
-def test_token_divergence_is_located_relative_to_the_restored_prefix(
-    recovered_tokens: list[int], expected_kind: str, expected_diff: int | None
-) -> None:
-    baseline = _generated_row(0, [1, 2, 3, 4, 5, 6, 7, 8])
-    recovery = _generated_row(0, recovered_tokens, group_id="recovered-group")
-
-    result = _HELPER._classify_token_divergence(
-        [{"train_step": 1, "rows": [baseline]}],
-        [{"train_step": 1, "rows": [recovery]}],
-        _CUT_SELECTION,
-        # The worker restored exactly the trained prefix tokens.
-        _restored_log(recovered_tokens[5:7]),
-    )
-
-    assert result[(1, 7, 0)] == {
-        "kind": expected_kind,
-        "first_diff": expected_diff,
-        "restored_prefix_end": 7,
-        "restored_prefix_hash_matches": True,
-    }
-
-
-@pytest.mark.parametrize("logged_prefix", [[6, 7], [9], None])
-def test_pre_cut_divergence_needs_the_restored_tokens_in_the_trained_row(
-    logged_prefix: list[int] | None,
-) -> None:
-    # Trained prefix [9, 7] diverges from the baseline inside the cut. It is
-    # excusable only if the worker restored exactly [9, 7].
-    baseline = _generated_row(0, [1, 2, 3, 4, 5, 6, 7, 8])
-    recovery = _generated_row(0, [1, 2, 3, 4, 5, 9, 7, 8], group_id="recovered-group")
-
-    result = _HELPER._classify_token_divergence(
-        [{"train_step": 1, "rows": [baseline]}],
-        [{"train_step": 1, "rows": [recovery]}],
-        _CUT_SELECTION,
-        "" if logged_prefix is None else _restored_log(logged_prefix),
-    )
-
-    assert result[(1, 7, 0)]["kind"] == "prefix_mismatch"
-
-
-def test_token_divergence_without_a_cut_is_unrestored() -> None:
-    result = _HELPER._classify_token_divergence(
-        [{"train_step": 1, "rows": [_generated_row(0, [1, 2, 3, 4, 5, 6])]}],
-        [{"train_step": 1, "rows": [_generated_row(0, [1, 2, 3, 4, 5, 9])]}],
-        {"cuts": []},
-        "",
-    )
-
-    assert result[(1, 7, 0)]["kind"] == "unrestored"
-
-
-def test_compare_training_rows_skips_only_excused_rows() -> None:
-    baseline = [
-        _row(),
-        {**_row(), "generation_index": 1, "sample_id": "physical-group_g1"},
-    ]
-    recovery = [
-        {**baseline[0], "token_ids": [1, 2, 4]},
-        {**baseline[1], "token_ids": [1, 2, 4]},
-    ]
-    records = {
-        "baseline": [{"train_step": 1, "rows": baseline}],
-        "recovery": [{"train_step": 1, "rows": recovery}],
-    }
-
-    with pytest.raises(AssertionError, match=r"\(1, 7, 1\) field 'token_ids'"):
+    with pytest.raises(AssertionError, match=r"token_ids.*first difference at index 4"):
         _HELPER._compare_training_rows(
-            records["baseline"],
-            records["recovery"],
+            [{"train_step": 1, "rows": [baseline]}],
+            [{"train_step": 1, "rows": [recovery]}],
             steps=1,
             prompts_per_step=1,
-            generations_per_prompt=2,
-            rtol=1e-4,
-            atol=1e-5,
-            excused=frozenset({(1, 7, 0)}),
+            generations_per_prompt=1,
+            rtol=0.0,
+            atol=0.0,
         )
 
 
-def test_excused_rows_still_require_equal_rewards() -> None:
-    baseline = [_row()]
-    recovery = [{**_row(token_ids=[1, 2, 4]), "reward": 0.0}]
+def _restored_log(source: str, prefix_ids: list[int]) -> str:
+    digest = hashlib.sha256(",".join(map(str, prefix_ids)).encode()).hexdigest()
+    return (
+        f"generation prefix restored: rollout_id=r model_call_id=new-{source} "
+        f"source_model_call_id={source} prefix_tokens={len(prefix_ids)} "
+        f"prefix_digest={'0' * 64} weight_version_span=[0,0] "
+        f"prefix_ids_sha256={digest}\n"
+    )
 
-    with pytest.raises(AssertionError, match=r"\(1, 7, 0\) field 'reward'"):
+
+def _cut(source: str, generation_index: int, prefix_tokens: int) -> dict[str, Any]:
+    return {
+        "model_call_id": source,
+        "group_id": "physical-group",
+        "generation_index": generation_index,
+        "prefix_token_count": prefix_tokens,
+    }
+
+
+def _diverged(
+    baseline_rows: list[dict[str, Any]],
+    recovery_rows: list[dict[str, Any]],
+    cuts: list[dict[str, Any]],
+    log: str,
+) -> frozenset[tuple[int, int, int]]:
+    return _HELPER._rows_diverged_before_cut(
+        {"cuts": cuts},
+        log,
+        [{"train_step": 1, "rows": baseline_rows}],
+        [{"train_step": 1, "rows": recovery_rows}],
+    )
+
+
+def test_restored_row_whose_phase_one_prefix_differed_is_set_aside() -> None:
+    """Phase 1 took the other side of a near-tie before the cut."""
+    baseline = [
+        _generated_row(0, [0, 1, 2, 3, 4, 10, 11, 12, 13]),
+        _generated_row(1, [0, 1, 2, 3, 4, 10, 11, 12]),
+    ]
+    recovery = [
+        _generated_row(0, [0, 1, 2, 3, 4, 20, 21, 22]),
+        _generated_row(1, [0, 1, 2, 3, 4, 10, 11, 12]),
+    ]
+    cuts = [_cut("call-a", 0, 2), _cut("call-b", 1, 1)]
+    log = _restored_log("call-a", [20, 21]) + _restored_log("call-b", [10])
+
+    diverged = _diverged(baseline, recovery, cuts, log)
+
+    assert diverged == {(1, 7, 0)}
+
+    def compare(diverged_before_cut: frozenset[tuple[int, int, int]]) -> None:
         _HELPER._compare_training_rows(
             [{"train_step": 1, "rows": baseline}],
             [{"train_step": 1, "rows": recovery}],
             steps=1,
             prompts_per_step=1,
-            generations_per_prompt=1,
-            rtol=1e-4,
-            atol=1e-5,
-            excused=frozenset({(1, 7, 0)}),
+            generations_per_prompt=2,
+            rtol=0.0,
+            atol=0.0,
+            diverged_before_cut=diverged_before_cut,
+        )
+
+    compare(diverged)
+    with pytest.raises(AssertionError, match=r"row \(1, 7, 0\) field 'input_length'"):
+        compare(frozenset())
+
+
+def test_restored_row_must_start_with_the_restored_tokens() -> None:
+    baseline = [_generated_row(0, [0, 1, 2, 3, 4, 10, 11, 12])]
+    recovery = [_generated_row(0, [0, 1, 2, 3, 4, 20, 99, 22])]
+
+    with pytest.raises(AssertionError, match="does not start with its 2 restored"):
+        _diverged(
+            baseline,
+            recovery,
+            [_cut("call-a", 0, 2)],
+            _restored_log("call-a", [20, 21]),
+        )
+
+
+def test_restored_row_that_matched_the_reference_prefix_is_not_set_aside() -> None:
+    """Only a pre-cut difference is excused; a different tail still fails."""
+    baseline = [_generated_row(0, [0, 1, 2, 3, 4, 10, 11, 12])]
+    recovery = [_generated_row(0, [0, 1, 2, 3, 4, 10, 11, 99])]
+
+    diverged = _diverged(
+        baseline, recovery, [_cut("call-a", 0, 2)], _restored_log("call-a", [10, 11])
+    )
+
+    assert diverged == frozenset()
+
+
+def test_set_aside_row_must_match_before_its_closing_call() -> None:
+    baseline = [
+        _generated_row(0, [0, 1, 2, 3, 4, 10, 11]),
+        _generated_row(1, [0, 1, 2, 3, 4, 10, 11]),
+    ]
+    recovery = [
+        _generated_row(0, [0, 1, 2, 3, 77, 20, 21]),
+        _generated_row(1, [0, 1, 2, 3, 4, 10, 11]),
+    ]
+    cuts = [_cut("call-a", 0, 1), _cut("call-b", 1, 1)]
+    log = _restored_log("call-a", [20]) + _restored_log("call-b", [10])
+
+    with pytest.raises(AssertionError, match="differs before its restored closing"):
+        _diverged(baseline, recovery, cuts, log)
+
+
+def test_not_every_restored_row_may_be_set_aside() -> None:
+    baseline = [_generated_row(0, [0, 1, 2, 3, 4, 10, 11])]
+    recovery = [_generated_row(0, [0, 1, 2, 3, 4, 20, 21])]
+
+    with pytest.raises(AssertionError, match="every restored prefix differed"):
+        _diverged(
+            baseline, recovery, [_cut("call-a", 0, 1)], _restored_log("call-a", [20])
         )
 
 
@@ -567,86 +446,69 @@ def test_every_restored_prefix_must_complete_exactly_once() -> None:
         _HELPER._assert_prefix_boundary(selection, log, _trained_records(12))
 
 
-def test_generation_logprob_report_excludes_rows_whose_tokens_diverged() -> None:
-    matched = _row(token_ids=[1, 2, 3])
-    diverged = {
-        **_row(token_ids=[1, 2, 3]),
-        "generation_index": 1,
-        "sample_id": "physical-group_g1",
-    }
+# 202 generated tokens: prompt [0, 1] and tool result [4] are not generated.
+_LOGPROB_TOKENS = list(range(205))
 
-    report = _HELPER._generation_logprob_report(
-        [{"train_step": 1, "rows": [matched, diverged]}],
-        [{"train_step": 1, "rows": [matched, {**diverged, "token_ids": [1, 2, 4]}]}],
+
+def _logprob_records(
+    generated_diffs: dict[int, float], *, prompt_diff: float = 0.0
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Baseline and recovery rows whose generation logprobs differ as given."""
+    baseline = _generated_row(0, _LOGPROB_TOKENS)
+    baseline["generation_logprobs"] = [-1.0] * len(_LOGPROB_TOKENS)
+    recovery = {
+        **baseline,
+        "generation_logprobs": list(baseline["generation_logprobs"]),
+    }
+    recovery["generation_logprobs"][0] += prompt_diff
+    for position, diff in generated_diffs.items():
+        recovery["generation_logprobs"][position] += diff
+    return (
+        [{"train_step": 1, "rows": [baseline]}],
+        [{"train_step": 1, "rows": [recovery]}],
     )
 
-    assert report["excluded_rows"] == ["(1, 7, 1)"]
-    assert report["pooled"]["generated_tokens"] == 2
+
+def test_generation_logprob_gate_accepts_bf16_noise(capsys) -> None:
+    # One small difference in 202 generated tokens; prompt logprobs are ignored.
+    baseline, recovery = _logprob_records({10: 0.125}, prompt_diff=5.0)
+
+    _HELPER._assert_generation_logprob_agreement(
+        baseline, recovery, min_bit_identical=0.99, max_abs_diff=0.5
+    )
+
+    assert (
+        "bit_identical=0.9950, max_abs_diff=0.125, tokens=202"
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize(
-    ("pooled", "message"),
+    ("generated_diffs", "message"),
     [
-        (
-            {
-                "generated_tokens": 10,
-                "bit_identical_fraction": 0.98,
-                "spearman": 1.0,
-                "max_abs_diff": 0.1,
-            },
-            "bit_identical",
-        ),
-        (
-            {
-                "generated_tokens": 10,
-                "bit_identical_fraction": 1.0,
-                "spearman": 0.9,
-                "max_abs_diff": 0.1,
-            },
-            "spearman",
-        ),
-        (
-            {
-                "generated_tokens": 10,
-                "bit_identical_fraction": 1.0,
-                "spearman": None,
-                "max_abs_diff": 0.0,
-            },
-            "spearman",
-        ),
-        (
-            {
-                "generated_tokens": 10,
-                "bit_identical_fraction": 1.0,
-                "spearman": 1.0,
-                "max_abs_diff": 0.6,
-            },
-            "max_abs_diff",
-        ),
-        ({"generated_tokens": 0}, "no token-matched rows"),
+        ({10: 0.125, 11: 0.125, 12: 0.125}, "bit_identical=0.9851"),
+        ({10: 0.75}, "max_abs_diff=0.750"),
     ],
 )
 def test_generation_logprob_gate_rejects_disagreement(
-    pooled: dict[str, Any], message: str
+    generated_diffs: dict[int, float], message: str
 ) -> None:
+    baseline, recovery = _logprob_records(generated_diffs)
+
     with pytest.raises(AssertionError, match=message):
         _HELPER._assert_generation_logprob_agreement(
-            pooled, min_bit_identical=0.99, min_spearman=0.99, max_abs_diff=0.5
+            baseline, recovery, min_bit_identical=0.99, max_abs_diff=0.5
         )
 
 
-def test_generation_logprob_gate_accepts_bf16_noise() -> None:
-    _HELPER._assert_generation_logprob_agreement(
-        {
-            "generated_tokens": 135492,
-            "bit_identical_fraction": 0.997,
-            "spearman": 0.995,
-            "max_abs_diff": 0.174,
-        },
-        min_bit_identical=0.99,
-        min_spearman=0.99,
-        max_abs_diff=0.5,
-    )
+def test_generation_logprob_gate_needs_token_matched_rows() -> None:
+    baseline, recovery = _logprob_records({})
+    recovery[0]["rows"][0] = {**recovery[0]["rows"][0], "token_ids": [9] * 205}
+
+    with pytest.raises(AssertionError, match="no token-matched rows"):
+        _HELPER._assert_generation_logprob_agreement(
+            baseline, recovery, min_bit_identical=0.99, max_abs_diff=0.5
+        )
 
 
 def test_cut_coverage_counts_distinct_prompt_groups() -> None:

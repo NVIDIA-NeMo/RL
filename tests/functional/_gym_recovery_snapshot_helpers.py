@@ -22,6 +22,7 @@ ledger or manifest format change is fixed here once.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,39 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"expected a JSON object in {path}")
     return value
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def calendar_sentinel_count(state: dict[str, Any], event_name: str) -> int:
+    """Count the selected calendar event in a checkpointed Workplace state."""
+    columns = state["calendar"]["_calendar_events"]["columns"]
+    names = next(
+        column["values"] for column in columns if column["name"] == "event_name"
+    )
+    return sum(str(name).lower() == event_name.lower() for name in names)
+
+
+# Written once, by GenerationCutCapture when a restored prefix is admitted.
+_RESTORED_PREFIX_LINE = re.compile(
+    r"generation prefix restored: rollout_id=(?P<rollout_id>\S+) "
+    r"model_call_id=(?P<model_call_id>\S+) "
+    r"source_model_call_id=(?P<source_model_call_id>\S+) "
+    r"prefix_tokens=(?P<prefix_tokens>\d+) "
+    r"prefix_digest=(?P<prefix_digest>[0-9a-f]{64}) "
+    r"weight_version_span=\[\d+,\d+\] "
+    r"prefix_ids_sha256=(?P<prefix_ids_sha256>[0-9a-f]{64})"
+)
+
+
+def restored_prefixes(log: str) -> list[dict[str, Any]]:
+    """Parse every "generation prefix restored" line in a run log."""
+    return [
+        {**match.groupdict(), "prefix_tokens": int(match["prefix_tokens"])}
+        for match in _RESTORED_PREFIX_LINE.finditer(log)
+    ]
 
 
 def ledger_episode_index(path: Path) -> dict[tuple[str, int], dict[str, Any]]:

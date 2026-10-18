@@ -44,32 +44,9 @@ mkdir -p "$TEST_DIR"
 # Force one real Workplace mutation per rollout. The checkpoint test agent holds
 # the first boundary after it in phase one, so a published checkpoint always
 # holds a turn whose calendar write has already been applied.
-jq -c -s --argjson count "$NUM_PROMPTS" --arg event "$SENTINEL_EVENT" '
-    limit($count; .[])
-    | del(.agent_ref)
-    | .task_source = "workplace_assistant_checkpoint_test_agent"
-    | .responses_create_params.input = [{
-        "role": "user",
-        "content": ("Call calendar_create_event exactly once with event_name " + $event
-            + ", participant_email checkpoint-recovery@example.com, event_start "
-            + "2025-01-15 10:00:00, and duration 30.")
-      }]
-    | .responses_create_params.tools = [
-        .responses_create_params.tools[] | select(.name == "calendar_create_event")
-      ]
-    | .responses_create_params.tool_choice = {"type": "function", "name": "calendar_create_event"}
-    | .responses_create_params.parallel_tool_calls = false
-    | .ground_truth = [{
-        "name": "calendar_create_event",
-        "arguments": ({
-          "event_name": $event,
-          "participant_email": "checkpoint-recovery@example.com",
-          "event_start": "2025-01-15 10:00:00",
-          "duration": "30"
-        } | tojson)
-      }]
-    | .category = "workplace_assistant_calendar"
-    | .environment_name = "workplace_assistant"
+jq -c -s -L "$SCRIPT_DIR" --argjson count "$NUM_PROMPTS" --arg event "$SENTINEL_EVENT" '
+    include "_workplace_calendar_rows";
+    limit($count; .[]) | workplace_calendar_row($event; ""; "30")
 ' "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" > "$TEST_DATA"
 
 stop_phase1() {
@@ -183,6 +160,7 @@ from pathlib import Path
 
 import torch
 from _gym_recovery_snapshot_helpers import (
+    calendar_sentinel_count,
     ledger_episode_index,
     participant_records,
 )
@@ -197,13 +175,6 @@ backup_path = Path(sys.argv[7])
 sentinel_event = sys.argv[8]
 if expected_gym_instances < 1:
     raise ValueError("expected Gym instance count must be positive")
-
-
-def sentinel_count(state: dict) -> int:
-    """Count calendar rows the held turn wrote before the crash."""
-    columns = state["calendar"]["_calendar_events"]["columns"]
-    names = next(column["values"] for column in columns if column["name"] == "event_name")
-    return sum(str(name).lower() == sentinel_event.lower() for name in names)
 
 
 while time.monotonic() < deadline:
@@ -262,7 +233,7 @@ while time.monotonic() < deadline:
                 model_manifest, pre_cut_model_call_ids = model_entry
                 resources_manifest, resources_state = resources_entry
                 # The held turn applied its calendar write exactly once.
-                if sentinel_count(resources_state) != 1:
+                if calendar_sentinel_count(resources_state, sentinel_event) != 1:
                     continue
                 if (
                     recovery["restore_level"] != "turn"
