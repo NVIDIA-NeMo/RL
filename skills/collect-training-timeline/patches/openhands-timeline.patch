@@ -1,0 +1,459 @@
+--- a/openhands/agenthub/nemo_gym_client.py
++++ b/openhands/agenthub/nemo_gym_client.py
+@@ -16,6 +16,12 @@
+ from nemo_gym.global_config import get_global_config_dict
+ from nemo_gym.server_utils import ServerClient
+ from nemo_gym.server_utils import get_response_json, raise_for_status
++from openhands.utils.nemo_gym_timeline import (
++    nemo_gym_cache_metrics,
++    nemo_gym_disagg_metrics,
++    nemo_gym_timeline_span,
++    nemo_gym_llm_timing_metrics,
++)
+ 
+ if TYPE_CHECKING:
+     from litellm import ChatCompletionToolParam
+@@ -43,6 +49,7 @@
+         )
+         self.model_server_cookies = None
+         self.llm = llm
++        self._timeline_turn = 1
+ 
+     async def model_call(
+         self,
+@@ -59,7 +66,47 @@
+             A validated ModelResponse from the server.
+         """
+         start_time = time.time()
+-        response = await self._post_completion(messages, tools)
++        turn = self._timeline_turn
++        self._timeline_turn += 1
++        with nemo_gym_timeline_span(
++            "model_call", "model", turn=turn
++        ) as timeline_args:
++            response = await self._post_completion(messages, tools)
++            provider_fields = (
++                getattr(response, "_provider_specific_fields", None) or {}
++            )
++            for field in (
++                "prompt_tokens",
++                "decode_tokens",
++                "generation_replica_idx",
++                "cached_prompt_tokens",
++                "uncached_prompt_tokens",
++                "kv_cache_hit_rate",
++                "llm_arrival_ts_us",
++                "queued_ts_us",
++                "first_scheduled_ts_us",
++                "first_token_ts_us",
++                "last_token_ts_us",
++                "llm_response_ready_ts_us",
++                "gym_llm_response_received_ts_us",
++                "gym_tokenize_duration_us",
++                "gym_response_ready_ts_us",
++                "openhands_response_received_ts_us",
++                "openhands_parse_validate_duration_us",
++                "frontend_recv_ts_us",
++                "frontend_fwd_ts_us",
++                "ctx_arrival_ts_us",
++                "ctx_queued_ts_us",
++                "ctx_first_scheduled_ts_us",
++                "ctx_done_ts_us",
++                "ctx_cached_prompt_tokens",
++                "ctx_computed_tokens",
++                "ctx_first_begin",
++                "ctx_num_chunks",
++            ):
++                value = provider_fields.get(field)
++                if value is not None:
++                    timeline_args[field] = value
+         self._update_model_call_time(start_time)
+         return response
+ 
+@@ -120,6 +167,8 @@
+         )
+         await raise_for_status(model_response)
+         model_response_json = await get_response_json(model_response)
++        openhands_response_received_ts_us = time.time_ns() // 1_000
++        parse_validate_start_ns = time.perf_counter_ns()
+         latency = time.perf_counter() - latency_start
+         completion_timestamp = datetime.now(timezone.utc).isoformat()
+         response_id = model_response_json.get("id", "unknown")
+@@ -156,14 +205,47 @@
+ 
+         response: ModelResponse = ModelResponse.model_validate(model_response_json)
+ 
+-        provider_specific_fields: dict = {}
++        provider_specific_fields: dict = nemo_gym_cache_metrics(
++            model_response_json.get("usage")
++        )
++        provider_specific_fields.update(
++            nemo_gym_llm_timing_metrics(model_response_json)
++        )
++        provider_specific_fields.update(
++            nemo_gym_disagg_metrics(model_response_json)
++        )
++        provider_specific_fields["openhands_response_received_ts_us"] = (
++            openhands_response_received_ts_us
++        )
++        generation_replica_idx = model_response_json.get(
++            "nemo_generation_replica_idx"
++        )
++        if (
++            isinstance(generation_replica_idx, int)
++            and not isinstance(generation_replica_idx, bool)
++            and generation_replica_idx >= 0
++        ):
++            provider_specific_fields["generation_replica_idx"] = (
++                generation_replica_idx
++            )
+         if response_message_dict.get("prompt_token_ids"):
+-            provider_specific_fields = {
+-                "prompt_token_ids": response_message_dict["prompt_token_ids"],
+-                "generation_token_ids": response_message_dict["generation_token_ids"],
+-                "generation_log_probs": response_message_dict["generation_log_probs"],
+-            }
+-            response._provider_specific_fields = provider_specific_fields
++            provider_specific_fields.update(
++                {
++                    "prompt_token_ids": response_message_dict[
++                        "prompt_token_ids"
++                    ],
++                    "generation_token_ids": response_message_dict[
++                        "generation_token_ids"
++                    ],
++                    "generation_log_probs": response_message_dict[
++                        "generation_log_probs"
++                    ],
++                }
++            )
++        provider_specific_fields["openhands_parse_validate_duration_us"] = (
++            max(time.perf_counter_ns() - parse_validate_start_ns, 0) // 1_000
++        )
++        response._provider_specific_fields = provider_specific_fields
+ 
+         self._log_completion(
+             messages, model_response_json, provider_specific_fields, params
+--- a/openhands/runtime/base.py
++++ b/openhands/runtime/base.py
+@@ -81,6 +81,7 @@
+     call_async_from_sync,
+     call_sync_from_async,
+ )
++from openhands.utils.nemo_gym_timeline import nemo_gym_timeline_span
+ 
+ 
+ def _default_env_vars(sandbox_config: SandboxConfig) -> dict[str, str]:
+@@ -329,7 +330,15 @@
+         if isinstance(event, Action):
+             start_time = time.time()
+ 
+-            asyncio.get_event_loop().run_until_complete(self._handle_action(event))
++            with nemo_gym_timeline_span(
++                type(event).__name__,
++                "tool",
++                action_type=type(event).__name__,
++                event_id=str(event.id),
++            ):
++                asyncio.get_event_loop().run_until_complete(
++                    self._handle_action(event)
++                )
+ 
+             import os, json
+ 
+--- /dev/null
++++ b/openhands/utils/nemo_gym_timeline.py
+@@ -0,0 +1,202 @@
++"""Best-effort Chrome trace spans for NeMo Gym OpenHands rollouts."""
++
++import json
++import os
++import socket
++import threading
++import time
++from contextlib import contextmanager
++from typing import Any, Generator
++
++
++def nemo_gym_cache_metrics(usage: Any) -> dict[str, float | int]:
++    """Normalize OpenAI token usage into timeline metrics."""
++    if not isinstance(usage, dict):
++        return {}
++    metrics: dict[str, float | int] = {}
++    completion_tokens = usage.get("completion_tokens")
++    if (
++        isinstance(completion_tokens, int)
++        and not isinstance(completion_tokens, bool)
++        and completion_tokens >= 0
++    ):
++        metrics["decode_tokens"] = completion_tokens
++    prompt_tokens = usage.get("prompt_tokens")
++    valid_prompt_tokens = (
++        isinstance(prompt_tokens, int)
++        and not isinstance(prompt_tokens, bool)
++        and prompt_tokens >= 0
++    )
++    if valid_prompt_tokens:
++        metrics["prompt_tokens"] = prompt_tokens
++    prompt_token_details = usage.get("prompt_tokens_details") or {}
++    if not isinstance(prompt_token_details, dict):
++        return metrics
++    cached_prompt_tokens = prompt_token_details.get("cached_tokens")
++    if (
++        not valid_prompt_tokens
++        or not isinstance(cached_prompt_tokens, int)
++        or isinstance(cached_prompt_tokens, bool)
++        or not 0 <= cached_prompt_tokens <= prompt_tokens
++    ):
++        return metrics
++    metrics.update({
++        "cached_prompt_tokens": cached_prompt_tokens,
++        "uncached_prompt_tokens": prompt_tokens - cached_prompt_tokens,
++        "kv_cache_hit_rate": (
++            cached_prompt_tokens / prompt_tokens if prompt_tokens else 0.0
++        ),
++    })
++    return metrics
++
++
++def nemo_gym_llm_timing_metrics(response: Any) -> dict[str, int]:
++    """Copy valid LLM request milestones from a live completion response."""
++    if not isinstance(response, dict):
++        return {}
++    metrics: dict[str, int] = {}
++    for response_field, timeline_field in (
++        ("nemo_llm_arrival_ts_us", "llm_arrival_ts_us"),
++        ("nemo_llm_queued_ts_us", "queued_ts_us"),
++        (
++            "nemo_llm_first_scheduled_ts_us",
++            "first_scheduled_ts_us",
++        ),
++        ("nemo_llm_first_token_ts_us", "first_token_ts_us"),
++        ("nemo_llm_last_token_ts_us", "last_token_ts_us"),
++        (
++            "nemo_llm_response_ready_ts_us",
++            "llm_response_ready_ts_us",
++        ),
++        (
++            "nemo_gym_llm_response_received_ts_us",
++            "gym_llm_response_received_ts_us",
++        ),
++        ("nemo_gym_response_ready_ts_us", "gym_response_ready_ts_us"),
++    ):
++        value = response.get(response_field)
++        if (
++            isinstance(value, int)
++            and not isinstance(value, bool)
++            and value > 0
++        ):
++            metrics[timeline_field] = value
++    tokenize_duration_us = response.get("nemo_gym_tokenize_duration_us")
++    if (
++        isinstance(tokenize_duration_us, int)
++        and not isinstance(tokenize_duration_us, bool)
++        and tokenize_duration_us >= 0
++    ):
++        metrics["gym_tokenize_duration_us"] = tokenize_duration_us
++    return metrics
++
++
++def nemo_gym_disagg_metrics(response: Any) -> dict[str, int]:
++    """Copy the PD-disaggregation frontend and context-engine fields.
++
++    The TRT-LLM disagg server relays these onto the final (generation)
++    response. Context-side prefix reuse lives here, not in ``usage``: under
++    context-first disaggregation the generation leg's usage does not describe
++    the prefill that the context engine ran.
++    """
++    if not isinstance(response, dict):
++        return {}
++    metrics: dict[str, int] = {}
++    for response_field, timeline_field, minimum in (
++        ("nemo_fe_recv_ts_us", "frontend_recv_ts_us", 1),
++        ("nemo_fe_fwd_ts_us", "frontend_fwd_ts_us", 1),
++        ("nemo_ctx_arrival_ts_us", "ctx_arrival_ts_us", 1),
++        ("nemo_ctx_queued_ts_us", "ctx_queued_ts_us", 1),
++        ("nemo_ctx_first_scheduled_ts_us", "ctx_first_scheduled_ts_us", 1),
++        ("nemo_ctx_done_ts_us", "ctx_done_ts_us", 1),
++        ("nemo_ctx_cached_tokens", "ctx_cached_prompt_tokens", 0),
++        ("nemo_ctx_computed_tokens", "ctx_computed_tokens", 0),
++        ("nemo_ctx_first_begin", "ctx_first_begin", 0),
++        ("nemo_ctx_num_chunks", "ctx_num_chunks", 1),
++    ):
++        value = response.get(response_field)
++        if (
++            isinstance(value, int)
++            and not isinstance(value, bool)
++            and value >= minimum
++        ):
++            metrics[timeline_field] = value
++    return metrics
++
++
++def _append_event(
++    name: str,
++    category: str,
++    start_epoch_ns: int,
++    duration_ns: int,
++    args: dict[str, Any],
++) -> None:
++    path = os.environ.get("NEMO_GYM_TIMELINE_FPATH")
++    if not path:
++        return
++
++    event_args = {
++        "hostname": socket.gethostname(),
++        "source": "openhands",
++        "rollout_id": os.environ.get("NEMO_GYM_ROLLOUT_ID", "unknown"),
++        **args,
++    }
++    event = {
++        "name": name,
++        "cat": category,
++        "ph": "X",
++        "ts": start_epoch_ns / 1_000,
++        "dur": max(duration_ns, 0) / 1_000,
++        "pid": os.getpid(),
++        "tid": threading.get_native_id(),
++        "args": event_args,
++    }
++    try:
++        parent = os.path.dirname(path)
++        if parent:
++            os.makedirs(parent, exist_ok=True)
++        payload = (json.dumps(event, separators=(",", ":")) + "\n").encode()
++        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++        try:
++            os.write(fd, payload)
++        finally:
++            os.close(fd)
++    except (OSError, TypeError, ValueError):
++        pass
++
++
++@contextmanager
++def nemo_gym_timeline_span(
++    name: str, category: str, **args: Any
++) -> Generator[dict[str, Any], None, None]:
++    """Record a complete event and allow numeric metadata updates."""
++    event_args = dict(args)
++    if not os.environ.get("NEMO_GYM_TIMELINE_FPATH"):
++        yield event_args
++        return
++
++    start_epoch_ns = time.time_ns()
++    start_perf_ns = time.perf_counter_ns()
++    try:
++        yield event_args
++    except BaseException as error:
++        _append_event(
++            name,
++            category,
++            start_epoch_ns,
++            time.perf_counter_ns() - start_perf_ns,
++            {
++                **event_args,
++                "status": "error",
++                "error_type": type(error).__name__,
++            },
++        )
++        raise
++    else:
++        _append_event(
++            name,
++            category,
++            start_epoch_ns,
++            time.perf_counter_ns() - start_perf_ns,
++            {**event_args, "status": "ok"},
++        )
+--- a/evaluation/benchmarks/swe_bench/run_infer.py
++++ b/evaluation/benchmarks/swe_bench/run_infer.py
+@@ -69,6 +69,7 @@
+ from openhands.events.serialization.event import event_from_dict, event_to_dict
+ from openhands.runtime.base import Runtime
+ from openhands.utils.async_utils import call_async_from_sync
++from openhands.utils.nemo_gym_timeline import nemo_gym_timeline_span
+ from openhands.utils.shutdown_listener import sleep_if_should_continue
+ from evaluation.benchmarks.swe_bench.replay_utils import messages_to_replay_events  # noqa: E402
+ 
+@@ -1649,12 +1650,14 @@
+         config.sandbox.remote_runtime_resource_factor
+     )
+     start_time = time.perf_counter()
+-    runtime = create_runtime(config)
++    with nemo_gym_timeline_span("create_runtime", "runtime"):
++        runtime = create_runtime(config)
+     end_time = time.perf_counter()
+     update_metrics({"create_runtime_time": end_time - start_time})
+     print(f"create runtime: {end_time - start_time} seconds", flush = True)
+     start_time = time.perf_counter()
+-    call_async_from_sync(runtime.connect)
++    with nemo_gym_timeline_span("connect_runtime", "runtime"):
++        call_async_from_sync(runtime.connect)
+     end_time = time.perf_counter()
+     update_metrics({"connect_to_runtime_time": end_time - start_time})
+     print(f"connect to runtime: {end_time - start_time} seconds", flush = True)
+@@ -1665,11 +1668,13 @@
+ 
+     try:
+         start_time = time.perf_counter()
+-        initialize_runtime(runtime, instance, metadata)
++        with nemo_gym_timeline_span("initialize_runtime", "runtime"):
++            initialize_runtime(runtime, instance, metadata)
+         end_time = time.perf_counter()
+         update_metrics({"initialize_runtime_time": end_time - start_time})
+         print(f"init runtime: {end_time - start_time} seconds", flush = True)
+-        message_action = get_instruction(instance, metadata)
++        with nemo_gym_timeline_span("prepare_instruction", "agent"):
++            message_action = get_instruction(instance, metadata)
+ 
+         # Check if we have replay data for this instance
+         replay_events = None
+@@ -1682,17 +1687,18 @@
+ 
+         # Here's how you can run the agent (similar to the `main` function) and get the final task state
+         start_time = time.perf_counter()
+-        state: State | None = asyncio.run(
+-            run_controller(
+-                config=config,
+-                initial_user_action=message_action,
+-                runtime=runtime,
+-                fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
+-                    metadata.agent_class
+-                ],
+-                replay_events=replay_events,
++        with nemo_gym_timeline_span("run_controller", "agent"):
++            state: State | None = asyncio.run(
++                run_controller(
++                    config=config,
++                    initial_user_action=message_action,
++                    runtime=runtime,
++                    fake_user_response_fn=AGENT_CLS_TO_FAKE_USER_RESPONSE_FN[
++                        metadata.agent_class
++                    ],
++                    replay_events=replay_events,
++                )
+             )
+-        )
+         end_time = time.perf_counter()
+         print(f"run controller: {end_time - start_time} seconds", flush = True)
+ 
+@@ -1708,13 +1714,15 @@
+             )
+         else:
+             complete_runtime_fn = complete_runtime
+-        return_val = complete_runtime_fn(runtime, instance)
+-        git_patch = return_val['git_patch']
++        with nemo_gym_timeline_span("extract_patch", "agent"):
++            return_val = complete_runtime_fn(runtime, instance)
++            git_patch = return_val['git_patch']
+         logger.info(
+             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
+         )
+     finally:
+-        runtime.close()
++        with nemo_gym_timeline_span("runtime_cleanup", "runtime"):
++            runtime.close()
+         # _cleanup_eval_sessions(eval_sessions_dir, pre_existing_sessions)
+     # ==========================================
+ 

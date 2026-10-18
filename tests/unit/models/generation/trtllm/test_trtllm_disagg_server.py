@@ -31,6 +31,7 @@ from nemo_rl.models.generation.trtllm.trtllm_disagg_server import (
     _GYM_ONLY_REQUEST_FIELDS,
     _DropGymOnlyRequestFields,
     attach_rollout_fields,
+    attach_timeline_fields,
     generation_token_ids,
 )
 
@@ -430,3 +431,52 @@ def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
 
     [tool_calls] = _dumped_tool_calls({"messages": rendered["messages"]})
     assert [c["function"]["name"] for c in tool_calls] == ["execute_bash"]
+
+
+def test_the_middleware_stamps_frontend_receipt_and_forward():
+    body = json.dumps(_warmup_payload()).encode()
+    app = _CaptureApp()
+
+    _drive(_DropGymOnlyRequestFields(app), _scope("/v1/chat/completions", body), body)
+
+    headers = dict(app.scope["headers"])
+    recv = int(headers[b"x-nemo-fe-recv-us"])
+    fwd = int(headers[b"x-nemo-fe-fwd-us"])
+    assert 0 < recv <= fwd
+
+
+def test_the_middleware_skips_frontend_stamps_when_disabled(monkeypatch):
+    import nemo_rl.models.generation.trtllm.trtllm_disagg_server as server
+
+    monkeypatch.setattr(server, "_TL_EMIT_TIMELINE_FIELDS", False)
+    body = json.dumps(_warmup_payload()).encode()
+    app = _CaptureApp()
+
+    _drive(_DropGymOnlyRequestFields(app), _scope("/v1/chat/completions", body), body)
+
+    assert b"x-nemo-fe-recv-us" not in dict(app.scope["headers"])
+
+
+def test_timeline_fields_move_frontend_and_ctx_stamps_onto_the_payload():
+    payload = {"choices": [], "nemo_llm_arrival_ts_us": 5}
+    headers = {"x-nemo-fe-recv-us": "1", "x-nemo-fe-fwd-us": "2"}
+    ctx = {"nemo_ctx_arrival_ts_us": 3, "nemo_ctx_cached_tokens": 0}
+
+    attach_timeline_fields(payload, headers, ctx)
+
+    assert payload == {
+        "choices": [],
+        "nemo_llm_arrival_ts_us": 5,
+        "nemo_fe_recv_ts_us": 1,
+        "nemo_fe_fwd_ts_us": 2,
+        "nemo_ctx_arrival_ts_us": 3,
+        "nemo_ctx_cached_tokens": 0,
+    }
+
+
+def test_timeline_fields_ignore_missing_or_malformed_stamps():
+    payload = {"choices": []}
+
+    attach_timeline_fields(payload, {"x-nemo-fe-recv-us": "abc"}, None)
+
+    assert payload == {"choices": []}
