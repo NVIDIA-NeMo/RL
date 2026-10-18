@@ -309,6 +309,7 @@ Completed groups are restored directly from the TQ snapshot. For unfinished
 token-capture groups, `rollout_recovery.target_level` selects the requested
 restart boundary:
 
+- `prefix` also keeps the tokens each active model call has decoded, and resumes the call from them.
 - `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
@@ -382,6 +383,14 @@ If no rollout snapshot follows the newest trainer checkpoint, SC restores that
 checkpoint on its own: completed groups come back from TQ and unfinished
 turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its
 `gym_checkpoint.json` is refused.
+
+The `prefix` target needs everything the `turn` target needs (listed below),
+and does not yet support multimodal capture or router replay. Each cut must
+finish within `token_capture.control_timeout_s`; a call that is not cut in time
+restarts from its last saved turn. Calls using stop strings, `bad_words`, or a
+presence or frequency penalty are never cut, because a resumed call could not
+apply them to the tokens it already decoded; they also restart from their last
+saved turn.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
 periodic rollout snapshots, `restore_mode: latest`, and the same named Gym

@@ -1883,6 +1883,20 @@ class VllmGeneration(GenerationInterface):
             )
         return True
 
+    def get_generation_prefix_restore_counts(self) -> dict[str, int]:
+        """Sum over workers of calls resumed from a restored generation prefix."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_generation_prefix_restore_counts",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        totals = {"restored_calls": 0, "restored_prefix_tokens": 0}
+        for counts in ray.get(futures):
+            for name, value in counts.items():
+                totals[name] += value
+        return totals
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.

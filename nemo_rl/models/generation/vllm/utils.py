@@ -65,9 +65,18 @@ G_ROUTED_EXPERTS_RANGE_CHECKED = False
 
 
 def _extract_selected_token_logprobs(
-    generation_token_ids: list[int], generation_logprob_details: list[Any]
+    generation_token_ids: list[int],
+    generation_logprob_details: list[Any],
+    *,
+    where: str = "",
 ) -> list[float]:
-    """Extract the sampled token's log probability at every output position."""
+    """Extract the sampled token's log probability at every output position.
+
+    Args:
+        generation_token_ids: The sampled token at each output position.
+        generation_logprob_details: vLLM's per-position logprob mapping.
+        where: Context prepended to the token in a missing-token error.
+    """
     selected_logprobs: list[float] = []
     for token_id, position_logprobs in zip(
         generation_token_ids, generation_logprob_details, strict=True
@@ -76,7 +85,7 @@ def _extract_selected_token_logprobs(
         if selected is None:
             raise RuntimeError(
                 "vLLM generation log probabilities did not include the selected "
-                f"token: token_id={token_id}"
+                f"token: {where}token_id={token_id}"
             )
         selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
     return selected_logprobs
@@ -701,21 +710,11 @@ def attach_token_information_to_chat_response_choices(
                     f"token_count={len(generation_token_ids)}, "
                     f"logprob_count={len(generation_logprob_details)}."
                 )
-            generation_log_probs = []
-            for token_id, position_logprobs in zip(
-                generation_token_ids, generation_logprob_details
-            ):
-                selected_token_logprob = position_logprobs.get(token_id)
-                if selected_token_logprob is None:
-                    raise RuntimeError(
-                        "vLLM generation log probabilities did not include the "
-                        "selected token while attaching token information to "
-                        "the OpenAI-compatible chat response: "
-                        f"choice_idx={choice.index}, token_id={token_id}."
-                    )
-                generation_log_probs.append(
-                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-                )
+            generation_log_probs = _extract_selected_token_logprobs(
+                generation_token_ids,
+                generation_logprob_details,
+                where=f"choice_idx={choice.index}, ",
+            )
 
         choice.message.prompt_token_ids = list(prompt_token_ids)
         choice.message.generation_token_ids = generation_token_ids

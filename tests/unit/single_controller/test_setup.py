@@ -1082,6 +1082,36 @@ class TestSetup:
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
     @pytest.mark.parametrize(
+        ("target_level", "generation_prefix_cuts"),
+        [(RecoveryTargetLevel.TURN, False), (RecoveryTargetLevel.PREFIX, True)],
+    )
+    def test_gym_spinup_passes_generation_prefix_cuts_explicitly(
+        self, target_level: RecoveryTargetLevel, generation_prefix_cuts: bool
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = target_level
+
+        with patch.object(
+            sc_setup_mod,
+            "build_nemo_gym_actors",
+            return_value=MagicMock(),
+        ) as mock_spinup:
+            sc_setup_mod._spinup_gym(
+                mc,
+                ["http://generation"],
+                MagicMock(name="tokenizer"),
+                policy_api_key=None,
+            )
+
+        kwargs = mock_spinup.call_args.kwargs
+        assert kwargs["turn_checkpointing_enabled"] is True
+        assert kwargs["generation_prefix_cuts_enabled"] is generation_prefix_cuts
+        # The flag is a typed keyword, not an undeclared key in the capture config.
+        assert "generation_prefix_cuts_enabled" not in kwargs["token_capture"]
+
+    @pytest.mark.parametrize(
         "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
     )
     def test_gym_state_recovery_requires_periodic_snapshots(
@@ -1103,6 +1133,33 @@ class TestSetup:
             ),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("feature", "match"),
+        [
+            ("router_replay", "does not yet support router replay"),
+            ("multimodal", "does not yet support multimodal capture"),
+        ],
+    )
+    def test_prefix_recovery_rejects_unsupported_features(self, feature, match):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+        processor = None
+        if feature == "router_replay":
+            mc.policy["router_replay"] = {"enabled": True}
+        else:
+            processor = MagicMock()
+
+        with pytest.raises(NotImplementedError, match=match):
+            setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
 
     @pytest.mark.parametrize(
         ("overrides", "error", "match"),
@@ -2274,6 +2331,7 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
             turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,

@@ -56,7 +56,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -291,6 +291,30 @@ class _RolloutCheckpointSaveResult:
 
     saved: bool
     reason: RolloutCheckpointAttemptReason
+
+
+@dataclass
+class _GenerationCutCheckpointStats:
+    """What one checkpoint's generation cut cost and achieved.
+
+    ``_prepared_gym_checkpoint`` fills it in; the save logs it with the other
+    checkpoint metrics.
+    """
+
+    # From the terminal-capture fence's acquisition to its release.
+    fence_hold_seconds: Optional[float] = None
+    # Gym's ``cut`` / ``cut_failed`` / ``cut_skipped`` counts.
+    counts: dict[str, int] = field(default_factory=dict)
+
+
+def _format_generation_cut_stats(cut_stats: _GenerationCutCheckpointStats) -> str:
+    """The save line's generation-cut suffix; empty when nothing was cut."""
+    if cut_stats.fence_hold_seconds is None:
+        return ""
+    counts = ", ".join(f"{name}={count}" for name, count in cut_stats.counts.items())
+    return f", generation_cut_fence_hold_seconds={cut_stats.fence_hold_seconds:.2f}" + (
+        f", {counts}" if counts else ""
+    )
 
 
 @dataclass(frozen=True)
@@ -3797,6 +3821,24 @@ class SingleControllerActor:
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                if self._generation_prefix_cuts_enabled:
+                    try:
+                        restore_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_restore_counts
+                        )
+                    except RayActorError as error:
+                        log.warning(
+                            "Skipping generation-prefix restore metrics: %s", error
+                        )
+                    else:
+                        # Totals since the generation workers started, so a
+                        # restore shows up as a step in the curve.
+                        step_metrics.update(
+                            {
+                                f"generation_prefix/{name}": float(count)
+                                for name, count in restore_counts.items()
+                            }
+                        )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -5050,13 +5092,52 @@ class SingleControllerActor:
         return expected_staging_keys
 
     @contextlib.asynccontextmanager
+    async def _token_capture_snapshot_fence(
+        self, cut_stats: Optional[_GenerationCutCheckpointStats] = None
+    ) -> AsyncIterator[None]:
+        """Fence terminal capture writes on every generation worker.
+
+        Decoding continues; only terminal staging waits, so the TQ cut and
+        Gym's generation cut see the same live calls. A no-op without prefix
+        cuts.
+        """
+        if not self._generation_prefix_cuts_enabled:
+            yield
+            return
+        timeout_s = self._master_config.token_capture.control_timeout_s
+        acquired: Optional[float] = None
+        try:
+            await asyncio.to_thread(
+                self._gen.begin_token_capture_snapshot_fence, timeout_s=timeout_s
+            )
+            acquired = time.monotonic()
+            yield
+        finally:
+            # Idempotent, so it also releases workers a failed begin had
+            # already fenced. A failed release keeps the error it interrupted
+            # as its __context__.
+            await asyncio.to_thread(
+                self._gen.end_token_capture_snapshot_fence, timeout_s=timeout_s
+            )
+            if acquired is not None and cut_stats is not None:
+                cut_stats.fence_hold_seconds = time.monotonic() - acquired
+
+    @contextlib.asynccontextmanager
     async def _prepared_gym_checkpoint(
         self,
         checkpoint_path: PathLike,
         *,
         checkpoint_id: str,
+        cut_stats: Optional[_GenerationCutCheckpointStats] = None,
     ) -> AsyncIterator[GymCheckpointCommitResult | None]:
-        """Close Gym admission, commit owned episodes, and drain on-wire replies."""
+        """Close Gym admission, commit owned episodes, and drain on-wire replies.
+
+        Args:
+            checkpoint_path: Directory the Gym commit writes into.
+            checkpoint_id: Gym's identifier for this checkpoint.
+            cut_stats: Filled with the generation cut's fence hold time and
+                Gym's cut counts, when prefix cuts are enabled.
+        """
         coordinator = self._gym_checkpoint_coordinator
         if coordinator is None:
             yield None
@@ -5067,106 +5148,64 @@ class SingleControllerActor:
                 "Gym checkpoint coordinator has no dispatch admission gate"
             )
 
-        fence_timeout_s: float | None = None
-        fence_started = False
-        if self._generation_prefix_cuts_enabled:
-            fence_timeout_s = self._master_config.token_capture.control_timeout_s
+        async with (
+            self._token_capture_snapshot_fence(cut_stats),
+            gate.checkpoint(),
+        ):
+            # Gym parks every live rollout until resume, so the wait must not
+            # count against their deadlines. A separate holder keeps a
+            # colocated engine's own pause intact when this one ends.
+            self._rollout_manager.suspend_request_deadlines(
+                _GYM_CHECKPOINT_DEADLINE_HOLDER
+            )
             try:
-                await asyncio.to_thread(
-                    self._gen.begin_token_capture_snapshot_fence,
-                    timeout_s=fence_timeout_s,
-                )
-                fence_started = True
-            except BaseException as fence_error:
-                # Fan-out may have fenced a subset of workers before raising.
-                # Always attempt the idempotent release on every worker.
-                try:
-                    await asyncio.to_thread(
-                        self._gen.end_token_capture_snapshot_fence,
-                        timeout_s=fence_timeout_s,
-                    )
-                except BaseException as release_error:
-                    raise BaseExceptionGroup(
-                        "token-capture snapshot fencing failed and partially fenced "
-                        "workers could not be released",
-                        [fence_error, release_error],
-                    )
-                raise
-
-        checkpoint_error: BaseException | None = None
-        try:
-            async with gate.checkpoint():
-                # Gym parks every live rollout until resume, so the wait must not
-                # count against their deadlines. A separate holder keeps a
-                # colocated engine's own pause intact when this one ends.
-                self._rollout_manager.suspend_request_deadlines(
-                    _GYM_CHECKPOINT_DEADLINE_HOLDER
-                )
-                try:
-                    # Gym refuses a retire once a checkpoint is open, so retire while
-                    # it is still idle; dispatch is already closed, so nothing new
-                    # races in.
-                    await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
-                    async with coordinator.prepared(checkpoint_id) as restarts:
-                        candidates = self._gym_checkpoint_inventory(coordinator)
-                        # A row dropped since that retire is still running in Gym,
-                        # which exports it; naming it keeps the export in scope, and
-                        # the cut leaves it out of the saved manifest.
-                        dropped = self._queued_gym_retirements(coordinator)
-                        # Gym refuses a commit that names an episode it cannot
-                        # capture; those start over after a crash instead.
-                        scope = {
+                # Gym refuses a retire once a checkpoint is open, so retire while
+                # it is still idle; dispatch is already closed, so nothing new
+                # races in.
+                await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
+                async with coordinator.prepared(checkpoint_id) as prepared:
+                    restarts = prepared.restarts
+                    if cut_stats is not None:
+                        cut_stats.counts = dict(prepared.generation_cut_counts)
+                    candidates = self._gym_checkpoint_inventory(coordinator)
+                    # A row dropped since that retire is still running in Gym,
+                    # which exports it; naming it keeps the export in scope, and
+                    # the cut leaves it out of the saved manifest.
+                    dropped = self._queued_gym_retirements(coordinator)
+                    # Gym refuses a commit that names an episode it cannot
+                    # capture; those start over after a crash instead.
+                    scope = {
+                        instance_id: tuple(
+                            episode
+                            for episode in episodes
+                            + tuple(sorted(dropped[instance_id] - set(episodes)))
+                            if episode not in restarts[instance_id]
+                        )
+                        for instance_id, episodes in candidates.items()
+                    }
+                    commit = await coordinator.commit(
+                        checkpoint_id,
+                        Path(checkpoint_path),
+                        scope,
+                        restarts={
                             instance_id: tuple(
                                 episode
                                 for episode in episodes
-                                + tuple(sorted(dropped[instance_id] - set(episodes)))
-                                if episode not in restarts[instance_id]
+                                if episode in restarts[instance_id]
                             )
                             for instance_id, episodes in candidates.items()
-                        }
-                        commit = await coordinator.commit(
-                            checkpoint_id,
-                            Path(checkpoint_path),
-                            scope,
-                            restarts={
-                                instance_id: tuple(
-                                    episode
-                                    for episode in episodes
-                                    if episode in restarts[instance_id]
-                                )
-                                for instance_id, episodes in candidates.items()
-                            },
-                        )
-                        await self._drain_non_exported_gym_candidates(
-                            coordinator,
-                            candidates,
-                            commit,
-                        )
-                        yield commit
-                finally:
-                    self._rollout_manager.resume_request_deadlines(
-                        _GYM_CHECKPOINT_DEADLINE_HOLDER
+                        },
                     )
-        except BaseException as error:
-            checkpoint_error = error
-        finally:
-            if fence_started:
-                assert fence_timeout_s is not None
-                try:
-                    await asyncio.to_thread(
-                        self._gen.end_token_capture_snapshot_fence,
-                        timeout_s=fence_timeout_s,
+                    await self._drain_non_exported_gym_candidates(
+                        coordinator,
+                        candidates,
+                        commit,
                     )
-                except BaseException as release_error:
-                    if checkpoint_error is not None:
-                        raise BaseExceptionGroup(
-                            "Gym checkpoint failed and generation workers could "
-                            "not be released",
-                            [checkpoint_error, release_error],
-                        )
-                    raise
-        if checkpoint_error is not None:
-            raise checkpoint_error
+                    yield commit
+            finally:
+                self._rollout_manager.resume_request_deadlines(
+                    _GYM_CHECKPOINT_DEADLINE_HOLDER
+                )
 
     async def _write_rollout_checkpoint_sidecars(
         self,
@@ -5344,6 +5383,7 @@ class SingleControllerActor:
             )
             try:
                 gym_park_started = time.monotonic()
+                cut_stats = _GenerationCutCheckpointStats()
                 async with contextlib.AsyncExitStack() as gym_phase:
                     (
                         entered,
@@ -5353,6 +5393,7 @@ class SingleControllerActor:
                         self._prepared_gym_checkpoint(
                             tmp_path,
                             checkpoint_id=f"rollout-{uuid.uuid4().hex}",
+                            cut_stats=cut_stats,
                         ),
                     )
                     if not entered:
@@ -5455,6 +5496,12 @@ class SingleControllerActor:
             if gym_commit is not None:
                 checkpoint_metrics["gym_parked_seconds"] = gym_parked_seconds
                 self._warn_if_gym_parked_past_interval(gym_parked_seconds)
+            if cut_stats.fence_hold_seconds is not None:
+                checkpoint_metrics["generation_cut_fence_hold_seconds"] = (
+                    cut_stats.fence_hold_seconds
+                )
+            for name, count in cut_stats.counts.items():
+                checkpoint_metrics[f"generation_{name}_calls"] = float(count)
             self._log_telemetry_metrics(
                 checkpoint_metrics,
                 step=expected_train_step,
@@ -5467,7 +5514,9 @@ class SingleControllerActor:
                 f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
-                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
+                f"{checkpoint_metrics['exclusive_hold_seconds']:.2f}"
+                + _format_generation_cut_stats(cut_stats)
+                + ")",
                 flush=True,
             )
             return _RolloutCheckpointSaveResult(saved=True, reason="completed")

@@ -801,6 +801,18 @@ class GenerationInterface(ABC):
             f"{type(self).__name__}"
         )
 
+    def get_generation_prefix_restore_counts(self) -> dict[str, int]:
+        """Sum over workers of calls resumed from a restored generation prefix.
+
+        Returns:
+            ``restored_calls`` and their total ``restored_prefix_tokens`` since
+            the workers started.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

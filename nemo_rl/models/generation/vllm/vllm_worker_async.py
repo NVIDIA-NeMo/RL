@@ -25,6 +25,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Literal, Optional, cast
 
 import ray
@@ -92,6 +93,34 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
+# Gym owns this route (nemo_gym._checkpoint.generation_cut.GENERATION_CUT_ROUTE),
+# but nemo_gym is an optional extra. A drifted copy would 404 every cut, which Gym
+# treats as "regenerate", so test_generation_cut_route_matches_gym pins it.
+_GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
+
+
+# Reasons already logged by this worker process; calls sharing a setting log once.
+_LOGGED_UNCUTTABLE_REASONS: set[str] = set()
+
+
+def _generation_cut_blockers(sampling_params: Any) -> list[str]:
+    """Sampling settings a resumed tail cannot honor across a generation cut.
+
+    After a restore the prefix is part of the prompt, but vLLM matches stop
+    strings and bad words, and counts presence/frequency penalties, over the
+    output tokens only. A resumed tail would therefore miss a stop string or
+    bad word that straddles the cut and stop penalizing the prefix's tokens.
+    """
+    blockers = []
+    if getattr(sampling_params, "stop", None):
+        blockers.append("stop strings")
+    if getattr(sampling_params, "bad_words", None):
+        blockers.append("bad_words")
+    if getattr(sampling_params, "presence_penalty", 0.0):
+        blockers.append("presence_penalty")
+    if getattr(sampling_params, "frequency_penalty", 0.0):
+        blockers.append("frequency_penalty")
+    return blockers
 
 
 @dataclass(frozen=True)
@@ -199,6 +228,56 @@ def _build_restored_prefix_terminal_output(
     )
 
 
+def _detokenize_restored_prefix(
+    tokenizer: Any,
+    *,
+    original_prompt_token_ids: Sequence[int],
+    prefix_token_ids: Sequence[int],
+    terminal: _RestoredPrefixTerminal | None,
+    stop: str | Sequence[str] | None,
+    min_tokens: int,
+    include_stop_str_in_output: bool,
+    skip_special_tokens: bool,
+    spaces_between_special_tokens: bool,
+) -> str:
+    """Return the text vLLM produced for a restored prefix the first time.
+
+    The prefix is replayed through vLLM's own incremental detokenizer, primed
+    on the call's original prompt: a standalone decode drops the leading space
+    of SentencePiece tokenizers. Replaying with the call's stop settings also
+    reapplies what vLLM stripped from an output that had already stopped: the
+    final stop token (EOS or a ``stop_token_ids`` entry) and a matched stop
+    string.
+    """
+    # Deferred: vLLM is only installed in the generation worker's environment.
+    from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+
+    stop_token_terminated = (
+        terminal is not None
+        and terminal.finish_reason == "stop"
+        and not isinstance(terminal.stop_reason, str)
+    )
+    # The detokenizer reads only these request and sampling fields.
+    sampling_params = SimpleNamespace(
+        stop=stop,
+        min_tokens=min_tokens,
+        include_stop_str_in_output=include_stop_str_in_output,
+        skip_special_tokens=skip_special_tokens,
+        spaces_between_special_tokens=spaces_between_special_tokens,
+    )
+    detokenizer = IncrementalDetokenizer.from_new_request(
+        tokenizer,
+        SimpleNamespace(
+            request_id="restored-prefix",
+            prompt_token_ids=list(original_prompt_token_ids),
+            prompt_embeds=None,
+            sampling_params=sampling_params,
+        ),
+    )
+    detokenizer.update(list(prefix_token_ids), stop_token_terminated)
+    return detokenizer.get_next_output_text(finished=True, delta=False)
+
+
 @dataclass(frozen=True)
 class _RestoredPrefixParser:
     """Give vLLM's parser the complete output while capture keeps tail deltas."""
@@ -228,96 +307,6 @@ class _RestoredPrefixParser:
         return self.delegate.count_reasoning_tokens(
             [*self.prefix_token_ids, *token_ids]
         )
-
-
-@dataclass
-class _CompletionOutputDeltaAccumulator:
-    """Linear-time accumulator for one vLLM completion index."""
-
-    template: Any | None = None
-    text_parts: list[str] = field(default_factory=list)
-    token_ids: list[int] = field(default_factory=list)
-    logprobs: list[Any] | None = None
-    routed_expert_chunks: list[Any] = field(default_factory=list)
-
-    def append(self, output: Any) -> None:
-        if self.template is None:
-            self.template = copy.copy(output)
-        else:
-            for name in (
-                "cumulative_logprob",
-                "finish_reason",
-                "stop_reason",
-                "lora_request",
-            ):
-                if hasattr(output, name):
-                    setattr(self.template, name, getattr(output, name))
-        self.text_parts.append(str(getattr(output, "text", "")))
-        self.token_ids.extend(list(getattr(output, "token_ids", ()) or ()))
-        delta_logprobs = getattr(output, "logprobs", None)
-        if delta_logprobs is not None:
-            if self.logprobs is None:
-                self.logprobs = []
-            self.logprobs.extend(list(delta_logprobs))
-        routed = getattr(output, "routed_experts", None)
-        if routed is not None:
-            self.routed_expert_chunks.append(copy.deepcopy(routed))
-
-    def build(self) -> Any:
-        if self.template is None:
-            raise RuntimeError("cannot build an empty completion output")
-        self.template.text = "".join(self.text_parts)
-        self.template.token_ids = self.token_ids
-        self.template.logprobs = self.logprobs
-        if self.routed_expert_chunks:
-            self.template.routed_experts = torch.cat(
-                [torch.as_tensor(chunk) for chunk in self.routed_expert_chunks],
-                dim=0,
-            )
-        return self.template
-
-
-@dataclass
-class _RequestOutputDeltaAccumulator:
-    """Reconstruct one final RequestOutput from immutable engine deltas."""
-
-    template: Any | None = None
-    completions: dict[int, _CompletionOutputDeltaAccumulator] = field(
-        default_factory=dict
-    )
-
-    def append(self, delta: Any) -> None:
-        if self.template is None:
-            self.template = copy.copy(delta)
-        else:
-            previous = self.template
-            self.template = copy.copy(delta)
-            for name in (
-                "prompt",
-                "prompt_token_ids",
-                "prompt_logprobs",
-                "encoder_prompt",
-                "encoder_prompt_token_ids",
-                "lora_request",
-                "num_cached_tokens",
-                "prompt_routed_experts",
-            ):
-                if getattr(self.template, name, None) is None and hasattr(
-                    previous, name
-                ):
-                    setattr(self.template, name, getattr(previous, name))
-        for output in getattr(delta, "outputs", ()):
-            self.completions.setdefault(
-                output.index, _CompletionOutputDeltaAccumulator()
-            ).append(output)
-
-    def build(self) -> Any:
-        if self.template is None:
-            raise RuntimeError("cannot build an empty request output")
-        self.template.outputs = [
-            self.completions[index].build() for index in sorted(self.completions)
-        ]
-        return self.template
 
 
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
@@ -529,6 +518,10 @@ class VllmAsyncGenerationWorkerImpl(
         self._generation_cut_control_token: str | None = None
         self._generation_cut_control_timeout_s: float | None = None
         self._generation_cut_tokenizer: Any | None = None
+        # Calls this process resumed from a restored generation prefix, and
+        # their prefix tokens; the driver logs the sums each step.
+        self._restored_generation_prefix_calls = 0
+        self._restored_generation_prefix_tokens = 0
         self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
         # A dedicated executor prevents completions waiting on the closed gate
         # from consuming all threads needed to create the checkpoint cut.
@@ -1039,19 +1032,36 @@ class VllmAsyncGenerationWorkerImpl(
                 )
             self._capture_calls[id(request)] = state
             self._capture_calls_by_model_call_id[call.model_call_id] = state
+            if admission.generation_cut is not None:
+                # Counted once Gym's begin_call has accepted the restored cut.
+                self._restored_generation_prefix_calls += 1
+                self._restored_generation_prefix_tokens += (
+                    admission.generation_cut.prefix_token_count
+                )
 
     def _observe_request_capture(self, request: Any, request_output: Any) -> None:
-        """Append one request's immutable vLLM output delta."""
+        """Observe the tokens one cumulative vLLM output adds."""
         state = self._get_request_capture(request)
         if state is None:
             return
         outputs = getattr(request_output, "outputs", None)
         if not outputs:
             return
+        with state.lock:
+            observed = state.observed_generation_token_count
         try:
             output = outputs[0]
-            generation_token_ids = list(getattr(output, "token_ids", ()) or ())
-            generation_logprobs = extract_selected_token_logprobs(output)
+            # Cumulative output: slice off what earlier steps already observed.
+            # The lists are vLLM's live ones, so copy only the new tail.
+            token_ids = getattr(output, "token_ids", None) or ()
+            logprobs = getattr(output, "logprobs", None)
+            generation_token_ids = list(token_ids[observed:])
+            generation_logprobs = extract_selected_token_logprobs(
+                SimpleNamespace(
+                    token_ids=generation_token_ids,
+                    logprobs=None if logprobs is None else logprobs[observed:],
+                )
+            )
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
         except (RuntimeError, TypeError, ValueError) as error:
@@ -1094,17 +1104,65 @@ class VllmAsyncGenerationWorkerImpl(
         output = outputs[0]
         # vLLM already detokenized the tail with the request's settings and
         # stripped EOS and any matched stop string from it. Re-decoding the
-        # whole sequence would restore both, so decode only the prefix, with
-        # the same settings, and prepend it to the processed tail.
+        # whole sequence would restore both, so replay only the prefix, with
+        # the same settings, and prepend it to the processed tail. A call that
+        # had already stopped has no tail, so its stop is stripped here.
         with state.lock:
-            prefix_text = tokenizer.decode(
-                state.resumed_generation_token_ids,
-                skip_special_tokens=getattr(request, "skip_special_tokens", True),
-                spaces_between_special_tokens=getattr(
-                    request, "spaces_between_special_tokens", True
-                ),
+            prefix_token_ids = list(state.resumed_generation_token_ids)
+            engine_prompt_token_ids = list(state.prompt_token_ids)
+        # The engine prompt ends with the spliced prefix; what precedes it is
+        # the prompt vLLM decoded the prefix against the first time.
+        if len(engine_prompt_token_ids) < len(prefix_token_ids):
+            raise RuntimeError(
+                "restored engine prompt is shorter than its generation prefix"
             )
+        original_min_tokens = getattr(request, "_original_min_tokens", None)
+        prefix_text = _detokenize_restored_prefix(
+            tokenizer,
+            original_prompt_token_ids=engine_prompt_token_ids[
+                : len(engine_prompt_token_ids) - len(prefix_token_ids)
+            ],
+            prefix_token_ids=prefix_token_ids,
+            terminal=getattr(request, "_restored_prefix_terminal", None),
+            stop=getattr(request, "stop", None),
+            min_tokens=(
+                original_min_tokens
+                if original_min_tokens is not None
+                else getattr(request, "min_tokens", None) or 0
+            ),
+            include_stop_str_in_output=bool(
+                getattr(request, "include_stop_str_in_output", False)
+            ),
+            skip_special_tokens=getattr(request, "skip_special_tokens", True),
+            spaces_between_special_tokens=getattr(
+                request, "spaces_between_special_tokens", True
+            ),
+        )
         output.text = prefix_text + (getattr(output, "text", None) or "")
+
+    def _record_request_cut_constraints(
+        self, request: Any, sampling_params: Any
+    ) -> None:
+        """Keep a call out of generation cuts when a resumed tail would differ.
+
+        Such a call regenerates from its previous boundary after a restore, which
+        costs time but not correctness; see ``_generation_cut_blockers``.
+        """
+        blockers = _generation_cut_blockers(sampling_params)
+        if not blockers:
+            return
+        state = self._get_request_capture(request)
+        if state is None:
+            return
+        reason = f"{', '.join(blockers)} do not carry across a generation cut"
+        with state.lock:
+            state.uncuttable_reason = reason
+        if reason not in _LOGGED_UNCUTTABLE_REASONS:
+            _LOGGED_UNCUTTABLE_REASONS.add(reason)
+            LOGGER.warning(
+                "model calls using %s are not cut; they regenerate after a restore",
+                ", ".join(blockers),
+            )
 
     def _record_request_effective_output_limit(
         self, request: Any, effective_output_limit: int
@@ -1505,11 +1563,14 @@ class VllmAsyncGenerationWorkerImpl(
                 """Set the request's max output tokens.
 
                 Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
-                and max_tokens (deprecated but still supported by vLLM).
+                and max_tokens (deprecated but still supported by vLLM). A request
+                that set neither gets max_tokens: otherwise vLLM would fall back to
+                the generation config's budget, e.g. for a restored call whose
+                remaining budget is smaller.
                 """
                 if request.max_completion_tokens is not None:
                     request.max_completion_tokens = max_tokens
-                elif request.max_tokens is not None:
+                else:
                     request.max_tokens = max_tokens
 
             def _clamp_max_tokens(
@@ -1635,6 +1696,9 @@ class VllmAsyncGenerationWorkerImpl(
                         ]
                         request._restored_generation_token_ids = tuple(
                             resumed_generation_token_ids
+                        )
+                        request._original_min_tokens = getattr(
+                            request, "min_tokens", None
                         )
                         (
                             remaining_output_tokens,
@@ -1853,6 +1917,9 @@ class VllmAsyncGenerationWorkerImpl(
                 default=None
             )
             _restored_generation_token_ids: tuple[int, ...] = PrivateAttr(default=())
+            # The client's min_tokens before it is reduced by a restored prefix;
+            # replaying the prefix's stop handling needs the original window.
+            _original_min_tokens: int | None = PrivateAttr(default=None)
 
             def to_sampling_params(self, *args, **kwargs):
                 sampling_params = super().to_sampling_params(*args, **kwargs)
@@ -1860,10 +1927,16 @@ class VllmAsyncGenerationWorkerImpl(
                     worker_self._generation_prefix_cuts_enabled
                     and self.ng_capture is not None
                 ):
-                    sampling_params.output_kind = RequestOutputKind.DELTA
+                    # A cut needs per-step progress, not vLLM's FINAL_ONLY.
+                    # CUMULATIVE outputs reference vLLM's live token and
+                    # logprob lists, so each step costs only its new tokens.
+                    # Streaming keeps vLLM's DELTA, which its stream expects.
+                    if not self.stream:
+                        sampling_params.output_kind = RequestOutputKind.CUMULATIVE
                     worker_self._record_request_effective_output_limit(
                         self, int(sampling_params.max_tokens)
                     )
+                    worker_self._record_request_cut_constraints(self, sampling_params)
                 return sampling_params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
@@ -1871,7 +1944,7 @@ class VllmAsyncGenerationWorkerImpl(
         # belongs on the renderer subclass.
         worker_self = self
 
-        @app.post("/ng-control/v1/generation-cut")
+        @app.post(_GENERATION_CUT_ROUTE)
         async def checkpoint_generation_cut(
             inventory: dict[str, Any],
             authorization: str | None = Header(default=None),
@@ -1930,33 +2003,19 @@ class VllmAsyncGenerationWorkerImpl(
                         parameter="top_logprobs",
                     )
 
-                aggregate_deltas = bool(
-                    worker_self._generation_prefix_cuts_enabled
-                    and request.ng_capture is not None
-                )
                 final_res = None
                 cancelled = False
-                delta_accumulator = _RequestOutputDeltaAccumulator()
 
                 async def capture_result_generator():
                     nonlocal final_res, cancelled
                     try:
+                        # vLLM's full generator keeps only the last output, so
+                        # observe each and restore the prefix once, on the last.
                         async for res in result_generator:
                             worker_self._observe_request_capture(request, res)
-                            if not aggregate_deltas:
-                                final_res = res
-                                worker_self._restore_response_prefix(
-                                    request,
-                                    res,
-                                    tokenizer=self.renderer.tokenizer,
-                                )
-                                yield res
-                                continue
-                            delta_accumulator.append(res)
-
-                        if not aggregate_deltas or delta_accumulator.template is None:
+                            final_res = res
+                        if final_res is None:
                             return
-                        final_res = delta_accumulator.build()
                         worker_self._restore_response_prefix(
                             request,
                             final_res,
@@ -2140,6 +2199,26 @@ class VllmAsyncGenerationWorkerImpl(
 
         generation_config = self.cfg
 
+        async def abort_request_capture(request: Any, reason: str) -> None:
+            """Fail a request's capture without blocking the event loop.
+
+            An uncontended abort finishes here, so it never queues behind
+            executor work. Only one that must wait out a generation cut or a
+            terminal write holding the call's lifecycle lock moves off the loop.
+            """
+            if worker_self._abort_request_capture(
+                request, reason=reason, blocking=False
+            ):
+                return
+            # Shielded: these paths often run after the handler was cancelled,
+            # and a second cancel must not drop the abort before it starts,
+            # leaving the call neither completed nor failed.
+            await asyncio.shield(
+                asyncio.to_thread(
+                    worker_self._abort_request_capture, request, reason=reason
+                )
+            )
+
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         # Like vLLM's own routes: cancel the handler (and with it the engine
@@ -2198,7 +2277,7 @@ class VllmAsyncGenerationWorkerImpl(
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
-                worker_self._abort_request_capture(request, reason="context_length")
+                await abort_request_capture(request, "context_length")
                 return JSONResponse(
                     content={
                         "error": {
@@ -2216,7 +2295,7 @@ class VllmAsyncGenerationWorkerImpl(
                 # symmetry. Return a 400 carrying a stable code so Gym and the
                 # worker log can distinguish a retained-media re-tile from a
                 # real engine error (which stays a 500 below).
-                worker_self._abort_request_capture(request, reason=e.code)
+                await abort_request_capture(request, e.code)
                 LOGGER.warning(
                     "Rejected captured call before inference (%s): %s", e.code, e
                 )
@@ -2241,10 +2320,10 @@ class VllmAsyncGenerationWorkerImpl(
                 # MediaCaptureRejected, which is also a ValueError.
                 if "maximum context length" not in str(e):
                     # Re-raising here bypasses the BaseException handler below.
-                    worker_self._abort_request_capture(request, reason="engine_error")
+                    await abort_request_capture(request, "engine_error")
                     raise
                 LOGGER.warning("Prompt exceeds max_model_len: %s", e)
-                worker_self._abort_request_capture(request, reason="context_length")
+                await abort_request_capture(request, "context_length")
                 return JSONResponse(
                     content={
                         "error": {
@@ -2261,14 +2340,14 @@ class VllmAsyncGenerationWorkerImpl(
                 # before generation starts propagates here directly; one that
                 # lands mid-generation is swallowed by vLLM and re-raised by
                 # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
-                worker_self._abort_request_capture(request, reason="client_disconnect")
+                await abort_request_capture(request, "client_disconnect")
                 raise
             except BaseException:
-                worker_self._abort_request_capture(request, reason="engine_error")
+                await abort_request_capture(request, "engine_error")
                 raise
 
             if isinstance(generator, ErrorResponse):
-                worker_self._abort_request_capture(request, reason="error_response")
+                await abort_request_capture(request, "error_response")
                 return JSONResponse(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
@@ -2288,13 +2367,11 @@ class VllmAsyncGenerationWorkerImpl(
                 except asyncio.CancelledError:
                     # Queued executor work may never start after cancellation.
                     # If staging already claimed the capture, abort is a no-op.
-                    worker_self._abort_request_capture(
-                        request, reason="client_disconnect"
-                    )
+                    await abort_request_capture(request, "client_disconnect")
                     raise
                 return JSONResponse(content=content)
 
-            worker_self._abort_request_capture(request, reason="streaming_response")
+            await abort_request_capture(request, "streaming_response")
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
         ########################################

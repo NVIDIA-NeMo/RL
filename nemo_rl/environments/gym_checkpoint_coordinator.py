@@ -250,6 +250,16 @@ def _episodes_by_instance(
 
 
 @dataclass(frozen=True)
+class GymCheckpointPrepared:
+    """What every prepared Gym deployment reported for one checkpoint."""
+
+    # Each instance's episodes a commit must leave out.
+    restarts: dict[str, frozenset[GymCheckpointEpisode]]
+    # Gym's generation-cut outcome, summed over instances.
+    generation_cut_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
 class GymCheckpointCommitResult:
     """Outer manifest plus each Gym actor's validated commit summary."""
 
@@ -723,10 +733,11 @@ class GymCheckpointCoordinator:
     @asynccontextmanager
     async def prepared(
         self, checkpoint_id: str
-    ) -> AsyncIterator[dict[str, frozenset[GymCheckpointEpisode]]]:
+    ) -> AsyncIterator[GymCheckpointPrepared]:
         """Prepare every deployment, renew its lease, and always release it.
 
-        Yields each instance's restarts: the episodes a commit must leave out.
+        Yields each instance's restarts, the episodes a commit must leave out,
+        and Gym's generation-cut counts.
         Gym resumes when the body exits, before the caller publishes, so new
         rollouts wait only for Gym's own commit. Once the body succeeded every
         commit is written and resume only reopens admission: a resume that
@@ -744,10 +755,19 @@ class GymCheckpointCoordinator:
             )
             body_error: BaseException | None = None
             try:
-                yield {
-                    instance_id: frozenset(summary.restarts)
-                    for instance_id, summary in summaries.items()
-                }
+                generation_cut_counts: dict[str, int] = {}
+                for summary in summaries.values():
+                    for name, count in summary.generation_cut_counts.items():
+                        generation_cut_counts[name] = (
+                            generation_cut_counts.get(name, 0) + count
+                        )
+                yield GymCheckpointPrepared(
+                    restarts={
+                        instance_id: frozenset(summary.restarts)
+                        for instance_id, summary in summaries.items()
+                    },
+                    generation_cut_counts=generation_cut_counts,
+                )
             except BaseException as error:
                 body_error = error
                 raise

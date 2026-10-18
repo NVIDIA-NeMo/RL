@@ -22,61 +22,15 @@ import os
 import re
 import shutil
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
-
-def _read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text())
-    if not isinstance(value, dict):
-        raise TypeError(f"expected a JSON object in {path}")
-    return value
-
-
-def _ledger_episode_index(path: Path) -> dict[tuple[str, int], dict[str, Any]]:
-    import torch
-
-    state = torch.load(path, weights_only=True)
-    result: dict[tuple[str, int], dict[str, Any]] = {}
-    for group in state["groups"]:
-        for sibling in group["siblings"]:
-            attempt = sibling["attempts"][-1]
-            generation_index = sibling["generation_index"]
-            rollout_id = (
-                f"{group['group_id']}_g{generation_index}_a"
-                f"{uuid.UUID(bytes=attempt['attempt_uuid']).hex}"
-            )
-            result[(rollout_id, attempt["gym_attempt"])] = {
-                "group_id": group["group_id"],
-                "generation_index": generation_index,
-                "target_step": group["target_step"],
-                "restore_level": group["restore_level"],
-                "status": attempt["status"],
-                "gym_instance_id": attempt["gym_instance_id"],
-            }
-    return result
-
-
-def _participant_records(
-    snapshot: Path, kind: str
-) -> list[tuple[Path, dict[str, Any]]]:
-    records: list[tuple[Path, dict[str, Any]]] = []
-    pattern = f"gym-instances/*/replica-*/gym/{kind}/*/manifest.json"
-    for manifest_path in snapshot.glob(pattern):
-        manifest = _read_json(manifest_path)
-        if manifest.get("kind") != kind or manifest.get("record_count", 0) <= 0:
-            continue
-        records_path = manifest_path.parent / manifest["records_file"]
-        for line in records_path.read_text().splitlines():
-            if line:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise TypeError(
-                        f"participant row must be an object in {records_path}"
-                    )
-                records.append((manifest_path, record))
-    return records
+from _gym_recovery_snapshot_helpers import (
+    ledger_episode_index,
+    matching_siblings,
+    participant_records,
+    read_json,
+)
 
 
 def _episode_key(record: dict[str, Any]) -> tuple[str, int]:
@@ -137,20 +91,19 @@ def inspect_snapshot(snapshot: Path) -> dict[str, Any]:
         or not (snapshot / "data_plane").is_dir()
     ):
         raise FileNotFoundError("snapshot is not fully published")
-    manifest = _read_json(required[0])
+    manifest = read_json(required[0])
     if manifest.get("base_train_step") != 0 or manifest.get("trainer_version") != 0:
         raise AssertionError("prefix fault injection must use a bootstrap snapshot")
 
-    gym = _read_json(required[1])
-    ledger = _ledger_episode_index(required[2])
+    gym = read_json(required[1])
+    ledger = ledger_episode_index(required[2])
     agent_keys = {
-        _episode_key(record) for _, record in _participant_records(snapshot, "agent")
+        _episode_key(record) for _, record in participant_records(snapshot, "agent")
     }
     resources_keys = {
-        _episode_key(record)
-        for _, record in _participant_records(snapshot, "resources")
+        _episode_key(record) for _, record in participant_records(snapshot, "resources")
     }
-    model_records = _participant_records(snapshot, "model")
+    model_records = participant_records(snapshot, "model")
 
     candidates: list[dict[str, Any]] = []
     for model_manifest, record in model_records:
@@ -235,31 +188,14 @@ def _events(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line]
 
 
-def _matching_siblings(
-    events: list[dict[str, Any]], selection: dict[str, Any], event_name: str
-) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    for event in events:
-        if event["event"] != event_name or event["group_id"] != selection["group_id"]:
-            continue
-        siblings = event.get("siblings") or [event.get("sibling")]
-        found.extend(
-            sibling
-            for sibling in siblings
-            if sibling is not None
-            and sibling["gym_rollout_id"] == selection["gym_rollout_id"]
-        )
-    return found
-
-
 def verify_restore(args: argparse.Namespace) -> None:
-    selection = _read_json(Path(args.selection_file))
+    selection = read_json(Path(args.selection_file))
     phase1 = _events(Path(args.phase1_events))
     phase2 = _events(Path(args.phase2_events))
     log = Path(args.phase2_log).read_text()
-    training_info = _read_json(Path(args.training_info))
+    training_info = read_json(Path(args.training_info))
 
-    phase1_dispatch = _matching_siblings(phase1, selection, "dispatch")
+    phase1_dispatch = matching_siblings(phase1, selection, "dispatch")
     if not phase1_dispatch:
         raise AssertionError(
             "selected Gym episode was not observed in phase-one dispatches"
@@ -273,8 +209,8 @@ def verify_restore(args: argparse.Namespace) -> None:
             f"phase-one dispatch identity mismatch: {phase1_dispatch!r}"
         )
 
-    phase2_dispatch = _matching_siblings(phase2, selection, "dispatch")
-    phase2_refused = _matching_siblings(phase2, selection, "refused")
+    phase2_dispatch = matching_siblings(phase2, selection, "dispatch")
+    phase2_refused = matching_siblings(phase2, selection, "refused")
     if len(phase2_dispatch) - len(phase2_refused) != 1:
         raise AssertionError(
             f"expected one accepted restored dispatch: {phase2_dispatch!r}, {phase2_refused!r}"
@@ -293,7 +229,7 @@ def verify_restore(args: argparse.Namespace) -> None:
     if actual_identity != expected_identity:
         raise AssertionError((actual_identity, expected_identity))
 
-    completions = _matching_siblings(phase2, selection, "completion")
+    completions = matching_siblings(phase2, selection, "completion")
     if not any(
         sibling["gym_instance_id"] == selection["gym_instance_id"]
         and sibling["gym_attempt"] == selection["gym_attempt"] + 1

@@ -165,13 +165,6 @@ def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) ->
     checkpoint_id, checkpoint_separator, identity_and_sequence = (
         checkpoint_and_identity.partition("/")
     )
-    if (
-        checkpoint_id
-        and checkpoint_separator
-        and identity_and_sequence == snapshot.staging_key
-    ):
-        # Compatibility with cuts written before chunks had a sequence suffix.
-        return True
     logical_key, sequence_separator, chunk_sequence = identity_and_sequence.rpartition(
         "/"
     )
@@ -497,6 +490,7 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
+        """Write a call's token row and its media under its staging key."""
         return self._stage_at_key(
             record,
             record.staging_key,

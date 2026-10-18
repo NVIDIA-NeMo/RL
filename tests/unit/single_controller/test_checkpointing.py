@@ -1636,7 +1636,7 @@ class TestPeriodicRolloutCheckpoint:
         validated_commits: list[object] = []
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             assert checkpoint_id.startswith("rollout-")
             yield gym_commit
 
@@ -1675,6 +1675,34 @@ class TestPeriodicRolloutCheckpoint:
         if warns:
             assert "snapshot_attempt_interval_s=0.5s" in parked_warnings[0]
 
+    def test_rollout_checkpoint_logs_generation_cut_stats(self, tmp_path: Path) -> None:
+        """A prefix checkpoint logs its fence hold and Gym's cut outcome."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
+            assert cut_stats is not None
+            cut_stats.counts = {"cut": 3, "cut_failed": 1, "cut_skipped": 2}
+            yield object()
+            cut_stats.fence_hold_seconds = 1.5
+
+        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
+            pass
+
+        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["generation_cut_fence_hold_seconds"] == 1.5
+        assert logged["generation_cut_calls"] == 3.0
+        assert logged["generation_cut_failed_calls"] == 1.0
+        assert logged["generation_cut_skipped_calls"] == 2.0
+
     def test_a_resume_lost_after_gym_committed_keeps_the_snapshot(
         self, tmp_path: Path
     ) -> None:
@@ -1686,7 +1714,7 @@ class TestPeriodicRolloutCheckpoint:
         coordinator = gym_coordinator(gym)
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             async with coordinator.prepared(checkpoint_id):
                 yield object()
 
@@ -1720,7 +1748,7 @@ class TestPeriodicRolloutCheckpoint:
         gym_parked = asyncio.Event()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             gym_phase_events.append("park")
             try:
                 gym_parked.set()
