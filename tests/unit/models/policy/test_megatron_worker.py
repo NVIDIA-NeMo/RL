@@ -2465,9 +2465,6 @@ def test_megatron_move_model_does_not_serialize_extra_state():
 
 
 def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
-    from nemo_rl.models.policy.workers.checkpoint_engine import (
-        MegatronCheckpointEngineSendMixin,
-    )
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -2475,20 +2472,9 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
         CheckpointEngineWeightSynchronizer,
     )
 
-    class _PrequantCheckpointWorker(MegatronCheckpointEngineSendMixin):
-        enable_refit_prequantize = MegatronPolicyWorkerImpl.enable_refit_prequantize
-        _is_fp8_export = MegatronPolicyWorkerImpl._is_fp8_export
-        _generation_needs_logical_weights = (
-            MegatronPolicyWorkerImpl._generation_needs_logical_weights
-        )
-        _iter_params_with_optional_kv_scales = (
-            MegatronPolicyWorkerImpl._iter_params_with_optional_kv_scales
-        )
-        _maybe_prequantize_param = MegatronPolicyWorkerImpl._maybe_prequantize_param
-
     name = "model.layers.0.mlp.down_proj.weight"
     weight = torch.randn(64, 64, dtype=torch.bfloat16)
-    worker = _PrequantCheckpointWorker()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
     worker._refit_prequant_names = set()
     worker._refit_param_info_hf = None
     worker.fp8_cfg = None
