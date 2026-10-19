@@ -463,9 +463,7 @@ class GenerationCutCaptureMixin:
 
     def _fetch_generation_cut_chunks(self, continuation: Any) -> list[Any]:
         """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
-        chunks = GenerationCutCaptureMixin._fetch_generation_cut_rows(
-            self, list(continuation.staging_keys)
-        )
+        chunks = self._fetch_generation_cut_rows(list(continuation.staging_keys))
         if not chunks:
             raise RuntimeError("generation-cut continuation has no staged chunks")
         return chunks

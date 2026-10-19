@@ -218,6 +218,15 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     return worker
 
 
+def _real_worker() -> VllmAsyncGenerationWorkerImpl:
+    """A real worker over the fake's attributes, so methods resolve on the class."""
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    fake = vars(_fake_worker())
+    fake.pop("install_token_capture")
+    vars(worker).update(fake)
+    return worker
+
+
 def test_generation_cut_route_matches_gym():
     """The worker serves cuts where Gym sends them; a drifted route 404s every cut."""
     assert _GENERATION_CUT_ROUTE == GENERATION_CUT_ROUTE
@@ -238,7 +247,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
             sink
         ),
     )
-    worker = _fake_worker()
+    worker = _real_worker()
 
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
@@ -294,7 +303,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
             sink
         ),
     )
-    worker = _fake_worker()
+    worker = _real_worker()
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
             worker,
@@ -818,10 +827,7 @@ def _worker_with_capture(sink: _MemorySink):
     """A real worker, minus the engine, with in-memory token capture."""
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    fake = vars(_fake_worker())
-    fake.pop("install_token_capture")
-    vars(worker).update(fake)
+    worker = _real_worker()
     worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
