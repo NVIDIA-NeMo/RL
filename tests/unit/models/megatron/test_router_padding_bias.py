@@ -259,6 +259,46 @@ def test_packed_router_mask_with_alltoall_dispatcher(
         assert processed.padding_mask is None
 
 
+_DISPATCHERS = {
+    "hybridep": {
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+    },
+    "deepep": {
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "deepep",
+    },
+    "alltoall": {"moe_token_dispatcher_type": "alltoall"},
+}
+
+
+@pytest.mark.parametrize(
+    "dispatcher,create_router_padding_mask,expected",
+    [
+        ("hybridep", False, True),
+        ("deepep", False, False),
+        ("alltoall", False, False),
+        ("hybridep", True, True),
+        ("deepep", True, True),
+        ("alltoall", True, True),
+    ],
+)
+def test_packed_padding_mask_rule(dispatcher, create_router_padding_mask, expected):
+    """One rule decides packed padding masks for dense and shared-prefix units.
+
+    The shared-prefix iterator tests need megatron.rl; this one does not.
+    """
+    from nemo_rl.models.megatron.data import _masks_packed_sequence_padding
+
+    assert (
+        _masks_packed_sequence_padding(
+            _DISPATCHERS[dispatcher],
+            create_router_padding_mask=create_router_padding_mask,
+        )
+        is expected
+    )
+
+
 @pytest.mark.parametrize("chunkwise", [False, True])
 def test_nested_language_decoder_router_mask(chunkwise):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

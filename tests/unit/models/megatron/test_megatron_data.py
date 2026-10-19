@@ -3172,6 +3172,7 @@ class TestSharedPrefixMicrobatchIterator:
                 pad_packed_seq_to_multiple_of=1,
                 pad_full_seq_to=None,
                 straggler_timer=None,
+                mask_sequence_padding=False,
             )
         )
         assert len(microbatches) == len(units)
@@ -3186,34 +3187,47 @@ class TestSharedPrefixMicrobatchIterator:
             )
 
     @pytest.mark.parametrize(
-        "backend,excluded", [("hybridep", True), ("deepep", False)]
+        "dispatcher,create_router_padding_mask,excluded",
+        [
+            ("hybridep", False, True),
+            ("deepep", False, False),
+            ("alltoall", False, False),
+            # Live expert-bias updates mask padding with any dispatcher.
+            ("hybridep", True, True),
+            ("deepep", True, True),
+            ("alltoall", True, True),
+        ],
     )
     def test_star_units_state_the_expert_bias_padding_convention(
-        self, backend, excluded
+        self, monkeypatch, dispatcher, create_router_padding_mask, excluded
     ):
         """Star forwards mask per-branch padding exactly when dense units do."""
         pytest.importorskip("megatron.core.models.hybrid.shared_prefix")
-        from nemo_rl.models.megatron.data import process_shared_prefix_microbatch
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
         from nemo_rl.models.megatron.train import model_forward
 
+        # Keep the iterator's device move on CPU.
+        monkeypatch.setattr(BatchedDataDict, "to", lambda self, device: self)
         data = _shared_prefix_batch(_STAR_TOKENS, _STAR_PROMPTS, _STAR_GROUPS)
         cfg = _shared_prefix_cfg()
-        cfg["megatron_cfg"].update(
-            moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend=backend
-        )
-        microbatch = next(
-            process_shared_prefix_microbatch(
-                data_dict=data,
-                cfg=cfg,
-                bin_capacity=64,
-                execution_units=self._plan(data, cfg),
-                seq_length_key="input_lengths",
-                pad_individual_seqs_to_multiple_of=1,
-                pad_packed_seq_to_multiple_of=1,
-                pad_full_seq_to=None,
-                straggler_timer=None,
+        if dispatcher == "alltoall":
+            cfg["megatron_cfg"].update(moe_token_dispatcher_type="alltoall")
+        else:
+            cfg["megatron_cfg"].update(
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend=dispatcher,
             )
+        iterator, *_ = get_microbatch_iterator(
+            data,
+            cfg,
+            1,
+            None,
+            seq_length_key="input_lengths",
+            create_router_padding_mask=create_router_padding_mask,
+            shared_prefix_bin_capacity=64,
+            shared_prefix_execution_units=self._plan(data, cfg),
         )
+        microbatch = next(iterator)
         metadata = microbatch.shared_prefix
         assert metadata.exclude_sequence_padding_from_expert_bias is excluded
 

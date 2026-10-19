@@ -2511,6 +2511,7 @@ def test_shared_prefix_logprobs_match_dense_rows(pack_groups):
             pad_packed_seq_to_multiple_of=1,
             pad_full_seq_to=None,
             straggler_timer=None,
+            mask_sequence_padding=False,
         )
         for microbatch in microbatches:
             metadata = microbatch.shared_prefix

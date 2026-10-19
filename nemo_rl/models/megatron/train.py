@@ -300,7 +300,8 @@ def model_forward(
                 )
         if shared_prefix.exclude_sequence_padding_from_expert_bias:
             # Match the dense packed path, which masks per-sequence padding
-            # from MoE expert-bias counts with HybridEP. Sent only when set.
+            # from MoE expert-bias counts with HybridEP, and with any
+            # dispatcher while expert-bias updates are live. Sent only when set.
             additional_kwargs[
                 "shared_prefix_exclude_sequence_padding_from_expert_bias"
             ] = True

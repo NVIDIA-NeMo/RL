@@ -361,6 +361,7 @@ def make_processed_microbatch_iterator(
                 pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
                 pad_full_seq_to=pad_full_seq_to,
                 straggler_timer=straggler_timer,
+                mask_sequence_padding=create_packed_seq_padding_mask,
                 mtp_enabled=mtp_enabled,
             )
             continue
@@ -445,6 +446,19 @@ def _pad_sequence_aligned_tensors(
         data_dict[key] = torch.cat(
             (value, value.new_zeros(pad_shape)), dim=1
         ).contiguous()
+
+
+def _masks_packed_sequence_padding(
+    megatron_cfg: Mapping[str, Any], *, create_router_padding_mask: bool
+) -> bool:
+    """Whether packed forwards mask per-sequence padding from MoE routing.
+
+    HybridEP always masks it. Any other dispatcher masks it while expert-bias
+    updates are live (``create_router_padding_mask``), so alignment padding
+    never reaches expert-bias load counts. Dense packed microbatches and
+    shared-prefix units (dense fallbacks and star forwards) share this rule.
+    """
+    return uses_hybridep_flex_dispatcher(megatron_cfg) or create_router_padding_mask
 
 
 def get_microbatch_iterator(
@@ -634,6 +648,11 @@ def get_microbatch_iterator(
             shared_prefix_padding_multiple,
             max_execution_length,
         )
+        # Dense fallbacks mask their padding, and star forwards state the same
+        # convention to the model, exactly as dense packed microbatches do.
+        create_packed_seq_padding_mask = _masks_packed_sequence_padding(
+            cfg["megatron_cfg"], create_router_padding_mask=create_router_padding_mask
+        )
         micro_batch_size = 1
     elif direct_packed_rows:
         raw_iterator = data.make_microbatch_iterator(1)
@@ -653,7 +672,9 @@ def get_microbatch_iterator(
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
         # statistics with any dispatcher, not only HybridEP.
-        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        create_packed_seq_padding_mask = _masks_packed_sequence_padding(
+            cfg["megatron_cfg"], create_router_padding_mask=create_router_padding_mask
+        )
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
@@ -1175,12 +1196,16 @@ def process_shared_prefix_microbatch(
     pad_packed_seq_to_multiple_of: int,
     pad_full_seq_to: Optional[int],
     straggler_timer: Optional[StragglerDetector],
+    mask_sequence_padding: bool,
     mtp_enabled: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Expand one conventional local batch into star and fallback forwards.
 
     ``execution_units`` is the plan :func:`plan_shared_prefix_execution_units`
-    produced for this exact batch.
+    produced for this exact batch. ``mask_sequence_padding`` is the dense packed
+    expert-bias padding rule that :func:`get_microbatch_iterator` resolved:
+    dense fallback units mask their padding from MoE routing, and star units
+    state the same convention to the model.
     """
     # Lazy: megatron.rl ships only with shared-prefix Megatron-LM builds.
     from megatron.rl.shared_prefix_tensors import (
@@ -1208,9 +1233,6 @@ def process_shared_prefix_microbatch(
     tp_size, cp_size, padding_multiple = _resolve_shared_prefix_execution_topology(cfg)
     cp_rank = get_context_parallel_rank() if cp_size > 1 else 0
     source_sequence_length = data_dict["input_ids"].shape[1]
-    # Packed dense units mask their padding from MoE routing with HybridEP;
-    # star units state the same convention to the model.
-    mask_sequence_padding = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
     for unit in execution_units:
         unit_rows = list(unit.row_indices)
         unit_data = data_dict.select_indices(unit_rows)
