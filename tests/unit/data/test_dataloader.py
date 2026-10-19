@@ -15,8 +15,9 @@
 from collections.abc import Iterator
 
 import pytest
+from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.data.dataloader import CyclingDataLoader
+from nemo_rl.data.dataloader import CyclingDataLoader, shutdown_dataloader_workers
 
 
 class _EpochListLoader:
@@ -61,3 +62,34 @@ def test_cycling_dataloader_delegates_checkpoint_state():
     dataloader = _EpochListLoader([1])
 
     assert CyclingDataLoader(dataloader).state_dict() == {"iter_count": 0}
+
+
+def test_shutdown_dataloader_workers_after_early_break():
+    dataloader = StatefulDataLoader(list(range(8)), batch_size=2, num_workers=1)
+    for _ in dataloader:
+        break
+
+    # StatefulDataLoader keeps the unfinished iterator, so its worker survives the loop.
+    workers = dataloader._iterator._workers
+    assert all(worker.is_alive() for worker in workers)
+
+    shutdown_dataloader_workers(dataloader)
+
+    assert dataloader._iterator is None
+    assert not any(worker.is_alive() for worker in workers)
+    # The next pass starts from the beginning, as it did before the shutdown.
+    assert next(iter(dataloader)).tolist() == [0, 1]
+    shutdown_dataloader_workers(dataloader)
+
+
+@pytest.mark.parametrize("num_workers", [0, 1])
+def test_shutdown_dataloader_workers_is_noop_without_live_iterator(num_workers):
+    dataloader = StatefulDataLoader(
+        list(range(4)), batch_size=2, num_workers=num_workers
+    )
+    shutdown_dataloader_workers(dataloader)  # never iterated
+
+    assert [batch.tolist() for batch in dataloader] == [[0, 1], [2, 3]]
+    shutdown_dataloader_workers(dataloader)  # fully consumed
+
+    assert dataloader._iterator is None

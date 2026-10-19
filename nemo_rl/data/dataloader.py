@@ -20,6 +20,25 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+def shutdown_dataloader_workers(dataloader: Any) -> None:
+    """Stop the worker processes of a partially consumed dataloader.
+
+    ``StatefulDataLoader`` keeps its last iterator in ``_iterator`` so that
+    ``state_dict()`` can read it. Breaking out of a loop over the loader early
+    therefore leaves that iterator's worker processes running until the next
+    ``iter()``. Each worker is a fork of the caller and pins a copy-on-write
+    image of the caller's memory at fork time, which the caller can no longer
+    return to the OS.
+    """
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is None:
+        return
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if shutdown is not None:
+        shutdown()
+    dataloader._iterator = None
+
+
 class CyclingDataLoader:
     """Repeat a stateful dataloader until its consumer stops."""
 
