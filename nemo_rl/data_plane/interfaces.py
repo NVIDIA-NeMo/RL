@@ -112,7 +112,7 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
 
     enabled: bool = False
     path: str | None = None  # absolute; required when enabled
-    offload_threshold: float = Field(default=0.9, gt=0.0, le=1.0)
+    offload_threshold: float = Field(default=0.5, gt=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":

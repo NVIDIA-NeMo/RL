@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 import torch
 
+import nemo_rl.data_plane.adapters.mooncake_ssd_offload as offload
 import nemo_rl.data_plane.adapters.tq_mooncake_checkpoint as checkpoint_plugin
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     _load_storage_checkpoint,
@@ -1901,7 +1902,7 @@ def _evictable_managers(cluster: _FakeCluster, identities, **options) -> list[An
 @pytest.fixture
 def no_restore_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     sleeps: list[float] = []
-    monkeypatch.setattr(checkpoint_plugin.time, "sleep", sleeps.append)
+    monkeypatch.setattr(offload.time, "sleep", sleeps.append)
     return sleeps
 
 
@@ -1995,10 +1996,9 @@ def test_offload_restore_waits_for_eviction_to_free_memory(
 def test_offload_restore_gives_up_when_memory_never_frees(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_restore_backoff: list[float]
 ) -> None:
-    monkeypatch.setattr(checkpoint_plugin, "_RESTORE_FULL_RETRIES", 4)
-    with pytest.raises(RuntimeError, match="incomplete or invalid results"):
+    monkeypatch.setattr(offload, "PUT_WAIT_S", 0.0)
+    with pytest.raises(RuntimeError, match="memory stayed full"):
         _restore_with(tmp_path, monkeypatch, full_attempts=1_000)
-    assert len(no_restore_backoff) == 4
 
 
 def test_pinned_restore_does_not_retry_a_full_store(

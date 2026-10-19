@@ -204,7 +204,7 @@ def test_mooncake_ssd_offload_makes_objects_evictable(
     assert "--offload_on_evict=true" in extra
     assert "--offload_force_evict=false" in extra
     assert "--eviction_high_watermark_ratio=0.2" in extra
-    assert "--default_kv_lease_ttl=10000" in extra
+    assert "--default_kv_lease_ttl=1000" in extra
 
 
 @pytest.mark.parametrize("ssd_offload", [False, True])

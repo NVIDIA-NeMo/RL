@@ -469,7 +469,7 @@ data_plane:
     ssd_offload:                       # see "Mooncake SSD offload"
       enabled: false                   # true: spill memory to local SSD
       path: null                       # absolute node-local dir; required if enabled
-      offload_threshold: 0.9           # offload above this share of segment memory
+      offload_threshold: 0.5           # offload above this share of segment memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
@@ -995,6 +995,15 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
   instead of reading pinned memory in place. That read also fetches objects
   already on SSD. A restore retries a write that finds memory full while
   eviction frees space. See "Experimental Mooncake storage checkpoints".
+- **A put that finds memory full waits; it does not fail.** Mooncake
+  accepts a put only into free segment memory, and offload frees memory in
+  the background, so a burst of writes can briefly fill every segment. Each
+  client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with
+  backoff, logging one warning per waiting put, for up to 600 s. Sustained
+  writes therefore run at most as fast as offload frees memory; bursts
+  become stalls, not crashes. A new object can be evicted once its 1 s
+  lease expires; the 0.5 default `offload_threshold` leaves room for a
+  burst while offload catches up.
 - **Directories:** each owner writes to
   `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
   At the end of a run the SingleController asks each storage unit to delete
@@ -1012,9 +1021,10 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
 > (`master_evict_disk_replica_requests_total`). With offload on, the process
 > that started the master checks that counter every 30 s and stops the run
 > at the first deletion. If instead free space falls below one object plus
-> 256 MiB, Mooncake fails the SSD write, keeps the object in memory, and the
-> run ends once puts fail with `NO_AVAILABLE_HANDLE`. Either way, give `path`
-> enough free disk for everything offloaded during the run.
+> 256 MiB, Mooncake fails the SSD write and keeps the object in memory;
+> memory then stops being freed, and a put that has waited 600 s for it
+> fails with an error naming `path`. Either way, give `path` enough free
+> disk for everything offloaded during the run.
 
 ### Experimental Mooncake storage checkpoints
 
@@ -1115,9 +1125,9 @@ exercise save, process restart, load, and read on the intended training topology
 For runs that save or resume checkpoints, the adapter pins memory replicas
 (or leaves them evictable when `mooncake_cpu.ssd_offload` is on) and keeps TQ's
 own Mooncake offload client off. These are not additional user
-configuration knobs. With SSD offload, restore retries a write that finds
-memory full (`NO_AVAILABLE_HANDLE`) for up to about 2 minutes while eviction
-moves older objects to SSD. Verification then accepts an object that is
+configuration knobs. With SSD offload, restore waits on a write that finds
+memory full (`NO_AVAILABLE_HANDLE`) like any put, for up to 600 s, while
+eviction moves older objects to SSD. Verification then accepts an object that is
 already on SSD. Workers inherit this storage mode from TQ's controller.
 Other jobs keep TQ's storage defaults. A checkpoint saved with
 `simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises

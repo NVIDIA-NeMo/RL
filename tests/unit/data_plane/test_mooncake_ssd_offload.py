@@ -45,8 +45,13 @@ def test_master_args_turn_eviction_into_offload() -> None:
         "--offload_force_evict=false",
         "--eviction_high_watermark_ratio=0.2",
         "--eviction_ratio=0.1",
-        "--default_kv_lease_ttl=10000",
+        "--default_kv_lease_ttl=1000",
     )
+
+
+def test_offload_starts_at_half_full_by_default() -> None:
+    # At 0.9 the headroom above the watermark is less than one large put.
+    assert _cfg(ssd_offload=_SSD).ssd_offload.offload_threshold == 0.5
 
 
 @pytest.mark.parametrize(
@@ -76,7 +81,9 @@ def fake_store(monkeypatch, tmp_path):
             calls.append((args, kwargs))
             return 0
 
+    FakeClient = _client_cls([])
     monkeypatch.setattr(mooncake_client, "MooncakeDistributedStore", FakeStore)
+    monkeypatch.setattr(mooncake_client, "MooncakeStoreClient", FakeClient)
     monkeypatch.setattr(
         ray,
         "get_runtime_context",
@@ -90,7 +97,11 @@ def fake_store(monkeypatch, tmp_path):
     exit_hooks = []
     monkeypatch.setattr(atexit, "register", exit_hooks.append)
     return SimpleNamespace(
-        module=mooncake_client, cls=FakeStore, calls=calls, exit_hooks=exit_hooks
+        module=mooncake_client,
+        cls=FakeStore,
+        client_cls=FakeClient,
+        calls=calls,
+        exit_hooks=exit_hooks,
     )
 
 
@@ -108,6 +119,9 @@ def test_install_is_a_noop_unless_this_process_owns_memory(
     offload.install(_cfg(**mooncake_cpu), segment_size)
     assert fake_store.module.MooncakeDistributedStore is fake_store.cls
     assert fake_store.exit_hooks == []
+    # Every client writes, so every client waits for memory when offload is on.
+    waits = getattr(fake_store.client_cls, "_nrl_waits_for_memory", False)
+    assert waits == ("ssd_offload" in mooncake_cpu)
 
 
 def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
@@ -146,6 +160,109 @@ def test_install_keeps_a_launcher_override(fake_store, monkeypatch, tmp_path) ->
 
 def test_remove_dir_without_install_is_a_noop(fake_store) -> None:
     offload.remove_dir()
+
+
+FULL = offload.NO_AVAILABLE_HANDLE
+
+
+def _client_cls(tq_retries):
+    """A fresh TQ store-client class (patching is per class) recording TQ's retries."""
+
+    class Client:
+        replica_config = None
+
+        def _batch_upsert_with_retry(self, keys, ptrs, sizes):
+            tq_retries.append(list(keys))
+
+    return Client
+
+
+class _Store:
+    """Answers each batch_upsert_from with the next scripted result list."""
+
+    def __init__(self, *rounds):
+        self.rounds = list(rounds)
+        self.calls = []
+
+    def batch_upsert_from(self, keys, ptrs, sizes, config=None):
+        self.calls.append(list(keys))
+        return self.rounds.pop(0)
+
+
+def _waiting_client(monkeypatch, *rounds, step_s=0.0):
+    """A store client whose puts wait for memory; returns it, TQ's retries, sleeps."""
+    tq_retries, sleeps, now = [], [], [0.0]
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += step_s
+
+    monkeypatch.setattr(
+        offload, "time", SimpleNamespace(sleep=sleep, monotonic=lambda: now[0])
+    )
+
+    Client = _client_cls(tq_retries)
+    offload.wait_for_memory_on_put(Client)
+    client = Client()
+    client._store = _Store(*rounds)
+    return client, tq_retries, sleeps
+
+
+def test_put_waits_for_offload_to_free_memory(monkeypatch) -> None:
+    client, tq_retries, sleeps = _waiting_client(monkeypatch, [FULL, 0], [FULL], [0])
+    client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
+    # Only the key that found memory full is put again, until it fits.
+    assert client._store.calls == [["a", "b"], ["a"], ["a"]]
+    assert tq_retries == []
+    assert sleeps == [0.05, 0.1]
+
+
+def test_put_backoff_is_capped(monkeypatch) -> None:
+    client, _, sleeps = _waiting_client(monkeypatch, *([[FULL]] * 8), [0])
+    client._batch_upsert_with_retry(["a"], [1], [8])
+    assert max(sleeps) == offload.PUT_BACKOFF_MAX_S
+
+
+@pytest.mark.parametrize(
+    ("rounds", "warnings"), [([[FULL], [FULL], [0]], 1), ([[0]], 0)]
+)
+def test_a_waiting_put_warns_once(monkeypatch, caplog, rounds, warnings) -> None:
+    client, _, _ = _waiting_client(monkeypatch, *rounds)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        client._batch_upsert_with_retry(["a"], [1], [8])
+    assert [
+        "waiting for SSD offload to free memory" in r.getMessage()
+        for r in caplog.records
+    ] == [True] * warnings
+
+
+def test_other_put_errors_keep_tqs_own_retry(monkeypatch) -> None:
+    client, tq_retries, sleeps = _waiting_client(monkeypatch, [-1, 0])
+    client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
+    assert tq_retries == [["a"]]
+    assert sleeps == []
+
+
+def test_put_fails_once_memory_stays_full_for_the_whole_wait(monkeypatch) -> None:
+    rounds = [[FULL]] * 100
+    client, _, _ = _waiting_client(monkeypatch, *rounds, step_s=100.0)
+    with pytest.raises(RuntimeError, match="stayed full .* SSD offload.*'a'"):
+        client._batch_upsert_with_retry(["a"], [1], [8])
+    assert len(client._store.calls) == offload.PUT_WAIT_S / 100 + 1
+
+
+def test_put_rejects_a_short_result_list(monkeypatch) -> None:
+    client, _, _ = _waiting_client(monkeypatch, [0])
+    with pytest.raises(RuntimeError, match=r"returned \[0\] for 2 keys"):
+        client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
+
+
+def test_wait_for_memory_patches_a_class_once() -> None:
+    Client = _client_cls([])
+    offload.wait_for_memory_on_put(Client)
+    patched = Client._batch_upsert_with_retry
+    offload.wait_for_memory_on_put(Client)
+    assert Client._batch_upsert_with_retry is patched
 
 
 _METRICS = """\

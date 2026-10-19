@@ -104,7 +104,7 @@ def _write(client) -> None:  # pragma: no cover
             partition_id=f"p{p}",
             fields=TensorDict({"big": _expected(p)}, batch_size=[ROWS]),
         )
-        # Objects are evictable only once their lease (10 s) expires.
+        # Objects are evictable only once their lease (1 s) expires.
         time.sleep(2.0)
 
 
@@ -253,7 +253,7 @@ def _fill_small_disk(ssd_root: str) -> None:  # pragma: no cover
     import ray
     from tensordict import TensorDict
 
-    # 1 GiB unit: room for the ~200 MiB still under its 10 s lease at ~20 MiB/s.
+    # 1 GiB unit: ample room for what is still under its 1 s lease at ~20 MiB/s.
     client, _units = _start(_cfg(ssd_root, True, segment_bytes=1 << 30), True)
     try:
         # ~4 GiB in 16 MiB partitions, paced at ~20 MiB/s so eviction keeps up

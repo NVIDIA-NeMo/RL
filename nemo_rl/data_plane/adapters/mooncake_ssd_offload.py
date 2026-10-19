@@ -29,6 +29,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import urllib.request
 from collections.abc import Callable
 from typing import Any
@@ -55,6 +56,15 @@ ENV_DEFAULTS = {
 # This process's offload directory, once installed.
 _dir: str | None = None
 
+# Mooncake's ErrorCode::NO_AVAILABLE_HANDLE: no segment had room for the put.
+NO_AVAILABLE_HANDLE = -200
+# With offload on, a full segment is a wait, not an error: offload frees
+# memory in the background. The bound only turns a stuck offload (disk full,
+# SSD writes failing) into an error instead of a hang.
+PUT_WAIT_S = 600.0
+_FIRST_BACKOFF_S = 0.05
+PUT_BACKOFF_MAX_S = 1.0
+
 # The master counts every report of SSD copies its owners deleted for space
 # (FileStorage::NotifyEvictedDiskReplicas -> BatchEvictDiskReplica). NeMo-RL
 # and TQ never delete SSD copies themselves, so any count means data loss.
@@ -71,9 +81,11 @@ def master_args(cfg: MooncakeCpuConfig) -> tuple[str, ...]:
     master moves objects to SSD and frees ``eviction_ratio`` of the memory.
     These replace the no-eviction flags TQ passes (gflags keeps the last
     occurrence). ``offload_force_evict=false``: an object whose SSD write
-    failed stays in memory rather than being dropped. TQ's 999999 ms lease
-    would keep every object written in the last ~17 min from being evicted,
-    so it goes back to mooncake's own 10 s default.
+    failed stays in memory rather than being dropped. A fresh object cannot
+    be evicted until its lease expires: TQ's 999999 ms would pin ~17 min of
+    writes, and even 10 s let a 512 MiB segment fill at 64 MiB/s before
+    anything was evictable (job 1321643). 1 s still covers a read, which
+    takes milliseconds and renews the lease.
     """
     if not cfg.ssd_offload.enabled:
         return ()
@@ -83,31 +95,33 @@ def master_args(cfg: MooncakeCpuConfig) -> tuple[str, ...]:
         "--offload_force_evict=false",
         f"--eviction_high_watermark_ratio={cfg.ssd_offload.offload_threshold}",
         "--eviction_ratio=0.1",
-        "--default_kv_lease_ttl=10000",
+        "--default_kv_lease_ttl=1000",
     )
 
 
 def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
-    """Make this process's Mooncake store offload to its own SSD directory.
+    """Set up this process's Mooncake client for SSD offload.
 
-    No-op unless offload is on and this process owns memory. TQ's client calls
-    ``setup`` with no offload arguments, so this swaps the store class it
-    builds for one that adds them. Each process gets a fresh, owner-only
-    ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``: no run can
-    pick up, or wipe, another's files. Must run before the store is set up.
+    No-op unless offload is on. Every client's puts then wait for memory
+    (:func:`wait_for_memory_on_put`). A process that owns memory also offloads
+    to its own SSD directory: TQ's client calls ``setup`` with no offload
+    arguments, so this swaps the store class it builds for one that adds them.
+    Each owner gets a fresh, owner-only ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``:
+    no run can pick up, or wipe, another's files. Must run before the store
+    is set up.
     """
     global _dir
-    if (
-        _dir is not None
-        or not cfg.ssd_offload.enabled
-        or not cfg.owned_segment_size(segment_size)
-    ):
+    if not cfg.ssd_offload.enabled:
         return
 
     import ray
     from transfer_queue.storage.clients import mooncake_client
 
     from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
+
+    wait_for_memory_on_put(getattr(mooncake_client, "MooncakeStoreClient", None))
+    if _dir is not None or not cfg.owned_segment_size(segment_size):
+        return
 
     base = getattr(mooncake_client, "MooncakeDistributedStore", None)
     if base is None:
@@ -136,6 +150,95 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
 
     mooncake_client.MooncakeDistributedStore = _OffloadingStore
     LOGGER.info("Mooncake SSD offload for this process under %s", path)
+
+
+def wait_for_memory_on_put(client_cls: Any) -> None:
+    """Make TQ's puts wait for offload to free memory instead of failing.
+
+    TQ's ``_batch_upsert_with_retry`` gives up after 3 x 1 s. Raising TQ's
+    ``MAX_RETRIES`` instead would also retry permanent errors, logging each
+    at ERROR. Patches ``client_cls`` once.
+    """
+    if getattr(client_cls, "_nrl_waits_for_memory", False):
+        return
+    tq_upsert = getattr(client_cls, "_batch_upsert_with_retry", None)
+    if tq_upsert is None:
+        from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
+
+        raise _tq_shape_drift_error(
+            "MooncakeStoreClient._batch_upsert_with_retry is gone",
+            "puts would fail instead of waiting while SSD offload frees memory",
+            "put retry",
+        )
+
+    def _batch_upsert_with_retry(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
+        upsert_waiting_for_memory(
+            lambda k, p, s: self._store.batch_upsert_from(
+                k, p, s, config=self.replica_config
+            ),
+            keys,
+            ptrs,
+            sizes,
+            on_error=lambda k, p, s, _: tq_upsert(self, k, p, s),
+        )
+
+    client_cls._batch_upsert_with_retry = _batch_upsert_with_retry
+    client_cls._nrl_waits_for_memory = True
+
+
+def upsert_waiting_for_memory(
+    upsert: Callable[[list[str], list[int], list[int]], Any],
+    keys: list[str],
+    ptrs: list[int],
+    sizes: list[int],
+    *,
+    on_error: Callable[[list[str], list[int], list[int], list[int]], None],
+) -> None:
+    """Upsert, putting keys that find every segment full again until they fit.
+
+    Mooncake admits a put only into free segment memory, while offload frees
+    memory later, in the background. ``upsert`` returns one status per key;
+    keys answered ``NO_AVAILABLE_HANDLE`` are put again with capped backoff
+    for up to ``PUT_WAIT_S``, with one warning. ``on_error(keys, ptrs, sizes,
+    statuses)`` gets the keys that failed any other way.
+    """
+    deadline = time.monotonic() + PUT_WAIT_S
+    backoff = _FIRST_BACKOFF_S
+    while True:
+        results = upsert(keys, ptrs, sizes)
+        if not isinstance(results, (list, tuple)) or len(results) != len(keys):
+            raise RuntimeError(
+                f"batch_upsert_from returned {results!r} for {len(keys)} keys"
+            )
+        failed = [i for i, r in enumerate(results) if r not in (0, NO_AVAILABLE_HANDLE)]
+        if failed:
+            on_error(*_pick((keys, ptrs, sizes, results), failed))
+        full = [i for i, r in enumerate(results) if r == NO_AVAILABLE_HANDLE]
+        if not full:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Mooncake memory stayed full for {PUT_WAIT_S:.0f} s with SSD "
+                f"offload on; {len(full)} key(s) not stored, e.g. "
+                f"{keys[full[0]]!r}. Offload is not freeing memory: check the "
+                "disk under data_plane.mooncake_cpu.ssd_offload.path and the "
+                "mooncake_master log."
+            )
+        if backoff == _FIRST_BACKOFF_S:
+            LOGGER.warning(
+                "Mooncake memory is full; %d key(s) (e.g. %r) waiting for SSD "
+                "offload to free memory (up to %.0f s).",
+                len(full),
+                keys[full[0]],
+                PUT_WAIT_S,
+            )
+        keys, ptrs, sizes = _pick((keys, ptrs, sizes), full)
+        time.sleep(backoff)
+        backoff = min(PUT_BACKOFF_MAX_S, 2 * backoff)
+
+
+def _pick(columns: tuple[list[Any], ...], indexes: list[int]) -> list[list[Any]]:
+    return [[column[i] for i in indexes] for column in columns]
 
 
 def remove_dir() -> None:

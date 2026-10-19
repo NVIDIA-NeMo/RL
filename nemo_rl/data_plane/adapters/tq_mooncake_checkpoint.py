@@ -57,7 +57,6 @@ import json
 import mmap
 import os
 import pickle
-import time
 import uuid
 from collections.abc import Mapping
 from contextlib import ExitStack, closing, contextmanager
@@ -68,6 +67,8 @@ from typing import Any, Iterator, cast
 import ray
 import torch
 
+from nemo_rl.data_plane.adapters.mooncake_ssd_offload import upsert_waiting_for_memory
+
 _STORAGE_DIR = "mooncake_storage"
 _MANIFEST_FILE = "manifest.json"
 # Per Ray wait, not a whole-checkpoint deadline; match TQ Simple's default.
@@ -75,12 +76,6 @@ _DEFAULT_TIMEOUT_S = 200.0
 _BATCH_KEYS = 400  # Match TQ's native Mooncake batch limit.
 _BATCH_BYTES = 64 * 1024 * 1024
 _BUFFER_ALIGNMENT = 256  # Match TQ's native transfer-buffer alignment.
-# With SSD offload, a full segment frees memory once eviction has written older
-# objects to SSD, which the master does in later cycles. Restore retries an
-# upsert that found no space this many times, backing off up to 1 s each.
-_NO_AVAILABLE_HANDLE = -200
-_RESTORE_FULL_RETRIES = 120
-_RESTORE_BACKOFF_MAX_S = 1.0
 
 # An mmap must outlive its Mooncake registration. On registration errors or a
 # failed unregister, retain it until process teardown instead of
@@ -1011,27 +1006,17 @@ class _CheckpointParticipant:
         self, keys: list[str], pointers: list[int], sizes: list[int], config: Any
     ) -> None:
         """Upsert one batch; with SSD offload, wait out a full segment."""
-        pending = list(range(len(keys)))
-        for attempt in range(_RESTORE_FULL_RETRIES + 1):
-            results = self._store.batch_upsert_from(
-                [keys[i] for i in pending],
-                [pointers[i] for i in pending],
-                [sizes[i] for i in pending],
-                config,
-            )
-            full = (
-                []
-                if self._pinned
-                or not isinstance(results, (list, tuple))
-                or len(results) != len(pending)
-                or any(r not in (0, _NO_AVAILABLE_HANDLE) for r in results)
-                else [i for i, r in zip(pending, results) if r == _NO_AVAILABLE_HANDLE]
-            )
-            if not full or attempt == _RESTORE_FULL_RETRIES:
-                _check_batch_results(results, [0] * len(pending), operation="restore")
-                return
-            pending = full
-            time.sleep(min(_RESTORE_BACKOFF_MAX_S, 0.05 * 2**attempt))
+
+        def upsert(k: list[str], p: list[int], s: list[int]) -> Any:
+            return self._store.batch_upsert_from(k, p, s, config)
+
+        def check(k: list[str], p: list[int], s: list[int], results: Any) -> None:
+            _check_batch_results(results, [0] * len(k), operation="restore")
+
+        if self._pinned:  # hard-pinned memory never frees itself
+            check(keys, pointers, sizes, upsert(keys, pointers, sizes))
+        else:
+            upsert_waiting_for_memory(upsert, keys, pointers, sizes, on_error=check)
 
     def _load_shards(self, body: Mapping[str, Any]) -> dict[str, Any]:
         root = self._checkpoint_root(body)
