@@ -30,6 +30,7 @@ from pydantic import TypeAdapter, ValidationError
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     CustomSamplerConfig,
+    DropAccountingSampler,
     InOrderSampler,
     InOrderSamplerConfig,
     PromptGroupSampler,
@@ -120,6 +121,72 @@ class TestBuiltinsImplementInterface:
     def test_isinstance_protocol(self, sampler):
         assert isinstance(sampler, PromptGroupSampler)
         assert isinstance(sampler, TransactionalAdmissionSampler)
+
+
+class TestDropAccounting:
+    """What each built-in says losing a prompt group for good costs."""
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            WindowedSampler(FakeBuffer(), max_staleness_versions=1),
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+            InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
+        ],
+        ids=["windowed", "ready_first", "weight_fifo", "in_order"],
+    )
+    def test_builtins_implement_the_optional_protocol(self, sampler):
+        assert isinstance(sampler, DropAccountingSampler)
+
+    def test_a_sampler_without_the_members_is_not_an_instance(self):
+        assert not isinstance(object(), DropAccountingSampler)
+
+    def test_in_order_charges_the_stamped_step_and_uses_the_pool(self):
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=3, assembling_version=7
+        )
+        assert charged == 3
+        assert sampler.uses_replacement_pool is True
+        assert sampler.closes_short_at_exhaustion is False
+
+    @pytest.mark.parametrize(
+        "sampler",
+        [
+            ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
+            WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
+        ],
+        ids=["ready_first", "weight_fifo"],
+    )
+    def test_gated_samplers_charge_the_step_being_assembled(self, sampler):
+        unstamped = sampler.charge_step_for_lost_group(
+            target_step=None, assembling_version=7
+        )
+        assert unstamped == 7
+        assert sampler.uses_replacement_pool is True
+        assert sampler.closes_short_at_exhaustion is False
+
+    def test_windowed_charges_nothing_and_closes_short_at_the_end(self):
+        sampler = WindowedSampler(FakeBuffer(), max_staleness_versions=1)
+        assert (
+            sampler.charge_step_for_lost_group(target_step=None, assembling_version=7)
+            is None
+        )
+        assert (
+            sampler.charge_step_for_lost_group(target_step=3, assembling_version=7)
+            is None
+        )
+        assert sampler.uses_replacement_pool is False
+        assert sampler.closes_short_at_exhaustion is True
+
+    def test_a_custom_subclass_of_a_builtin_keeps_that_policy(self):
+        sampler = EchoSampler(FakeBuffer(), max_lookahead_versions=1)
+        assert isinstance(sampler, DropAccountingSampler)
+        charged = sampler.charge_step_for_lost_group(
+            target_step=2, assembling_version=9
+        )
+        assert charged == 2
 
 
 class TestAdmission:
