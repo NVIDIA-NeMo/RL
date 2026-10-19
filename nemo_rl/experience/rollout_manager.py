@@ -1234,6 +1234,28 @@ class AsyncNemoGymRolloutImpl:
 
         return env_timing_metrics
 
+    @staticmethod
+    def _retire_unreturned_ledgers(
+        nemo_gym_env: Any, inputs: list[dict], results: list[Optional[dict]]
+    ) -> None:
+        """Queue the capture ledgers of rows that returned no result.
+
+        The call is not awaited, because this runs while a failure or cancellation unwinds.
+        The actor batches the request with its own retirements and retries it.
+        """
+        rollout_ids = [
+            row["_ng_rollout_id"]
+            for row in inputs
+            if "_ng_rollout_id" in row and results[row["_rowidx"]] is None
+        ]
+        if not rollout_ids:
+            return
+        try:
+            nemo_gym_env.retire_rollout_ledgers.remote(rollout_ids)
+        except ray.exceptions.RayError as error:
+            # Never replace the exception that is unwinding the dispatch.
+            print(f"could not queue capture ledger retirement: {error}", flush=True)
+
     async def _run_rollouts(
         self,
         inputs: list[dict],
@@ -1298,65 +1320,77 @@ class AsyncNemoGymRolloutImpl:
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
-            async with _Deadline(
-                self._timeouts.rollout_s,
-                "NeMo-Gym prompt group",
-                registry=self._deadline_registry,
-            ):
-                for attempt in range(1, max_row_attempts + 1):
-                    pending = [row for row in inputs if results[row["_rowidx"]] is None]
-                    if not pending:
-                        break
-                    if attempt > 1:
-                        print(
-                            f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
-                            f"row(s) (attempt {attempt}/{max_row_attempts})",
-                            flush=True,
-                        )
-                        # Row re-dispatches are invisible in redispatch_total -- they
-                        # recover a partial group instead of retrying the prompt -- so
-                        # gym could retry rows all run with every counter flat.
-                        if self._stats is not None:
-                            self._stats.record_gym_row_redispatch(len(pending))
-                    try:
-                        timing_metrics = await self._stream_rows(
-                            nemo_gym_env,
-                            pending,
-                            results,
-                            shaping_by_rowidx,
-                            total_rows,
-                            instance_timer_prefix,
-                            on_completion=on_completion,
-                        )
-                    except Exception as error:
-                        last_error = error
-                        # Only transport-shaped failures are worth another dispatch; a
-                        # prompt NeMo-Gym cannot serve fails the same way every time.
-                        if (
-                            classify_rollout_failure(error) is not FailureClass.INFRA
-                            or attempt == max_row_attempts
-                        ):
-                            error.add_note(
-                                f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
+            try:
+                async with _Deadline(
+                    self._timeouts.rollout_s,
+                    "NeMo-Gym prompt group",
+                    registry=self._deadline_registry,
+                ):
+                    for attempt in range(1, max_row_attempts + 1):
+                        pending = [
+                            row for row in inputs if results[row["_rowidx"]] is None
+                        ]
+                        if not pending:
+                            break
+                        if attempt > 1:
+                            print(
+                                f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
+                                f"row(s) (attempt {attempt}/{max_row_attempts})",
+                                flush=True,
                             )
-                            raise
-                    else:
-                        if timing_metrics is not None:
-                            env_timing_metrics = timing_metrics
+                            # Row re-dispatches are invisible in redispatch_total -- they
+                            # recover a partial group instead of retrying the prompt -- so
+                            # gym could retry rows all run with every counter flat.
+                            if self._stats is not None:
+                                self._stats.record_gym_row_redispatch(len(pending))
+                        try:
+                            timing_metrics = await self._stream_rows(
+                                nemo_gym_env,
+                                pending,
+                                results,
+                                shaping_by_rowidx,
+                                total_rows,
+                                instance_timer_prefix,
+                                on_completion=on_completion,
+                            )
+                        except Exception as error:
+                            last_error = error
+                            # Only transport-shaped failures are worth another dispatch; a
+                            # prompt NeMo-Gym cannot serve fails the same way every time.
+                            if (
+                                classify_rollout_failure(error)
+                                is not FailureClass.INFRA
+                                or attempt == max_row_attempts
+                            ):
+                                error.add_note(
+                                    f"NeMo-Gym instance '{instance_label}' failed during rollout collection"
+                                )
+                                raise
+                        else:
+                            if timing_metrics is not None:
+                                env_timing_metrics = timing_metrics
 
-            missing = [index for index in expected_indices if results[index] is None]
-            if missing:
-                failure = GymTransportError(
-                    f"NeMo-Gym instance '{instance_label}' rollout stream ended "
-                    "before all rows arrived; missing "
-                    f"rows {missing} of {total_rows} after "
-                    f"{max_row_attempts} attempt(s)"
-                )
-                # Narrowed before the raise: pyrefly rejects an Optional in a `from`
-                # clause, even though `raise ... from None` is legal at runtime.
-                if last_error is None:
-                    raise failure
-                raise failure from last_error
+                missing = [
+                    index for index in expected_indices if results[index] is None
+                ]
+                if missing:
+                    failure = GymTransportError(
+                        f"NeMo-Gym instance '{instance_label}' rollout stream ended "
+                        "before all rows arrived; missing "
+                        f"rows {missing} of {total_rows} after "
+                        f"{max_row_attempts} attempt(s)"
+                    )
+                    # Narrowed before the raise: pyrefly rejects an Optional in a `from`
+                    # clause, even though `raise ... from None` is legal at runtime.
+                    if last_error is None:
+                        raise failure
+                    raise failure from last_error
+            except BaseException:
+                # NeMo RL will never read these rows' manifests.
+                # Retire them on the actor that ran them, whose model server holds the ledgers.
+                # Rows with a result were retired when their manifest was read.
+                self._retire_unreturned_ledgers(nemo_gym_env, inputs, results)
+                raise
 
             completed_results = [result for result in results if result is not None]
             completed_shaping = [
@@ -2467,8 +2501,7 @@ class RolloutManager:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
             # run end (there is no prefix-clear primitive in the data plane
-            # yet). Their ledger files are inert — failure rows or missing
-            # terminal rows keep any later read fail-closed.
+            # yet). AsyncNemoGymRolloutImpl retires their capture ledgers.
             self._tq_buffer.abort(group_id)
             async with self._recovery_mutation() as cut:
                 # Intentional staleness aborts discard the ledger owner before
@@ -2476,9 +2509,6 @@ class RolloutManager:
                 # than replacing it with "unknown group" during cleanup.
                 if group_id in self._recovery_ledger:
                     self._recovery_ledger.abandon_unsealed(cut, group_id)
-            # The capture ledger has no per-rollout fail endpoint. Rows from
-            # abandoned attempts are unreferenced and are swept with the
-            # staging partition at run teardown.
             raise
 
     async def discard_recovery_group(
