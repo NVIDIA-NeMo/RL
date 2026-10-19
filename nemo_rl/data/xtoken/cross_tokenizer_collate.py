@@ -63,8 +63,9 @@ class CrossTokenizerCollatorConfig(BaseModel, extra="allow"):
         include_thinking_in_loss: Include reasoning text and its closing marker
             in assistant supervision, excluding the opening scaffold. Separate
             ``reasoning_content`` fields require native thinking alignment;
-            ordinary chat supports inline ``<think>`` content. Only the final
-            assistant turn is supervised; earlier turns remain context.
+            ordinary chat supports inline ``<think>`` content only when the
+            template renders content verbatim. Only the final assistant turn
+            is supervised; earlier turns remain context.
         native_thinking_alignment: Align reasoning, close, answer/tool and EOT
             independently on supported Qwen/Nano ChatML templates.
             Requires chat mode and thinking loss.
