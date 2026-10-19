@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Automodel checkpoint utilities for DTensor policy workers.
+"""Automodel checkpoint utilities for the policy workers.
 
 This module provides a wrapper class around the nemo_automodel Checkpointer
-for saving and loading model checkpoints in DTensor-based policy workers.
+for saving and loading model checkpoints in Automodel policy workers.
 """
 
 import logging
@@ -69,10 +69,10 @@ def build_checkpoint_config(
     is_async: bool,
     skip_task_head_prefixes_for_base_model: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Build the Automodel checkpoint config for a DTensor v2 worker.
+    """Build the Automodel checkpoint config for a worker.
 
     Read NeMo-RL settings from the YAML-backed checkpoint block and forward
-    them to Automodel. This integration boundary is shared by the two DTensor
+    them to Automodel. This integration boundary is shared by the two Automodel
     v2 workers; defaults belong in the exemplar configs.
 
     Args:
@@ -100,7 +100,7 @@ def build_checkpoint_config(
     if model_save_format not in ("torch_save", "safetensors"):
         raise ValueError(
             "automodel_cfg.checkpoint.model_save_format must be 'torch_save' or "
-            "'safetensors' when using DTensor v2."
+            "'safetensors' when using Automodel."
         )
 
     checkpoint_config = {
@@ -189,7 +189,7 @@ except Exception as e:  # pragma: no cover - defensive: never break import
 
 
 class AutomodelCheckpointManager:
-    """Manages checkpointing for DTensor-based models using nemo_automodel's Checkpointer.
+    """Manages checkpointing for Automodel models using nemo_automodel's Checkpointer.
 
     This class provides a clean interface for saving and loading model checkpoints,
     wrapping the nemo_automodel Checkpointer with configuration management.
@@ -454,37 +454,55 @@ class AutomodelCheckpointManager:
 
         # load optimizer
         if optimizer_path and optimizer is not None:
-            if getattr(optimizer, "master_weights", False):
-                # Check the on-disk dtype before DCP copies into current buffers:
-                # legacy FP32 masters must not be cast into BF16 int16 remainders.
-                metadata = dcp.FileSystemReader(
-                    os.path.join(optimizer_path, "optim")
-                ).read_metadata()
-                optimizer_state = OptimizerState(
-                    model,
-                    optimizer,
-                    is_peft=self.checkpointer.config.is_peft,
-                    has_expert_parallelism=self.moe_mesh is not None,
-                )
-                expected_state, _ = flatten_state_dict(optimizer_state.state_dict())
-                for key, value in expected_state.items():
-                    if not key.endswith(".master_param"):
-                        continue
-                    saved = metadata.state_dict_metadata.get(key)
-                    if saved is not None and saved.properties.dtype != value.dtype:
-                        raise ValueError(
-                            f"Cannot resume optimizer master weights: {key} has "
-                            f"checkpoint dtype {saved.properties.dtype}, but the "
-                            f"current optimizer expects {value.dtype}. "
-                            "Check policy.precision and policy.optimizer.kwargs "
-                            "(especially store_param_remainders and master_weight_dtype) "
-                            "against the configuration and code used to save the checkpoint, "
-                            "or start a fresh run without restoring optimizer state."
-                        )
-                del expected_state, optimizer_state
+            self.check_master_weight_dtypes(model, optimizer, optimizer_path)
             self.checkpointer.load_optimizer(
                 optimizer=optimizer,
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
             )
+
+    def check_master_weight_dtypes(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        optimizer_path: str,
+    ) -> None:
+        """Hard-error if a resumed optimizer's on-disk master dtype has drifted.
+
+        Must run before ``checkpointer.load_optimizer``: legacy FP32 masters
+        must not be silently cast into BF16 int16 remainders (or vice versa)
+        just because ``store_param_remainders``/``master_weight_dtype``
+        changed between save and resume.
+        """
+        if not getattr(optimizer, "master_weights", False):
+            return
+        assert self.checkpointer is not None, (
+            "Checkpointer must be initialized before loading checkpoint. "
+            "Call init_checkpointer() first."
+        )
+        # Check the on-disk dtype before DCP copies into current buffers.
+        metadata = dcp.FileSystemReader(
+            os.path.join(optimizer_path, "optim")
+        ).read_metadata()
+        optimizer_state = OptimizerState(
+            model,
+            optimizer,
+            is_peft=self.checkpointer.config.is_peft,
+            has_expert_parallelism=self.moe_mesh is not None,
+        )
+        expected_state, _ = flatten_state_dict(optimizer_state.state_dict())
+        for key, value in expected_state.items():
+            if not key.endswith(".master_param"):
+                continue
+            saved = metadata.state_dict_metadata.get(key)
+            if saved is not None and saved.properties.dtype != value.dtype:
+                raise ValueError(
+                    f"Cannot resume optimizer master weights: {key} has "
+                    f"checkpoint dtype {saved.properties.dtype}, but the "
+                    f"current optimizer expects {value.dtype}. "
+                    "Check policy.precision and policy.optimizer.kwargs "
+                    "(especially store_param_remainders and master_weight_dtype) "
+                    "against the configuration and code used to save the checkpoint, "
+                    "or start a fresh run without restoring optimizer state."
+                )

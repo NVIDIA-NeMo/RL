@@ -39,9 +39,9 @@
 <summary>Previous News</summary>
 
 * [02/04/2026] LoRA Support
-    * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
-    * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
-    * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
+    * LoRA SFT is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
+    * LoRA GRPO is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
+    * LoRA DPO is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
         * [sft-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml)
@@ -92,7 +92,7 @@ Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/ma
 ### Training Backends
 NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
 
-- **DTensor** - PyTorch's next-generation distributed training with improved memory efficiency (PyTorch-native TP, SP, PP, CP, and FSDP2).
+- [**Automodel**](https://github.com/NVIDIA-NeMo/Automodel) - Accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, CP, EP, and FSDP2).
 - [**Megatron**](https://github.com/NVIDIA-NeMo/Megatron-Bridge) - NVIDIA's high-performance training framework for scaling to large models with 6D parallelisms.
 
 The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
@@ -127,11 +127,11 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
+- ✅ **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, and EP for efficient training (through NeMo AutoModel).
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
-- ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
+- ✅ **Sequence Packing** - Sequence packing in both Automodel and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **Hugging Face Integration** - OOB support in the DTensor path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
+- ✅ **Hugging Face Integration** - OOB support in the Automodel path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
 - ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
@@ -159,8 +159,6 @@ For detailed information on backend selection, configuration, and examples, see 
     <p></p>
 
   - [Evaluation](#evaluation)
-    - [Convert Model Format (Optional)](#convert-model-format-optional)
-    - [Run Evaluation](#run-evaluation)
   - [Set Up Clusters](#set-up-clusters)
   - [Tips and Tricks](#tips-and-tricks)
   - [Citation](#citation)
@@ -203,7 +201,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ### Bare-Metal Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
+Use this quick start to get going with either the Automodel or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -213,7 +211,7 @@ For more examples and setup details, continue to the [Prerequisites](#prerequisi
 <table style="border-collapse:collapse; width:100%; table-layout:fixed;">
   <thead>
     <tr>
-      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Native PyTorch (DTensor)</th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Automodel</th>
       <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Megatron Core</th>
     </tr>
   </thead>
@@ -229,7 +227,7 @@ uv venv</code></pre>
     </tr>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <strong>Run GRPO (DTensor)</strong>
+        <strong>Run GRPO (Automodel)</strong>
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py</code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
@@ -352,7 +350,7 @@ uv run python examples/run_grpo.py \
   logger.num_val_samples_to_print=10
 ```
 
-The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+The default configuration uses the Automodel training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
 
 To train using this config on a single GPU:
 
@@ -432,7 +430,7 @@ NeMo RL supports two distillation recipes:
 | Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
 |---|---|---|---|---|---|---|
 | MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
-| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | Automodel |
 
 ## On-policy Distillation
 
@@ -494,7 +492,7 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 ```
 
 > [!NOTE]
-> X-token distillation runs on the DTensor backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
+> X-token distillation runs on the Automodel backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
 
 ### X-Token Off-Policy Distillation Single Node
 
@@ -695,70 +693,21 @@ sbatch \
 
 ## Evaluation
 
-We provide evaluation tools to assess model capabilities.
+For general model and agent evaluation, use [NeMo Gym](https://docs.nvidia.com/nemo/gym/). NeMo Gym supports repeatable benchmarks and custom evaluations with environments that can also produce rollouts and rewards for RL training. Follow the [evaluation overview](docs/about/evaluation.md) to choose a benchmark, run it against a model, and analyze the results.
 
-### Convert Model Format (Optional)
-
-If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
+NeMo RL also includes a convenient [built-in evaluator](examples/run_eval.py) for quickly checking a Hugging Face-format checkpoint against a selection of bundled benchmarks. It runs vLLM directly from the NeMo RL configuration, making it useful for quick checks within an existing NeMo RL setup. For broader benchmark coverage and custom evaluations, use NeMo Gym.
 
 ```sh
-# Example for a GRPO checkpoint at step 170
-uv run python examples/converters/convert_dcp_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
-    --hf-ckpt-path results/grpo/hf
+uv run python examples/run_eval.py generation.model_name=/path/to/hugging-face-checkpoint
 ```
 
-If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires Megatron Core, so make sure you launch with the mcore extra:
+If the checkpoint is not in Hugging Face format, convert it first:
 
-```sh
-# Example for a GRPO checkpoint at step 170
-uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --megatron-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
-    --hf-ckpt-path results/grpo/hf
-```
+- [Automodel DCP checkpoints](docs/design-docs/checkpointing.md#converting-torch-distributed-checkpoints-to-hugging-face-format)
+- [Megatron checkpoints](docs/design-docs/checkpointing.md#converting-megatron-checkpoints-to-hugging-face-format)
+- [Megatron LoRA adapter checkpoints](docs/design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format)
 
-If you trained with **LoRA on the Megatron backend**, use the LoRA merger to fold the adapter weights into the base model and export a standalone Hugging Face checkpoint:
-
-```sh
-uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
-    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
-    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
-    --hf-model-name <huggingface_model_name> \
-    --hf-ckpt-path results/lora_merged_hf
-```
-
-> **Note:** Adjust the paths according to your training output directory structure.
-
-For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](docs/design-docs/checkpointing.md).
-
-### Run Evaluation
-
-Run the evaluation script with the converted model:
-
-```sh
-uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
-```
-
-Run the evaluation script with custom settings:
-
-```sh
-# Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
-#          Pass@1 accuracy averaged over 16 samples for each problem
-uv run python examples/run_eval.py \
-    --config examples/configs/evals/math_eval.yaml \
-    generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
-    generation.temperature=0.6 \
-    generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=math500 \
-    eval.num_tests_per_prompt=16 \
-    cluster.gpus_per_node=8
-```
-> **Note:** Evaluation results may vary slightly due to various factors, such as sampling parameters, random seed, inference engine version, and inference engine settings.
-
-Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](docs/guides/eval.md).
+See `examples/configs/evals/eval.yaml` for the available configuration options.
 
 ## Set Up Clusters
 

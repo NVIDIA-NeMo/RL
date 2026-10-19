@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import datetime
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -3241,59 +3242,61 @@ class TestValidateDtypeConfig:
         assert "optimizer" in str(exc_info.value).lower()
 
 
+def _megatron_config(**megatron_overrides: Any) -> dict[str, Any]:
+    megatron_cfg = {
+        "optimizer": {"use_distributed_optimizer": False},
+        "scheduler": {},
+        "distributed_data_parallel_config": {
+            "overlap_param_gather": False,
+            "grad_reduce_in_fp32": False,
+            "overlap_grad_reduce": False,
+            "data_parallel_sharding_strategy": "no_shard",
+        },
+        "train_iters": 10,
+    }
+    megatron_cfg.update(megatron_overrides)
+    return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+
+def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
+    """Return the dist config _create_megatron_config hands to ConfigContainer.
+
+    The container and sibling sub-config builders are patched so only the
+    DistributedInitConfig branch is exercised; DistributedInitConfig itself
+    stays real so the asserted attribute reflects actual behavior.
+    """
+    # Megatron is optional outside the mcore test lane.
+    from nemo_rl.models.megatron.setup import _create_megatron_config
+
+    with (
+        patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+        patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+        patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+        patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+        patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+        patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+        patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+    ):
+        _create_megatron_config(
+            model_cfg=MagicMock(),
+            checkpoint_config=MagicMock(),
+            config=config,
+            hf_model_name="test-model",
+            dtype=torch.bfloat16,
+        )
+
+    return mock_container.call_args.kwargs["dist"]
+
+
 @pytest.mark.mcore
 class TestCreateMegatronConfigGlooProcessGroups:
     """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
 
-    @staticmethod
-    def _config(**megatron_overrides):
-        megatron_cfg = {
-            "optimizer": {"use_distributed_optimizer": False},
-            "scheduler": {},
-            "distributed_data_parallel_config": {
-                "overlap_param_gather": False,
-                "grad_reduce_in_fp32": False,
-                "overlap_grad_reduce": False,
-                "data_parallel_sharding_strategy": "no_shard",
-            },
-            "train_iters": 10,
-        }
-        megatron_cfg.update(megatron_overrides)
-        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
-
-    def _dist_config_passed_to_container(self, config):
-        """Return the dist config _create_megatron_config hands to ConfigContainer.
-
-        The container and sibling sub-config builders are patched so only the
-        DistributedInitConfig branch is exercised; DistributedInitConfig itself
-        stays real so the asserted attribute reflects actual behavior.
-        """
-        from nemo_rl.models.megatron.setup import _create_megatron_config
-
-        with (
-            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
-            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
-            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
-            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
-            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
-            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
-            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
-        ):
-            _create_megatron_config(
-                model_cfg=MagicMock(),
-                checkpoint_config=MagicMock(),
-                config=config,
-                hf_model_name="test-model",
-                dtype=torch.bfloat16,
-            )
-
-        return mock_container.call_args.kwargs["dist"]
-
     @pytest.mark.parametrize("value", [True, False])
     def test_explicit_value_is_forwarded(self, value):
         """An explicit use_gloo_process_groups is applied to the dist config."""
-        dist_config = self._dist_config_passed_to_container(
-            self._config(use_gloo_process_groups=value)
+        dist_config = _dist_config_passed_to_container(
+            _megatron_config(use_gloo_process_groups=value)
         )
 
         assert dist_config.use_gloo_process_groups is value
@@ -3302,12 +3305,144 @@ class TestCreateMegatronConfigGlooProcessGroups:
         """Omitting the key leaves the Megatron Bridge default untouched."""
         from megatron.bridge.training.config import DistributedInitConfig
 
-        dist_config = self._dist_config_passed_to_container(self._config())
+        dist_config = _dist_config_passed_to_container(_megatron_config())
 
         assert (
             dist_config.use_gloo_process_groups
             == DistributedInitConfig().use_gloo_process_groups
         )
+
+
+@pytest.mark.mcore
+class TestDistributedTimeoutMinutes:
+    """distributed_timeout_minutes reaches the default and model-parallel groups."""
+
+    @staticmethod
+    def _init_process_group_call(megatron_cfg):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        with (
+            patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+            patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+            patch("torch.distributed.init_process_group") as mock_init,
+        ):
+            setup_distributed({"megatron_cfg": megatron_cfg, "generation": None})
+
+        mock_init.assert_called_once()
+        return mock_init.call_args
+
+    @pytest.mark.parametrize("minutes", [30, 0.5])
+    def test_setup_distributed_forwards_timeout(self, minutes):
+        call_args = self._init_process_group_call(
+            {"distributed_timeout_minutes": minutes}
+        )
+
+        assert call_args.args == ("nccl",)
+        assert call_args.kwargs == {"timeout": datetime.timedelta(minutes=minutes)}
+
+    @pytest.mark.parametrize(
+        "megatron_cfg", [{}, {"distributed_timeout_minutes": None}]
+    )
+    def test_setup_distributed_unset_keeps_torch_default(self, megatron_cfg):
+        call_args = self._init_process_group_call(megatron_cfg)
+
+        assert call_args.args == ("nccl",)
+        assert call_args.kwargs == {}
+
+    @pytest.mark.parametrize("minutes", [0, -5])
+    def test_non_positive_timeout_is_rejected(self, minutes):
+        with pytest.raises(
+            ValueError,
+            match=r"^megatron_cfg\.distributed_timeout_minutes must be positive",
+        ):
+            self._init_process_group_call({"distributed_timeout_minutes": minutes})
+
+    def test_missing_megatron_config_is_rejected(self) -> None:
+        # Megatron is optional outside the mcore test lane.
+        from nemo_rl.models.megatron.setup import _distributed_timeout_minutes
+
+        with pytest.raises(KeyError, match="megatron_cfg"):
+            _distributed_timeout_minutes({})
+
+    @pytest.mark.parametrize("minutes", [30, 0.5])
+    def test_forwarded_to_bridge_dist_config(self, minutes):
+        cfg = _megatron_config(distributed_timeout_minutes=minutes)
+        dist_config = _dist_config_passed_to_container(cfg)
+
+        assert dist_config.distributed_timeout_minutes == minutes
+
+    @pytest.mark.parametrize("overrides", [{}, {"distributed_timeout_minutes": None}])
+    def test_unset_defers_to_bridge_default(self, overrides):
+        # Megatron is optional outside the mcore test lane.
+        from megatron.bridge.training.config import DistributedInitConfig
+
+        cfg = _megatron_config(**overrides)
+        dist_config = _dist_config_passed_to_container(cfg)
+
+        assert (
+            dist_config.distributed_timeout_minutes
+            == DistributedInitConfig().distributed_timeout_minutes
+        )
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("worker_kind", ["policy", "value"])
+class TestReplicaGroupTimeout:
+    """Both workers apply the timeout to every replica group they create."""
+
+    @pytest.mark.parametrize(
+        "megatron_cfg, expected_timeout",
+        [
+            ({"distributed_timeout_minutes": 30}, datetime.timedelta(minutes=30)),
+            ({"distributed_timeout_minutes": 0.5}, datetime.timedelta(seconds=30)),
+            ({}, None),
+            ({"distributed_timeout_minutes": None}, None),
+        ],
+    )
+    def test_timeout_and_cached_group(
+        self,
+        worker_kind: str,
+        megatron_cfg: dict[str, Any],
+        expected_timeout: datetime.timedelta | None,
+    ) -> None:
+        # Worker imports require the optional Megatron/TransformerEngine stack.
+        from megatron.core import parallel_state
+
+        if worker_kind == "policy":
+            from nemo_rl.models.policy.workers.megatron_policy_worker import (
+                MegatronPolicyWorkerImpl,
+            )
+
+            get_replica_group = MegatronPolicyWorkerImpl._get_replica_group
+        else:
+            from nemo_rl.models.value.workers.megatron_value_worker import (
+                MegatronValueWorkerImpl,
+            )
+
+            get_replica_group = MegatronValueWorkerImpl._get_replica_group
+
+        worker = SimpleNamespace(cfg={"megatron_cfg": megatron_cfg})
+        # Two replicas ensure the timeout reaches all collectively created groups,
+        # including the group to which this rank does not belong.
+        dp_ranks = torch.tensor([0, 0, 1, 1])
+        groups = [MagicMock(), MagicMock()]
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=4),
+            patch("torch.distributed.get_rank", return_value=2),
+            patch.object(parallel_state, "get_data_parallel_rank", return_value=1),
+            patch("torch.full", return_value=dp_ranks),
+            patch("torch.distributed.all_reduce") as mock_reduce,
+            patch("torch.distributed.new_group", side_effect=groups) as mock_group,
+        ):
+            assert get_replica_group(worker) is groups[1]
+            assert get_replica_group(worker) is groups[1]
+
+        assert mock_group.call_args_list == [
+            call(ranks=[0, 1], backend="nccl", timeout=expected_timeout),
+            call(ranks=[2, 3], backend="nccl", timeout=expected_timeout),
+        ]
+        mock_reduce.assert_called_once()
 
 
 @pytest.mark.mcore
