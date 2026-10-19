@@ -177,8 +177,8 @@ export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 # Keep the first async comparison on the same four-task causal-gate manifest as
 # sync v19. Eight prompt groups draw repeated rows from that unchanged set.
 export TRAIN_LIMIT=${TRAIN_LIMIT:-4}
-export SAVE_PERIOD=${SAVE_PERIOD:-1}
-export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-2}
+export SAVE_PERIOD=${SAVE_PERIOD:-20}
+export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-0}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-normal}
 export SLURM_TIME_LIMIT=${SLURM_TIME_LIMIT:-24:00:00}

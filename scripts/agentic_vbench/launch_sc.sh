@@ -159,7 +159,9 @@ fi
 # or Slurm/checkpoint boundary; this must not become a one-step smoke cap.
 max_steps="${MAX_STEPS:-1000000}"
 save_period="${SAVE_PERIOD:-10}"
-checkpoint_keep_top_k="${CHECKPOINT_KEEP_TOP_K:-2}"
+checkpoint_keep_top_k="${CHECKPOINT_KEEP_TOP_K:-0}"
+checkpoint_ft_save_period="${CHECKPOINT_FT_SAVE_PERIOD:-10}"
+checkpoint_ft_keep_latest_k="${CHECKPOINT_FT_KEEP_LATEST_K:-5}"
 train_global_batch_size=$((num_prompts * num_generations))
 num_storage_units="${TQ_NUM_STORAGE_UNITS:-$((2 * num_nodes))}"
 
@@ -347,7 +349,8 @@ python3 - \
   "${num_nodes}" "${num_gen_nodes}" "${gpus_per_node}" "${segment_size}" \
   "${num_prompts}" "${num_generations}" "${generation_tensor_parallel_size}" \
   "${max_steps}" "${save_period}" \
-  "${checkpoint_keep_top_k}" "${context_compaction}" \
+  "${checkpoint_keep_top_k}" "${checkpoint_ft_save_period}" \
+  "${checkpoint_ft_keep_latest_k}" "${context_compaction}" \
   "${launch_compaction_auto}" "${launch_compaction_prune}" \
   "${launch_subagents}" "${launch_training_mode}" "${wandb_project}" \
   "${wandb_run_id}" "${wandb_run_name}" "${wandb_cluster_name}" \
@@ -392,6 +395,8 @@ from pathlib import Path
     max_num_steps,
     save_period,
     keep_top_k,
+    ft_save_period,
+    ft_keep_latest_k,
     context_compaction,
     opencode_compaction_auto,
     opencode_compaction_prune,
@@ -489,6 +494,8 @@ payload = {
     "max_num_epochs": None,
     "save_period": int(save_period),
     "keep_top_k": None if keep_top_k == "null" else int(keep_top_k),
+    "ft_save_period": int(ft_save_period),
+    "ft_keep_latest_k": int(ft_keep_latest_k),
     "context_compaction": boolean(context_compaction),
     "opencode_compaction_auto": boolean(opencode_compaction_auto),
     "opencode_compaction_prune": boolean(opencode_compaction_prune),
@@ -711,6 +718,8 @@ fi
   policy.train_global_batch_size="${train_global_batch_size}" \
   checkpointing.save_period="${save_period}" \
   checkpointing.keep_top_k="${checkpoint_keep_top_k}" \
+  ++checkpointing.ft_save_period="${checkpoint_ft_save_period}" \
+  ++checkpointing.ft_keep_latest_k="${checkpoint_ft_keep_latest_k}" \
   token_capture.enabled=true \
   token_capture.context_compaction="${context_compaction}" \
   token_capture.capture_dir="${token_capture_dir}" \

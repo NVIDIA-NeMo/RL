@@ -87,7 +87,7 @@ export REQUIRE_RESUMABLE_JOB_CYCLES=true
 # 20-step milestones are periodic checkpoints retained indefinitely; only the
 # two newest non-milestone recovery checkpoints are kept.
 export SAVE_PERIOD=20
-export CHECKPOINT_KEEP_TOP_K=null
+export CHECKPOINT_KEEP_TOP_K=0
 
 # Framework capture stays on for session reconstruction, but neither OpenCode
 # compaction nor pruning rewrites the context in this subagent-only gate.
@@ -142,6 +142,6 @@ export NRL_R3_TRACE_VERIFY_FORWARD=1
 exec bash "$script_dir/debug_subagents_sync_8n.sh" \
   policy.generation.vllm_cfg.tensor_parallel_size="$GENERATION_TENSOR_PARALLEL_SIZE" \
   checkpointing.save_period=20 \
-  checkpointing.keep_top_k=null \
-  +checkpointing.ft_save_period=1 \
-  +checkpointing.ft_keep_latest_k=2
+  checkpointing.keep_top_k=0 \
+  ++checkpointing.ft_save_period=10 \
+  ++checkpointing.ft_keep_latest_k=5

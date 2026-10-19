@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # First production gate for subagent training: 8 nodes, synchronous/in-order
-# rollouts, explicit delegation, and one checkpoint per optimizer update.
+# rollouts, explicit delegation, and full recovery checkpoints every ten updates.
 set -euo pipefail
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -24,12 +24,12 @@ export TRAIN_REPEATS=${TRAIN_REPEATS:-4}
 # verifier rewards in the validated comparison run.  The full assembly set is
 # restored for the longer qualification run after this gate passes.
 export TRAIN_LIMIT=${TRAIN_LIMIT:-4}
-export SAVE_PERIOD=${SAVE_PERIOD:-1}
-export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-2}
+export SAVE_PERIOD=${SAVE_PERIOD:-20}
+export CHECKPOINT_KEEP_TOP_K=${CHECKPOINT_KEEP_TOP_K:-0}
 # Slurm allocations are resumable execution segments, not the GRPO horizon.
 # The old 2 h short-QoS default derived a 1 h 40 min controller deadline and
-# cleanly stopped v19 after step 4.  Use day-long normal-QoS segments; per-step
-# checkpoints plus the serialized array continue the same 1,000,000-step run
+# cleanly stopped v19 after step 4. Use day-long normal-QoS segments; ten-update
+# recovery checkpoints and the array continue the same 1,000,000-step run
 # across allocation boundaries. Six segments fit inside the dedicated 7-day
 # cpu-long task backend while leaving roughly one day of scheduling cushion.
 export JOB_CYCLES=${JOB_CYCLES:-6}

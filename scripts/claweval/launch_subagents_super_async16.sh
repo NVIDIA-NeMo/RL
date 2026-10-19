@@ -94,7 +94,7 @@ export MIN_SLURM_TIME_SECONDS=86400
 export MIN_CHECKPOINT_BUDGET_SECONDS=82800
 export REQUIRE_RESUMABLE_JOB_CYCLES=true
 export SAVE_PERIOD=20
-export CHECKPOINT_KEEP_TOP_K=null
+export CHECKPOINT_KEEP_TOP_K=0
 
 export CONTEXT_COMPACTION=true
 export CLAW_EVAL_COMPACTION_AUTO=false
@@ -132,6 +132,6 @@ export NRL_R3_TRACE_VERIFY_FORWARD=1
 
 exec bash "$script_dir/train_subagents_async_16n.sh" \
   checkpointing.save_period=20 \
-  checkpointing.keep_top_k=null \
-  +checkpointing.ft_save_period=1 \
-  +checkpointing.ft_keep_latest_k=2
+  checkpointing.keep_top_k=0 \
+  ++checkpointing.ft_save_period=10 \
+  ++checkpointing.ft_keep_latest_k=5

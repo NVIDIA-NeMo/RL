@@ -12,6 +12,9 @@ grpo:
 checkpointing:
   save_period: 20
   ft_save_period: 10
+  # Periodic checkpoints share the same latest-five recovery window.
+  keep_top_k: 0
+  ft_keep_latest_k: 5
 
 async_rl:
   sampler:

@@ -76,7 +76,7 @@ export REQUIRE_RESUMABLE_JOB_CYCLES=true
 # Keep exact 20-step milestone donors forever while retaining two recent
 # per-step recovery checkpoints between milestones.
 export SAVE_PERIOD=20
-export CHECKPOINT_KEEP_TOP_K=null
+export CHECKPOINT_KEEP_TOP_K=0
 
 export CLAW_EVAL_SOURCE=/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_omni/users/arushig/claw-eval
 export CLAW_EVAL_ORIGINAL_TASK_ROOT=$CLAW_EVAL_SOURCE/data_generation/runs/kimi_video_scaled_100/generated/tasks
@@ -142,6 +142,6 @@ export NRL_R3_TRACE_VERIFY_FORWARD=1
 exec bash "$script_dir/train_subagents_sync_8n.sh" \
   policy.generation.vllm_cfg.tensor_parallel_size="$GENERATION_TENSOR_PARALLEL_SIZE" \
   checkpointing.save_period=20 \
-  checkpointing.keep_top_k=null \
-  +checkpointing.ft_save_period=1 \
-  +checkpointing.ft_keep_latest_k=2
+  checkpointing.keep_top_k=0 \
+  ++checkpointing.ft_save_period=10 \
+  ++checkpointing.ft_keep_latest_k=5
