@@ -519,27 +519,6 @@ class TQTokenSink:
             attachments=attachments,
         )
 
-    def stage_generation_prefix(
-        self,
-        record: StagedCallRecord,
-        *,
-        checkpoint_id: str,
-        chunk_sequence: int,
-        attachments: Mapping[str, Any] | None = None,
-    ) -> StageResult:
-        """Stage an immutable active-call prefix under a checkpoint-scoped key."""
-        return self._stage_at_key(
-            record,
-            generation_cut_staging_key(
-                checkpoint_id,
-                record.rollout_id,
-                record.model_call_id,
-                chunk_sequence=chunk_sequence,
-            ),
-            attachments=attachments,
-            generation_cut_chunk=True,
-        )
-
     def _stage_at_key(
         self,
         record: StagedCallRecord,
@@ -727,16 +706,16 @@ class TQTokenSink:
         checkpoint_id: str,
         chunk_sequences: Sequence[int],
         attachments: Sequence[Mapping[str, Any] | None] | None = None,
-    ) -> list[StageResult]:
+    ) -> list[str]:
         """Publish compatible prefix rows using as few TQ calls as possible.
 
-        Results preserve input order. Rows with different optional columns or
-        fixed trailing tensor dimensions are written in separate TQ batches;
-        jagged token, identity, route-length, and media-length dimensions are
-        still coalesced by ``stack_or_nest``.
+        Returns the written staging keys in input order. Rows with different
+        optional columns or fixed trailing tensor dimensions are written in
+        separate TQ batches; jagged token, identity, route-length, and
+        media-length dimensions are still coalesced by ``stack_or_nest``.
+        Raises on the first encoding or TQ error; a TQ error first discards
+        every key of the batch, since earlier groups may already be written.
         """
-        from nemo_gym.token_id_capture.staging.records import StageResult
-
         if len(records) != len(chunk_sequences):
             raise ValueError("records and chunk_sequences must have equal lengths")
         if attachments is None:
@@ -754,9 +733,6 @@ class TQTokenSink:
         ]
         if len(set(keys)) != len(keys):
             raise ValueError("generation-prefix batch contains duplicate staging keys")
-        results = [
-            StageResult(ok=False, staging_key=key, error="not written") for key in keys
-        ]
         groups: dict[
             tuple[Any, ...],
             list[tuple[int, dict[str, torch.Tensor], dict[str, Any]]],
@@ -764,25 +740,17 @@ class TQTokenSink:
         for index, (record, row_attachments) in enumerate(
             zip(records, attachments, strict=True)
         ):
-            try:
-                fields, tags = self._encode_record(
-                    record, attachments=row_attachments, generation_cut_chunk=True
-                )
-                signature = tuple(
-                    (name, fields[name].dtype, tuple(fields[name].shape[2:]))
-                    for name in sorted(fields)
-                )
-                groups.setdefault(signature, []).append((index, fields, tags))
-            except Exception as error:  # Encoding failures fail only that row.
-                results[index] = StageResult(
-                    ok=False,
-                    staging_key=keys[index],
-                    error=f"{type(error).__name__}: {error}",
-                )
+            fields, tags = self._encode_record(
+                record, attachments=row_attachments, generation_cut_chunk=True
+            )
+            signature = tuple(
+                (name, fields[name].dtype, tuple(fields[name].shape[2:]))
+                for name in sorted(fields)
+            )
+            groups.setdefault(signature, []).append((index, fields, tags))
 
-        for group in groups.values():
-            indices = [item[0] for item in group]
-            try:
+        try:
+            for group in groups.values():
                 fields = TensorDict(
                     {
                         name: stack_or_nest([item[1][name][0] for item in group])
@@ -791,29 +759,14 @@ class TQTokenSink:
                     batch_size=[len(group)],
                 )
                 self._store.put_many(
-                    [keys[index] for index in indices],
+                    [keys[item[0]] for item in group],
                     fields,
                     tags=[item[2] for item in group],
                 )
-            except Exception as error:  # A transport failure fails the whole group.
-                failed_keys = [keys[index] for index in indices]
-                logging.getLogger(__name__).warning(
-                    "TQ generation-prefix batch failed for %d rows: %s: %s",
-                    len(group),
-                    type(error).__name__,
-                    error,
-                )
-                self._discard_failed_writes(failed_keys)
-                for index in indices:
-                    results[index] = StageResult(
-                        ok=False,
-                        staging_key=keys[index],
-                        error=f"{type(error).__name__}: {error}",
-                    )
-            else:
-                for index in indices:
-                    results[index] = StageResult(ok=True, staging_key=keys[index])
-        return results
+        except Exception:
+            self._discard_failed_writes(keys)
+            raise
+        return keys
 
     def _discard_failed_write(self, key: str) -> None:
         """Reclaim whatever a failed combined write may have left behind.

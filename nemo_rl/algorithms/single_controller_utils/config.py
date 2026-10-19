@@ -699,7 +699,8 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
-    # Per-generation-owner bounds for checkpoint-time prefix TQ I/O. Rows are
+    # Per-generation-owner bounds for prefix TQ I/O: rows per cut-time put and
+    # keys per restore-time get, and token rows per cut-time put. Rows are
     # never split; one row larger than the token limit is processed alone.
     generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
     generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304

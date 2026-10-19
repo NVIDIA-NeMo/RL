@@ -722,11 +722,10 @@ def _stage_media_prefix(dp, tokens, prompt):
             worker, SimpleNamespace(media=media)
         ),
     )
-    staged = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=0
+    [staged_key] = sink.stage_generation_prefix_batch(
+        [record], checkpoint_id="checkpoint-1", chunk_sequences=[0]
     )
-    assert staged.ok
-    return worker, media, staged.staging_key
+    return worker, media, staged_key
 
 
 @pytest.mark.parametrize(
