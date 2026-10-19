@@ -36,7 +36,7 @@ The value model is the key addition in PPO compared to GRPO. It is a language mo
 
 We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that contains everything needed to run a Value model. Similar to the policy, the Value object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes coordinated so it appears like 1 GPU.
 
-The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **DTensor backend** (`value.dtensor_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
 ### Deployment Architectures
 
@@ -355,7 +355,7 @@ PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It 
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.
 
 ## References
 

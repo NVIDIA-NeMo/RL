@@ -22,7 +22,10 @@ from nemo_rl.models.generation.constants import SGLANG_BACKEND
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.models.generation.sglang.config import get_sglang_fault_tolerance_config
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 
 _MEBIBYTE = 1024 * 1024
 
@@ -75,11 +78,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         # consume the legacy refit metadata.  Gathering it would needlessly
         # materialize every sharded policy tensor on every training rank.
         if not self._is_sglang():
-            self._generation.prepare_refit_info(
-                self._policy.prepare_refit_info(
-                    refit_payload_mode=self._generation.get_refit_payload_mode()
-                )
-            )
+            initialize_refit_metadata(self._policy, self._generation)
         self._ensure_ready_and_consume_count()
 
     def _set_terminal(self, exc: BaseException) -> None:

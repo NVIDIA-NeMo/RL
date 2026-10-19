@@ -19,7 +19,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-ROUTE_PLAN_SCHEMA_VERSION = 2
+ROUTE_PLAN_SCHEMA_VERSION = 3
 _EXTRAS_DIGEST_VERSION = 1
 _SHA256_HEX_LENGTH = 64
 
@@ -39,6 +39,9 @@ class RouteSpan:
     staged_route_len: int
     extras_digest_version: int
     extras_digest: str
+    # 1 if the staged routes start with the previous span's last-token route
+    # (see route_assembly.boundary_route_rows), else 0.
+    boundary_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,16 @@ def _validate_plan(plan: RouteAssemblyPlan) -> None:
             span.staged_route_len,
             where=f"route_plan.spans[{index}].staged_route_len",
         )
+        _require_int(
+            span.boundary_rows, where=f"route_plan.spans[{index}].boundary_rows"
+        )
+        if span.boundary_rows not in (0, 1):
+            raise ValueError(f"route_plan.spans[{index}].boundary_rows must be 0 or 1")
+        if span.boundary_rows and (index == 0 or span.staged_route_len == 0):
+            raise ValueError(
+                f"route_plan.spans[{index}] has a boundary row but no previous "
+                "span or no staged routes"
+            )
         if (
             type(span.extras_digest_version) is not int
             or span.extras_digest_version != _EXTRAS_DIGEST_VERSION
@@ -164,6 +177,7 @@ def encode_route_plan(plan: RouteAssemblyPlan) -> dict[str, Any]:
                 "staged_route_len": span.staged_route_len,
                 "extras_digest_version": span.extras_digest_version,
                 "extras_digest": span.extras_digest,
+                "boundary_rows": span.boundary_rows,
             }
             for span in plan.spans
         ],
@@ -187,6 +201,11 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
         },
         where="route_plan",
     )
+    if value["schema_version"] != ROUTE_PLAN_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported route plan schema version {value['schema_version']}; "
+            f"expected {ROUTE_PLAN_SCHEMA_VERSION}"
+        )
     spans_value = value["spans"]
     if not isinstance(spans_value, list):
         raise TypeError("route_plan.spans must be a list")
@@ -203,6 +222,7 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
                 "staged_route_len",
                 "extras_digest_version",
                 "extras_digest",
+                "boundary_rows",
             },
             where=f"route_plan.spans[{index}]",
         )
@@ -231,6 +251,10 @@ def decode_route_plan(value: Any) -> RouteAssemblyPlan:
                 extras_digest=_require_string(
                     span_value["extras_digest"],
                     where=f"route_plan.spans[{index}].extras_digest",
+                ),
+                boundary_rows=_require_int(
+                    span_value["boundary_rows"],
+                    where=f"route_plan.spans[{index}].boundary_rows",
                 ),
             )
         )

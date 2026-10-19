@@ -55,6 +55,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 
 def has_gloo() -> bool:
@@ -156,7 +157,7 @@ def _make_master_config(
                 "val_at_end": val_at_end,
             },
             "policy": {
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
@@ -172,7 +173,7 @@ def _make_master_config(
                     **{
                         "projection_matrix_path": "/tmp/dummy-projection.pt",
                         "weight": 1.0,
-                        "dtensor_cfg": {
+                        "automodel_cfg": {
                             "enabled": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
@@ -205,7 +206,7 @@ def _make_master_config(
                 "shuffle": False,
                 "num_workers": 0,
             },
-            "logger": {"log_dir": "/tmp/logger"},
+            "logger": LoggerConfig(log_dir="/tmp/logger"),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
             "checkpointing": {
                 "enabled": save_enabled,
@@ -324,46 +325,6 @@ def test_empty_teachers_list_rejected_at_config_load():
         e["loc"] == ("teachers",) and e["type"] == "too_short"
         for e in exc_info.value.errors()
     )
-
-
-def test_setup_rejects_legacy_v2_key_on_student():
-    cfg = _make_master_config()
-    cfg.policy["dtensor_cfg"]["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"DTensor v1 \(policy\.dtensor_cfg\._v2=false\)",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
-
-
-def test_setup_rejects_legacy_v2_key_on_teacher():
-    cfg = _make_master_config()
-    cfg.teachers[0].dtensor_cfg["_v2"] = False
-    with (
-        patch.object(xt_mod, "RayVirtualCluster") as mock_cluster,
-        pytest.raises(
-            ValueError,
-            match=r"DTensor v1 \(teachers\.0\.dtensor_cfg\._v2=false\)",
-        ),
-    ):
-        setup(
-            cfg,
-            student_tokenizer=_make_tokenizer(32),
-            teacher_tokenizers=[_make_tokenizer(24)],
-            train_dataset=MagicMock(),
-            val_dataset=None,
-        )
-    assert mock_cluster.call_count == 0
 
 
 def test_setup_injects_vocab_sizes_into_loss_config():
@@ -755,7 +716,7 @@ def test_setup_builds_one_policy_per_teacher():
             **{
                 "projection_matrix_path": None,
                 "weight": 0.5,
-                "dtensor_cfg": {
+                "automodel_cfg": {
                     "enabled": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,

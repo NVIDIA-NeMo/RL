@@ -55,6 +55,11 @@ on:
         default: ""
         description: Prefix for the TRT-LLM wheel cache image tag; the target architecture and a hash of the effective base image are appended automatically. Empty disables the cache.
         type: string
+      trtllm-cache-scope:
+        required: false
+        default: ""
+        description: Optional scope (e.g. a release branch name such as r0.8.0) inserted into the TRT-LLM cache image tags so a branch that pins a different TRT-LLM ref does not share caches with main. Empty keeps the unscoped tags.
+        type: string
       dockerfile:
         required: true
         description: Path to the Dockerfile.
@@ -92,6 +97,7 @@ jobs:
       REGISTRY: ${{ inputs.registry }}
       IMAGE_NAME: ${{ inputs.image-name }}
       GH_REF: ${{ github.ref }}
+      GH_EVENT_NAME: ${{ github.event_name }}
       RUN_ID: ${{ github.run_id }}
     steps:
       - name: Checkout repository
@@ -135,6 +141,7 @@ jobs:
           BUILD_ARGS: ${{ inputs.build-args }}
           CCACHE_TAG_PREFIX: ${{ inputs.trtllm-ccache-tag }}
           WHEEL_TAG_PREFIX: ${{ inputs.trtllm-wheel-cache-tag }}
+          CACHE_SCOPE: ${{ inputs.trtllm-cache-scope }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           PLATFORM: ${{ inputs.platform }}
         run: |
@@ -172,8 +179,25 @@ jobs:
           fi
 
           CACHE_KEY=$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)
+          # Scoped caches (release branches) get their own image tags; the unscoped tags stay main's.
+          if [[ -n "$CACHE_SCOPE" ]]; then
+            if [[ ! "$CACHE_SCOPE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Invalid TRT-LLM cache scope: $CACHE_SCOPE" >&2
+              exit 1
+            fi
+            CCACHE_TAG_PREFIX="${CCACHE_TAG_PREFIX:+${CCACHE_TAG_PREFIX}-${CACHE_SCOPE}}"
+            WHEEL_TAG_PREFIX="${WHEEL_TAG_PREFIX:+${WHEEL_TAG_PREFIX}-${CACHE_SCOPE}}"
+          fi
+          # Only builds of main or pushes to a release branch may write the shared TRT-LLM cache images;
+          # PR builds and manual release-branch dispatches still read (seed from) them but never push,
+          # so an unmerged PR or an experimental dispatch cannot alter them.
+          PUBLISH_CACHE=false
+          if [[ "$GH_REF" == "refs/heads/main" || ( "$GH_EVENT_NAME" == "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ) ]]; then
+            PUBLISH_CACHE=true
+          fi
           {
             echo "arch=$ARCH"
+            echo "publish=$PUBLISH_CACHE"
             if [[ -n "$CCACHE_TAG_PREFIX" ]]; then
               echo "ccache_tag=${CCACHE_TAG_PREFIX}-${ARCH}-${CACHE_KEY}"
             fi
@@ -181,7 +205,7 @@ jobs:
               echo "wheel_tag=${WHEEL_TAG_PREFIX}-${ARCH}-${CACHE_KEY}"
             fi
           } >> "$GITHUB_OUTPUT"
-          echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY)"
+          echo "TRT-LLM caches use $BASE_IMAGE on $ARCH (key $CACHE_KEY${CACHE_SCOPE:+, scope $CACHE_SCOPE})"
 
       - name: Resolve TRT-LLM cache seeds
         id: trtllm_cache_seed
@@ -307,6 +331,11 @@ jobs:
           if [[ "$GH_REF" == "refs/heads/main" ]]; then
             CACHE_KEY="main"
             TAGS+=("$REGISTRY/$IMAGE_NAME:main")
+          elif [[ "$GH_EVENT_NAME" == "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # Only pushes to the release branch itself (not its PRs or manual dispatches) publish the
+            # branch tag that Lfast runs on PRs to that branch reuse; the cache is likewise branch-scoped.
+            CACHE_KEY="${GH_REF#refs/heads/}"
+            TAGS+=("$REGISTRY/$IMAGE_NAME:$CACHE_KEY")
           elif [[ -n "$PR_NUMBER" ]]; then
             CACHE_KEY="$PR_NUMBER"
             TAGS+=("$REGISTRY/$IMAGE_NAME:$PR_NUMBER")
@@ -324,6 +353,12 @@ jobs:
             CACHE_FROM+=("type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max")
           fi
 
+          # A manual dispatch on a release branch reads the branch cache but writes a run-private one.
+          CACHE_TO_KEY="$CACHE_KEY"
+          if [[ "$GH_EVENT_NAME" != "push" && "$GH_REF" =~ ^refs/heads/r[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            CACHE_TO_KEY="run-$RUN_ID"
+          fi
+
           {
             echo "tags<<EOF"
             printf '%s\n' "${TAGS[@]}"
@@ -331,7 +366,7 @@ jobs:
             echo "cache-from<<EOF"
             printf '%s\n' "${CACHE_FROM[@]}"
             echo "EOF"
-            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_KEY-buildcache,mode=max"
+            echo "cache-to=type=registry,ref=$REGISTRY/$IMAGE_NAME:$CACHE_TO_KEY-buildcache,mode=max"
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and push
@@ -424,7 +459,7 @@ jobs:
         # Cache mounts survive a failed RUN in the current Buildx builder. Run
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.publish == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -450,7 +485,7 @@ jobs:
       - name: Update TRT-LLM wheel cache image
         # Persist the custom wheel even when the release build fails, so a
         # retry can reuse completed compilation work.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.publish == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           file: ${{ inputs.dockerfile }}

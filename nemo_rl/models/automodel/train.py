@@ -49,7 +49,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
-from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
@@ -59,9 +59,15 @@ from nemo_rl.distributed.model_utils import (
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
+    drop_explicit_only_kwargs_not_in_forward,
     filter_multimodal_kwargs_for_model,
 )
+from nemo_rl.models.automodel.router_replay import (
+    ReplayGate,
+    microbatch_replay_context,
+)
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -123,6 +129,8 @@ def _build_model_batch(
 
     if is_reward_model or not allow_flash_attn_args:
         model_batch.pop("flash_attn_kwargs", None)
+
+    drop_explicit_only_kwargs_not_in_forward(model, model_batch)
 
     if clone_model_tensors:
         # Automodel may pad or shard these tensors in place. Keep the loss-side
@@ -432,6 +440,7 @@ def automodel_forward_backward(
     num_global_batches: int = 1,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    router_replay_gates: Optional[list[ReplayGate]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -463,6 +472,8 @@ def automodel_forward_backward(
             If None, all microbatches are considered valid.
         on_microbatch_start: Optional callback called at the start of each microbatch
             with the microbatch index. Useful for cache clearing, etc.
+        router_replay_gates: When given, replay each microbatch's rollout
+            ``routed_experts`` on these MoE gates (R3) for both its forward and backward.
 
     Returns:
         List of (result, metrics) tuples from each microbatch
@@ -484,7 +495,12 @@ def automodel_forward_backward(
             allow_flash_attn_args=allow_flash_attn_args,
         )
 
-        with prepared.model_context_factory(), autocast_context_factory():
+        replay_context = microbatch_replay_context(router_replay_gates, processed_mb)
+        with (
+            replay_context,
+            prepared.model_context_factory(),
+            autocast_context_factory(),
+        ):
             # Forward pass with post-processing
             result, metrics, _ = forward_with_post_processing_fn(
                 model=model,
@@ -648,11 +664,14 @@ class LossPostProcessor:
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
+            cu_seqlens_q_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
             loss_fn = SequencePackingLossWrapper(
                 loss_fn=self.loss_fn,
                 prepare_fn=prepare_loss_input_wrapped,
-                cu_seqlens_q=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
-                cu_seqlens_q_padded=processed_inputs.flash_attn_kwargs.cu_seqlens_q,
+                cu_seqlens_q=cu_seqlens_q_cpu,
+                cu_seqlens_q_padded=cu_seqlens_q_cpu,
             )
             loss, loss_metrics = loss_fn(
                 logits,
@@ -719,7 +738,8 @@ class LogprobsPostProcessor:
             sequence_dim: Sequence dimension
 
         Returns:
-            Token log probabilities tensor [batch_size, seq_length]
+            Token log probabilities [batch_size, seq_length]. Filtering leaves
+            policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
 
@@ -767,11 +787,14 @@ class LogprobsPostProcessor:
                 dtype=token_logprobs.dtype,
                 device=token_logprobs.device,
             )
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item() + 1
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens_cpu[i] + 1
+                end = cu_seqlens_cpu[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
                 unpacked_logprobs[i, 1:seq_len_actual] = token_logprobs[0, start:end]
             token_logprobs = unpacked_logprobs
         else:
@@ -785,14 +808,14 @@ class LogprobsPostProcessor:
             for i, length in enumerate(input_lengths):
                 # For right-padded sequence, set 1s at the beginning of the sequence
                 post_attention_mask[i, :length] = 1
-            token_logprobs = token_logprobs * post_attention_mask
+            # torch.where: multiplying a filtered -inf by the mask would give NaN.
+            token_logprobs = torch.where(post_attention_mask, token_logprobs, 0.0)
 
-        # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
+        # Preserve -inf only on valid tokens outside the policy support. The
+        # actor loss excludes these positions before sanitizing logprobs.
         if need_top_k_or_top_p_filtering(self.sampling_params):
             mask = data_dict["token_mask"] * data_dict["sample_mask"].unsqueeze(-1)
-            token_logprobs = mask_out_neg_inf_logprobs(
-                token_logprobs, mask, "prev_logprobs"
-            )
+            token_logprobs = mask_filtered_logprobs_outside_tokens(token_logprobs, mask)
 
         return token_logprobs
 
@@ -976,12 +999,15 @@ class TopkLogitsPostProcessor:
                 device=idx.device,
             )
 
-            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            cu_seqlens_cpu = to_cpu_int_tuple(
+                processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            )
+            input_lengths_cpu = to_cpu_int_tuple(input_lengths)
 
             for i in range(original_batch_size):
-                start = cu_seqlens[i].item()
-                end = cu_seqlens[i + 1].item()
-                seq_len_actual = input_lengths[i].item()
+                start = cu_seqlens_cpu[i]
+                end = cu_seqlens_cpu[i + 1]
+                seq_len_actual = input_lengths_cpu[i]
 
                 # Extract the corresponding portion from packed results
                 # Note: vals and idx are [1, packed_seq_len, k] due to packing
@@ -1066,7 +1092,7 @@ class FullLogitsPostProcessor:
                     "teacher context parallel size, but got "
                     f"sequence_length={full_seq_len}, cp_size={self.cp_size}. "
                     "Set the teacher's make_sequence_length_divisible_by to a "
-                    "multiple of its dtensor_cfg.context_parallel_size."
+                    "multiple of its automodel_cfg.context_parallel_size."
                 )
             local_len = full_seq_len // self.cp_size
             cp_rank = torch.distributed.get_rank(self.cp_mesh.get_group())

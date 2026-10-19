@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import secrets
 import time
 import warnings
 from collections import defaultdict
@@ -44,15 +45,16 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    agreed_media_columns,
 )
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    validate_vllm_quantization_config,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
-    assert_refit_unsupported_grouped_moe_params,
     assert_reload_refit_config_supported,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
@@ -73,9 +75,49 @@ from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
+
+
+def http_server_api_key_and_worker_config(
+    config: VllmConfig,
+) -> tuple[Optional[str], VllmConfig]:
+    """Generate the exposed HTTP server's bearer token and the worker config carrying it.
+
+    Reads ``vllm_cfg.http_server_api_key_required`` and ``vllm_cfg.expose_http_server``
+    from ``config``. When the flag is off, no key exists and ``config`` is returned as
+    the worker config. When it is on, a random URL-safe key is generated and placed as
+    ``vllm_cfg.http_server_api_key`` in a shallow copy of ``config``; the workers
+    receive that copy and refuse OpenAI-route requests without the key. ``config``
+    itself is never modified, so the job's saved and logged configuration does not
+    carry the key. The flag without an exposed server is a configuration error:
+    there would be no server to protect and no key to hand to Gym.
+
+    Returns:
+        ``(api_key, worker_config)``; ``api_key`` is None when no key is required.
+    """
+    vllm_cfg = config["vllm_cfg"]
+    if "http_server_api_key" in vllm_cfg:
+        # A key set in the YAML would be enforced by the workers but never
+        # handed to Gym (every call a 401), and would land in the saved and
+        # logged configuration.
+        raise ValueError(
+            "policy.generation.vllm_cfg.http_server_api_key is filled by "
+            "VllmGeneration and must not be set in the configuration; set "
+            "vllm_cfg.http_server_api_key_required: true instead."
+        )
+    if not vllm_cfg.get("http_server_api_key_required"):
+        return None, config
+    if not vllm_cfg.get("expose_http_server"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.http_server_api_key_required requires "
+            "vllm_cfg.expose_http_server: true"
+        )
+    api_key = secrets.token_urlsafe(32)
+    worker_config = {**config, "vllm_cfg": {**vllm_cfg, "http_server_api_key": api_key}}
+    return api_key, worker_config
 
 
 def _record_vllm_generation_metrics(
@@ -178,6 +220,8 @@ class VllmGeneration(GenerationInterface):
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
         """
+        validate_vllm_quantization_config(config)
+
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
@@ -287,12 +331,19 @@ class VllmGeneration(GenerationInterface):
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
         if extension_fqn is not None:
             worker_cls = extension_fqn
+        # The exposed HTTP server's per-job bearer token. Generated once here so
+        # every worker checks the same key, and kept on the instance so setup can
+        # hand it to the NeMo-Gym model server as policy_api_key. Only the copy of
+        # the config the workers receive carries it.
+        self.http_server_api_key, worker_config = http_server_api_key_and_worker_config(
+            config
+        )
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
-                worker_cls, config, defer_model_load=defer_model_load
+                worker_cls, worker_config, defer_model_load=defer_model_load
             )
         else:
-            worker_builder = RayWorkerBuilder(worker_cls, config)
+            worker_builder = RayWorkerBuilder(worker_cls, worker_config)
 
         normalize_fastokens_env()
 
@@ -640,12 +691,13 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
+    ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
-        single Gym ``install_capture`` call.
+        single Gym ``install_capture`` call. Returns the media column spec the
+        leaders pinned (``None`` for text-only capture).
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -658,7 +710,7 @@ class VllmGeneration(GenerationInterface):
             capture_media=capture_media,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        ray.get(futures)
+        return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version workers stamp on captured model calls."""
@@ -1376,10 +1428,18 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        assert_refit_unsupported_grouped_moe_params(self.cfg, state_dict_info)
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
 
+        Returns:
+            When MXFP8 trainer-side pre-quantization is enabled
+            (vllm_cfg.refit_prequantize), the parameter names the engine wants
+            quantized on the trainer before streaming. None otherwise.
+        """
+        if state_dict_info is None:
+            return None
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"
@@ -1401,7 +1461,19 @@ class VllmGeneration(GenerationInterface):
             getattr(worker, method_name).remote(state_dict_info=state_dict_info)
             for worker in self._refit_leader_workers()
         ]
-        ray.get(futures)
+
+        # Union the fp8-eligible parameter names across workers: replicas are
+        # equivalent, but with pipeline parallelism each worker only reports
+        # the parameters of its local shard.
+        names = sorted(
+            {name for result in ray.get(futures) if result for name in result}
+        )
+        if self.cfg["vllm_cfg"].get("refit_prequantize") and not names:
+            raise RuntimeError(
+                "vllm_cfg.refit_prequantize=true, but vLLM reported no "
+                "FP8-eligible parameters; check the FP8 config and ignored layers."
+            )
+        return names or None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
