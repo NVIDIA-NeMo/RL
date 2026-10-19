@@ -89,6 +89,10 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
                 and "${BASE_IMAGE}" in line
                 and "${UV_VERSION}" in line
             ]
+            assert len(cache_mount_lines) == sum(
+                "--mount=type=cache" in line and "id=uv-cache-" in line
+                for line in lines
+            ), f"{dockerfile} has a uv cache mount missing BASE_IMAGE or UV_VERSION"
             assert cache_mount_lines, (
                 f"{dockerfile} does not define a uv cache mount keyed on the base image and uv version"
             )

@@ -385,14 +385,12 @@ find "${UV_CACHE_DIR}" -type d \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
 # Hand the cache and the venvs built from it to the runtime UID in the layer that creates
-# them, unless STRIP_UV_CACHE is going to delete the cache anyway (the trap above). The
-# venvs are hardlinked against the cache, so each inode changes owner once and nothing is
-# copied. A later layer could not do this without copying every file up. uv refuses to
-# start with a cache it cannot write, so without this a non-root runtime cannot install an
-# extra offline even though every wheel is in the image.
-if [ -z "${STRIP_UV_CACHE:-}" ]; then
-    chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
-fi
+# them. The venvs are hardlinked against the cache, so each inode changes owner once and
+# nothing is copied. A later layer could not do this without copying every file up, so this
+# stays unconditional even when STRIP_UV_CACHE is set -- the cache still exists at this
+# point (the trap above deletes it only on EXIT, after this chown has already run), and
+# skipping it here would force the final ownership sweep to copy up the whole venv instead.
+chown -R "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -605,12 +603,11 @@ find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
 
-# Hand this layer's new cache and venv entries to the runtime UID (unless STRIP_UV_CACHE
-# is going to delete the cache anyway). Entries from the dependency layer already belong
-# to it, so only files created here change owner and none is copied up.
-if [ -z "${STRIP_UV_CACHE:-}" ]; then
-    find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
-fi
+# Hand this layer's new cache and venv entries to the runtime UID. Entries from the
+# dependency layer already belong to it, so only files created here change owner and none
+# is copied up. Stays unconditional even when STRIP_UV_CACHE is set -- see the dependency
+# layer's chown above for why.
+find "${UV_CACHE_DIR}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -732,12 +729,11 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 # and a full FQN matches only itself.
 UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
-# this layer; hand only those to the runtime UID so it can re-sync the venvs offline
-# (unless STRIP_UV_CACHE is going to delete the cache anyway).
-if [ -z "${STRIP_UV_CACHE:-}" ]; then
-    find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
-        -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
-fi
+# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
+# unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
+# for why.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
