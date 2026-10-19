@@ -120,14 +120,17 @@ class CrossTokenizerCollator:
             multiple of this value (typically TP * CP * 2 for Automodel).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
         reject_overlength_text: Text-mode policy for rows longer than a
-            context length. ``False`` truncates each side to its own context
-            length. ``True`` raises ``ValueError`` for a row whose student or
-            teacher tokenization, or that length rounded up to the side's
+            context length. ``False`` truncates the student and each
+            cross-tokenizer teacher to its own context length; a
+            same-tokenizer teacher shares the student's truncation. ``True``
+            raises ``ValueError`` for a row whose student or teacher
+            tokenization, or that length rounded up to the side's
             sequence-length divisor, exceeds that side's context length, so
-            every side covers the same text and no padded batch is wider
-            than its context; same-tokenizer teachers check the shared
-            student tokenization against their own context length and
-            divisor. Chat mode always rejects overlength rows.
+            every side covers the same text and no student or
+            cross-tokenizer teacher batch is wider than its context;
+            same-tokenizer teachers check the shared student tokenization
+            against their own context length and divisor. Chat mode always
+            rejects rows longer than a context length.
         ce_covers_assistant_turn: Chat-mode CE target. ``False`` supervises
             the final assistant content and end-of-turn token. ``True``
             supervises every token of the final assistant turn (SFT-style),
