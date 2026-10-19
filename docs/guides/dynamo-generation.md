@@ -200,6 +200,87 @@ Current limits on this path:
 
 Setup rejects any of these before allocating clusters.
 
+## Run Megatron prefill/decode engines under the SingleController
+
+The SingleController can also put NeMo RL's own Megatron inference engines
+behind the Dynamo frontend, disaggregated into prefill and decode roles. Start
+from
+[`examples/configs/grpo_math_1B_dynamo_pd_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_pd_megatron_single_controller.yaml).
+The boundary is:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true            # the engines receive logical weights from a Megatron trainer
+  generation:
+    backend: dynamo
+    dynamo_cfg:
+      engine: megatron
+      megatron_root: null    # Megatron-LM tree the adapter imports; null = the Bridge submodule's
+      disaggregation:
+        prefill: {workers: 1, megatron_cfg: {tensor_model_parallel_size: 1}}
+        decode:  {workers: 1, megatron_cfg: {tensor_model_parallel_size: 1}}
+    mcore_generation_config:
+      enable_prefix_caching: true
+      kv_cache_management_mode: persist
+      expose_http_server: false
+    vllm_cfg: null
+```
+
+What runs:
+
+- **Engines.** Each entry in `disaggregation` becomes one dedicated Megatron
+  inference policy (its own worker group, data parallel one), the same object
+  `backend: megatron` builds when `colocated.enabled` is false. Decode engines
+  are numbered first, then prefill; a role's `megatron_cfg` may override only the
+  model-parallel layout keys and its `mcore_generation_config` only engine-sizing
+  keys, so the two roles cannot drift in ways the KV handoff cannot bridge.
+- **Adapter sidecars.** Next to each engine, a CPU Ray actor runs Megatron-LM's
+  Dynamo backend (`megatron.inference.integrations.dynamo`) from the Dynamo
+  virtual environment in external launch mode. It registers the engine with the
+  frontend, forwards requests to the engine's coordinator, and carries the KV
+  handoff between prefill and decode over NIXL. It never owns GPUs or weights.
+- **Frontend, etcd, NATS.** Driver-owned, as for the vLLM fleet. Decode engines
+  register as the `backend` component and prefill engines as `prefill`; the
+  frontend's prefill router splits each request between them.
+
+Refit and startup differ from the vLLM fleet:
+
+- The engines are built at the first weight update (`skip_weight_load`), so the
+  adapter sidecars start at setup but the frontend becomes ready only after that
+  first refit. `dynamo_cfg.startup_timeout_s` must cover trainer construction
+  plus the first refit.
+- A request spans two engines, and a Megatron engine refuses to suspend while a
+  prefill block is still pinned for decode. Before every refit the
+  SingleController therefore waits for every in-flight request and holds new
+  ones (the generation backend reports `requires_quiesce_before_weight_update`),
+  waits for the remaining handoff pins to clear, suspends decode then prefill,
+  runs the collective refit, and resumes prefill then decode. Both waits are
+  bounded by `dynamo_cfg.control_timeout_s`.
+- The collective is one NCCL group over trainer plus all engines, with each
+  engine's ranks offset by the cumulative width of the engines before it. The
+  engines receive logical (unfused) weights, as the Megatron backend does.
+- Shutdown stops decode engines first, then attests their termination to every
+  prefill coordinator (Megatron's handoff recovery hook) so pinned blocks are
+  released, then stops prefill.
+
+Limits:
+
+- Prefill/decode only: aggregated Megatron engines behind Dynamo are rejected,
+  and `dynamo_cfg.disaggregation` is rejected with `engine: vllm`.
+- Native rollouts only; NeMo-Gym under the SingleController does not support
+  `backend: dynamo`.
+- Each engine fits on one node; `refit_transport` must be null;
+  `recompute_kv_cache_after_weight_updates` must be false (the engines keep
+  their caches, mode `persist`).
+- The engine workers need the `nixl` package in the Megatron environment for the
+  KV handoff, and the adapter sidecar needs a Megatron-LM tree with the Dynamo
+  integration (`megatron/inference/integrations/dynamo`).
+
+The functional test is
+`tests/functional/grpo_dynamo_pd_megatron_single_controller.sh` (three GPUs:
+trainer, prefill, decode).
+
 ## Run SWE1 with W&B
 
 The three-node nightly recipe targets
