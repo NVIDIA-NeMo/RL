@@ -1635,6 +1635,48 @@ def test_nemo_gym_sc_path_applies_the_rollout_metrics_hook():
     assert metrics["hook_rows_seen"] == 2.0
 
 
+def test_nemo_gym_sc_hook_resolution_survives_pickling():
+    """The rollout implementation is built on the driver and pickled into the
+    controller actor. A hook not yet resolved there must still be read from the
+    actor's rollout_config instead of being taken for an already-resolved one,
+    which a sentinel compared by identity would be after unpickling."""
+    import pickle
+
+    from nemo_rl.experience.rollouts import Timer
+
+    restored = pickle.loads(pickle.dumps(_nemo_gym_impl(False)))
+    assert restored._rollout_metrics_hook_resolved is False
+
+    restored._num_generations_per_prompt = 2
+    restored._task_to_env = {
+        "nemo_gym": _ScriptedGymEnv(
+            scripts=[
+                [
+                    (0, {"name": "agent"}, _streamed_gym_result(), None),
+                    (1, {"name": "agent"}, _streamed_gym_result(), None),
+                ]
+            ],
+            rollout_settings={
+                "rollout_metrics_hook": (
+                    "tests.unit.experience.test_rollout_manager._sum_rewards_hook"
+                )
+            },
+        )
+    }
+    _completions, _message_log, metrics = _run(
+        restored._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+    assert metrics["reward_sum"] == 2.0
+    assert restored._rollout_metrics_hook_resolved is True
+
+
 def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
     """A numeric field only some completions carry is still aggregated: the
     per-agent keys are the union over the completions, not the first
@@ -1767,6 +1809,7 @@ def test_nemo_gym_sc_rollout_metrics_hook_runs_after_the_built_in_metrics(
     # Resolution from rollout_config is pinned by
     # test_nemo_gym_sc_path_applies_the_rollout_metrics_hook.
     impl._rollout_metrics_hook = hook
+    impl._rollout_metrics_hook_resolved = True
 
     with caplog.at_level(logging.WARNING):
         _completions, _prompt, metrics = _run(
