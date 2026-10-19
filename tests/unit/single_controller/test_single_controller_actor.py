@@ -4048,3 +4048,96 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert not any(name.startswith("finalize/effort/") for name in metrics)
     assert ctrl._finalizer_metrics_by_group == {}
     assert ctrl._finalizer_rewards_by_group == {}
+
+
+def _quiesce_controller(*, requires_quiesce: bool, sync_weights: MagicMock):
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=False)
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    calls = MagicMock()
+    calls.attach_mock(sync_weights, "sync_weights")
+    for name in (
+        "quiesce",
+        "release_turn_gate",
+        "drain_for_weight_update",
+        "resume_after_weight_update",
+    ):
+        calls.attach_mock(MagicMock(), name)
+
+    async def _quiesce(timeout_s):
+        calls.quiesce(timeout_s)
+
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=calls.sync_weights)
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._rollout_manager = SimpleNamespace(
+        resume_request_deadlines=MagicMock(),
+        quiesce=_quiesce,
+        release_turn_gate=calls.release_turn_gate,
+    )
+    ctrl._gen = SimpleNamespace(
+        requires_kv_scale_sync=False,
+        requires_quiesce_before_weight_update=requires_quiesce,
+        quiesce_timeout_s=42.0,
+        drain_for_weight_update=calls.drain_for_weight_update,
+        resume_after_weight_update=calls.resume_after_weight_update,
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
+    return ctrl, calls
+
+
+def test_sync_weights_quiesces_before_the_drain_when_the_generation_requires_it() -> (
+    None
+):
+    ctrl, calls = _quiesce_controller(requires_quiesce=True, sync_weights=MagicMock())
+
+    asyncio.run(ctrl._sync_weights())
+
+    assert [call[0] for call in calls.mock_calls] == [
+        "quiesce",
+        "drain_for_weight_update",
+        "sync_weights",
+        "resume_after_weight_update",
+        "release_turn_gate",
+    ]
+    calls.quiesce.assert_called_once_with(42.0)
+    assert ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_reopens_the_turn_gate_when_the_weight_update_fails() -> None:
+    ctrl, calls = _quiesce_controller(
+        requires_quiesce=True,
+        sync_weights=MagicMock(side_effect=RuntimeError("nccl failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="nccl failed"):
+        asyncio.run(ctrl._sync_weights())
+
+    assert [call[0] for call in calls.mock_calls] == [
+        "quiesce",
+        "drain_for_weight_update",
+        "sync_weights",
+        "resume_after_weight_update",
+        "release_turn_gate",
+    ]
+
+
+def test_sync_weights_skips_the_quiesce_for_engines_that_serve_through_the_refit() -> (
+    None
+):
+    ctrl, calls = _quiesce_controller(requires_quiesce=False, sync_weights=MagicMock())
+
+    asyncio.run(ctrl._sync_weights())
+
+    assert [call[0] for call in calls.mock_calls] == [
+        "drain_for_weight_update",
+        "sync_weights",
+        "resume_after_weight_update",
+    ]
