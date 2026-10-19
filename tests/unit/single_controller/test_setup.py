@@ -1710,8 +1710,8 @@ class TestSetup:
                 lambda mc: mc.policy["generation"]["vllm_cfg"].update(
                     enable_vllm_metrics_logger=True
                 ),
-                "enable_vllm_metrics_logger must be false",
-                id="metrics_sampler",
+                "requires rollout_checkpointing.telemetry_interval_s",
+                id="undrained_metrics_sampler",
             ),
         ],
     )

@@ -511,6 +511,11 @@ def test_metrics_parser_and_sampler_aliases() -> None:
     assert "vllm_gpu_cache_usage_perc" not in parsed
     assert "python_gc_objects_collected_total" not in parsed
 
+    # Rollout telemetry drains to each worker's latest sample, which it keeps.
+    sampler._samples["vllm_generation_tokens_total"][0].append(9.0)
+    for _ in range(2):
+        assert sampler.drain_latest()["generation_tokens"] == {0: [9.0]}
+
 
 def test_metrics_http_errors_are_ignored(monkeypatch) -> None:
     monkeypatch.setattr(

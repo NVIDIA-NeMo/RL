@@ -177,13 +177,17 @@ class DynamoGeneration(GenerationInterface):
                 f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
                 "which waits for running requests to finish."
             )
-        if generation["vllm_cfg"]["enable_vllm_metrics_logger"]:
-            # Only the legacy GRPO loop reads and clears the driver's sampler; here
-            # it would accumulate samples for the whole run.
+        if (
+            generation["vllm_cfg"]["enable_vllm_metrics_logger"]
+            and master_config.rollout_checkpointing.telemetry_interval_s is None
+        ):
+            # The rollout telemetry pump is what drains the driver's sampler on this
+            # path; without it the sampler would accumulate for the whole run.
             raise ValueError(
-                "policy.generation.vllm_cfg.enable_vllm_metrics_logger must be false "
-                "with policy.generation.backend='dynamo' under the SingleController; "
-                "nothing reads the Dynamo metrics sampler on this path."
+                "policy.generation.vllm_cfg.enable_vllm_metrics_logger requires "
+                "rollout_checkpointing.telemetry_interval_s with "
+                "policy.generation.backend='dynamo' under the SingleController; "
+                "the rollout telemetry pump drains the Dynamo metrics sampler."
             )
 
     def __init__(
@@ -303,6 +307,11 @@ class DynamoGeneration(GenerationInterface):
         sampler = self._metrics_sampler
         if sampler is not None:
             sampler.clear()
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Return each worker's latest Dynamo metrics for rollout telemetry."""
+        sampler = self._metrics_sampler
+        return {} if sampler is None else sampler.drain_latest()
 
     def get_inference_world_size(self) -> int:
         """Return the number of vLLM ranks across all discovered workers."""

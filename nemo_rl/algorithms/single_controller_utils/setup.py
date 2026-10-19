@@ -1213,7 +1213,7 @@ def setup_single_controller(
     telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
     if telemetry_interval_s is not None:
         generation_backend = generation_config["backend"]
-        if generation_backend != "vllm":
+        if generation_backend not in ("vllm", "dynamo"):
             warnings.warn(
                 "rollout_checkpointing.telemetry_interval_s is enabled with "
                 f"policy.generation.backend={generation_backend!r}. Canonical "
@@ -1231,7 +1231,7 @@ def setup_single_controller(
                     "vLLM token, request, and KV-cache signals will be absent.",
                     stacklevel=2,
                 )
-            elif not vllm_cfg["async_engine"]:
+            elif generation_backend == "vllm" and not vllm_cfg["async_engine"]:
                 warnings.warn(
                     "rollout_checkpointing.telemetry_interval_s and "
                     "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
