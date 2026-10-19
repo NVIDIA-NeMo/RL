@@ -129,6 +129,8 @@ class NixlStorageUnit:
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
         demote_after_s: float | None = None,
+        high_wm: float | None = None,
+        low_wm: float | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
@@ -157,6 +159,8 @@ class NixlStorageUnit:
             int(staging_bytes),
             float(pickup_s),
             demote_after_s,
+            high_wm,
+            low_wm,
         )
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
@@ -203,6 +207,8 @@ class NixlStorageUnit:
         staging_bytes: int,
         pickup_s: float,
         demote_after_s: float | None,
+        high_wm: float | None = None,
+        low_wm: float | None = None,
     ) -> None:
         self.ssd_dir: str | None = None
         self.staging_: SlabAllocator | None = None
@@ -217,8 +223,11 @@ class NixlStorageUnit:
             "stage_failures": 0,
             "stage_wait_ms_max": 0.0,
             "busy_replies": 0,
+            "watermark_batches": 0,
         }
         self._victims: set[str] = set()  # victims whose slab copy is still held
+        self._demote_jobs = 0  # demotions queued or running, released victims included
+        self.high_wm, self.low_wm = high_wm, low_wm
         self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
         if not ssd_dir:
             self.alloc_ = SlabAllocator(slab_bytes, on_free=self._wipe_footer)
@@ -249,8 +258,9 @@ class NixlStorageUnit:
     def _tick(self, every: float = 1.0, report_s: float = 30.0) -> None:
         """SSD ticker thread.
 
-        Drops victims' slab copies whose pins expired, demotes blobs older than
-        ``demote_after_s`` (opt-in), and prints stats when they change.
+        Drops victims' slab copies whose pins expired, retries the headroom batch
+        (``alloc`` starts it; the tick catches blobs that committed since), demotes blobs
+        older than ``demote_after_s`` (opt-in, testing), and prints stats when they change.
         """
         last, last_at = None, 0.0
         while True:
@@ -278,6 +288,36 @@ class NixlStorageUnit:
                 for b, r in self.blobs.items():
                     if _movable(r) and now - r.created_at >= self.demote_after_s:
                         self._mark_victim(b, r)
+            if self.high_wm is not None:
+                self._demote_to_low_watermark()
+
+    def _demote_to_low_watermark(self) -> None:
+        """Background headroom: one batch at a time, oldest first, so puts rarely see Busy.
+
+        ``_room`` stays the fallback (fragmentation, bursts). Quarantined bytes
+        are not counted: they free by time, demotion cannot help them.
+        """
+        a = self.alloc_
+        live = a.used_bytes - a.quarantined_bytes
+        if self._demotion_running() or live <= self.high_wm * a.capacity:
+            return
+        need = live - self.low_wm * a.capacity
+        picked = 0
+        movable = sorted(
+            ((b, r) for b, r in self.blobs.items() if _movable(r)),
+            key=lambda t: t[1].created_at,
+        )
+        for b, r in movable:
+            if picked >= need:
+                break
+            self._mark_victim(b, r)
+            picked += align_up(r.nbytes, a.align)
+        if picked:
+            self.ssd_stats["watermark_batches"] += 1
+
+    def _demotion_running(self) -> bool:
+        """A batch is queued or running, or its victims still hold slab copies."""
+        return bool(self._victims or self._demote_jobs)
 
     def _ssd_stats(self) -> dict[str, Any]:
         return {
@@ -310,8 +350,8 @@ class NixlStorageUnit:
             r.nbytes for _, r in movable
         ) < align_up(nbytes, a.align):
             return False
-        if self._victims:
-            return True  # a running batch frees its slab copies soon
+        if self._demotion_running():
+            return True  # a running or queued batch frees its slab copies soon
         if not movable:
             # Nothing left to demote: only quarantine (free at a known time) helps.
             return a.quarantined_bytes > 0
@@ -327,7 +367,15 @@ class NixlStorageUnit:
     def _mark_victim(self, b: str, rec: BlobRec) -> None:
         rec.victim = True  # resolve stops granting slab pins (design §5.1)
         self._victims.add(b)
-        self._demoter.submit(self._demote, b, rec)
+        self._demote_jobs += 1
+        self._demoter.submit(self._demote_job, b, rec)
+
+    def _demote_job(self, b: str, rec: BlobRec) -> None:
+        try:
+            self._demote(b, rec)
+        finally:
+            with self._mu:
+                self._demote_jobs -= 1
 
     def _demote(self, b: str, rec: BlobRec) -> None:
         """Demoter thread: copy the slab copy to a file, then drop the slab copy."""
@@ -515,6 +563,8 @@ class NixlStorageUnit:
             refs=int(n_entries),
             created_at=now,
         )
+        if self.high_wm is not None:
+            self._demote_to_low_watermark()  # like Mooncake's PutEnd: no tick lag
         return off
 
     @_locked
