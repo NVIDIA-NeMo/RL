@@ -917,7 +917,18 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "processor_name",
+    [
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+        "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
+    ],
+)
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, processor_name: str
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -982,9 +993,10 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
         model_input_names = ["input_ids", "pixel_values", "imgs_sizes"]
         tokenizer = _Tokenizer()
 
+    processor_type = type(processor_name, (NemotronNanoVLV2Processor,), {})
     datum = nemo_gym_example_to_video_datum_spec(
         example,
-        processor=NemotronNanoVLV2Processor(),
+        processor=processor_type(),
         max_seq_length=None,
         idx=3,
         task_name="nemo_gym",
