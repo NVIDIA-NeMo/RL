@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import threading
 import warnings
 from pathlib import Path
@@ -1248,8 +1249,26 @@ class TestSetup:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_msc_checkpoint_dir_replaces_native_tq_requirement_with_warning(
-        self, patched_factories
+        self, patched_factories, tmp_path, monkeypatch
     ):
+        # setup builds a real CheckpointManager, which resolves the MSC profile.
+        (tmp_path / "objects").mkdir()
+        msc_config = tmp_path / "msc.json"
+        msc_config.write_text(
+            json.dumps(
+                {
+                    "profiles": {
+                        "profile": {
+                            "storage_provider": {
+                                "type": "file",
+                                "options": {"base_path": str(tmp_path / "objects")},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("MSC_CONFIG", str(msc_config))
         mc = _make_master_config()
         mc.checkpointing["enabled"] = True
         mc.checkpointing["save_data_plane"] = False
