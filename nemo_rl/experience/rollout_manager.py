@@ -1528,9 +1528,9 @@ class AsyncNemoGymRolloutImpl:
             completions[0].env_extras or {}
         )
         if receipt_mode:
-            # Token-free receipts: token accounting comes from the manifest
-            # (cum_len of the deepest chain; delta sums as the generation
-            # proxy) instead of a message_log walk.
+            # A receipt knows context lengths, not generation lengths. Exact
+            # output metrics are emitted after staged tensors are verified by
+            # the reassembler; delta_len includes input and is not a proxy.
             if self._forest_training:
                 manifests = [
                     [
@@ -1557,16 +1557,7 @@ class AsyncNemoGymRolloutImpl:
             # fail the group as a deterministic data failure.
             turn_count = [len(m) for m in manifests]
             total_tokens = [
-                sum(entry.get("delta_len", 0) for entry in m)
-                if self._forest_training
-                else max((entry.get("cum_len", 0) for entry in m), default=0)
-                for m in manifests
-            ]
-            assistant_tokens = [
-                sum(entry.get("delta_len", 0) for entry in m) for m in manifests
-            ]
-            max_gen_tokens_per_turn = [
-                max((entry.get("delta_len", 0) for entry in m), default=0)
+                max((entry.get("cum_len", 0) for entry in m), default=0)
                 for m in manifests
             ]
         else:
@@ -1616,11 +1607,6 @@ class AsyncNemoGymRolloutImpl:
             "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
             **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **calculate_single_metric(
-                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
-            ),
-            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
             "truncation_rate": truncation_rate,
@@ -1645,7 +1631,16 @@ class AsyncNemoGymRolloutImpl:
                     "ng_reward_checks",
                     "ng_reward_log_context",
                 )
-                and not (receipt_mode and k == "reward")
+                and not (
+                    receipt_mode
+                    and k
+                    in (
+                        "reward",
+                        "gen_tokens_per_sample",
+                        "max_gen_tokens_per_turn",
+                        "mean_gen_tokens_per_sample",
+                    )
+                )
             }
             for result in agent_results
         ]
@@ -1670,11 +1665,23 @@ class AsyncNemoGymRolloutImpl:
                 total_tokens, n, f"{agent_name}/total_tokens_per_sample"
             )
         )
-        rollout_metrics.update(
-            calculate_single_metric(
-                assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+        if not receipt_mode:
+            rollout_metrics.update(
+                calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
             )
-        )
+            rollout_metrics.update(
+                calculate_single_metric(
+                    max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+                )
+            )
+            rollout_metrics["max_gen_tokens_per_turn/p95"] = pct(
+                max_gen_tokens_per_turn, 95
+            )
+            rollout_metrics.update(
+                calculate_single_metric(
+                    assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
+                )
+            )
         if self._log_full_result_tables and not receipt_mode:
             rollout_metrics[f"{agent_name}/full_result"] = Table(
                 data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
@@ -1682,9 +1689,10 @@ class AsyncNemoGymRolloutImpl:
             )
 
         # Necessary for downstream nemo rl logging/printing.
-        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
-            "gen_tokens_per_sample/mean"
-        ]
+        if not receipt_mode:
+            rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+                "gen_tokens_per_sample/mean"
+            ]
         return rollout_metrics
 
 

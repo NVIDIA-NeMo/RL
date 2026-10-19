@@ -1316,10 +1316,9 @@ Depending on your data shape, you may want to change these values."""
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
         """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
-        from nemo_gym.token_id_capture.staging import resolve_terminal
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.gym_selection import select_captured_calls
+        from nemo_rl.environments.call_selection import resolve_selection_policy
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -1347,41 +1346,22 @@ Depending on your data shape, you may want to change these values."""
         terminal_response_id = None
         if not capture_failed:
             try:
-                if self._selection_policy == "all_captured":
-                    selected = list(parsed.records)
-                    # Admission/completion order cannot identify the scored call.
-                    # Reuse shared witness attribution, without graph fallback.
-                    attribution = resolve_terminal(
-                        selected,
-                        result.get("response"),
-                        declared_response_id=result.get("terminal_response_id"),
-                    )
-                    if not attribution.attributed:
-                        raise ValueError(
-                            "all_captured requires an identifiable scored terminal: "
-                            + attribution.reason
-                        )
-                    terminal_response_id = next(
-                        record.response_id
-                        for record in selected
-                        if record.model_call_id == attribution.model_call_id
-                    )
-                    # Only an unscored failed leaf can be excluded safely.
-                    # Failed parents or the scored call still invalidate the owner.
-                    parents = {record.parent_call_id for record in selected}
-                    selected = [
-                        record
-                        for record in selected
-                        if record.response_status != "failed"
-                        or record.model_call_id == attribution.model_call_id
-                        or record.model_call_id in parents
-                    ]
-                elif self._selection_policy == "returned_history":
-                    selected = select_captured_calls(parsed.records, result)
-                else:
+                assert self._selection_policy is not None
+                select = resolve_selection_policy(self._selection_policy)
+                selected, terminal_response_id = select(
+                    [r.model_copy(deep=True) for r in parsed.records], result
+                )
+                by_call = {r.model_call_id: r for r in parsed.records}
+                if not selected or len({r.model_call_id for r in selected}) != len(
+                    selected
+                ):
+                    raise ValueError("Selection must contain unique captured calls")
+                if any(by_call.get(r.model_call_id) != r for r in selected):
                     raise ValueError(
-                        f"Unknown selection policy: {self._selection_policy}"
+                        "Selection must contain unchanged records from this attempt"
                     )
+                if terminal_response_id not in {r.response_id for r in selected}:
+                    raise ValueError("Selection must identify its scored terminal")
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(
@@ -1399,12 +1379,6 @@ Depending on your data shape, you may want to change these values."""
             r.finish_reason in ("length", "max_tokens", "max_output_tokens")
             for r in selected
         )
-        if selected and terminal_response_id is None:
-            terminal_response_id = result.get("terminal_response_id") or (
-                result.get("response") or {}
-            ).get("id")
-            if terminal_response_id not in {r.response_id for r in selected}:
-                terminal_response_id = selected[-1].response_id
         receipt = self._assemble_receipt(
             owner,
             manifest,

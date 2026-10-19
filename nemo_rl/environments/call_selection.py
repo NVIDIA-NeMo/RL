@@ -12,24 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Join existing Gym rollout evidence to whole captured generations.
+"""Select captured calls for training, independently of row reconstruction.
 
-This optional Gym integration selects calls, not segments. Captured storage
-parents and the existing finalizer continue to determine physical rows.
+A selection policy is a synchronous callable ``(records, result)`` returning
+``(selected_records, terminal_response_id)``. It must return unique, unchanged
+records from this attempt and identify the scored response within its selection.
+Order determines root/path priority, not storage ancestry. Policies choose
+membership; shared capture validation and reconstruction remain authoritative.
 """
 
-from collections import defaultdict
-from typing import Any
+from __future__ import annotations
 
-from nemo_gym.responses_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
-from nemo_gym.token_id_capture.completion import output_item_fingerprint
-from nemo_gym.token_id_capture.staging.records import CallRecord
+import importlib
+from collections import defaultdict
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.records import CallRecord
+
+type SelectionPolicy = Callable[
+    [list[CallRecord], dict[str, Any]], tuple[list[CallRecord], str | None]
+]
 
 
 def _output_items(
     result: dict[str, Any], *, captured_response_ids: set[str]
 ) -> tuple[list[dict[str, Any]], dict[int, str | None]]:
     """Normalize ordinary output, retaining envelope boundaries and identities."""
+    # Gym is optional; resolving policies must also work in non-Gym config tools.
+    from nemo_gym.responses_converter import _RESPONSE_OUTPUT_BOUNDARY_TYPES
+
     responses = result.get("responses") or [result.get("response") or {}]
     sessions = {(r.get("metadata") or {}).get("session_id") for r in responses}
     if len(sessions) > 1:
@@ -92,13 +105,16 @@ def _output_items(
 
 def select_captured_calls(
     records: list[CallRecord], result: dict[str, Any]
-) -> list[CallRecord]:
+) -> tuple[list[CallRecord], str | None]:
     """Resolve references and validate any accompanying ordinary output.
 
     Stable IDs constrain content matching rather than overriding contradictions.
     Content-only matches must be unique locally; this is deliberately not an
     exponential search over possible transcript interpretations.
     """
+    # Defer the optional Gym dependency until the policy is executed.
+    from nemo_gym.token_id_capture.completion import output_item_fingerprint
+
     by_response: dict[str, CallRecord] = {r.response_id: r for r in records}
     by_call: dict[str, CallRecord] = {r.model_call_id: r for r in records}
     if len(by_response) != len(records) or len(by_call) != len(records):
@@ -257,4 +273,68 @@ def select_captured_calls(
             raise ValueError("Declared terminal is absent from accepted history")
         if terminal is not None and declared != terminal.response_id:
             raise ValueError("Declared terminal differs from the scored response")
-    return selected
+    terminal_response_id = declared or (terminal.response_id if terminal else None)
+    if terminal_response_id is None:
+        # Returned history is ordered; preserve the existing last accepted call
+        # convention when envelopes use harness-local rather than served IDs.
+        terminal_response_id = selected[-1].response_id
+    return selected, terminal_response_id
+
+
+def select_all_captured(
+    records: list[CallRecord], result: dict[str, Any]
+) -> tuple[list[CallRecord], str | None]:
+    """Include all calls except failed, unscored leaves, retaining attribution."""
+    # Defer the optional Gym dependency until the policy is executed.
+    from nemo_gym.token_id_capture.staging import resolve_terminal
+
+    attribution = resolve_terminal(
+        records,
+        result.get("response"),
+        declared_response_id=result.get("terminal_response_id"),
+    )
+    if not attribution.attributed:
+        raise ValueError(
+            "all_captured requires an identifiable scored terminal: "
+            + attribution.reason
+        )
+    terminal_response_id = next(
+        record.response_id
+        for record in records
+        if record.model_call_id == attribution.model_call_id
+    )
+    # Failed parents or the scored call still invalidate the owner downstream.
+    parents = {record.parent_call_id for record in records}
+    selected = [
+        record
+        for record in records
+        if record.response_status != "failed"
+        or record.model_call_id == attribution.model_call_id
+        or record.model_call_id in parents
+    ]
+    return selected, terminal_response_id
+
+
+SELECTION_POLICIES: dict[str, SelectionPolicy] = {
+    "returned_history": select_captured_calls,
+    "all_captured": select_all_captured,
+}
+
+
+def resolve_selection_policy(name: str) -> SelectionPolicy:
+    """Resolve a built-in name or an importable ``package.module:function``."""
+    if name in SELECTION_POLICIES:
+        return SELECTION_POLICIES[name]
+    module_name, separator, function_name = name.partition(":")
+    if not separator or not module_name or not function_name.isidentifier():
+        raise ValueError(
+            f"Unknown selection_policy {name!r}: expected a built-in "
+            f"({', '.join(SELECTION_POLICIES)}) or 'package.module:function'"
+        )
+    try:
+        policy = getattr(importlib.import_module(module_name), function_name)
+    except (ImportError, AttributeError) as error:
+        raise ValueError(f"Cannot load selection_policy {name!r}: {error}") from error
+    if not callable(policy):
+        raise ValueError(f"selection_policy {name!r} is not callable")
+    return cast(SelectionPolicy, policy)

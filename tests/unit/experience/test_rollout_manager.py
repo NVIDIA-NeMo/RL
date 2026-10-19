@@ -1240,13 +1240,20 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert "agent/reward_score_raw/mean" not in metrics
 
 
-def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics(
+    forest_training,
+):
     def _receipt_completion(manifest, truncated):
+        manifest = [dict(entry, response_id=str(i)) for i, entry in enumerate(manifest)]
         return Completion(
             message_log=[],
             env_extras={
                 "reward": 0.5,
                 "ng_receipt": {"rollout_id": "r", "manifest": manifest},
+                "ng_logical_selection": SimpleNamespace(
+                    response_ids=tuple(str(i) for i in range(len(manifest)))
+                ),
             },
             truncated=truncated,
             reward=0.5,
@@ -1260,13 +1267,15 @@ def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
         _receipt_completion([{"cum_len": 4, "delta_len": 4}], truncated=True),
     ]
 
-    metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
+    impl = _nemo_gym_impl(True)
+    impl._forest_training = forest_training
+    metrics = impl._compute_rollout_metrics(completions, "agent")
 
     assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
     assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
     assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
-    assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
-    assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(4.5)
+    # Receipts cannot distinguish generated tokens from inputs; no proxy escapes.
+    assert not any("gen_tokens" in key for key in metrics)
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):

@@ -18,8 +18,9 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from responses_api_models.vllm_model.tests import test_framework_context as gym
 
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
-from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.environments.call_selection import select_captured_calls
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     ActionOutputFlags,
@@ -371,7 +372,7 @@ def test_twenty_calls_keep_baseline_rows(forest: ForestCapture, compact: bool) -
     if compact:
         parents[10] = None
     records, replies = forest.capture(parents)
-    selected = select_captured_calls(records, ordinary(replies))
+    selected = select_captured_calls(records, ordinary(replies))[0]
     result = publish(forest, records, selected)
     assert result.valid_row_count == (2 if compact else 1)
     assert_loss_once(forest, selected, records)
@@ -403,7 +404,7 @@ def test_selected_forest_publishes_once(
     forest: ForestCapture, parents: list[int | None], expected_rows: int
 ) -> None:
     records, replies = forest.capture(parents)
-    selected = select_captured_calls(records, ordinary(replies))
+    selected = select_captured_calls(records, ordinary(replies))[0]
     assert selected == records
     result = publish(forest, records, selected)
     assert result.valid_row_count == expected_rows
@@ -414,7 +415,7 @@ def test_shared_action_masks_counts_and_prompt_are_owned_once(
     forest: ForestCapture,
 ) -> None:
     records, replies = forest.capture([None, 0, 0])
-    selected = select_captured_calls(records, ordinary(replies))
+    selected = select_captured_calls(records, ordinary(replies))[0]
     flags = (
         ActionOutputFlags(True, True),
         ActionOutputFlags(False, False),
@@ -457,7 +458,7 @@ def test_shared_forest_loss_and_gradient_match_independent_calls(
     forest: ForestCapture,
 ) -> None:
     records, replies = forest.capture([None, 0, 0])
-    selected = select_captured_calls(records, ordinary(replies))
+    selected = select_captured_calls(records, ordinary(replies))[0]
     reference = [
         forest.finalizer.finalize_rollout(
             "attempt",
@@ -505,7 +506,7 @@ def test_shared_forest_loss_and_gradient_match_independent_calls(
 
 def test_omitted_ancestor_stays_rejected(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, 0, 1])
-    selected = select_captured_calls(records, ordinary([replies[0], replies[2]]))
+    selected = select_captured_calls(records, ordinary([replies[0], replies[2]]))[0]
     with pytest.raises(ValueError, match="selected predecessor"):
         publish(forest, records, selected)
     assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
@@ -513,7 +514,7 @@ def test_omitted_ancestor_stays_rejected(forest: ForestCapture) -> None:
 
 def test_excluded_leaf_preserves_selected_ancestor(forest: ForestCapture) -> None:
     records, replies = forest.capture([None, 0, None])
-    selected = select_captured_calls(records, ordinary([replies[0], replies[2]]))
+    selected = select_captured_calls(records, ordinary([replies[0], replies[2]]))[0]
     result = publish(forest, records, selected)
     assert result.valid_row_count == 2
     assert_loss_once(forest, selected, records)
@@ -528,7 +529,7 @@ def test_per_chain_envelopes_preserve_membership(forest: ForestCapture) -> None:
             ordinary([replies[1], replies[3]])["response"],
         ]
     }
-    selected = select_captured_calls(records, result)
+    selected = select_captured_calls(records, result)[0]
     assert {r.model_call_id for r in selected} == {r.model_call_id for r in records}
 
 
@@ -538,7 +539,7 @@ def test_explicit_scored_parent_can_precede_worker(forest: ForestCapture) -> Non
     result["terminal_response_id"] = records[2].response_id
     # Synthetic aggregate envelope ID leaves explicit terminal as authority.
     result["response"]["id"] = "aggregate"
-    selected = select_captured_calls(records, result)
+    selected = select_captured_calls(records, result)[0]
     assert selected == records
     plan = forest.finalizer._plan_selected_calls(
         ["attempt"], [receipt(records, terminal=records[2])], [selection(selected)]
@@ -689,7 +690,7 @@ def test_completion_order_does_not_change_selected_forest(
     manifest = list(reversed(records)) if reverse else records
     # Deliberately exercise a stronger permutation than real completion order:
     # storage order is not an ancestry or accepted-history contract.
-    selected = select_captured_calls(manifest, ordinary(replies))
+    selected = select_captured_calls(manifest, ordinary(replies))[0]
     result = publish(forest, manifest, selected)
     assert result.valid_row_count == 2
     assert_loss_once(forest, selected, records)
@@ -787,3 +788,41 @@ def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
     with pytest.raises(ValueError, match="publication IDs differ"):
         publish(forest, records, records)
     assert set(forest.plane.rows) == before
+
+
+@pytest.mark.parametrize(
+    "parents,omitted",
+    [
+        ([None, 0, 1, None, 3, 4], None),
+        ([None, 0, 0, None, 3], None),
+        ([None, 0, 0, None, 3], 1),
+    ],
+)
+@pytest.mark.parametrize("masked", [False, True])
+def test_capture_lengths_count_unique_generations_before_padding(
+    forest: ForestCapture, parents: list[int | None], omitted: int | None, masked: bool
+) -> None:
+    records, _ = forest.capture(parents)
+    selected = [record for index, record in enumerate(records) if index != omitted]
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[-1])],
+        [1.0],
+        mask_sample=[masked],
+        fallback_weight_version=7,
+        prompt_idx=0,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(selected)],
+        execution_row_multiple=4,
+        reward_log_contexts=[RewardLogContext("agent", None)],
+    )
+    assert result.meta is not None and result.meta.size == 4
+    metrics = result.meta.extra_info[ROLLOUT_METRICS][0]
+    # This harness generates exactly one token per model call. Contexts and
+    # duplicated ancestors in sibling rows must not change that population.
+    assert metrics["gen_tokens_per_sample/histogram"] == [len(selected)]
+    assert metrics["agent/gen_tokens_per_sample/mean"] == len(selected)
+    assert metrics["max_gen_tokens_per_turn/max"] == 1
+    assert metrics["total_tokens_per_sample/max"] == max(r.cum_len for r in selected)
+    assert result.canonical_output_tokens == len(selected)

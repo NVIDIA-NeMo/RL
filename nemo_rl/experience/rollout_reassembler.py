@@ -37,6 +37,7 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -55,6 +56,7 @@ from nemo_rl.data_plane.schema import (
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
     ROUTE_PLAN_TAG,
+    ROLLOUT_METRICS,
     TRUNCATED,
     LogicalRowTag,
     forest_row_ids,
@@ -66,6 +68,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
 )
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
@@ -120,6 +123,8 @@ class FinalizedRollout:
     penalty_counts: dict[str, int] = field(default_factory=dict)
     reward_metrics: dict[str, float] = field(default_factory=dict)
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
+    # One length per owned call, even when adjacent generations have no input gap.
+    generation_lengths: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,6 +197,52 @@ class FinalizedGroup:
     # (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
+
+
+def _capture_token_metrics(
+    rows: list[FinalizedRollout],
+    slots: list[int],
+    contexts: Sequence[RewardLogContext | None],
+) -> dict[str, Any]:
+    """Count verified output per logical owner, before sample-level filtering.
+
+    Called before execution padding. Invalid owners contribute zero; environment
+    masks do not erase verified generations. Shared ancestors already have zero
+    loss on later paths, and generation_lengths excludes those same owned calls.
+    """
+    n = len(contexts)
+    generated = [0] * n
+    longest = [0] * n
+    total = [0] * n
+    for row, slot in zip(rows, slots, strict=True):
+        if row.valid:
+            generated[slot] += sum(int(mask) for mask in row.token_mask)
+            longest[slot] = max(longest[slot], max(row.generation_lengths, default=0))
+            total[slot] = max(total[slot], len(row.token_ids))
+    metrics = {
+        **calculate_single_metric(generated, n, "gen_tokens_per_sample"),
+        **calculate_single_metric(longest, n, "max_gen_tokens_per_turn"),
+        **calculate_single_metric(total, n, "total_tokens_per_sample"),
+        "mean_gen_tokens_per_sample": sum(generated) / n,
+        "max_gen_tokens_per_turn/p95": pct(longest, 95),
+    }
+    agents = {context.agent_name for context in contexts if context is not None}
+    for agent in agents:
+        indices = [
+            i
+            for i, context in enumerate(contexts)
+            if context and context.agent_name == agent
+        ]
+        for name, values in (
+            ("gen_tokens_per_sample", generated),
+            ("total_tokens_per_sample", total),
+        ):
+            metrics.update(
+                calculate_single_metric(
+                    [values[i] for i in indices], len(indices), f"{agent}/{name}"
+                )
+            )
+    return metrics
 
 
 def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
@@ -607,6 +658,11 @@ class RolloutReassembler:
             rejection_reason=None,
             token_ids=row.token_ids,
             token_mask=token_mask,
+            generation_lengths=tuple(
+                length
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
             logprobs=row.logprobs,
             prompt_len=row.prompt_len,
             reward=reward,
@@ -956,7 +1012,16 @@ class RolloutReassembler:
             if row.valid
         ]
 
-        return self._publish_rows(
+        # Reuse the ordinary replay metric channel; finalizer timing counters stay
+        # scalar-only. Compute before _publish_rows appends execution padding.
+        token_metrics = _capture_token_metrics(
+            rows,
+            [tag["logical_slot"] for tag in logical.tags]
+            if logical is not None
+            else list(range(len(rows))),
+            log_contexts,
+        )
+        finalized = self._publish_rows(
             group_id,
             rows,
             rollout_ids,
@@ -972,6 +1037,9 @@ class RolloutReassembler:
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
         )
+        if finalized.meta is not None:
+            finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
+        return finalized
 
     def _publish_rows(
         self,

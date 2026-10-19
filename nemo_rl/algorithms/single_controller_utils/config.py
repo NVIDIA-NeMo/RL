@@ -56,6 +56,7 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     ClusterConfig,
 )
+from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.models.generation.vllm.config import (
@@ -673,13 +674,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
-    selection_policy: Literal["returned_history", "all_captured"] = "returned_history"
+    # Custom policies use an importable package.module:function path.
+    selection_policy: str = "returned_history"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
-        if self.selection_policy == "all_captured" and not self.forest_training:
+        resolve_selection_policy(self.selection_policy)
+        if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
-                "selection_policy=all_captured requires forest_training=true"
+                f"selection_policy={self.selection_policy} requires forest_training=true"
             )
         return self
 

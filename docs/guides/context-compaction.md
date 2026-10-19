@@ -121,6 +121,24 @@ Failed parents and failed scored calls remain invalid. Neither policy infers
 agent roles. `all_captured` requires `forest_training: true`; it does not enable
 per-agent rewards or remove the execution restrictions below.
 
+Custom policies use the same setting, for example
+`selection_policy: my_harness.training:select_calls`. The module must be importable
+in both the controller and Gym actor environments. Policy resolution happens during
+configuration validation, so an unknown name, missing import, or non-callable target
+fails before rollout.
+
+The synchronous function takes `(records, result)`: this attempt's `list[CallRecord]`
+and the ordinary harness result dictionary. It returns
+`(selected_records, terminal_response_id)`. Return a nonempty list of unique,
+unchanged records from the supplied capture and the served `response_id` of the
+scored call within that list. Selection order determines root/path priority;
+captured parents still determine reconstruction. The interface permits `None` as
+the terminal type, but a trainable selection must identify its scored response;
+the adapter rejects a missing terminal rather than guessing one. Custom selectors
+own membership and reward attribution, not segment definitions. They use the same
+completion checks, failure masking, and reconstruction as built-ins. Non-default
+policies require `forest_training: true`.
+
 For a SingleController configuration that otherwise supports Gym token capture, set these overrides together:
 
 ```yaml
@@ -175,6 +193,15 @@ check before whole-rollout mask propagation; they do not count all rows excluded
 by that propagation.
 
 Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
+
+Captured-rollout length metrics are emitted after tensor verification, with one
+observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned
+generated tokens across its rows; `max_gen_tokens_per_turn` is the largest actual
+model generation, and `total_tokens_per_sample` is its longest verified context
+chain. Rewritten input, shared-prefix copies, and execution padding do not count
+as generated output. Environment masking does not erase verified generations;
+unverifiable owners contribute zero. These are generation statistics before
+learner-side filtering, not counts of tokens ultimately used in the loss.
 
 Checkpoint/resume is separate work in [#4200](https://github.com/NVIDIA-NeMo/RL/pull/4200), tracked by [#4558](https://github.com/NVIDIA-NeMo/RL/issues/4558). The current path rejects trainer checkpoints and rollout snapshots rather than resuming without the accepted-call selection metadata.
 

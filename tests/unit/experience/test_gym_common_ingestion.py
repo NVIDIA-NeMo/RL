@@ -24,7 +24,7 @@ from nemo_gym.token_id_capture.staging.records import (
     RolloutManifest,
 )
 
-from nemo_rl.environments.gym_selection import select_captured_calls
+from nemo_rl.environments.call_selection import select_captured_calls
 from nemo_rl.environments.nemo_gym import _normalize_gym_validity
 from tests.unit.experience.test_agent_output_compatibility import captured  # noqa: F401
 from tests.unit.experience.test_common_output_comparison import message, record
@@ -70,7 +70,14 @@ def test_accepted_earlier_call_after_rejected_attempt_needs_no_parent_hint(
         ("response_status", "incomplete", "finish reason"),
     ],
 )
-@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "returned_history",
+        "all_captured",
+        "nemo_rl.environments.call_selection:select_all_captured",
+    ],
+)
 def test_missing_capture_evidence_is_rejected(
     captured: Any,  # noqa: F811
     field: str,
@@ -152,7 +159,7 @@ def test_unsupported_generated_item_cannot_be_hidden_by_matching_calls(
     with pytest.raises(
         ValueError, match=f"Unsupported generated output item.*{item_type}"
     ):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
 
 
 def test_refusal_and_tool_results_keep_supported_selection() -> None:
@@ -179,7 +186,7 @@ def test_refusal_and_tool_results_keep_supported_selection() -> None:
             ],
         }
     }
-    assert select_captured_calls(records, result) == records
+    assert select_captured_calls(records, result)[0] == records
 
 
 def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract() -> (
@@ -197,13 +204,13 @@ def test_exact_ids_distinguish_equal_text_across_reset_and_ignore_old_contract()
             "selected_actions": [],
         },
     }
-    assert [r.response_id for r in select_captured_calls(records, result)] == [
+    assert [r.response_id for r in select_captured_calls(records, result)[0]] == [
         "response-2",
         "response-3",
     ]
     result["response"]["output"][0] = b | {"content": message("edited")["content"]}
     with pytest.raises(ValueError, match="Missing or ambiguous"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
 
 
 def test_reasoning_only_identity_and_whole_call_requirement() -> None:
@@ -216,15 +223,19 @@ def test_reasoning_only_identity_and_whole_call_requirement() -> None:
     records = [call(1, [reasoning]), call(2, [final])]
     assert (
         len(
-            select_captured_calls(records, {"response": {"output": [reasoning, final]}})
+            select_captured_calls(
+                records, {"response": {"output": [reasoning, final]}}
+            )[0]
         )
         == 2
     )
-    assert len(select_captured_calls(records, {"response": {"output": [final]}})) == 1
+    assert (
+        len(select_captured_calls(records, {"response": {"output": [final]}})[0]) == 1
+    )
     with pytest.raises(ValueError, match="Missing or ambiguous"):
         select_captured_calls(
             [call(3, [reasoning, final])], {"response": {"output": [final]}}
-        )
+        )[0]
 
 
 @pytest.mark.parametrize("accepted", [("response-2",), ("response-1", "response-2")])
@@ -240,7 +251,7 @@ def test_response_collection_native_ids_disambiguate_equal_outputs(
         ],
         "response": {"id": "aggregate", "output": [same, last]},
     }
-    assert tuple(r.response_id for r in select_captured_calls(records, result)) == (
+    assert tuple(r.response_id for r in select_captured_calls(records, result)[0]) == (
         *accepted,
         "response-3",
     )
@@ -253,7 +264,7 @@ def test_response_collection_native_id_cannot_contradict_output() -> None:
         select_captured_calls(
             records,
             {"responses": [{"id": "response-1", "output": [second]}]},
-        )
+        )[0]
 
 
 @pytest.mark.parametrize("collection", [False, True])
@@ -266,7 +277,7 @@ def test_native_envelope_accepts_scored_call_before_last_history_item(
     records = [call(1, [first]), call(2, [worker]), call(3, [scored], parent=1)]
     envelope = {"id": "response-3", "output": [first, scored, worker]}
     result = {"responses": [envelope]} if collection else {"response": envelope}
-    assert select_captured_calls(records, result) == [
+    assert select_captured_calls(records, result)[0] == [
         records[0],
         records[2],
         records[1],
@@ -283,7 +294,7 @@ def test_native_envelope_cannot_borrow_identity_from_previous_envelope() -> None
         ]
     }
     with pytest.raises(ValueError, match="Missing or ambiguous"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
 
 
 def test_response_collection_native_id_identifies_cumulative_terminal() -> None:
@@ -292,7 +303,7 @@ def test_response_collection_native_id_identifies_cumulative_terminal() -> None:
     selected = select_captured_calls(
         records,
         {"responses": [{"id": "response-2", "output": [first, last]}]},
-    )
+    )[0]
     assert [r.response_id for r in selected] == ["response-1", "response-2"]
 
 
@@ -311,9 +322,9 @@ def test_empty_synthetic_envelopes_do_not_erase_native_identity(
     }
     if contradict:
         with pytest.raises(ValueError, match="Missing or ambiguous"):
-            select_captured_calls(records, result)
+            select_captured_calls(records, result)[0]
     else:
-        assert [r.response_id for r in select_captured_calls(records, result)] == [
+        assert [r.response_id for r in select_captured_calls(records, result)[0]] == [
             "response-1"
         ]
 
@@ -329,7 +340,7 @@ def test_empty_native_envelope_cannot_claim_a_captured_generation() -> None:
                     {"id": "response-2", "output": [last]},
                 ]
             },
-        )
+        )[0]
 
 
 def test_existing_trajectory_references_exclude_noise_and_validate_both_ids() -> None:
@@ -347,16 +358,16 @@ def test_existing_trajectory_references_exclude_noise_and_validate_both_ids() ->
             ]
         },
     }
-    assert [r.response_id for r in select_captured_calls(records, result)] == [
+    assert [r.response_id for r in select_captured_calls(records, result)[0]] == [
         "response-1",
         "response-4",
     ]
     result["response"]["output"] = [message("copied prompt")]
     with pytest.raises(ValueError, match="Missing or ambiguous"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
     result["ng_trajectory"]["turns"][0]["model_calls"][0]["model_call_id"] = "call-2"
     with pytest.raises(ValueError, match="contradictory"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
 
 
 @pytest.mark.parametrize("with_references", [False, True])
@@ -405,10 +416,10 @@ def test_whole_output_validation_is_shared(with_references: bool, change: str) -
             "turns": [{"model_calls": [{"response_id": "response-1"}]}]
         }
     if change == "unchanged":
-        assert select_captured_calls(records, result) == records
+        assert select_captured_calls(records, result)[0] == records
     else:
         with pytest.raises(ValueError, match="Missing or ambiguous") as failure:
-            select_captured_calls(records, result)
+            select_captured_calls(records, result)[0]
         assert "authored_output_index=" in str(failure.value)
         assert "item_id=" in str(failure.value)
         assert "no whole captured call matches" in str(failure.value)
@@ -419,11 +430,11 @@ def test_references_disambiguate_equal_content_without_bypassing_validation() ->
     records = [call(1, [item]), call(2, [item])]
     result = {"response": {"id": "export", "output": [item]}}
     with pytest.raises(ValueError, match="multiple captured calls match"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
     result["ng_trajectory"] = {
         "turns": [{"model_calls": [{"response_id": "response-2"}]}]
     }
-    assert select_captured_calls(records, result) == [records[1]]
+    assert select_captured_calls(records, result)[0] == [records[1]]
 
 
 @pytest.mark.parametrize("output", [[], [message("first")]])
@@ -438,7 +449,7 @@ def test_output_must_cover_all_explicitly_referenced_calls(output: list[dict]) -
         },
     }
     with pytest.raises(ValueError, match="missing referenced generations") as failure:
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
     assert "call-2" in str(failure.value)
 
 
@@ -450,7 +461,7 @@ def test_references_cannot_select_different_calls_from_matching_output() -> None
         "ng_trajectory": {"turns": [{"model_calls": [{"model_call_id": "call-1"}]}]},
     }
     with pytest.raises(ValueError, match="expected_call='call-1'"):
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
 
 
 def test_reference_only_output_keeps_existing_identity_checks() -> None:
@@ -458,10 +469,10 @@ def test_reference_only_output_keeps_existing_identity_checks() -> None:
     result = {
         "ng_trajectory": {"turns": [{"model_calls": [{"model_call_id": "call-1"}]}]}
     }
-    assert select_captured_calls(records, result) == records
+    assert select_captured_calls(records, result)[0] == records
     result["ng_trajectory"]["turns"][0]["model_calls"][0]["model_call_id"] = "unknown"
     with pytest.raises(ValueError, match="outside this capture") as failure:
-        select_captured_calls(records, result)
+        select_captured_calls(records, result)[0]
     assert "model_call_id='unknown'" in str(failure.value)
     assert "turn=0, reference=0" in str(failure.value)
 
@@ -576,7 +587,63 @@ def test_capture_evidence_roundtrip_restart_and_conflict(
 def test_identical_retry_is_resolved_by_the_terminal_parent_chain() -> None:
     a, b = message("A"), message("B")
     records = [call(1, [a]), call(2, [a]), call(3, [b], parent=2)]
-    selected = select_captured_calls(
+    selected, terminal = select_captured_calls(
         records, {"response": {"id": "response-3", "output": [a, b]}}
     )
     assert [r.response_id for r in selected] == ["response-2", "response-3"]
+    assert terminal == "response-3"
+
+
+@pytest.mark.parametrize(
+    "mode,error",
+    [
+        ("valid", None),
+        ("duplicate", "unique captured calls"),
+        ("empty", "unique captured calls"),
+        ("foreign", "unchanged records"),
+        ("edited", "unchanged records"),
+        ("missing_terminal", "identify its scored terminal"),
+        ("unselected_terminal", "identify its scored terminal"),
+    ],
+)
+def test_external_selector_uses_shared_ingestion(
+    captured: Any,  # noqa: F811
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    error: str | None,
+) -> None:
+    (tmp_path / "integration_selection.py").write_text(
+        "def choose(records, result):\n"
+        "    mode = result['selector_mode']\n"
+        "    chosen = records[0]\n"
+        "    if mode == 'empty': return [], None\n"
+        "    if mode == 'duplicate': return [chosen, chosen], chosen.response_id\n"
+        "    if mode == 'foreign': chosen.model_call_id = 'outside-capture'\n"
+        "    if mode == 'edited': chosen.cum_len += 1\n"
+        "    if mode == 'missing_terminal': return [chosen], None\n"
+        "    if mode == 'unselected_terminal': return [chosen], records[1].response_id\n"
+        "    return [chosen], chosen.response_id\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    captured.queue.extend(
+        {"role": "assistant", "content": text, "reasoning": None}
+        for text in ("accepted", "rejected")
+    )
+    first, _ = [
+        captured.harness.post("owner", [{"role": "user", "content": "task"}]).json()
+        for _ in range(2)
+    ]
+    env = _env(captured.harness)
+    env._selection_policy = "integration_selection:choose"
+    run = env._postprocess_receipt_mode(
+        {"_ng_rollout_id": "owner"},
+        {"response": first, "reward": 1.0, "selector_mode": mode},
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            asyncio.run(run)
+    else:
+        result = asyncio.run(run)
+        assert result["logical_selection"].response_ids == (first["id"],)
+        assert not result["receipt"]["capture_poisoned"]
