@@ -184,6 +184,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Megatron Bridge provider fields without a first-class NeMo-RL setting.
+    model_overrides: NotRequired[dict[str, Any]]
 
 
 class MCoreGenerationConfig(GenerationConfig):

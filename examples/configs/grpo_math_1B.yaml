@@ -197,6 +197,10 @@ policy:
   
   megatron_cfg:
     enabled: false
+    # When true, offload_after_refit skips rerunning the full offload_before_refit
+    # pass and only re-offloads the optimizer with a single allocator cleanup.
+    # When true, stage the per-step reference-policy swap in persistent pinned
+    # CPU buffers instead of pageable copies (faster PCIe, more host RAM).
     # Arbitrary overrides applied recursively to the Megatron Bridge model
     # provider before model instantiation. Do not duplicate first-class fields.
     model_overrides: {}
@@ -269,6 +273,9 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -513,6 +520,8 @@ policy:
       http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.

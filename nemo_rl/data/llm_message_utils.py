@@ -817,9 +817,12 @@ def decompose_message_log(
     - ``turn_lengths`` — ``torch.LongTensor(B, max_turns)``, zero in unused slots.
     - ``turn_roles`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
     - ``turn_contents`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
-    - ``response_token_lengths`` — ``torch.LongTensor(B,)``, assistant-turn
-      length per sample (0 if no assistant turn). Consumed by
+    - ``response_token_lengths`` — ``torch.LongTensor(B,)``, total length of
+      generated assistant turns per sample (0 if none). Prompt-history assistant
+      turns lack ``generation_logprobs`` and are excluded. Consumed by
       :func:`nemo_rl.algorithms.reward_functions.apply_reward_shaping`.
+
+    Call before loss-mask preparation backfills missing ``generation_logprobs``.
     """
     batch_size = len(message_log_batch)
     max_turns = max((len(ml) for ml in message_log_batch), default=0)
@@ -844,8 +847,8 @@ def decompose_message_log(
                 continue
             length = int(tok.shape[0]) if isinstance(tok, torch.Tensor) else len(tok)
             lengths_i[t] = length
-            if role == "assistant" and response_lengths[i] == 0:
-                response_lengths[i] = length
+            if role == "assistant" and "generation_logprobs" in m:
+                response_lengths[i] += length
         turn_roles[i] = roles
         turn_contents[i] = contents
 
