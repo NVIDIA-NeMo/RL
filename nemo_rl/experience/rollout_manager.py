@@ -2198,6 +2198,11 @@ class _LedgerDispatchRecorder:
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
+    # Set by the controller: finds the step a group without a target step is tallied
+    # under. A class attribute so a manager built without a controller tallies only the
+    # stamped groups.
+    _tally_step_provider: Optional[Callable[[], int]] = None
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -2476,6 +2481,14 @@ class RolloutManager:
         if isinstance(self._impl, AsyncNemoGymRolloutImpl):
             self._impl.set_next_nemo_gym_task_index(value)
 
+    def set_tally_step_provider(self, provider: Callable[[], int]) -> None:
+        """Set how a group with no target step finds the step it is tallied under.
+
+        Args:
+            provider: Zero-arg accessor for the step currently being assembled.
+        """
+        self._tally_step_provider = provider
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -2532,6 +2545,8 @@ class RolloutManager:
         zero_variance: bool,
     ) -> None:
         """Record a finished group's rewards for its original target step."""
+        if target_step is None and self._tally_step_provider is not None:
+            target_step = self._tally_step_provider()
         record_group_rewards(
             self._step_rewards,
             target_step,
