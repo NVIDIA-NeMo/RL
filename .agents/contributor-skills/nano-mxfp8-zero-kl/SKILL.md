@@ -45,7 +45,28 @@ To add a missing PR, inside `$M`: `git cherry-pick -s -S 1abb04855` for #7562, a
 `curl -sL https://github.com/NVIDIA/Megatron-LM/pull/8195.diff | git apply --index` for #8195.
 Then bump the submodule pins.
 
-## 3. Recipe knobs
+## 3. Worker venv with flash-attn-4
+
+If a worker fails with `flash-attn-4 is not installed (mcore extra)`, the image's prebuilt
+venv is older than this repo's FA4 pin. Rebuild the worker venvs once into a shared
+directory, then reuse them:
+
+```bash
+# first run: build
+NEMO_RL_VENV_DIR=/lustre/.../venvs/<name> NRL_FORCE_REBUILD_VENVS=true uv run examples/run_grpo.py ...
+# every later run: reuse
+NEMO_RL_VENV_DIR=/lustre/.../venvs/<name> uv run examples/run_grpo.py ...
+```
+
+Set both on the command that runs inside the container: the image sets its own
+`NEMO_RL_VENV_DIR`, which beats values exported on the Slurm side. Run later jobs from the same code path as the build: the venv's editable installs point at
+it. The check must print `ok`:
+
+```bash
+ls -d /lustre/.../venvs/<name>/*/lib/python3.*/site-packages/flash_attn_4-4.0.0b19.dist-info >/dev/null && echo ok
+```
+
+## 4. Recipe knobs
 
 Check these values in the **resolved** recipe `$R`, after `defaults:` inheritance. The
 validator does not catch the items marked **not validated**: if one of them is wrong, the
@@ -103,9 +124,9 @@ Top level:
 | `cluster.segment_size` | `null` (with 1-node training and generation clusters) | fails at startup |
 
 Not required: synchronous GRPO. `grpo.async_grpo` is not validated, and async works (it
-helps convergence). Section 5 says which checks apply to sync and async.
+helps convergence). Section 6 says which checks apply to sync and async.
 
-## 4. Precision file (`$P`)
+## 5. Precision file (`$P`)
 
 Required matchers, in this order (first match wins):
 
@@ -130,7 +151,7 @@ Validated in `setup.py`: both override flags in every MXFP8 block present, and
 `fp8_param: true` requires `fp8_cfg.fp8_param: true`. **Not validated**: the matchers and
 their order, `fp8_format`, and a missing `evaluation_recipe` (an absent block is skipped).
 
-## 5. Confirm with a run
+## 6. Confirm with a run
 
 Run `tests/test_suites/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.sh`
 (2 GB200 nodes, 5 steps), sync or async. It passes only if:
