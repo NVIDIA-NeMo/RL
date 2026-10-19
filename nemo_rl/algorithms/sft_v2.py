@@ -57,6 +57,7 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
+    iteration_scope,
     managed_span,
     trace_context_kwargs,
     umbrella_span,
@@ -222,18 +223,22 @@ class SFTSingleControllerActor:
             with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
                 self._trainer.prepare_for_training()
                 while self._save_state.total_steps < self._max_steps:
-                    metrics = self._run_train_step()
-                    self._logger.log_metrics(metrics, self._save_state.total_steps)
-                    metric = self._checkpoint_metric(metrics)
-                    self._timeout.mark_iteration()
-                    save_by_timeout = self._timeout.check_save()
-                    if self._should_save(save_by_timeout=save_by_timeout):
-                        self._save_checkpoint(metric)
-                    if save_by_timeout:
-                        # check_save fires once and then latches, so continuing
-                        # would train unsaved until the walltime kill.
-                        print("Timeout has been reached, stopping training early")
-                        break
+                    # Read before _run_train_step increments it, so the whole
+                    # pass is tagged with the step that is running rather than
+                    # the one that just finished.
+                    with iteration_scope(self._save_state.total_steps + 1):
+                        metrics = self._run_train_step()
+                        self._logger.log_metrics(metrics, self._save_state.total_steps)
+                        metric = self._checkpoint_metric(metrics)
+                        self._timeout.mark_iteration()
+                        save_by_timeout = self._timeout.check_save()
+                        if self._should_save(save_by_timeout=save_by_timeout):
+                            self._save_checkpoint(metric)
+                        if save_by_timeout:
+                            # check_save fires once and then latches, so continuing
+                            # would train unsaved until the walltime kill.
+                            print("Timeout has been reached, stopping training early")
+                            break
                 return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
