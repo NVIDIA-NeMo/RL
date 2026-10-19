@@ -72,6 +72,7 @@ from nemo_rl.models.generation.vllm.utils import (
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
+    vllm_timeline_fields,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -79,6 +80,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.timer import timeline_collection_enabled
 
 LOGGER = logging.getLogger(__name__)
 
@@ -284,6 +286,9 @@ class VllmAsyncGenerationWorkerImpl(
         # exact engine prompt ids recorded at preprocess time, and the media
         # snapshot the engine ran on (see CapturedRequest).
         self._capture_calls: dict[int, CapturedRequest] = {}
+        # Per-request timeline fields keyed by id(request), set by the chat
+        # full generator and popped by the route that serializes the response.
+        self._timeline_fields: dict[int, dict[str, int]] = {}
         self._capture_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
@@ -1372,6 +1377,11 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res,
                     )
 
+                if timeline_collection_enabled():
+                    worker_self._timeline_fields[id(request)] = vllm_timeline_fields(
+                        final_res, time.time_ns() - time.monotonic_ns()
+                    )
+
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
@@ -1403,6 +1413,10 @@ class VllmAsyncGenerationWorkerImpl(
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        if timeline_collection_enabled():
+            # Per-request prefix reuse (usage.prompt_tokens_details.cached_tokens)
+            # for the timeline; an explicit recipe setting still wins.
+            serving_chat_kwargs.setdefault("enable_prompt_tokens_details", True)
         # The embedded server is constructed directly instead of through
         # vLLM's CLI, where chat-template file paths are normally loaded.
         # OnlineRenderer expects literal Jinja content; passing a path makes
@@ -1473,6 +1487,8 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
+            # Route receipt, the timeline's nemo_llm_arrival_ts_us.
+            arrival_ts_us = time.time_ns() // 1_000
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
@@ -1592,6 +1608,8 @@ class VllmAsyncGenerationWorkerImpl(
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
 
+            timeline_fields = worker_self._timeline_fields.pop(id(request), None)
+
             if isinstance(generator, ErrorResponse):
                 worker_self._abort_request_capture(request, reason="error_response")
                 return JSONResponse(
@@ -1617,6 +1635,10 @@ class VllmAsyncGenerationWorkerImpl(
                         request, reason="client_disconnect"
                     )
                     raise
+                if timeline_fields is not None:
+                    content.update(timeline_fields)
+                    content["nemo_llm_arrival_ts_us"] = arrival_ts_us
+                    content["nemo_llm_response_ready_ts_us"] = time.time_ns() // 1_000
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")

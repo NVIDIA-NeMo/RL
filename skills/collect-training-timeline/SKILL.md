@@ -31,10 +31,15 @@ per line, epoch-microsecond `ts`, microsecond `dur`):
    [references/rollout-instrumentation.md](references/rollout-instrumentation.md).
 
 The NeMo-RL side is already in the tree. `nemo_rl/utils/timer.py` handles
-training events, `ReplayBuffer(lifecycle_log_path=...)` handles the lifecycle,
-and the TRT-LLM `trtllm_http_server.py` / `trtllm_disagg_server.py` emit
-per-request `nemo_llm_*`, `nemo_ctx_*` and `nemo_fe_*` fields. The vLLM worker
-does not emit request milestones yet.
+training events, and `ReplayBuffer(lifecycle_log_path=...)` handles the
+lifecycle. Both generation backends emit per-request fields:
+- TRT-LLM: `trtllm_http_server.py` / `trtllm_disagg_server.py` emit
+  `nemo_llm_*`, plus `nemo_ctx_*` and `nemo_fe_*` under PD disaggregation.
+- vLLM: the async worker's `/v1/chat/completions` emits `nemo_llm_*` from
+  `RequestOutput.metrics`, and turns on `enable_prompt_tokens_details` for
+  `cached_tokens`.
+
+Both are off unless the flag is set.
 
 ## Plot
 

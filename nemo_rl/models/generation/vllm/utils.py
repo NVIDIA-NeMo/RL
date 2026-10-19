@@ -950,3 +950,41 @@ def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
     if config.get("quant_cfg") is None:
         return default_cls
     return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+def vllm_timeline_fields(
+    request_output: Any, epoch_minus_monotonic_ns: int
+) -> dict[str, int]:
+    """Per-request engine milestones for the collect-training-timeline skill.
+
+    vLLM records ``queued_ts``, ``scheduled_ts``, ``first_token_ts`` and
+    ``last_token_ts`` on ``RequestOutput.metrics`` (``RequestStateStats``) as
+    engine-core monotonic seconds. CLOCK_MONOTONIC is host-wide and the engine
+    core runs on the serving host, so this host's epoch-minus-monotonic offset
+    converts them to the epoch microseconds the rest of the timeline uses.
+    ``metrics`` is only populated with ``disable_log_stats=False``; an unset or
+    zero stat is omitted rather than converted.
+
+    Args:
+        request_output: The final ``RequestOutput`` of one request.
+        epoch_minus_monotonic_ns: ``time.time_ns() - time.monotonic_ns()``,
+            read in this process.
+
+    Returns:
+        The ``nemo_llm_{queued,first_scheduled,first_token,last_token}_ts_us``
+        fields that are available.
+    """
+    stats = getattr(request_output, "metrics", None)
+    fields: dict[str, int] = {}
+    if stats is None:
+        return fields
+    for attr, field in (
+        ("queued_ts", "nemo_llm_queued_ts_us"),
+        ("scheduled_ts", "nemo_llm_first_scheduled_ts_us"),
+        ("first_token_ts", "nemo_llm_first_token_ts_us"),
+        ("last_token_ts", "nemo_llm_last_token_ts_us"),
+    ):
+        value = getattr(stats, attr, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            fields[field] = (int(value * 1_000_000_000) + epoch_minus_monotonic_ns) // 1_000
+    return fields
