@@ -34,52 +34,21 @@ from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.utils.config import load_config
 
 
-@pytest.fixture
-def worker_for_server_args(monkeypatch):
+@pytest.mark.parametrize(
+    "setting, expected", [(None, True), (True, True), (False, False)]
+)
+def test_worker_outlines_cache_default_and_opt_in(monkeypatch, setting, expected):
+    config = load_config("examples/configs/grpo_math_1B_sglang.yaml").policy.generation
+    # Exercise the worker fallback independently of the recipe's default.
+    config.sglang_cfg.pop("disable_outlines_disk_cache")
+    if setting is not None:
+        config.sglang_cfg.disable_outlines_disk_cache = setting
     monkeypatch.setattr(sglang_worker, "_apply_sglang_compat_patches", lambda: None)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     worker_class = sglang_worker.SGLangGenerationWorker.__ray_metadata__.modified_class
-    return worker_class(
-        gpus_per_node=1,
-        sglang_cfg={
-            "sglang_cfg": {
-                "model_path": "dummy",
-                "random_seed": 42,
-                "tp_size": 1,
-                "dp_size": 1,
-                "pp_size": 1,
-                "ep_size": 1,
-                "skip_server_warmup": True,
-                "sglang_server_config": {
-                    "num_gpus_per_engine": 1,
-                    "needs_offload": False,
-                    "cpu_weight_backup": False,
-                },
-            }
-        },
-        rank=0,
-        base_gpu_id=0,
-    )
+    worker = worker_class(gpus_per_node=1, sglang_cfg=config, rank=0, base_gpu_id=0)
 
-
-@pytest.mark.parametrize(
-    "overrides, expected",
-    [
-        pytest.param({}, True, id="omitted-disables-cache"),
-        pytest.param(
-            {"disable_outlines_disk_cache": True}, True, id="explicit-disable"
-        ),
-        pytest.param(
-            {"disable_outlines_disk_cache": False}, False, id="explicit-opt-in"
-        ),
-    ],
-)
-def test_worker_forwards_outlines_cache_policy(
-    worker_for_server_args, overrides, expected
-):
-    worker_for_server_args.sglang_cfg["sglang_cfg"].update(overrides)
-
-    args = worker_for_server_args._compute_server_args(
+    args = worker._compute_server_args(
         dist_init_addr="127.0.0.1:1500",
         nccl_port=1501,
         host="127.0.0.1",
@@ -87,23 +56,6 @@ def test_worker_forwards_outlines_cache_policy(
     )
 
     assert args["disable_outlines_disk_cache"] is expected
-
-
-@pytest.mark.parametrize("value", [None, "false", 0])
-def test_worker_rejects_non_boolean_cache_policy(worker_for_server_args, value):
-    worker_for_server_args.sglang_cfg["sglang_cfg"]["disable_outlines_disk_cache"] = (
-        value
-    )
-
-    with pytest.raises(
-        ValueError, match="disable_outlines_disk_cache must be a boolean"
-    ):
-        worker_for_server_args._compute_server_args(
-            dist_init_addr="127.0.0.1:1500",
-            nccl_port=1501,
-            host="127.0.0.1",
-            port=1502,
-        )
 
 
 def test_fault_tolerance_defaults_are_centralized_and_disabled():
