@@ -1624,17 +1624,21 @@ def setup(
                     "it as a cross-tokenizer teacher."
                 )
 
-    # With context parallelism every forwarded sequence width must split
-    # evenly across the CP ranks, and batch widths follow the data.
+    # With Automodel context parallelism every forwarded sequence width must
+    # split evenly across the CP ranks, and batch widths follow the data.
+    # Megatron pads its own inputs to its context-parallel layout.
     student_div = policy_config["make_sequence_length_divisible_by"]
-    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
-    assert student_div % student_cp == 0, (
-        f"policy.make_sequence_length_divisible_by ({student_div}) must be a "
-        f"multiple of policy.automodel_cfg.context_parallel_size ({student_cp})."
-    )
+    if not _megatron_enabled(policy_config):
+        student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
+        assert student_div % student_cp == 0, (
+            f"policy.make_sequence_length_divisible_by ({student_div}) must be a "
+            f"multiple of policy.automodel_cfg.context_parallel_size ({student_cp})."
+        )
     for i, (teacher, tc) in enumerate(zip(teachers, teacher_configs)):
+        if _megatron_enabled(tc):
+            continue
         teacher_cp = tc["automodel_cfg"]["context_parallel_size"]
-        if teacher.aligner.projection_matrix_path is None:
+        if not _teacher_is_cross_tokenizer(master_config, teacher):
             # A same-vocab teacher forwards the student batch.
             assert student_div % teacher_cp == 0, (
                 f"teachers.{i} is a same-vocab teacher, which forwards the "
