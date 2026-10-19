@@ -14,15 +14,27 @@
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     DynamoConfig,
+    DynamoDisaggregationConfig,
     DynamoFrontendArgs,
     DynamoWorkerArgs,
+    RolePoolConfig,
 )
 from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
+from nemo_rl.models.generation.dynamo.role_plan import (
+    DisaggRolePlan,
+    EngineRecord,
+    EngineSpec,
+)
 
 __all__ = [
+    "DisaggRolePlan",
     "DynamoCfg",
     "DynamoConfig",
+    "DynamoDisaggregationConfig",
     "DynamoFrontendArgs",
     "DynamoGeneration",
     "DynamoWorkerArgs",
+    "EngineRecord",
+    "EngineSpec",
+    "RolePoolConfig",
 ]
