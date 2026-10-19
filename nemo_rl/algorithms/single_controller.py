@@ -5438,11 +5438,14 @@ class SingleControllerActor:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. generation.drain_for_weight_update()  — no-op except managed Dynamo
-          5. weight_synchronizer.sync_weights(kv_scales=...), retried once if recovery
+          4. rollout_manager.wait_for_idle_rollouts()  — only if the generation requires it: hold new
+             turns and wait for outstanding requests (prefill/decode pools)
+          5. generation.drain_for_weight_update()  — no-op except managed Dynamo
+          6. weight_synchronizer.sync_weights(kv_scales=...), retried once if recovery
              rebuilds the group
-          6. generation.resume_after_weight_update()  — in finally, so also after a failed update
-          7. _rollout_permitted.set()   — resume
+          7. generation.resume_after_weight_update()  — in finally, so also after a failed
+             update; the turn gate reopens right after it
+          8. _rollout_permitted.set()   — resume
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -5506,6 +5509,20 @@ class SingleControllerActor:
         with self._timer.time("prepare_for_generation/sync_policy_params"):
             await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
+        # Engines that serve one request across several processes (prefill and
+        # decode pools behind a router) cannot drain themselves: a request between
+        # the two legs is invisible to every engine. For those the controller, as
+        # the only client, closes its turn gate and waits for every outstanding
+        # request to return first. The gate reopens in the finally below.
+        idle_rollouts_required = bool(
+            getattr(self._gen, "requires_idle_rollouts_before_weight_update", False)
+        )
+        if idle_rollouts_required:
+            with self._timer.time("prepare_for_generation/wait_for_idle_rollouts"):
+                await self._rollout_manager.wait_for_idle_rollouts(
+                    getattr(self._gen, "idle_rollouts_timeout_s", None)
+                )
+
         # A no-op for engines that serve through the refit. Backends whose weight
         # update is unsafe while any request runs (managed Dynamo) drain here, before
         # the trainer starts broadcasting, so the collective never waits on a peer
@@ -5558,7 +5575,11 @@ class SingleControllerActor:
             # both paths.
             self._record_refit_landed(participants)
         finally:
-            await asyncio.to_thread(self._gen.resume_after_weight_update)
+            try:
+                await asyncio.to_thread(self._gen.resume_after_weight_update)
+            finally:
+                if idle_rollouts_required:
+                    self._rollout_manager.release_turn_gate()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would

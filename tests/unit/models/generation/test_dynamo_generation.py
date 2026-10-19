@@ -14,6 +14,7 @@
 
 import asyncio
 import pickle
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -29,15 +30,22 @@ from nemo_rl.models.generation.dynamo.config import (
     VLLM_PACKED_BUFFER_SIZE_BYTES,
     VLLM_PACKED_NUM_BUFFERS,
 )
+from nemo_rl.models.generation.dynamo.megatron_refit_channel import (
+    MegatronRefitChannel,
+)
 from nemo_rl.models.generation.dynamo.metrics import (
     DynamoMetricsSampler,
     parse_prometheus_metrics,
 )
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
+from nemo_rl.models.generation.dynamo.role_plan import EngineRecord
+from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
 
 
-def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
-    return {
+def _config(
+    *, tp: int = 1, expose_http_server: bool = False, engine: str = "vllm"
+) -> dict[str, Any]:
+    config = {
         "backend": "dynamo",
         "model_name": "Qwen/Qwen3-0.6B",
         "max_new_tokens": 16,
@@ -92,12 +100,29 @@ def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
         },
         "vllm_kwargs": {},
     }
+    if engine == "megatron":
+        # One prefill and one decode engine, each `tp` ranks wide.
+        config["vllm_cfg"] = None
+        config["refit_transport"] = None
+        config["mcore_generation_config"] = {
+            "enable_prefix_caching": True,
+            "kv_cache_management_mode": "persist",
+            "expose_http_server": False,
+            "max_model_len": 5,
+        }
+        config["dynamo_cfg"]["engine"] = "megatron"
+        config["dynamo_cfg"]["disaggregation"] = {
+            role: {"workers": 1, "megatron_cfg": {"tensor_model_parallel_size": tp}}
+            for role in ("decode", "prefill")
+        }
+    return config
 
 
 def _patch_runtime(
     monkeypatch: pytest.MonkeyPatch,
     workers: list[dict[str, Any]] | None = None,
     calls: list[str] | None = None,
+    engines: dict[str, Any] | None = None,
 ) -> None:
     endpoints = workers or [
         {"instance_id": "worker-0", "system_url": "http://10.0.0.2:4000"}
@@ -105,8 +130,9 @@ def _patch_runtime(
     events = calls if calls is not None else []
 
     class FakeRuntime:
-        def __init__(self, *, cluster, config):
+        def __init__(self, *, cluster, config, **kwargs):
             events.append("init")
+            self.plan = kwargs.get("plan")
 
         def start(self):
             events.append("start")
@@ -115,11 +141,30 @@ def _patch_runtime(
         def frontend_url(self):
             return "http://10.0.0.1:3000/v1"
 
+        @property
+        def namespace(self):
+            return "ns"
+
         def refit_workers(self):
             return [dict(worker) for worker in endpoints]
 
         def validate_workers(self, expected):
             return expected
+
+        def expected_registrations(self):
+            return {"backend": ({"generate"}, 1), "prefill": ({"generate"}, 1)}
+
+        def engine_records(self):
+            return [
+                EngineRecord(
+                    spec.role,
+                    spec.world_size,
+                    spec.name,
+                    "10.0.0.2",
+                    engines[spec.name],
+                )
+                for spec in self.plan.engines
+            ]
 
         def shutdown(self):
             events.append("shutdown")
@@ -648,3 +693,188 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
 
     assert entered_count == request_count
     assert len(responses) == request_count
+
+
+# ---------------------------------------------------------------------------
+# Megatron prefill/decode engines behind the frontend
+# ---------------------------------------------------------------------------
+
+_MEGATRON_LOG: list[str] = []
+
+
+class _FakeMegatronEngine:
+    """Picklable stand-in for one MegatronGeneration; logs to a module list."""
+
+    def __init__(self, name: str, pinned: int = 0) -> None:
+        self.name = name
+        self.pinned = pinned
+
+    def prepare_refit_info(self, state_dict_info):
+        _MEGATRON_LOG.append(f"{self.name}.prepare")
+
+    def init_collective(self, ip, port, world_size, *, train_world_size):
+        _MEGATRON_LOG.append(f"{self.name}.init(off={train_world_size})")
+        return []
+
+    def update_weights_from_collective(self, refit_timeout_s=None):
+        _MEGATRON_LOG.append(f"{self.name}.update")
+        return []
+
+    def get_collective_sender_spec(self):
+        return CollectiveSenderSpec()
+
+    def suspend_for_refit(self):
+        _MEGATRON_LOG.append(f"{self.name}.suspend")
+
+    def resume_after_refit(self):
+        _MEGATRON_LOG.append(f"{self.name}.resume")
+
+    def prepare_for_generation(self, *args, **kwargs):
+        _MEGATRON_LOG.append(
+            f"{self.name}.prepare_for_generation({kwargs.get('tags')})"
+        )
+        return True
+
+    def pinned_handoff_block_count(self):
+        _MEGATRON_LOG.append(f"{self.name}.pins")
+        pinned, self.pinned = self.pinned, 0
+        return pinned
+
+
+def _policy_config(tp: int = 2) -> dict[str, Any]:
+    return {
+        "model_name": "Qwen/Qwen3-0.6B",
+        "megatron_cfg": {
+            "enabled": True,
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+        },
+        "generation": _config(tp=tp, engine="megatron"),
+    }
+
+
+def _megatron_generation(monkeypatch, *, prefill_pinned: int = 0, gpus: int = 4):
+    _MEGATRON_LOG.clear()
+    events: list[str] = []
+    engines = {
+        "decode-0": _FakeMegatronEngine("d0"),
+        "prefill-0": _FakeMegatronEngine("p0", pinned=prefill_pinned),
+    }
+    _patch_runtime(monkeypatch, calls=events, engines=engines)
+    waits: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        generation_module,
+        "wait_for_frontend_registrations",
+        lambda **kwargs: waits.append(kwargs),
+    )
+    generation = DynamoGeneration(
+        cluster=SimpleNamespace(world_size=lambda: gpus, num_gpus_per_node=8),
+        config=_config(tp=2, engine="megatron"),
+        tokenizer=object(),
+        policy_config=_policy_config(),
+    )
+    return generation, events, waits
+
+
+def test_megatron_engines_build_the_channel_and_require_idle_rollouts(
+    monkeypatch,
+) -> None:
+    generation, events, _ = _megatron_generation(monkeypatch)
+    assert events == ["init", "start"]
+    assert isinstance(generation._refit_channel, MegatronRefitChannel)
+    assert generation.requires_idle_rollouts_before_weight_update is True
+    assert generation.idle_rollouts_timeout_s == 10
+    assert generation.get_inference_world_size() == 4
+    assert generation.get_collective_sender_spec().nccl_peer == "nemo"
+    assert generation.dp_openai_server_base_urls == [None]
+    generation.init_collective("ip", 1, 12, train_world_size=8)
+    assert _MEGATRON_LOG == ["d0.init(off=8)", "p0.init(off=10)"]
+    assert generation.shutdown() and events.count("shutdown") == 1
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error", "match"),
+    [
+        ({}, RuntimeError, "tokenizer and the full policy config"),
+        (
+            {"tokenizer": object(), "policy_config": _policy_config(), "gpus": 3},
+            ValueError,
+            "allocated=3, expected=4",
+        ),
+    ],
+    ids=["missing_policy_inputs", "plan_does_not_fit"],
+)
+def test_megatron_engines_reject_incomplete_setup(monkeypatch, kwargs, error, match):
+    _patch_runtime(monkeypatch, engines={})
+    gpus = kwargs.pop("gpus", 4)
+    with pytest.raises(error, match=match):
+        DynamoGeneration(
+            cluster=SimpleNamespace(world_size=lambda: gpus, num_gpus_per_node=8),
+            config=_config(tp=2, engine="megatron"),
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize("pickled", [False, True], ids=["driver", "controller_copy"])
+def test_megatron_drain_waits_for_pins_and_first_resume_awaits_frontend(
+    monkeypatch, pickled
+) -> None:
+    generation, _, waits = _megatron_generation(monkeypatch, prefill_pinned=2)
+    if pickled:
+        generation = pickle.loads(pickle.dumps(generation))
+        assert generation._managed_runtime is None
+        assert generation.requires_idle_rollouts_before_weight_update is True
+
+    generation.drain_for_weight_update()
+    assert _MEGATRON_LOG == [
+        "p0.pins",  # 2 pinned: poll again
+        "p0.pins",  # 0: idle
+        "d0.suspend",
+        "p0.suspend",
+        "d0.prepare_for_generation(['weights'])",
+        "p0.prepare_for_generation(['weights'])",
+    ]
+    _MEGATRON_LOG.clear()
+    generation.resume_after_weight_update()
+    generation.resume_after_weight_update()
+    assert _MEGATRON_LOG[:4] == [
+        "p0.prepare_for_generation(['kv_cache'])",
+        "p0.resume",
+        "d0.prepare_for_generation(['kv_cache'])",
+        "d0.resume",
+    ]
+    assert len(waits) == 1, "the frontend is awaited only at the first resume"
+    assert waits[0] == {
+        "base_url": "http://10.0.0.1:3000",
+        "namespace": "ns",
+        "expected": {"backend": ({"generate"}, 1), "prefill": ({"generate"}, 1)},
+        "expected_model": "Qwen/Qwen3-0.6B",
+        "timeout_s": 5,
+    }
+    assert generation._allowed_new_tokens(2) == 3
+    with pytest.raises(ValueError, match="mcore_generation_config.max_model_len=5"):
+        generation._allowed_new_tokens(5)
+
+
+@pytest.mark.parametrize("megatron_trainer", [False, True])
+def test_megatron_engine_settings_require_the_megatron_trainer(megatron_trainer):
+    master_config = SimpleNamespace(
+        async_rl=SimpleNamespace(
+            generation_fleet_health=SimpleNamespace(
+                enabled=False, refit_timeout_s=None
+            ),
+            recompute_kv_cache_after_weight_updates=False,
+        ),
+        policy={
+            "megatron_cfg": {"enabled": megatron_trainer},
+            "generation": _config(engine="megatron"),
+        },
+    )
+    # The shared drain-timeout rule is checked first; satisfy it here.
+    master_config.policy["generation"]["dynamo_cfg"]["control_timeout_s"] = 30
+    if megatron_trainer:
+        DynamoGeneration.validate_settings(master_config)
+    else:
+        with pytest.raises(ValueError, match="policy.megatron_cfg.enabled=true"):
+            DynamoGeneration.validate_settings(master_config)

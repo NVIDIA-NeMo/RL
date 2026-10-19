@@ -1,0 +1,107 @@
+# SingleController variant with Megatron prefill/decode engines behind Dynamo.
+#
+# Generation is disaggregated: the Dynamo frontend sends each request's prefill
+# to a prefill engine, hands the KV cache to a decode engine over NIXL, and
+# streams the completion back. The engines are NeMo RL's dedicated Megatron
+# inference policies (one worker group per engine); next to each runs
+# Megatron-LM's Dynamo adapter, which registers the engine with the frontend.
+#
+# Weight updates use the collective transport, as for backend: megatron with
+# colocated.enabled: false. Because a request spans two engines, the
+# SingleController first waits for every in-flight request and holds new ones
+# (bounded by dynamo_cfg.control_timeout_s), then suspends the engines, runs
+# the refit, resumes them, and reopens generation.
+defaults: grpo_math_1B_megatron_single_controller.yaml
+
+async_rl:
+  # Engines keep their caches across the refit (kv_cache_management_mode:
+  # persist); a post-refit flush would be a second drain.
+  recompute_kv_cache_after_weight_updates: false
+  generation_fleet_health:
+    # The Dynamo frontend owns routing, and the engines cannot abort their
+    # refit collective.
+    enabled: false
+    refit_timeout_s: null
+
+policy:
+  # Training uses the Megatron backend inherited from
+  # grpo_math_1B_megatron_single_controller.yaml; the engines receive its
+  # logical weights through the collective refit.
+  generation:
+    backend: dynamo
+    refit_transport: null
+    dynamo_cfg:
+      engine: megatron
+      # The adapter sidecars start at setup but the engines register only at
+      # the first weight update, after the trainer is built; this timeout
+      # covers that whole window.
+      startup_timeout_s: 3600
+      request_timeout_s: 900
+      # Bounds the pre-refit wait for in-flight requests to finish and the
+      # wait for prefill handoff pins to clear; must be >= request_timeout_s.
+      control_timeout_s: 900
+      metrics_include_prefixes: null
+      metrics_exclude_prefixes: null
+      # Megatron-LM source tree the adapter imports. null resolves to the
+      # Megatron-LM nested in the Megatron-Bridge submodule.
+      megatron_root: null
+      worker_args:
+        tool_call_parser: null
+        reasoning_parser: null
+        exclude_tools_when_tool_choice_none: true
+        enable_structural_tag: false
+        structural_tag_scope: auto
+        structural_tag_schema: auto
+        custom_jinja_template: null
+        # Base models without a chat template serve completions only.
+        endpoint_types: [completions]
+        extra_cli_args: []
+      frontend_args:
+        tokenizer: default
+        tokenizer_cache: false
+        tokenizer_cache_bytes: 52428800
+        router_mode: kv
+        extra_cli_args: []
+      disaggregation:
+        # One engine per role on one GPU each. Per-role megatron_cfg may set
+        # only the model-parallel layout keys; mcore_generation_config may set
+        # only engine-sizing keys (max_requests, max_tokens, buffer_size_gb,
+        # num_cuda_graphs, cuda_graph_max_tokens, cuda_graph_sizing_distribution).
+        prefill:
+          workers: 1
+          megatron_cfg:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+        decode:
+          workers: 1
+          megatron_cfg:
+            tensor_model_parallel_size: 1
+            pipeline_model_parallel_size: 1
+    mcore_generation_config:
+      # KV handoff reads the registered cache buffers in place; prefix caching
+      # is the allocator decode admission reuses. Both are required.
+      enable_prefix_caching: true
+      kv_cache_management_mode: persist
+      # The Dynamo frontend is the HTTP surface.
+      expose_http_server: false
+    # vLLM is not involved when dynamo_cfg.engine is megatron.
+    vllm_cfg: null
+    vllm_kwargs: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+cluster:
+  gpus_per_node: 3
+  num_nodes: 1
+
+logger:
+  log_dir: results/grpo-math-1b-dynamo-pd-megatron-single-controller
+  wandb:
+    name: grpo-dynamo-pd-megatron-single-controller-dev
+  swanlab:
+    name: grpo-dynamo-pd-megatron-single-controller-dev
+  mlflow:
+    run_name: grpo-dynamo-pd-megatron-single-controller-dev

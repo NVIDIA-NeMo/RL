@@ -752,6 +752,23 @@ class GenerationInterface(ABC):
     def resume_after_weight_update(self) -> None:
         """Resume serving after :meth:`drain_for_weight_update`."""
 
+    @property
+    def requires_idle_rollouts_before_weight_update(self) -> bool:
+        """Whether the controller must stop issuing requests before the drain.
+
+        Engines that serve a request across more than one process (prefill and
+        decode pools behind a router) cannot drain themselves: a request can sit
+        between the two legs where no single engine sees it. Such backends ask
+        the controller to close its turn gate and wait for every outstanding
+        request to return before :meth:`drain_for_weight_update` runs.
+        """
+        return False
+
+    @property
+    def idle_rollouts_timeout_s(self) -> float | None:
+        """Bound for the controller's wait for in-flight rollouts; None waits indefinitely."""
+        return None
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 

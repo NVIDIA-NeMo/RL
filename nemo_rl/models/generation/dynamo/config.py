@@ -15,6 +15,7 @@
 """Validated configuration for the managed Dynamo generation backend."""
 
 import warnings
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -24,6 +25,8 @@ from pydantic import (
     PositiveInt,
     model_validator,
 )
+
+from nemo_rl.models.generation.dynamo.role_plan import DisaggRolePlan
 
 # Packed weight-transfer geometry. NeMo RL declares it to each Dynamo worker in
 # the NCCL init info, and the trainer packs with the same values, so both sides
@@ -132,10 +135,100 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     extra_cli_args: list[str]
 
 
-class DynamoCfg(BaseModel, extra="forbid"):
-    """Driver-owned Dynamo service and worker-fleet configuration."""
+# Per-role overrides a Megatron engine may carry on top of policy.megatron_cfg.
+# Layout keys change the engine's rank count; the rest only size one engine.
+MEGATRON_ROLE_LAYOUT_KEYS = frozenset(
+    {
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "expert_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "context_parallel_size",
+    }
+)
+MEGATRON_ROLE_GENERATION_KEYS = frozenset(
+    {
+        "max_requests",
+        "max_tokens",
+        "buffer_size_gb",
+        "num_cuda_graphs",
+        "cuda_graph_max_tokens",
+        "cuda_graph_sizing_distribution",
+    }
+)
+VLLM_ROLE_OVERRIDE_KEYS = frozenset(
+    {
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "gpu_memory_utilization",
+        "enforce_eager",
+    }
+)
 
-    engine: Literal["vllm"]
+
+class RolePoolConfig(BaseModel, extra="forbid"):
+    """One prefill or decode pool: how many engines, and how each differs.
+
+    ``megatron_cfg`` overrides ``policy.megatron_cfg`` keys from
+    ``MEGATRON_ROLE_LAYOUT_KEYS``; ``mcore_generation_config`` overrides
+    ``policy.generation.mcore_generation_config`` keys from
+    ``MEGATRON_ROLE_GENERATION_KEYS``; ``vllm_cfg`` overrides
+    ``policy.generation.vllm_cfg`` keys from ``VLLM_ROLE_OVERRIDE_KEYS``.
+    Anything else is rejected so the two roles cannot drift in ways the KV
+    handoff cannot bridge (model, dtype, KV dtype, block size).
+    """
+
+    workers: PositiveInt
+    megatron_cfg: dict[str, Any] | None = None
+    mcore_generation_config: dict[str, Any] | None = None
+    vllm_cfg: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_override_keys(self) -> "RolePoolConfig":
+        for label, block, allowed in (
+            ("megatron_cfg", self.megatron_cfg, MEGATRON_ROLE_LAYOUT_KEYS),
+            (
+                "mcore_generation_config",
+                self.mcore_generation_config,
+                MEGATRON_ROLE_GENERATION_KEYS,
+            ),
+            ("vllm_cfg", self.vllm_cfg, VLLM_ROLE_OVERRIDE_KEYS),
+        ):
+            if not block:
+                continue
+            unknown = sorted(set(block) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"dynamo_cfg.disaggregation.<role>.{label} may only override "
+                    f"{sorted(allowed)}; got {unknown}"
+                )
+        if self.megatron_cfg and self.megatron_cfg.get("context_parallel_size", 1) != 1:
+            raise ValueError(
+                "Megatron prefill/decode engines require context_parallel_size=1; "
+                "the KV handoff reshard planners have no context-parallel dimension"
+            )
+        return self
+
+
+class DynamoDisaggregationConfig(BaseModel, extra="forbid"):
+    """Fixed prefill and decode pools behind one Dynamo frontend."""
+
+    prefill: RolePoolConfig
+    decode: RolePoolConfig
+
+
+class DynamoCfg(BaseModel, extra="forbid"):
+    """Driver-owned Dynamo service and worker-fleet configuration.
+
+    ``engine`` selects what runs behind the frontend: Dynamo-managed ``vllm``
+    workers (aggregated only, as today) or NeMo-RL-owned ``megatron`` inference
+    engines (prefill/decode disaggregated, requires ``disaggregation``).
+    ``megatron_root`` is the Megatron-LM source tree the adapter sidecar
+    imports; None resolves to the Megatron-LM nested in the Megatron-Bridge
+    submodule.
+    """
+
+    engine: Literal["vllm", "megatron"]
     startup_timeout_s: PositiveFloat
     request_timeout_s: PositiveFloat
     control_timeout_s: PositiveFloat
@@ -143,6 +236,23 @@ class DynamoCfg(BaseModel, extra="forbid"):
     frontend_args: DynamoFrontendArgs
     metrics_include_prefixes: list[str] | None
     metrics_exclude_prefixes: list[str] | None
+    disaggregation: DynamoDisaggregationConfig | None = None
+    megatron_root: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_engine_mode(self) -> "DynamoCfg":
+        if self.engine == "megatron" and self.disaggregation is None:
+            raise ValueError(
+                "dynamo_cfg.engine='megatron' requires dynamo_cfg.disaggregation "
+                "with prefill and decode pools; aggregated Megatron engines behind "
+                "Dynamo are not supported"
+            )
+        if self.engine == "vllm" and self.disaggregation is not None:
+            raise ValueError(
+                "dynamo_cfg.disaggregation is not supported with "
+                "dynamo_cfg.engine='vllm' yet; use engine='megatron'"
+            )
+        return self
 
 
 class DynamoVllmConfig(BaseModel, extra="allow"):
@@ -252,13 +362,30 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
         return self
 
 
-def _require_nonempty_vllm_config(value: Any) -> Any:
+def _vllm_config_or_none(value: Any) -> Any:
+    """Keep ``None`` (Megatron engines) and reject an empty vLLM mapping."""
+    if value is None:
+        return None
     if not isinstance(value, dict) or not value:
         raise ValueError(
             "policy.generation.vllm_cfg must be a nonempty mapping when "
-            "backend='dynamo'"
+            "backend='dynamo' and dynamo_cfg.engine='vllm'"
         )
     return value
+
+
+def _megatron_engine_world_size(base_megatron_cfg: Mapping[str, Any], overrides: Mapping[str, Any]) -> int:
+    """Ranks in one Megatron engine (DP = 1): TP x PP, with CP pinned to 1."""
+    merged = {**base_megatron_cfg, **overrides}
+    tp = int(merged["tensor_model_parallel_size"])
+    pp = int(merged["pipeline_model_parallel_size"])
+    cp = int(merged.get("context_parallel_size", 1))
+    if cp != 1:
+        raise ValueError(
+            "Megatron prefill/decode engines require context_parallel_size=1; "
+            f"got {cp}"
+        )
+    return tp * pp
 
 
 class DynamoConfig(BaseModel, extra="allow"):
@@ -267,18 +394,123 @@ class DynamoConfig(BaseModel, extra="allow"):
     backend: Literal["dynamo"]
     dynamo_cfg: DynamoCfg
     vllm_cfg: Annotated[
-        DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
-    ]
-    vllm_kwargs: dict[str, Any]
+        DynamoVllmConfig | None, BeforeValidator(_vllm_config_or_none)
+    ] = None
+    vllm_kwargs: dict[str, Any] = {}
+
+    @property
+    def is_megatron_engine(self) -> bool:
+        return self.dynamo_cfg.engine == "megatron"
 
     @property
     def engine_world_size(self) -> int:
         """Return the derived ranks in each single-node vLLM engine."""
+        if self.vllm_cfg is None:
+            raise ValueError(
+                "engine_world_size is only defined for dynamo_cfg.engine='vllm'; "
+                "Megatron engines take their layout from the role plan"
+            )
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
+
+    def role_plan(
+        self, base_megatron_cfg: Mapping[str, Any] | None = None
+    ) -> DisaggRolePlan:
+        """Build the engine plan for ``dynamo_cfg.disaggregation``.
+
+        Args:
+            base_megatron_cfg: ``policy.megatron_cfg`` for Megatron engines; the
+                per-role ``megatron_cfg`` overrides are applied on top of it.
+        """
+        disaggregation = self.dynamo_cfg.disaggregation
+        if disaggregation is None:
+            raise ValueError("dynamo_cfg.disaggregation is not configured")
+        if self.is_megatron_engine:
+            if base_megatron_cfg is None:
+                raise ValueError(
+                    "policy.megatron_cfg is required to plan Megatron engines"
+                )
+            sizes = {
+                role: _megatron_engine_world_size(
+                    base_megatron_cfg, pool.megatron_cfg or {}
+                )
+                for role, pool in (
+                    ("decode", disaggregation.decode),
+                    ("prefill", disaggregation.prefill),
+                )
+            }
+        else:
+            assert self.vllm_cfg is not None
+            base = {
+                "tensor_parallel_size": self.vllm_cfg.tensor_parallel_size,
+                "pipeline_parallel_size": self.vllm_cfg.pipeline_parallel_size,
+            }
+            sizes = {}
+            for role, pool in (
+                ("decode", disaggregation.decode),
+                ("prefill", disaggregation.prefill),
+            ):
+                merged = {**base, **(pool.vllm_cfg or {})}
+                sizes[role] = int(merged["tensor_parallel_size"]) * int(
+                    merged["pipeline_parallel_size"]
+                )
+        return DisaggRolePlan.from_role_counts(
+            decode_workers=disaggregation.decode.workers,
+            decode_world_size=sizes["decode"],
+            prefill_workers=disaggregation.prefill.workers,
+            prefill_world_size=sizes["prefill"],
+            decode_cfg=disaggregation.decode.model_dump(exclude_none=True),
+            prefill_cfg=disaggregation.prefill.model_dump(exclude_none=True),
+        )
 
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
         extra = self.model_extra or {}
+        if self.is_megatron_engine:
+            if self.vllm_kwargs:
+                raise ValueError(
+                    "policy.generation.vllm_kwargs must be empty when "
+                    "dynamo_cfg.engine='megatron'"
+                )
+            if extra.get("colocated", {}).get("enabled"):
+                raise ValueError(
+                    "policy.generation.colocated.enabled must be false when "
+                    "backend='dynamo'"
+                )
+            if extra.get("refit_transport") is not None:
+                raise ValueError(
+                    "policy.generation.refit_transport must be null when "
+                    "dynamo_cfg.engine='megatron'; the collective transport is used"
+                )
+            mcore = extra.get("mcore_generation_config")
+            if not isinstance(mcore, dict):
+                raise ValueError(
+                    "policy.generation.mcore_generation_config is required when "
+                    "dynamo_cfg.engine='megatron'"
+                )
+            if not mcore.get("enable_prefix_caching"):
+                raise ValueError(
+                    "mcore_generation_config.enable_prefix_caching must be true for "
+                    "Megatron prefill/decode engines: decode admission reuses the "
+                    "prefix-cache allocator"
+                )
+            if mcore.get("kv_cache_management_mode") != "persist":
+                raise ValueError(
+                    "mcore_generation_config.kv_cache_management_mode must be "
+                    "'persist' for Megatron prefill/decode engines; offload and "
+                    "recompute invalidate the registered KV transfer buffers"
+                )
+            if mcore.get("expose_http_server"):
+                raise ValueError(
+                    "mcore_generation_config.expose_http_server must be false when "
+                    "dynamo_cfg.engine='megatron'; the Dynamo frontend is the HTTP "
+                    "surface"
+                )
+            return self
+        if self.vllm_cfg is None:
+            raise ValueError(
+                "policy.generation.vllm_cfg is required when dynamo_cfg.engine='vllm'"
+            )
+        vllm_cfg = self.vllm_cfg
         # Shared GRPO YAML inheritance supplies mcore_generation_config and
         # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
         # synchronizer instead, so these two sections are intentionally ignored.
@@ -306,7 +538,7 @@ class DynamoConfig(BaseModel, extra="allow"):
                     "when backend='dynamo'"
                 )
         speculative_config = self.vllm_kwargs.get("speculative_config") or (
-            self.vllm_cfg.model_extra or {}
+            vllm_cfg.model_extra or {}
         ).get("speculative_config")
         if speculative_config:
             raise ValueError(
@@ -319,7 +551,7 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.vllm_kwargs.quantization is not supported "
                 "when backend='dynamo'"
             )
-        vllm_extra = self.vllm_cfg.model_extra or {}
+        vllm_extra = vllm_cfg.model_extra or {}
         for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
             for source, value in (
                 ("vllm_cfg", vllm_extra.get(field)),

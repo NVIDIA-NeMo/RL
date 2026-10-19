@@ -380,6 +380,30 @@ def test_build_generation_constructs_dynamo_from_normalized_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_passes_policy_and_tokenizer_for_megatron_engines():
+    """Megatron prefill/decode engines are dedicated inference policies."""
+    master_config = _make_master_config(backend="dynamo", megatron_enabled=True)
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    master_config.policy["generation"]["dynamo_cfg"]["engine"] = "megatron"
+    inference_cluster = MagicMock(name="inference_cluster")
+    tokenizer = MagicMock(name="tokenizer")
+
+    with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
+        generation, _ = sc_setup_mod._build_generation(
+            inference_cluster,
+            master_config,
+            tokenizer=tokenizer,
+        )
+
+    mock_dynamo.assert_called_once_with(
+        cluster=inference_cluster,
+        config=master_config.policy["generation"],
+        tokenizer=tokenizer,
+        policy_config=master_config.policy,
+    )
+    generation.finish_generation.assert_called_once_with()
+
+
 def test_build_generation_rejects_deferred_dynamo_load():
     master_config = _make_master_config(backend="dynamo")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
@@ -1703,6 +1727,19 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_generation"].assert_not_called()
+
+    def test_megatron_engine_config_keeps_vllm_kwargs_empty(self, patched_factories):
+        """hf_config_overrides reach Megatron engines through the policy config."""
+        mc = _make_master_config(backend="dynamo", megatron_enabled=True)
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+        mc.policy["generation"]["dynamo_cfg"]["engine"] = "megatron"
+
+        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (raw_config,), _ = validate.call_args
+        assert "vllm_kwargs" not in raw_config
 
     def test_dynamo_generation_config_is_normalized(self, patched_factories):
         mc = _make_master_config(backend="dynamo")

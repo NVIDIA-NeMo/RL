@@ -59,8 +59,10 @@ from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
+    RolloutIdleTimeout,
     RolloutRetryPolicy,
     RolloutStats,
+    TurnGate,
     _nemo_gym_metric_namespace,
 )
 from nemo_rl.experience.rollout_recovery import (
@@ -864,6 +866,99 @@ class TestGenerateAndPushFlow:
 # ---------------------------------------------------------------------------
 # Tests for RolloutManager
 # ---------------------------------------------------------------------------
+
+
+class _BlockingGeneration:
+    """generate_async that parks until the test releases it."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.started = asyncio.Event()
+        self.proceed = asyncio.Event()
+        self.calls = 0
+        self.fail = fail
+
+    async def generate_async(self, data):
+        self.calls += 1
+        self.started.set()
+        await self.proceed.wait()
+        if self.fail:
+            raise RuntimeError("engine down")
+        input_len = int(data["input_lengths"][0])
+        yield (
+            0,
+            BatchedDataDict(
+                {
+                    "output_ids": torch.cat(
+                        (data["input_ids"], torch.tensor([[7]])), dim=1
+                    ),
+                    "unpadded_sequence_lengths": torch.tensor([input_len + 1]),
+                    "logprobs": torch.zeros(1, input_len + 1),
+                }
+            ),
+        )
+
+
+def _gated_turn(generation, gate: TurnGate):
+    impl = object.__new__(AsyncRolloutImpl)
+    impl._policy_generation = generation
+    impl._tokenizer = SimpleNamespace(pad_token_id=0, decode=lambda *a, **k: "x")
+    impl._timeouts = SimpleNamespace(generation_s=None)
+    impl._deadline_registry = None
+    impl._turn_gate = gate
+    message_log = [
+        {"role": "user", "content": "q", "token_ids": torch.tensor([1, 2, 3])}
+    ]
+    return asyncio.create_task(impl._generate_response(message_log, None))
+
+
+def test_turn_gate_wait_for_idle_waits_for_outstanding_turns_then_holds_new_ones():
+    async def scenario():
+        gate = TurnGate()
+        gen = _BlockingGeneration()
+        turn = _gated_turn(gen, gate)
+        await gen.started.wait()
+        assert gate.outstanding == 1
+
+        idle = asyncio.create_task(gate.wait_for_idle(timeout_s=5.0))
+        await asyncio.sleep(0)
+        assert not idle.done() and not gate.is_open
+
+        gen.proceed.set()
+        await turn
+        await idle
+        assert gate.outstanding == 0
+        assert not gate.is_open, "stays closed until the controller reopens it"
+
+        held = _gated_turn(gen, gate)
+        await asyncio.sleep(0.01)
+        assert gen.calls == 1, "a new turn must not reach the engine while closed"
+        gate.open()
+        await held
+        assert gen.calls == 2 and gate.outstanding == 0
+
+    _run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["idle_wait_timeout", "generation_error"])
+def test_turn_gate_recovers_from_failures(failure):
+    async def scenario():
+        gate = TurnGate()
+        gen = _BlockingGeneration(fail=failure == "generation_error")
+        turn = _gated_turn(gen, gate)
+        await gen.started.wait()
+        if failure == "idle_wait_timeout":
+            with pytest.raises(RolloutIdleTimeout, match="1 generation request"):
+                await gate.wait_for_idle(timeout_s=0.01)
+            assert gate.is_open, "a timed-out wait reopens the gate"
+            gen.proceed.set()
+            await turn
+        else:
+            gen.proceed.set()
+            with pytest.raises(RuntimeError, match="engine down"):
+                await turn
+        assert gate.outstanding == 0
+
+    _run(scenario())
 
 
 def test_rollout_manager_raises_without_impl_params():

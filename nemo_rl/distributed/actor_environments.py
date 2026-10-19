@@ -55,6 +55,8 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
+    # CPU sidecar that spawns the Megatron Dynamo adapter in the Dynamo venv.
+    "nemo_rl.models.generation.dynamo.megatron_engine_pool.DynamoMegatronAdapterActor": None,
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],

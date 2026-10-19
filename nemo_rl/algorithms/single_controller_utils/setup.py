@@ -516,9 +516,15 @@ def _build_clusters(
                     "pipeline_parallel_size", 1
                 )
             elif backend == "dynamo":
-                gpus_per_instance = DynamoConfig.model_validate(
-                    generation_config_dict
-                ).engine_world_size
+                dynamo_config = DynamoConfig.model_validate(generation_config_dict)
+                if dynamo_config.dynamo_cfg.disaggregation is not None:
+                    # Prefill and decode engines may differ in width; segments
+                    # must fit the widest one.
+                    gpus_per_instance = dynamo_config.role_plan(
+                        master_config.policy.get("megatron_cfg")
+                    ).max_engine_world_size
+                else:
+                    gpus_per_instance = dynamo_config.engine_world_size
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
@@ -663,10 +669,21 @@ def _build_generation(
         )
         # setup_single_controller validated and normalized this config through
         # DynamoConfig before allocating clusters.
-        gen = DynamoGeneration(
-            cluster=inference_cluster,
-            config=cast(dict[str, Any], generation_config),
-        )
+        dynamo_generation_config = cast(dict[str, Any], generation_config)
+        if dynamo_generation_config["dynamo_cfg"].get("engine") == "megatron":
+            # Megatron prefill/decode engines are dedicated inference policies
+            # built from the full policy config, like the megatron backend above.
+            gen = DynamoGeneration(
+                cluster=inference_cluster,
+                config=dynamo_generation_config,
+                tokenizer=tokenizer,
+                policy_config=master_config.policy,
+            )
+        else:
+            gen = DynamoGeneration(
+                cluster=inference_cluster,
+                config=dynamo_generation_config,
+            )
 
     else:
         raise ValueError(
@@ -1251,9 +1268,12 @@ def setup_single_controller(
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services, as grpo.setup does.
         dynamo_config = cast(dict[str, Any], generation_config)
-        dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
+        if dynamo_config["dynamo_cfg"].get("engine") != "megatron":
+            # Megatron engines take hf_config_overrides through the policy config
+            # they are built from; vllm_kwargs must stay empty for them.
+            dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+                policy_config.get("hf_config_overrides") or {}
+            )
         generation_config = cast(
             GenerationConfig, DynamoConfig.model_validate(dynamo_config).model_dump()
         )
