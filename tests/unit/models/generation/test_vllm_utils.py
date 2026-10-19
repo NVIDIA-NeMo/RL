@@ -1380,6 +1380,38 @@ def test_remap_multimodal_placeholders_locates_prefix_media_inside_exact_prefix(
     assert [item.offset for item in result["image"]] == [1, 7]
 
 
+@pytest.mark.parametrize("prefix_shift", [0, 3])
+@pytest.mark.parametrize(
+    "history,spans",
+    [
+        ([1, 7, 8, 9, 9, 9, 10, 7, 8, 9, 9, 9, 10, 7, 2], [(1, 7), (7, 7)]),
+        ([1, 18, 18, 18, 18, 18, 18, 11, 2], [(1, 3), (4, 3)]),
+    ],
+    ids=["shared-delimiter", "adjacent-pad-runs"],
+)
+def test_remap_multimodal_placeholders_keeps_adjacent_prefix_ranges(
+    history, spans, prefix_shift
+):
+    """Preserve actual overlaps without introducing overlaps in bare pad runs."""
+    final_tokens = [*([99] * prefix_shift), *history, 31, 32, 2, 5, 6]
+    result = remap_multimodal_placeholders(
+        template_token_ids=[*history, 1001, 2, 5, 6],
+        final_token_ids=final_tokens,
+        mm_placeholders={
+            "image": [_PlaceholderRange(offset=o, length=n) for o, n in spans]
+        },
+        splice=PrefixSplice(
+            final_tokens,
+            model_cut_end=prefix_shift + len(history) + 2,
+            template_cut_start=len(history) + 1,
+        ),
+    )
+
+    assert [item.offset for item in result["image"]] == [
+        offset + prefix_shift for offset, _ in spans
+    ]
+
+
 def test_remap_multimodal_placeholders_rejects_span_crossing_splice_boundary():
     template_token_ids = [1, 18, 18, 2, 3]
     final_token_ids = [1, 9, 18, 18, 2, 3]
