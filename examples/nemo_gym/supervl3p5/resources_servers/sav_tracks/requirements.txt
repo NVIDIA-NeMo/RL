@@ -1,2 +1,1 @@
--e nemo-gym[dev] @ /opt/nemo-rl/3rdparty/Gym-workspace/Gym
-fastapi
+-e nemo-gym[dev] @ ../../

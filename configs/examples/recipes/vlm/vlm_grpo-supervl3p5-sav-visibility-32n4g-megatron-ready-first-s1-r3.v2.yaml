@@ -1,0 +1,8 @@
+defaults: vlm_grpo-supervl3p5-sav-visibility-32n4g-megatron-ready-first-s1.v2.yaml
+
+policy:
+  router_replay:
+    enabled: true
+  generation:
+    vllm_kwargs:
+      enable_return_routed_experts: true
