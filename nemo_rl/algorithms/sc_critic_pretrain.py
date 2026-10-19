@@ -238,6 +238,114 @@ def critic_resume_paths(
     return weights, optimizer, str(last_checkpoint_path)
 
 
+# Bound on landing a pending async save after an error (a full write takes ~1 min).
+CHECKPOINT_CLOSE_TIMEOUT_S = 600.0
+
+
+class CriticCheckpointSaver:
+    """Writes stage-B checkpoints: step_N, plus the rolling full one when ``rolling``.
+
+    Synchronous by default. With ``async_save`` (Megatron
+    ``value.megatron_cfg.checkpoint.async_save``) a save returns once the
+    writes are staged to host memory and training goes on while they land on
+    disk; ``wait()`` then completes the save: it blocks on the writes, renames
+    tmp_step_N to step_N and promotes resume_state/tmp. The loop calls it
+    before the next save and before exiting, so step_N and the rolling
+    checkpoint only appear once fully on disk, and a crash mid-write leaves the
+    previous ones. The trainer's Ray calls to the value workers run one at a
+    time, so the wait is deferred instead of handed to the checkpointer's
+    background finalization thread (which would block the next training step
+    on the write).
+    """
+
+    def __init__(
+        self, value: Any, checkpointer: Any, *, rolling: bool, async_save: bool
+    ) -> None:
+        self.value = value
+        self.checkpointer = checkpointer
+        self.rolling = rolling
+        self.async_save = async_save
+        self._pending: Optional[tuple[str, int]] = None
+
+    def save(
+        self,
+        step: int,
+        save_state: dict[str, Any],
+        master_config: Any,
+        files_record: Any,
+        *,
+        is_last: bool,
+    ) -> None:
+        self.wait()
+        started = time.perf_counter()
+        checkpoint_path = self.checkpointer.init_tmp_checkpoint(
+            step, save_state, master_config
+        )
+        self.value.prepare_for_training()
+        self.value.save_checkpoint(
+            weights_path=os.path.join(checkpoint_path, "value", "weights"),
+            optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+            if self.checkpointer.save_optimizer and not self.rolling
+            else None,
+            tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+            is_final_checkpoint=is_last,
+            defer_finalize=self.async_save,
+        )
+        if self.rolling:
+            _, resume_tmp = resume_state_dirs(self.checkpointer.checkpoint_dir)
+            shutil.rmtree(resume_tmp, ignore_errors=True)
+            self.value.save_checkpoint(
+                weights_path=str(resume_tmp / "value" / "weights"),
+                optimizer_path=str(resume_tmp / "value" / "optimizer"),
+                tokenizer_path=str(resume_tmp / "value" / "tokenizer"),
+                is_final_checkpoint=is_last,
+                defer_finalize=self.async_save,
+            )
+        self.value.finish_training()
+        with open(os.path.join(checkpoint_path, FILE_LIST_NAME), "w") as f:
+            json.dump(files_record, f)
+        self._pending = (str(checkpoint_path), step)
+        if not self.async_save:
+            self.wait()
+        print(
+            f"💾 Critic checkpoint for step {step} "
+            f"{'scheduled' if self.async_save else 'saved'} in "
+            f"{time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
+
+    def wait(self, *, terminate: bool = False, timeout: Optional[float] = None) -> None:
+        """Complete the pending save, if any; ``terminate`` also stops the writer."""
+        pending, self._pending = self._pending, None
+        started = time.perf_counter()
+        if self.async_save and (pending is not None or terminate):
+            self.value.finalize_async_save(terminate=terminate, timeout=timeout)
+        if pending is None:
+            return
+        checkpoint_path, step = pending
+        self.checkpointer.finalize_checkpoint(checkpoint_path)
+        if self.rolling:
+            promote_rolling_resume(self.checkpointer.checkpoint_dir, step)
+        if self.async_save:
+            print(
+                f"💾 Critic checkpoint for step {step} is on disk (waited "
+                f"{time.perf_counter() - started:.1f}s)",
+                flush=True,
+            )
+
+    def close(self, timeout: float) -> None:
+        """After an error, still land a pending save, waiting at most ``timeout`` s.
+
+        Never raises, so the error that ended training is the one reported.
+        """
+        if self._pending is None:
+            return
+        try:
+            self.wait(terminate=True, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ Could not complete the pending critic checkpoint: {e}")
+
+
 # ── split / order (pure, unit-tested) ───────────────────────────────────────
 
 
@@ -1330,6 +1438,23 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+    megatron_cfg = value_config.get("megatron_cfg") or {}
+    async_save = bool(
+        megatron_cfg.get("enabled")
+        and (megatron_cfg.get("checkpoint") or {}).get("async_save")
+    )
+    saver = CriticCheckpointSaver(
+        value,
+        checkpointer,
+        rolling=cfg.optimizer_state == "latest_only" and checkpointer.save_optimizer,
+        async_save=async_save,
+    )
+    if async_save:
+        print(
+            "💾 Async critic checkpoints: each save completes at the next save or "
+            "at exit.",
+            flush=True,
+        )
 
     try:
         while step < planned_steps:
@@ -1396,42 +1521,17 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 save_by_step or save_by_timeout
             ):
                 print(f"💾 Saving critic checkpoint for step {step}...", flush=True)
-                checkpoint_path = checkpointer.init_tmp_checkpoint(
-                    step, save_state, master_config
+                saver.save(
+                    step, save_state, master_config, files_record, is_last=is_last
                 )
-                rolling = (
-                    cfg.optimizer_state == "latest_only" and checkpointer.save_optimizer
-                )
-                value.prepare_for_training()
-                value.save_checkpoint(
-                    weights_path=os.path.join(checkpoint_path, "value", "weights"),
-                    optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
-                    if checkpointer.save_optimizer and not rolling
-                    else None,
-                    tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                    is_final_checkpoint=is_last,
-                )
-                if rolling:
-                    _, resume_tmp = resume_state_dirs(checkpointer.checkpoint_dir)
-                    shutil.rmtree(resume_tmp, ignore_errors=True)
-                    value.save_checkpoint(
-                        weights_path=str(resume_tmp / "value" / "weights"),
-                        optimizer_path=str(resume_tmp / "value" / "optimizer"),
-                        tokenizer_path=str(resume_tmp / "value" / "tokenizer"),
-                        is_final_checkpoint=is_last,
-                    )
-                value.finish_training()
-                with open(os.path.join(checkpoint_path, FILE_LIST_NAME), "w") as f:
-                    json.dump(files_record, f)
-                checkpointer.finalize_checkpoint(checkpoint_path)
-                if rolling:
-                    promote_rolling_resume(checkpointer.checkpoint_dir, step)
             if save_by_timeout:
                 print(
                     "⏰ Walltime budget reached; stopping after the save.", flush=True
                 )
                 break
+        saver.wait(terminate=True)
     finally:
+        saver.close(timeout=CHECKPOINT_CLOSE_TIMEOUT_S)
         trainer.close()
         value.shutdown()
     print(f"🏁 Critic pretraining stopped at step {step}/{planned_steps}.", flush=True)

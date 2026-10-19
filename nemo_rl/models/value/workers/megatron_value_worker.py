@@ -941,12 +941,21 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        defer_finalize: bool = False,
         **kwargs,
     ):
         """Save a checkpoint of the value model.
 
         The value head is the model's ``output_layer`` and is saved as part of
         the normal Megatron dist-checkpoint — no separate value-head sidecar.
+
+        By default the save is complete on return, also with
+        ``megatron_cfg.checkpoint.async_save``. With ``defer_finalize`` and
+        async_save it returns once the persistent writer has staged the tensors
+        to host memory (NVRx joins on that D2H copy before scheduling returns),
+        so the caller may offload and keep training while the disk write runs in
+        the background; the caller must call ``finalize_async_save()`` before
+        renaming or promoting the checkpoint directory.
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(
@@ -984,24 +993,46 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 checkpointing_context=self.checkpointing_context,
             )
 
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-                terminate=True,
+            deferred = bool(
+                defer_finalize and self.mcore_state.cfg.checkpoint.async_save
             )
+            if not deferred:
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                    terminate=True,
+                )
 
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             torch.distributed.barrier()
-            print(f"Saved value model checkpoint to {weights_path}")
+            print(
+                f"Scheduled value model checkpoint to {weights_path} (async write)"
+                if deferred
+                else f"Saved value model checkpoint to {weights_path}"
+            )
 
         except Exception as e:
             print(f"Failed to save value checkpoint to {weights_path}: {e}")
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self, terminate: bool = False) -> None:
+        """Block until every scheduled async checkpoint write is on disk.
+
+        Runs the writes' finalize steps (metadata, tracker files) on all ranks.
+        No-op without async_save or with nothing pending. ``terminate`` also
+        closes the persistent writer process (at the end of a run).
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+            terminate=terminate,
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a checkpoint for the value model."""

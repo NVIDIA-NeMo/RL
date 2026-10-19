@@ -428,11 +428,17 @@ class Value(ValueInterface):
         tokenizer_path: Optional[str] = None,
         *,
         is_final_checkpoint: bool,
+        defer_finalize: bool = False,
     ) -> None:
         """Save a checkpoint of the value model.
 
         DTensor v2 checkpoint resources are configured when the Value is
         constructed. ``weights_path`` selects the destination for each save.
+
+        With Megatron ``checkpoint.async_save`` and ``defer_finalize``, this
+        returns after D2H staging, like ``Policy.save_checkpoint``; the caller
+        must call ``finalize_async_save()`` before renaming the checkpoint
+        directory. Otherwise the write is complete on return.
         """
         megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
@@ -442,6 +448,7 @@ class Value(ValueInterface):
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
+                defer_finalize=defer_finalize,
             )
         else:
             futures = self.worker_group.run_all_workers_single_data(
@@ -452,6 +459,22 @@ class Value(ValueInterface):
                 is_final_checkpoint=is_final_checkpoint,
             )
         ray.get(futures)
+
+    def finalize_async_save(
+        self, terminate: bool = False, timeout: Optional[float] = None
+    ) -> None:
+        """Block until all workers' deferred async checkpoint writes complete.
+
+        No-op without Megatron async_save or with nothing pending. ``terminate``
+        also stops the workers' persistent checkpoint writers; ``timeout`` (s)
+        bounds the wait (``ray.get`` raises ``GetTimeoutError``).
+        """
+        if not bool(self.cfg.get("megatron_cfg", {}).get("enabled", False)):
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "finalize_async_save", terminate=terminate
+        )
+        ray.get(futures, timeout=timeout)
 
     def shutdown(self) -> bool:
         """Shut down all value workers and clean up resources."""

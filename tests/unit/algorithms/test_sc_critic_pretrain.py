@@ -698,3 +698,131 @@ def test_save_due_adds_fault_tolerance_saves():
     assert [s for s in range(1, 8) if due(s, 1)] == list(range(1, 8))
     assert [s for s in range(1, 13) if due(s, 3)] == [3, 6, 9, 10, 12]
     assert due(7, None, last=True)
+
+
+class _SavingValue:
+    """The Value calls CriticCheckpointSaver makes, recorded in order."""
+
+    def __init__(self, events: list) -> None:
+        self.events = events
+        self.fail_finalize = False
+
+    def prepare_for_training(self):
+        self.events.append("prepare")
+
+    def finish_training(self):
+        self.events.append("finish")
+
+    def save_checkpoint(self, *, weights_path, optimizer_path, defer_finalize, **_):
+        Path(weights_path).mkdir(parents=True)
+        self.events.append(
+            ("save", Path(weights_path).parts[-3], optimizer_path is not None, defer_finalize)
+        )
+
+    def finalize_async_save(self, *, terminate, timeout):
+        self.events.append(("finalize_async", terminate, timeout))
+        if self.fail_finalize:
+            raise RuntimeError("worker died")
+
+
+class _SavingCheckpointer:
+    """CheckpointManager's tmp_step_N -> step_N lifecycle, recorded in order."""
+
+    save_optimizer = True
+
+    def __init__(self, checkpoint_dir: Path, events: list) -> None:
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.events = events
+
+    def init_tmp_checkpoint(self, step, save_state, master_config):
+        path = self.checkpoint_dir / f"tmp_step_{step}"
+        path.mkdir(parents=True)
+        self.events.append(("init", step))
+        return path
+
+    def finalize_checkpoint(self, path):
+        path = Path(path)
+        assert (path / cp.FILE_LIST_NAME).exists()
+        path.rename(path.with_name(path.name.removeprefix("tmp_")))
+        self.events.append(("finalize", path.name))
+
+
+def _saver(tmp_path, *, rolling, async_save):
+    events: list = []
+    value = _SavingValue(events)
+    saver = cp.CriticCheckpointSaver(
+        value,
+        _SavingCheckpointer(tmp_path, events),
+        rolling=rolling,
+        async_save=async_save,
+    )
+    return saver, value, events
+
+
+def _save(saver, step):
+    saver.save(step, {"total_steps": step}, None, {"files": []}, is_last=False)
+
+
+def test_sync_critic_save_is_complete_on_return(tmp_path):
+    saver, _, events = _saver(tmp_path, rolling=True, async_save=False)
+    _save(saver, 1)
+    # step_N weights only; the optimizer goes to the rolling checkpoint, which is
+    # promoted after step_N is finalized.
+    assert events == [
+        ("init", 1),
+        "prepare",
+        ("save", "tmp_step_1", False, False),
+        ("save", "tmp", True, False),
+        "finish",
+        ("finalize", "tmp_step_1"),
+    ]
+    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) == 1
+    saver.wait(terminate=True)
+    saver.close(timeout=1.0)
+    assert len(events) == 6  # nothing pending, no async writer to stop
+
+    saver, _, events = _saver(tmp_path / "every", rolling=False, async_save=False)
+    _save(saver, 1)
+    assert ("save", "tmp_step_1", True, False) in events
+    assert not cp.resume_state_dirs(tmp_path / "every")[1].exists()
+
+
+def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
+    saver, _, events = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1)
+    # Scheduled, not finalized: neither step_1 nor the rolling checkpoint exists.
+    assert events[-2:] == [("save", "tmp", True, True), "finish"]
+    assert (tmp_path / "tmp_step_1").exists() and not (tmp_path / "step_1").exists()
+    assert cp.rolling_resume_step(tmp_path) is None
+
+    events.clear()
+    _save(saver, 2)
+    # The write lands, step_1 is finalized and its rolling checkpoint promoted
+    # before step_2's tmp folder is created and its rolling tmp cleared.
+    assert events[:3] == [
+        ("finalize_async", False, None),
+        ("finalize", "tmp_step_1"),
+        ("init", 2),
+    ]
+    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) == 1
+
+    events.clear()
+    saver.wait(terminate=True)
+    assert events == [("finalize_async", True, None), ("finalize", "tmp_step_2")]
+    assert cp.rolling_resume_step(tmp_path) == 2
+    saver.close(timeout=1.0)  # nothing pending after a normal exit
+    assert len(events) == 2
+
+
+def test_async_critic_save_lands_after_an_error_without_raising(tmp_path):
+    saver, value, events = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1)
+    events.clear()
+    saver.close(timeout=5.0)
+    assert events == [("finalize_async", True, 5.0), ("finalize", "tmp_step_1")]
+    assert cp.rolling_resume_step(tmp_path) == 1
+
+    _save(saver, 2)
+    value.fail_finalize = True
+    saver.close(timeout=5.0)  # logged, not raised; the previous checkpoints stay
+    assert (tmp_path / "tmp_step_2").exists() and cp.rolling_resume_step(tmp_path) == 1
