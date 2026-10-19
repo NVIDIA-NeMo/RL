@@ -16,22 +16,27 @@
 import json
 import uuid
 
+import multistorageclient as msc
 import pytest
 
-from nemo_rl.utils.checkpoint import CheckpointManager, _load_checkpoint_history
+from nemo_rl.utils.checkpoint import (
+    CheckpointManager,
+    _load_checkpoint_history,
+    validate_warm_start_checkpoint,
+)
 from nemo_rl.utils.checkpoint_storage import (
-    enable_msc,
-    enable_msc_for,
+    as_path,
     load_checkpoint_object,
+    maybe_enable_msc,
     open_path,
     path_exists,
+    rmtree,
     save_checkpoint_object,
 )
 
 
 @pytest.fixture
 def manager(tmp_path, monkeypatch):
-    pytest.importorskip("multistorageclient")
     pytest.importorskip("megatron.core")
     profile = "test-" + uuid.uuid4().hex
     config = tmp_path / "msc.json"
@@ -84,7 +89,7 @@ def test_failed_async_writer_never_publishes(manager):
     manager.begin_finalization(checkpoint, wait_fn=fail)
     with pytest.raises(RuntimeError, match="finalization failed"):
         manager.finalize_pending()
-    assert not enable_msc().os.path.exists(checkpoint + "/_SUCCESS")
+    assert not msc.os.path.exists(checkpoint + "/_SUCCESS")
     assert manager.get_latest_checkpoint_path() is None
 
 
@@ -143,20 +148,25 @@ def test_save_dataloader_state_uses_shared_path_for_local_and_msc(tmp_path, mana
     }
 
 
-def test_enable_msc_for_only_enables_for_msc_urls(tmp_path, manager):
-    assert enable_msc_for(None, str(tmp_path), "") is None
-    assert enable_msc_for(str(tmp_path), str(manager.checkpoint_dir)) is not None
+def test_maybe_enable_msc_only_enables_for_msc_urls(tmp_path, manager):
+    from megatron.core.msc_utils import MultiStorageClientFeature
+
+    MultiStorageClientFeature.disable()
+    maybe_enable_msc(None, str(tmp_path), "")
+    assert not MultiStorageClientFeature.is_enabled()
+    maybe_enable_msc(str(tmp_path), str(manager.checkpoint_dir))
+    assert MultiStorageClientFeature.is_enabled()
 
 
 def test_interrupted_step_can_be_saved_again_after_resume(manager):
     first = manager.init_tmp_checkpoint(1, {"step": 1})
     stale = first + "/policy/weights/shard.bin"
-    with enable_msc().open(stale, "w") as f:
+    with msc.open(stale, "w") as f:
         f.write("partial write from a preempted run")
     # No _SUCCESS was published, so a resumed run may re-save the same step.
     again = manager.init_tmp_checkpoint(1, {"step": 1})
     assert again == first
-    assert not enable_msc().os.path.exists(stale)
+    assert not msc.os.path.exists(stale)
     manager.finalize_checkpoint(again)
     assert manager.get_latest_checkpoint_path() == again
 
@@ -168,3 +178,19 @@ def test_history_lists_only_published_steps_with_their_info(manager):
     history = _load_checkpoint_history(manager.checkpoint_dir)
     assert sorted((step, info["step"]) for step, _, info in history) == [(1, 1), (2, 2)]
     assert manager.get_latest_checkpoint_path().endswith("/step_2")
+
+
+def test_rmtree_and_as_path_keep_msc_urls_intact(manager):
+    checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
+    assert str(as_path(checkpoint)) == checkpoint
+    rmtree(checkpoint)
+    assert not path_exists(checkpoint + "/training_info.json")
+
+
+def test_warm_start_validation_accepts_msc_urls(manager):
+    checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
+    with open_path(checkpoint + "/value/weights/shard.bin", "w") as f:
+        f.write("weights")
+    validate_warm_start_checkpoint(checkpoint, model_component="value")
+    with pytest.raises(ValueError, match="no policy/weights subtree"):
+        validate_warm_start_checkpoint(checkpoint, model_component="policy")

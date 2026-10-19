@@ -26,7 +26,6 @@ from typing import Any, Optional, cast
 
 import numpy as np
 import ray
-import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
@@ -67,6 +66,11 @@ from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint_storage import (
+    load_checkpoint_object,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
@@ -442,7 +446,9 @@ class SFTSingleControllerActor:
             tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
             is_final_checkpoint=step == self._max_steps,
         )
-        torch.save(loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt"))
+        save_checkpoint_object(
+            loader_states, os.path.join(checkpoint_path, "sft_v2_loaders.pt")
+        )
         self._checkpointer.begin_finalization(
             checkpoint_path, wait_fn=self._trainer.finalize_async_save
         )
@@ -602,10 +608,10 @@ def setup_sft_v2(
     )
     loader_states = None
     if latest is not None:
-        loader_path = Path(latest) / "sft_v2_loaders.pt"
-        if not loader_path.exists():
-            raise ValueError(f"SFTv2 checkpoint is missing {loader_path.name}.")
-        loader_states = torch.load(loader_path, weights_only=False)
+        loader_path = os.path.join(latest, "sft_v2_loaders.pt")
+        if not path_exists(loader_path):
+            raise ValueError(f"SFTv2 checkpoint is missing {Path(loader_path).name}.")
+        loader_states = load_checkpoint_object(loader_path, weights_only=False)
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=megatron_config["use_fused_linear_logprobs"]
     )

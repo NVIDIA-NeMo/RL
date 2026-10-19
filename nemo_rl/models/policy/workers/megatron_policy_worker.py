@@ -156,7 +156,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
-from nemo_rl.utils.checkpoint_storage import enable_msc_for
+from nemo_rl.utils.checkpoint_storage import maybe_enable_msc
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -833,7 +833,7 @@ class MegatronPolicyWorkerImpl(
         """Initialize the MegatronPolicyWorker."""
         # Resume loads from weights_path/optimizer_path during setup, before any
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
-        enable_msc_for(weights_path, optimizer_path)
+        maybe_enable_msc(weights_path, optimizer_path)
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -5029,7 +5029,7 @@ class MegatronPolicyWorkerImpl(
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
 
-        enable_msc_for(weights_path)
+        maybe_enable_msc(weights_path)
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save

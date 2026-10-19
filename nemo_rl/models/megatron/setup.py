@@ -90,8 +90,8 @@ from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
 from nemo_rl.utils.checkpoint_storage import (
-    enable_msc_for,
     listdir,
+    maybe_enable_msc,
     open_path,
     path_exists,
     path_isdir,
@@ -710,14 +710,14 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
     or a checkpoint root with a latest_checkpointed_iteration.txt tracker file /
     iter_* subdirectories.
     """
-    if not os.path.isdir(restore_from):
+    if not path_isdir(restore_from):
         raise FileNotFoundError(
             f"megatron_cfg.peft.restore_from={restore_from!r} does not exist or is "
             "not a directory. It must point to a native Megatron-Bridge PEFT "
             "checkpoint (an iter_XXXXXXX directory or a checkpoint root "
             "containing one)."
         )
-    if os.path.exists(os.path.join(restore_from, "run_config.yaml")):
+    if path_exists(os.path.join(restore_from, "run_config.yaml")):
         return restore_from
     resolved = _resolve_iter_dir_from_root(
         restore_from,
@@ -728,7 +728,7 @@ def _resolve_peft_restore_dir(restore_from: str) -> str:
         "one).",
         config_key="megatron_cfg.peft.restore_from",
     )
-    if not os.path.exists(os.path.join(resolved, "run_config.yaml")):
+    if not path_exists(os.path.join(resolved, "run_config.yaml")):
         raise FileNotFoundError(
             f"megatron_cfg.peft.restore_from={restore_from!r}: resolved to "
             f"iteration directory {resolved!r} but it does not contain "
@@ -752,7 +752,7 @@ def _validate_peft_restore_config(
     no diagnostics and leave this run's extra adapters at fresh init.
     """
     run_config_path = os.path.join(restore_dir, "run_config.yaml")
-    with open(run_config_path) as f:
+    with open_path(run_config_path) as f:
         run_config = yaml.safe_load(f)
     saved_peft = run_config.get("peft") if isinstance(run_config, dict) else None
     if not isinstance(saved_peft, dict):
@@ -898,7 +898,7 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     pretrained_ckpt = config.get("pretrained_checkpoint")
     # Megatron-Bridge loads this checkpoint later and only understands msc://
     # once its flag is on.
-    enable_msc_for(pretrained_ckpt["path"] if pretrained_ckpt else None)
+    maybe_enable_msc(pretrained_ckpt["path"] if pretrained_ckpt else None)
 
     if pretrained_ckpt is not None:
         fmt = pretrained_ckpt["format"]

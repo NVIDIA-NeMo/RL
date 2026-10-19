@@ -91,6 +91,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils.checkpoint_storage import maybe_enable_msc
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 from nemo_rl.utils.tensor_ops import pad_and_concat
@@ -353,6 +354,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             init_optimizer: Whether to initialize the optimizer.
             worker_sharding_annotations: Sharding topology for distributed training.
         """
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        maybe_enable_msc(weights_path, optimizer_path)
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
         gpu_ids = ray.get_gpu_ids()
@@ -942,6 +946,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
             )
+
+        maybe_enable_msc(weights_path)
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
 

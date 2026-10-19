@@ -127,6 +127,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
+from nemo_rl.utils.checkpoint_storage import path_exists
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -2440,7 +2441,7 @@ def async_ppo_train(
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
-        if os.path.exists(replay_buffer_path):
+        if path_exists(replay_buffer_path):
             print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
             restore_max_age = _async_ppo_buffer_max_age(
                 step=step,
