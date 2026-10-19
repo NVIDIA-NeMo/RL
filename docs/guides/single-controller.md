@@ -382,14 +382,23 @@ Field definitions:
 
 Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations all received the same reward (zero within-group variance, so no advantage signal) and resample a substitute, as in [DAPO](dapo.md). Filtering works on both the token-capture and non-capture paths. Each dropped group needs a replacement prompt, otherwise it would silently shrink its training step, so setup requires:
 
-- `async_rl.rollout_failure.on_dropped_prompt: replace`.
+- `async_rl.rollout_failure.on_dropped_prompt: replace`, unless the sampler is `windowed`, which never uses a spare pool (see below).
 - `async_rl.rollout_failure.max_replacement_attempts >= 1`. Each slot gets at most this many replacements. If the last one is also dropped, that step closes one group short, and if too many groups are lost the step falls below `min_step_batch_fraction` and the run raises. At high drop rates, raise `max_replacement_attempts` or lower `min_step_batch_fraction`.
-- A sampler that stamps a target step: `in_order`, or a `custom` sampler that does. The other built-in samplers (`weight_fifo`, `ready_first`, `windowed`) are rejected, because without a stamped step a dropped group can be neither replaced nor counted as missing.
 - `grpo.num_generations_per_prompt >= 2`.
+
+Every built-in sampler works. Each decides what it costs to lose a group for good, which is when no spare is left or the replacement budget is spent:
+
+| `sampler.name` | Spare pool | A group lost for good |
+| --- | --- | --- |
+| `in_order` | Yes | Shrinks the step the group was stamped for. |
+| `ready_first`, `weight_fifo` | Yes | Shrinks the step being assembled at that moment, or the next one if that step has already finished selecting. These samplers stamp no step, and their gate would otherwise wait on a group nobody is generating. The shrunk step is not necessarily the batch that lost the group, so batch boundaries can shift, but the total consumed is right. |
+| `windowed` | No | Nothing. Rollout keeps producing, so later groups make up for it and every step still fills. The data runs out sooner, so the run can end before `len(dataloader)` steps; the last step closes on the groups left, subject to `min_step_batch_fraction`. |
+
+A `custom` sampler is treated like `ready_first` unless it implements `DropAccountingSampler`.
 
 The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect here; `max_replacement_attempts` is the budget instead. Dropped groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)), and a dropped group that cannot be replaced shortens the step.
 
-`reward` stays the mean over the trained rows, which only hold groups with reward spread, so it can stay flat while the policy still improves. Watch `unfiltered_reward` (or `first_attempt_reward`) for the pre-filter progress signal instead. These per-step metrics are also reported, and all of them need a sampler that stamps target steps:
+`reward` stays the mean over the trained rows, which only hold groups with reward spread, so it can stay flat while the policy still improves. Watch `unfiltered_reward` (or `first_attempt_reward`) for the pre-filter progress signal instead. These per-step metrics are also reported. A group from a sampler that stamps no step is counted under the step being assembled when it finishes:
 
 | Metric | Meaning |
 | --- | --- |

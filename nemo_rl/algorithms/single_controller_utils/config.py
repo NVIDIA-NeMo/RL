@@ -993,16 +993,11 @@ def _validate_failure_settings(
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    Warnings rather than errors for most of them, deliberately: a strict "never train a
+    All of them are warnings rather than errors, deliberately: a strict "never train a
     short batch" run, one base YAML whose sampler is overridden per experiment, a
     deliberately deep spare pool are all coherent things to have typed, so rejecting
     them would forbid configurations somebody wants. What is not acceptable is finding
     out hours into a run, or not at all.
-
-    The exception, and the only hard error here, is a drop budget under a sampler that
-    stamps no target step. That one is not a knob cancelling itself out; it converts a
-    recoverable prompt failure into a stalled run, so there is no configuration it
-    could be the intent of.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1010,46 +1005,14 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # InOrderSampler is the only built-in that stamps a target step, and only a
-    # stamped step can be credited short, so for the others the floor is unreachable
-    # and the spare pool is never filled. A "custom" sampler may or may not stamp,
-    # which is why it is in neither set -- a warning nobody can act on is noise.
-    #
-    # Named by exclusion rather than by list so that a sampler added later is guarded
-    # by default instead of silently exempt: every built-in but InOrderSampler leaves
-    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
-    # that after this check was first written.
+    # A lost group shrinks a step under every built-in sampler but windowed, whose
+    # rollout keeps producing and only comes up short at the end of the data. A "custom"
+    # sampler is in neither group -- a warning nobody can act on is noise.
     sampler_name = async_config.sampler.name
-    sampler_stamps = sampler_name == "in_order"
-    sampler_never_stamps = sampler_name not in ("in_order", "custom")
-
-    # A budget that permits drops is worse than inert under an unstamped sampler: the
-    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
-    # so the step's target never falls and the train pump waits on a group nobody is
-    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
-    # does: the same gate that stops the rollout pump running ahead also stops it
-    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
-    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
-    # shortfall instead migrates from batch to batch until the last one, which has none
-    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
-    # drop is tolerated at all then, so nothing reaches the shortfall path and the
-    # warnings below are the right register.
-    if sampler_never_stamps and drop_budget:
-        raise ValueError(
-            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
-            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
-            f"max_consecutive_dropped_prompts="
-            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
-            "prompt that is given up on is never subtracted from the step waiting for "
-            "it, so that step waits on a group no one is generating -- ending the run "
-            "at its final step, or stalling it outright with no error at all. Set "
-            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
-            "promise, or set both budgets to 0 to end the run on the first dropped "
-            "prompt instead."
-        )
+    sampler_shrinks_steps = sampler_name in ("in_order", "ready_first", "weight_fifo")
 
     if (
-        sampler_stamps
+        sampler_shrinks_steps
         and drop_budget
         and floor >= num_prompts_per_step
         and failure_config.on_dropped_prompt == "shrink"
@@ -1067,13 +1030,12 @@ def _validate_failure_settings(
             stacklevel=2,
         )
 
-    if failure_config.on_dropped_prompt == "replace" and sampler_never_stamps:
+    if failure_config.on_dropped_prompt == "replace" and sampler_name == "windowed":
         warnings.warn(
-            f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
-            f"the {sampler_name} sampler: it does not stamp a target step, so no step "
-            "is ever left short, the spare pool is never filled, and every drop "
-            "behaves as 'shrink'. replaced_prompt_groups will stay at 0 whether or "
-            "not anything failed.",
+            "async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
+            "the windowed sampler: its rollout never stops producing, so a dropped "
+            "group is made up by later ones and no spare pool is filled. "
+            "replaced_prompt_groups will stay at 0 whether or not anything failed.",
             stacklevel=2,
         )
 
@@ -1195,7 +1157,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
-    # The default on_dropped_prompt="shrink" would silently shrink the step instead.
+    # The default on_dropped_prompt="shrink" would silently shrink the step instead. The
+    # windowed sampler is exempt: its rollout keeps producing, so later groups make up for
+    # a dropped one without a spare pool.
     if algo_cfg.use_dynamic_sampling:
         # Dynamic-sampling drops shorten the training step. PPO's critic shards that
         # step against value.train_global_batch_size, so the first short step fails a
@@ -1213,21 +1177,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         rollout_failure = async_config.rollout_failure
-        if rollout_failure.on_dropped_prompt != "replace":
+        if (
+            async_config.sampler.name != "windowed"
+            and rollout_failure.on_dropped_prompt != "replace"
+        ):
             raise ValueError(
                 f"{algo_prefix}.use_dynamic_sampling requires "
                 'async_rl.rollout_failure.on_dropped_prompt="replace"; with '
                 f'"{rollout_failure.on_dropped_prompt}" a filtered group is never '
                 "substituted, so each zero-variance group silently shrinks its "
                 "training step instead of being resampled."
-            )
-        if async_config.sampler.name not in ("in_order", "custom"):
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires a sampler that stamps a "
-                "target step (async_rl.sampler.name must be 'in_order', or a 'custom' "
-                f"sampler that stamps one), but got '{async_config.sampler.name}': "
-                "without a stamped step a filtered group cannot be credited short or "
-                "replaced, so every filtered group silently shrinks the batch."
             )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(

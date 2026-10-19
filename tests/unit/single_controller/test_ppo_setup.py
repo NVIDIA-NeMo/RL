@@ -607,6 +607,11 @@ def _dynamic_sampling_config(
     mc.policy["train_global_batch_size"] = (
         _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
     )
+    if sampler == "ready_first":
+        # ready_first trains on groups from older policies, so it needs the correction.
+        mc.loss_fn = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0, use_importance_sampling_correction=True
+        )
     sampler_cfg = {"name": sampler}
     if sampler == "custom":
         # A custom sampler config requires a target; the validator does not import it.
@@ -637,10 +642,21 @@ class TestDynamicSamplingValidation:
         with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
             validate_single_controller_config(mc)
 
-    def test_rejects_a_sampler_that_stamps_no_target_step(self):
-        mc = _dynamic_sampling_config(sampler="ready_first")
+    @pytest.mark.parametrize("sampler", ["windowed", "ready_first", "weight_fifo"])
+    def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
+        validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
-        with pytest.raises(ValueError, match="stamps a target step"):
+    def test_windowed_needs_no_replacement(self):
+        """Its rollout keeps producing, so a filtered group does not shrink a step."""
+        mc = _dynamic_sampling_config(sampler="windowed", on_dropped_prompt="shrink")
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("sampler", ["ready_first", "weight_fifo"])
+    def test_a_gated_sampler_still_requires_replace(self, sampler):
+        mc = _dynamic_sampling_config(sampler=sampler, on_dropped_prompt="shrink")
+
+        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
             validate_single_controller_config(mc)
 
     def test_rejects_a_single_generation_per_prompt(self):

@@ -26,6 +26,9 @@ loop in one object, injected into both pumps:
   - ``is_on_policy`` / ``required_buffer_capacity`` (derived facts): what the
     weight-sync and capacity-validation paths need *without* re-reading raw
     knobs, so those consumers can't drift out of sync with the sampler.
+  - ``DropAccountingSampler`` (optional): what losing a prompt group for good
+    costs under this policy, i.e. which step it is charged to and whether a
+    spare pool replaces it.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
 ``ReadyFirstSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
@@ -182,6 +185,39 @@ class TransactionalAdmissionSampler(Protocol):
         ...
 
 
+@runtime_checkable
+class DropAccountingSampler(Protocol):
+    """Sampler that says what it costs to lose a prompt group for good.
+
+    A group is lost when its rollout is dropped (a failure, or dynamic sampling
+    filtering a zero-variance group) and no replacement is available. Optional: for a
+    sampler without these members the controller charges the group's ``target_step``
+    and only uses the spare pool once the sampler has stamped a step.
+    """
+
+    uses_replacement_pool: ClassVar[bool]
+    """Whether a dropped group is replaced from a pool of spare prompts."""
+
+    closes_short_at_exhaustion: ClassVar[bool]
+    """Whether the last step may close on the groups that exist once the data runs out."""
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Return the step a permanently lost group is charged to.
+
+        Args:
+            target_step: The step stamped on the lost group, or ``None`` if the
+                policy does not stamp.
+            assembling_version: The step the train pump is assembling, or will
+                assemble next once the current one has finished selecting.
+
+        Returns:
+            The step whose size shrinks by one, or ``None`` if nothing is charged.
+        """
+        ...
+
+
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
 
@@ -193,11 +229,21 @@ class BaseSampler(abc.ABC):
     supports_buffer_checkpoint: ClassVar[bool] = False
     supports_training_claims: ClassVar[bool] = True
 
+    # Defaults for DropAccountingSampler, right for a gated sampler that does not stamp.
+    uses_replacement_pool: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step, or the one being assembled if it has none."""
+        return assembling_version if target_step is None else target_step
 
     @property
     def dispatch_index(self) -> int:
@@ -370,6 +416,11 @@ class WindowedSampler(BaseSampler):
     # Ungated restored groups are ordinary in-window candidates.
     supports_buffer_checkpoint: ClassVar[bool] = True
 
+    # Rollout never stops producing, so a lost group is made up by later ones: no spare
+    # pool is needed, and only the tail of the data can leave a step short.
+    uses_replacement_pool: ClassVar[bool] = False
+    closes_short_at_exhaustion: ClassVar[bool] = True
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -394,6 +445,12 @@ class WindowedSampler(BaseSampler):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return self.min_groups_for_streaming_train
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge nothing: a step takes any ready groups, so none of them is missing."""
+        return None
 
     def should_abort_inflight(
         self,
@@ -646,6 +703,9 @@ class InOrderSampler(_GatedSampler):
     # The controller checkpoints the exact dispatch cursor separately.
     supports_buffer_checkpoint: ClassVar[bool] = True
 
+    uses_replacement_pool: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -656,6 +716,12 @@ class InOrderSampler(_GatedSampler):
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
         self.warmup_lookahead_versions = warmup_lookahead_versions
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step: each batch is trained as exactly one step."""
+        return target_step
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         # Sized for the peak window: otherwise the buffer, not the gate, bounds

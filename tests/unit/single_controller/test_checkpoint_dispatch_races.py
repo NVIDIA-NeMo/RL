@@ -522,7 +522,9 @@ def _reserve_controller() -> Any:
     controller = object.__new__(controller_cls)
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._replacement_reserve = deque()
-    controller._sampler_stamps_target_steps = True
+    controller._batch_admitted = True
+    # No DropAccountingSampler members, so the spare pool is used.
+    controller._sampler = SimpleNamespace()
     controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
@@ -986,7 +988,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         assert sampler.admission_commits == 0
         assert sampler.dispatch_index == 7
         assert controller._batch_shortfall == {6: 1}
-        assert controller._sampler_stamps_target_steps is True
+        assert controller._batch_admitted is True
         recovery_metrics = controller._logger.log_metrics.call_args.args[0]
         assert recovery_metrics["groups_unfinished_found"] == 1.0
         assert recovery_metrics["siblings_reused"] == 0.0
