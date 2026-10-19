@@ -108,6 +108,18 @@ def parse_prometheus_metrics(
     return metrics
 
 
+def _with_canonical_aliases(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Rename the first available source of each canonical logger metric."""
+    for alias, sources in CANONICAL_LOGGER_ALIASES.items():
+        if alias in metrics:
+            continue
+        source = next((name for name in sources if name in metrics), None)
+        metrics[alias] = dict(metrics[source]) if source is not None else {}
+        if source is not None:
+            del metrics[source]
+    return metrics
+
+
 class DynamoMetricsSampler:
     """Own polling thread, samples, and deterministic sampler shutdown."""
 
@@ -179,21 +191,34 @@ class DynamoMetricsSampler:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            metrics = {
+            metrics = self._copy_samples()
+        return _with_canonical_aliases(metrics)
+
+    def drain_latest(self) -> dict[str, Any]:
+        """Return each worker's latest sample of every metric and drop older ones.
+
+        The SingleController's rollout telemetry polls this, as it does the vLLM
+        backend's ``drain_latest_logger_metrics``, which keeps histories bounded.
+        """
+        with self._lock:
+            self._samples = {
                 name: {
-                    worker_id: list(samples)
+                    worker_id: samples[-1:]
                     for worker_id, samples in worker_metrics.items()
                 }
                 for name, worker_metrics in self._samples.items()
             }
-        for alias, sources in CANONICAL_LOGGER_ALIASES.items():
-            if alias in metrics:
-                continue
-            source = next((name for name in sources if name in metrics), None)
-            metrics[alias] = dict(metrics[source]) if source is not None else {}
-            if source is not None:
-                del metrics[source]
-        return metrics
+            metrics = self._copy_samples()
+        return _with_canonical_aliases(metrics)
+
+    def _copy_samples(self) -> dict[str, dict[int, list[float]]]:
+        return {
+            name: {
+                worker_id: list(samples)
+                for worker_id, samples in worker_metrics.items()
+            }
+            for name, worker_metrics in self._samples.items()
+        }
 
     def clear(self) -> None:
         with self._lock:

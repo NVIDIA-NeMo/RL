@@ -195,8 +195,10 @@ Current limits on this path:
   Dynamo workers cannot abort their refit collective.
 - `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
   because it bounds the drain.
-- `vllm_cfg.enable_vllm_metrics_logger` must be false; only the legacy GRPO loop
-  reads the Dynamo metrics sampler.
+- `vllm_cfg.enable_vllm_metrics_logger` requires
+  `rollout_checkpointing.telemetry_interval_s`: the rollout telemetry pump drains
+  the Dynamo metrics sampler and reports each engine's generated tokens, running
+  and waiting requests, and KV-cache usage.
 
 Setup rejects any of these before allocating clusters.
 
