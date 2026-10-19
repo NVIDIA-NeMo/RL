@@ -20,6 +20,7 @@ import threading
 import time
 import warnings
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, Callable, Optional, TypeVar, cast
 
@@ -86,6 +87,11 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 )
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
+)
+from nemo_rl.models.megatron.optimizer_state_sync import (
+    checkpoint_bf16_master_dtypes,
+    preserve_hybrid_optimizer_state_dtypes,
+    refresh_hybrid_optimizer_after_checkpoint,
 )
 
 _HF_CONFIG_PATCHED = False
@@ -241,18 +247,12 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
 
 
 def _force_sync_model_from_optimizer_fp32(optimizer):
-    """Restore BF16 compute weights from loaded HybridDeviceOptimizer masters.
+    """Refresh hybrid working masters after the complete distributed state load.
 
-    On a full checkpoint resume, ``HybridDeviceOptimizer.load_state_dict`` restores
-    its FP32 master parameters, but the BF16 parameter shards used by the first
-    forward can still contain the pre-load values. The first optimizer step copies
-    the masters back and masks the problem from subsequent steps, producing a
-    one-step loss/reward discontinuity exactly at the resume boundary.
-
-    Copy each loaded FP32 working parameter back to its BF16 shard and then force a
-    synchronous DP parameter all-gather before any reference-policy or training
-    forward. This is the inverse of ``_force_sync_optimizer_fp32_from_model`` and
-    is only called for a genuine optimizer-state resume.
+    The distributed loader assigns checkpoint tensors after the hybrid optimizer's
+    ordinary post-load hook. Refresh its FP32 working parameters and CPU Adam
+    state from those tensors before copying into BF16 model shards or gathering.
+    GPU FusedAdam's int16 remainder checkpoints are reconstructed losslessly.
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
@@ -269,14 +269,22 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             return False
 
         hdo = distrib_opt.optimizer
+        # DistributedOptimizer assigns resharded checkpoint tensors directly
+        # into HDO state after its ordinary load_state_dict hook. Refresh the
+        # actual FP32/CPU Adam parameters before copying anything into BF16.
+        remainder_parameters = refresh_hybrid_optimizer_after_checkpoint(hdo)
         param_to_fp32_param = getattr(hdo, "param_to_fp32_param", None)
         if not param_to_fp32_param:
             return False
 
-        # HybridDeviceOptimizer's post-load hook has already populated these
-        # FP32 working parameters from the checkpoint's master_param entries.
+        # The explicit refresh above populated these working parameters from
+        # the loaded master_param entries, including saved BF16 remainder bits.
         for model_param, fp32_param in param_to_fp32_param.items():
-            model_param.data.copy_(fp32_param.data)
+            # TE's remainder format rounds exact BF16 halfway cases upward;
+            # an FP32-to-BF16 copy would instead round to even. Those compute
+            # weights were loaded with the checkpoint and must stay bit exact.
+            if model_param not in remainder_parameters:
+                model_param.data.copy_(fp32_param.data)
 
         # The copied parameters are local distributed-optimizer shards. Rebuild
         # full BF16 compute parameters before the first forward after resume.
@@ -1913,6 +1921,7 @@ def _create_checkpoint_config(
     # default (synchronous save).
     _optional_ckpt_fields = (
         "async_save",
+        "load_rng",
         "ckpt_assume_constant_structure",
         "ckpt_fully_parallel_save_process_group",
         "ckpt_fully_parallel_load_process_group",
@@ -2577,14 +2586,56 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        load_checkpoint(
-            state,
-            model,
-            optimizer,
-            scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
-        )
+        with ExitStack() as checkpoint_load_stack:
+            if optimizer is not None and resume_checkpoint_exists:
+                from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                    HybridDeviceOptimizer,
+                )
+
+                hybrid_optimizers = [
+                    (index, distrib_opt.optimizer)
+                    for index, distrib_opt in enumerate(
+                        getattr(optimizer, "chained_optimizers", [optimizer])
+                    )
+                    if isinstance(
+                        getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+                    )
+                ]
+                source_formats = (
+                    checkpoint_bf16_master_dtypes(megatron_cfg.checkpoint.load)
+                    if hybrid_optimizers
+                    else None
+                )
+                for index, hybrid in hybrid_optimizers:
+                    source_dtype = (
+                        None if source_formats is None else source_formats.get(index)
+                    )
+                    if (
+                        source_formats is not None
+                        and source_dtype is None
+                        and any(
+                            parameter.dtype == torch.bfloat16
+                            for group in hybrid.param_groups
+                            for parameter in group["params"]
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"BF16 optimizer master metadata missing for chained optimizer {index}"
+                        )
+                    checkpoint_load_stack.enter_context(
+                        preserve_hybrid_optimizer_state_dtypes(
+                            hybrid, bf16_master_dtype=source_dtype
+                        )
+                    )
+            load_checkpoint(
+                state,
+                model,
+                optimizer,
+                scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
         print("Checkpoint loaded")
 
         # See _force_sync_optimizer_fp32_from_model: required when

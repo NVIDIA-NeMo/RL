@@ -541,6 +541,81 @@ def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts(
         )
 
 
+def test_chat_prediction_fingerprints_keep_choice_provenance_and_response(monkeypatch):
+    from nemo_rl.utils import r3_trace
+
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_STEPS", "10")
+    records = []
+    monkeypatch.setattr(r3_trace, "_write_record", records.append)
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        prompt_routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int16),
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[201, 202],
+                routed_experts=torch.tensor([[[31]], [[32]]], dtype=torch.int16),
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor([[[30]]], dtype=torch.int16),
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(
+                    generation_log_probs=[-0.5], content="unchanged-0"
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                message=SimpleNamespace(
+                    generation_log_probs=[-1.0, -1.5], content="unchanged-1"
+                ),
+            ),
+        ]
+    )
+    result = attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        capture_trace_context=r3_trace.CapturedPredictionContext(
+            "rollout", "call", 4, 5
+        ),
+    )
+    assert result is response
+    assert [r["choice_index"] for r in records] == [0, 1]
+    assert [r["generation_tokens"] for r in records] == [1, 2]
+    assert [r["predictor_shape"] for r in records] == [[1, 1, 1], [2, 1, 1]]
+    assert all(
+        r["model_call_id"] == "call" and r["status"] == "available" for r in records
+    )
+    assert (
+        records[0]["generation_predictor_routes_sha256"]
+        != records[1]["generation_predictor_routes_sha256"]
+    )
+    assert response.choices[0].message.content == "unchanged-0"
+    assert response.choices[1].message.generation_log_probs == [-1.0, -1.5]
+    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+        [[10]],
+        [[11]],
+        [[30]],
+        [[0]],
+    ]
+    assert _decoded_routes(response.choices[1].message.routed_experts) == [
+        [[10]],
+        [[11]],
+        [[31]],
+        [[32]],
+        [[0]],
+    ]
+
+
 def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes():
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],

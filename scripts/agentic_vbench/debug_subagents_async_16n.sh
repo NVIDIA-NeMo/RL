@@ -9,7 +9,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_dir=$(cd "$script_dir/../.." && pwd)
 
 : "${AGENTIC_VBENCH_BACKEND_DIR:?Set AGENTIC_VBENCH_BACKEND_DIR to the dedicated live async backend}"
-: "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
+if [[ ${ASYNC_INIT_MODE:-sync_step20} == sync_step20 ]]; then
 if [[ -n ${EXTRA_OVERRIDES:-} ]]; then
   echo "ERROR: async qualification requires EXTRA_OVERRIDES to be empty" >&2
   exit 2
@@ -20,37 +20,60 @@ for reserved_variable in RESULTS_DIR CHECKPOINT_ROOT CHECKPOINT_DIR TOKEN_CAPTUR
     exit 2
   fi
 done
-[[ -d $SYNC_POLICY_CHECKPOINT ]] || {
-  echo "ERROR: SYNC_POLICY_CHECKPOINT is not a directory: $SYNC_POLICY_CHECKPOINT" >&2
-  exit 2
-}
-sync_policy_checkpoint_real=$(realpath "$SYNC_POLICY_CHECKPOINT")
-case $sync_policy_checkpoint_real in
-  */step_20/policy/weights) ;;
-  *)
-    echo "ERROR: async qualification requires the exact sync step_20/policy/weights donor: $sync_policy_checkpoint_real" >&2
-    exit 2
-    ;;
-esac
-SYNC_POLICY_CHECKPOINT=$sync_policy_checkpoint_real
-[[ -s $SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt ]] || {
-  echo "ERROR: sync policy donor lacks latest_checkpointed_iteration.txt: $SYNC_POLICY_CHECKPOINT" >&2
-  exit 2
-}
-sync_iteration=
-IFS= read -r sync_iteration <"$SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt" || true
-if [[ $sync_iteration == release ]]; then
-  sync_iteration_dir=release
-elif [[ $sync_iteration =~ ^[0-9]+$ ]]; then
-  printf -v sync_iteration_dir 'iter_%07d' "$((10#$sync_iteration))"
-else
-  echo "ERROR: sync policy donor has an invalid checkpoint tracker: $sync_iteration" >&2
-  exit 2
 fi
-[[ -s $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir/run_config.yaml ]] || {
-  echo "ERROR: tracked sync policy iteration lacks run_config.yaml: $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir" >&2
+initialization_overrides=()
+async_init_mode=${ASYNC_INIT_MODE:-sync_step20}
+case "$async_init_mode" in
+hf)
+  [[ -z ${SYNC_POLICY_CHECKPOINT:-} ]] || {
+    echo 'ERROR: hf initialization cannot also specify SYNC_POLICY_CHECKPOINT' >&2
+    exit 2
+  }
+  echo 'Async starts from the configured HF model; sync qualification is still pending.'
+  ;;
+sync_step20)
+  : "${SYNC_POLICY_CHECKPOINT:?Set SYNC_POLICY_CHECKPOINT to the qualified sync step_20/policy/weights directory}"
+  [[ -d $SYNC_POLICY_CHECKPOINT ]] || {
+    echo "ERROR: SYNC_POLICY_CHECKPOINT is not a directory: $SYNC_POLICY_CHECKPOINT" >&2
+    exit 2
+  }
+  sync_policy_checkpoint_real=$(realpath "$SYNC_POLICY_CHECKPOINT")
+  case $sync_policy_checkpoint_real in
+    */step_20/policy/weights) ;;
+    *)
+      echo "ERROR: async qualification requires the exact sync step_20/policy/weights donor: $sync_policy_checkpoint_real" >&2
+      exit 2
+      ;;
+  esac
+  SYNC_POLICY_CHECKPOINT=$sync_policy_checkpoint_real
+  [[ -s $SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt ]] || {
+    echo "ERROR: sync policy donor lacks latest_checkpointed_iteration.txt: $SYNC_POLICY_CHECKPOINT" >&2
+    exit 2
+  }
+  sync_iteration=
+  IFS= read -r sync_iteration <"$SYNC_POLICY_CHECKPOINT/latest_checkpointed_iteration.txt" || true
+  if [[ $sync_iteration == release ]]; then
+    sync_iteration_dir=release
+  elif [[ $sync_iteration =~ ^[0-9]+$ ]]; then
+    printf -v sync_iteration_dir 'iter_%07d' "$((10#$sync_iteration))"
+  else
+    echo "ERROR: sync policy donor has an invalid checkpoint tracker: $sync_iteration" >&2
+    exit 2
+  fi
+  [[ -s $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir/run_config.yaml ]] || {
+    echo "ERROR: tracked sync policy iteration lacks run_config.yaml: $SYNC_POLICY_CHECKPOINT/$sync_iteration_dir" >&2
+    exit 2
+  }
+  initialization_overrides=(
+    "+checkpointing.pretrained_checkpoint.path=${SYNC_POLICY_CHECKPOINT}"
+    +checkpointing.pretrained_checkpoint.format=megatron_bridge
+  )
+  ;;
+*)
+  echo "ERROR: ASYNC_INIT_MODE must be hf or sync_step20" >&2
   exit 2
-}
+  ;;
+esac
 for override in "$@"; do
   case $override in
     checkpointing.pretrained_checkpoint* | +checkpointing.pretrained_checkpoint* | ++checkpointing.pretrained_checkpoint* | '~checkpointing.pretrained_checkpoint'*)
@@ -64,12 +87,14 @@ for override in "$@"; do
   esac
 done
 
+if [[ $async_init_mode == sync_step20 ]]; then
 super_checkpoint=/lustre/fsw/portfolios/nemotron/users/ehosseiniasl/checkpoints/super35-journey-mopd2-identity-upsampling-from-my-step30-yifuw-001_boosted_mtp
 export MODEL_PATH=${MODEL_PATH:-$super_checkpoint}
 [[ $(realpath "$MODEL_PATH") == $(realpath "$super_checkpoint") ]] || {
   echo "ERROR: async qualification requires the exact Super-GA checkpoint: $super_checkpoint" >&2
   exit 2
 }
+fi
 export GENERATION_TENSOR_PARALLEL_SIZE=${GENERATION_TENSOR_PARALLEL_SIZE:-4}
 # Gate 2 keeps the exact Gate 1 prompts; only sampler topology changes.
 debug_delegation_prompt="Your first action must be exactly one task tool call before bash read or any other tool. "
@@ -82,6 +107,7 @@ debug_subagent_prompt+="Use one batched ffprobe command and one batched ffmpeg -
 debug_subagent_prompt+="Choose the best full clip for every storyboard slot silently. Your very next response after the overview read results must call bash to create /workspace/output/solution.mp4 and /workspace/output/solution.json. Concatenate each selected full clip once. Use source ffprobe durations for truthful contiguous JSON ranges and do not tune timestamps frame counts or sub-frame MP4 duration rounding. The JSON must be a top-level JSON object with a segments list and never a bare JSON list. "
 debug_subagent_prompt+="Do not use todowrite and do not retry cosmetic labels. Keep private selection reasoning under 200 words. Use one final bash call to verify both artifacts exist and that solution.json parses. Then return only a brief completion result."
 export AGENTIC_VBENCH_SUBAGENT_PROMPT=${AGENTIC_VBENCH_SUBAGENT_PROMPT:-"${debug_subagent_prompt}"}
+if [[ $async_init_mode == sync_step20 ]]; then
 source_commit=$(git -C "$repo_dir" rev-parse HEAD)
 sync_result_dir=$(realpath "$SYNC_POLICY_CHECKPOINT/../../../..")
 sync_health_auditor=${SYNC_HEALTH_AUDITOR:-$repo_dir/../../nemo-rl-resources/recipes/subagent/audit_single_controller_health.py}
@@ -138,6 +164,7 @@ print(payload["dcp_sha256_manifest"]["manifest_sha256"])
 DCP_DIGEST_PY
 )
 export SYNC_DCP_MANIFEST_SHA256
+fi
 export SLURM_ACCOUNT=${SLURM_ACCOUNT:-nemotron_n4_omni}
 export CONFIG_IN_CONTAINER=${CONFIG_IN_CONTAINER:-examples/configs/recipes/vlm/vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml}
 export NUM_NODES=${NUM_NODES:-16}
@@ -168,12 +195,14 @@ export BASE_NAME=${BASE_NAME:-agentic_vbench_v2_subagents_async_16n_$(date -u +%
   echo "ERROR: BASE_NAME must contain only letters, digits, dot, underscore, or dash" >&2
   exit 2
 }
+if [[ $async_init_mode == sync_step20 ]]; then
 export RESULTS_DIR=$repo_dir/results/$BASE_NAME
 [[ ! -e $RESULTS_DIR ]] || {
   echo "ERROR: async qualification requires a fresh result directory: $RESULTS_DIR" >&2
   exit 2
 }
 export CHECKPOINT_ROOT=$RESULTS_DIR
+fi
 export WANDB_RUN_NAME=${WANDB_RUN_NAME:-$BASE_NAME}
 export WANDB_PROJECT=nemorl-v2-subagent-comapction-debug
 export WANDB_ENTITY=${WANDB_ENTITY:-adlr}
@@ -201,5 +230,4 @@ exec bash "$script_dir/smoke_subagents_fast_step.sh" \
   "async_rl.max_inflight_prompts=${inflight_groups}" \
   "async_rl.max_buffered_rollouts=${inflight_groups}" \
   "$@" \
-  "+checkpointing.pretrained_checkpoint.path=${SYNC_POLICY_CHECKPOINT}" \
-  +checkpointing.pretrained_checkpoint.format=megatron_bridge
+  "${initialization_overrides[@]}"

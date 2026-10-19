@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# The same verified Super kernels on an 8-node learner plus 8 generation nodes.
+# Launch ownership, native online W&B, and full-state resume remain required.
+defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-agentic-vbench-sc.v1.yaml
+
+grpo:
+  num_prompts_per_step: 8
+
+policy:
+  train_global_batch_size: 32
+  megatron_cfg:
+    expert_model_parallel_size: 64
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8
+
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 2
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 24
+  max_buffered_rollouts: 24
+
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
+  segment_size: 8

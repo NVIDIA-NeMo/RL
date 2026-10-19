@@ -15,6 +15,7 @@
 """Actual train-pump/GRPO composition; storage, learner and sampler are doubles."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,6 +25,9 @@ from tensordict import TensorDict
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
+from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
+    TMPEOutlierDumpRef,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from tests.unit.single_controller.test_logical_advantage import _batch, _controller
@@ -295,6 +299,85 @@ def test_role_counts_are_emitted_on_the_committed_step_after_owner_admission(
         metrics["session_traces/post_admission_parent_trace_count"]
         + metrics["session_traces/post_admission_child_trace_count"]
         == metrics["session_traces/post_admission_trace_count"]
+    )
+
+
+@pytest.mark.parametrize("failure_phase", ["refit", "checkpoint"])
+def test_completed_optimizer_metrics_are_committed_before_later_io_fails(
+    monkeypatch, failure_phase
+):
+    ctrl, _ = _setup(monkeypatch)
+    ctrl._trainer.finish_train_step.return_value = {
+        "loss": 0.25,
+        "grad_norm": 1.5,
+        "optimizer_update_successful": True,
+        "all_mb_metrics": {"global_valid_toks": [12]},
+    }
+    error = RuntimeError(f"{failure_phase} failed")
+    if failure_phase == "refit":
+        ctrl._sync_weights.side_effect = error
+    else:
+        ctrl._master_config.checkpointing.update(enabled=True, save_period=1)
+        ctrl._save_checkpoint = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError, match=f"{failure_phase} failed"):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    ctrl._trainer.finish_train_step.assert_called_once()
+    assert ctrl._train_steps == 1
+    train_logs = [
+        call
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert len(train_logs) == 1
+    assert train_logs[0].kwargs == {
+        "step": 1,
+        "prefix": "train",
+        "step_finished": True,
+    }
+    metrics = train_logs[0].args[0]
+    assert metrics["loss"] == 0.25
+    assert metrics["grad_norm"] == 1.5
+    assert metrics["optimizer_update_successful"] == 1.0
+    assert metrics["global_valid_toks"] == 12
+
+
+def test_train_pump_links_each_raw_dump_to_its_actual_chunk_admission(
+    monkeypatch, tmp_path
+):
+    batches = [
+        _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True),
+        _batch([("b", [(0.0, 3), (1.0, 2)])], padding=True),
+    ]
+    # Owner fanout rejects the first parent's row because its child is invalid.
+    batches[0][1]["sample_mask"][1] = 0
+    ctrl, metas = _setup(monkeypatch, batches=batches)
+    ctrl._policy_logprobs_required = True
+    dumps = []
+    for index, meta in enumerate(metas):
+        raw = tmp_path / f"raw-chunk-{index}.pt"
+        raw.write_bytes(b"immutable raw dump boundary fixture")
+        dumps.append([TMPEOutlierDumpRef(meta.sample_ids[0], raw)])
+    ctrl._maybe_dump_tmpe_outliers = AsyncMock(side_effect=dumps)
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    records = [
+        json.loads(refs[0].path.with_suffix(".admission.json").read_text())
+        for refs in dumps
+    ]
+    assert [record["sample_id"] for record in records] == [
+        meta.sample_ids[0] for meta in metas
+    ]
+    assert [record["admitted"] for record in records] == [False, True]
+    assert [record["final_sample_mask"] for record in records] == [0, 1]
+    assert all(record["step"] == 0 for record in records)
+    ctrl._trainer.finish_train_step.assert_called_once_with()
+    assert ctrl._train_steps == 1
+    assert all(
+        refs[0].path.read_bytes() == b"immutable raw dump boundary fixture"
+        for refs in dumps
     )
 
 

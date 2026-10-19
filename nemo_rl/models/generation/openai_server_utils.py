@@ -35,6 +35,43 @@ class PrefixSplice:
     template_cut_start: int
 
 
+def escape_prefix_media_markers(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide literal media markers in assistant history during prefix rendering.
+
+    Multimodal processors can mistake an assistant's textual ``<image>`` or
+    ``<video>`` for a payload placeholder and shift every subsequent image.
+    For an exact-token continuation, assistant history is discarded by the
+    splice, so its render can use ordinary text in place of these markers.
+    The sampled model prefix, appended observations, and actual media stay
+    unchanged. Callers must discard this render if the request starts a root.
+
+    Returns the original list when no assistant strings need escaping. No
+    input objects are mutated, including nested tool-call arguments.
+    """
+
+    def escape(value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace("<image>", "< image >").replace("<video>", "< video >")
+        if isinstance(value, list):
+            return [escape(item) for item in value]
+        if isinstance(value, dict):
+            return {key: escape(item) for key, item in value.items()}
+        return value
+
+    result = []
+    changed = False
+    for message in messages:
+        if message.get("role") == "assistant":
+            escaped = escape(message)
+            changed |= escaped != message
+            result.append(escaped)
+        else:
+            result.append(message)
+    return result if changed else messages
+
+
 def replace_prefix_tokens(
     tokenizer: Any,
     model_prefix_token_ids: list[int],

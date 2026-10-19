@@ -28,9 +28,11 @@ import torch.nn.functional as F
 
 
 def _dump_root() -> Path | None:
-    explicit = os.environ.get("NEMO_RL_VISION_PARITY_DUMP_DIR", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
+    explicit = os.environ.get("NEMO_RL_VISION_PARITY_DUMP_DIR")
+    if explicit is not None:
+        # An explicit empty override disables layer dumps independently of
+        # the smaller TMPE outlier snapshots needed for training diagnostics.
+        return Path(explicit.strip()).expanduser() if explicit.strip() else None
     outlier_path = os.environ.get("NEMO_RL_TMPE_OUTLIER_DUMP_PATH", "").strip()
     if outlier_path:
         return Path(outlier_path).expanduser().parent / "vision_parity"
@@ -52,7 +54,6 @@ def dump_vision_features(
     stage: str = "projected",
 ) -> Path | None:
     """Save one unique exact input/output pair on distributed rank zero only."""
-
     root = _dump_root()
     if root is None:
         return None
@@ -102,7 +103,6 @@ def dump_vision_features(
 
 def _hidden_state(value: Any) -> torch.Tensor:
     """Extract a layer hidden state from vLLM or Megatron hook values."""
-
     if torch.is_tensor(value):
         return value
     if isinstance(value, (tuple, list)) and value and torch.is_tensor(value[0]):
@@ -112,7 +112,6 @@ def _hidden_state(value: Any) -> torch.Tensor:
 
 def _batch_sequence_layout(engine: str, hidden_state: torch.Tensor) -> torch.Tensor:
     """Normalize vLLM BSH and Megatron SBH tensors to the same BSH layout."""
-
     if hidden_state.ndim != 3:
         raise ValueError(
             f"Vision parity hook expected a 3-D hidden state, got {tuple(hidden_state.shape)}"
@@ -124,7 +123,6 @@ def _batch_sequence_layout(engine: str, hidden_state: torch.Tensor) -> torch.Ten
 
 def _flatten_batch_sequence_layout(engine: str, value: Any) -> torch.Tensor:
     """Normalize an attention intermediate to BSH, flattening head dimensions."""
-
     hidden_state = _hidden_state(value)
     if hidden_state.ndim < 3:
         raise ValueError(
@@ -142,7 +140,6 @@ def _flatten_batch_sequence_layout(engine: str, value: Any) -> torch.Tensor:
 
 def _residual_branch_state(engine: str, value: Any) -> torch.Tensor:
     """Include Megatron's separately returned bias in a residual branch."""
-
     hidden_state = _hidden_state(value)
     if (
         engine == "policy"
@@ -162,7 +159,6 @@ def vision_parity_layer_hooks(
     imgs_sizes: Any,
 ) -> Iterator[None]:
     """Capture RADIO's decoder input and per-layer outputs when dumping is enabled."""
-
     if _dump_root() is None:
         yield
         return
@@ -174,7 +170,9 @@ def vision_parity_layer_hooks(
     else:
         raise ValueError(f"Unsupported vision parity engine: {engine!r}")
     if not layers:
-        raise ValueError("Vision parity capture requires at least one RADIO encoder layer")
+        raise ValueError(
+            "Vision parity capture requires at least one RADIO encoder layer"
+        )
 
     handles = []
     forward_restores = []
@@ -357,7 +355,6 @@ def vision_parity_layer_hooks(
     mlp_fc2 = mlp_module.linear_fc2 if engine == "policy" else mlp_module.fc2
 
     if engine == "generation":
-
         dump_vision_features(
             engine,
             pixels,

@@ -36,6 +36,14 @@ if [[ -f $backend_dir/client.env ]]; then
   echo "A backend already publishes $backend_dir/client.env; refusing to start a second one" >&2
   exit 1
 fi
+# A portable bundle keeps the native Harbor backend usable on Slurm nodes
+# without a system Podman installation. All writable state remains job-local.
+if [[ -n ${PODMAN_BUNDLE_ROOT:-} ]]; then
+  PODMAN_BUNDLE_ROOT=$(cd "$PODMAN_BUNDLE_ROOT" && pwd)
+  export PODMAN_BUNDLE_ROOT
+  export PATH="$PODMAN_BUNDLE_ROOT/usr/local/bin:$PATH"
+  export LD_LIBRARY_PATH="$PODMAN_BUNDLE_ROOT/usr/local/lib:${LD_LIBRARY_PATH:-}"
+fi
 for tool in podman socat openssl; do
   command -v "$tool" >/dev/null || { echo "missing $tool on $(hostname)" >&2; exit 1; }
 done
@@ -61,6 +69,55 @@ export TMPDIR="$runtime/tmp"
 # cleanup removes the whole directory when the backend exits.
 export XDG_CONFIG_HOME="$runtime/config"
 export XDG_CACHE_HOME="$runtime/cache"
+if [[ -n ${PODMAN_BUNDLE_ROOT:-} ]]; then
+  export XDG_RUNTIME_DIR="$runtime/xdg-runtime"
+  mkdir -m 700 "$XDG_RUNTIME_DIR"
+  # Podman's image/build library looks in the normal home directory for its
+  # policy even when XDG_CONFIG_HOME is set. Preserve the user's trust policy.
+  [[ -r $HOME/.config/containers/policy.json || -r /etc/containers/policy.json ]] || {
+    echo 'Missing Podman policy.json; install the bundle policy in the normal user config before launching the backend' >&2
+    exit 1
+  }
+  python3 - "$PODMAN_BUNDLE_ROOT" "$runtime" <<'PODMAN_CONFIG_PY'
+import json
+from pathlib import Path
+import sys
+
+bundle, runtime = map(Path, sys.argv[1:])
+quote = lambda path: json.dumps(str(path))
+helpers = bundle / "usr/local/lib/podman"
+# Rootless cgroup v1 cannot enforce per-container limits. Keep the service in
+# Slurm's cgroup: otherwise Podman moves it to a transient user-systemd scope
+# whose manager exits when the batch node has no interactive login session.
+cgroup_config = '' if Path('/sys/fs/cgroup/cgroup.controllers').exists() else 'cgroups = "disabled"\n'
+(runtime / "containers.conf").write_text(
+    '[containers]\n'
+    + cgroup_config +
+    f'seccomp_profile = {quote(bundle / "etc/containers/seccomp.json")}\n'
+    '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\nruntime = "crun"\n'
+    f'conmon_path = [{quote(helpers / "conmon")}]\n'
+    f'helper_binaries_dir = [{quote(helpers)}, {quote(bundle / "usr/local/bin")}]\n'
+    '[engine.runtimes]\n'
+    f'crun = [{quote(bundle / "usr/local/bin/crun")}]\n'
+)
+(runtime / "storage.conf").write_text(
+    '[storage]\ndriver = "overlay"\n'
+    f'runroot = {quote(runtime / "run")}\n'
+    f'graphroot = {quote(runtime / "storage")}\n'
+    '[storage.options.overlay]\nignore_chown_errors = "true"\n'
+    f'mount_program = {quote(bundle / "usr/local/bin/fuse-overlayfs")}\n'
+)
+PODMAN_CONFIG_PY
+  export CONTAINERS_CONF="$runtime/containers.conf"
+  export CONTAINERS_STORAGE_CONF="$runtime/storage.conf"
+  export CONTAINERS_REGISTRIES_CONF="$PODMAN_BUNDLE_ROOT/etc/containers/registries.conf"
+  if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+    # The API command has no --cgroups flag; its rootless setup still attempts
+    # a user-systemd scope even with cgroupfs selected. No session bus is needed
+    # on cgroup v1. Prevent that optional move out of the Slurm allocation.
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/no-session-bus"
+  fi
+fi
 port=${AVB_BACKEND_PORT:-18443}
 # Certificates must outlive the job: the walltime in days, plus one.
 walltime_seconds=$(squeue -h -j "${SLURM_JOB_ID:-0}" -o %l 2>/dev/null | awk -F'[-:]' '
@@ -94,7 +151,24 @@ done
 # The Docker client reads ca.pem, cert.pem and key.pem from DOCKER_CERT_PATH.
 cp "$backend_dir/client-cert.pem" "$backend_dir/cert.pem"
 cp "$backend_dir/client-key.pem" "$backend_dir/key.pem"
-podman --root "$runtime/storage" --runroot "$runtime/run" \
+# Initialize rootless namespaces before backgrounding the API. Otherwise the
+# initial Podman invocation can re-exec and leave the supervisor tracking the
+# bootstrap process rather than the server (Podman's own API tests do this).
+podman --root "$runtime/storage" --runroot "$runtime/run" unshare true \
+  > "$backend_dir/bootstrap.log" 2>&1
+service_trace=()
+if [[ ${AVB_TRACE_SERVICE:-0} == 1 ]]; then
+  service_trace=("$(command -v strace)" -f -e trace=signal -o "$backend_dir/service-signals.log")
+fi
+podman_binary=$(command -v podman)
+service_path=$PATH
+if [[ -n ${PODMAN_BUNDLE_ROOT:-} && ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+  # Netavark 1.17 starts its DNS daemon through systemd-run whenever it finds
+  # that binary on PATH. Use only the portable runtime's complete helper set
+  # so DNS starts directly and remains in Slurm's allocation, like the API.
+  service_path="$PODMAN_BUNDLE_ROOT/usr/local/bin:$PODMAN_BUNDLE_ROOT/usr/local/lib/podman"
+fi
+PATH="$service_path" "${service_trace[@]}" "$podman_binary" --log-level="${AVB_PODMAN_LOG_LEVEL:-info}" --root "$runtime/storage" --runroot "$runtime/run" \
   --storage-opt overlay.ignore_chown_errors=true system service --time=0 "unix:$runtime/api.sock" \
   > "$backend_dir/podman.log" 2>&1 &
 service_pid=$!
@@ -121,4 +195,13 @@ kill -0 "$proxy_pid"
   printf 'export DOCKER_BUILDKIT=0\n'
 } > "$backend_dir/client.env"
 echo "Backend ready: source $backend_dir/client.env"
-wait -n "$proxy_pid" "$service_pid"
+if [[ ${AVB_TRACE_SERVICE:-0} == 1 ]]; then
+  ps -u "$(id -u)" -o pid,ppid,comm > "$backend_dir/processes.log"
+  printf 'batch=%s parent=%s service=%s proxy=%s\n' "$$" "$PPID" "$service_pid" "$proxy_pid" >> "$backend_dir/processes.log"
+fi
+backend_status=0
+wait -n -p exited_pid "$proxy_pid" "$service_pid" || backend_status=$?
+echo "Backend process ${exited_pid:-unknown} exited unexpectedly (status=$backend_status; proxy=$proxy_pid service=$service_pid)" >&2
+# A clean daemon exit still means the long-lived backend failed.
+(( backend_status != 0 )) || backend_status=1
+exit "$backend_status"

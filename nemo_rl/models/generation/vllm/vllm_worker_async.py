@@ -21,7 +21,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -72,7 +72,16 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
+    escape_prefix_media_markers,
     splice_prefix_tokens,
+)
+from nemo_rl.utils.r3_trace import (
+    CapturedPredictionContext,
+    RefitTraceSnapshot,
+    capture_refit_snapshot,
+    trace_capture_weight_span,
+    trace_serving_weight_version,
+    trace_weight_refit_rpc,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
@@ -89,6 +98,9 @@ class CapturedRequest:
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
+    refit_snapshot: RefitTraceSnapshot | None = field(
+        default_factory=capture_refit_snapshot
+    )
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -612,7 +624,26 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
+        previous_version = self._rollout_weight_version
         self._rollout_weight_version = int(version)
+        trace_serving_weight_version(
+            previous_version=previous_version, version=self._rollout_weight_version
+        )
+
+    def _trace_request_capture_completion(self, request: Any) -> None:
+        """Observe the version at engine-response completion before staging."""
+        state = self._capture_calls.get(id(request))
+        if state is None:
+            return
+        call = state.call
+        trace_capture_weight_span(
+            rollout_id=call.admission.rollout_id,
+            model_call_id=call.admission.model_call_id,
+            admission_weight_version=call.weight_version,
+            response_weight_version=self._rollout_weight_version,
+            admission_refit=state.refit_snapshot,
+            response_refit=capture_refit_snapshot(),
+        )
 
     def _capture_admission(self, request: Any) -> Any | None:
         """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
@@ -1108,12 +1139,20 @@ class VllmAsyncGenerationWorkerImpl(
                         message["tool_calls"] = list(message["tool_calls"])
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+                admission = worker_self._capture_admission(request)
+                render_messages = messages
+                if worker_self._capture_media and (
+                    bool(getattr(request, "required_prefix_token_ids", None))
+                    or (
+                        admission is not None
+                        and admission.prev_len > 0
+                        and admission.mode in ("candidate", "token_in")
+                    )
+                ):
+                    render_messages = escape_prefix_media_markers(messages)
                 # #4124: processor-only cache reads retain concrete pixels even
                 # when the engine's sender cache would return references.
-                if (
-                    worker_self._capture_media
-                    and worker_self._capture_admission(request) is not None
-                ):
+                if worker_self._capture_media and admission is not None:
                     skip_mm_cache = True
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
@@ -1133,7 +1172,7 @@ class VllmAsyncGenerationWorkerImpl(
                 try:
                     res = await super().preprocess_chat(
                         request=request,
-                        messages=messages,
+                        messages=render_messages,
                         default_template=default_template,
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
@@ -1159,7 +1198,6 @@ class VllmAsyncGenerationWorkerImpl(
                 # its event loop explicitly. The adapter then attaches the
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
-                admission = worker_self._capture_admission(request)
                 serving_admission = admission
                 verify_retained_media = False
                 if admission is not None and admission.mode == "candidate":
@@ -1196,6 +1234,20 @@ class VllmAsyncGenerationWorkerImpl(
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
+                    if render_messages is not messages:
+                        # A rewritten candidate starts a root. Its rendered
+                        # history becomes model input, so discard the temporary
+                        # escaped render and process the original source again.
+                        res = await super().preprocess_chat(
+                            request=request,
+                            messages=messages_for_replace_prefix_tokens,
+                            default_template=default_template,
+                            default_template_content_format=default_template_content_format,
+                            default_template_kwargs=default_template_kwargs,
+                            tool_dicts=tool_dicts,
+                            parser=parser,
+                            skip_mm_cache=skip_mm_cache,
+                        )
                     # Clamp the request's max output tokens so that input + output <= max_model_len.
                     if actual_request_max_tokens is not None:
                         self._clamp_max_tokens(
@@ -1220,6 +1272,10 @@ class VllmAsyncGenerationWorkerImpl(
                     return res
 
                 model_prefix_token_ids = list(request.required_prefix_token_ids)
+                if render_messages is not messages:
+                    messages_for_replace_prefix_tokens = escape_prefix_media_markers(
+                        messages_for_replace_prefix_tokens
+                    )
 
                 # Token-in splice path — shared by staging_chain and direct prefix.
                 last_assistant_message_idx = None
@@ -1366,6 +1422,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     return response
 
+                worker_self._trace_request_capture_completion(request)
                 if request.logprobs and return_as_token_id:
                     response = attach_token_information_to_chat_response_choices(
                         response,
@@ -1373,12 +1430,24 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 if worker_self._return_routed_experts_enabled():
+                    capture_state = worker_self._capture_calls.get(id(request))
+                    capture_trace_context = (
+                        CapturedPredictionContext(
+                            rollout_id=capture_state.call.admission.rollout_id,
+                            model_call_id=capture_state.call.admission.model_call_id,
+                            admission_weight_version=capture_state.call.weight_version,
+                            response_weight_version=worker_self._rollout_weight_version,
+                        )
+                        if capture_state is not None
+                        else None
+                    )
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
                         final_res,
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        capture_trace_context=capture_trace_context,
                     )
 
                 return response
@@ -1652,6 +1721,7 @@ class VllmAsyncGenerationWorkerImpl(
                     return JSONResponse(
                         content={
                             "prompt_token_count": generator.count,
+                            "max_model_len": generator.max_model_len,
                             "ng_context_measured": True,
                         }
                     )
@@ -2236,15 +2306,16 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq",
-                args=tuple(),
-            )
+            with trace_weight_refit_rpc(transport="ipc_zmq"):
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_via_ipc_zmq",
+                    args=tuple(),
+                )
 
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
 
             worker_results = cast(list[bool], worker_results)
 
@@ -2276,15 +2347,16 @@ class VllmAsyncGenerationWorkerImpl(
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
 
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective",
-                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
-            )
+            with trace_weight_refit_rpc(transport="collective"):
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_from_collective",
+                    args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
+                )
 
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
 
             worker_results = cast(list[bool], worker_results)
 
@@ -2352,14 +2424,15 @@ class VllmAsyncGenerationWorkerImpl(
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
-            result_or_coro = await self.llm.collective_rpc(
-                "nccl_reshard_refit", args=(refit_timeout_s,)
-            )
+            with trace_weight_refit_rpc(transport="nccl_reshard"):
+                result_or_coro = await self.llm.collective_rpc(
+                    "nccl_reshard_refit", args=(refit_timeout_s,)
+                )
 
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
 
             worker_result = worker_results[0]
 

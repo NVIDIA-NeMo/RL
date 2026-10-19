@@ -27,6 +27,7 @@ project-includes = [
   "nemo_rl/models/megatron/stable_forward.py",
   "nemo_rl/environments/gym_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
+  "nemo_rl/algorithms/single_controller_utils/call_replay_metrics.py",
   "nemo_rl/data/captured_media.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
@@ -196,6 +197,7 @@ project-includes = [
   "nemo_rl/experience/payload.py",
   "nemo_rl/experience/rollout_manager.py",
   "nemo_rl/experience/rollout_reassembler.py",
+  "nemo_rl/experience/original_call_evidence.py",
   "nemo_rl/experience/rollout_reassembler_actor.py",
   "nemo_rl/experience/rollout_recovery.py",
   "nemo_rl/experience/rollouts.py",
@@ -277,6 +279,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/utils.py",
   "nemo_rl/models/megatron/hybridep.py",
   "nemo_rl/models/megatron/memory_saver.py",
+  "nemo_rl/models/megatron/optimizer_state_sync.py",
   "nemo_rl/models/megatron/opd_full_capture.py",
   "nemo_rl/models/policy/__init__.py",
   "nemo_rl/models/policy/draft_config.py",

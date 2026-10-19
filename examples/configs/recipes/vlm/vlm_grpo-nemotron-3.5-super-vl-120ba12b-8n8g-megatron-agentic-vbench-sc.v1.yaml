@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Public NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16 for the native
+# parent/subagent gate. MODEL_PATH points at the complete local HF checkpoint.
+# Launch through scripts/agentic_vbench/debug_subagents_sync_8n.sh so session
+# ownership, routed-expert replay, and the production GRPO horizon stay aligned.
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-sc-256k.v1.yaml
+
+grpo:
+  num_prompts_per_step: 4
+
+checkpointing:
+  save_period: 20
+  ft_save_period: 10
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+policy:
+  train_global_batch_size: 16
+  megatron_cfg:
+    # Keep policy scoring and checkpoint recomputation on the qualified BF16
+    # kernels. This requires the source-pinned native TE/MCore runtime.
+    stable_policy_forward: true
+    expert_model_parallel_size: 32
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    # HF serializes one shared attention+MoE MTP block; the Super-VL bridge
+    # applies it at two prediction depths with shared parameters.
+    mtp_num_layers: 2
+    mtp_use_repeated_layer: true
+  generation:
+    vllm_kwargs:
+      # Qualified on the original AVB call on all generation engines in both
+      # sync8 and async16. Keep the Mamba2 batch-invariance guard enabled.
+      moe_backend: triton
+      mamba_ssm_cache_dtype: float32
+    vllm_cfg:
+      env_vars:
+        VLLM_BATCH_INVARIANT: '0'
+      # TP4 weights use 57.55 GiB per H100; 0.8 leaves too little KV cache
+      # for the full 262144-token context after runtime profiling.
+      gpu_memory_utilization: 0.9
+      reasoning_parser_plugin: ${policy.model_name}/ultra_v3_reasoning_parser.py
+    colocated:
+      resources:
+        num_nodes: 4
+
+cluster:
+  num_nodes: 8
+  gpus_per_node: 8
+  segment_size: 4

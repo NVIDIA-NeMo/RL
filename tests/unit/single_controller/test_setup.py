@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import pickle
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -321,6 +322,105 @@ def patched_factories():
         }
 
 
+@pytest.mark.parametrize("megatron_enabled", [False, True])
+def test_policy_warm_start_keeps_adam_and_starts_fresh_data(
+    tmp_path: Path, patched_factories: dict[str, Any], megatron_enabled: bool
+) -> None:
+    seed = tmp_path / "seed" / "step_20"
+    (seed / "policy" / "weights").mkdir(parents=True)
+    (seed / "policy" / "optimizer").mkdir()
+    (seed / "training_info.json").write_text(json.dumps(vars(_save_state(step=20))))
+    torch.save({"cursor": 20}, seed / "train_dataloader.pt")
+    config = _make_master_config(megatron_enabled=megatron_enabled)
+    config.checkpointing.update(
+        checkpoint_dir=str(tmp_path / "new_run"),
+        warm_start_policy_checkpoint=str(seed),
+    )
+
+    actor_args, _ = setup_single_controller(config, MagicMock(pad_token_id=0))
+
+    trainer = patched_factories["_build_trainer"].call_args.kwargs
+    assert trainer["weights_path"] == seed / "policy" / "weights"
+    assert trainer["optimizer_path"] == seed / "policy" / "optimizer"
+    assert actor_args.save_state.current_step == 0
+    assert actor_args.last_checkpoint_path is None
+    assert actor_args.data_plane_checkpoint_metadata is None
+    if megatron_enabled:
+        assert config.policy["megatron_cfg"]["checkpoint"]["load_rng"] is False
+    patched_factories["dataloader"].load_state_dict.assert_not_called()
+    patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
+
+
+def test_policy_warm_start_rejects_missing_adam_before_building_workers(
+    tmp_path: Path, patched_factories: dict[str, Any]
+) -> None:
+    seed = tmp_path / "seed" / "step_20"
+    (seed / "policy" / "weights").mkdir(parents=True)
+    config = _make_master_config()
+    config.checkpointing.update(
+        checkpoint_dir=str(tmp_path / "new_run"),
+        warm_start_policy_checkpoint=str(seed),
+    )
+
+    with pytest.raises(ValueError, match="refusing an Adam reset"):
+        setup_single_controller(config, MagicMock(pad_token_id=0))
+
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_trainer"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "source_ep,target_ep,fully_reshardable,bucket_sharded,rejected",
+    [
+        (64, 32, False, True, True),
+        (32, 32, False, True, False),
+        (64, 32, True, False, False),
+        (64, 32, False, False, False),
+    ],
+)
+def test_policy_warm_start_bucket_adam_ep_guard(
+    tmp_path: Path,
+    source_ep: int,
+    target_ep: int,
+    fully_reshardable: bool,
+    bucket_sharded: bool,
+    rejected: bool,
+) -> None:
+    weights = tmp_path / "weights"
+    iteration = weights / "iter_0000000"
+    iteration.mkdir(parents=True)
+    state_key = (
+        "optimizer.distributed.dp_group_idx_0.gbuf_idx_0.bucket_idx_0.exp_avg"
+        if bucket_sharded
+        else "optimizer.state.model.layers.0.exp_avg"
+    )
+    with (iteration / ".metadata").open("wb") as stream:
+        pickle.dump(SimpleNamespace(state_dict_metadata={state_key: None}), stream)
+    OmegaConf.save(
+        {
+            "model": {"expert_model_parallel_size": source_ep},
+            "optimizer": {"use_distributed_optimizer": True},
+            "checkpoint": {
+                "ckpt_format": "torch_dist",
+                "dist_ckpt_optim_fully_reshardable": fully_reshardable,
+            },
+        },
+        iteration / "run_config.yaml",
+    )
+    config = _make_master_config(megatron_enabled=True)
+    config.policy["megatron_cfg"]["expert_model_parallel_size"] = target_ep
+    if rejected:
+        with pytest.raises(ValueError, match="EP64 to EP32 with bucket-sharded Adam"):
+            sc_setup_mod._validate_megatron_warm_start_optimizer_topology(
+                weights, config.policy
+            )
+    else:
+        sc_setup_mod._validate_megatron_warm_start_optimizer_topology(
+            weights, config.policy
+        )
+
+
 def test_build_generation_passes_sglang_config():
     """SGLangGeneration receives the complete generation config by keyword."""
     master_config = _make_master_config(backend="sglang")
@@ -390,6 +490,8 @@ def test_cc_restores_discovered_checkpoint(
         enabled=saving,
         save_data_plane=True,
         save_period=1,
+        # An ordinary resume must ignore even an unavailable initialization seed.
+        warm_start_policy_checkpoint=str(tmp_path / "missing_seed"),
     )
     mc.rollout_checkpointing = RolloutCheckpointConfig(
         snapshot_attempt_interval_s=interval, restore_mode=restore_mode
@@ -425,6 +527,9 @@ def test_cc_restores_discovered_checkpoint(
     assert actor_args.last_checkpoint_path == str(checkpoint)
     assert actor_args.save_state.current_step == 3
     assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
+    # Both CC partitions already have their typed schema in the restored TQ
+    # controller. Float32 warm-up rows would conflict with int64 input_ids.
+    actor_args.dp_client.register_partition.assert_not_called()
     policy.load_data_plane_checkpoint.assert_called_once_with(
         checkpoint / DATA_PLANE_CHECKPOINT_DIR
     )
@@ -434,6 +539,7 @@ def test_cc_restores_discovered_checkpoint(
     trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
     assert trainer_kwargs["weights_path"] == checkpoint / "policy" / "weights"
     assert trainer_kwargs["optimizer_path"] == checkpoint / "policy" / "optimizer"
+    assert mc.policy["megatron_cfg"].get("checkpoint", {}).get("load_rng", True)
     if interval is not None and restore_mode == "latest":
         resolve.assert_called_once_with(
             checkpoint,
@@ -1944,12 +2050,16 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     @pytest.mark.parametrize("with_processor", [True, False])
+    @pytest.mark.parametrize("outlier_dumps", [True, False])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor
+        self, patched_factories, with_processor, outlier_dumps, monkeypatch, tmp_path
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
         mc = _make_master_config(backend="vllm", megatron_enabled=with_processor)
+        monkeypatch.delenv("NEMO_RL_TMPE_OUTLIER_DUMP_PATH", raising=False)
+        if outlier_dumps:
+            monkeypatch.setenv("NEMO_RL_TMPE_OUTLIER_DUMP_PATH", str(tmp_path))
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -1995,6 +2105,13 @@ class TestSetup:
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_config.capture_media is with_processor
+        if outlier_dumps:
+            assert actor_config.original_call_evidence is not None
+            assert actor_config.original_call_evidence.output_path == str(
+                tmp_path / "original_calls"
+            )
+        else:
+            assert actor_config.original_call_evidence is None
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
@@ -2685,6 +2802,7 @@ class TestNativeTQRecoverySetup:
         assert events == ["load", "build"]
         assert actor_args.data_plane_checkpoint_metadata == _native_tq_metadata()
         assert actor_args.rollout_checkpoint_load_metrics["tq_load_seconds"] >= 0
+        actor_args.dp_client.register_partition.assert_not_called()
 
     @pytest.mark.parametrize("save_enabled", [False, True])
     def test_mooncake_setup_defers_restore_and_warmup_decision_to_actor(

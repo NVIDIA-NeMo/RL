@@ -67,6 +67,56 @@ class FakeWeightSynchronizer:
     pass
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [None, torch.OutOfMemoryError("CUDA out of memory"), asyncio.CancelledError()],
+    ids=["success", "learner_oom", "cancelled"],
+)
+def test_run_pumps_reports_status_and_preserves_original_failure(failure) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._master_config = SimpleNamespace(
+        rollout_checkpointing=SimpleNamespace(
+            telemetry_interval_s=None, snapshot_attempt_interval_s=None
+        )
+    )
+    ctrl._weight_synchronizer = MagicMock(is_stale=False)
+    ctrl._rollout_manager = MagicMock()
+    ctrl._trainer_version = 0
+    ctrl._train_steps = 0
+    ctrl._maybe_restore_replay_buffer = AsyncMock(return_value=0)
+    ctrl._maybe_restore_rollout_recovery = AsyncMock()
+    ctrl._maybe_restore_replacement_reserve = AsyncMock()
+    ctrl._validate_restored_sampler_cursor = MagicMock()
+    ctrl._log_rollout_restore_metrics = MagicMock()
+    ctrl._gen_fleet = None
+    ctrl._engine_supervisor = None
+    ctrl._finalizer_actors = []
+    ctrl._logger = MagicMock()
+    ctrl._checkpointer = MagicMock()
+
+    async def wait_until_cancelled():
+        await asyncio.Event().wait()
+
+    ctrl._rollout_pump = wait_until_cancelled
+    ctrl._stall_watchdog_pump = wait_until_cancelled
+    ctrl._train_pump = AsyncMock(side_effect=failure)
+
+    if failure is None:
+        assert asyncio.run(ctrl._run_pumps()) == {
+            "train_steps": 0,
+            "trainer_version": 0,
+        }
+    else:
+        with pytest.raises(type(failure)) as caught:
+            asyncio.run(ctrl._run_pumps())
+        assert caught.value is failure
+
+    ctrl._logger.finish.assert_called_once_with(exit_code=0 if failure is None else 1)
+    ctrl._checkpointer.shutdown.assert_called_once_with()
+    ctrl._weight_synchronizer.shutdown.assert_called_once_with()
+
+
 def _data_plane_config(backend: str = "simple") -> dict[str, Any]:
     config: dict[str, Any] = {
         "enabled": True,
@@ -833,6 +883,8 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     meta = KVBatchMeta(
@@ -927,6 +979,8 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -1000,6 +1054,8 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
         "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -1090,6 +1146,8 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -1154,6 +1212,8 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
         "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -1216,6 +1276,8 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         "sample_masks": [],
         "masked_advantages": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
     }
@@ -1303,6 +1365,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         "sequence_lengths": [],
         "seq_logprob_error_metrics": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
     }
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
@@ -1695,6 +1759,8 @@ def _train_pump_controller(*, sampler) -> object:
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     ctrl._opd_stat_sum = 0.0
@@ -2619,6 +2685,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         "masked_advantages": [],
         "sequence_lengths": [],
         "num_mask_sample_filtered": [],
+        "num_overlong_filtered": [],
+        "num_owner_fanout_filtered": [],
         "seq_logprob_error_metrics": [],
     }
     meta = KVBatchMeta(

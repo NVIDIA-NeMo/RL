@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Mixed rows must retain task_source=agentic_vbench_agent or claweval_agent.
+defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-claweval-sc.v1.yaml
+
+env:
+  nemo_gym:
+    agent_name: null
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml
+    - responses_api_agents/claweval_agent/configs/claweval_train.yaml

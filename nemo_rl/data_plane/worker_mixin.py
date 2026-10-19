@@ -37,7 +37,10 @@ import numpy as np
 import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import (
+    PackedTensor,
+    attach_captured_media_anchor_mask,
+)
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
 from nemo_rl.data_plane.observability import is_metrics_client
@@ -263,19 +266,23 @@ def _materialize_fetched(
                 "to a single row. This batch needs materialize_local()."
             )
     if local_batch:
-        return materialize_local(
+        data = materialize_local(
             td,
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
         )
-    return materialize(
-        td,
-        layout=layout,
-        pad_value_dict=pad_value_dict,
-        pad_to_seqlen=pad_to_seqlen,
-        tags=tags,
-    )
+    else:
+        data = materialize(
+            td,
+            layout=layout,
+            pad_value_dict=pad_value_dict,
+            pad_to_seqlen=pad_to_seqlen,
+            tags=tags,
+        )
+    if tags:
+        attach_captured_media_anchor_mask(data, tags)
+    return data
 
 
 class TQWorkerMixin:

@@ -345,6 +345,11 @@ def bootstrap_compatibility_identity(
 ) -> BootstrapCompatibilityIdentity:
     """Remove explicitly operational paths from the fail-closed run identity."""
     dumped = master_config.model_dump(mode="json")
+    policy_seed = dumped.get("checkpointing", {}).get("warm_start_policy_checkpoint")
+    if policy_seed is not None:
+        # Checkpoint cadence and destinations are operational and excluded
+        # below. A new lineage's initial model/Adam source is semantic.
+        dumped["warm_start_policy_checkpoint"] = policy_seed
     rollout_checkpointing = dumped.get("rollout_checkpointing", {})
     if not isinstance(rollout_checkpointing, Mapping):
         raise TypeError("rollout_checkpointing config must be a mapping")

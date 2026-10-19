@@ -2816,6 +2816,20 @@ class TestCreateCheckpointConfig:
         assert config.load_rng is resume_weights
         assert config.load_optim is resume_optimizer
 
+    def test_fresh_rng_keeps_full_optimizer_restore(self, tmp_path: Path) -> None:
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        weights_path = str(tmp_path / "weights")
+        config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            weights_path,
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={"load_rng": False},
+        )
+        assert config.load == weights_path
+        assert config.load_optim is True
+        assert config.load_rng is False
+
     def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
         """An absent checkpoint block keeps Megatron Bridge's default (sync save).
 
@@ -4979,7 +4993,7 @@ class TestForceSyncOptimizerFp32FromModel:
 
 @pytest.mark.mcore
 class TestForceSyncModelFromOptimizerFp32:
-    """Regression tests for the first forward after a full optimizer resume."""
+    """Check setup wiring; genuine master refresh is covered in test_optimizer_state_sync."""
 
     @staticmethod
     def _make_distrib_opt(hdo_cls, model_values=(0.0, 0.0), master_values=(3.0, 4.0)):
@@ -5006,6 +5020,11 @@ class TestForceSyncModelFromOptimizerFp32:
         """Loaded FP32 masters must reach BF16 shards before the first forward."""
         from nemo_rl.models.megatron import setup as setup_mod
 
+        refresh = MagicMock(return_value=frozenset())
+        monkeypatch.setattr(
+            setup_mod, "refresh_hybrid_optimizer_after_checkpoint", refresh
+        )
+
         class _HybridDeviceOptimizer:
             pass
 
@@ -5016,12 +5035,18 @@ class TestForceSyncModelFromOptimizerFp32:
 
         setup_mod._force_sync_model_from_optimizer_fp32(fake.distrib_opt)
 
+        refresh.assert_called_once_with(fake.distrib_opt.optimizer)
         torch.testing.assert_close(fake.model_param, fake.fp32_master)
         fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
 
     def test_handles_chained_optimizers(self, monkeypatch):
         """Every distributed optimizer in a chain is restored and synchronized."""
         from nemo_rl.models.megatron import setup as setup_mod
+
+        refresh = MagicMock(return_value=frozenset())
+        monkeypatch.setattr(
+            setup_mod, "refresh_hybrid_optimizer_after_checkpoint", refresh
+        )
 
         class _HybridDeviceOptimizer:
             pass
@@ -5039,6 +5064,10 @@ class TestForceSyncModelFromOptimizerFp32:
 
         setup_mod._force_sync_model_from_optimizer_fp32(chained)
 
+        assert refresh.call_args_list == [
+            call(a.distrib_opt.optimizer),
+            call(b.distrib_opt.optimizer),
+        ]
         for fake in (a, b):
             torch.testing.assert_close(fake.model_param, fake.fp32_master)
             fake.model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
@@ -5046,6 +5075,11 @@ class TestForceSyncModelFromOptimizerFp32:
     def test_noop_for_non_hybrid_optimizer(self, monkeypatch):
         """Other optimizer implementations must remain untouched."""
         from nemo_rl.models.megatron import setup as setup_mod
+
+        refresh = MagicMock(return_value=frozenset())
+        monkeypatch.setattr(
+            setup_mod, "refresh_hybrid_optimizer_after_checkpoint", refresh
+        )
 
         class _HybridDeviceOptimizer:
             pass
@@ -5061,6 +5095,7 @@ class TestForceSyncModelFromOptimizerFp32:
 
         setup_mod._force_sync_model_from_optimizer_fp32(plain_opt)
 
+        refresh.assert_not_called()
         model_chunk.start_param_sync.assert_not_called()
 
 

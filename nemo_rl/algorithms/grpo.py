@@ -404,7 +404,7 @@ class GRPOSaveState:
     current_step: int
     current_epoch: int
     total_steps: int
-    total_valid_tokens: int  # Track total number of non-padding tokens during training
+    total_valid_tokens: float  # Loss normalization may include fractional sample weights.
     val_reward: float  # May be removed when no validation metrics are available
     # SC may advance the policy version independently from the optimizer-step
     # counter. None preserves compatibility with checkpoints predating it.

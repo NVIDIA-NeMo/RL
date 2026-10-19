@@ -13,6 +13,7 @@
 # limitations under the License.
 import datetime
 import logging
+import math
 import sys
 import threading
 import time
@@ -419,6 +420,23 @@ class ThreadSafeTimer(Timer):
     def reset(self, label: Optional[str] = None) -> None:
         with self._lock:
             super().reset(label)
+
+
+def remaining_checkpoint_timeout(deadline_epoch: float) -> str:
+    """Convert an absolute save deadline into a remaining DD:HH:MM:SS budget.
+
+    Call after worker setup so model initialization consumes allocation time.
+    An expired or nonfinite deadline is an error rather than an infinite budget.
+    """
+    if not math.isfinite(deadline_epoch):
+        raise ValueError("Checkpoint deadline must be a finite Unix timestamp")
+    remaining = math.floor(deadline_epoch - time.time())
+    if remaining <= 0:
+        raise ValueError("Checkpoint deadline elapsed during worker setup")
+    days, remainder = divmod(remaining, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days:02d}:{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def convert_to_seconds(time_string: str) -> int:

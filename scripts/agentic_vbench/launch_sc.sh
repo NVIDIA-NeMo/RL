@@ -20,10 +20,7 @@ if [[ -f "${env_file}" ]]; then
   source "${env_file}"
   set +a
 fi
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  echo "WANDB_API_KEY not found; using WANDB_MODE=offline." >&2
-  export WANDB_MODE=offline
-fi
+export WANDB_MODE=online
 
 # The unified-teacher base ran in containers/nemo-rl.nightly-gym.20260930.sqsh, an
 # aarch64 image (GB200, 4 GPUs/node) that cannot start on the x86 B200 nodes here;
@@ -229,7 +226,13 @@ mkdir -p \
 wandb_run_id="${WANDB_RUN_ID:-$(printf '%s' "${base_name}" | sha256sum | cut -c1-16)}"
 wandb_project="${WANDB_PROJECT:-megatron-omni-v3}"
 wandb_run_name="${WANDB_RUN_NAME:-${base_name}}"
-wandb_cluster_name="${WANDB_CLUSTER_NAME:-${SLURM_CLUSTER_NAME:-nsc-svg-slurm-1}}"
+wandb_cluster_name="${WANDB_CLUSTER_NAME:-${SLURM_CLUSTER_NAME:-}}"
+if [[ -z "${wandb_cluster_name}" ]]; then
+  wandb_cluster_name="$(scontrol show config | awk '$1 == "ClusterName" {print $3}')"
+fi
+case "${wandb_cluster_name}" in
+  cw-dfw-*) wandb_cluster_name=dfw ;;
+esac
 [[ "${wandb_cluster_name}" =~ ^[A-Za-z0-9._-]+$ ]] || {
   echo "ERROR: WANDB_CLUSTER_NAME must contain only letters, digits, dot, underscore, or dash" >&2
   exit 1
@@ -536,7 +539,8 @@ if [[ -n ${SYNC_POLICY_CHECKPOINT:-} ]]; then
   }
 fi
 
-base_mounts="/lustre:/lustre,/scratch:/scratch"
+base_mounts="/lustre:/lustre"
+[[ ! -d /scratch ]] || base_mounts+=",/scratch:/scratch"
 selective_mounts="${runtime_code_dir}/nemo_rl:/opt/nemo-rl/nemo_rl"
 selective_mounts+=",${runtime_code_dir}/examples:/opt/nemo-rl/examples"
 selective_mounts+=",${runtime_code_dir}/tools:/opt/nemo-rl/tools"
@@ -554,6 +558,7 @@ for sub in 3rdparty/Gym-workspace/Gym 3rdparty/Megatron-Bridge-workspace/Megatro
 done
 export MOUNTS="${base_mounts},${selective_mounts}${EXTRA_MOUNTS:+,${EXTRA_MOUNTS}}"
 export CONTAINER="${container}"
+export CONTAINER_ENV_VARS="${CONTAINER_ENV_VARS:+${CONTAINER_ENV_VARS},}PATH,PYTHONPATH,LD_LIBRARY_PATH"
 export BASE_LOG_DIR="${slurm_log_dir}"
 export RAY_SUB_PATH="${code_dir}/ray.sub"
 # Sync Ray's own session logs (gcs_server/raylet) to the shared log dir often enough
@@ -563,7 +568,7 @@ export GPUS_PER_NODE="${gpus_per_node}"
 export SANDBOX_COMMAND=""
 export SANDBOX_CONTAINER=""
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-export NEMO_RL_VENV_DIR=/opt/ray_venvs
+export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-/opt/ray_venvs}
 export NEMO_GYM_VENV_DIR="${gym_venv_dir}"
 export NRL_FORCE_REBUILD_VENVS=false
 export NRL_IGNORE_VERSION_MISMATCH="${NRL_IGNORE_VERSION_MISMATCH:-1}"
@@ -578,27 +583,37 @@ export FLASHINFER_WORKSPACE_BASE="${persistent_cache}/flashinfer_workspace"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HOME="${persistent_cache}/huggingface"
 export HF_MODULES_CACHE="${persistent_cache}/huggingface/modules/${base_name}"
+export NRL_LOCAL_MCORE="${job_local_cache_root}/megatron-core"
+# All actors must use this checkout's Bridge/MCore pair. Stage MCore locally
+# before Ray starts so any dataset helper builds leave the source tree intact.
+export PYTHONPATH="/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${NRL_LOCAL_MCORE}:${PYTHONPATH:-}"
 
 read -r -d '' SETUP_COMMAND <<'SETUP_EOF' || true
 set -euo pipefail
 cd /opt/nemo-rl
-export PATH=/opt/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin:${PATH}
+export PATH=${PYTHON_TOOLCHAIN_BIN:-/opt/uv/python/cpython-3.13.14-linux-x86_64-gnu/bin}:${PATH}
 export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 export UV_LINK_MODE=copy
+# Image venvs may symlink into /root/.cache/uv. Keep that store visible and
+# write new uv cache entries under this allocation's writable scratch instead.
+export UV_CACHE_DIR="${TMPDIR}/uv"
 export NRL_CONTAINER=1
 export RAY_USAGE_STATS_ENABLED=0
 # The driver venv has no nemo_gym extra; the driver imports Gym's config helpers from the source tree.
-export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:${PYTHONPATH:-}
+if [[ ! -f ${NRL_LOCAL_MCORE}/megatron/core/__init__.py ]]; then
+  mkdir -p "${NRL_LOCAL_MCORE}"
+  cp -a /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/. "${NRL_LOCAL_MCORE}/"
+fi
 mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" "${CUDA_CACHE_PATH}"
 command -v python3-config >/dev/null
 uv_bin=$(command -v uv || echo /usr/local/bin/uv)
 test -x "${uv_bin}"
 bash "${TRAINING_DEPS_SETUP_SCRIPT:-/opt/nemo-rl/tools/ensure_agentic_vbench_deps.sh}"
 "${uv_bin}" run --no-sync python -c 'import sys; assert sys.version_info >= (3, 13, 14); import ray, transformers, nemo_rl.algorithms.single_controller, nemo_rl.environments.nemo_gym'
-generation_vllm_python=/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+generation_vllm_python=${NEMO_RL_VENV_DIR}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
 test -x "${generation_vllm_python}"
 "${generation_vllm_python}" -c 'import vllm; from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorker; from nemo_rl.models.generation.capture_context import decide_capture_input'
-megatron_python=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
+megatron_python=${NEMO_RL_VENV_DIR}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
 test -x "${megatron_python}"
 "${megatron_python}" -c 'import megatron.core, transformer_engine'
 SETUP_EOF
@@ -610,6 +625,7 @@ cd /opt/nemo-rl
 export PATH=${python_toolchain_bin}:\${PATH}
 export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 export UV_LINK_MODE=copy
+export UV_CACHE_DIR="\${TMPDIR}/uv"
 export NRL_CONTAINER=1
 export RAY_USAGE_STATS_ENABLED=0
 export PYTHONPATH=/opt/nemo-rl:/opt/nemo-rl/3rdparty/Gym-workspace/Gym:\${PYTHONPATH:-}
@@ -626,7 +642,7 @@ fi
 export HF_HOME=${HF_HOME}
 export HF_MODULES_CACHE=${HF_MODULES_CACHE}
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
-export NEMO_RL_VENV_DIR=/opt/ray_venvs
+export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR}
 export NEMO_GYM_VENV_DIR=${gym_venv_dir}
 export NRL_FORCE_REBUILD_VENVS=false
 # Harbor/Podman scratch for this job's episodes, on the node running the Gym servers.
@@ -638,17 +654,12 @@ mkdir -p "\${AGENTIC_VBENCH_RUNTIME_ROOT}"
 # Populate the cache with the exact Transformers environment used by vLLM.
 # A second fresh process verifies imports before concurrent actor model loads.
 for prewarm_pass in populate verify; do
-  /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python -c "import nemo_rl; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; c=AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('vLLM prewarm: \${prewarm_pass}', type(c).__module__, type(c).__name__)"
+  ${NEMO_RL_VENV_DIR}/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python -c "import nemo_rl; from transformers import AutoConfig, AutoProcessor, AutoTokenizer; p='${model_path}'; c=AutoConfig.from_pretrained(p, trust_remote_code=True); AutoProcessor.from_pretrained(p, trust_remote_code=True, use_fast=True); AutoTokenizer.from_pretrained(p, trust_remote_code=True, use_fast=True); print('vLLM prewarm: \${prewarm_pass}', type(c).__module__, type(c).__name__)"
 done
-# SKIP_REPLAY_RESTORE=1 (default): resume weights + dataloader cursor only. The
-# native TQ snapshot restore logs "dtype mismatch: existing=int64, incoming=
-# float32" for both partitions and the first step trained on restored rows had a
-# token_mult_prob_error of 1140 (run 2209083/2210161 step 2). Without
-# replay_buffer_metadata.pt the controller takes its documented empty-buffer
-# path. The controller rewinds an ahead-of-trainer in-order dispatch cursor when
-# both ownership sidecars are absent, so fresh prompts can refill that step
-# instead of waiting forever at the admission gate.
-if [[ "${SKIP_REPLAY_RESTORE:-1}" == "1" ]]; then
+# Restore native replay and rollout ownership alongside model/optimizer state.
+# SKIP_REPLAY_RESTORE=1 is an explicit recovery option for incompatible replay
+# snapshots: preserve the sidecars as .disabled and refill from fresh prompts.
+if [[ "${SKIP_REPLAY_RESTORE:-0}" == "1" ]]; then
   # rollout_recovery.pt must go with it: the controller refuses a recovery file
   # whose TQ snapshot is not being restored.
   for meta in "${checkpoint_dir}"/step_*/replay_buffer_metadata.pt "${checkpoint_dir}"/step_*/rollout_recovery.pt; do
@@ -715,8 +726,28 @@ export COMMAND
 last_array_task=$((job_cycles - 1))
 # The cluster's OccupiedIdleGPUsJobReaper cancels jobs whose GPUs look idle;
 # model loading, Harbor container setup and the first long-episode wave keep the
-# generation GPUs idle for well over an hour. Declare the exemption up front.
-sbatch_comment="${SBATCH_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTimeMins\":\"240\",\"reason\":\"data_loading\",\"description\":\"Model load, task-container setup and agentic rollouts keep GPUs idle for up to 240 minutes (training GPUs wait a whole generation phase)\"}}}"
+# training GPUs idle for a whole generation phase. Preserve the supported
+# exemption when callers add a descriptive label or additional JSON metadata.
+# JSON braces inside ${VAR:-...} append stray braces to a supplied override.
+default_sbatch_comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"data_loading","description":"Model load, task-container setup and agentic rollouts; training GPUs wait a whole generation phase"}}'
+sbatch_comment=$(python3 - "$default_sbatch_comment" "${SBATCH_COMMENT:-}" <<'PY'
+import json
+import sys
+
+comment = json.loads(sys.argv[1])
+custom = sys.argv[2].strip()
+if custom.startswith("{"):
+    overrides = json.loads(custom)
+    reaper = overrides.pop("OccupiedIdleGPUsJobReaper", {})
+    if not isinstance(reaper, dict):
+        raise ValueError("SBATCH_COMMENT OccupiedIdleGPUsJobReaper must be an object")
+    comment["OccupiedIdleGPUsJobReaper"].update(reaper)
+    comment.update(overrides)
+elif custom:
+    comment["description"] = custom
+print(json.dumps(comment, separators=(",", ":")))
+PY
+)
 submit_args=(
   --parsable
   --comment="${sbatch_comment}"
@@ -724,7 +755,7 @@ submit_args=(
   --gres="gpu:${gpus_per_node}"
   --exclusive
   --time="${slurm_time_limit}"
-  --dependency=singleton
+  --dependency="${SLURM_DEPENDENCY:-singleton}"
   --array="0-${last_array_task}%1"
   --account="${SLURM_ACCOUNT}"
   --partition="${SLURM_PARTITION}"
@@ -742,6 +773,7 @@ echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
 echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
+echo "slurm_dependency=${SLURM_DEPENDENCY:-singleton}"
 echo "context_compaction=${context_compaction}"
 if [[ $launch_benchmark == claweval ]]; then
   echo "claweval_compaction_auto=${CLAW_EVAL_COMPACTION_AUTO:-null} claweval_prune=${CLAW_EVAL_COMPACTION_PRUNE:-null} training_mode=${CLAW_EVAL_TRAINING_MODE:-null} subagents=${CLAW_EVAL_SUBAGENTS_ENABLED:-false} max_turns=${CLAW_EVAL_MAX_TURNS:-40} context_tokens=${CLAW_EVAL_CONTEXT_TOKENS:-49152} output_tokens=${CLAW_EVAL_OUTPUT_TOKENS:-8192}"

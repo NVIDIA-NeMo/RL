@@ -658,7 +658,7 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(
             {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
         )
-        mock_run.finish.assert_called_once_with()
+        mock_run.finish.assert_called_once_with(exit_code=None)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_pending_trainer_row(self, mock_wandb):
@@ -673,7 +673,7 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(
             {"train/loss": 0.5, WANDB_CALLER_STEP_METRIC: 7}
         )
-        mock_run.finish.assert_called_once_with()
+        mock_run.finish.assert_called_once_with(exit_code=None)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_finish_flushes_histogram_and_plot_with_pending_trainer_row(
@@ -701,7 +701,21 @@ class TestWandbLogger:
                 WANDB_CALLER_STEP_METRIC: 7,
             }
         )
-        mock_run.finish.assert_called_once_with()
+        mock_run.finish.assert_called_once_with(exit_code=None)
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_failed_finish_flushes_metrics_and_preserves_failure(self, mock_wandb):
+        logger = WandbLogger({})
+        logger.log_metrics({"train_steps": 0}, step=0, prefix="rollout")
+        mock_run = mock_wandb.init.return_value
+
+        logger.finish(exit_code=1)
+        logger.finish()
+
+        mock_run.log.assert_called_once_with(
+            {"rollout/train_steps": 0, WANDB_CALLER_STEP_METRIC: 0}
+        )
+        mock_run.finish.assert_called_once_with(exit_code=1)
 
     @patch("nemo_rl.utils.logger.wandb")
     def test_log_hyperparams(self, mock_wandb):
@@ -1787,6 +1801,17 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
 
 class TestLogger:
     """Test the main Logger class."""
+
+    def test_finish_passes_status_only_to_wandb(self):
+        logger = object.__new__(Logger)
+        logger.wandb_logger = MagicMock()
+        other_backend = MagicMock()
+        logger.loggers = [logger.wandb_logger, other_backend]
+
+        logger.finish(exit_code=1)
+
+        logger.wandb_logger.finish.assert_called_once_with(exit_code=1)
+        other_backend.finish.assert_called_once_with()
 
     @pytest.fixture
     def temp_dir(self):

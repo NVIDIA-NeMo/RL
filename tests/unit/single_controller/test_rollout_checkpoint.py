@@ -176,6 +176,29 @@ def test_bootstrap_anchor_mismatch_names_redacted_config_paths(tmp_path: Path) -
     assert "custom-secret-one" not in manifest
 
 
+def test_bootstrap_fingerprint_distinguishes_policy_and_adam_seed() -> None:
+    base = {"policy": {"model_name": "same-model"}}
+
+    def fingerprint(checkpointing: dict) -> str:
+        config = _DumpedConfig({**base, "checkpointing": checkpointing})
+        return bootstrap_compatibility_identity(cast(Any, config)).fingerprint()
+
+    cold = fingerprint({})
+    assert fingerprint({"warm_start_policy_checkpoint": None}) == cold
+    seeded = fingerprint({"warm_start_policy_checkpoint": "/seed/step_20"})
+    assert seeded != cold
+    assert fingerprint({"warm_start_policy_checkpoint": "/seed/step_30"}) != seeded
+    assert (
+        fingerprint(
+            {
+                "warm_start_policy_checkpoint": "/seed/step_20",
+                "checkpoint_dir": "/new/output",
+            }
+        )
+        == seeded
+    )
+
+
 def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
     base = {
         "policy": {

@@ -25,8 +25,10 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree and inspect what each consumer was constructed with.
 """
 
+import asyncio
 import sys
 import types
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 import pytest
@@ -256,3 +258,132 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "root",
+        "candidate_continuation",
+        "candidate_rewrite",
+        "direct_prefix",
+        "empty_prefix",
+    ],
+)
+def test_media_marker_escape_is_discarded_or_replaced_by_exact_prefix(
+    monkeypatch, mode
+):
+    """Exercise the real renderer override, including candidate-root fallback."""
+    calls = []
+    captures = []
+    model_prefix = [900, 18, 2]
+    messages = [
+        {"role": "assistant", "content": "Count the <image> tags"},
+        {"role": "tool", "content": "observation"},
+        {"role": "user", "content": "new <image>"},
+    ]
+    original = deepcopy(messages)
+
+    def render(items):
+        tokens = []
+        for message in items:
+            if message["role"] == "assistant":
+                tokens += [70, 18 if "<image>" in message["content"] else 50, 2]
+            elif message["role"] == "tool":
+                tokens += [80, 81, 2]
+            else:
+                tokens += [90, 18, 2]
+        return tokens
+
+    async def preprocess(_self, *, messages, **_kwargs):
+        calls.append(deepcopy(messages))
+        return messages, [{"prompt_token_ids": render(messages)}]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", True, raising=False
+    )
+    admission = (
+        types.SimpleNamespace(mode="candidate", prev_len=len(model_prefix))
+        if mode.startswith("candidate")
+        else None
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda *_: admission
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda *_: model_prefix,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda _self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_request_media",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_begin_request_capture",
+        lambda _self, _request, ids, **_kwargs: captures.append(list(ids)),
+    )
+
+    def decide(_admission, *, messages, **_kwargs):
+        assert messages == original
+        serving = (
+            types.SimpleNamespace(mode="token_in")
+            if mode == "candidate_continuation"
+            else None
+        )
+        return types.SimpleNamespace(
+            storage=serving, serving=serving, verify_retained_media=True
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.decide_capture_input", decide
+    )
+    renderer = _build_server(monkeypatch, {})[0][0]
+    renderer.renderer = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(eos_token_id=2)
+    )
+
+    class Request(types.SimpleNamespace):
+        def model_copy(self, *, update):
+            return Request(**(vars(self) | update))
+
+    prefix = (
+        model_prefix
+        if mode == "direct_prefix"
+        else []
+        if mode == "empty_prefix"
+        else None
+    )
+    request = Request(required_prefix_token_ids=prefix)
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request=request,
+            messages=messages,
+            default_template=None,
+            default_template_content_format="auto",
+            default_template_kwargs={},
+        )
+    )
+    assert messages == original
+    actual_ids = result[1][0]["prompt_token_ids"]
+    if mode in ("candidate_continuation", "direct_prefix"):
+        assert all("<image>" not in call[0]["content"] for call in calls)
+        assert actual_ids == model_prefix + render(original[1:])
+        assert captures == [actual_ids]
+    else:
+        assert calls[0 if mode == "empty_prefix" else -1] == original
+        assert actual_ids == render(original)
+        assert captures == [actual_ids]
+        if mode == "candidate_rewrite":
+            assert "<image>" not in calls[0][0]["content"]
+            assert len(calls) == 2

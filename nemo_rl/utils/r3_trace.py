@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import socket
 import threading
@@ -24,12 +25,14 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
+from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
 _TRACE_ENV = "NRL_R3_TRACE"
 _TRACE_STEPS_ENV = "NRL_R3_TRACE_STEPS"
+_TRACE_CONSUMER_CALLS_ENV = "NRL_R3_TRACE_CONSUMER_CALLS"
 _TRACE_SAMPLES_ENV = "NRL_R3_TRACE_SAMPLES"
 _TRACE_DIR_ENV = "NRL_R3_TRACE_DIR"
 _TRACE_MICROBATCHES_ENV = "NRL_R3_TRACE_MICROBATCHES"
@@ -40,11 +43,16 @@ _DEFAULT_TRACE_STEPS = 1
 _DEFAULT_TRACE_SAMPLES = 2
 _DEFAULT_TRACE_MICROBATCHES = 2
 
+_LOGGER = logging.getLogger(__name__)
+_trace_write_failed = False
 _write_lock = threading.Lock()
 _patch_lock = threading.Lock()
 _router_replay_patch_depth = 0
 _original_get_replay_topk: Optional[Any] = None
 _event_counts: dict[str, int] = defaultdict(int)
+_refit_state_lock = threading.Lock()
+_refit_boundary_count = 0
+_active_refit_rpcs = 0
 _context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
     "nrl_r3_trace_context",
     default=None,
@@ -78,6 +86,29 @@ def _trace_steps() -> int:
     return max(0, _env_int(_TRACE_STEPS_ENV, _DEFAULT_TRACE_STEPS))
 
 
+def configure_r3_trace_for_streaming(
+    *, num_prompt_groups: int, min_groups_per_chunk: int
+) -> None:
+    """Budget learner trace calls for every chunk in the requested steps.
+
+    Producer calls remain bounded by ``NRL_R3_TRACE_STEPS`` independently in
+    each producer process. A learner can consume several chunks per optimizer
+    step, so it needs a larger budget to retain matching fetch/replay evidence.
+    Set this before Ray snapshots the driver's environment. An explicit
+    ``NRL_R3_TRACE_CONSUMER_CALLS`` override takes precedence.
+    """
+    if not r3_trace_enabled():
+        return
+    if num_prompt_groups < 1 or min_groups_per_chunk < 1:
+        raise ValueError("R3 trace prompt-group and chunk sizes must be positive")
+    chunks_per_step = (
+        num_prompt_groups + min_groups_per_chunk - 1
+    ) // min_groups_per_chunk
+    os.environ.setdefault(
+        _TRACE_CONSUMER_CALLS_ENV, str(_trace_steps() * chunks_per_step)
+    )
+
+
 def _trace_samples() -> int:
     return max(0, _env_int(_TRACE_SAMPLES_ENV, _DEFAULT_TRACE_SAMPLES))
 
@@ -95,7 +126,10 @@ def _should_trace_step(counter_name: str) -> tuple[bool, int]:
     if not r3_trace_enabled():
         return False, 0
     step = _next_count(counter_name)
-    return step <= _trace_steps(), step
+    limit = _trace_steps()
+    if counter_name.startswith(("tq_fetch:", "stage:")):
+        limit = max(0, _env_int(_TRACE_CONSUMER_CALLS_ENV, limit))
+    return step <= limit, step
 
 
 def _current_context() -> Optional[dict[str, Any]]:
@@ -131,7 +165,8 @@ def _trace_path() -> Path:
 
 
 def _write_record(record: dict[str, Any]) -> None:
-    if not r3_trace_enabled():
+    global _trace_write_failed
+    if _trace_write_failed or not r3_trace_enabled():
         return
     payload = {
         "time": time.time(),
@@ -142,8 +177,16 @@ def _write_record(record: dict[str, Any]) -> None:
     }
     line = json.dumps(payload, sort_keys=True) + "\n"
     with _write_lock:
-        with _trace_path().open("a", encoding="utf-8") as f:
-            f.write(line)
+        if _trace_write_failed:
+            return
+        try:
+            with _trace_path().open("a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError as error:
+            # Trace-file storage is diagnostic only. Keep the route verifier
+            # active: its mismatch exception is raised independently below.
+            _trace_write_failed = True
+            _LOGGER.warning("R3 trace file output disabled after I/O error: %s", error)
 
 
 def _tensor_sha256(tensor: Any) -> str:
@@ -362,6 +405,256 @@ def _verify_router_replay_forward_context() -> Iterator[None]:
             ):
                 RouterReplay.get_replay_topk = _original_get_replay_topk
                 _original_get_replay_topk = None
+
+
+@dataclass(frozen=True)
+class RefitTraceSnapshot:
+    """CPU observation of refit RPC boundaries in this serving process."""
+
+    boundary: int
+    active_rpcs: int
+
+
+def capture_refit_snapshot() -> RefitTraceSnapshot | None:
+    """Read diagnostic state without touching engine or capture provenance."""
+    if not r3_trace_enabled() or _trace_steps() == 0:
+        return None
+    with _refit_state_lock:
+        return RefitTraceSnapshot(_refit_boundary_count, _active_refit_rpcs)
+
+
+@contextmanager
+def trace_weight_refit_rpc(*, transport: str) -> Iterator[None]:
+    """Observe the awaited RPC interval, including exceptional exits.
+
+    This interval bounds the caller's wait, not individual GPU weight writes.
+    An RPC exception may leave GPU work outstanding. No pause, drain, cache
+    reset, retry, or change to call attribution is introduced here.
+    """
+    global _refit_boundary_count, _active_refit_rpcs
+    if not r3_trace_enabled() or _trace_steps() == 0:
+        yield
+        return
+    with _refit_state_lock:
+        _refit_boundary_count += 1
+        _active_refit_rpcs += 1
+        entered = RefitTraceSnapshot(_refit_boundary_count, _active_refit_rpcs)
+    ordinal = _next_count("weight_refit_rpc")
+    trace = ordinal <= _trace_steps()
+    if trace:
+        _write_record(
+            {
+                "event": "weight_refit_rpc",
+                "phase": "begin",
+                "transport": transport,
+                "rpc_id": entered.boundary,
+                **asdict(entered),
+                "refit_free_generation_verified": False,
+            }
+        )
+    returned = False
+    try:
+        yield
+        returned = True
+    finally:
+        with _refit_state_lock:
+            _refit_boundary_count += 1
+            _active_refit_rpcs -= 1
+            exited = RefitTraceSnapshot(_refit_boundary_count, _active_refit_rpcs)
+        if trace:
+            _write_record(
+                {
+                    "event": "weight_refit_rpc",
+                    "phase": "end",
+                    "transport": transport,
+                    "rpc_id": entered.boundary,
+                    **asdict(exited),
+                    "rpc_returned_without_exception": returned,
+                    "refit_free_generation_verified": False,
+                }
+            )
+
+
+@dataclass(frozen=True)
+class CapturedPredictionContext:
+    """Join small prediction fingerprints to a native captured model call."""
+
+    rollout_id: str
+    model_call_id: str
+    admission_weight_version: int
+    response_weight_version: int
+
+
+def trace_captured_prediction_evidence(
+    *,
+    context: CapturedPredictionContext,
+    choice_index: int,
+    prompt_token_ids: Sequence[int],
+    generation_token_ids: Sequence[int],
+    generation_logprobs: Sequence[float] | None,
+    routed_experts: Any,
+) -> None:
+    """Fingerprint original CPU predictions without retaining large call tensors.
+
+    Predictor rows ``[prompt_len-1:total_len-1)`` determine the generated
+    targets. The final route row is padding and must not enter this digest.
+    All digests use contiguous little-endian bytes: i64 token IDs, f32 selected
+    logprobs and i16 routes. No tensors or token contents enter the trace.
+    Diagnostic unavailability is recorded rather than changing a response.
+    """
+    if (
+        not r3_trace_enabled()
+        or _trace_steps() == 0
+        or max(context.admission_weight_version, context.response_weight_version)
+        > _trace_steps()
+    ):
+        return
+    import torch
+
+    record = {
+        "event": "captured_prediction_evidence",
+        **asdict(context),
+        "choice_index": choice_index,
+        "prompt_tokens": len(prompt_token_ids),
+        "generation_tokens": len(generation_token_ids),
+        "digest_encoding": "contiguous-little-endian-i64-f32-i16-v1",
+        "scope": "original CPU fields before route serialization; not per-token weight provenance",
+    }
+    if (
+        not isinstance(routed_experts, torch.Tensor)
+        or routed_experts.device.type != "cpu"
+    ):
+        record.update(status="unavailable", reason="routes_not_cpu_tensor")
+        _write_record(record)
+        return
+    prompt_len = len(prompt_token_ids)
+    generation_len = len(generation_token_ids)
+    if (
+        prompt_len < 1
+        or routed_experts.ndim != 3
+        or routed_experts.shape[0] != prompt_len + generation_len
+        or generation_logprobs is None
+        or len(generation_logprobs) != generation_len
+    ):
+        record.update(status="unavailable", reason="unaligned_prediction_fields")
+        _write_record(record)
+        return
+    try:
+
+        def digest(tensor: Any, dtype: str) -> str:
+            array = tensor.detach().contiguous().numpy().astype(dtype, copy=False)
+            return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+        predictors = routed_experts[prompt_len - 1 : prompt_len + generation_len - 1]
+        record.update(
+            status="available",
+            prompt_token_ids_sha256=digest(
+                torch.tensor(prompt_token_ids, dtype=torch.int64, device="cpu"), "<i8"
+            ),
+            generation_token_ids_sha256=digest(
+                torch.tensor(generation_token_ids, dtype=torch.int64, device="cpu"),
+                "<i8",
+            ),
+            generation_logprobs_sha256=digest(
+                torch.tensor(generation_logprobs, dtype=torch.float32, device="cpu"),
+                "<f4",
+            ),
+            generation_predictor_routes_sha256=digest(
+                predictors.to(torch.int16), "<i2"
+            ),
+            predictor_shape=list(predictors.shape),
+            predictor_start=prompt_len - 1,
+            predictor_end=prompt_len + generation_len - 1,
+        )
+    except (RuntimeError, TypeError, ValueError):
+        record.update(status="unavailable", reason="prediction_fingerprint_failed")
+    _write_record(record)
+
+
+def trace_capture_weight_span(
+    *,
+    rollout_id: str,
+    model_call_id: str,
+    admission_weight_version: int,
+    response_weight_version: int,
+    admission_refit: RefitTraceSnapshot | None = None,
+    response_refit: RefitTraceSnapshot | None = None,
+) -> None:
+    """Record observed version changes while a captured HTTP call is pending.
+
+    This observes admission through construction of the engine response, before
+    the potentially slow staging write. It does not assign per-token versions
+    or establish that generation was free of refits. RPC snapshots also expose
+    overlaps before a new weight version is published. Keep every scalar call
+    span within the trace horizon: a later TMPE outlier needs its exact negative
+    observation too. Tensor sampling limits do not apply to these small records.
+    """
+    if not r3_trace_enabled() or _trace_steps() == 0:
+        return
+    observed = _next_count("capture_weight_span")
+    crossed = admission_weight_version != response_weight_version
+    overlap = (
+        admission_refit.boundary != response_refit.boundary
+        or admission_refit.active_rpcs > 0
+        or response_refit.active_rpcs > 0
+        if admission_refit is not None and response_refit is not None
+        else None
+    )
+    if crossed:
+        _next_count("capture_weight_span_crossed")
+    if overlap:
+        _next_count("capture_refit_rpc_overlap")
+    if max(admission_weight_version, response_weight_version) > _trace_steps():
+        return
+    _write_record(
+        {
+            "event": "captured_call_weight_span",
+            "rollout_id": rollout_id,
+            "model_call_id": model_call_id,
+            "admission_weight_version": admission_weight_version,
+            "response_weight_version": response_weight_version,
+            "observed_version_change": crossed,
+            "admission_refit_rpc": asdict(admission_refit)
+            if admission_refit is not None
+            else None,
+            "response_refit_rpc": asdict(response_refit)
+            if response_refit is not None
+            else None,
+            "observed_refit_rpc_overlap": overlap,
+            "completed_captured_calls_observed": observed,
+            "cross_version_calls_observed": _event_counts[
+                "capture_weight_span_crossed"
+            ],
+            "refit_rpc_overlap_calls_observed": _event_counts[
+                "capture_refit_rpc_overlap"
+            ],
+            "observation_window": "capture_admission_to_engine_response_built",
+            "refit_free_generation_verified": False,
+        }
+    )
+
+
+def trace_serving_weight_version(*, previous_version: int, version: int) -> None:
+    """Record version publication alongside cumulative call-span observations."""
+    if (
+        not r3_trace_enabled()
+        or _trace_steps() == 0
+        or max(previous_version, version) > _trace_steps()
+    ):
+        return
+    _write_record(
+        {
+            "event": "serving_weight_version",
+            "previous_version": previous_version,
+            "weight_version": version,
+            "completed_captured_calls_observed": _event_counts.get(
+                "capture_weight_span", 0
+            ),
+            "cross_version_calls_observed": _event_counts.get(
+                "capture_weight_span_crossed", 0
+            ),
+        }
+    )
 
 
 def trace_rollout_payload(

@@ -1116,6 +1116,17 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
 
         return loaded_params
 """
+    # vLLM 0.29 already initializes missing scales, but still needs the
+    # identity marker so the forward path matches Megatron's folded order.
+    initialized_snippet = """        initializer_factor = self.config.initializer_factor
+        for name, param in params_dict.items():
+            if name.endswith((".ls1", ".ls2")) and name not in loaded_params:
+                param.data.fill_(initializer_factor)
+                loaded_params.add(name)
+
+        return loaded_params
+"""
+    initialized_replacement = new_snippet.split("\n\n", 1)[1]
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if "ls_param.data.fill_(initializer_factor)" in content:
@@ -1127,7 +1138,11 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
         if skip_removed:
             updated = updated.replace(skip_old, skip_new, 1)
 
-        if old_snippet not in updated:
+        if initialized_snippet in updated:
+            updated = updated.replace(initialized_snippet, initialized_replacement, 1)
+        elif old_snippet in updated:
+            updated = updated.replace(old_snippet, new_snippet, 1)
+        else:
             logger.warning(
                 "Could not apply vLLM RADIO LayerScale loader patch: the "
                 "load_weights tail anchor was not found in %s. LayerScale "
@@ -1136,8 +1151,6 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
                 file_to_patch,
             )
             return
-        updated = updated.replace(old_snippet, new_snippet, 1)
-
         write_back(updated)
 
     logger.info(

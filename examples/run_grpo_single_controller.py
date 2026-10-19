@@ -56,6 +56,11 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.r3_trace import (
+    configure_r3_trace_for_streaming,
+    r3_trace_enabled,
+)
+from nemo_rl.utils.timer import remaining_checkpoint_timeout
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -139,7 +144,25 @@ def main() -> None:
     # Startup is inside the try so shutdown_telemetry() below still runs when
     # it raises, which is when buffered spans are most worth having.
     actor_args = None
+    startup_wandb_run = None
+    startup_started = time.perf_counter()
     try:
+        # Make model/Gym startup visible before the controller exists. Finish
+        # this SDK writer before the actor resumes the same run, so there is
+        # only one writer and no training metrics are invented during setup.
+        if config.logger["wandb_enabled"]:
+            import wandb
+
+            startup_wandb_config = dict(config.logger["wandb"])
+            startup_wandb_config.pop("log_nemo_gym_full_result_tables", None)
+            startup_wandb_config["resume"] = "allow"
+            startup_wandb_run = wandb.init(
+                **startup_wandb_config, dir=config.logger["log_dir"]
+            )
+            config.logger["wandb"]["id"] = startup_wandb_run.id
+            config.logger["wandb"]["resume"] = "allow"
+            startup_wandb_run.log({"setup/driver_started": 1})
+
         # One root span, so init_ray() and setup_single_controller() phases land
         # in the same trace. Closed before the actor is launched, so the run's
         # own job and step spans stay separate traces.
@@ -149,6 +172,12 @@ def main() -> None:
             maybe_configure_engine_reaping_env(
                 config.async_rl.generation_fleet_health.enabled
             )
+            if r3_trace_enabled():
+                algo_config = config.ppo if is_ppo_run(config) else config.grpo
+                configure_r3_trace_for_streaming(
+                    num_prompt_groups=algo_config.num_prompts_per_step,
+                    min_groups_per_chunk=config.async_rl.min_groups_for_streaming_train,
+                )
             # Opens rl.setup.ray_init itself, so no span here.
             init_ray()
 
@@ -186,10 +215,40 @@ def main() -> None:
             # No child spans here: parallel init runs in threads, which do not
             # carry the OTel context. The breakdown comes from the
             # rl.setup.duration metric.
+            if startup_wandb_run is not None:
+                startup_wandb_run.log(
+                    {
+                        "setup/worker_initialization_started": 1,
+                        "setup/pre_worker_initialization_seconds": time.perf_counter()
+                        - startup_started,
+                    }
+                )
             with setup_span("workers"):
                 actor_args, setup_timing_metrics = setup_single_controller(
                     config, tokenizer, processor=processor
                 )
+
+        if startup_wandb_run is not None:
+            startup_wandb_run.log(
+                {
+                    "setup/worker_initialization_seconds": time.perf_counter()
+                    - startup_started
+                }
+            )
+            startup_wandb_run.finish()
+            startup_wandb_run = None
+
+        checkpoint_deadline = os.environ.get("NRL_SLURM_CHECKPOINT_DEADLINE_EPOCH")
+        if checkpoint_deadline is not None:
+            # Model and Gym setup have already consumed part of the allocation.
+            # Recompute immediately before the actor starts its relative timer.
+            config.checkpointing["checkpoint_must_save_by"] = (
+                remaining_checkpoint_timeout(float(checkpoint_deadline))
+            )
+            print(
+                "Checkpoint budget after worker setup: "
+                f"{config.checkpointing['checkpoint_must_save_by']}"
+            )
 
         print("🚀 Launching SingleControllerActor")
         sc = SingleControllerActor.remote(
@@ -200,6 +259,8 @@ def main() -> None:
         result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
+        if startup_wandb_run is not None:
+            startup_wandb_run.finish(exit_code=1)
         # None when setup raised before building them.
         if actor_args is not None:
             # Drain env actors before generation to avoid in-flight requests

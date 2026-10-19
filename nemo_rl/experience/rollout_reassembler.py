@@ -37,13 +37,13 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional, cast
 
 import torch
 
 from nemo_rl.data.captured_media import verified_media_items, verify_media_geometry
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import MEDIA_ANCHOR_SPANS_TAG, PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
@@ -60,11 +60,20 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.original_call_evidence import (
+    ORIGINAL_CALL_EVIDENCE_PATH_TAG,
+    ORIGINAL_CALL_EVIDENCE_SHA256_TAG,
+    OriginalCallEvidenceConfig,
+    OriginalCallEvidenceRef,
+    OriginalCallEvidenceWriter,
+)
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
+    RoutePlanExecution,
     execute_route_plan,
+    execute_route_plan_with_call_views,
 )
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
@@ -100,6 +109,39 @@ class FinalizedRollout:
     model_call_ids: tuple[str, ...] = ()
     media: Optional[dict[str, PackedTensor]] = None
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
+    # Opt-in direct-call reconstruction only. Ordinary publication remains one
+    # canonical row until the logical publisher explicitly consumes these views.
+    call_views: tuple[FinalizedCallView, ...] = ()
+    original_call_evidence: OriginalCallEvidenceRef | None = None
+    # Authenticated engine embedding spans, distinct from vocabulary matches.
+    # None denotes legacy/unverified media metadata; () denotes no anchors.
+    media_anchor_spans: tuple[tuple[int, int, int], ...] | None = None
+
+
+@dataclass(frozen=True)
+class FinalizedCallView:
+    """One verified call's training input and its original generation version.
+
+    ``row`` retains the whole conditioning prefix but owns only this call's
+    targets. Its min/max versions retain the canonical segment's admission
+    semantics; ``generation_weight_version`` identifies the actual call.
+    """
+
+    model_call_id: str
+    generation_weight_version: int
+    generation_start: int
+    generation_end: int
+    row: FinalizedRollout
+
+
+@dataclass(frozen=True)
+class _ResolvedMedia:
+    """Verified canonical media and optional cumulative per-call media."""
+
+    media: Optional[dict[str, PackedTensor]]
+    by_call: dict[str, Optional[dict[str, PackedTensor]]]
+    failure_reason: Optional[str]
+    anchor_spans: tuple[tuple[int, int, int], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -138,6 +180,16 @@ class SegmentReceipt:
     # Owning OpenCode session of this segment's chain (session-trace training).
     session_id: str | None = None
     session_role: str | None = None
+
+
+@dataclass(frozen=True)
+class _LogicalExecutionRow:
+    """One physical row after the complete logical owner has been verified."""
+
+    row: FinalizedRollout
+    context_segment_index: int
+    call_index: int | None
+    call: FinalizedCallView | None
 
 
 def group_selected_chains(records: list[Any]) -> list[list[int]]:
@@ -307,6 +359,7 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         max_train_row_tokens: Optional[int] = None,
+        original_call_evidence: OriginalCallEvidenceConfig | None = None,
     ) -> None:
         self._dp_client = dp_client
         if max_train_row_tokens is not None and max_train_row_tokens < 1:
@@ -326,6 +379,13 @@ class RolloutReassembler:
                 "defer_routed_experts_to_policy requires router replay to be enabled"
             )
         self._staging_partition = staging_partition
+        self._evidence_writer = (
+            OriginalCallEvidenceWriter(original_call_evidence)
+            if original_call_evidence is not None
+            and router_replay_enabled
+            and not defer_routed_experts_to_policy
+            else None
+        )
         # (num_moe_layers, topk), learned from the first rebuilt row that
         # carries routes; placeholder-only groups need it to shape their
         # sentinel tensors consistently with the model.
@@ -349,6 +409,51 @@ class RolloutReassembler:
         reward: float,
         context_compaction: bool = False,
         action_flags: tuple[ActionOutputFlags, ...] | None = None,
+    ) -> FinalizedRollout:
+        """Verify and reconstruct one canonical row, without extra call copies."""
+        return self._finalize_rollout(
+            rollout_id,
+            receipt,
+            reward=reward,
+            context_compaction=context_compaction,
+            action_flags=action_flags,
+            capture_call_views=False,
+        )
+
+    def finalize_rollout_with_call_views(
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        action_flags: tuple[ActionOutputFlags, ...] | None = None,
+    ) -> FinalizedRollout:
+        """Also reconstruct each call's original direct R3 conditioning input.
+
+        The canonical row and every call must verify before any views escape.
+        Route fragments and media are each fetched in one batch, not once per
+        prefix. This API does not publish or enable the views for training.
+        """
+        if not self._router_replay_enabled or self._defer_routed_experts_to_policy:
+            raise ValueError("call views require direct router replay")
+        return self._finalize_rollout(
+            rollout_id,
+            receipt,
+            reward=reward,
+            context_compaction=True,
+            action_flags=action_flags,
+            capture_call_views=True,
+        )
+
+    def _finalize_rollout(
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        context_compaction: bool,
+        action_flags: tuple[ActionOutputFlags, ...] | None,
+        capture_call_views: bool,
     ) -> FinalizedRollout:
         """Verify one receipt against its staged rows and linearize the main chain.
 
@@ -405,9 +510,19 @@ class RolloutReassembler:
             self._router_replay_enabled and not self._defer_routed_experts_to_policy
         ) or (self._capture_media and context_compaction)
         try:
-            fetched = self._source.fetch_for_finalization(
-                staging_keys, include_route_fragments=fetch_fragments
-            )
+            if (
+                self._evidence_writer is not None
+                and self._evidence_writer.wants_capture
+            ):
+                fetched = self._source.fetch_for_finalization(
+                    staging_keys,
+                    include_route_fragments=fetch_fragments,
+                    retain_wire_rows=True,
+                )
+            else:
+                fetched = self._source.fetch_for_finalization(
+                    staging_keys, include_route_fragments=fetch_fragments
+                )
         except KeyError as error:
             return rejected(f"missing_staging_row:{error}", staging_keys)
         except (TypeError, ValueError) as error:
@@ -445,14 +560,18 @@ class RolloutReassembler:
         # Media: the presence flags fetched with the base columns say which
         # terminal-chain calls carry pixels; one batched read pulls them,
         # after token verification so a rejected rollout never moves pixels.
-        media, media_failure = self._resolve_media(
-            row, fetched_by_call, verify_occurrences=context_compaction
+        resolved_media = self._resolve_media(
+            row,
+            fetched_by_call,
+            verify_occurrences=context_compaction,
+            capture_call_views=capture_call_views,
         )
-        if media_failure is not None:
-            return rejected(media_failure, staging_keys)
+        if resolved_media.failure_reason is not None:
+            return rejected(resolved_media.failure_reason, staging_keys)
 
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None
+        route_execution: Optional[RoutePlanExecution] = None
         if self._router_replay_enabled:
             # One plan construction for both modes: join Gym's link spans and
             # extras commitments with the fetch's staging keys and route
@@ -473,9 +592,7 @@ class RolloutReassembler:
                 commitment = commitments_by_call.get(call_id)
                 if record is None or item is None or commitment is None:
                     return rejected(f"route_span_identity:{call_id}", staging_keys)
-                prefix_len = (item.extras or {}).get(
-                    ROUTED_EXPERTS_PREFIX_LEN_FIELD
-                )
+                prefix_len = (item.extras or {}).get(ROUTED_EXPERTS_PREFIX_LEN_FIELD)
                 if prefix_len is None:
                     route_len_valid = item.routed_len in (0, record.delta_len)
                 else:
@@ -524,11 +641,16 @@ class RolloutReassembler:
             # the published row carries the assembled tensor instead).
             route_plan = plan
             if not self._defer_routed_experts_to_policy:
-                routed_experts, failure = self._execute_direct_plan(
-                    plan, fetched, backpatch_predecessor_tail=context_compaction
+                route_execution, failure = self._execute_direct_plan(
+                    plan,
+                    fetched,
+                    backpatch_predecessor_tail=context_compaction,
+                    capture_call_views=capture_call_views,
                 )
                 if failure is not None:
                     return rejected(f"route_assembly:{failure}", staging_keys)
+                if route_execution is not None:
+                    routed_experts = route_execution.routed_experts
 
         output_masks = {}
         if action_flags is not None:
@@ -555,7 +677,7 @@ class RolloutReassembler:
                     flags.malformed_thinking
                 ] * generation_len
                 position = end
-        return FinalizedRollout(
+        canonical = FinalizedRollout(
             rollout_id=rollout_id,
             valid=True,
             rejection_reason=None,
@@ -569,62 +691,191 @@ class RolloutReassembler:
             max_wv=max_wv,
             routed_experts=routed_experts,
             route_plan=route_plan,
-            media=media,
+            media=resolved_media.media,
+            media_anchor_spans=resolved_media.anchor_spans,
             model_call_ids=tuple(row.model_call_ids),
             output_masks=output_masks,
         )
+        if (
+            self._evidence_writer is not None
+            and routed_experts is not None
+            and (
+                self._max_train_row_tokens is None
+                or len(row.token_ids) <= self._max_train_row_tokens
+            )
+        ):
+            # Only the verified terminal chain is archive evidence. Unselected
+            # manifest rows remain cleanup-owned and are never labeled verified.
+            selected_records = [records_by_call[call] for call in row.model_call_ids]
+            selected_receipt = parsed.model_copy(update={"manifest": selected_records})
+            evidence_ref = self._evidence_writer.reference_for_verified_receipt(
+                selected_receipt.model_dump()
+            )
+            if evidence_ref is None and self._evidence_writer.wants_capture:
+                wire_rows = {}
+                for record in selected_records:
+                    columns = fetched_by_call[record.model_call_id].wire_columns
+                    if columns is None:
+                        raise RuntimeError(
+                            "Evidence capture lost its explicit wire custody"
+                        )
+                    wire_rows[record.staging_key] = columns
+                evidence_ref = self._evidence_writer.write_verified_context(
+                    receipt=selected_receipt.model_dump(),
+                    rows=wire_rows,
+                    context_compaction=context_compaction,
+                    capture_media=self._capture_media,
+                    action_flags=(
+                        [asdict(flags) for flags in action_flags]
+                        if action_flags is not None
+                        else None
+                    ),
+                )
+            canonical = replace(canonical, original_call_evidence=evidence_ref)
+        if not capture_call_views:
+            return canonical
+        if route_execution is None or len(route_execution.call_views) != len(
+            row.link_spans
+        ):
+            return rejected("route_assembly:missing_call_views", staging_keys)
+        calls = []
+        covered_targets = [0.0] * len(row.token_ids)
+        for view, (call_id, _carry, _generation) in zip(
+            route_execution.call_views, row.link_spans, strict=True
+        ):
+            record = records_by_call[call_id]
+            if view.staging_key != record.staging_key:
+                return rejected("route_assembly:call_view_identity", staging_keys)
+            start, end = view.generation_start, view.generation_end
+            call_mask = [0.0] * start + row.token_mask[start:end]
+            for position in range(start, end):
+                covered_targets[position] += row.token_mask[position]
+            calls.append(
+                FinalizedCallView(
+                    model_call_id=call_id,
+                    generation_weight_version=record.weight_version,
+                    generation_start=start,
+                    generation_end=end,
+                    row=replace(
+                        canonical,
+                        token_ids=row.token_ids[:end],
+                        token_mask=call_mask,
+                        logprobs=row.logprobs[:end],
+                        prompt_len=start,
+                        routed_experts=view.routed_experts,
+                        route_plan=None,
+                        model_call_ids=(call_id,),
+                        media=resolved_media.by_call.get(call_id),
+                        media_anchor_spans=(
+                            tuple(
+                                span
+                                for span in canonical.media_anchor_spans
+                                if span[0] + span[1] <= end
+                            )
+                            if canonical.media_anchor_spans is not None
+                            else None
+                        ),
+                        output_masks={
+                            key: [False] * start + mask[start:end]
+                            for key, mask in output_masks.items()
+                        },
+                    ),
+                )
+            )
+        if covered_targets != row.token_mask:
+            return rejected("route_assembly:call_view_target_partition", staging_keys)
+        return replace(canonical, call_views=tuple(calls))
 
     def _resolve_media(
         self,
         row: Any,
         fetched_by_call: dict[str, FetchedStagedCall],
         *,
-        verify_occurrences: bool = False,
-    ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
+        verify_occurrences: bool,
+        capture_call_views: bool,
+    ) -> _ResolvedMedia:
         """Read and validate the media columns along the terminal chain.
 
         Each call row holds only the media new to that call (the worker
         slices at the parent chain's item count), so the chain's parts are
         concatenated in order, like the token deltas. Returns
-        ``(media, rejection_reason)``. Text-only partitions and text rollouts
-        return ``(None, None)`` without touching storage; media-carrying
+        canonical media and optional per-call prefixes. Text-only partitions
+        and text rollouts return no media without touching storage; media-carrying
         rollouts cost exactly one batched tensor read. The media columns live
         on the call rows themselves, so cleanup needs no extra key.
         """
         if not self._capture_media:
-            return None, None
+            return _ResolvedMedia(None, {}, None)
         items: list[FetchedStagedCall] = []
         descriptors = []
+        anchor_spans: list[tuple[int, int, int]] = []
         for call_id, _carry_len, _generation_len in row.link_spans:
             item = fetched_by_call.get(call_id)
             if item is None:
-                return None, f"media_chain_identity:{call_id}"
+                return _ResolvedMedia(None, {}, f"media_chain_identity:{call_id}")
             if verify_occurrences:
                 try:
                     occurrences = verified_media_items(item)
+                    for occurrence in occurrences:
+                        for start, length in occurrence.embedding_spans:
+                            if start + length > len(row.token_ids) or any(
+                                token != occurrence.token_id
+                                for token in row.token_ids[start : start + length]
+                            ):
+                                raise ValueError(
+                                    "Captured media anchors disagree with canonical tokens"
+                                )
+                            anchor_spans.append((start, length, occurrence.token_id))
                 except (KeyError, TypeError, ValueError) as error:
-                    return None, f"invalid_media_evidence:{error}"
+                    return _ResolvedMedia(None, {}, f"invalid_media_evidence:{error}")
                 if item.media_present:
                     descriptors.append(occurrences)
             if item.media_present:
                 items.append(item)
         if not items:
-            return None, None
+            return _ResolvedMedia(None, {}, None, () if verify_occurrences else None)
         if len({item.media_has_frames for item in items}) != 1:
-            return None, "media_chain_incompatible:mixed image and video calls"
+            return _ResolvedMedia(
+                None, {}, "media_chain_incompatible:mixed image and video calls"
+            )
         try:
             parts = self._source.fetch_media(items)
             if verify_occurrences:
                 for occurrences, part in zip(descriptors, parts, strict=True):
                     verify_media_geometry(occurrences, part)
         except (KeyError, TypeError, ValueError) as error:
-            return None, f"invalid_media_columns:{error}"
+            return _ResolvedMedia(None, {}, f"invalid_media_columns:{error}")
+        by_call: dict[str, Optional[dict[str, PackedTensor]]] = {}
         try:
             combined = _concat_media(parts)
             media = _trainer_media(combined)
+            if capture_call_views:
+                part_by_call = {
+                    item.snapshot.model_call_id: part
+                    for item, part in zip(items, parts, strict=True)
+                }
+                cumulative_parts = []
+                current_media = None
+                for call_id, _carry, _generation in row.link_spans:
+                    part = part_by_call.get(call_id)
+                    if part is not None:
+                        cumulative_parts.append(part)
+                        # Reuse the already-built full media for the last
+                        # addition and reuse immutable media on later calls.
+                        current_media = (
+                            media
+                            if len(cumulative_parts) == len(parts)
+                            else _trainer_media(_concat_media(cumulative_parts))
+                        )
+                    by_call[call_id] = current_media
         except (TypeError, ValueError, RuntimeError) as error:
-            return None, f"media_chain_incompatible:{error}"
-        return media, None
+            return _ResolvedMedia(None, {}, f"media_chain_incompatible:{error}")
+        return _ResolvedMedia(
+            media,
+            by_call,
+            None,
+            tuple(anchor_spans) if verify_occurrences else None,
+        )
 
     def _execute_direct_plan(
         self,
@@ -632,7 +883,8 @@ class RolloutReassembler:
         fetched: list[Any],
         *,
         backpatch_predecessor_tail: bool = False,
-    ) -> tuple[Optional[torch.Tensor], Optional[str]]:
+        capture_call_views: bool,
+    ) -> tuple[Optional[RoutePlanExecution], Optional[str]]:
         """Run the shared executor eagerly with locally fetched fragments.
 
         Returns ``(None, None)`` when the rollout staged no routes at all —
@@ -656,13 +908,22 @@ class RolloutReassembler:
             self._routed_dims = (int(first.shape[1]), int(first.shape[2]))
         if self._routed_dims is None:
             return None, "missing_fragment"
-        return execute_route_plan(
+        if capture_call_views:
+            return execute_route_plan_with_call_views(
+                plan,
+                fragments,
+                dims=self._routed_dims,
+                canonical_len=plan.expected_token_length,
+                backpatch_predecessor_tail=backpatch_predecessor_tail,
+            )
+        routed, failure = execute_route_plan(
             plan,
             fragments,
             dims=self._routed_dims,
             canonical_len=plan.expected_token_length,
             backpatch_predecessor_tail=backpatch_predecessor_tail,
         )
+        return (RoutePlanExecution(routed, ()) if routed is not None else None), failure
 
     # ── per group ───────────────────────────────────────────────────────────
 
@@ -688,7 +949,9 @@ class RolloutReassembler:
             routed_experts=None,
             route_plan=None,
             media=None,
+            media_anchor_spans=None,
             output_masks={},
+            call_views=(),
         )
 
     def finalize_group(
@@ -705,6 +968,79 @@ class RolloutReassembler:
         canonical_sample_ids: Optional[list[str]] = None,
         logical_selections: Optional[list[RolloutSelection]] = None,
         execution_row_multiple: int = 1,
+    ) -> FinalizedGroup:
+        """Verify and publish canonical context segments for one prompt group."""
+        return self._finalize_group(
+            group_id,
+            rollout_ids,
+            receipts,
+            rewards,
+            mask_sample=mask_sample,
+            fallback_weight_version=fallback_weight_version,
+            prompt_idx=prompt_idx,
+            loss_multiplier=loss_multiplier,
+            canonical_sample_ids=canonical_sample_ids,
+            logical_selections=logical_selections,
+            execution_row_multiple=execution_row_multiple,
+            capture_call_views=False,
+        )
+
+    def finalize_group_with_call_views(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        rewards: list[float],
+        *,
+        mask_sample: list[bool],
+        fallback_weight_version: int,
+        prompt_idx: int,
+        logical_selections: Optional[list[RolloutSelection]],
+        canonical_sample_ids: list[str],
+        loss_multiplier: float = 1.0,
+        execution_row_multiple: int = 1,
+    ) -> FinalizedGroup:
+        """Publish original call inputs after verifying every logical owner.
+
+        The same published routes and target masks are consumed by probability
+        evaluation and training. No call is dropped, and earlier generated
+        targets are conditioning only in later calls. This explicit API is not
+        selected by the ordinary training dispatcher.
+        """
+        if not self._router_replay_enabled or self._defer_routed_experts_to_policy:
+            raise ValueError("call views require direct router replay")
+        if logical_selections is None:
+            raise ValueError("call views require logical owner selections")
+        return self._finalize_group(
+            group_id,
+            rollout_ids,
+            receipts,
+            rewards,
+            mask_sample=mask_sample,
+            fallback_weight_version=fallback_weight_version,
+            prompt_idx=prompt_idx,
+            loss_multiplier=loss_multiplier,
+            canonical_sample_ids=canonical_sample_ids,
+            logical_selections=logical_selections,
+            execution_row_multiple=execution_row_multiple,
+            capture_call_views=True,
+        )
+
+    def _finalize_group(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        rewards: list[float],
+        *,
+        mask_sample: list[bool],
+        fallback_weight_version: int,
+        prompt_idx: int,
+        loss_multiplier: float,
+        canonical_sample_ids: Optional[list[str]],
+        logical_selections: Optional[list[RolloutSelection]],
+        execution_row_multiple: int,
+        capture_call_views: bool,
     ) -> FinalizedGroup:
         """Publish one prompt group, with optional physical rows per logical owner.
 
@@ -756,8 +1092,19 @@ class RolloutReassembler:
                 rewards,
                 mask_sample,
                 canonical_sample_ids=canonical_sample_ids,
+                capture_call_views=capture_call_views,
             )
             rows = logical.rows
+            if capture_call_views and tuple(row.rollout_id for row in rows) != (
+                self.selected_execution_sample_ids(
+                    group_id,
+                    canonical_sample_ids,
+                    logical_segments,
+                    execution_row_multiple=1,
+                    capture_call_views=True,
+                )
+            ):
+                raise ValueError("call publication disagrees with its cleanup plan")
             # Keep every captured call cleanup-owned, including unselected roots.
             logical.staging_keys = list(
                 dict.fromkeys(
@@ -793,6 +1140,11 @@ class RolloutReassembler:
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
             )
+            if capture_call_views:
+                metrics["finalize/call_view_row_count"] = float(len(rows))
+                metrics["finalize/context_segment_count"] = float(
+                    sum(len(segments) for segments in logical_segments)
+                )
         # Ledger-derived admission counters (per group): each manifest row
         # carries its admission mode. token_in_rate near 1.0 is the capture
         # health signal (a text root only opens each chain); this replaces the
@@ -1124,6 +1476,16 @@ class RolloutReassembler:
         # directly instead of going through TQReplayBuffer.commit().  Trace the
         # final payload here, after logical row IDs have been resolved, so R3's
         # rollout-to-policy identity audit covers both publication paths.
+        for tag, row in zip(tags, rows, strict=True):
+            if row.valid and row.media_anchor_spans is not None:
+                tag[MEDIA_ANCHOR_SPANS_TAG] = [
+                    list(span) for span in row.media_anchor_spans
+                ]
+            if row.valid and row.original_call_evidence is not None:
+                tag[ORIGINAL_CALL_EVIDENCE_PATH_TAG] = row.original_call_evidence.path
+                tag[ORIGINAL_CALL_EVIDENCE_SHA256_TAG] = (
+                    row.original_call_evidence.sha256
+                )
         trace_rollout_payload(keys=sample_ids, data=train_batch)
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
@@ -1169,6 +1531,37 @@ class RolloutReassembler:
         )
 
     # ── internals ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def selected_execution_sample_ids(
+        group_id: str,
+        canonical_sample_ids: list[str],
+        logical_segments: list[list[SegmentReceipt]],
+        *,
+        execution_row_multiple: int,
+        capture_call_views: bool,
+    ) -> tuple[str, ...]:
+        """Plan exact publication/cleanup IDs before any payload is verified.
+
+        Invalid owners retain the same physical cardinality as their intent.
+        A poisoned capture with no selected calls contributes one placeholder.
+        """
+        if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+            raise ValueError("execution_row_multiple must be a positive integer")
+        counts = [
+            sum(max(1, len(segment.selected_response_ids)) for segment in segments)
+            if capture_call_views
+            else len(segments)
+            for segments in logical_segments
+        ]
+        real_ids = tuple(
+            f"{owner_id}_s{ordinal}"
+            for owner_id, count in zip(canonical_sample_ids, counts, strict=True)
+            for ordinal in range(count)
+        )
+        return real_ids + tuple(
+            f"{group_id}_pad{i}" for i in range(-len(real_ids) % execution_row_multiple)
+        )
 
     @staticmethod
     def _plan_selected_calls(
@@ -1237,16 +1630,21 @@ class RolloutReassembler:
             roles = selection.session_roles
             if (sessions is None) != (roles is None) or (
                 sessions is not None
-                and (len(sessions) != len(selected) or len(roles) != len(selected))
+                and (
+                    len(sessions) != len(selected)
+                    or roles is None
+                    or len(roles) != len(selected)
+                )
             ):
                 raise ValueError("Session ownership must parallel the selection")
             owner_plan = []
             for members in group_selected_chains(selected_records):
                 chain = [selected_records[index] for index in members]
                 flags = [selection.action_flags[index] for index in members]
-                if sessions is not None and len(
-                    {sessions[index] for index in members}
-                ) != 1:
+                if (
+                    sessions is not None
+                    and len({sessions[index] for index in members}) != 1
+                ):
                     raise ValueError("A continuation chain cannot span sessions")
                 row_receipt = parsed.model_copy(
                     update={
@@ -1280,6 +1678,7 @@ class RolloutReassembler:
         mask_sample: list[bool],
         *,
         canonical_sample_ids: list[str],
+        capture_call_views: bool,
     ) -> _LogicalRows:
         """Verify ordinary segments, then keep all or none of each owner's rows.
 
@@ -1334,15 +1733,22 @@ class RolloutReassembler:
                     prepared.staging_keys.extend(
                         record.staging_key for record in parsed.manifest
                     )
-                row = self._cap_row_length(
-                    self.finalize_rollout(
+                if capture_call_views:
+                    row = self.finalize_rollout_with_call_views(
+                        expected_id,
+                        segment.receipt,
+                        reward=reward,
+                        action_flags=segment.action_flags,
+                    )
+                else:
+                    row = self.finalize_rollout(
                         expected_id,
                         segment.receipt,
                         reward=reward,
                         context_compaction=True,
                         action_flags=segment.action_flags,
                     )
-                )
+                row = self._cap_row_length(row)
                 selected = segment.selected_response_ids
                 record_by_call = (
                     {record.model_call_id: record for record in parsed.manifest}
@@ -1444,12 +1850,46 @@ class RolloutReassembler:
                         route_plan=None,
                         media=None,
                         output_masks={},
+                        call_views=(),
                     )
                     for _ in segments
                 ]
-            for ordinal, row in enumerate(rebuilt):
-                segment = segments[ordinal]
+            execution_rows: list[_LogicalExecutionRow] = []
+            for context_index, (row, segment) in enumerate(
+                zip(rebuilt, segments, strict=True)
+            ):
+                if not capture_call_views:
+                    execution_rows.append(
+                        _LogicalExecutionRow(row, context_index, None, None)
+                    )
+                elif owner_valid:
+                    if len(row.call_views) != len(segment.selected_response_ids):
+                        raise ValueError("call views must cover every selected action")
+                    for call_index, call in enumerate(row.call_views):
+                        if call.model_call_id != row.model_call_ids[call_index]:
+                            raise ValueError(
+                                "call views changed the selected action order"
+                            )
+                        execution_rows.append(
+                            _LogicalExecutionRow(
+                                call.row, context_index, call_index, call
+                            )
+                        )
+                else:
+                    execution_rows.extend(
+                        _LogicalExecutionRow(row, context_index, call_index, None)
+                        for call_index in range(
+                            max(1, len(segment.selected_response_ids))
+                        )
+                    )
+            for ordinal, execution in enumerate(execution_rows):
+                row = execution.row
+                segment = segments[execution.context_segment_index]
                 flags = segment.action_flags or ()
+                message_count = len(segment.selected_response_ids)
+                if execution.call_index is not None:
+                    flags = flags[execution.call_index : execution.call_index + 1]
+                    message_count = int(execution.call_index < message_count)
                 prepared.rows.append(replace(row, rollout_id=f"{owner_id}_s{ordinal}"))
                 prepared.prompt_ids.append(original_prompt)
                 prepared.mask_sample.append(owner_mask)
@@ -1463,7 +1903,7 @@ class RolloutReassembler:
                         "logical_slot": slot,
                         "logical_group_size": n,
                         "segment_index": ordinal,
-                        "segment_count": len(rebuilt),
+                        "segment_count": len(execution_rows),
                         "is_execution_padding": False,
                         "num_invalid_tool_calls": sum(
                             flag.invalid_tool_call for flag in flags
@@ -1471,7 +1911,27 @@ class RolloutReassembler:
                         "num_malformed_thinking": sum(
                             flag.malformed_thinking for flag in flags
                         ),
-                        "num_assistant_messages": len(segment.selected_response_ids),
+                        "num_assistant_messages": message_count,
+                        **(
+                            {
+                                "context_segment_index": execution.context_segment_index,
+                                "context_segment_count": len(segments),
+                                "call_index": execution.call_index,
+                                "call_count": len(segment.selected_response_ids),
+                            }
+                            if capture_call_views
+                            else {}
+                        ),
+                        **(
+                            {
+                                "model_call_id": execution.call.model_call_id,
+                                "generation_weight_version": execution.call.generation_weight_version,
+                                "call_generation_start": execution.call.generation_start,
+                                "call_generation_end": execution.call.generation_end,
+                            }
+                            if execution.call is not None
+                            else {}
+                        ),
                         **(
                             {
                                 "session_id": segment.session_id,

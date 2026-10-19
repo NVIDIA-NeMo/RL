@@ -21,8 +21,9 @@ canonical publication in deferred mode (the same reason maps to the existing
 counted sentinel fallback). The executor owns per-span extras-digest
 verification against Gym's receipt-bound commitments, span classification via
 Gym's decision table, full/tail slicing, sentinel fill, and shape checks — it
-also applies authenticated newest-prefix replacement for continuations. It
-returns a tensor or a failure reason and never decides policy.
+also applies authenticated newest conditioning routes while preserving the
+routes that predicted each call's generated targets. It returns a tensor or
+a failure reason and never decides policy.
 """
 
 from __future__ import annotations
@@ -74,6 +75,29 @@ class RouteFragment:
     routes: torch.Tensor
     encoding: int
     extras_metadata_json: bytes
+
+
+@dataclass(frozen=True)
+class CallRouteView:
+    """An authenticated prefix before any later call replaces its routes.
+
+    The prefix includes all conditioning tokens. Only targets in
+    ``[generation_start, generation_end)`` belong to this call; earlier
+    generated tokens remain context and belong to their own views.
+    """
+
+    staging_key: str
+    generation_start: int
+    generation_end: int
+    routed_experts: torch.Tensor
+
+
+@dataclass(frozen=True)
+class RoutePlanExecution:
+    """Canonical predictor routes and optional independent original call prefixes."""
+
+    routed_experts: torch.Tensor
+    call_views: tuple[CallRouteView, ...]
 
 
 def verify_route_fragment_integrity(
@@ -140,6 +164,51 @@ def execute_route_plan(
         topk]`` int16, sentinel-filled wherever no fragment contributed — or
         ``(None, reason)`` with a reason from the shared vocabulary.
     """
+    execution, failure = _execute_route_plan(
+        plan,
+        fragments,
+        dims=dims,
+        canonical_len=canonical_len,
+        backpatch_predecessor_tail=backpatch_predecessor_tail,
+        capture_call_views=False,
+    )
+    return (execution.routed_experts if execution is not None else None), failure
+
+
+def execute_route_plan_with_call_views(
+    plan: RouteAssemblyPlan,
+    fragments: Mapping[str, RouteFragment],
+    *,
+    dims: tuple[int, int],
+    canonical_len: int,
+    backpatch_predecessor_tail: bool,
+) -> tuple[Optional[RoutePlanExecution], Optional[str]]:
+    """Keep each call's routes before subsequent prefix/tail replacement.
+
+    Verification and canonical assembly are identical to ``execute_route_plan``.
+    All fragments must verify before any views are returned. Each view owns a
+    copy, so later continuation backpatches cannot change earlier evidence.
+    This does not change training rows, masks, normalization, or model routing.
+    """
+    return _execute_route_plan(
+        plan,
+        fragments,
+        dims=dims,
+        canonical_len=canonical_len,
+        backpatch_predecessor_tail=backpatch_predecessor_tail,
+        capture_call_views=True,
+    )
+
+
+def _execute_route_plan(
+    plan: RouteAssemblyPlan,
+    fragments: Mapping[str, RouteFragment],
+    *,
+    dims: tuple[int, int],
+    canonical_len: int,
+    backpatch_predecessor_tail: bool,
+    capture_call_views: bool,
+) -> tuple[Optional[RoutePlanExecution], Optional[str]]:
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
     from nemo_gym.token_id_capture.staging.routes import classify_route_span
 
@@ -151,7 +220,12 @@ def execute_route_plan(
         ROUTE_MISSING_SENTINEL,
         dtype=torch.int16,
     )
+    protected_predictors = torch.zeros(canonical_len, dtype=torch.bool)
+    # Diagnostic views must retain each actual prefill, independently of the
+    # canonical tensor's custody of earlier generation predictors.
+    call_context = routed.clone() if capture_call_views else None
     position = 0
+    call_views: list[CallRouteView] = []
     for span in plan.spans:
         contribution = span.carry_len + span.generation_len
         # A digest-covered prefix marker extends Gym's legacy full/tail span
@@ -206,7 +280,12 @@ def execute_route_plan(
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
             if prefix_replacement:
-                routed[:position] = routes[:position].to(torch.int16)
+                mutable_prefix = ~protected_predictors[:position]
+                routed[:position][mutable_prefix] = routes[:position][
+                    mutable_prefix
+                ].to(torch.int16)
+                if call_context is not None:
+                    call_context[:position] = routes[:position].to(torch.int16)
             boundary = metadata.get("routed_experts_prefix_boundary")
             if boundary is not None:
                 if position == 0:
@@ -218,6 +297,8 @@ def execute_route_plan(
                 if previous_route.shape != (1, num_moe_layers, top_k):
                     return None, ROUTE_FAILURE_PREFIX_BOUNDARY
                 routed[position - 1] = previous_route[0]
+                if call_context is not None:
+                    call_context[position - 1] = previous_route[0]
             if backpatch_predecessor_tail:
                 # Integrity was checked above over this exact metadata too.
                 tail = metadata.get("predecessor_tail_route")
@@ -240,10 +321,12 @@ def execute_route_plan(
                     ):
                         return None, "invalid_predecessor_tail"
                     routed[position - 1] = torch.tensor(tail, dtype=torch.int16)
+                    if call_context is not None:
+                        call_context[position - 1] = routed[position - 1]
             if prefix_replacement:
-                routed[position : position + contribution] = routes[
-                    prefix_len:
-                ].to(torch.int16)
+                routed[position : position + contribution] = routes[prefix_len:].to(
+                    torch.int16
+                )
             elif mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:
@@ -251,7 +334,36 @@ def execute_route_plan(
                 routed[tail_start : position + contribution] = routes[
                     -span.generation_len :
                 ].to(torch.int16)
+            if span.generation_len:
+                # Targets [start, end) use predictor routes [start-1, end-1).
+                # The final generated token's route is only padding until a
+                # continuation captures it, so never protect that final row.
+                # Legacy tail-only fragments do not supply the first predictor;
+                # do not freeze their missing prompt route against later repair.
+                supplied_start = 0 if prefix_replacement else position
+                if mode == "tail":
+                    supplied_start = position + span.carry_len
+                elif not prefix_replacement and (
+                    boundary is not None or backpatch_predecessor_tail
+                ):
+                    supplied_start = position - 1
+                predictor_start = max(0, supplied_start, position + span.carry_len - 1)
+                predictor_end = position + contribution - 1
+                if predictor_start < predictor_end:
+                    protected_predictors[predictor_start:predictor_end] = True
+        if call_context is not None:
+            call_context[position : position + contribution] = routed[
+                position : position + contribution
+            ]
+            call_views.append(
+                CallRouteView(
+                    staging_key=span.staging_key,
+                    generation_start=position + span.carry_len,
+                    generation_end=position + contribution,
+                    routed_experts=call_context[: position + contribution].clone(),
+                )
+            )
         position += contribution
     if plan.spans and position != canonical_len:
         return None, ROUTE_FAILURE_ASSEMBLED_LENGTH
-    return routed, None
+    return RoutePlanExecution(routed, tuple(call_views)), None

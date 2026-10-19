@@ -1856,6 +1856,66 @@ def load_media_from_message(
     return loaded_media
 
 
+MEDIA_ANCHOR_SPANS_TAG = "captured_media_anchor_spans"
+
+
+def attach_captured_media_anchor_mask(
+    batch: Any, tags: Sequence[dict[str, Any]]
+) -> None:
+    """Restore verified media ownership carried by canonical rollout tags.
+
+    Captured embedding spans distinguish image features from the same token ID
+    written as ordinary text, including text retained after a context reset.
+    This only controls embedding insertion; training targets remain untouched.
+    Rows from older checkpoints without this tag keep the legacy derivation.
+    """
+    if not any(MEDIA_ANCHOR_SPANS_TAG in tag for tag in tags):
+        return
+    input_ids = batch["input_ids"]
+    if input_ids.is_nested or input_ids.ndim != 2:
+        raise ValueError("Captured media anchors require padded [B, S] input_ids")
+    if len(tags) != input_ids.shape[0]:
+        raise ValueError("Captured media anchor tags must match the token rows")
+    lengths = batch["input_lengths"].tolist()
+    mask = torch.ones_like(input_ids, dtype=torch.bool)
+    for row, tag in enumerate(tags):
+        if MEDIA_ANCHOR_SPANS_TAG not in tag:
+            continue
+        spans = tag[MEDIA_ANCHOR_SPANS_TAG]
+        if not isinstance(spans, (list, tuple)):
+            raise ValueError("Captured media anchor spans must be a sequence")
+        mask[row] = False
+        previous_end = 0
+        for span in spans:
+            if (
+                not isinstance(span, (list, tuple))
+                or len(span) != 3
+                or any(type(value) is not int for value in span)
+            ):
+                raise ValueError(
+                    "Captured media anchors require integer offset, length and token ID"
+                )
+            start, length, token_id = span
+            end = start + length
+            if (
+                start < previous_end
+                or length <= 0
+                or end > lengths[row]
+                or token_id < 0
+            ):
+                raise ValueError(
+                    "Captured media anchors exceed or overlap their token row"
+                )
+            if not bool((input_ids[row, start:end] == token_id).all()):
+                raise ValueError(
+                    "Captured media anchor tokens do not match the learner input"
+                )
+            mask[row, start:end] = True
+            previous_end = end
+    base_mask = batch.get("media_token_validity_mask")
+    batch["media_token_validity_mask"] = mask if base_mask is None else mask & base_mask
+
+
 def build_media_token_validity_mask(
     input_ids: torch.Tensor,
     media_token_id: int,
@@ -1869,9 +1929,9 @@ def build_media_token_validity_mask(
     in a text-only row the same id is whatever the author wrote, and counting
     it as a placeholder makes the model demand a feature that does not exist.
 
-    Rows that do carry media keep every position valid, so a real
-    placeholder/feature disagreement there is still reported rather than
-    silently masked away.
+    Rows that carry media preserve the supplied validity mask, or leave the
+    model's derivation untouched when none was supplied. Actual feature-count
+    disagreements remain errors in the model's media merge.
 
     Args:
         input_ids: ``[B, S]`` token ids, one row per sample.
@@ -1978,6 +2038,11 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:
         return
-    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    mask = build_media_token_validity_mask(
+        input_ids,
+        media_token_id,
+        counts,
+        base_mask=batch.get("media_token_validity_mask"),
+    )
     if mask is not None:
         batch["media_token_validity_mask"] = mask

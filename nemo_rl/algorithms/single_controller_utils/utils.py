@@ -189,9 +189,7 @@ def reduce_advantage_pump_metrics(
     if num_overlong_filtered is not None:
         out["num_overlong_filtered"] = float(sum(num_overlong_filtered))
     if num_owner_fanout_filtered is not None:
-        out["num_owner_fanout_filtered"] = float(
-            sum(num_owner_fanout_filtered)
-        )
+        out["num_owner_fanout_filtered"] = float(sum(num_owner_fanout_filtered))
     if seq_logprob_error_metrics:
         out.update(_reduce_seq_logprob_error_metrics(seq_logprob_error_metrics))
     n_asst = sum(num_assistant_messages or [])

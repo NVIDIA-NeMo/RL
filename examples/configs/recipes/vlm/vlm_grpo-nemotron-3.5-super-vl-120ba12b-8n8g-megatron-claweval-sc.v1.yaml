@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Use the public Super VL checkpoint while retaining ClawEval's native tasks,
+# verifier, and parent/child trace ownership. The ClawEval launcher owns paths
+# and prompt-group counts; keep its dataset and sandbox backend independent.
+defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-agentic-vbench-sc.v1.yaml
+
+grpo:
+  num_prompts_per_step: 8
+
+policy:
+  train_global_batch_size: 32
+
+token_capture:
+  max_train_row_tokens: 65536
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/claweval_agent/configs/claweval_train.yaml
+
+checkpointing:
+  checkpoint_dir: results/claweval-public-super-sc

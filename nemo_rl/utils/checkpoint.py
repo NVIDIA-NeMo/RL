@@ -160,6 +160,8 @@ class CheckpointingConfig(TypedDict):
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
     ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
+    protected_steps (Optional[list[int]]): Nonnegative checkpoint steps that must
+        survive retention, for example a full recovery seed. None adds no pins.
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
@@ -181,12 +183,17 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int | None]
     ft_keep_latest_k: NotRequired[int | None]
+    protected_steps: NotRequired[list[int] | None]
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
     load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
+    # A new dataset lineage can retain trained policy weights and Adam while
+    # starting fresh rollout, replay, and dataloader state. Ordinary resumes
+    # always take precedence over this one-time initialization source.
+    warm_start_policy_checkpoint: NotRequired[str | None]
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
@@ -251,6 +258,16 @@ class CheckpointManager:
         self.keep_top_k = config["keep_top_k"]
         self.save_period: int = config["save_period"]
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
+        protected_steps = config.get("protected_steps")
+        self.protected_steps: frozenset[int] | None = None
+        if protected_steps is not None:
+            if not isinstance(protected_steps, list) or any(
+                type(step) is not int or step < 0 for step in protected_steps
+            ):
+                raise ValueError(
+                    "checkpointing.protected_steps must be a list of nonnegative integers or null"
+                )
+            self.protected_steps = frozenset(protected_steps)
         self.save_optimizer = config["save_optimizer"]
 
         # Async finalization state
@@ -532,6 +549,9 @@ class CheckpointManager:
         Applied to all checkpoints regardless of save_period alignment.
         Purely recency-based — metrics are not considered.
 
+        protected_steps: explicit seed/recovery steps survive all ranking and
+        recency limits, including keep_top_k=0. Missing steps are not created.
+
         Args:
             exclude_latest (bool): Whether to protect the most recent checkpoint
                 from deletion.
@@ -544,6 +564,8 @@ class CheckpointManager:
 
         latest_step = max(step for step, _, _ in checkpoint_history)
         protected_steps: set[int] = set()
+        if self.protected_steps is not None:
+            protected_steps.update(self.protected_steps)
 
         if exclude_latest:
             protected_steps.add(latest_step)

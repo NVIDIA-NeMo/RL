@@ -28,6 +28,7 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutReassembler,
     RolloutSelection,
 )
+from nemo_rl.experience.original_call_evidence import OriginalCallEvidenceConfig
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -75,11 +76,18 @@ class ReassemblyRequest:
     loss_multiplier: float = 1.0
     logical_selections: Optional[tuple[RolloutSelection, ...]] = None
     execution_row_multiple: int = 1
+    # Wire compatibility for requests serialized before call publication existed.
+    # The ordinary dispatcher does not opt in; this is not a user-config default.
+    capture_call_views: bool = False
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
         """Return cleanup receipts only after validating CC capture ownership."""
+        if type(self.capture_call_views) is not bool:
+            raise ValueError("capture_call_views must be a boolean")
         if self.logical_selections is None:
+            if self.capture_call_views:
+                raise ValueError("call views require logical owner selections")
             return self.receipts
         from nemo_gym.token_id_capture.staging.records import (
             RolloutReceipt,
@@ -117,25 +125,18 @@ class ReassemblyRequest:
     @property
     def cleanup_sample_ids(self) -> tuple[str, ...]:
         """Return the segment publication plan, including exact padding."""
+        _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
         if self.logical_selections is None:
             return self.canonical_sample_ids
-        _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
-        if (
-            type(self.execution_row_multiple) is not int
-            or self.execution_row_multiple < 1
-        ):
-            raise ValueError("execution_row_multiple must be a positive integer")
         plans = RolloutReassembler._plan_selected_calls(
             list(self.rollout_ids), list(self.receipts), list(self.logical_selections)
         )
-        real_ids = tuple(
-            f"{owner_id}_s{ordinal}"
-            for owner_id, segments in zip(self.canonical_sample_ids, plans, strict=True)
-            for ordinal in range(len(segments))
-        )
-        return real_ids + tuple(
-            f"{self.group_id}_pad{i}"
-            for i in range(-len(real_ids) % self.execution_row_multiple)
+        return RolloutReassembler.selected_execution_sample_ids(
+            self.group_id,
+            list(self.canonical_sample_ids),
+            plans,
+            execution_row_multiple=self.execution_row_multiple,
+            capture_call_views=self.capture_call_views,
         )
 
 
@@ -153,6 +154,7 @@ class RolloutReassemblerActorConfig:
     capture_media: bool
     # Rows rebuilt longer than this are rejected (row_too_long); None = no cap.
     max_train_row_tokens: Optional[int] = None
+    original_call_evidence: OriginalCallEvidenceConfig | None = None
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -209,6 +211,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             max_seq_len=config.max_seq_len,
             capture_media=config.capture_media,
             max_train_row_tokens=config.max_train_row_tokens,
+            original_call_evidence=config.original_call_evidence,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
@@ -241,7 +244,12 @@ class RolloutReassemblerActor:  # pragma: no cover
                 "finalizer request rollout_ids, canonical_sample_ids, receipts, "
                 "rewards, and mask_sample must be parallel"
             )
-        result = self._finalizer.finalize_group(
+        finalize_group = (
+            self._finalizer.finalize_group_with_call_views
+            if request.capture_call_views
+            else self._finalizer.finalize_group
+        )
+        result = finalize_group(
             request.group_id,
             list(request.rollout_ids),
             list(request.receipts),

@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from argparse import Namespace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,10 +26,12 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.utils.timer import convert_to_seconds
 
 
 @pytest.fixture
 def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    monkeypatch.delenv("NRL_SLURM_CHECKPOINT_DEADLINE_EPOCH", raising=False)
     generation_config = {"backend": "vllm"}
     config = MasterConfig.model_construct(
         policy={
@@ -38,7 +43,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         data={},
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
-        logger={"log_dir": "/tmp/logs"},
+        logger={"log_dir": "/tmp/logs", "wandb_enabled": False},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
             stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
@@ -131,6 +136,95 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
 
 
+@pytest.fixture
+def startup_wandb(
+    main_context: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> SimpleNamespace:
+    main_context.config.logger.update(
+        wandb_enabled=True,
+        wandb={
+            "project": "test-startup",
+            "id": "requested-startup-run",
+            "log_nemo_gym_full_result_tables": False,
+        },
+    )
+    run = MagicMock()
+    run.id = "actual-startup-run"
+    initialize = MagicMock(return_value=run)
+    monkeypatch.setattr("wandb.init", initialize)
+    return SimpleNamespace(run=run, initialize=initialize)
+
+
+def test_startup_metrics_precede_ray_and_workers_and_finish_before_actor(
+    main_context: SimpleNamespace,
+    startup_wandb: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def initialize_ray() -> None:
+        startup_wandb.run.log.assert_called_once_with({"setup/driver_started": 1})
+
+    def initialize_workers(
+        *_args: object, **_kwargs: object
+    ) -> tuple[SimpleNamespace, SetupTimingMetrics]:
+        rows = [call.args[0] for call in startup_wandb.run.log.call_args_list]
+        assert rows[-1]["setup/worker_initialization_started"] == 1
+        assert rows[-1]["setup/pre_worker_initialization_seconds"] >= 0
+        startup_wandb.run.finish.assert_not_called()
+        return main_context.actor_args, SetupTimingMetrics()
+
+    launch = run_grpo_single_controller.SingleControllerActor.remote
+    actor = launch.return_value
+
+    def launch_actor(**kwargs: Any) -> SimpleNamespace:
+        startup_wandb.run.finish.assert_called_once_with()
+        config = kwargs["master_config"]
+        assert config.logger["wandb"]["id"] == "actual-startup-run"
+        assert config.logger["wandb"]["resume"] == "allow"
+        return actor
+
+    monkeypatch.setattr(run_grpo_single_controller, "init_ray", initialize_ray)
+    main_context.setup_single_controller.side_effect = initialize_workers
+    launch.side_effect = launch_actor
+    run_grpo_single_controller.main()
+
+    assert "log_nemo_gym_full_result_tables" not in (
+        startup_wandb.initialize.call_args.kwargs
+    )
+    rows = [call.args[0] for call in startup_wandb.run.log.call_args_list]
+    assert len(rows) == 3
+    assert rows[-1]["setup/worker_initialization_seconds"] >= 0
+    assert all(key.startswith("setup/") for row in rows for key in row)
+    startup_wandb.run.finish.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_phase", ["ray", "workers"])
+def test_startup_failure_keeps_initial_metric_and_finishes_failed_run(
+    main_context: SimpleNamespace,
+    startup_wandb: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    def fail_setup(*_args: object, **_kwargs: object) -> None:
+        assert startup_wandb.run.log.call_args_list[0].args[0] == {
+            "setup/driver_started": 1
+        }
+        raise RuntimeError("native startup failed")
+
+    if failure_phase == "ray":
+        monkeypatch.setattr(run_grpo_single_controller, "init_ray", fail_setup)
+    else:
+        main_context.setup_single_controller.side_effect = fail_setup
+
+    with pytest.raises(RuntimeError, match="native startup failed"):
+        run_grpo_single_controller.main()
+
+    startup_wandb.run.finish.assert_called_once_with(exit_code=1)
+    run_grpo_single_controller.SingleControllerActor.remote.assert_not_called()
+    rows = [call.args[0] for call in startup_wandb.run.log.call_args_list]
+    assert all(key.startswith("setup/") for row in rows for key in row)
+    assert not any("setup/worker_initialization_seconds" in row for row in rows)
+
+
 def test_cleanup_is_best_effort_and_preserves_run_error(
     main_context: SimpleNamespace,
     capsys: pytest.CaptureFixture[str],
@@ -165,6 +259,38 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
     assert "Generation shutdown failed: generation cleanup failed" in output
 
 
+def test_main_subtracts_worker_setup_from_allocation_deadline(
+    main_context: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_800_000_000
+    deadline = now + 6000
+    monkeypatch.setenv("NRL_SLURM_CHECKPOINT_DEADLINE_EPOCH", str(deadline))
+    monkeypatch.setattr(time, "time", lambda: now)
+
+    def setup(*args: object, **kwargs: object) -> tuple[object, SetupTimingMetrics]:
+        nonlocal now
+        now += 1200
+        return main_context.actor_args, SetupTimingMetrics()
+
+    main_context.setup_single_controller.side_effect = setup
+    run_grpo_single_controller.main()
+
+    assert (
+        convert_to_seconds(main_context.config.checkpointing["checkpoint_must_save_by"])
+        == 4800
+    )
+    launched = run_grpo_single_controller.SingleControllerActor.remote.call_args.kwargs
+    assert launched["master_config"] is main_context.config
+
+
+def test_main_preserves_explicit_checkpoint_timeout_without_allocation_deadline(
+    main_context: SimpleNamespace,
+) -> None:
+    main_context.config.checkpointing["checkpoint_must_save_by"] = "00:03:40:00"
+    run_grpo_single_controller.main()
+    assert main_context.config.checkpointing["checkpoint_must_save_by"] == "00:03:40:00"
+
+
 def test_main_configures_generation_for_trained_mtp(
     main_context: SimpleNamespace,
 ) -> None:
@@ -179,6 +305,28 @@ def test_main_configures_generation_for_trained_mtp(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
+
+
+def test_main_budgets_streamed_route_traces_before_ray_init(
+    main_context: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_STEPS", "2")
+    monkeypatch.delenv("NRL_R3_TRACE_CONSUMER_CALLS", raising=False)
+    main_context.config.grpo.num_prompts_per_step = 8
+    main_context.config.async_rl.min_groups_for_streaming_train = 1
+    observed = []
+    monkeypatch.setattr(
+        run_grpo_single_controller,
+        "init_ray",
+        lambda: observed.append(os.environ["NRL_R3_TRACE_CONSUMER_CALLS"]),
+    )
+
+    run_grpo_single_controller.main()
+
+    assert observed == ["16"]
+    assert main_context.config.grpo.num_prompts_per_step == 8
+    assert main_context.config.async_rl.min_groups_for_streaming_train == 1
 
 
 def test_main_materializes_video_contract_before_worker_setup(

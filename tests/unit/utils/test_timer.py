@@ -20,7 +20,40 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from nemo_rl.utils.timer import ThreadSafeTimer, TimeoutChecker, Timer
+from nemo_rl.utils.timer import (
+    ThreadSafeTimer,
+    TimeoutChecker,
+    Timer,
+    remaining_checkpoint_timeout,
+)
+
+
+@pytest.mark.parametrize("allocation_hours", [2, 4])
+def test_checkpoint_deadline_accounts_for_worker_setup(
+    monkeypatch: pytest.MonkeyPatch, allocation_hours: int
+) -> None:
+    allocation_start = 1_800_000_000
+    setup_seconds = 1200
+    checkpoint_reserve = 1200
+    now = allocation_start + setup_seconds
+    monkeypatch.setattr(time, "time", lambda: now)
+    deadline = allocation_start + allocation_hours * 3600 - checkpoint_reserve
+    timeout = TimeoutChecker(remaining_checkpoint_timeout(deadline))
+
+    assert not timeout.would_save()
+    now = deadline - 1
+    assert not timeout.would_save()
+    now = deadline
+    assert timeout.would_save()
+
+
+@pytest.mark.parametrize("deadline", [999.9, 1000, float("nan"), float("inf")])
+def test_checkpoint_deadline_rejects_expired_or_nonfinite(
+    monkeypatch: pytest.MonkeyPatch, deadline: float
+) -> None:
+    monkeypatch.setattr(time, "time", lambda: 1000)
+    with pytest.raises(ValueError, match="deadline"):
+        remaining_checkpoint_timeout(deadline)
 
 
 class TestTimer:

@@ -310,6 +310,9 @@ class FetchedStagedCall:
     # ``media_present`` is True; ``media_has_frames`` selects the video shape.
     media_present: bool = False
     media_has_frames: bool = False
+    # Explicit opt-in forensic custody. These are original wire tensor views;
+    # only the bounded evidence writer clones selected rows before cleanup.
+    wire_columns: dict[str, torch.Tensor] | None = None
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -813,6 +816,9 @@ class TQTokenSource:
         parts: list[StagedMediaTensors] = []
         for index in range(n_rows):
             row = _select_row(rows, index)
+            wire_columns = items[index].wire_columns
+            if wire_columns is not None:
+                wire_columns.update({name: value[0] for name, value in row.items()})
 
             def column(name: str) -> torch.Tensor:
                 value = row[MEDIA_TENSOR_COLUMNS[name]]
@@ -844,6 +850,7 @@ class TQTokenSource:
         staging_keys: list[str],
         *,
         include_route_fragments: bool = False,
+        retain_wire_rows: bool = False,
     ) -> list[FetchedStagedCall]:
         """Fetch digest-covered base columns, plus route payloads when requested.
 
@@ -920,6 +927,11 @@ class TQTokenSource:
                     extras=_row_extras(row, verify_media=self._capture_media),
                     media_present=media_present,
                     media_has_frames=media_has_frames,
+                    wire_columns=(
+                        {name: value[0] for name, value in row.items()}
+                        if retain_wire_rows
+                        else None
+                    ),
                 )
             )
         return fetched

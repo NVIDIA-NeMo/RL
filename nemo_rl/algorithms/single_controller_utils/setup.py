@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional, cast
 import ray
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+from torch.distributed.checkpoint import FileSystemReader
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -79,6 +80,10 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
+from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
+    tmpe_outlier_dump_config_from_env,
+)
+from nemo_rl.experience.original_call_evidence import original_call_evidence_config
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
@@ -1046,6 +1051,46 @@ _MEGATRON_FREEZE_FIELDS = (
 )
 
 
+def _validate_megatron_warm_start_optimizer_topology(
+    weights_path: Path, policy_config: PolicyConfig
+) -> None:
+    """Reject known bucket-sharded Adam EP changes before creating workers."""
+    megatron_config = policy_config["megatron_cfg"]
+    if not megatron_config["enabled"]:
+        return
+    run_configs = sorted(weights_path.glob("iter_*/run_config.yaml"))
+    if not run_configs:
+        return
+    source = OmegaConf.load(run_configs[-1])
+    if (
+        OmegaConf.select(source, "checkpoint.ckpt_format") != "torch_dist"
+        or OmegaConf.select(source, "optimizer.use_distributed_optimizer") is not True
+        or OmegaConf.select(source, "checkpoint.dist_ckpt_optim_fully_reshardable")
+        is not False
+    ):
+        return
+    source_ep = OmegaConf.select(source, "model.expert_model_parallel_size")
+    target_ep = megatron_config.get("expert_model_parallel_size")
+    if source_ep is not None and target_ep is not None and source_ep != target_ep:
+        # Older Bridge checkpoints can use model-space optimizer state even
+        # without this config flag. Reject only actual flat bucket metadata.
+        iteration = run_configs[-1].parent
+        if not (iteration / ".metadata").is_file():
+            return
+        metadata = FileSystemReader(iteration).read_metadata()
+        if not any(
+            ".gbuf_idx_" in name and ".bucket_idx_" in name
+            for name in metadata.state_dict_metadata
+        ):
+            return
+        raise ValueError(
+            "warm_start_policy_checkpoint cannot change expert parallelism "
+            f"from EP{source_ep} to EP{target_ep} with bucket-sharded Adam. "
+            "Use a full model-and-Adam checkpoint with matching EP, or convert "
+            "the donor optimizer to a fully reshardable format; refusing an Adam reset."
+        )
+
+
 def _drop_optimizer_for_changed_megatron_freeze_contract(
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
@@ -1059,7 +1104,6 @@ def _drop_optimizer_for_changed_megatron_freeze_contract(
     but the old optimizer state does not.  Detect that transition from the
     checkpoint's serialized provider config and perform a weight-only resume.
     """
-
     if weights_path is None or optimizer_path is None:
         return optimizer_path
     megatron_config = policy_config.get("megatron_cfg", {})
@@ -1090,9 +1134,7 @@ def _drop_optimizer_for_changed_megatron_freeze_contract(
         if checkpoint_value is None:
             continue
         if bool(checkpoint_value) != bool(megatron_config[field]):
-            changed.append(
-                f"{field}={checkpoint_value}->{megatron_config[field]}"
-            )
+            changed.append(f"{field}={checkpoint_value}->{megatron_config[field]}")
 
     if not changed:
         return optimizer_path
@@ -1138,7 +1180,7 @@ def _validate_session_resume_checkpoint(
     saved = OmegaConf.to_container(OmegaConf.load(saved_path), resolve=True)
     if not isinstance(saved, Mapping):
         raise ValueError(f"Checkpoint config must be a mapping: {saved_path}")
-    validate_session_resume_config(saved, current)
+    validate_session_resume_config(cast(Mapping[str, Any], saved), current)
 
 
 def setup_single_controller(
@@ -1372,6 +1414,12 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
+        if token_capture_cfg.context_compaction:
+            # Deferred: the controller's selected-call cleanup validates these
+            # optional Gym records locally, including when finalization fails.
+            from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+            RolloutReceipt.model_rebuild()
         if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
                 "token_capture.enabled supports vllm or megatron; got "
@@ -1451,14 +1499,41 @@ def setup_single_controller(
         checkpointer.load_training_info(trainer_checkpoint_path),
     )
     save_state = _get_grpo_save_state(loaded_state)
-    weights_path, optimizer_path = checkpointer.get_resume_paths(
-        trainer_checkpoint_path
+    warm_start_policy_checkpoint = master_config.checkpointing.get(
+        "warm_start_policy_checkpoint"
     )
+    policy_checkpoint_path = trainer_checkpoint_path
+    if trainer_checkpoint_path is None and warm_start_policy_checkpoint is not None:
+        validate_warm_start_checkpoint(
+            warm_start_policy_checkpoint, model_component="policy"
+        )
+        policy_checkpoint_path = warm_start_policy_checkpoint
+    weights_path, optimizer_path = checkpointer.get_resume_paths(policy_checkpoint_path)
     optimizer_path = _drop_optimizer_for_changed_megatron_freeze_contract(
         weights_path,
         optimizer_path,
         cast(dict[str, Any], policy_config),
     )
+    if trainer_checkpoint_path is None and warm_start_policy_checkpoint is not None:
+        if weights_path is None or optimizer_path is None:
+            raise ValueError(
+                "warm_start_policy_checkpoint requires complete native policy "
+                "weights and compatible optimizer state; refusing an Adam reset"
+            )
+        _validate_megatron_warm_start_optimizer_topology(weights_path, policy_config)
+        if policy_config["megatron_cfg"]["enabled"]:
+            # Donor RNG shards belong to the donor data/parallel topology.
+            # Only this fresh lineage starts new RNG; an ordinary resume
+            # bypasses this block and restores its own RNG with its Adam state.
+            megatron_checkpoint_cfg = policy_config["megatron_cfg"].setdefault(
+                "checkpoint", {}
+            )
+            megatron_checkpoint_cfg["load_rng"] = False
+        print(
+            f"📦 Initializing policy weights and optimizer from {policy_checkpoint_path}; "
+            "starting a new dataset, rollout and replay lineage",
+            flush=True,
+        )
     if is_ppo_run(master_config):
         # Only a fresh run reads this; a resume ignores it and restores the critic
         # from its own checkpoint, so the key can stay in the config.
@@ -2043,7 +2118,10 @@ def setup_single_controller(
             "token_capture.defer_routed_experts_to_policy requires "
             "policy.router_replay.enabled=true"
         )
-    if not restore_data_plane_in_actor:
+    # A restored controller already has the typed schema for both partitions.
+    # Float32 placeholders would conflict with retained int64 fields, just as
+    # in the actor-side Mooncake restore path. Fresh runs still need warm-up.
+    if not restore_data_plane_in_actor and data_plane_checkpoint_metadata is None:
         _register_single_controller_partitions(
             dp_client,
             master_config=master_config,
@@ -2111,6 +2189,7 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        outlier_dump_config = tmpe_outlier_dump_config_from_env()
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2122,6 +2201,11 @@ def setup_single_controller(
                 max_seq_len=_generation_max_seq_len(generation_config),
                 capture_media=capture_media,
                 max_train_row_tokens=token_capture_cfg.max_train_row_tokens,
+                original_call_evidence=original_call_evidence_config(
+                    outlier_dump_config.output_path
+                    if outlier_dump_config is not None
+                    else None
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

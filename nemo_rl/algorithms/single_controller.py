@@ -54,7 +54,7 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -135,8 +135,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 )
 from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
     TMPE_METRIC_FIELDS,
-    TMPE_OPTIONAL_MEDIA_FIELDS,
+    TMPE_OPTIONAL_FIELDS,
     TMPE_OUTLIER_DUMP_FIELDS,
+    TMPEOutlierDumpRef,
+    dump_tmpe_outlier_admissions,
     dump_tmpe_outlier_rows,
     find_tmpe_outlier_rows,
     tmpe_outlier_dump_config_from_env,
@@ -617,7 +619,7 @@ class SingleControllerActor:
             actor_args.rollout_checkpoint_load_metrics
         )
         self._consumed_samples: int = actor_args.save_state.consumed_samples
-        self._total_valid_tokens: int = actor_args.save_state.total_valid_tokens
+        self._total_valid_tokens: float = actor_args.save_state.total_valid_tokens
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
@@ -865,6 +867,9 @@ class SingleControllerActor:
         )
         if probe_task is not None:
             tasks.append(probe_task)
+        # A failed or cancelled pump must not appear as a successful W&B run.
+        # Set success only after all required pump results have been awaited.
+        exit_code = 1
         try:
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
@@ -906,6 +911,7 @@ class SingleControllerActor:
                 await rollout_task
             if not stop_after_rollout_checkpoint:
                 await train_task
+            exit_code = 0
         finally:
             for task in tasks:
                 task.cancel()
@@ -929,7 +935,7 @@ class SingleControllerActor:
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
             finally:
-                self._logger.finish()
+                self._logger.finish(exit_code=exit_code)
                 await asyncio.to_thread(self._checkpointer.shutdown)
 
         return {
@@ -3055,6 +3061,7 @@ class SingleControllerActor:
 
                     # ---- 2. Prepare the batch ----
                     # Compute prev_logprobs / ref_logprobs
+                    tmpe_outlier_dumps: list[TMPEOutlierDumpRef] = []
                     if (
                         self._policy_logprobs_required
                         or self._reference_logprobs_required
@@ -3095,7 +3102,9 @@ class SingleControllerActor:
                                     train_meta,
                                 )
                         if self._policy_logprobs_required:
-                            await self._maybe_dump_tmpe_outliers(train_meta)
+                            tmpe_outlier_dumps = await self._maybe_dump_tmpe_outliers(
+                                train_meta
+                            )
                     elif self._is_ppo:
                         # prepare_for_lp_inference is skipped here, and it is the only
                         # other call that parks the policy optimizer before the critic.
@@ -3137,6 +3146,7 @@ class SingleControllerActor:
                         ) = await self._advantage_stage(
                             train_meta,
                             role_count_accumulator=post_admission_role_counts,
+                            tmpe_outlier_dumps=tmpe_outlier_dumps,
                         )
                     if context_compaction:
                         # The advantage stage has verified every owner/segment.
@@ -3489,6 +3499,19 @@ class SingleControllerActor:
                 self._consumed_samples += groups_dispatched
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
+
+                # Publish completed optimizer results before refit/checkpoint I/O.
+                # Either can take minutes or fail after the update succeeded;
+                # buffering until the epilogue would leave training charts empty.
+                # The epilogue still adds refit diagnostics and full-step timings
+                # on the same caller step (independent of W&B's internal step).
+                if policy_result:
+                    self._logger.log_metrics(
+                        dict(step_metrics),
+                        step=self._train_steps,
+                        prefix="train",
+                        step_finished=True,
+                    )
 
                 is_last_step = self._train_steps >= self._algo_cfg.max_num_steps or (
                     self._rollout_exhausted.is_set() and len(self._buffer) == 0
@@ -5388,6 +5411,7 @@ class SingleControllerActor:
         meta: KVBatchMeta,
         *,
         role_count_accumulator: Optional[list[dict[str, int]]] = None,
+        tmpe_outlier_dumps: Sequence[TMPEOutlierDumpRef] = (),
     ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
@@ -5402,6 +5426,8 @@ class SingleControllerActor:
             role_count_accumulator: Optional step-local telemetry sink. A role
                 record is appended only after the final owner-fanned sample
                 mask and advantage writeback succeed.
+            tmpe_outlier_dumps: Raw dump references to annotate with the actual
+                final masks after successful writeback, independent of commit.
 
         Returns:
             The updated batch metadata and whether the batch contains at least
@@ -5468,9 +5494,7 @@ class SingleControllerActor:
                 (final_sample_mask.bool() & truncated).sum().item()
             )
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
-        self._step_log_dict["num_overlong_filtered"].append(
-            num_overlong_filtered
-        )
+        self._step_log_dict["num_overlong_filtered"].append(num_overlong_filtered)
 
         seq_logprob_error_threshold = self._algo_cfg.seq_logprob_error_threshold
         # Match the legacy path: whenever real policy logprobs are available,
@@ -5545,9 +5569,9 @@ class SingleControllerActor:
                             "policy_logprobs": masking_data["prev_logprobs"][
                                 row, positions + 1
                             ].tolist(),
-                            "generation_logprobs": masking_data[
-                                "generation_logprobs"
-                            ][row, positions + 1].tolist(),
+                            "generation_logprobs": masking_data["generation_logprobs"][
+                                row, positions + 1
+                            ].tolist(),
                             "tags": (meta.tags or [{}] * meta.size)[row],
                         }
                     )
@@ -5585,10 +5609,7 @@ class SingleControllerActor:
             )
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
             num_owner_fanout_filtered = int(
-                (
-                    pre_owner_sample_mask.bool()
-                    & ~final_sample_mask.bool()
-                ).sum().item()
+                (pre_owner_sample_mask.bool() & ~final_sample_mask.bool()).sum().item()
             )
         self._step_log_dict["num_owner_fanout_filtered"].append(
             num_owner_fanout_filtered
@@ -5731,6 +5752,27 @@ class SingleControllerActor:
         if owner_batch is not None and role_count_accumulator is not None:
             role_counts = _post_admission_session_role_counts(meta, final_sample_mask)
             role_count_accumulator.append(role_counts)
+        if tmpe_outlier_dumps:
+            try:
+                await asyncio.to_thread(
+                    dump_tmpe_outlier_admissions,
+                    dumps=tmpe_outlier_dumps,
+                    meta=meta,
+                    input_sample_mask=sample_mask,
+                    mask_sample=mask_sample,
+                    truncated=truncated,
+                    pre_owner_sample_mask=pre_owner_sample_mask,
+                    final_sample_mask=final_sample_mask,
+                    token_mask=token_mask,
+                    overlong_filtering=self._algo_cfg.overlong_filtering,
+                    seq_logprob_error_threshold=seq_logprob_error_threshold,
+                    step=self._train_steps,
+                    trainer_version=self._trainer_version,
+                )
+            except Exception:  # noqa: BLE001 - diagnostics cannot fail training
+                log.exception(
+                    "TMPE admission sidecar failed; continuing training unchanged"
+                )
         return (
             meta.with_fields(new_fields),
             has_valid_training_tokens,
@@ -5738,18 +5780,19 @@ class SingleControllerActor:
 
     # ── utility helpers ────────────────────────────────────────────────────
 
-    async def _maybe_dump_tmpe_outliers(self, meta: KVBatchMeta) -> None:
+    async def _maybe_dump_tmpe_outliers(
+        self, meta: KVBatchMeta
+    ) -> list[TMPEOutlierDumpRef]:
         """Snapshot raw sequence-TMPE outliers after prev-logprob writeback.
 
         This is deliberately best effort: a diagnostic must not change whether
         a batch reaches advantage calculation or optimization. Read the three
-        small metric columns first, then fetch the large media payload only for
-        rows that cross the independent diagnostic threshold.
+        small metric columns first, then fetch media and generation routes only
+        for rows that cross the independent diagnostic threshold.
         """
-
         config = getattr(self, "_tmpe_outlier_dump_config", None)
         if config is None:
-            return
+            return []
 
         try:
             # read_from_dataplane stamps padding metadata on its argument. Work
@@ -5766,19 +5809,17 @@ class SingleControllerActor:
                 threshold=config.threshold,
             )
             if not outlier_indices:
-                return
+                return []
 
             outlier_meta = meta.subset(outlier_indices)
             mandatory_fields = [
                 field
                 for field in TMPE_OUTLIER_DUMP_FIELDS
-                if field not in TMPE_OPTIONAL_MEDIA_FIELDS
+                if field not in TMPE_OPTIONAL_FIELDS
             ]
             available_fields = set(meta.fields or [])
             dump_fields = mandatory_fields + [
-                field
-                for field in TMPE_OPTIONAL_MEDIA_FIELDS
-                if field in available_fields
+                field for field in TMPE_OPTIONAL_FIELDS if field in available_fields
             ]
             outlier_data = await asyncio.to_thread(
                 self._trainer.read_from_dataplane,
@@ -5799,10 +5840,17 @@ class SingleControllerActor:
                 len(written),
                 config.output_path,
             )
+            return [
+                TMPEOutlierDumpRef(sample_id=sample_id, path=path)
+                for sample_id, path in zip(
+                    outlier_meta.sample_ids, written, strict=True
+                )
+            ]
         except Exception:  # noqa: BLE001 - diagnostics cannot fail training
             log.exception(
                 "Sequence-TMPE outlier dump failed; continuing training unchanged"
             )
+            return []
 
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg

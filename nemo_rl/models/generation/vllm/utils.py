@@ -44,6 +44,10 @@ from nemo_rl.models.generation.vllm.metric_names import (
     REQUEST_SUCCESS_COUNTERS,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+from nemo_rl.utils.r3_trace import (
+    CapturedPredictionContext,
+    trace_captured_prediction_evidence,
+)
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
@@ -363,6 +367,7 @@ def attach_routed_experts_to_chat_response_choices(
     device: torch.device,
     logger: Any = None,
     routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+    capture_trace_context: CapturedPredictionContext | None = None,
 ) -> Any:
     """Attach aligned routed experts to OpenAI chat response choices."""
     outputs_by_index = {
@@ -422,6 +427,17 @@ def attach_routed_experts_to_chat_response_choices(
         choice.message.routed_experts = encode_routed_experts(
             routed_experts.to(dtype=routed_experts_dtype)
         )
+        if capture_trace_context is not None:
+            trace_captured_prediction_evidence(
+                context=capture_trace_context,
+                choice_index=choice.index,
+                prompt_token_ids=final_request_output.prompt_token_ids,
+                generation_token_ids=generation_details.token_ids,
+                generation_logprobs=getattr(
+                    choice.message, "generation_log_probs", None
+                ),
+                routed_experts=routed_experts,
+            )
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(

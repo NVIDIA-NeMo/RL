@@ -626,16 +626,17 @@ class WandbLogger(LoggerInterface):
                 step_finished=False,
             )
 
-    def finish(self) -> None:
+    def finish(self, *, exit_code: Optional[int] = None) -> None:
         """Flush queued metrics and close the wandb service.
 
         Required when the run lives inside a Ray actor: Ray tears the worker
         down before wandb's atexit hook can drain the IPC queue to the service.
+        Pass a nonzero exit code when training fails; None uses W&B's default.
         """
         with self._log_lock:
             if self.run is not None:
                 self._flush_pending_metrics_locked()
-                self.run.finish()
+                self.run.finish(exit_code=exit_code)
                 self.run = None
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
@@ -1335,12 +1336,15 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_hyperparams(params)
 
-    def finish(self) -> None:
-        """Flush and close backends that need explicit teardown (e.g. wandb)."""
+    def finish(self, *, exit_code: Optional[int] = None) -> None:
+        """Flush and close backends, passing the controller status to W&B."""
         for logger in self.loggers:
             finish = getattr(logger, "finish", None)
             if callable(finish):
-                finish()
+                if logger is self.wandb_logger:
+                    finish(exit_code=exit_code)
+                else:
+                    finish()
 
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str

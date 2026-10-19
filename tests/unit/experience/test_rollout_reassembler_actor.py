@@ -186,6 +186,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "loss_multiplier",
         "logical_selections",
         "execution_row_multiple",
+        "capture_call_views",  # One boolean; route payloads remain in TQ.
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",

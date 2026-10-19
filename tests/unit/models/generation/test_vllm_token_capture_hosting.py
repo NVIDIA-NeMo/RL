@@ -23,9 +23,10 @@ a mock worker group.
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -45,8 +46,10 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
+    CapturedRequest,
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils import r3_trace  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -158,6 +161,105 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     )
     assert coords.weight_version == 4
     assert sink.records[0].weight_version == 4
+
+
+def test_completion_trace_keeps_original_capture_stamp(monkeypatch):
+    """Observe a changed serving version without rewriting capture provenance."""
+    records = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.trace_capture_weight_span",
+        lambda **record: records.append(record),
+    )
+    sink = _MemorySink()
+    capture = RolloutTokenCapture(sink=sink, weight_version_fn=lambda: 4)
+    call = capture.begin_call(
+        CaptureAdmission(rollout_id="r", model_call_id="c", mode="text")
+    )
+    request = SimpleNamespace()
+    admission_refit = r3_trace.RefitTraceSnapshot(0, 0)
+    response_refit = r3_trace.RefitTraceSnapshot(2, 0)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_refit_snapshot",
+        lambda: response_refit,
+    )
+    worker = SimpleNamespace(
+        _capture_calls={id(request): CapturedRequest(call, [1], None, admission_refit)},
+        _rollout_weight_version=5,
+    )
+
+    VllmAsyncGenerationWorkerImpl._trace_request_capture_completion(worker, request)
+    coords = capture.complete_call(
+        call, prompt_token_ids=[1], generated_token_ids=[2], generated_logprobs=[-0.1]
+    )
+
+    assert records == [
+        {
+            "rollout_id": "r",
+            "model_call_id": "c",
+            "admission_weight_version": 4,
+            "response_weight_version": 5,
+            "admission_refit": admission_refit,
+            "response_refit": response_refit,
+        }
+    ]
+    assert coords.weight_version == 4
+    assert sink.records[0].weight_version == 4
+    assert worker._capture_calls[id(request)].call is call
+    VllmAsyncGenerationWorkerImpl._trace_request_capture_completion(
+        worker, SimpleNamespace()
+    )
+    assert len(records) == 1
+
+
+@pytest.mark.parametrize(
+    "method,transport",
+    [
+        ("update_weights_via_ipc_zmq_async", "ipc_zmq"),
+        ("update_weights_from_collective_async", "collective"),
+        ("nccl_reshard_refit_async", "nccl_reshard"),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["success", "nested", "false", "exception"])
+def test_refit_trace_wraps_real_worker_await(monkeypatch, method, transport, outcome):
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_STEPS", "10")
+    monkeypatch.setattr(r3_trace, "_refit_boundary_count", 0)
+    monkeypatch.setattr(r3_trace, "_active_refit_rpcs", 0)
+    monkeypatch.setattr(r3_trace, "_event_counts", defaultdict(int))
+    observed = []
+    records = []
+    monkeypatch.setattr(r3_trace, "_write_record", records.append)
+
+    async def rpc(*args, **kwargs):
+        observed.append(r3_trace.capture_refit_snapshot())
+        await asyncio.sleep(0)
+        if outcome == "exception":
+            raise RuntimeError("RPC error")
+        if outcome == "nested":
+
+            async def nested():
+                observed.append(r3_trace.capture_refit_snapshot())
+                await asyncio.sleep(0)
+                return [True]
+
+            return nested()
+        return [outcome != "false"]
+
+    worker = SimpleNamespace(
+        llm=SimpleNamespace(collective_rpc=rpc),
+        cfg={"vllm_cfg": {"async_engine": True}},
+        _refit_with_reload_api_enabled=lambda: False,
+        _reset_encoder_cache_after_weight_update=AsyncMock(),
+    )
+    result = asyncio.run(getattr(VllmAsyncGenerationWorkerImpl, method)(worker))
+
+    assert result is (outcome in {"success", "nested"})
+    assert observed and all(s == r3_trace.RefitTraceSnapshot(1, 1) for s in observed)
+    assert r3_trace.capture_refit_snapshot() == r3_trace.RefitTraceSnapshot(2, 0)
+    assert [r["phase"] for r in records] == ["begin", "end"]
+    assert all(r["transport"] == transport for r in records)
+    assert records[-1]["rpc_returned_without_exception"] is (outcome != "exception")
+    assert worker._reset_encoder_cache_after_weight_update.await_count == int(result)
 
 
 def _generation_with_mock_group(*, async_engine: bool = True) -> VllmGeneration:
@@ -629,8 +731,7 @@ def test_route_capture_preserves_full_prefix_and_actual_predecessor_tail(prev_le
     )
     extras = VLLMCaptureAdapter().extract_extras(payload)
     assert (
-        decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
-        == routes
+        decode_routed_experts(extras["routed_experts"], torch.int16).tolist() == routes
     )
     if prev_len:
         assert extras["routed_experts_prefix_len"] == prev_len

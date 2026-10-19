@@ -1,5 +1,53 @@
 # Subagent RL for Agentic-VBench
 
+## Super VL TMPE regression fix (2026-10-19)
+
+The public Super 3.5 recipe is
+`examples/configs/recipes/vlm/vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-agentic-vbench-sc.v1.yaml`.
+The 16-node async counterpart is
+`examples/configs/recipes/vlm/vlm_grpo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-agentic-vbench-async-sc.v1.yaml`.
+It selects `policy.megatron_cfg.stable_policy_forward: true`, native CPU
+optimizer offload, and `policy.generation.vllm_kwargs.moe_backend: triton`
+with `mamba_ssm_cache_dtype: float32`. The existing launchers still own
+subagent mode, dataset paths, allocation identity, and online W&B settings.
+Keep the full 262144-token context and leave vLLM batch-invariant mode off:
+the native Mamba2 attention guard does not support that mode.
+
+The learner fix scopes stable BF16 TP reductions, RMSNorm statistics, and
+expert forward GEMMs across the actual scheduler, including checkpoint
+recomputation on autograd threads. Native TE backward GEMMs remain in use.
+Ignored dense padding uses balanced dummy expert routes only for independent,
+dropless routers; all real token routes remain unchanged. The optional policy
+flag defaults off for other recipes. Its native TE/MCore source hashes are
+checked before installation; a different runtime requires requalification.
+
+Both native layouts completed the original failing AVB-call regression with
+every original token and all 5,002 generation targets preserved:
+
+| Layout | Generation engines | Policy replicas | Worst raw standard TMPE |
+| --- | ---: | ---: | ---: |
+| Sync8, TP8/EP32 learner | 8 | 4 | 1.0121357957 |
+| Async16, TP8/EP64 learner | 16 | 8 | 1.0199028627 |
+
+Each generation engine was compared using its own captured expert routes
+against every policy replica. Padding residuals were at most
+4.76837158203125e-7 and repeated stable forwards matched exactly. All engines'
+1,024-token greedy decodes were preserved; policy comparison of those fresh
+decodes covered generation DP0. Native online W&B evidence:
+[sync8](https://wandb.ai/adlr/nemorl-v2-subagent-comapction-debug/runs/superfreshparitys8v42)
+and
+[async16](https://wandb.ai/adlr/nemorl-v2-subagent-comapction-debug/runs/superfreshparitya16v43).
+
+These are fixed-weight numerical regressions, with zero GRPO updates. They do
+not establish 200-step training stability, identical generation/learner
+probabilities, or a universal low-level CUDA root cause. Standard TMPE
+calculation, original thresholds, GRPO loss, rewards, advantages, and target
+masks are unchanged. Existing running allocations retain their loaded backend;
+the revised launch contracts take effect at the next natural allocation.
+When resuming, carry the generation backend and SSM dtype from the reviewed
+launch recipe into the saved config, while preserving optimizer/data-plane
+state, batches, sampler semantics, checkpoint cadence, and training horizon.
+
 The integration branch `ehsan/nemorl-v2-video-cc-subagents` builds on Rohit's
 NeMo-RL v2 unified-teacher line and adds video, R3, framework-owned context
 reconstruction, and subagent training modelled on `mengxiwu/nemo-rl-internal`

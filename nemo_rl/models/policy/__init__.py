@@ -364,6 +364,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     # Offload disk writes to a persistent background worker so save_checkpoint
     # returns after D2H staging.
     async_save: bool
+    # A new policy/Adam lineage can initialize fresh RNG while retaining all
+    # trained optimizer state. Ordinary resumes default to restoring RNG.
+    load_rng: bool
     # Skip metadata recomputation after the first two saves when the sharded
     # state structure is constant across steps.
     ckpt_assume_constant_structure: bool
