@@ -29,17 +29,17 @@ from nemo_rl.environments.nemo_gym_task import (
     "row",
     [
         {"responses_create_params": {}},
-        {"task_id": "legacy-id", "task_input": {"custom": True}},
+        {"task_id": "flat-id", "task_input": {"custom": True}},
         {"task_id": {"taskset": "workplace:train"}},
     ],
 )
-def test_legacy_task_fields_do_not_change_wire_format(row):
+def test_nonmaterialized_task_fields_preserve_flat_row(row):
     assert not is_nemo_gym_task(row)
     assert get_nemo_gym_task_input(row) is row
 
 
 @pytest.mark.parametrize("taskset", ["workplace:train", "", None])
-def test_native_task_input_returns_nested_object(taskset):
+def test_materialized_task_input_returns_nested_object(taskset):
     row = {
         "task_id": {"taskset": taskset, "task_id": "17"},
         "task_input": {
@@ -52,7 +52,7 @@ def test_native_task_input_returns_nested_object(taskset):
 
 
 @pytest.mark.parametrize("task_input", [None, [], "serialized"])
-def test_malformed_native_task_input_is_rejected(task_input):
+def test_malformed_materialized_task_input_is_rejected(task_input):
     row = {
         "task_id": {"taskset": "workplace:train", "task_id": "17"},
         "task_input": task_input,
@@ -61,8 +61,8 @@ def test_malformed_native_task_input_is_rejected(task_input):
         get_nemo_gym_task_input(row)
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_request_metadata_is_read_without_rewriting_envelope(native):
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_request_metadata_is_read_without_rewriting_envelope(materialized):
     task_input = {
         "responses_create_params": {
             "metadata": {
@@ -77,7 +77,7 @@ def test_request_metadata_is_read_without_rewriting_envelope(native):
             "task_id": {"taskset": "math:train", "task_id": "4"},
             "task_input": task_input,
         }
-        if native
+        if materialized
         else task_input
     )
     original = deepcopy(row)

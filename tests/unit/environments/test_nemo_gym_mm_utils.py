@@ -36,8 +36,8 @@ from nemo_rl.environments.nemo_gym_request import _metadata_extra_body
 from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_media_normalization_preserves_task_envelope(tmp_path, native):
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_media_normalization_preserves_task_envelope(tmp_path, materialized):
     image_path = tmp_path / "input.png"
     Image.new("RGB", (2, 3)).save(image_path)
     task_input = {
@@ -49,7 +49,7 @@ def test_media_normalization_preserves_task_envelope(tmp_path, native):
             "task_id": {"taskset": "vision:train", "task_id": "image-1"},
             "task_input": task_input,
         }
-        if native
+        if materialized
         else task_input
     )
     original = deepcopy(row)
@@ -60,12 +60,12 @@ def test_media_normalization_preserves_task_envelope(tmp_path, native):
     source = converted["responses_create_params"]["input"][0]["content"][0]["image_url"]
     assert source.startswith("data:image/")
     assert converted["task_data"] == {"media_ref": str(image_path)}
-    if native:
+    if materialized:
         assert row["task_id"] == original["task_id"]
         assert "responses_create_params" not in row
 
 
-def test_native_video_preprocessing_updates_nested_request_only(tmp_path):
+def test_materialized_task_video_preprocessing_updates_nested_request_only(tmp_path):
     video_path = tmp_path / "input.mp4"
     video_path.write_bytes(b"video placeholder")
     row = {

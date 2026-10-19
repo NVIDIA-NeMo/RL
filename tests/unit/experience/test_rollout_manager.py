@@ -1461,7 +1461,7 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
-def test_nemo_gym_build_inputs_preserves_native_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)

@@ -708,7 +708,7 @@ def test_list_environment_server_routes_reads_the_resolved_gym_config():
 
 
 @pytest.mark.parametrize(
-    "routes", [["native"], {"tasks": ""}, {"": "native"}, {"tasks": 3}]
+    "routes", [["environment"], {"tasks": ""}, {"": "environment"}, {"tasks": 3}]
 )
 def test_list_environment_server_routes_rejects_malformed_routes(routes):
     with _stub_gym_resolved_config(DictConfig({"environment_server_routes": routes})):
@@ -975,7 +975,7 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
 
 @pytest.mark.parametrize("sharded", [False, True])
-def test_actor_factory_reads_native_routes_from_resolved_configs(
+def test_actor_factory_reads_environment_server_routes_from_resolved_configs(
     detected_uv_dirs, sharded
 ):
     routes = {"workplace:train": "workplace_environment"}
@@ -1005,7 +1005,7 @@ def test_actor_factory_reads_native_routes_from_resolved_configs(
     assert shard_set.pick_handle(route_name) is cluster.actors[0]
 
 
-def test_actor_factory_cleans_up_when_native_route_target_is_not_an_environment(
+def test_actor_factory_cleans_up_when_environment_server_route_target_is_not_an_environment(
     detected_uv_dirs,
 ):
     cluster = _FakeGymCluster(
@@ -1412,7 +1412,7 @@ def _sharded_set(route_to_shard):
     )
 
 
-def test_native_taskset_routing_takes_precedence_over_agent_ref():
+def test_materialized_taskset_routing_takes_precedence_over_agent_ref():
     row = {
         "task_id": {"taskset": "workplace:train", "task_id": "1"},
         "task_input": {},
@@ -1427,7 +1427,7 @@ def test_native_taskset_routing_takes_precedence_over_agent_ref():
     )
 
 
-def test_native_taskset_without_route_fails_even_if_agent_ref_is_present():
+def test_materialized_taskset_without_route_fails_even_if_agent_ref_is_present():
     with pytest.raises(
         ValueError, match="No environment server route.*workplace:train"
     ):
@@ -1443,16 +1443,20 @@ def test_native_taskset_without_route_fails_even_if_agent_ref_is_present():
 @pytest.mark.parametrize(
     "task_id", [{}, {"taskset": ""}, {"taskset": ["workplace:train"]}]
 )
-def test_malformed_taskset_does_not_fall_back_to_legacy_agent(task_id):
+def test_malformed_taskset_does_not_fall_back_to_agent_ref(task_id):
     with pytest.raises(ValueError, match="non-empty task_id.taskset"):
         nemo_gym_mod.get_nemo_gym_route_name(
-            {"task_id": task_id, "task_input": {}, "agent_ref": {"name": "legacy"}},
+            {
+                "task_id": task_id,
+                "task_input": {},
+                "agent_ref": {"name": "fallback_agent"},
+            },
             {"workplace:train": "workplace_environment"},
         )
 
 
 @pytest.mark.parametrize("cached_source", [False, True])
-def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
+def test_materialized_dataset_coverage_resolves_tasksets_before_matching_shards(
     tmp_path, cached_source
 ):
     raw_row = {
@@ -1461,7 +1465,7 @@ def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
     }
     rows = [{"extra_env_info": json.dumps(raw_row)}]
     if cached_source:
-        source_path = tmp_path / "native.jsonl"
+        source_path = tmp_path / "materialized_tasks.jsonl"
         source_path.write_text(json.dumps(raw_row) + "\n")
         source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
             str(source_path), source_path.stat()

@@ -1267,7 +1267,7 @@ class AsyncNemoGymRolloutImpl:
             and not shard_set.environment_server_routes
             and not shard_set.route_to_shard
         ):
-            # A bare actor validates native taskset routes from its own Gym config.
+            # A bare actor validates taskset routes from its own Gym config.
             nemo_gym_env = shard_set.sole_handle()
         else:
             nemo_gym_env = shard_set.pick_handle(

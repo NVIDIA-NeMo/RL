@@ -505,10 +505,10 @@ def build_route_shard_map(
     """Map each routable entry to its shard, rejecting ambiguous routes.
 
     Takes what each shard reported from ``NemoGym.list_entries()`` and returns
-    ``{route_name: shard_name}``, the lookup the router dispatches on. Legacy
+    ``{route_name: shard_name}``, the lookup the router dispatches on. Flat
     rows route either by ``agent_ref.name`` or by ``task_source``. The
     latter names the agent or resources-server entry that declared the dataset,
-    so both entry types must be included. Native tasksets resolve to an
+    so both entry types must be included. Materialized task rows resolve to an
     Environment Server entry instead.
 
     Two failures are caught here rather than at first dispatch. A routable

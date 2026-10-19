@@ -2497,13 +2497,13 @@ def _bucket_nemo_gym_rows_by_instance(
         and not shard_set.environment_server_routes
         and not shard_set.route_to_shard
     ):
-        # A bare actor validates native taskset routes from its own Gym config.
-        # Still reject groups mixing tasksets or legacy routes before dispatch.
+        # A bare actor validates taskset routes from its own Gym config.
+        # Still reject groups mixing tasksets or flat-row routes before dispatch.
         for start in range(0, len(rows), num_generations):
             identities = {
                 ("taskset", row["task_id"]["taskset"])
                 if is_nemo_gym_task(row)
-                else ("legacy", get_nemo_gym_route_name(row))
+                else ("flat", get_nemo_gym_route_name(row))
                 for row in rows[start : start + num_generations]
             }
             if len(identities) != 1:

@@ -193,9 +193,9 @@ def _count_structured_response_tokens(
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     """Require real agent references for RL metrics and teacher attribution.
 
-    For legacy rows, ``run_examples`` resolves ``task_source`` to ``agent_ref``
-    in place before it returns. Native preparation reads the reference from the
-    selected Environment Server. Unguarded, a row
+    For flat rows, ``run_examples`` resolves ``task_source`` to ``agent_ref``
+    in place before it returns. Materialized task preparation reads the reference
+    from the selected Environment Server. Unguarded, a row
     that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
     inside an ExceptionGroup, forty lines from anything that names the cause.
 
@@ -234,15 +234,15 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     )
 
 
-def _prepare_native_nemo_gym_rows(
+def _prepare_materialized_nemo_gym_rows(
     rows: list[dict],
     global_config: Mapping[str, Any],
     environment_server_routes: Mapping[str, str],
 ) -> None:
-    """Resolve native destinations and the real agent used for RL attribution.
+    """Resolve materialized task destinations and the agent used for RL attribution.
 
-    Gym's in-memory collector expects the destination to be stamped on native
-    tasks. It constructs the episode request itself, but deliberately does not
+    Gym's in-memory collector expects the destination on materialized task rows.
+    It constructs the episode request itself, but deliberately does not
     attach the agent reference that RL uses for metrics and teacher selection.
     """
     # Gym is an optional worker dependency, unavailable in the training driver.
@@ -279,10 +279,10 @@ def _prepare_native_nemo_gym_rows(
 
 
 def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
-    """Validate a native episode reply and retain its training result and IDs.
+    """Validate an episode reply and retain its training result and IDs.
 
-    Legacy replies are opaque and must not be unwrapped just because a verifier
-    happens to return a field called ``result``. Handled native failures are
+    Replies to flat rows are opaque and must not be unwrapped just because a
+    verifier returns a field called ``result``. Reported episode failures are
     exceptions, never scored rollouts.
     """
     if not is_nemo_gym_task(row):
@@ -333,7 +333,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         or not math.isfinite(reward)
     ):
         raise RolloutDataFailure(
-            "NeMo-Gym native training results must contain a finite scalar reward"
+            "NeMo-Gym episode training results must contain a finite scalar reward"
         )
     return {
         **result,
@@ -1248,7 +1248,7 @@ Depending on your data shape, you may want to change these values."""
             # Only the Gym worker imports Gym or reads its resolved config.
             from nemo_gym.global_config import get_global_config_dict
 
-            _prepare_native_nemo_gym_rows(
+            _prepare_materialized_nemo_gym_rows(
                 nemo_gym_examples,
                 get_global_config_dict(),
                 self.list_environment_server_routes(),
@@ -2214,7 +2214,7 @@ def get_nemo_gym_route_name(
     row: Mapping[str, Any],
     environment_server_routes: Mapping[str, str] | None = None,
 ) -> str:
-    """Resolve a native taskset or legacy row to its Gym server entry name."""
+    """Resolve a materialized task row or flat row to its Gym server entry name."""
     if is_nemo_gym_task(row):
         taskset = row["task_id"].get("taskset")
         if not isinstance(taskset, str) or not taskset:
@@ -2243,7 +2243,7 @@ def get_nemo_gym_route_name(
         return task_source
 
     raise ValueError(
-        "A NeMo-Gym row must contain a native task_id.taskset and task_input, "
+        "A NeMo-Gym row must contain task_id.taskset and task_input, "
         "or a non-empty agent_ref.name or task_source"
     )
 
@@ -2258,9 +2258,9 @@ class NemoGymShardSet:
     Attributes:
         handles: Shard name to its replica handles, in replica order.
         route_to_shard: Agent or task-source entry name to the shard hosting
-            it, including Environment Server entries for native tasksets.
+            it, including Environment Server entries for materialized task rows.
             Empty when unsharded, where every row goes to the only actor.
-        environment_server_routes: Native taskset names to Environment Server
+        environment_server_routes: Taskset names to Environment Server
             names, read from the actors' resolved Gym configuration.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
@@ -2496,7 +2496,7 @@ def _build_single_gym_actor(
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
-    """Start one actor and read its resolved native taskset routes."""
+    """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
         base_urls=base_urls,
@@ -2812,8 +2812,8 @@ def validate_dataset_agent_coverage(
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
-    Rows can name a legacy ``agent_ref``, a Gym ``task_source``, or a native
-    ``task_id.taskset`` mapped to an Environment Server.
+    Flat rows name an ``agent_ref`` or ``task_source``. Materialized task rows
+    name a ``task_id.taskset`` mapped to an Environment Server.
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
