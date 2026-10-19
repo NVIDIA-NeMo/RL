@@ -67,10 +67,10 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
-from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.generation_cut_capture import (
     GenerationCutCaptureMixin,
 )
+from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _verify_resumed_media_prompt,

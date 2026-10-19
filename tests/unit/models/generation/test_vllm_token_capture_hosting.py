@@ -28,9 +28,9 @@ import json
 import logging
 import threading
 import time
-from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
