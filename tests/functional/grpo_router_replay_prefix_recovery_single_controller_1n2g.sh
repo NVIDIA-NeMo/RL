@@ -75,6 +75,10 @@ rm -rf "${TEST_DIR}"
 mkdir -p "${TEST_DIR}"
 cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+# The model is rebuilt on every run, but Megatron's HF conversion is cached by
+# model path: convert into this run's directory so a cache from an earlier run
+# (another transformers version, other weights) is never reused.
+export NRL_MEGATRON_CHECKPOINT_DIR="${TEST_DIR}/megatron-conversion"
 
 # Two MoE layers of eight top-2 experts in Qwen3-30B-A3B's checkpoint layout,
 # with the Qwen3 tokenizer. Seeded so its routing is the same on every run.
