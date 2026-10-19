@@ -389,15 +389,15 @@ class DynamoRefitChannel:
         return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
     def _pause_workers(
-        self, *, clear_cache: bool
+        self, *, mode: str, clear_cache: bool, timeout_s: float
     ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Drain in-flight requests, optionally clear caches; new requests wait."""
+        """Pause every worker in vLLM's ``mode``; new requests wait for resume."""
         pause_futures = [
             _post_worker_route.remote(
                 system_url=worker.system_url,
                 route="pause_generation",
-                payload={"mode": "wait", "clear_cache": clear_cache},
-                timeout_s=self._control_timeout_s,
+                payload={"mode": mode, "clear_cache": clear_cache},
+                timeout_s=timeout_s,
             )
             for worker in self._workers
         ]
@@ -412,7 +412,9 @@ class DynamoRefitChannel:
                 paused_workers.append(worker)
         return paused_workers, pause_errors
 
-    def _resume_workers(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
+    def _resume_workers(
+        self, workers: Sequence[DynamoWorkerEndpoint], *, timeout_s: float
+    ) -> list[str]:
         resume_futures = [
             (
                 worker,
@@ -420,7 +422,7 @@ class DynamoRefitChannel:
                     system_url=worker.system_url,
                     route="resume_generation",
                     payload={},
-                    timeout_s=self._control_timeout_s,
+                    timeout_s=timeout_s,
                 ),
             )
             for worker in workers
@@ -433,22 +435,28 @@ class DynamoRefitChannel:
                 resume_errors.append(f"{worker.system_url}: {error}")
         return resume_errors
 
-    def pause(self, *, clear_cache: bool) -> None:
-        """Drain and pause every worker ahead of a weight update.
+    def pause(self, *, clear_cache: bool, timeout_s: float | None) -> None:
+        """Freeze every worker's requests in place ahead of a weight update.
 
-        Workers that confirmed the pause are resumed if any peer fails.
+        Frozen requests continue on the new weights after :meth:`resume`; with
+        ``clear_cache`` their KV is dropped now, so they recompute it. Workers
+        that confirmed the pause are resumed if any peer fails.
         """
-        paused_workers, pause_errors = self._pause_workers(clear_cache=clear_cache)
+        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
+        paused_workers, pause_errors = self._pause_workers(
+            mode="keep", clear_cache=clear_cache, timeout_s=timeout_s
+        )
         if pause_errors:
-            resume_errors = self._resume_workers(paused_workers)
+            resume_errors = self._resume_workers(paused_workers, timeout_s=timeout_s)
             details = "pause/clear failed for " + "; ".join(pause_errors)
             if resume_errors:
                 details += "; resume failed for " + "; ".join(resume_errors)
             raise RuntimeError(f"Dynamo pause before weight update failed: {details}")
 
-    def resume(self) -> None:
+    def resume(self, *, timeout_s: float | None) -> None:
         """Resume every worker after a weight update."""
-        resume_errors = self._resume_workers(self._workers)
+        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
+        resume_errors = self._resume_workers(self._workers, timeout_s=timeout_s)
         if resume_errors:
             raise RuntimeError(
                 "Dynamo resume after weight update failed for "
@@ -456,9 +464,16 @@ class DynamoRefitChannel:
             )
 
     def flush_cache(self) -> bool:
-        """Drain, clear, and resume every worker using immutable endpoints."""
-        paused_workers, pause_errors = self._pause_workers(clear_cache=True)
-        resume_errors = self._resume_workers(paused_workers)
+        """Drain, clear, and resume every worker using immutable endpoints.
+
+        Workers that confirmed the pause are resumed even if a peer fails.
+        """
+        paused_workers, pause_errors = self._pause_workers(
+            mode="wait", clear_cache=True, timeout_s=self._control_timeout_s
+        )
+        resume_errors = self._resume_workers(
+            paused_workers, timeout_s=self._control_timeout_s
+        )
 
         if pause_errors or resume_errors:
             details = []
