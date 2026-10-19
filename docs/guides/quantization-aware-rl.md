@@ -392,7 +392,7 @@ uv run --extra mcore --extra modelopt \
 ## Limitations
 
 - **Generation**: Currently only vLLM is supported for generation.
-- **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
+- **Automodel backend**: Quantization support for the Automodel policy worker is not yet implemented.
 - **Real-quant rollout**: The native-loader path has end-to-end functional coverage for dense W4A16 and two-step grouped-MoE W4A4 coverage. Other W4A4, MoE, and hybrid MoE/Mamba recipes still require architecture-specific validation. The policy recipe must leave unsupported or sensitive paths in BF16.
 - **Real-quant refit transport**: NIXL, custom checkpoint engines, `nccl_reshard`, and remote sparse-delta transports are not supported because they bypass vLLM's native layerwise reload lifecycle.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.

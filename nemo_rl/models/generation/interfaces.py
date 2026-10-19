@@ -268,6 +268,10 @@ class GenerationConfig(TypedDict):
     _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # The trainer streams the drafter's full weight set (incl. embed/lm_head)
+    # on refit (Automodel draft co-training); drafter module sharing must be
+    # disabled and the draft manifest is validated exactly.
+    _draft_full_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
@@ -590,8 +594,17 @@ class GenerationInterface(ABC):
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            Optionally, the parameter names the backend wants pre-quantized on
+            the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:

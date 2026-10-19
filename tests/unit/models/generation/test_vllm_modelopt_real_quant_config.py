@@ -704,6 +704,65 @@ def test_real_quant_backend_uses_modelopt_refit_timeout(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("real_quant", [False, True])
+def test_modelopt_refit_info_routes_legacy_fp8_config(
+    monkeypatch: pytest.MonkeyPatch, real_quant: bool
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    base_backend = _base_vllm_backend()
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: real_quant
+    state_dict_info: dict[str, object] = {"decoder.weight": ([1], torch.float32)}
+    serialized_fp8_config: dict[str, object] = {"is_mx": True}
+    expected_names = ["decoder.weight"]
+    calls = []
+
+    def prepare_refit_info(
+        _self: object,
+        info: dict[str, object],
+        fp8_config: dict[str, object] | None = None,
+    ) -> list[str] | None:
+        calls.append((info, fp8_config))
+        return None if fp8_config is None else expected_names
+
+    monkeypatch.setattr(
+        base_backend.VllmInternalWorkerExtension,
+        "prepare_refit_info",
+        prepare_refit_info,
+    )
+
+    result = extension.prepare_refit_info(state_dict_info, serialized_fp8_config)
+
+    assert calls == [(state_dict_info, None if real_quant else serialized_fp8_config)]
+    assert result is (None if real_quant else expected_names)
+
+
+@pytest.mark.parametrize("real_quant", [False, True])
+def test_modelopt_refit_info_preserves_base_validation_errors(
+    monkeypatch: pytest.MonkeyPatch, real_quant: bool
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    base_backend = _base_vllm_backend()
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: real_quant
+
+    def reject_refit_info(
+        _self: object,
+        _info: dict[str, object],
+        _fp8_config: dict[str, object] | None = None,
+    ) -> None:
+        raise ValueError("invalid refit metadata")
+
+    monkeypatch.setattr(
+        base_backend.VllmInternalWorkerExtension,
+        "prepare_refit_info",
+        reject_refit_info,
+    )
+
+    with pytest.raises(ValueError, match="invalid refit metadata"):
+        extension.prepare_refit_info({}, {"is_mx": True})
+
+
 @pytest.mark.parametrize(
     ("quantization", "expected"),
     [

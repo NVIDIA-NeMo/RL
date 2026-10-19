@@ -1217,13 +1217,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 

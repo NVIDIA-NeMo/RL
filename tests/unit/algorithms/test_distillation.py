@@ -64,7 +64,7 @@ def mock_components():
     # This makes NEED_REFIT = False, so refit_policy_generation won't be called
     student_generation = None
 
-    # Create a proper message log structure with token_ids (similar to SFT)
+    # Simulate a completed rollout, including logprobs on its generated turn.
     # Use BatchedDataDict instead of regular dict to support repeat_interleave
     mock_batch = BatchedDataDict[DatumSpec](
         {
@@ -79,6 +79,7 @@ def mock_components():
                         "token_ids": torch.tensor([4, 5, 6]),
                         "role": "assistant",
                         "content": "The answer is 2.",
+                        "generation_logprobs": torch.zeros(3),
                     },
                 ]
             ],
@@ -367,6 +368,89 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     ]
     assert train_metric_calls
     assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
+
+
+@pytest.mark.parametrize("rollout_mode", ["sync", "async", "nemo_gym"])
+def test_distillation_excludes_prompt_history_from_loss_masks(
+    mock_components: dict, monkeypatch: pytest.MonkeyPatch, rollout_mode: str
+) -> None:
+    """Train and teacher inference see only generated assistant tokens as targets."""
+    config = mock_components["master_config"]
+    config.distillation.max_num_steps = 1
+    config.distillation.max_num_epochs = 1
+    config.distillation.val_period = 0
+    config.distillation.max_rollout_turns = 2
+    config.env["should_use_nemo_gym"] = rollout_mode == "nemo_gym"
+    config.policy["generation"].update(
+        backend="vllm",
+        vllm_cfg={"async_engine": rollout_mode != "sync", "expose_http_server": True},
+    )
+    batch = next(iter(mock_components["train_dataloader"]))
+    messages = batch["message_log"][0]
+    messages[1:1] = [
+        {
+            "role": "assistant",
+            "content": "history",
+            "token_ids": torch.ones(100, dtype=torch.long),
+        },
+        {
+            "role": "user",
+            "content": "follow-up",
+            "token_ids": torch.ones(5, dtype=torch.long),
+        },
+    ]
+    messages[-1]["token_ids"] = torch.ones(15, dtype=torch.long)
+    messages[-1]["generation_logprobs"] = torch.zeros(15)
+    messages.extend(
+        [
+            {
+                "role": "tool",
+                "content": "result",
+                "token_ids": torch.ones(2, dtype=torch.long),
+            },
+            {
+                "role": "assistant",
+                "content": "final",
+                "token_ids": torch.ones(10, dtype=torch.long),
+                "generation_logprobs": torch.zeros(10),
+            },
+        ]
+    )
+    runner_name = {
+        "sync": "run_multi_turn_rollout",
+        "async": "run_async_multi_turn_rollout",
+        "nemo_gym": "run_nemo_gym_rollout_sync",
+    }[rollout_mode]
+    rollout_result = (
+        SimpleNamespace(
+            final_batch=batch, rollout_metrics={"mean_gen_tokens_per_sample": 25.0}
+        )
+        if rollout_mode == "nemo_gym"
+        else (batch, {"mean_gen_tokens_per_sample": 25.0})
+    )
+    runner = MagicMock(return_value=rollout_result)
+    monkeypatch.setattr(distil_mod, runner_name, runner)
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_distillation_save_state(),
+        config,
+    )
+    runner.assert_called_once()
+    expected = torch.tensor([[0] * 108 + [1] * 15 + [0] * 2 + [1] * 10 + [0]])
+    train_data = mock_components["student_policy"].train.call_args.args[0]
+    teacher_data = mock_components["teacher_policy"].get_topk_logits.call_args.args[0]
+    torch.testing.assert_close(train_data["token_mask"], expected)
+    torch.testing.assert_close(teacher_data["token_mask"], expected)
 
 
 def test_exit_on_timeout(mock_components, capsys, tmp_path):

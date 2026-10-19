@@ -258,6 +258,28 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_megatron_refit_without_synchronizer_uses_collective_broadcast(
+    mock_ray: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MegatronWithoutSynchronizer:
+        weight_synchronizer = None
+
+        def __init__(self):
+            self.update_weights_from_collective = MagicMock(return_value=[True])
+
+    monkeypatch.setattr(grpo_mod, "MegatronGeneration", MegatronWithoutSynchronizer)
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    generation = MegatronWithoutSynchronizer()
+
+    refit_policy_generation(policy, generation, colocated_inference=False)
+
+    policy.broadcast_weights_for_collective.assert_called_once_with(kv_scales=None)
+    policy.swap_weights_via_reshard.assert_not_called()
+    generation.update_weights_from_collective.assert_called_once_with()
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
 def test_legacy_colocated_refit_syncs_policy_params_before_offload(
     mock_ray: MagicMock,
 ) -> None:
@@ -3005,6 +3027,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
                     "role": "assistant",
                     "content": f"response_{i}",
                     "token_ids": torch.arange(length, dtype=torch.long),
+                    "generation_logprobs": torch.zeros(length, dtype=torch.float32),
                 },
             ]
         )

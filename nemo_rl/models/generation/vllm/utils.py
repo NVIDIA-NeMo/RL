@@ -45,6 +45,14 @@ from nemo_rl.models.generation.vllm.metric_names import (
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
 

@@ -15,7 +15,7 @@
 import types
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack, contextmanager
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import vllm  # noqa: F401
@@ -77,6 +77,17 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             torch.accelerator.synchronize()
             return
         super()._synchronize_before_ipc_data_ack()
+
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        serialized_fp8_config: Optional[dict[str, Any]] = None,
+    ) -> Optional[list[str]]:
+        # Real ModelOpt refits must not enter legacy FP8 prequantization.
+        return super().prepare_refit_info(
+            state_dict_info,
+            None if self._is_real_quant_model() else serialized_fp8_config,
+        )
 
     def _prepare_ipc_weight_buffer(
         self, buffer: torch.Tensor, used_bytes: int
