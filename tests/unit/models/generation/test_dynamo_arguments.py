@@ -30,6 +30,7 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoConfig,
     DynamoWorkerArgs,
 )
+from nemo_rl.models.generation.dynamo.role_plan import DisaggRolePlan
 
 
 def _config(**overrides) -> dict:
@@ -395,3 +396,210 @@ def test_redaction_hides_credentials() -> None:
         "HF_TOKEN": "<redacted>",
         "NCCL_DEBUG": "INFO",
     }
+
+
+# ---------------------------------------------------------------------------
+# Megatron prefill/decode engines
+# ---------------------------------------------------------------------------
+
+_DELETE = object()
+MEGATRON_CFG = {
+    "enabled": True,
+    "tensor_model_parallel_size": 2,
+    "pipeline_model_parallel_size": 1,
+    "context_parallel_size": 1,
+}
+
+
+def _megatron_config(**overrides) -> dict:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg.update(
+        engine="megatron",
+        disaggregation={
+            "decode": {"workers": 2, "megatron_cfg": {"tensor_model_parallel_size": 2}},
+            "prefill": {
+                "workers": 1,
+                "megatron_cfg": {"tensor_model_parallel_size": 4},
+                "mcore_generation_config": {"max_requests": 16},
+            },
+        },
+    )
+    config = {
+        "backend": "dynamo",
+        "model_name": "Qwen/Qwen3-0.6B",
+        "dynamo_cfg": dynamo_cfg,
+        "refit_transport": None,
+        "mcore_generation_config": {
+            "enable_prefix_caching": True,
+            "kv_cache_management_mode": "persist",
+            "expose_http_server": False,
+        },
+        "colocated": {"enabled": False},
+    }
+    config.update(overrides)
+    return config
+
+
+def _set(*path, value):
+    """Mutator that assigns (or deletes) one nested key of a config dict."""
+
+    def mutate(config: dict) -> None:
+        node = config
+        for key in path[:-1]:
+            node = node[key]
+        if value is _DELETE:
+            del node[path[-1]]
+        else:
+            node[path[-1]] = value
+
+    return mutate
+
+
+def test_megatron_engine_plan_orders_decode_first_with_cumulative_offsets() -> None:
+    config = DynamoConfig.model_validate(_megatron_config())
+    assert config.is_megatron_engine and config.vllm_cfg is None
+    with pytest.raises(ValueError, match="only defined for dynamo_cfg.engine='vllm'"):
+        _ = config.engine_world_size
+
+    plan = config.role_plan(MEGATRON_CFG)
+    assert [(s.name, s.component, s.world_size) for s in plan.engines] == [
+        ("decode-0", "backend", 2),
+        ("decode-1", "backend", 2),
+        ("prefill-0", "prefill", 4),
+    ]
+    assert plan.rank_offsets(train_world_size=8) == [8, 10, 12]
+    assert (plan.inference_world_size, plan.max_engine_world_size) == (8, 4)
+    assert plan.expected_components == {"backend": 2, "prefill": 1}
+    assert plan.engines[2].engine_cfg["mcore_generation_config"] == {"max_requests": 16}
+    plan.assert_fits(8)
+    with pytest.raises(ValueError, match="allocated=7, expected=8"):
+        plan.assert_fits(7)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        pytest.param(
+            _set("dynamo_cfg", "disaggregation", value=_DELETE),
+            "requires dynamo_cfg.disaggregation",
+            id="megatron_needs_disaggregation",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "engine", value="vllm"),
+            "not supported with dynamo_cfg.engine='vllm'",
+            id="vllm_rejects_disaggregation",
+        ),
+        pytest.param(
+            lambda c: (
+                c["dynamo_cfg"].update(engine="vllm"),
+                c["dynamo_cfg"].pop("disaggregation"),
+            ),
+            "vllm_cfg is required",
+            id="vllm_still_needs_vllm_cfg",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", "enable_prefix_caching", value=False),
+            "enable_prefix_caching",
+            id="prefix_caching",
+        ),
+        pytest.param(
+            _set(
+                "mcore_generation_config", "kv_cache_management_mode", value="recompute"
+            ),
+            "persist",
+            id="kv_cache_mode",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", "expose_http_server", value=True),
+            "expose_http_server",
+            id="http_server",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", value=_DELETE),
+            "mcore_generation_config is required",
+            id="missing_mcore_config",
+        ),
+        pytest.param(
+            _set("vllm_kwargs", value={"max_num_seqs": 8}),
+            "vllm_kwargs must be empty",
+            id="vllm_kwargs",
+        ),
+        pytest.param(
+            _set("refit_transport", value="mcore"),
+            "refit_transport must be null",
+            id="refit_transport",
+        ),
+        pytest.param(
+            _set(
+                "dynamo_cfg",
+                "disaggregation",
+                "decode",
+                "megatron_cfg",
+                value={"num_layers": 4},
+            ),
+            "may only override",
+            id="role_layout_allowlist",
+        ),
+        pytest.param(
+            _set(
+                "dynamo_cfg",
+                "disaggregation",
+                "decode",
+                "megatron_cfg",
+                value={"context_parallel_size": 2},
+            ),
+            "context_parallel_size=1",
+            id="role_context_parallel",
+        ),
+        pytest.param(
+            _set(
+                "dynamo_cfg",
+                "disaggregation",
+                "decode",
+                "vllm_cfg",
+                value={"max_model_len": 4096},
+            ),
+            "may only override",
+            id="role_vllm_allowlist",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "disaggregation", "decode", "workers", value=0),
+            "greater than 0",
+            id="zero_workers",
+        ),
+    ],
+)
+def test_megatron_engine_config_rejects_unsupported_shapes(mutate, match) -> None:
+    config = _megatron_config()
+    mutate(config)
+    with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
+
+
+@pytest.mark.parametrize(
+    ("base_megatron_cfg", "match"),
+    [
+        (None, "policy.megatron_cfg is required"),
+        ({**MEGATRON_CFG, "context_parallel_size": 2}, "context_parallel_size=1"),
+    ],
+    ids=["no_trainer_layout", "context_parallel_trainer"],
+)
+def test_megatron_engine_plan_rejects_unusable_trainer_layouts(
+    base_megatron_cfg, match
+) -> None:
+    config = DynamoConfig.model_validate(_megatron_config())
+    with pytest.raises(ValueError, match=match):
+        config.role_plan(base_megatron_cfg)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"decode_workers": 0}, {"prefill_workers": 0}, {"decode_world_size": 0}],
+)
+def test_role_plan_counts_and_sizes_must_be_positive(override) -> None:
+    kwargs = dict(
+        decode_workers=1, decode_world_size=1, prefill_workers=1, prefill_world_size=1
+    )
+    kwargs.update(override)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        DisaggRolePlan.from_role_counts(**kwargs)
