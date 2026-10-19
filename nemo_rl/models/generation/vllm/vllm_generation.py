@@ -694,7 +694,7 @@ class VllmGeneration(GenerationInterface):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int,
         generation_prefix_batch_max_tokens: int,
-        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 

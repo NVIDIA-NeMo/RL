@@ -243,7 +243,7 @@ rollout_recovery:
   generation_prefix_cleanup:
     enabled: false
     batch_size: 32       # completed calls per CLEAR, not number of keys
-    max_pending: 128     # reserved + queued + active completed calls per owner
+    max_pending: 128     # completed calls queued per owner; completions block when full
     wait_seconds: 0.01   # maximum coalescing window; finite and nonnegative
   # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
   # Until Gym advertises group-scoring capability, configure GenRM explicitly:

@@ -265,6 +265,7 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
             staging_partition="rollout_staging",
             generation_prefix_batch_size=17,
             generation_prefix_batch_max_tokens=4096,
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
         )
     )
 
@@ -291,6 +292,7 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
             worker,
             dp_cfg={},
             staging_partition="rollout_staging",
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
             **_PREFIX_BATCH_LIMITS,
         )
     )
@@ -318,6 +320,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
             worker,
             dp_cfg={},
             staging_partition="rollout_staging",
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
             **_PREFIX_BATCH_LIMITS,
         )
     )
@@ -360,6 +363,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         generation_cut_control_timeout_s=60.0,
         generation_prefix_batch_size=128,
         generation_prefix_batch_max_tokens=2048,
+        generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
     )
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
@@ -371,7 +375,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         generation_cut_control_timeout_s=60.0,
         generation_prefix_batch_size=128,
         generation_prefix_batch_max_tokens=2048,
-        generation_prefix_cleanup=None,
+        generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -379,7 +383,12 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
 def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
-        gen.setup_token_capture({}, "rollout_staging", **_PREFIX_BATCH_LIMITS)
+        gen.setup_token_capture(
+            {},
+            "rollout_staging",
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
+            **_PREFIX_BATCH_LIMITS,
+        )
 
 
 @pytest.mark.parametrize(
@@ -448,6 +457,7 @@ def test_prefix_capture_setup_requires_control_token(monkeypatch):
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
+                generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
                 **_PREFIX_BATCH_LIMITS,
             )
         )
@@ -486,6 +496,7 @@ def test_prefix_capture_with_router_replay_fails_at_setup_without_route_state(
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
                 generation_cut_control_token="secret",
+                generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
                 **_PREFIX_BATCH_LIMITS,
             )
         )
@@ -3392,6 +3403,7 @@ def test_omni_capture_setup_rejects_video_pruning(
     kwargs = {
         "staging_partition": "staging",
         "capture_media": True,
+        "generation_prefix_cleanup": GenerationPrefixCleanupConfig(),
         **_PREFIX_BATCH_LIMITS,
     }
     if prefix_cuts:
@@ -3413,6 +3425,17 @@ def test_omni_capture_setup_rejects_video_pruning(
         assert worker._capture_image_token_id == 18
 
 
+class _RecordingCleanup:
+    def __init__(self, gate: _TokenCaptureSnapshotGate) -> None:
+        self.gate = gate
+        self.submitted: list[list[str]] = []
+
+    def submit(self, keys):
+        # Submitting inside the gate would hold a permit the fence waits for.
+        assert self.gate._active == 0
+        self.submitted.append(list(keys))
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_background_cleanup_only_receives_acknowledged_prefix_keys(failure):
     sink = _MemorySink()
@@ -3430,32 +3453,54 @@ def test_background_cleanup_only_receives_acknowledged_prefix_keys(failure):
         if failure:
             raise RuntimeError("terminal put failed")
         # This return represents a successfully acknowledged terminal stage.
-        return response, (prefix, "rollout/old-canonical-call")
+        return response, (prefix,)
 
     worker._finish_request_capture_with_lifecycle_owned = finish
-    cleanup = BackgroundPrefixCleanup(
-        sink.clear, config=GenerationPrefixCleanupConfig()
-    )
+    cleanup = _RecordingCleanup(worker._token_capture_snapshot_gate)
     worker._prefix_cleanup = cleanup
-    cleanup.pause(1)
-    try:
-        if failure:
-            with pytest.raises(RuntimeError, match="terminal put failed"):
-                VllmAsyncGenerationWorkerImpl._finish_request_capture(
-                    worker, object(), content
-                )
-            assert cleanup.stats().pending_requests == 0
-        else:
-            out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    if failure:
+        with pytest.raises(RuntimeError, match="terminal put failed"):
+            VllmAsyncGenerationWorkerImpl._finish_request_capture(
                 worker, object(), content
             )
-            assert out is content
-            assert cleanup.stats().queued_requests == 1
+    else:
+        out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+            worker, object(), content
+        )
+        assert out is content
+    # Only an acknowledged row's keys are queued, and nothing is cleared inline.
+    assert cleanup.submitted == ([] if failure else [[prefix]])
+    assert sink.cleared_generation_prefix_keys == []
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_obsolete_keys_never_include_a_restored_canonical_row(background):
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    cleanup = _RecordingCleanup(worker._token_capture_snapshot_gate)
+    worker._prefix_cleanup = cleanup if background else None
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    cut_key = "__generation_cut__/checkpoint/r0/c0/0"
+    # A restored terminal-completion cut names the canonical row it replaced.
+    canonical_key = "r0/c0"
+    worker._capture_calls[id(request)].generation_cut_staging_keys = [
+        cut_key,
+        canonical_key,
+    ]
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([12], [-0.1])
+    )
+    # Both paths delete the same rows: the cut chunk, never the canonical row.
+    if background:
+        assert cleanup.submitted == [[cut_key]]
         assert sink.cleared_generation_prefix_keys == []
-    finally:
-        cleanup.resume()
-        cleanup.close()
-    assert sink.cleared_generation_prefix_keys == ([] if failure else [prefix])
+    else:
+        assert cleanup.submitted == []
+        assert sink.cleared_generation_prefix_keys == [cut_key]
 
 
 def test_background_cleanup_completion_does_not_wait_for_delete():
@@ -3469,47 +3514,166 @@ def test_background_cleanup_completion_does_not_wait_for_delete():
         assert release.wait(5)
 
     cleanup = BackgroundPrefixCleanup(
-        clear, config=GenerationPrefixCleanupConfig(batch_size=1)
+        clear,
+        worker._token_capture_snapshot_gate,
+        config=GenerationPrefixCleanupConfig(batch_size=1),
     )
     worker._prefix_cleanup = cleanup
     worker._capture_sink = SimpleNamespace(clear=clear)
-    state = SimpleNamespace(
+    worker._get_request_capture = lambda request: SimpleNamespace(
         lifecycle_lock=threading.Lock(),
         terminal_started=False,
         call=SimpleNamespace(model_call_id="call"),
     )
-    worker._get_request_capture = lambda request: state
-    prefix = "__generation_cut__/checkpoint/rollout/call/0"
+    first = "__generation_cut__/checkpoint/rollout/call/0"
+    second = "__generation_cut__/checkpoint/rollout/call/1"
     worker._finish_request_capture_with_lifecycle_owned = (
-        lambda state, request, content: (content, (prefix,))
+        lambda state, request, content: (content, (first,))
     )
     try:
         assert worker._finish_request_capture(object(), {"done": True}) == {
             "done": True
         }
+        # Terminal completion returned while its delete is still running.
         assert entered.wait(5)
-        # Terminal completion returned while the delete is still active.
-        assert cleanup.stats().active_batch
 
         async def checkpoint():
             task = asyncio.create_task(
                 worker.begin_token_capture_snapshot_fence_async()
             )
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.1)
+            # The fence waits for the running CLEAR.
             assert not task.done()
+            entered.clear()
             release.set()
             assert await asyncio.wait_for(task, timeout=5)
-            assert cleanup.stats().paused
+            # No CLEAR starts while the fence holds the gate closed.
+            cleanup.submit([second])
+            assert not await asyncio.to_thread(entered.wait, 0.2)
             assert await worker.end_token_capture_snapshot_fence_async()
-            assert not cleanup.stats().paused
+            assert await asyncio.to_thread(entered.wait, 5)
 
         asyncio.run(checkpoint())
     finally:
         release.set()
-        cleanup.resume()
-        cleanup.close()
         _shutdown_fence_worker(worker)
-    assert keys == [prefix]
+    assert keys == [first, second]
+
+
+def _background_cleanup_worker(
+    clear, *, config: GenerationPrefixCleanupConfig
+) -> tuple[VllmAsyncGenerationWorkerImpl, list[str]]:
+    """A fence-capable worker whose completions each retire one new cut key."""
+    worker = _fence_worker()
+    worker._prefix_cleanup = BackgroundPrefixCleanup(
+        clear, worker._token_capture_snapshot_gate, config=config
+    )
+    worker._capture_sink = SimpleNamespace(clear=clear)
+    worker._get_request_capture = lambda request: SimpleNamespace(
+        lifecycle_lock=threading.Lock(),
+        terminal_started=False,
+        call=SimpleNamespace(model_call_id="call"),
+    )
+    keys = [f"__generation_cut__/checkpoint/rollout/call/{index}" for index in range(8)]
+    pending = iter(keys)
+    worker._finish_request_capture_with_lifecycle_owned = (
+        lambda state, request, content: (content, (next(pending),))
+    )
+    return worker, keys
+
+
+def test_failed_background_clear_does_not_fail_later_completions(caplog):
+    calls, failed, cleared = [], threading.Event(), threading.Event()
+
+    def clear(keys):
+        calls.append(keys)
+        if len(calls) == 1:
+            failed.set()
+            raise RuntimeError("transport failed")
+        cleared.set()
+
+    worker, keys = _background_cleanup_worker(
+        clear, config=GenerationPrefixCleanupConfig(batch_size=1)
+    )
+    try:
+        with caplog.at_level(logging.ERROR):
+            assert worker._finish_request_capture(object(), {"done": 1}) == {"done": 1}
+            assert failed.wait(5)
+            # A completion after the failed CLEAR still succeeds and is cleaned.
+            assert worker._finish_request_capture(object(), {"done": 2}) == {"done": 2}
+            assert cleared.wait(5)
+        assert calls == [[keys[0]], [keys[1]]]
+        assert "background prefix cleanup failed for 1 keys" in caplog.text
+
+        async def checkpoint():
+            # Nor does the failure fail or stall the next checkpoint fence.
+            assert await asyncio.wait_for(
+                worker.begin_token_capture_snapshot_fence_async(), timeout=5
+            )
+            assert await worker.end_token_capture_snapshot_fence_async()
+
+        asyncio.run(checkpoint())
+    finally:
+        _shutdown_fence_worker(worker)
+
+
+def test_full_cleanup_queue_cannot_block_the_snapshot_fence():
+    calls, entered, release = [], threading.Event(), threading.Event()
+
+    def clear(keys):
+        calls.append(keys)
+        entered.set()
+        assert release.wait(10)
+
+    worker, keys = _background_cleanup_worker(
+        clear,
+        config=GenerationPrefixCleanupConfig(
+            batch_size=1, max_pending=1, wait_seconds=0
+        ),
+    )
+    producers = [
+        threading.Thread(
+            target=worker._finish_request_capture, args=(object(), {"done": index})
+        )
+        for index in (3, 4)
+    ]
+    try:
+        # The cleanup thread holds the first CLEAR and the second call fills
+        # the queue, so the next two completions block on a full queue.
+        worker._finish_request_capture(object(), {"done": 1})
+        assert entered.wait(5)
+        worker._finish_request_capture(object(), {"done": 2})
+        for producer in producers:
+            producer.start()
+        for producer in producers:
+            producer.join(0.2)
+            assert producer.is_alive()
+
+        async def checkpoint():
+            task = asyncio.create_task(
+                worker.begin_token_capture_snapshot_fence_async()
+            )
+            await asyncio.sleep(0.1)
+            # The fence waits for the running CLEAR...
+            assert not task.done()
+            release.set()
+            # ...and then completes even though a producer is still blocked
+            # on the full queue: blocked producers hold no gate permit.
+            assert await asyncio.wait_for(task, timeout=5)
+            assert any(producer.is_alive() for producer in producers)
+            assert await worker.end_token_capture_snapshot_fence_async()
+
+        asyncio.run(checkpoint())
+        for producer in producers:
+            producer.join(5)
+            assert not producer.is_alive()
+        deadline = time.monotonic() + 5
+        while len(calls) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sorted(key for batch in calls for key in batch) == sorted(keys[:4])
+    finally:
+        release.set()
+        _shutdown_fence_worker(worker)
 
 
 def test_background_cleanup_setup_rejects_nonprefix_capture():
