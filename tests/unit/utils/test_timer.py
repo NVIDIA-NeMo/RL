@@ -20,6 +20,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+import nemo_rl.utils.timer as timer_module
 from nemo_rl.utils.timer import ThreadSafeTimer, TimeoutChecker, Timer
 
 
@@ -681,8 +682,7 @@ class TestTimelineEvents:
         import json
 
         path = tmp_path / "training_timeline.jsonl"
-        monkeypatch.setenv("NRL_TRAINING_TIMELINE", "1")
-        monkeypatch.setenv("NRL_TRAINING_TIMELINE_FPATH", str(path))
+        monkeypatch.setattr(timer_module, "_training_timeline_path", str(path))
 
         timer = Timer()
         timer.start("total_step_time")
@@ -694,10 +694,9 @@ class TestTimelineEvents:
         assert event["ph"] == "X"
         assert event["ts"] > 0 and event["dur"] >= 0
 
-    def test_nothing_is_written_without_the_opt_in(self, tmp_path, monkeypatch):
+    def test_nothing_is_written_without_a_timeline_path(self, tmp_path, monkeypatch):
         path = tmp_path / "training_timeline.jsonl"
-        monkeypatch.delenv("NRL_TRAINING_TIMELINE", raising=False)
-        monkeypatch.setenv("NRL_TRAINING_TIMELINE_FPATH", str(path))
+        monkeypatch.setattr(timer_module, "_training_timeline_path", None)
 
         timer = Timer()
         timer.start("total_step_time")

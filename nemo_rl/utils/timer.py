@@ -28,6 +28,31 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def timeline_collection_enabled() -> bool:
+    """Whether NRL_COLLECT_TIMELINE_FIELDS opts in to timeline collection.
+
+    One switch, off by default, for every collect-training-timeline producer:
+    training timer events, rollout lifecycle records and the generation
+    servers' per-request timing fields.
+    """
+    return os.environ.get("NRL_COLLECT_TIMELINE_FIELDS", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+# Where stopped timers in this process append Chrome trace events; set by the
+# GRPO driver when NRL_COLLECT_TIMELINE_FIELDS opts in, None otherwise.
+_training_timeline_path: Optional[str] = None
+
+
+def set_training_timeline_path(path: Optional[str]) -> None:
+    """Route this process's stopped-timer events to *path*; None disables."""
+    global _training_timeline_path
+    _training_timeline_path = path
+
+
 def _append_timeline_event(
     path: str, label: str, start_epoch_ns: int, duration_ns: int
 ) -> None:
@@ -141,8 +166,7 @@ class Timer:
         if label in self._start_times:
             raise ValueError(f"Timer '{label}' is already running")
         self._start_times[label] = time.perf_counter()
-        timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
-        if timeline_path and os.environ.get("NRL_TRAINING_TIMELINE") == "1":
+        if _training_timeline_path is not None:
             self._timeline_start_times[label] = (
                 time.time_ns(),
                 time.perf_counter_ns(),
@@ -173,8 +197,8 @@ class Timer:
         self._timers[label].append(elapsed)
         del self._start_times[label]
         timeline_start = self._timeline_start_times.pop(label, None)
-        timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
-        if timeline_start is not None and timeline_path:
+        timeline_path = _training_timeline_path
+        if timeline_start is not None and timeline_path is not None:
             start_epoch_ns, start_perf_ns = timeline_start
             _append_timeline_event(
                 timeline_path,

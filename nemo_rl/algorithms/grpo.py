@@ -197,7 +197,12 @@ from nemo_rl.utils.path_utils import (
     path_exists,
     save_checkpoint_object,
 )
-from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.timer import (
+    TimeoutChecker,
+    Timer,
+    set_training_timeline_path,
+    timeline_collection_enabled,
+)
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
@@ -3438,6 +3443,7 @@ def _grpo_train_impl(
     processor: Optional[AutoProcessor] = None,
 ) -> None:
     """Run GRPO training algorithm."""
+    _default_timeline_paths(master_config)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
@@ -4704,6 +4710,24 @@ def _grpo_train_impl(
     checkpointer.shutdown()
 
 
+def _default_timeline_paths(master_config: MasterConfig) -> Optional[str]:
+    """Point the collect-training-timeline outputs at ``logger.log_dir``.
+
+    Only under NRL_COLLECT_TIMELINE_FIELDS: training_timeline.jsonl and
+    rollout_lifecycle.jsonl go to the run's log dir. The training path is
+    handed to this process's timers.
+
+    Returns:
+        The rollout lifecycle path, or None when collection is off.
+    """
+    if not timeline_collection_enabled():
+        return None
+    # Absolute, so actors on other nodes resolve it the same way.
+    log_dir = os.path.abspath(str(master_config.logger.log_dir))
+    set_training_timeline_path(os.path.join(log_dir, "training_timeline.jsonl"))
+    return os.path.join(log_dir, "rollout_lifecycle.jsonl")
+
+
 @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
@@ -5175,6 +5199,9 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
+    # Rollout lifecycle JSONL for the collect-training-timeline skill; resolved
+    # before the Timer so the training timeline path is already set.
+    rollout_lifecycle_path = _default_timeline_paths(master_config)
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
     _tracer = _telemetry.tracer if _telemetry is not None else None
@@ -5253,17 +5280,6 @@ def async_grpo_train(
     optimal_buffer_size = (
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
-
-    # Rollout lifecycle JSONL for the collect-training-timeline skill; defaults
-    # to rollout_lifecycle.jsonl beside the training timeline when only that is set.
-    rollout_lifecycle_path = os.environ.get("NRL_ROLLOUT_LIFECYCLE_FPATH")
-    if rollout_lifecycle_path is None:
-        training_timeline_path = os.environ.get("NRL_TRAINING_TIMELINE_FPATH")
-        if training_timeline_path and os.environ.get("NRL_TRAINING_TIMELINE") == "1":
-            rollout_lifecycle_path = os.path.join(
-                os.path.dirname(training_timeline_path),
-                "rollout_lifecycle.jsonl",
-            )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,

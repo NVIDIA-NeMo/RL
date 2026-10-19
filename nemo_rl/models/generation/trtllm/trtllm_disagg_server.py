@@ -28,7 +28,7 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
-    _TL_EMIT_TIMELINE_FIELDS,
+    _COLLECT_TIMELINE_FIELDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -307,7 +307,7 @@ class _DropGymOnlyRequestFields:
         ]
         if mutated:
             headers.append((b"content-length", str(len(body)).encode()))
-        if _TL_EMIT_TIMELINE_FIELDS:
+        if _COLLECT_TIMELINE_FIELDS:
             # Ride the scope headers so the route wrapper can attach them to
             # the final response: recv = raw receipt, fwd = after this
             # middleware's parse/strip/tokenize work.
@@ -479,7 +479,7 @@ def _build_adaptor_class() -> type:
                 # trtllm_http_server emits; only the JSONResponse re-wrap
                 # belongs to this subclass.
                 payload = attach_rollout_fields(json.loads(bytes(response.body)))
-                if _TL_EMIT_TIMELINE_FIELDS:
+                if _COLLECT_TIMELINE_FIELDS:
                     attach_timeline_fields(
                         payload,
                         raw_req.headers,
