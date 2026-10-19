@@ -255,12 +255,12 @@ def test_finalized_effort_matches_inline_formula_and_metrics(
         ),
     ],
 )
-@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
 def test_classification_retains_original_last_user_membership_rule(
-    messages, expected, native
+    messages, expected, materialized
 ):
     prompt = _input(*messages)
-    if native:
+    if materialized:
         prompt = {
             "task_id": {"taskset": "math:train", "task_id": "1"},
             "task_input": prompt,

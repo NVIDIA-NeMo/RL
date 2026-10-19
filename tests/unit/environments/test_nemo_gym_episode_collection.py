@@ -19,6 +19,7 @@ collector/adapter integration without starting an agent or a policy model.
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -27,6 +28,7 @@ from aiohttp.test_utils import TestServer
 from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
 pytest.importorskip("nemo_gym.episode_types")
 gym_config = pytest.importorskip("nemo_gym.global_config")
@@ -44,9 +46,9 @@ class _TokenDecoder:
         return [" ".join(map(str, token_ids)) for token_ids in batch]
 
 
-def _model_response(*, native: bool) -> gym_openai.NeMoGymResponse:
+def _model_response(*, episode_protocol: bool) -> gym_openai.NeMoGymResponse:
     return gym_openai.NeMoGymResponse(
-        id="response-native" if native else "response-legacy",
+        id="response-episode" if episode_protocol else "response-flat",
         created_at=0,
         model="deterministic-test-model",
         object="response",
@@ -55,88 +57,108 @@ def _model_response(*, native: bool) -> gym_openai.NeMoGymResponse:
         tools=[],
         output=[
             gym_openai.NeMoGymResponseOutputMessageForTraining(
-                id="message-native" if native else "message-legacy",
+                id="message-episode" if episode_protocol else "message-flat",
                 content=[
                     gym_openai.NeMoGymResponseOutputText(
                         text="The weather is sunny.", annotations=[]
                     )
                 ],
-                prompt_token_ids=[1, 2, 3] if native else [4, 5],
-                generation_token_ids=[11, 12] if native else [21],
-                generation_log_probs=[-0.1, -0.2] if native else [-0.4],
+                prompt_token_ids=[1, 2, 3] if episode_protocol else [4, 5],
+                generation_token_ids=[11, 12] if episode_protocol else [21],
+                generation_log_probs=[-0.1, -0.2] if episode_protocol else [-0.4],
             )
         ],
     )
 
 
-@pytest.mark.parametrize("token_capture", [False, True])
-def test_real_collector_streams_native_and_legacy_http_results(
+@pytest.mark.parametrize(
+    ("token_capture", "group_attempt", "compatibility_response"),
+    [
+        (False, 0, False),
+        (False, 2, False),
+        (True, 3, False),
+        (False, 0, True),
+        (True, 3, True),
+    ],
+)
+def test_real_collector_streams_episode_and_flat_http_results(
     monkeypatch: pytest.MonkeyPatch,
     token_capture: bool,
+    group_attempt: int,
+    compatibility_response: bool,
 ) -> None:
     async def run() -> None:
-        received_native = []
-        received_legacy = []
+        received_episode = []
+        received_flat = []
 
-        async def native_run(request: web.Request) -> web.Response:
+        async def episode_run(request: web.Request) -> web.Response:
             body = await request.json()
             episode = gym_protocol.SingleAgentTurnRequest.model_validate(body)
-            received_native.append(body)
+            received_episode.append(body)
             reply = gym_protocol.SingleAgentTurnResponse(
                 episode_id=episode.episode_id,
                 task_id=episode.task.task_id,
                 result=gym_protocol.SingleAgentTurnResult(
                     responses_create_params=episode.task.task_input.responses_create_params,
-                    response=_model_response(native=True),
+                    response=_model_response(episode_protocol=True),
                     reward=0.75,
                 ),
             )
+            if compatibility_response:
+                return web.json_response(
+                    reply.result.model_dump(mode="json")
+                    | {"agent_ref": {"name": "episode_agent"}}
+                )
             return web.json_response(reply.model_dump(mode="json"))
 
-        async def legacy_run(request: web.Request) -> web.Response:
+        async def flat_run(request: web.Request) -> web.Response:
             body = await request.json()
-            legacy = gym_resources.BaseRunRequest.model_validate(body)
-            received_legacy.append(body)
+            flat_request = gym_resources.BaseRunRequest.model_validate(body)
+            received_flat.append(body)
             reply = gym_resources.BaseVerifyResponse(
-                responses_create_params=legacy.responses_create_params,
-                response=_model_response(native=False),
+                responses_create_params=flat_request.responses_create_params,
+                response=_model_response(episode_protocol=False),
                 reward=0.25,
             )
             return web.json_response(reply.model_dump(mode="json"))
 
-        native_app = web.Application()
-        native_app.router.add_post("/run", native_run)
-        legacy_app = web.Application()
-        legacy_app.router.add_post("/run", legacy_run)
+        episode_app = web.Application()
+        episode_app.router.add_post("/run", episode_run)
+        flat_app = web.Application()
+        flat_app.router.add_post("/run", flat_run)
         async with (
-            TestServer(native_app) as native_server,
-            TestServer(legacy_app) as legacy_server,
+            TestServer(episode_app) as episode_server,
+            TestServer(flat_app) as flat_server,
             ClientSession() as http_client,
         ):
             global_config = OmegaConf.create(
                 {
                     "environment_server_routes": {
-                        "weather:train": "native_environment"
+                        "weather:train": "episode_environment"
                     },
-                    "native_agent": {"responses_api_agents": {"simple_agent": {}}},
+                    "episode_agent": {"responses_api_agents": {"simple_agent": {}}},
                     "legacy_agent": {"responses_api_agents": {"simple_agent": {}}},
-                    "native_environment": {
+                    "episode_environment": {
                         "environment_servers": {
-                            "single_agent_turn": {
-                                "host": native_server.host,
-                                "port": native_server.port,
+                            (
+                                "single_agent_turn_legacy"
+                                if compatibility_response
+                                else "single_agent_turn"
+                            ): {
+                                "host": episode_server.host,
+                                "port": episode_server.port,
                                 "agent_server": {
                                     "type": "responses_api_agents",
-                                    "name": "native_agent",
+                                    "name": "episode_agent",
                                 },
                             }
                         }
                     },
-                    "legacy_environment": {
+                    "flat_environment": {
                         "environment_servers": {
                             "legacy_agent": {
-                                "host": legacy_server.host,
-                                "port": legacy_server.port,
+                                "host": flat_server.host,
+                                "port": flat_server.port,
                                 "agent_server": {
                                     "type": "responses_api_agents",
                                     "name": "legacy_agent",
@@ -155,7 +177,7 @@ def test_real_collector_streams_native_and_legacy_http_results(
             monkeypatch.setattr(gym_config, "_GLOBAL_CONFIG_DICT", global_config)
             monkeypatch.setattr(gym_server, "_GLOBAL_AIOHTTP_CLIENT", http_client)
 
-            native_task = {
+            materialized_task = {
                 "task_id": {"taskset": "weather:train", "task_id": "weather-17"},
                 "task_input": {
                     "responses_create_params": {
@@ -169,34 +191,61 @@ def test_real_collector_streams_native_and_legacy_http_results(
                     },
                 },
             }
-            rows = [
-                {
-                    **deepcopy(native_task),
-                    "_rowidx": index,
-                    "_ng_group_id": "native-group",
-                    "_ng_group_attempt": 3,
-                    "_ng_rollout_index": index,
-                    "_ng_rollout_id": f"capture-native-{index}",
-                    "_ng_attempt_index": index * 2,
-                }
-                for index in range(2)
-            ]
+            rows = [deepcopy(materialized_task) for _ in range(2)]
             rows.append(
                 {
-                    "_rowidx": 2,
-                    "_ng_rollout_id": "capture-legacy",
                     "agent_ref": {"name": "legacy_agent"},
                     "responses_create_params": {
-                        "input": [{"role": "user", "content": "Legacy weather request"}]
+                        "input": [{"role": "user", "content": "Flat weather request"}]
                     },
                 }
             )
+            expected_task = deepcopy(materialized_task)
+            if token_capture:
+                for index, row in enumerate(rows[:2]):
+                    row.update(
+                        {
+                            "_rowidx": index,
+                            "_ng_group_id": "episode-group",
+                            "_ng_group_attempt": group_attempt,
+                            "_ng_rollout_index": index,
+                            "_ng_rollout_id": f"capture-episode-{index}",
+                            "_ng_attempt_index": index * 2,
+                        }
+                    )
+                rows[2].update({"_rowidx": 2, "_ng_rollout_id": "capture-flat"})
+                expected_episode_ids = [
+                    {"rollout_id": f"capture-episode-{index}", "attempt": index * 2}
+                    for index in range(2)
+                ]
+            else:
+                # Dataset rows have no rollout identity. Exercise the driver's
+                # real preparation step with complete materialized/flat groups.
+                rows.append(deepcopy(rows[2]))
+                if group_attempt:
+                    for row in rows:
+                        row["_ng_group_attempt"] = group_attempt
+                _prepare_nemo_gym_rows(
+                    rows,
+                    generation_config={"max_new_tokens": 64},
+                    sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+                    num_generations=2,
+                )
+                assert all("_ng_rollout_id" not in row for row in rows)
+                expected_task["task_input"]["responses_create_params"]["top_p"] = 0.9
+                expected_episode_ids = [
+                    {
+                        "rollout_id": f"{row['_ng_group_id']}-g{index}-t{group_attempt}",
+                        "attempt": 0,
+                    }
+                    for index, row in enumerate(rows[:2])
+                ]
 
             actor = NemoGym.__ray_metadata__.modified_class({})
             actor.rh = object()
             actor.rch = gym_rollouts.RolloutCollectionHelper()
             actor.head_server_config = gym_server.BaseServerConfig(
-                host=native_server.host, port=native_server.port
+                host=episode_server.host, port=episode_server.port
             )
             actor._tokenizer = _TokenDecoder()
             actor._token_capture_enabled = token_capture
@@ -204,9 +253,9 @@ def test_real_collector_streams_native_and_legacy_http_results(
             async def manifest(method: str, path: str) -> dict:
                 capture_key = path.split("/")[-2]
                 response_id = (
-                    "response-legacy"
-                    if capture_key == "capture-legacy"
-                    else "response-native"
+                    "response-flat"
+                    if capture_key == "capture-flat"
+                    else "response-episode"
                 )
                 return {
                     "rollout_id": capture_key,
@@ -235,38 +284,44 @@ def test_real_collector_streams_native_and_legacy_http_results(
                 item async for item in actor.run_rollouts(rows, "timing/integration")
             ]
 
-        assert len(received_native) == 2
-        assert len(received_legacy) == 1
-        assert {body["episode_id"]["rollout_id"] for body in received_native} == {
-            "capture-native-0",
-            "capture-native-1",
+        assert len(received_episode) == 2
+        assert len(received_flat) == len(rows) - 2
+        assert {body["episode_id"]["rollout_id"] for body in received_episode} == {
+            episode_id["rollout_id"] for episode_id in expected_episode_ids
         }
-        for body in received_native:
+        for body in received_episode:
             assert set(body) == {"episode_id", "task"}
-            index = int(body["episode_id"]["rollout_id"].rsplit("-", 1)[1])
-            assert body["episode_id"]["attempt"] == index * 2
-            assert body["task"] == native_task
-        assert "episode_id" not in received_legacy[0]
-        assert received_legacy[0]["agent_ref"]["name"] == "legacy_agent"
+            assert body["episode_id"] in expected_episode_ids
+            assert body["task"] == expected_task
+        for body in received_flat:
+            assert "episode_id" not in body
+            assert body["agent_ref"]["name"] == "legacy_agent"
 
         by_index = {
             row_index: (agent_ref, result)
             for row_index, agent_ref, result, _ in streamed
         }
-        assert set(by_index) == {0, 1, 2}
+        assert set(by_index) == set(range(len(rows)))
         assert sum(timing is not None for _, _, _, timing in streamed) == 1
         for index in (0, 1):
             agent_ref, result = by_index[index]
-            assert agent_ref == {"type": "responses_api_agents", "name": "native_agent"}
-            assert result["full_result"]["reward"] == 0.75
-            assert result["full_result"]["_ng_episode_id"] == {
-                "rollout_id": f"capture-native-{index}",
-                "attempt": index * 2,
+            assert agent_ref == {
+                "type": "responses_api_agents",
+                "name": "episode_agent",
             }
-            assert result["full_result"]["_ng_task_id"] == native_task["task_id"]
-            assert (
-                result["full_result"]["_ng_environment_server"] == "native_environment"
-            )
+            assert result["full_result"]["reward"] == 0.75
+            if not compatibility_response:
+                assert (
+                    result["full_result"]["_ng_episode_id"]
+                    == expected_episode_ids[index]
+                )
+                assert (
+                    result["full_result"]["_ng_task_id"] == materialized_task["task_id"]
+                )
+                assert (
+                    result["full_result"]["_ng_environment_server"]
+                    == "episode_environment"
+                )
             if not token_capture:
                 assert result["message_log"][0]["token_ids"].tolist() == [1, 2, 3]
                 assert result["message_log"][1]["token_ids"].tolist() == [11, 12]
@@ -274,14 +329,20 @@ def test_real_collector_streams_native_and_legacy_http_results(
                     "generation_logprobs"
                 ].tolist() == pytest.approx([-0.1, -0.2])
                 assert result["message_log"][1]["role"] == "assistant"
-        legacy_ref, legacy_result = by_index[2]
-        assert legacy_ref["name"] == "legacy_agent"
-        assert legacy_result["full_result"]["reward"] == 0.25
+        for index in range(2, len(rows)):
+            flat_ref, flat_result = by_index[index]
+            assert flat_ref["name"] == "legacy_agent"
+            assert flat_result["full_result"]["reward"] == 0.25
+            if not token_capture:
+                assert flat_result["message_log"][1]["token_ids"].tolist() == [21]
+                assert flat_result["message_log"][1][
+                    "generation_logprobs"
+                ].tolist() == pytest.approx([-0.4])
         if token_capture:
             expected_captures = [
-                ("capture-native-0", 0.75),
-                ("capture-native-1-a2", 0.75),
-                ("capture-legacy", 0.25),
+                ("capture-episode-0", 0.75),
+                ("capture-episode-1-a2", 0.75),
+                ("capture-flat", 0.25),
             ]
             actor._control.assert_has_awaits(
                 [
@@ -305,9 +366,5 @@ def test_real_collector_streams_native_and_legacy_http_results(
                 assert result["receipt"]["capture_poisoned"] is False
         else:
             actor._control.assert_not_awaited()
-            assert legacy_result["message_log"][1]["token_ids"].tolist() == [21]
-            assert legacy_result["message_log"][1][
-                "generation_logprobs"
-            ].tolist() == pytest.approx([-0.4])
 
     asyncio.run(run())
