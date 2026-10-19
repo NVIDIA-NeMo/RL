@@ -441,9 +441,11 @@ def test_worker_argument_validation_has_startup_timeout(monkeypatch) -> None:
         )
 
 
-@pytest.mark.parametrize("precision", ["bfloat16", "fp8"])
+@pytest.mark.parametrize(
+    ("precision", "fp32_lm_head"), [("bfloat16", True), ("fp8", False)]
+)
 def test_worker_registers_process_group_immediately_after_launch(
-    monkeypatch, precision
+    monkeypatch, precision, fp32_lm_head
 ) -> None:
     class FakeSocket:
         def __enter__(self):
@@ -472,6 +474,11 @@ def test_worker_registers_process_group_immediately_after_launch(
         "nemo_rl.models.generation.vllm.patches.ensure_vllm_source_compat",
         lambda: None,
     )
+    fp32_patch = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.patches.require_nemotron_h_fp32_lm_head_patch",
+        fp32_patch,
+    )
     launched = {}
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
@@ -497,6 +504,7 @@ def test_worker_registers_process_group_immediately_after_launch(
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     config = _config()
     config["vllm_cfg"]["precision"] = precision
+    config["vllm_cfg"]["fp32_lm_head"] = fp32_lm_head
 
     worker_cls(
         config,
@@ -521,6 +529,9 @@ def test_worker_registers_process_group_immediately_after_launch(
     else:
         assert "--quantization" not in command
         assert "NRL_VLLM_FP8_CONFIG" not in env
+    # The Nemotron-H fp32 LM head: source patch in this venv, enabled per engine.
+    assert fp32_patch.called is fp32_lm_head
+    assert env["NRL_VLLM_FP32_LM_HEAD"] == ("1" if fp32_lm_head else "0")
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:

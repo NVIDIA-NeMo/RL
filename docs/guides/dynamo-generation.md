@@ -93,7 +93,7 @@ equal to TP. Parser settings belong under `dynamo_cfg.worker_args`; inherited
 vLLM HTTP-parser settings are rejected with the corresponding Dynamo field.
 Service ports and the namespace are runtime-owned rather than public config.
 
-`vllm_cfg` settings are handled in seven explicit classes:
+`vllm_cfg` settings are handled in eight explicit classes:
 
 | Class | Behavior | Examples |
 | --- | --- | --- |
@@ -101,6 +101,7 @@ Service ports and the namespace are runtime-owned rather than public config.
 | Refit | Read by NeMo RL's worker extension inside each engine | `refit_with_reload_api` |
 | Moved | Startup error naming the Dynamo replacement | tool and reasoning parsers, HTTP serving chat kwargs |
 | FP8 | Read by the vLLM backend's FP8 builder when `precision: fp8`; an error otherwise | `is_mx`, mixed BF16/FP8 layers, DeepGEMM, pow2 scales |
+| Engine patch | The vLLM backend's source patch, enabled in each engine's environment | `fp32_lm_head` (Nemotron-H fp32 LM head) |
 | Unsupported | Warning when active | tokenizer skipping, context-length token capping |
 | Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
 | Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
