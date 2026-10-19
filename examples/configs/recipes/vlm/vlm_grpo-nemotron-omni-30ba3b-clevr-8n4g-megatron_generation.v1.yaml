@@ -56,6 +56,7 @@ policy:
       expert_tensor_parallel_size: 1
       context_parallel_size: 1
       sequence_parallel: true
+      moe_router_dtype: fp32
       moe_pad_experts_for_cuda_graph_inference: false
       mamba_inference_ssm_states_dtype: float32
       mamba_inference_conv_states_dtype: float32

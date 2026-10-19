@@ -35,6 +35,7 @@ policy:
         num_nodes: 1
     mcore_generation_config:
       transformer_impl: inference_optimized
+      moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
       enable_chunked_prefill: false
       enable_prefix_caching: false  # Exactness gate: keep every prefill token recomputed.
