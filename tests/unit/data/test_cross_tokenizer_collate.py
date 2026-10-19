@@ -525,6 +525,30 @@ class TestRejectOverlengthText:
         ):
             collator([_datum("alpha beta gamma", idx=6)])
 
+    def test_same_tokenizer_teacher_checks_shared_batch_width(self):
+        # Five words fit teacher 1's 6-token context and its divisor 2, but
+        # the shared batch it receives pads to 8 (the student's divisor 4).
+        batch = [_datum("alpha beta gamma delta epsilon", idx=8)]
+        shared = _text_collator(
+            ctx_length_student=8,
+            ctx_length_teachers=[27, 6],
+            make_seq_div_by_teachers=(3, 2),
+        )(batch)
+        assert shared["input_ids"].shape == (1, 8)
+        collator = _text_collator(
+            ctx_length_student=8,
+            ctx_length_teachers=[27, 6],
+            make_seq_div_by_teachers=(3, 2),
+            reject_overlength_text=True,
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"^teacher 1, sample idx=8: shared tokenization has 5 tokens, "
+            r"padded to 8 for a sequence-length multiple of 4, exceeding context "
+            r"length 6; overlength rows are rejected$",
+        ):
+            collator(batch)
+
     @pytest.mark.parametrize(
         "texts,student_lengths,teacher_lengths,widths",
         [

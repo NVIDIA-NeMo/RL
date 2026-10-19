@@ -126,10 +126,10 @@ class CrossTokenizerCollator:
             raises ``ValueError`` for a row whose student or teacher
             tokenization, or that length rounded up to the side's
             sequence-length divisor, exceeds that side's context length, so
-            every side covers the same text and no student or
-            cross-tokenizer teacher batch is wider than its context;
-            same-tokenizer teachers check the shared student tokenization
-            against their own context length and divisor. Chat mode always
+            every side covers the same text and no padded batch is wider
+            than its context; same-tokenizer teachers check the shared
+            student tokenization against their own context length, rounded
+            up to both the student's divisor and their own. Chat mode always
             rejects rows longer than a context length.
         ce_covers_assistant_turn: Chat-mode CE target. ``False`` supervises
             the final assistant content and end-of-turn token. ``True``
@@ -331,17 +331,22 @@ class CrossTokenizerCollator:
                 # no alignment. Its forward reuses the student tokenization.
                 if self.reject_overlength_text:
                     ctx_length = self.ctx_length_teachers[i]
-                    make_seq_div_by = self.make_seq_div_by_teachers[i]
                     for row_idx, length in zip(idx, out["input_lengths"].tolist()):
                         if length > ctx_length:
                             raise ValueError(
                                 f"teacher {i}, sample idx={row_idx}: shared tokenization exceeds context length {ctx_length}; overlength rows are rejected"
                             )
-                        padded = self._padded_width(length, make_seq_div_by)
-                        if padded > ctx_length:
-                            raise ValueError(
-                                f"teacher {i}, sample idx={row_idx}: shared tokenization has {length} tokens, padded to {padded} for a sequence-length multiple of {make_seq_div_by}, exceeding context length {ctx_length}; overlength rows are rejected"
-                            )
+                        # The forward reuses the shared batch, padded to the
+                        # student's divisor; packed rows pad to the teacher's.
+                        for make_seq_div_by in (
+                            self.make_seq_div_by_student,
+                            self.make_seq_div_by_teachers[i],
+                        ):
+                            padded = self._padded_width(length, make_seq_div_by)
+                            if padded > ctx_length:
+                                raise ValueError(
+                                    f"teacher {i}, sample idx={row_idx}: shared tokenization has {length} tokens, padded to {padded} for a sequence-length multiple of {make_seq_div_by}, exceeding context length {ctx_length}; overlength rows are rejected"
+                                )
                 continue
             if self.reject_overlength_text:
                 self._reject_overlength_texts(
