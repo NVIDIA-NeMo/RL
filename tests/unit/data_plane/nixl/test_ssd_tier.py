@@ -38,7 +38,16 @@ KB = 1 << 10
 BLOB = 128 * KB
 
 
-def _unit(tmp_path, *, slab=1 << 20, staging=256 * KB, pickup_s=10.0, read_pin_s=60.0):
+def _unit(
+    tmp_path,
+    *,
+    slab=1 << 20,
+    staging=256 * KB,
+    pickup_s=10.0,
+    read_pin_s=60.0,
+    high_wm=None,
+    low_wm=None,
+):
     """1 MiB slab: 768 KiB for puts (six 128 KiB blobs), 256 KiB staging (two)."""
     return bare_unit(
         slab,
@@ -46,6 +55,8 @@ def _unit(tmp_path, *, slab=1 << 20, staging=256 * KB, pickup_s=10.0, read_pin_s
         ssd_dir=str(tmp_path),
         staging_bytes=staging,
         pickup_s=pickup_s,
+        high_wm=high_wm,
+        low_wm=low_wm,
     )
 
 
@@ -368,10 +379,145 @@ def test_ssd_config_validation():
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,
         "demote_after_s": None,
+        "high_wm": None,
+        "low_wm": None,
     }
+    wm = {**on, "ssd": {"enabled": True, "high_watermark": 0.8, "low_watermark": 0.5}}
+    assert tq_nixl.ssd_config(wm)["high_wm"] == 0.8
+    for bad in (
+        {"high_watermark": 1.0, "low_watermark": 0.5},  # high=1 can never trigger
+        {"high_watermark": 0.5, "low_watermark": 0.5},
+        {"high_watermark": 0.5},  # needs both
+        {"high_watermark": 0.8, "low_watermark": 0.5, "demote_after_s": 1.0},
+    ):
+        with pytest.raises(ValueError, match="watermark|demote_after_s"):
+            tq_nixl.ssd_config({**on, "ssd": {"enabled": True, **bad}})
     with pytest.raises(ValueError, match="pickup_s"):
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "pickup_s": 1.0}})
     with pytest.raises(ValueError, match="staging_bytes"):
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "staging_bytes": 1 << 30}})
     with pytest.raises(ValueError, match="store.kind"):
         tq_nixl.ssd_config({**on, "store": {"kind": "file"}})
+
+
+# ------------------------------------------------------------------ watermark demotion
+def _wm(u, high, low):
+    """Arm the watermarks after filling: ``alloc`` starts a batch as soon as they are set."""
+    u.high_wm, u.low_wm = high, low
+
+
+def _victim_count(u):
+    return sum(r.victim or not r.in_slab for r in u.blobs.values())
+
+
+def test_watermark_demotes_down_to_low_without_any_put(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u, 5)  # 640 KiB of a 768 KiB put area: above the high mark
+    _wm(u, 0.6, 0.3)
+    u._tick_once()
+    _wait(lambda: sum(not r.in_slab for r in u.blobs.values()) == 4)  # oldest first
+    assert [b for b, r in u.blobs.items() if r.in_slab] == ["b4"]
+    assert u.stats()["watermark_batches"] == 1
+    _put(u, "new", 9)  # room without a Busy
+    assert u.stats()["busy_replies"] == 0
+    assert set(_read(u, "b0")[0]) == {1}
+
+
+def test_watermarks_are_off_by_default_and_below_high_does_nothing(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u, 5)
+    u._tick_once()
+    assert _victim_count(u) == 0
+    w = _unit(tmp_path)
+    _fill(w, 5)  # 0.83 < 0.9
+    _wm(w, 0.9, 0.5)
+    w._tick_once()
+    assert _victim_count(w) == 0
+
+
+def test_watermark_counts_aligned_bytes(tmp_path):
+    # 1000-byte blobs occupy 1024: raw sizes would pick one blob too many.
+    u = _unit(tmp_path, slab=24576, staging=16384)
+    for i in range(6):
+        _put(u, f"b{i}", i + 1, n=1000)
+    _wm(u, 0.5, 0.38)
+    assert u.alloc_.used_bytes == 6 * 1024 and u.alloc_.capacity == 8192
+    u._tick_once()
+    assert _victim_count(u) == 3
+
+
+def test_watermark_ignores_quarantined_bytes(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u, 5)
+    _wm(u, 0.6, 0.3)
+    a = u.alloc_
+    for b in ("b0", "b1", "b2"):  # as a hinted release would: kept in used_bytes until reclaimed
+        rec = u.blobs.pop(b)
+        a.quarantine(rec.off, rec.nbytes, time.monotonic() + 60)
+    assert a.used_bytes > 0.6 * a.capacity > a.used_bytes - a.quarantined_bytes
+    u._tick_once()
+    assert _victim_count(u) == 0
+
+
+def test_watermark_starts_one_batch_while_pinned_victims_hold_slab(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u, 5)
+    r = u.resolve(["b0"])  # a live pin keeps b0's slab copy after its write
+    _wm(u, 0.6, 0.3)
+    u._tick_once()
+    _wait(lambda: u._demote_jobs == 0 and u.blobs["b0"].disk is not None)
+    assert u.blobs["b0"].in_slab and "b0" in u._victims  # pinned: slab copy held
+    u._tick_once()
+    u._tick_once()
+    assert u.stats()["watermark_batches"] == 1  # no second batch without new puts
+    u.unpin(r["pin_id"])
+
+
+def test_released_victims_do_not_let_queued_batches_pile_up(tmp_path):
+    u = _unit(tmp_path)
+    gate = threading.Event()
+    u._demote = lambda b, rec: gate.wait(10)  # a stalled disk write
+    _fill(u, 5)
+    _wm(u, 0.6, 0.3)
+    u._tick_once()
+    queued = u._demote_jobs
+    assert queued == 4
+    u.release_many([(f"b{i}", 1) for i in range(4)])  # victims leave _victims
+    for i in range(6):  # refill; Busy or UnitFull ends it
+        try:
+            _put(u, f"c{i}", 9)
+        except (DataPlaneBusy, UnitFull):
+            break
+    u._tick_once()  # watermark path
+    try:
+        u.alloc("x", BLOB, 1)  # reactive path
+    except (DataPlaneBusy, UnitFull):
+        pass
+    assert u._demote_jobs == queued and not u._victims - set(u.blobs)
+    gate.set()
+    _wait(lambda: u._demote_jobs == 0)
+
+
+def test_read_of_a_victim_is_pending_until_its_demotion_ends(tmp_path):
+    u = _unit(tmp_path)
+    gate = threading.Event()
+    real = u._demote
+    u._demote = lambda b, rec: (gate.wait(10), real(b, rec))[1]
+    _fill(u, 5)
+    _wm(u, 0.6, 0.3)
+    u._tick_once()
+    r = u.resolve(["b0"])
+    assert "b0" in r["pending"] and "b0" not in r["offsets"]
+    u.unpin(r["pin_id"])
+    gate.set()
+    assert set(_read(u, "b0")[0]) == {1}
+
+
+def test_alloc_starts_the_batch_without_waiting_for_a_tick(tmp_path):
+    u = _unit(tmp_path, high_wm=0.6, low_wm=0.3)
+    u._tick_once = lambda: None  # the ticker must not be what demotes
+    for i in range(5):
+        _put(u, f"b{i}", i + 1)  # the 4th alloc crosses the high mark
+    assert u.stats()["watermark_batches"] >= 1
+    _wait(lambda: sum(not r.in_slab for r in u.blobs.values()) >= 3)
+    assert set(_read(u, "b0")[0]) == {1}
