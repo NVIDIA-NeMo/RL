@@ -195,7 +195,9 @@ def _tokenize_chat_text(
             f"turn {len(messages) - 1}: supervising separate reasoning_content requires "
             "collator.native_thinking_alignment=true with a supported "
             "Qwen/Nano ChatML template; ordinary chat supports inline "
-            "<think> reasoning in message.content"
+            "<think> reasoning in message.content only when the template renders "
+            "content verbatim. For Qwen-style templates, set "
+            "collator.native_thinking_alignment=true."
         )
     encoded = tokenizer(
         text,
