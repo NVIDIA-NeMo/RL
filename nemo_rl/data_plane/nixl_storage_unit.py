@@ -129,8 +129,7 @@ class NixlStorageUnit:
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
         demote_after_s: float | None = None,
-        high_wm: float | None = None,
-        low_wm: float | None = None,
+        watermarks: tuple[float, float] | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
@@ -159,8 +158,7 @@ class NixlStorageUnit:
             int(staging_bytes),
             float(pickup_s),
             demote_after_s,
-            high_wm,
-            low_wm,
+            watermarks,
         )
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
@@ -207,8 +205,8 @@ class NixlStorageUnit:
         staging_bytes: int,
         pickup_s: float,
         demote_after_s: float | None,
-        high_wm: float | None = None,
-        low_wm: float | None = None,
+        watermarks: tuple[float, float]
+        | None = None,  # (high, low) fractions of the put area
     ) -> None:
         self.ssd_dir: str | None = None
         self.staging_: SlabAllocator | None = None
@@ -227,7 +225,7 @@ class NixlStorageUnit:
         }
         self._victims: set[str] = set()  # victims whose slab copy is still held
         self._demote_jobs = 0  # demotions queued or running, released victims included
-        self.high_wm, self.low_wm = high_wm, low_wm
+        self.watermarks = watermarks
         self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
         if not ssd_dir:
             self.alloc_ = SlabAllocator(slab_bytes, on_free=self._wipe_footer)
@@ -288,32 +286,36 @@ class NixlStorageUnit:
                 for b, r in self.blobs.items():
                     if _movable(r) and now - r.created_at >= self.demote_after_s:
                         self._mark_victim(b, r)
-            if self.high_wm is not None:
-                self._demote_to_low_watermark()
+            self._demote_to_low_watermark()
 
     def _demote_to_low_watermark(self) -> None:
         """Background headroom: one batch at a time, oldest first, so puts rarely see Busy.
 
-        ``_room`` stays the fallback (fragmentation, bursts). Quarantined bytes
-        are not counted: they free by time, demotion cannot help them.
+        No-op unless watermarks are set. ``_room`` stays the fallback
+        (fragmentation, bursts). Quarantined bytes are not counted: they free
+        by time, demotion cannot help them.
         """
+        if self.watermarks is None or self._demotion_running():
+            return
+        high, low = self.watermarks
         a = self.alloc_
         live = a.used_bytes - a.quarantined_bytes
-        if self._demotion_running() or live <= self.high_wm * a.capacity:
-            return
-        need = live - self.low_wm * a.capacity
+        if live > high * a.capacity and self._mark_oldest(live - low * a.capacity):
+            self.ssd_stats["watermark_batches"] += 1
+
+    def _mark_oldest(self, want: int) -> int:
+        """Mark the oldest movable blobs as victims until ``want`` aligned bytes are covered."""
         picked = 0
         movable = sorted(
             ((b, r) for b, r in self.blobs.items() if _movable(r)),
             key=lambda t: t[1].created_at,
         )
         for b, r in movable:
-            if picked >= need:
+            if picked >= want:
                 break
             self._mark_victim(b, r)
-            picked += align_up(r.nbytes, a.align)
-        if picked:
-            self.ssd_stats["watermark_batches"] += 1
+            picked += align_up(r.nbytes, self.alloc_.align)
+        return picked
 
     def _demotion_running(self) -> bool:
         """A batch is queued or running, or its victims still hold slab copies."""
@@ -355,13 +357,7 @@ class NixlStorageUnit:
         if not movable:
             # Nothing left to demote: only quarantine (free at a known time) helps.
             return a.quarantined_bytes > 0
-        want = max(nbytes, a.capacity // 8)
-        picked = 0
-        for b, r in sorted(movable, key=lambda t: t[1].created_at):
-            if picked >= want:
-                break
-            self._mark_victim(b, r)
-            picked += r.nbytes
+        self._mark_oldest(max(nbytes, a.capacity // 8))
         return True
 
     def _mark_victim(self, b: str, rec: BlobRec) -> None:
@@ -563,8 +559,7 @@ class NixlStorageUnit:
             refs=int(n_entries),
             created_at=now,
         )
-        if self.high_wm is not None:
-            self._demote_to_low_watermark()  # like Mooncake's PutEnd: no tick lag
+        self._demote_to_low_watermark()  # like Mooncake's PutEnd: no tick lag
         return off
 
     @_locked

@@ -45,8 +45,7 @@ def _unit(
     staging=256 * KB,
     pickup_s=10.0,
     read_pin_s=60.0,
-    high_wm=None,
-    low_wm=None,
+    watermarks=None,
 ):
     """1 MiB slab: 768 KiB for puts (six 128 KiB blobs), 256 KiB staging (two)."""
     return bare_unit(
@@ -55,8 +54,7 @@ def _unit(
         ssd_dir=str(tmp_path),
         staging_bytes=staging,
         pickup_s=pickup_s,
-        high_wm=high_wm,
-        low_wm=low_wm,
+        watermarks=watermarks,
     )
 
 
@@ -379,11 +377,10 @@ def test_ssd_config_validation():
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,
         "demote_after_s": None,
-        "high_wm": None,
-        "low_wm": None,
+        "watermarks": None,
     }
     wm = {**on, "ssd": {"enabled": True, "high_watermark": 0.8, "low_watermark": 0.5}}
-    assert tq_nixl.ssd_config(wm)["high_wm"] == 0.8
+    assert tq_nixl.ssd_config(wm)["watermarks"] == (0.8, 0.5)
     for bad in (
         {"high_watermark": 1.0, "low_watermark": 0.5},  # high=1 can never trigger
         {"high_watermark": 0.5, "low_watermark": 0.5},
@@ -403,7 +400,7 @@ def test_ssd_config_validation():
 # ------------------------------------------------------------------ watermark demotion
 def _wm(u, high, low):
     """Arm the watermarks after filling: ``alloc`` starts a batch as soon as they are set."""
-    u.high_wm, u.low_wm = high, low
+    u.watermarks = (high, low)
 
 
 def _victim_count(u):
@@ -451,7 +448,11 @@ def test_watermark_ignores_quarantined_bytes(tmp_path):
     _fill(u, 5)
     _wm(u, 0.6, 0.3)
     a = u.alloc_
-    for b in ("b0", "b1", "b2"):  # as a hinted release would: kept in used_bytes until reclaimed
+    for b in (
+        "b0",
+        "b1",
+        "b2",
+    ):  # as a hinted release would: kept in used_bytes until reclaimed
         rec = u.blobs.pop(b)
         a.quarantine(rec.off, rec.nbytes, time.monotonic() + 60)
     assert a.used_bytes > 0.6 * a.capacity > a.used_bytes - a.quarantined_bytes
@@ -514,7 +515,7 @@ def test_read_of_a_victim_is_pending_until_its_demotion_ends(tmp_path):
 
 
 def test_alloc_starts_the_batch_without_waiting_for_a_tick(tmp_path):
-    u = _unit(tmp_path, high_wm=0.6, low_wm=0.3)
+    u = _unit(tmp_path, watermarks=(0.6, 0.3))
     u._tick_once = lambda: None  # the ticker must not be what demotes
     for i in range(5):
         _put(u, f"b{i}", i + 1)  # the 4th alloc crosses the high mark
