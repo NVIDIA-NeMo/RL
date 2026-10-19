@@ -61,7 +61,8 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
      - Conflict: append the conflict, e.g. `... first. There's a conflict in `<file>` (<why, e.g. depends on #M which is not in <rel>>).`
 
 6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`). Do not copy
-   release labels such as `r0.8.0` — they drive the auto-cherry-pick bot. Then post
+   `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such
+   as `r0.8.0`. Then post
    `/ok to test <full head sha>` as an issue comment.
 
 7. **Report**: PR number (bare `#N`), base, commit sha, labels, that `/ok to test` was
@@ -70,4 +71,4 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
 ## Reference PRs
 
 - #4412 (r0.8.0, clean, new flow): body `manually cp #4182 into r0.8.0 branch since it was merged into main instead of r0.8.0 first.`
-- r0.7.0, old flow: #3211 (clean, empty body); conflicts: #3153 `manually cp #3147 into r0.7.0 branch since there's a conflict in `docs/guides/environments.md`.`, #3195, #3213, #3214.
+- r0.7.0, old flow: #3211 (clean, empty body); conflicts: #3153 `manually cp #3147 into r0.7.0 branch since there's a conflict in `docs/guides/environments.md`.`, #3195, #3214.

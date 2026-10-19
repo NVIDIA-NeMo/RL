@@ -35,7 +35,7 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
    `merge_commit_sha`, `base` (the release branch), and the labels starting with `CI:`.
 
 2. **Check it is not already handled.**
-   - `git fetch origin`; `git log origin/main --oneline --grep="<N>" | head` — already on main? stop.
+   - `git fetch origin`; `git log origin/main --oneline --grep="(#<N>)" | head` — already on main? stop.
    - Open PR from the bot or a prior attempt:
      `curl ... "/pulls?state=open&head=NVIDIA-NeMo:cherry-pick-<N>-main"` and
      `git ls-remote origin refs/heads/<user>/cp-<N>-main`. If either exists, ask the user.
