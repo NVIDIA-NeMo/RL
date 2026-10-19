@@ -25,7 +25,7 @@ rollout, no generation). Per step:
     3. Pack alignment payload + teacher IPC handles into a student-side
        ``train_data`` dict.
     4. ``student_policy.train(train_data, loss_fn)`` — student forward +
-       loss + backward + optimizer step happens inside the dtensor v2
+       loss + backward + optimizer step happens inside the Automodel
        worker.
 
 The collator and aligner do all the CPU-side cross-tokenizer work; the

@@ -281,10 +281,10 @@ def setup(
         refit_transport=generation_config.get("refit_transport"),
     )
 
-    # Disallow SP + packing for dtensor path
+    # Disallow SP + packing for the Automodel path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
-        # This incompatibility is enforced in DTensor workers during initialization.
+        # Automodel sequence parallel is supported; ensure CP and SP are not enabled together
+        # This incompatibility is enforced in Automodel workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
@@ -297,7 +297,7 @@ def setup(
 
         if automodel_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
-                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
+                f"Distillation does not support Automodel sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
             )
 
