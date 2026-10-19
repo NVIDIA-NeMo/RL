@@ -24,6 +24,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import islice
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
@@ -421,6 +422,14 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# Each actor batches the capture ledgers it retires.
+# A flush is sent once this many rollouts are queued, or after the interval, whichever comes first.
+# A failed flush keeps its rollouts queued and backs off up to the cap.
+_RETIRE_BATCH_SIZE = 256
+_RETIRE_FLUSH_INTERVAL_S = 1.0
+_RETIRE_MAX_BACKOFF_S = 30.0
+# Retrying these cannot succeed: the batch or the bearer token is malformed.
+_RETIRE_PERMANENT_STATUSES = frozenset({400, 401, 422})
 # The generation server's bearer token travels to Gym's servers the same way as
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
@@ -821,6 +830,11 @@ Depending on your data shape, you may want to change these values."""
         self._server_client = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
+        # Rollout IDs waiting to be retired, in arrival order.
+        # A dict keeps the order and drops duplicates.
+        self._retire_pending: Dict[str, None] = {}
+        self._retire_full = asyncio.Event()
+        self._retire_task: Optional[asyncio.Task[None]] = None
         if self._token_capture_enabled:
             assert token_capture is not None
             policy_overrides = (
@@ -920,10 +934,11 @@ Depending on your data shape, you may want to change these values."""
             )
         return self._server_client
 
-    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+    async def _control_response(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Send one bearer-authenticated call to the policy model server."""
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
         try:
-            response = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 self._control_client().request(
                     server_name=_POLICY_SERVER_NAME,
                     url_path=path,
@@ -938,12 +953,108 @@ Depending on your data shape, you may want to change these values."""
                 f"ledger control call {method} {path} exceeded "
                 f"{self._control_timeout_s}s (control plane unreachable or stalled)"
             ) from None
+
+    async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
+        response = await self._control_response(method, path, **kwargs)
         if response.status != 200:
             raise RuntimeError(
                 f"ledger control call {method} {path} failed: "
                 f"HTTP {response.status} {await response.text()}"
             )
         return await response.json()
+
+    async def retire_rollout_ledgers(self, rollout_ids: List[str]) -> None:
+        """Queue capture ledgers NeMo RL no longer reads for retirement.
+
+        Without this, the policy model server keeps one ledger file per rollout attempt for the whole run.
+        Retiring leaves a fence that discards any later write,
+        so it is also safe for abandoned attempts whose agent is still running.
+        This call does no I/O.
+        ``_retire_flush_loop`` sends the queued rollouts in batches.
+        """
+        if not self._token_capture_enabled or not rollout_ids:
+            return
+        self._retire_pending.update(dict.fromkeys(rollout_ids))
+        if len(self._retire_pending) >= _RETIRE_BATCH_SIZE:
+            self._retire_full.set()
+        if self._retire_task is None or self._retire_task.done():
+            self._retire_task = asyncio.get_running_loop().create_task(
+                self._retire_flush_loop()
+            )
+
+    async def _retire_flush_loop(self) -> None:
+        """Flush queued retirements until the queue is empty.
+
+        Waits for a full batch or the flush interval, then sends everything queued.
+        After a failed flush it sleeps with exponential backoff instead,
+        so an unreachable server is not polled faster as rollouts pile up.
+        The loop exits once the queue drains, and the next enqueue starts a new one.
+        """
+        backoff_s = 0.0
+        while self._retire_pending:
+            if backoff_s:
+                await asyncio.sleep(backoff_s)
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._retire_full.wait(), timeout=_RETIRE_FLUSH_INTERVAL_S
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            self._retire_full.clear()
+            if await self._flush_retired_rollouts():
+                backoff_s = 0.0
+            else:
+                backoff_s = min(
+                    max(2 * backoff_s, _RETIRE_FLUSH_INTERVAL_S), _RETIRE_MAX_BACKOFF_S
+                )
+
+    async def _flush_retired_rollouts(self) -> bool:
+        """Send every queued rollout to the retire route.
+
+        Returns False when the caller should retry later.
+        A rollout leaves the queue only once Gym confirmed its batch,
+        or when Gym rejected the batch in a way a retry cannot fix.
+        Retire is idempotent, so resending a batch whose response was lost is safe.
+        """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        import aiohttp
+        from nemo_gym.token_id_capture.control_routes import MAX_LEDGER_BATCH
+
+        path = f"{_TOKEN_CAPTURE_CONTROL_PREFIX}/rollouts/retire"
+        while self._retire_pending:
+            batch = list(islice(self._retire_pending, MAX_LEDGER_BATCH))
+            try:
+                # The reserved control pool keeps cleanup off the connections that serve model calls.
+                response = await self._control_response(
+                    "POST", path, json={"rollout_ids": batch}, _control=True
+                )
+                status = response.status
+                body = "" if status == 200 else await response.text()
+                response.release()
+            except (RuntimeError, OSError, aiohttp.ClientError) as error:
+                print(
+                    f"retire of {len(batch)} capture ledgers failed, will retry: "
+                    f"{error}",
+                    flush=True,
+                )
+                return False
+            if status != 200 and status not in _RETIRE_PERMANENT_STATUSES:
+                print(
+                    f"retire of {len(batch)} capture ledgers got HTTP {status}, "
+                    f"will retry: {body}",
+                    flush=True,
+                )
+                return False
+            if status != 200:
+                print(
+                    f"retire of {len(batch)} capture ledgers rejected with HTTP "
+                    f"{status}; dropping them (first={batch[0]}): {body}",
+                    flush=True,
+                )
+            for rollout_id in batch:
+                self._retire_pending.pop(rollout_id, None)
+        return True
 
     def list_entries(self) -> Dict[str, List[str]]:
         """Report which config entries this actor actually spawned.
@@ -1213,6 +1324,10 @@ Depending on your data shape, you may want to change these values."""
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
             print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
+        # The manifest is never read again.
+        # A restore retries every unsealed attempt under a fresh rollout ID.
+        # This actor's model server is the one that recorded the ledger.
+        await self.retire_rollout_ledgers([rollout_id])
         return {
             "message_log": [],
             "input_message_log": [],
@@ -1656,6 +1771,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         cleanup attempt invokes again.
         """
         try:
+            if self._retire_pending:
+                # Ledgers live under token_capture.capture_dir.
+                # Whatever is still queued here stays on disk after the run.
+                print(
+                    f"shutting down with {len(self._retire_pending)} capture "
+                    "ledgers not yet retired",
+                    flush=True,
+                )
+            if self._retire_task is not None:
+                self._retire_task.cancel()
             rh, self.rh = self.rh, None
             if rh is not None:
                 rh.shutdown()

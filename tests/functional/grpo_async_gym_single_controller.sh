@@ -113,6 +113,16 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     if [[ "$*" == *token_capture.enabled=true* ]]; then
         # Nonzero only when a finalizer actor ran, i.e. capture really was on.
         EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+        # Every finished or abandoned rollout leaves a retired fence instead of its ledger.
+        # Only rollouts in flight at shutdown keep a live ledger.
+        LINEAGE_DIR=$LOG_DIR/gym_token_capture/lineage
+        NUM_RETIRED=$(find $LINEAGE_DIR -name '*.lineage.retired' | wc -l)
+        NUM_LIVE=$(find $LINEAGE_DIR -name '*.lineage.jsonl' | wc -l)
+        echo "capture ledgers: $NUM_RETIRED retired, $NUM_LIVE live"
+        if [[ $NUM_RETIRED -eq 0 || $NUM_LIVE -ge $NUM_RETIRED ]]; then
+            echo "[ERROR] capture ledgers were not retired"
+            exit 1
+        fi
     fi
 
     # Observed to be between 0.8-1.3
