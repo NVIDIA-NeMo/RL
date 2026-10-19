@@ -63,8 +63,6 @@ def _shared_options(config: CrossTokenizerCollatorConfig) -> dict[str, bool]:
     options = {"reject_overlength_text": True}
     if config.mode == "text":
         options["add_special_tokens_in_text"] = True
-    elif not config.native_thinking_alignment:
-        options["ce_covers_assistant_turn"] = True
     return options
 
 
@@ -315,10 +313,7 @@ def test_batch_is_the_shared_batch_plus_sample_ids(mode: str):
         batch
     )
 
-    expected_keys = _STUDENT_KEYS | _TEACHER_0_KEYS
-    if mode == "chat":
-        expected_keys |= {"kd_token_mask"}
-    assert set(out.keys()) == expected_keys
+    assert set(out.keys()) == _STUDENT_KEYS | _TEACHER_0_KEYS
     # Row identities keep their values (an integer 0 is a valid id) and order.
     assert out["sample_id"] == ["doc-b", 0]
     shared = _shared_collator(
@@ -457,9 +452,10 @@ def test_router_replay_chat_concatenates_per_message_routes():
     assert out["routed_experts"].shape == (1, 8, 2, 2)
     assert torch.equal(out["routed_experts"][0, : len(token_ids)], routes)
     assert torch.count_nonzero(out["routed_experts"][0, len(token_ids) :]) == 0
-    # The supervised final turn replays the final message's routes.
-    final_turn = out["token_mask"][0].bool()
-    assert torch.equal(out["routed_experts"][0, final_turn], routes[split:])
+    # The supervised content and EOT replay the final message's routes after
+    # its <assistant> header.
+    supervised = out["token_mask"][0].bool()
+    assert torch.equal(out["routed_experts"][0, supervised], routes[split + 1 :])
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +567,7 @@ def test_clip_overlength_text_requires_text_mode():
 
 
 # ---------------------------------------------------------------------------
-# Chat mode: CE on the whole final assistant turn, KD on its content and EOT
+# Chat mode: CE and KD on the final assistant turn's content and EOT
 # ---------------------------------------------------------------------------
 
 
@@ -582,7 +578,7 @@ def _chat_pair() -> tuple[PreTrainedTokenizerFast, PreTrainedTokenizerFast]:
 def _assert_kd_alignment_matches_masks(out: Any) -> None:
     """Aligned positions are exactly the KD positions on each side."""
     for side, mask_key in (
-        ("student", "kd_token_mask"),
+        ("student", "token_mask"),
         ("teacher", "teacher_0_token_mask"),
     ):
         chunks = out[f"alignment_0_{side}_chunk_id"][0]
@@ -596,8 +592,8 @@ def test_chat_single_turn_masks():
     out = _csd_collator(_CHAT, student, [teacher], make_seq_div_by_student=8)(
         [_row(_SINGLE_TURN)]
     )
-    assert _supervised(student, out, "token_mask") == ["<assistant>", "Answer", "<eot>"]
-    assert _supervised(student, out, "kd_token_mask") == ["Answer", "<eot>"]
+    assert _supervised(student, out, "token_mask") == ["Answer", "<eot>"]
+    assert "kd_token_mask" not in out
     assert _supervised(
         teacher, out, "teacher_0_token_mask", ids_key="teacher_0_input_ids"
     ) == ["Answer", "<eot>"]
@@ -629,14 +625,12 @@ def test_chat_multi_turn_supervises_only_the_final_turn(message_loss_mask):
         "Done",
         "<eot>",
     ]
-    assert _supervised(student, out, "token_mask") == ["<assistant>", "Done", "<eot>"]
-    assert _supervised(student, out, "kd_token_mask") == ["Done", "<eot>"]
+    assert _supervised(student, out, "token_mask") == ["Done", "<eot>"]
     assert _supervised(
         teacher, out, "teacher_0_token_mask", ids_key="teacher_0_input_ids"
     ) == ["Done", "<eot>"]
     # The earlier assistant turn gets neither CE nor KD.
     assert not out["token_mask"][0, 3:6].any()
-    assert not out["kd_token_mask"][0, 3:6].any()
     _assert_kd_alignment_matches_masks(out)
 
 
@@ -659,22 +653,16 @@ def test_chat_selection_without_the_final_turn_is_rejected(message_loss_mask):
 def test_chat_same_tokenizer_teacher_bypasses_alignment():
     student = _chat_tokenizer()
     out = _csd_collator(_CHAT, student, [None])([_row(_SINGLE_TURN)])
-    assert set(out.keys()) == _STUDENT_KEYS | {"kd_token_mask"}
-    assert _supervised(student, out, "token_mask") == ["<assistant>", "Answer", "<eot>"]
-    assert _supervised(student, out, "kd_token_mask") == ["Answer", "<eot>"]
+    assert set(out.keys()) == _STUDENT_KEYS
+    assert _supervised(student, out, "token_mask") == ["Answer", "<eot>"]
 
 
-def test_chat_template_with_a_footer_fails_with_the_prefix_error():
-    # A footer after the last message is not part of the history rendering,
-    # so the final turn's first token cannot be located.
+def test_chat_template_with_a_footer_supervises_content_and_eot():
+    # A footer after the last message is context, not supervision.
     student = _chat_tokenizer()
     student.chat_template += "{{ '<eos>' }}"
-    with pytest.raises(
-        ValueError,
-        match=r"^student, sample idx=0: rendering the messages before the final "
-        r"assistant turn does not give a prefix of the full rendering",
-    ):
-        _csd_collator(_CHAT, student, [None])([_row(_SINGLE_TURN)])
+    out = _csd_collator(_CHAT, student, [None])([_row(_SINGLE_TURN)])
+    assert _supervised(student, out, "token_mask") == ["Answer", "<eot>"]
 
 
 # ---------------------------------------------------------------------------

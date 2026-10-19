@@ -182,9 +182,9 @@ formats include `.arrow`, `.parquet`, `.json`, `.jsonl`, and `.txt`. The
 collator. `collator.mode=text` tokenizes each text with both tokenizers;
 use the existing [chat-data guidance](xtoken-off-policy-distillation.md#text-and-chat-batches)
 for conversational examples. CSD chat mode supervises only the final assistant
-turn; earlier messages are context. In ordinary CSD chat mode, CE covers the
-whole final assistant turn, including its template markers, and KD uses its
-content and EOT. Native thinking alignment reuses the shared region-based
+turn; earlier messages are context. In ordinary CSD chat mode, CE and KD both
+use that turn's content and EOT; template markers such as the role header are
+not supervised. Native thinking alignment reuses the shared region-based
 supervision described in that guide.
 
 A text row that does not fit every model's sequence limit after tokenization

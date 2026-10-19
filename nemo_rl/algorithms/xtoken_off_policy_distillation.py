@@ -1701,8 +1701,8 @@ def setup(
         # CSD never truncates one side alone: a text row that does not fit
         # every side is clipped to a prefix that does, and overlength chat
         # rows are rejected. Text rows carry each tokenizer's special
-        # tokens; ordinary chat supervises the whole final assistant turn
-        # with CE and its content + end-of-turn token with KD.
+        # tokens; ordinary chat supervises the final assistant turn's
+        # content + end-of-turn token with both CE and KD.
         csd_collator_options = {
             "require_routed_experts": router_replay_enabled(policy_config),
             "reject_overlength_text": True,
@@ -1710,8 +1710,6 @@ def setup(
         if master_config.collator.mode == "text":
             csd_collator_options["add_special_tokens_in_text"] = True
             csd_collator_options["clip_overlength_text"] = True
-        elif not master_config.collator.native_thinking_alignment:
-            csd_collator_options["ce_covers_assistant_turn"] = True
     collator = collator_cls(
         config=master_config.collator,
         student_tokenizer=student_tokenizer,
