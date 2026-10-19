@@ -21,6 +21,7 @@ from contextlib import contextmanager
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 import nemo_rl.modelopt.utils as modelopt_utils
 from nemo_rl.modelopt.utils import resolve_quant_cfg
@@ -968,7 +969,11 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=object(),
+        vllm_config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                world_size_across_dp=1, enable_eplb=False
+            )
+        ),
     )
     extension.model_config = model_config
     extension.device = torch.device("cpu")
@@ -1079,7 +1084,11 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=torch.nn.Linear(1, 1),
-        vllm_config=object(),
+        vllm_config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                world_size_across_dp=1, enable_eplb=False
+            )
+        ),
     )
     extension.model_config = object()
     extension.device = torch.device("cuda:0")
@@ -1117,68 +1126,104 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
-@pytest.mark.parametrize("failure", [None, "prepare", "load"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "empty",
+        "prepare",
+        "pre_fence",
+        "ack",
+        "load",
+        "load_fence",
+        "load_and_fence",
+    ],
+)
+@pytest.mark.parametrize("load_after_ack", [False, True])
 def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
-    monkeypatch, failure
+    monkeypatch, caplog, failure, load_after_ack: bool
 ):
     backend = _import_vllm_quant_backend(monkeypatch)
     base_backend = _base_vllm_backend()
     reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
     from nemo_rl.models.policy.utils import IPCProtocol
 
+    empty = failure == "empty"
+    success = failure in (None, "empty")
     payload_weight = torch.tensor([1.0, 2.0], dtype=torch.float32)
-    used_bytes = base_backend.calculate_aligned_size(payload_weight.nbytes)
-    payload_buffer = torch.zeros(used_bytes * 2, dtype=torch.uint8)
-    payload_buffer[: payload_weight.nbytes].view(torch.float32).copy_(payload_weight)
+    allocation_bytes = base_backend.calculate_aligned_size(payload_weight.nbytes)
+    used_bytes = 0 if empty else allocation_bytes
+    payload_buffer = torch.zeros(allocation_bytes * 2, dtype=torch.uint8)
     loaded = []
+    retained = []
     calls = []
-    view_refs = []
     ipc_refs = []
+    owned_storage_refs = []
 
     class FakeSocket:
         def __init__(self):
             self.payloads = iter(
                 [
-                    ("ipc-handle", ["decoder.weight"], used_bytes),
-                    ("ipc-handle", ["decoder.bias"], used_bytes),
+                    ("ipc-handle", [] if empty else ["decoder.weight"], used_bytes),
+                    ("ipc-handle", [] if empty else ["decoder.bias"], used_bytes),
                     IPCProtocol.COMPLETE,
                 ]
             )
             self.sent = []
+            self.batch_index = -1
+            self.complete = False
 
         def recv_pyobj(self):
-            return next(self.payloads)
+            payload = next(self.payloads)
+            self.complete = payload == IPCProtocol.COMPLETE
+            if not self.complete:
+                self.batch_index += 1
+            return payload
 
         def send(self, payload):
-            if failure is None:
+            if failure != "prepare":
                 assert all(ref() is None for ref in ipc_refs)
-            if len(self.sent) < 2 and failure is None:
-                assert view_refs
-                assert all(view_ref() is None for view_ref in view_refs)
-                calls.append("views_released")
+            if not self.complete:
+                calls.append(("ack", self.batch_index))
+                if failure == "ack" and self.batch_index == 0:
+                    raise RuntimeError("ack failed")
             self.sent.append(payload)
+            if not self.complete:
+                # Native loading must see the owned copy, never reused IPC data.
+                payload_buffer.fill_(0xA5)
 
     model = torch.nn.Linear(1, 1)
     model_config = object()
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
         model=model,
-        vllm_config=object(),
+        vllm_config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                world_size_across_dp=1 if load_after_ack else 2,
+                enable_eplb=False,
+            )
+        ),
     )
     extension.model_config = model_config
     extension.device = torch.device("cuda:0")
     extension.zmq_socket = FakeSocket()
-    extension.state_dict_info = {
-        "decoder.weight": ([2], torch.float32),
-        "decoder.bias": ([2], torch.float32),
-    }
+    extension.state_dict_info = (
+        {}
+        if empty
+        else {
+            "decoder.weight": ([2], torch.float32),
+            "decoder.bias": ([2], torch.float32),
+        }
+    )
     extension.maybe_init_zmq = lambda: None
 
     def load_weights(weights):
+        calls.append(("load", extension.zmq_socket.batch_index))
+        retained.append(weights)
         for name, weight in weights:
-            view_refs.append(weakref.ref(weight))
+            torch.testing.assert_close(weight, payload_weight)
             loaded.append((name, weight.clone()))
-        if failure == "load":
+        if failure in ("load", "load_and_fence"):
             raise RuntimeError("load failed")
 
     model.load_weights = load_weights
@@ -1188,18 +1233,41 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
     def prepare_buffer(buffer, size):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
-        return original_prepare(buffer, size)
+        owned, loader = original_prepare(buffer, size)
+        # dtype views retain storage, not necessarily this Python Tensor wrapper.
+        owned_storage_refs.append(StorageWeakRef(owned.untyped_storage()))
+        return owned, loader
 
     extension._prepare_ipc_weight_buffer = prepare_buffer
 
     def rebuild_buffer(ipc_handle, device_index):
+        payload_buffer[: payload_weight.nbytes].view(torch.float32).copy_(
+            payload_weight
+        )
         buffer = payload_buffer[:]
         ipc_refs.append(weakref.ref(buffer))
         return buffer
 
     def synchronize():
-        assert ipc_refs[-1]() is not None
-        calls.append("sync")
+        index = extension.zmq_socket.batch_index
+        after_ack = len(extension.zmq_socket.sent) > index
+        calls.append(("fence", index, after_ack))
+        if after_ack:
+            assert all(ref() is None for ref in ipc_refs)
+            if not empty:
+                assert not owned_storage_refs[index].expired()
+                assert owned_storage_refs[index] == StorageWeakRef(
+                    retained[-1][0][1].untyped_storage()
+                )
+        else:
+            assert ipc_refs[-1]() is not None
+        if index == 0 and (
+            (failure == "pre_fence" and not after_ack)
+            or (
+                failure in ("load_fence", "load_and_fence") and ("load", index) in calls
+            )
+        ):
+            raise RuntimeError("fence failed")
 
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
@@ -1216,65 +1284,162 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
         "finalize_layerwise_reload",
         lambda model_arg, config_arg: calls.append(("finalize", model_arg, config_arg)),
     )
-    monkeypatch.setattr(
-        base_backend,
-        "rebuild_cuda_tensor_from_ipc",
-        rebuild_buffer,
-    )
+    monkeypatch.setattr(base_backend, "rebuild_cuda_tensor_from_ipc", rebuild_buffer)
     monkeypatch.setattr(
         base_backend.torch.cuda,
         "current_stream",
-        lambda: pytest.fail("real quant must not use a current-stream IPC ACK fence"),
+        lambda: pytest.fail("real quant must use the device-wide IPC fence"),
     )
+    monkeypatch.setattr(backend.torch.accelerator, "synchronize", synchronize)
     monkeypatch.setattr(
-        backend.torch.accelerator,
-        "synchronize",
-        synchronize,
-    )
-    monkeypatch.setattr(
-        base_backend.torch.cuda,
-        "synchronize",
-        lambda: calls.append("sync"),
+        base_backend.torch.cuda, "synchronize", lambda: calls.append("sync")
     )
     monkeypatch.setattr(
         backend.torch.cuda, "empty_cache", lambda: calls.append("empty")
     )
     monkeypatch.setattr(base_backend.gc, "collect", lambda: calls.append("gc"))
 
-    if failure is None:
+    error = {
+        "pre_fence": "fence failed",
+        "load_fence": "fence failed",
+        "load_and_fence": "load failed",
+    }.get(failure, f"{failure} failed")
+    if success:
         assert extension.update_weights_via_ipc_zmq() is True
     else:
-        with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        with pytest.raises(RuntimeError, match=error):
             extension.update_weights_via_ipc_zmq()
 
-    assert extension.zmq_socket.sent == [
-        IPCProtocol.ACK.value.encode(),
-        IPCProtocol.ACK.value.encode(),
-        IPCProtocol.ACK.value.encode(),
-    ]
-    assert [name for name, _ in loaded] == (
-        []
-        if failure == "prepare"
-        else ["decoder.weight"]
-        if failure == "load"
-        else ["decoder.weight", "decoder.bias"]
-    )
-    for _, loaded_weight in loaded:
-        torch.testing.assert_close(loaded_weight, payload_weight)
-    if failure:
-        assert calls == [("initialize", model), "sync"]
+    if success:
+        expected_loads = 2
+    elif failure == "prepare" or (load_after_ack and failure in ("pre_fence", "ack")):
+        expected_loads = 0
     else:
-        assert calls == [
-            ("initialize", model),
-            "sync",
-            "views_released",
-            "sync",
-            "views_released",
-            ("finalize", model, model_config),
-            "sync",
-            "gc",
-            "empty",
-        ]
+        expected_loads = 1
+    assert (
+        sum(isinstance(call, tuple) and call[0] == "load" for call in calls)
+        == expected_loads
+    )
+    assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * (
+        0 if failure == "ack" else 3
+    )
+    if success:
+        assert [[name for name, _ in batch] for batch in retained] == (
+            [[], []] if empty else [["decoder.weight"], ["decoder.bias"]]
+        )
+        for index in range(2):
+            ack = calls.index(("ack", index))
+            load = calls.index(("load", index))
+            assert (ack < load) == load_after_ack
+            assert calls.index(("fence", index, False)) < ack
+            if load_after_ack:
+                assert load < calls.index(("fence", index, True))
+        assert ("finalize", model, model_config) in calls
+    else:
+        assert not any(
+            isinstance(call, tuple) and call[0] == "finalize" for call in calls
+        )
+        assert isinstance(extension._nrl_layerwise_reload_failure, RuntimeError)
+        if failure == "load_and_fence":
+            assert "fence failed" not in str(extension._nrl_layerwise_reload_failure)
+        if load_after_ack and failure in ("load", "load_fence", "load_and_fence"):
+            assert retained == [[]]
+        if load_after_ack and failure == "ack":
+            assert all(ref.expired() for ref in owned_storage_refs)
+        with pytest.raises(RuntimeError, match="unusable after a failed"):
+            extension.update_weights_via_ipc_zmq()
+    if failure in ("load", "load_and_fence"):
+        assert "IPC weight batch load failed" in caplog.text
+        assert "decoder.weight" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("real_quant", "parallel_kwargs", "expected"),
+    [
+        (False, {}, False),
+        (True, {"world_size_across_dp": 1, "enable_eplb": False}, True),
+        (
+            True,
+            {
+                "world_size_across_dp": 1,
+                "enable_eplb": False,
+                "enable_expert_parallel": True,
+            },
+            True,
+        ),
+        (
+            True,
+            {
+                "world_size_across_dp": 2,
+                "enable_eplb": False,
+                "world_size": 1,
+                "tensor_parallel_size": 1,
+                "data_parallel_size": 2,
+            },
+            False,
+        ),
+        (
+            True,
+            {
+                "world_size_across_dp": 2,
+                "enable_eplb": False,
+                "tensor_parallel_size": 1,
+                "prefill_context_parallel_size": 2,
+            },
+            False,
+        ),
+        (
+            True,
+            {
+                "world_size_across_dp": 2,
+                "enable_eplb": False,
+                "tensor_parallel_size": 2,
+            },
+            False,
+        ),
+        (
+            True,
+            {
+                "world_size_across_dp": 2,
+                "enable_eplb": False,
+                "pipeline_parallel_size": 2,
+            },
+            False,
+        ),
+        (True, {"world_size_across_dp": 1, "enable_eplb": True}, False),
+    ],
+    ids=["fake", "singleton", "singleton-ep-flag", "dp", "pcp", "tp", "pp", "eplb"],
+)
+def test_ipc_post_ack_loading_requires_resolved_singleton_without_eplb(
+    monkeypatch: pytest.MonkeyPatch,
+    real_quant: bool,
+    parallel_kwargs: dict[str, int | bool],
+    expected: bool,
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: real_quant
+    extension.model_runner = types.SimpleNamespace()
+    if real_quant:
+        extension.model_runner.vllm_config = types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(**parallel_kwargs)
+        )
+    assert extension._can_load_ipc_weights_after_ack() is expected
+
+
+def test_ipc_post_ack_loading_does_not_assume_missing_world_size_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: True
+    extension.model_runner = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(enable_eplb=False)
+        )
+    )
+    with pytest.raises(AttributeError, match="world_size_across_dp"):
+        extension._can_load_ipc_weights_after_ack()
 
 
 @pytest.mark.parametrize("real_quant", [False, True])

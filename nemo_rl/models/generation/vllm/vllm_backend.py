@@ -1243,6 +1243,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Select the storage and loader for one received IPC packet."""
         return buffer, self._load_weights
 
+    def _can_load_ipc_weights_after_ack(self) -> bool:
+        """Opt in only for independently owned storage and peer-free loading.
+
+        The prepared buffer must not alias IPC storage, and native loading must
+        not issue collectives with peers still exporting or acknowledging data.
+        """
+        return False
+
     def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
         """Return this worker's transport-neutral checkpoint preparer."""
         return None
@@ -1424,8 +1432,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         buffer = None
         weight = None
         weights = None
+        deferred_weights = None
 
         try:
+            load_after_ack = self._can_load_ipc_weights_after_ack()
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
 
@@ -1444,6 +1454,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                         break
 
+                    deferred_weights = None
                     batch_keys = None
                     batch_error = None
                     try:
@@ -1479,7 +1490,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             "inaccurate info like keys or cached dtype in "
                             "state_dict_info"
                         )
-                        load_weights(weights)
+                        if load_after_ack:
+                            deferred_weights, weights = weights, None
+                        else:
+                            load_weights(weights)
                     except Exception as error:
                         batch_error = error
                         # The manifest only keeps the exception message; log
@@ -1504,16 +1518,47 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
                         if batch_error is not None:
                             manifest.record_load_failure(batch_error)
+                            if deferred_weights is not None:
+                                deferred_weights.clear()
+                                deferred_weights = None
                         elif batch_keys is not None:
                             manifest.record_loaded(batch_keys)
 
-                        # Drop every view before ACK permits sender-side reuse.
+                        # Drop transport views before sender-side reuse. An
+                        # opted-in loader retains only independently owned data.
                         del weight, weights, buffer, ipc_buffer
                         weight = None
                         weights = None
                         buffer = None
                         ipc_buffer = None
                         self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+                    if deferred_weights is not None:
+                        try:
+                            load_weights(deferred_weights)
+                        except Exception as error:
+                            batch_error = error
+                            logger.exception(
+                                "Owned IPC weight batch load failed (batch: %s)",
+                                [
+                                    (name, tuple(tensor.shape))
+                                    for name, tensor in deferred_weights[:40]
+                                ],
+                            )
+                        finally:
+                            # ACK released only the transport allocation. Keep
+                            # owned inputs alive until native CUDA work finishes.
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                logger.exception("Failed to fence owned IPC weights")
+                                if batch_error is None:
+                                    batch_error = error
+                            if batch_error is not None:
+                                manifest.record_load_failure(batch_error)
+                                deferred_weights.clear()
+                            # Successful loaders may retain the list itself.
+                            deferred_weights = None
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -1525,7 +1570,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
                 e,
             )
-            return False
+        finally:
+            # ACK can fail before native loading starts; do not retain the owned
+            # packet through the permanently poisoned worker's traceback.
+            deferred_weights = None
+        return False
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"

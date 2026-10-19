@@ -87,6 +87,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             return buffer[:used_bytes].clone(), self.model_runner.model.load_weights
         return super()._prepare_ipc_weight_buffer(buffer, used_bytes)
 
+    def _can_load_ipc_weights_after_ack(self) -> bool:
+        if not self._is_real_quant_model():
+            return False
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        return (
+            parallel_config.world_size_across_dp == 1
+            and not parallel_config.enable_eplb
+        )
+
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
         """Temporarily expose fake-quant activation amax buffers to loaders."""

@@ -1786,6 +1786,7 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
+    assert ext._can_load_ipc_weights_after_ack() is False
     ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
     ext.zmq_socket = FakeSocket()
     ext.maybe_init_zmq = lambda: None
@@ -1860,6 +1861,9 @@ def test_native_ipc_reload_drains_sender_after_loader_failure(monkeypatch):
     ext.model_runner = SimpleNamespace(reload_weights=reload_weights)
     ext.maybe_init_zmq = lambda: None
     ext._get_reload_weight_preparer = lambda: preparer
+    ext._can_load_ipc_weights_after_ack = lambda: pytest.fail(
+        "canonical preparers must dispatch before the legacy scheduling opt-in"
+    )
     ext._weight_update_errors_are_fatal = lambda: True
     ext._synchronize_before_ipc_data_ack = lambda: None
 
