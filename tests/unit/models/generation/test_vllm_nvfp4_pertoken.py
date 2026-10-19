@@ -37,28 +37,32 @@ def nvfp4_module():
     yield M
 
 
-def _quantizer_with_layer_quantized(M, quantized: bool, expected_roles=None):
-    """Build a quantizer around one synthetic Qwen-style target inventory."""
+def _quantizer_with_layer_quantized(
+    M, quantized: bool, expected_roles=None, *, is_gated=True
+):
+    """Build a quantizer around one gated or non-gated target inventory."""
     quantizer = M.NvFp4PerTokenQuantizer.__new__(M.NvFp4PerTokenQuantizer)
     quantizer._model = None
     owner = torch.nn.Module()
+    projections = (
+        (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
+        if is_gated
+        else (("w1", "up_proj"), ("w2", "down_proj"))
+    )
     specs = tuple(
         M.ExpertWeightSpec(
             checkpoint_suffix=f"experts.0.{projection}.weight",
             logical_key="experts.0.<projection>",
             role=role,
         )
-        for role, projection in (
-            ("w1", "gate_proj"),
-            ("w2", "down_proj"),
-            ("w3", "up_proj"),
-        )
+        for role, projection in projections
     )
     if expected_roles is None:
         expected_roles = {("experts.0.<projection>", spec.role) for spec in specs}
     target = M.RoutedExpertTarget(
         module=owner,
         module_name="model.layers.0.mlp.experts",
+        is_gated=is_gated,
         specs=specs,
         specs_by_suffix={spec.checkpoint_suffix: spec for spec in specs},
         expected_roles=frozenset(expected_roles),
@@ -272,14 +276,11 @@ def test_ignored_expert_layer_passes_through_bf16(nvfp4_module):
     assert torch.equal(out[0][1], tensor)
 
 
-def test_boundary_that_matched_no_module_names_is_fatal(nvfp4_module):
-    """A boundary glob that matches nothing must fail, not silently quantize.
+def test_quantized_boundary_layer_is_fatal(nvfp4_module):
+    """Catch a boundary layer quantized despite semantic method selection.
 
-    The ignore patterns are module-name globs shaped like ``mlp.experts``.
-    A MoE family that names its container differently (Mixtral's
-    ``block_sparse_moe.experts``, DBRX's ``ffn.experts``) matches nothing, so
-    every boundary layer would be quantized in the rollout while the trainer
-    keeps it BF16 -- a silent train/rollout precision split.
+    Verification uses the decoder-layer index even when the module path differs
+    from the legacy ``mlp.experts`` spelling in the configuration patterns.
     """
     M = nvfp4_module
     with pytest.raises(RuntimeError, match="BF16 boundary did not match"):
@@ -456,6 +457,7 @@ def test_vllm_mapping_classifies_projection_names_without_hardcoding(
     M = nvfp4_module
 
     class FakeRoutedExperts:
+        moe_config = types.SimpleNamespace(is_act_and_mul=True)
         ckpt_gate_proj_name, ckpt_down_proj_name, ckpt_up_proj_name = projection_names
 
         def get_expert_mapping(self):
@@ -481,6 +483,7 @@ def test_vllm_mapping_rejects_incomplete_projection_group(nvfp4_module):
     M = nvfp4_module
 
     class FakeRoutedExperts:
+        moe_config = types.SimpleNamespace(is_act_and_mul=True)
         ckpt_gate_proj_name = "w1"
         ckpt_down_proj_name = "w2"
         ckpt_up_proj_name = "w3"
@@ -644,7 +647,17 @@ def test_quant_config_keeps_ordinary_linears_unquantized(nvfp4_module, monkeypat
     )
 
 
-def test_quant_config_selects_only_supported_routed_experts(nvfp4_module, monkeypatch):
+@pytest.mark.parametrize(
+    "expert_path",
+    [
+        "model.layers.{layer}.mlp.experts",
+        "backbone.layers.{layer}.mixer.experts",
+        "model.layers.{layer}.block_sparse_moe.experts",
+    ],
+)
+def test_quant_config_selects_only_supported_routed_experts(
+    nvfp4_module, monkeypatch, expert_path: str
+):
     M = nvfp4_module
 
     class FakeRoutedExperts(torch.nn.Module):
@@ -671,19 +684,15 @@ def test_quant_config_selects_only_supported_routed_experts(nvfp4_module, monkey
     )
     config.FusedMoEMethodCls = FakeSelectedMethod
 
-    selected = config.get_quant_method(
-        FakeRoutedExperts(), "model.layers.1.mlp.experts"
-    )
-    excluded = config.get_quant_method(
-        FakeRoutedExperts(), "model.layers.0.mlp.experts"
-    )
+    selected = config.get_quant_method(FakeRoutedExperts(), expert_path.format(layer=1))
+    excluded = config.get_quant_method(FakeRoutedExperts(), expert_path.format(layer=0))
 
     assert isinstance(selected, FakeSelectedMethod)
     assert isinstance(excluded, FakeUnquantizedMethod)
     with pytest.raises(ValueError, match="fused shared experts"):
         config.get_quant_method(
             FakeRoutedExperts(num_fused_shared_experts=1),
-            "model.layers.1.mlp.experts",
+            expert_path.format(layer=1),
         )
 
 
@@ -834,74 +843,14 @@ def test_prequantized_extension_uses_native_ipc_reload(
     assert "[nvfp4_pertoken] refit: quantized 1 expert weight groups" in printed
 
 
-def test_host_captured_experts_cls_disables_in_kernel_capture_for_monolithic(
-    nvfp4_module,
-):
-    """vLLM 0.29 binds routed-experts capture to the experts object of monolithic
-    kernels; the per-token method rebuilds that object on every refit, so it must
-    report no in-kernel capture and let the router hook (vLLM 0.26's path) capture."""
-    M = nvfp4_module
-
-    class Monolithic:
-        @staticmethod
-        def is_monolithic() -> bool:
-            return True
-
-        def supports_routing_replay_capture(self) -> bool:
-            return True
-
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    wrapped = M.host_captured_experts_cls(Monolithic)
-    assert wrapped is not Monolithic
-    assert issubclass(wrapped, Monolithic)
-    assert wrapped.is_monolithic()
-    assert wrapped.__name__ == "HostCapturedMonolithic"
-    instance = wrapped(moe_config="cfg", per_token_activation=True)
-    assert instance.supports_routing_replay_capture() is False
-    assert instance.kwargs == {"moe_config": "cfg", "per_token_activation": True}
-    # Cached so repeated kernel rebuilds keep one class identity.
-    assert M.host_captured_experts_cls(Monolithic) is wrapped
-
-
-def test_host_captured_experts_cls_leaves_modular_kernels_alone(nvfp4_module):
-    M = nvfp4_module
-
-    class Modular:
-        @staticmethod
-        def is_monolithic() -> bool:
-            return False
-
-        def supports_routing_replay_capture(self) -> bool:
-            return True
-
-    assert M.host_captured_experts_cls(Modular) is Modular
-
-
-def test_per_token_method_uses_host_captured_experts(nvfp4_module):
-    """The real vLLM TRT-LLM monolithic experts class is what the wrapper wraps."""
-    M = nvfp4_module
-    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
-        TrtLlmNvFp4ExpertsMonolithic,
-    )
-
-    wrapped = M.host_captured_experts_cls(TrtLlmNvFp4ExpertsMonolithic)
-    assert issubclass(wrapped, TrtLlmNvFp4ExpertsMonolithic)
-    assert wrapped.is_monolithic()
-    assert "TrtLlmNvFp4ExpertsMonolithic" in wrapped.__name__
-    assert wrapped.supports_routing_replay_capture(object.__new__(wrapped)) is False
-
-
 def test_per_token_method_rebuilds_kernel_through_the_installed_vllm_signature(
     nvfp4_module, monkeypatch
 ):
     """The per-refit kernel rebuild must call vLLM's factory as vLLM 0.29 defines it.
 
     0.29 dropped the ``layer`` kwarg (the te_nvfp4_pertoken recipe died with
-    ``TypeError: unexpected keyword argument 'layer'``) and binds routed-experts
-    capture to the experts object, so the rebuilt kernel has to use the
-    host-captured experts class. Binding the recorded kwargs to the installed
+    ``TypeError: unexpected keyword argument 'layer'``). The rebuilt kernel keeps
+    vLLM's own experts class so router replay uses in-kernel capture. Binding the recorded kwargs to the installed
     factory's signature turns the next upstream signature change into a unit
     failure instead of a GPU-job failure.
     """
@@ -928,14 +877,10 @@ def test_per_token_method_rebuilds_kernel_through_the_installed_vllm_signature(
     method = M.ModelOptNvFp4PerTokenFusedMoE(
         quant_config=None, moe_config=types.SimpleNamespace(is_act_and_mul=True)
     )
-    # __init__ swaps in the wrapper that reports no in-kernel capture.
-    assert issubclass(method.experts_cls, TrtLlmNvFp4ExpertsMonolithic)
-    assert method.experts_cls is not TrtLlmNvFp4ExpertsMonolithic
-    assert (
-        method.experts_cls.supports_routing_replay_capture(
-            object.__new__(method.experts_cls)
-        )
-        is False
+    # Router replay relies on the kernel's own routing_replay_out capture.
+    assert method.experts_cls is TrtLlmNvFp4ExpertsMonolithic
+    assert method.experts_cls.supports_routing_replay_capture(
+        object.__new__(method.experts_cls)
     )
 
     signature = inspect.signature(make_nvfp4_moe_kernel)
@@ -1000,3 +945,163 @@ def test_per_token_method_rebuilds_kernel_through_the_installed_vllm_signature(
     assert kwargs["backend"] is NvFp4MoeBackend.FLASHINFER_TRTLLM
     assert kwargs["routing_tables"] == ("routing-tables",)
     assert kwargs["moe_quant_config"] == "quant-config"
+
+
+@pytest.mark.parametrize("reverse_order", [False, True])
+def test_non_gated_projections_quantize_independently(
+    nvfp4_module, monkeypatch, reverse_order: bool
+) -> None:
+    M = nvfp4_module
+    calls = _fake_scaled_fp4_quant(monkeypatch, M)
+    quantizer = _quantizer_with_layer_quantized(M, True, is_gated=False)
+    prefix = "backbone.layers.1.mixer.experts.0"
+    weights = [
+        ("up_proj", torch.full((16, 32), 2.0)),
+        ("down_proj", torch.full((32, 16), 8.0)),
+    ]
+    if reverse_order:
+        weights.reverse()
+    # Each projection can arrive in its own IPC batch, in either order.
+    for projection, weight in weights:
+        emitted = dict(quantizer.process([(f"{prefix}.{projection}.weight", weight)]))
+        assert not quantizer._pending
+        assert set(emitted) == {
+            f"{prefix}.{projection}.{suffix}"
+            for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        }
+        torch.testing.assert_close(
+            emitted[f"{prefix}.{projection}.weight_scale_2"],
+            weight.abs().amax() / (448 * 6),
+        )
+    quantizer.finish()
+    assert len(calls) == 2
+    assert not torch.equal(calls[0][1], calls[1][1])
+    # A new refit must not inherit the previous manifest or projection scales.
+    quantizer.reset()
+    for projection, weight in weights:
+        emitted = dict(
+            quantizer.process([(f"{prefix}.{projection}.weight", weight * 3)])
+        )
+        torch.testing.assert_close(
+            emitted[f"{prefix}.{projection}.weight_scale_2"],
+            weight.abs().amax() * 3 / (448 * 6),
+        )
+    quantizer.finish()
+    assert quantizer._quantized_events == 2
+
+
+@pytest.mark.parametrize("projection", ["up_proj", "down_proj"])
+def test_non_gated_incomplete_and_duplicate_refit_fail(
+    nvfp4_module, monkeypatch, projection: str
+) -> None:
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    quantizer = _quantizer_with_layer_quantized(M, True, is_gated=False)
+    item = (
+        f"backbone.layers.1.mixer.experts.0.{projection}.weight",
+        torch.ones(16, 32),
+    )
+    quantizer.process([item])
+    with pytest.raises(RuntimeError, match="did not cover every selected"):
+        quantizer.finish()
+    with pytest.raises(RuntimeError, match="duplicate"):
+        quantizer.process([item])
+
+
+@pytest.mark.parametrize("extra_w3", [False, True])
+def test_non_gated_mapping_uses_vllm_roles(nvfp4_module, extra_w3: bool) -> None:
+    M = nvfp4_module
+
+    class FakeRoutedExperts:
+        moe_config = types.SimpleNamespace(is_act_and_mul=False)
+        ckpt_gate_proj_name = "up_proj"
+        ckpt_down_proj_name = "down_proj"
+        ckpt_up_proj_name = None
+
+        def get_expert_mapping(self):
+            mapping = [
+                ("experts.w13_", "experts.0.up_proj.", 0, "w1"),
+                ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
+            ]
+            if extra_w3:
+                mapping.append(("experts.w13_", "experts.0.gate_proj.", 0, "w3"))
+            return mapping
+
+    if extra_w3:
+        with pytest.raises(RuntimeError, match="unsupported expert shard"):
+            M._build_expert_target(
+                "backbone.layers.1.mixer.experts", FakeRoutedExperts()
+            )
+    else:
+        target = M._build_expert_target(
+            "backbone.layers.1.mixer.experts", FakeRoutedExperts()
+        )
+        assert not target.is_gated
+        assert target.expected_roles == frozenset(
+            {("experts.0.<projection>", "w1"), ("experts.0.<projection>", "w2")}
+        )
+
+
+@pytest.mark.parametrize("is_gated,alignment", [(True, 256), (False, 512)])
+def test_finalize_uses_activation_specific_alignment(
+    nvfp4_module, monkeypatch, is_gated: bool, alignment: int
+) -> None:
+    M = nvfp4_module
+    layer = torch.nn.Module()
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.ones(2, 16, 16), requires_grad=False)
+        )
+    for name in ("w13_weight_scale_2", "w13_input_scale"):
+        layer.register_parameter(
+            name,
+            torch.nn.Parameter(
+                torch.ones(2, 2 if is_gated else 1), requires_grad=False
+            ),
+        )
+    for name in ("w2_weight_scale_2", "w2_input_scale"):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        )
+    layer._expert_routing_tables = lambda: None
+    captured = []
+
+    def convert(**kwargs):
+        captured.append(kwargs)
+        assert kwargs["trtllm_hidden_alignment"] == alignment
+        assert kwargs["is_act_and_mul"] == is_gated
+        assert kwargs["w13_scale_2"].shape == (2,)
+        return tuple(
+            kwargs[key]
+            for key in (
+                "w13",
+                "w13_scale",
+                "w13_scale_2",
+                "a13_scale",
+                "w2",
+                "w2_scale",
+                "w2_scale_2",
+                "a2_scale",
+            )
+        )
+
+    def make_kernel(**kwargs):
+        assert kwargs["per_token_activation"] is True
+        return types.SimpleNamespace(
+            fused_experts=types.SimpleNamespace(
+                process_weights_after_loading=lambda layer: None
+            )
+        )
+
+    monkeypatch.setattr(M, "convert_to_nvfp4_moe_kernel_format", convert)
+    monkeypatch.setattr(M, "make_nvfp4_moe_kernel", make_kernel)
+    method = types.SimpleNamespace(
+        moe=types.SimpleNamespace(is_act_and_mul=is_gated),
+        nvfp4_backend=M.NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        experts_cls=object,
+        get_fused_moe_quant_config=lambda layer: None,
+    )
+    M.ModelOptNvFp4PerTokenFusedMoE.process_weights_after_loading(method, layer)
+    assert len(captured) == 1
+    torch.testing.assert_close(layer.w13_input_scale, torch.ones(2))
+    torch.testing.assert_close(layer.w2_input_scale, torch.ones(2))

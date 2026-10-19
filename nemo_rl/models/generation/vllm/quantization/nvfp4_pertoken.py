@@ -22,7 +22,7 @@ refit transport remain BF16.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType, new_class
+from types import MappingProxyType
 from typing import Any, Literal, Optional, cast
 
 import torch
@@ -40,6 +40,9 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    trtllm_nvfp4_hidden_alignment,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.utils import replace_parameter
@@ -104,13 +107,16 @@ class RoutedExpertTarget:
 
     module: RoutedExperts
     module_name: str
+    is_gated: bool
     specs: tuple[ExpertWeightSpec, ...]
     specs_by_suffix: Mapping[str, ExpertWeightSpec]
     expected_roles: frozenset[tuple[str, ProjectionRole]]
 
 
 def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExpertTarget:
-    """Build and validate the checkpoint W1/W2/W3 map exposed by vLLM."""
+    """Validate checkpoint projections against the destination expert structure."""
+    is_gated = module.moe_config.is_act_and_mul
+    required_roles = {"w1", "w2", "w3"} if is_gated else {"w1", "w2"}
     projection_names = {
         "w1": module.ckpt_gate_proj_name,
         "w2": module.ckpt_down_proj_name,
@@ -118,7 +124,7 @@ def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExper
     }
     specs_by_suffix: dict[str, ExpertWeightSpec] = {}
     for _param_name, weight_name, _expert_id, shard_id in module.get_expert_mapping():
-        if shard_id not in projection_names:
+        if shard_id not in required_roles:
             raise RuntimeError(
                 f"[nvfp4_pertoken] {module_name} returned unsupported expert "
                 f"shard {shard_id!r} for {weight_name!r}."
@@ -153,14 +159,14 @@ def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExper
     for spec in specs_by_suffix.values():
         roles_by_key.setdefault(spec.logical_key, set()).add(spec.role)
     incomplete = {
-        key: sorted({"w1", "w2", "w3"} - roles)
+        key: sorted(required_roles - roles)
         for key, roles in roles_by_key.items()
-        if roles != {"w1", "w2", "w3"}
+        if roles != required_roles
     }
     if not specs_by_suffix or incomplete:
         raise RuntimeError(
             f"[nvfp4_pertoken] incomplete vLLM expert mapping for {module_name}: "
-            f"missing roles {incomplete or 'all W1/W2/W3 entries'}."
+            f"missing roles {incomplete or sorted(required_roles)}."
         )
 
     specs = tuple(
@@ -172,6 +178,7 @@ def _build_expert_target(module_name: str, module: RoutedExperts) -> RoutedExper
     return RoutedExpertTarget(
         module=module,
         module_name=module_name,
+        is_gated=is_gated,
         specs=specs,
         specs_by_suffix=MappingProxyType(dict(specs_by_suffix)),
         expected_roles=frozenset((spec.logical_key, spec.role) for spec in specs),
@@ -182,12 +189,13 @@ class NvFp4PerTokenQuantizer:
     """Quantizes routed-expert weights to NVFP4 during vLLM-side weight refit.
 
     Stateful only over a single W1/W3 pair per logical expert — never a whole
-    layer — so memory stays bounded regardless of expert count. W1 and W3
+    layer — so memory stays bounded regardless of expert count. Gated W1 and W3
     share one global scale (vLLM's
     ``ModelOptNvFp4FusedMoE.process_weights_after_loading`` collapses
     ``w13_weight_scale_2`` to column 0, so independently-scaled halves would
     decode W3 with W1's scale), so quantization is deferred until both halves
-    arrive. Projection names and expert identities come exclusively from each
+    arrive. Non-gated W1 and all W2 projections are quantized independently.
+    Projection names and expert identities come exclusively from each
     destination ``RoutedExperts.get_expert_mapping()``; no model-family naming
     convention is assumed.
     """
@@ -261,12 +269,10 @@ class NvFp4PerTokenQuantizer:
     ) -> None:
         """Fail closed when the BF16 boundary did not land where it was derived.
 
-        The ignore patterns are module-name globs, so a model family whose
-        routed experts are not named ``mlp.experts`` matches nothing and every
-        boundary layer would silently be quantized while the trainer keeps it
-        BF16. Compare the decisions this worker actually made against the layer
-        indices the patterns encode, restricted to the layers this pipeline
-        stage owns.
+        Compare the decisions this worker actually made against the semantic
+        decoder-layer indices encoded in the boundary patterns, restricted to
+        the layers this pipeline stage owns. This also catches a configuration
+        or loader change that bypassed our layer-based method selection.
         """
         if boundary_patterns is None:
             # No local NVFP4 target: a pipeline stage may legitimately own only
@@ -360,7 +366,7 @@ class NvFp4PerTokenQuantizer:
                 )
             seen_roles.add(role_key)
             source_prefix = name.removesuffix(".weight")
-            if spec.role == "w2":
+            if spec.role == "w2" or not target.is_gated:
                 out.extend(self._quantize(source_prefix, weight=tensor))
                 continue
 
@@ -468,7 +474,7 @@ class NvFp4PerTokenQuantizer:
         than let that pass unnoticed (mirrors
         ``_IPCWeightManifest.require_complete``).
 
-        Every selected local target must receive its complete W1/W2/W3
+        Every selected local target must receive its complete projection
         inventory. A PP worker owning only BF16 boundary layers may have no
         selected local target; the driver preflight separately rejects a
         globally dense-only model. Use print because Ray workers default to
@@ -499,7 +505,7 @@ class NvFp4PerTokenQuantizer:
         if missing:
             preview = {module_name: roles[:8] for module_name, roles in missing.items()}
             raise RuntimeError(
-                "[nvfp4_pertoken] refit did not cover every selected W1/W2/W3 "
+                "[nvfp4_pertoken] refit did not cover every selected projection "
                 f"target (first missing entries): {preview}"
             )
         if self._targets and self._quantized_events == 0:
@@ -512,48 +518,6 @@ class NvFp4PerTokenQuantizer:
             f"weight groups across {len(self._targets)} RoutedExperts containers",
             flush=True,
         )
-
-
-class _HostCapturedRoutingMixin:
-    """Report no in-kernel routing capture so vLLM binds it to the router."""
-
-    def supports_routing_replay_capture(self) -> bool:
-        return False
-
-
-_HOST_CAPTURED_EXPERTS_CLS: dict[type, type] = {}
-
-
-def host_captured_experts_cls(experts_cls: type) -> type:
-    """Return ``experts_cls`` with in-kernel routed-experts capture disabled.
-
-    vLLM 0.29 binds ``RoutedExpertsCapturer`` to a monolithic kernel's experts
-    *object* (``supports_routing_replay_capture`` / ``set_capture_fn``) and the
-    FlashInfer launch then fills ``routing_replay_out`` itself.
-    ``ModelOptNvFp4PerTokenFusedMoE.process_weights_after_loading`` rebuilds the
-    kernel on every cold and warm refit, so a capture function bound to the
-    experts object is gone after the first weight update and every later rollout
-    would hand router replay all-zero routes. Reporting no in-kernel capture makes
-    NeMo-RL's binder fallback (``patches._patch_vllm_routed_experts_capture_router_fallback``)
-    attach the capture to the layer's router, where
-    ``patches._patch_vllm_moe_routed_experts_capture`` fires ``select_experts``
-    on the monolithic branch — the path this method used on vLLM 0.26.
-    Non-monolithic experts classes already capture through the router and are
-    returned unchanged. The subclass keeps the original name as a suffix
-    because vLLM logs and duck-types on ``type(...).__name__``.
-    """
-    is_monolithic = getattr(experts_cls, "is_monolithic", None)
-    if not callable(is_monolithic) or not is_monolithic():
-        return experts_cls
-    cached = _HOST_CAPTURED_EXPERTS_CLS.get(experts_cls)
-    if cached is None:
-        cached = new_class(
-            f"HostCaptured{experts_cls.__name__}",
-            (_HostCapturedRoutingMixin, experts_cls),
-            exec_body=lambda namespace: namespace.update(__module__=__name__),
-        )
-        _HOST_CAPTURED_EXPERTS_CLS[experts_cls] = cached
-    return cached
 
 
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
@@ -588,10 +552,8 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
                 f"{NVFP4_PER_TOKEN_METHOD} requires the FlashInfer TRT-LLM MoE "
                 f"backend, got {self.nvfp4_backend}."
             )
-        # Router replay must survive the per-refit kernel rebuild below, so
-        # routed-experts capture goes through the router, not the kernel.
-        assert self.experts_cls is not None
-        self.experts_cls = host_captured_experts_cls(self.experts_cls)
+        # Router replay keeps vLLM's in-kernel capture: its layer-owned
+        # RoutedExpertsSink survives the per-refit kernel rebuild below.
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.
@@ -642,6 +604,10 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            trtllm_hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                per_token_activation=True,
+                is_act_and_mul=self.moe.is_act_and_mul,
+            ),
         )
 
         # Stride-0 expanded scale views break layerwise-reload finalize
@@ -688,7 +654,12 @@ class NvFp4PerTokenConfig(ModelOptNvFp4Config):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         """Quantize selected RoutedExperts and keep all ordinary linears BF16."""
         if isinstance(layer, RoutedExperts):
-            if self.is_layer_excluded(prefix):
+            # These exclusions encode Megatron decoder-layer boundaries, not
+            # architecture-specific module names. NemotronH uses mixer.experts
+            # where Qwen uses mlp.experts; both must honor the same layer index.
+            if module_layer_index(prefix) in boundary_layer_indices(
+                self.exclude_modules
+            ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             num_fused_shared_experts = int(
                 getattr(layer.expert_map_manager, "num_fused_shared_experts", 0)

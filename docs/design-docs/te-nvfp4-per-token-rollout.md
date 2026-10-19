@@ -67,9 +67,12 @@ iterator to vLLM's native `reload_weights` API. Routed-expert projections are
 quantized at load time, mirroring the fp8/mxfp8 real-quant rollout path. NeMo RL
 resolves the destination `RoutedExperts` container and classifies W1/W2/W3 from
 that container's vLLM checkpoint mapping; it does not maintain model-family
-projection names. W1 and W3 (often gate and up) share one per-expert global
-scale, while W2 (often down) is quantized independently. BF16 boundary layers
-pass through unchanged.
+projection names. For gated experts, W1 and W3 (often gate and up) share one
+per-expert global scale, while W2 (often down) is quantized independently.
+For non-gated experts, vLLM's `moe_config.is_act_and_mul` is false and its
+checkpoint mapping contains only W1 (up) and W2 (down). Both are quantized
+independently; no W3 pairing or concatenation is performed. BF16 boundary
+layers pass through unchanged.
 
 The IPC allocation is acknowledged only after quantization and passthrough
 copies no longer depend on it. The final COMPLETE message is acknowledged only
@@ -137,7 +140,22 @@ The rollout BF16 exclusions are derived from the effective
 `num_layers_at_end_in_bf16` settings, so recipes do not duplicate layer paths.
 For migration, an explicit `additional_ignore` is accepted only when it uses
 complete `*.layers.<index>.mlp.experts*` patterns and exactly matches that
-derived boundary.
+derived boundary. At method selection, these patterns encode decoder-layer
+indices rather than literal module paths, so `mixer.experts` and `mlp.experts`
+honor the same training precision boundary.
+
+## Nemotron 3.5 Lightning
+
+Lightning (30B-A3B) has non-gated ReLU² routed experts. Only the routed experts
+are quantized; Mamba, attention and shared experts stay BF16. Two recipes use 8 nodes
+× 4 GPUs (TP=2, EP=8): `grpo-nemotron35-lightning-30ba3b-8n4g-megatron-te-nvfp4-pertoken.yaml`
+and a 20-step `-quick` variant for nightly coverage. They require:
+
+- The pinned vLLM nightly (`fb2ac82`) and FlashInfer `0.7.0.post1`, which add
+  non-gated per-token NVFP4 kernels and pad the hidden size (2688 to 3072).
+- `vllm_kwargs.async_scheduling: false`. With routed experts returned, this
+  nightly asserts when the post-refit prefix-cache reset meets an in-flight step.
+- The `mcp<2` override in `pyproject.toml` until Gym supports MCP 2.
 
 ## Validated Configuration
 
@@ -171,7 +189,7 @@ models, but this release has the following enforced or validated boundaries:
 
 | Area | Current limitation |
 |---|---|
-| Model layout | Requires a vLLM `RoutedExperts` container with an unambiguous W1/W2/W3 checkpoint mapping; dense-only models are rejected |
+| Model layout | Requires a vLLM `RoutedExperts` container with an unambiguous W1/W2/W3 (gated) or W1/W2 (non-gated) checkpoint mapping; dense-only models are rejected |
 | Quantized modules | Routed-expert MLP projections only; dense MLPs, attention, routers, and shared experts remain BF16 |
 | Shared-expert fusion | A layout that fuses shared experts into the selected `RoutedExperts` container is rejected |
 | Hardware and kernel | NVIDIA Blackwell with the FlashInfer TRT-LLM NVFP4 fused-MoE backend; GB200 is validated |
