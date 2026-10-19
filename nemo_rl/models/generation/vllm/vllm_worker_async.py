@@ -16,19 +16,30 @@ import asyncio
 import copy
 import gc
 import logging
+import secrets
 import threading
 import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from typing import Any, AsyncGenerator, Optional, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
+from nemo_rl.data.captured_media import (
+    CapturedMedia,
+    CapturedMediaItem,
+    MediaCaptureRejected,
+    MediaColumnSpec,
+    capture_processed_media,
+)
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
@@ -37,10 +48,14 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
+)
+from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
+    CapturedChatLogprobsMixin,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
@@ -53,16 +68,68 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
-    replace_prefix_tokens,
+    PrefixSplice,
+    splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from nemo_gym.token_id_capture.staging.capture import ActiveCall
+
+
+@dataclass
+class CapturedRequest:
+    """Request-local ownership of tokens and processed-media snapshots."""
+
+    call: "ActiveCall"
+    prompt_token_ids: list[int]
+    media: CapturedMedia | None
+
+
+# Paths the bearer-token check protects: the OpenAI-compatible routes this module
+# registers, which NeMo-Gym's model server calls. The sparse-refit routes the
+# receiver registers on the same app carry their own header token
+# (vllm_sparse_refit.setup_api_server) and are not covered.
+HTTP_SERVER_PROTECTED_PATH_PREFIXES = ("/v1/", "/tokenize")
+
+
+def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
+    """Refuse OpenAI-route requests that do not carry ``Authorization: Bearer <api_key>``.
+
+    Registers an HTTP middleware on ``app``. For a request whose path starts with one
+    of ``HTTP_SERVER_PROTECTED_PATH_PREFIXES``, the ``Authorization`` header is
+    compared in constant time with ``Bearer <api_key>``; a missing or different
+    value is answered with HTTP 401 in OpenAI's error envelope and never reaches the
+    route. Requests to other paths pass through unchanged.
+    """
+    expected = f"Bearer {api_key}".encode()
+
+    @app.middleware("http")
+    async def _require_bearer_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path.startswith(HTTP_SERVER_PROTECTED_PATH_PREFIXES):
+            supplied = (request.headers.get("Authorization") or "").encode()
+            if not secrets.compare_digest(supplied, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "missing or invalid bearer token",
+                            "type": "authentication_error",
+                            "code": 401,
+                        }
+                    },
+                )
+        return await call_next(request)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -212,9 +279,17 @@ class VllmAsyncGenerationWorkerImpl(
         # the set_rollout_weight_version fan-out from the SC's _sync_weights.
         self.token_capture = None
         self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): (ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time).
-        self._capture_calls: dict[int, tuple[Any, list[int]]] = {}
+        # In-flight captured calls keyed by id(request): the ActiveCall, the
+        # exact engine prompt ids recorded at preprocess time, and the media
+        # snapshot the engine ran on (see CapturedRequest).
+        self._capture_calls: dict[int, CapturedRequest] = {}
+        self._capture_media = False
+        self._capture_patch_size: int | None = None
+        self._capture_image_token_id: int | None = None
+        # TQTokenSource installed by setup_token_capture. The media path reads
+        # parent-chain rows through it directly; prefix resolution goes through
+        # the shared ChainPrefixCache below.
+        self._staging_source: Any | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -242,6 +317,27 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the inner TP workers.
+
+        The async engine's collective_rpc is a coroutine; the inherited sync
+        start_gpu_profiling would drop it un-awaited, so the inner TP workers
+        never receive cudaProfilerStart. Await it here so every inner worker starts.
+        This outer actor deliberately does not call cudaProfilerStart itself, so its
+        own nsys session never opens a capture and writes no report.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the inner TP workers.
+
+        Awaits collective_rpc("stop_gpu_profiling") so cudaProfilerStop reaches every
+        inner worker and ends its capture.
+        """
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
@@ -494,18 +590,23 @@ class VllmAsyncGenerationWorkerImpl(
         self.token_capture = capture
 
     async def setup_token_capture(
-        self, dp_cfg: dict[str, Any], staging_partition: str
-    ) -> bool:
+        self,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
         Fan-out target (token_capture.enabled only): builds the in-worker
         data-plane client and TQTokenSink, then makes the single
         ``install_capture`` call wiring Gym's engine-blind capture core +
-        vLLM adapter into this worker. Returns whether capture was installed
-        (False on non-model-owner ranks, which serve no HTTP).
+        vLLM adapter into this worker. Returns the media column spec this
+        worker pinned the staging column to (``None`` for text-only capture
+        and on non-model-owner ranks, which serve no HTTP and install nothing).
         """
         if not self.is_model_owner:
-            return False
+            return None
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -513,18 +614,66 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        sink = TQTokenSink(dp_client, staging_partition=staging_partition)
-        self._chain_prefix.install(
-            TQTokenSource(dp_client, staging_partition=staging_partition)
+        # Own no segment: a save would otherwise wait on this actor, whose event
+        # loop is busy serving rollouts. Capture writes land in other segments.
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        # The Omni processor emits pixels in the engine's model dtype; the
+        # sink pins its media column to it so text-call sentinels never
+        # introduce a second dtype (TQ keeps one dtype per field).
+        pixel_dtype = self.llm.model_config.dtype if capture_media else None
+        sink = TQTokenSink(
+            dp_client,
+            staging_partition=staging_partition,
+            capture_media=capture_media,
+            media_pixel_dtype=pixel_dtype,
         )
+        if capture_media:
+            # Omni-only: a new processor family must also change setup.py (driver
+            # checks), captured_media.py (_processed_omni_tensors, pack_images,
+            # capture_processed_media), tq_token_sink.py (MEDIA_TENSOR_COLUMNS,
+            # validate_media_tensors, fetch_media) and rollout_reassembler.py
+            # (_concat_media, _trainer_media).
+            # Optional engine/Gym capabilities are checked only on VLM workers.
+            from vllm.model_executor.models.nano_nemotron_vl import (
+                NanoNemotronVLProcessingInfo,
+            )
+
+            info = self.llm.renderer.get_mm_processor().info
+            if (
+                not isinstance(info, NanoNemotronVLProcessingInfo)
+                or not info.is_dynamic_tiler
+            ):
+                raise ValueError(
+                    "Media capture requires vLLM's Omni dynamic-resolution processor"
+                )
+            if info.get_video_pruning_rate():
+                raise ValueError(
+                    "Omni media capture does not support video token pruning"
+                )
+            context_ids = info.get_hf_processor()._img_context_token_ids
+            if len(context_ids) != 1:
+                raise ValueError(
+                    "Omni media capture requires one image-context token ID"
+                )
+            self._capture_image_token_id = int(context_ids[0])
+            self._capture_patch_size = int(info.get_hf_config().patch_size)
+        self._capture_media = capture_media
+        source = TQTokenSource(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
+        self._staging_source = source
+        self._chain_prefix.install(source)
         install_capture(
             self,
             sink=sink,
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
-        return True
+        if not capture_media:
+            return None
+        return MediaColumnSpec(
+            pixel_dtype=pixel_dtype, patch_size=self._capture_patch_size
+        )
 
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
@@ -556,6 +705,7 @@ class VllmAsyncGenerationWorkerImpl(
         *,
         admission: Any | None = None,
         prefix_token_ids: list[int] | None = None,
+        media: CapturedMedia | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
@@ -581,7 +731,105 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
-        self._capture_calls[id(request)] = (call, list(prompt_token_ids))
+        self._capture_calls[id(request)] = CapturedRequest(
+            call, list(prompt_token_ids), media
+        )
+
+    def _capture_request_media(
+        self,
+        engine_prompt: dict[str, Any],
+        *,
+        admission: Any | None,
+        splice: PrefixSplice | None = None,
+    ) -> CapturedMedia | None:
+        """Run off-loop: resolve retained geometry and snapshot processed pixels."""
+        if admission is None:
+            return None
+        if not self._capture_media:
+            if engine_prompt.get("mm_placeholders") or engine_prompt.get("mm_kwargs"):
+                raise MediaCaptureRejected(
+                    "Multimodal token capture requires media capture setup"
+                )
+            return None
+        retained: tuple[CapturedMediaItem, ...] = ()
+        if admission.parent_call_id is not None:
+            # Optional Gym dependency: this method only runs on captured calls.
+            # Gym owns the media_spans key its adapter copies into the extras.
+            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+            from nemo_gym.token_id_capture.staging.digest import compute_chain_hash
+            from nemo_gym.token_id_capture.staging.records import staging_key
+
+            source = self._staging_source
+            if source is None:
+                raise RuntimeError("Media capture staging source is not initialized")
+            try:
+                if admission.staging_chain:
+                    calls = source.fetch_for_finalization(
+                        list(admission.staging_chain), include_route_fragments=False
+                    )
+                else:
+                    # Inline token admissions still have receipt-owned parent keys.
+                    calls, visited = [], set()
+                    parent = admission.parent_call_id
+                    while parent is not None:
+                        if parent in visited:
+                            raise MediaCaptureRejected("Cycle in retained media chain")
+                        visited.add(parent)
+                        call = source.fetch_for_finalization(
+                            [staging_key(admission.rollout_id, parent)],
+                            include_route_fragments=False,
+                        )[0]
+                        calls.append(call)
+                        parent = call.snapshot.parent_call_id
+                    calls.reverse()
+            except (KeyError, MediaMetadataIntegrityError) as error:
+                raise MediaCaptureRejected(
+                    f"Invalid retained media metadata: {error}"
+                ) from error
+            parent, length, chain_hash = None, 0, None
+            for call in calls:
+                snapshot = call.snapshot
+                if (
+                    snapshot.rollout_id != admission.rollout_id
+                    or snapshot.parent_call_id != parent
+                    or snapshot.prev_len != length
+                    or snapshot.chain_hash
+                    != compute_chain_hash(chain_hash, snapshot.token_ids_delta)
+                ):
+                    raise MediaCaptureRejected("Invalid retained media call chain")
+                parent, length, chain_hash = (
+                    snapshot.model_call_id,
+                    snapshot.cum_len,
+                    snapshot.chain_hash,
+                )
+            if (parent, length, chain_hash) != (
+                admission.parent_call_id,
+                admission.prev_len,
+                admission.parent_chain_hash,
+            ):
+                raise MediaCaptureRejected(
+                    "Retained image chain does not match capture admission"
+                )
+            retained_items = []
+            for call in calls:
+                extras = call.extras or {}
+                if MEDIA_SPANS_FIELD not in extras:
+                    raise MediaCaptureRejected("Retained vLLM media spans are missing")
+                for value in extras[MEDIA_SPANS_FIELD]:
+                    item = CapturedMediaItem.from_dict(value)
+                    item.verify_tokens(
+                        call.snapshot.token_ids_delta, origin=call.snapshot.prev_len
+                    )
+                    retained_items.append(item)
+            retained = tuple(retained_items)
+        return capture_processed_media(
+            engine_prompt,
+            prev_len=admission.prev_len,
+            retained=retained,
+            splice=splice,
+            image_token_id=self._capture_image_token_id,
+            patch_size=self._capture_patch_size,
+        )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Resolve a staging chain through the shared, cached TQ read."""
@@ -610,7 +858,7 @@ class VllmAsyncGenerationWorkerImpl(
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
     ) -> None:
-        """Normalize optional vLLM routes to the exact staged token delta."""
+        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -643,7 +891,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"route length {experts.shape[0]} does not match engine sequence "
                     f"length {expected_full_len}"
                 )
-            message["routed_experts"] = encode_routed_experts(experts[prev_len:])
+            start = prev_len - boundary_route_rows(prev_len)
+            message["routed_experts"] = encode_routed_experts(experts[start:])
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -655,22 +904,28 @@ class VllmAsyncGenerationWorkerImpl(
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Fail-closed: the sink write happens inside complete_call —
-        the coords exist only after the bytes are durable, and any capture
-        failure degrades to capture_failed coords without breaking the
-        completion. Token ids and logprobs are stripped: the staged delta is
-        the only token store on this path, so the worker->gate hop carries
-        text + delta ids + coords only.
+        Tokens and the call's new media tensors go to TQ in one write (the
+        media ride as opaque attachments beside the record), so ``staged``
+        coords vouch for both and any failure is ``capture_failed`` at call
+        time. Token ids, logprobs, and routes are stripped after staging, so
+        the worker->gate hop carries the completion and coords only.
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
-        call, prompt_token_ids = state
+        call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
         # preprocess-time engine prompt off the payload (see
         # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
         payload["prompt_token_ids"] = prompt_token_ids
+        if state.media is not None:
+            # Optional Gym dependency: only captured media calls reach here.
+            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+            # Placeholder metadata (offsets, token hashes, sizes) rides the
+            # digest-covered extras; the pixels themselves are attachments.
+            payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
         if adapter is not None:
             try:
@@ -683,7 +938,11 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(call, payload)
+        coords = self.token_capture.complete_call_from_response(
+            call,
+            payload,
+            attachments=state.media.tensors if state.media is not None else None,
+        )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -704,7 +963,7 @@ class VllmAsyncGenerationWorkerImpl(
         """Drop the in-flight capture state for a request that errored."""
         state = self._capture_calls.pop(id(request), None)
         if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state[0], reason=reason)
+            self.token_capture.fail_call(state.call, reason=reason)
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -737,6 +996,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -842,6 +1102,13 @@ class VllmAsyncGenerationWorkerImpl(
                         message["tool_calls"] = list(message["tool_calls"])
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+                # #4124: processor-only cache reads retain concrete pixels even
+                # when the engine's sender cache would return references.
+                if (
+                    worker_self._capture_media
+                    and worker_self._capture_admission(request) is not None
+                ):
+                    skip_mm_cache = True
 
                 # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
                 # the actual value will be set through _clamp_max_tokens later.
@@ -907,8 +1174,16 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
+                    media = await asyncio.to_thread(
+                        worker_self._capture_request_media,
+                        res[1][0],
+                        admission=admission,
+                    )
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"], admission=admission
+                        request,
+                        res[1][0]["prompt_token_ids"],
+                        admission=admission,
+                        media=media,
                     )
                     return res
 
@@ -952,13 +1227,19 @@ class VllmAsyncGenerationWorkerImpl(
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
+                splice = splice_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
-
+                final_prompt_token_ids = splice.token_ids
+                media = await asyncio.to_thread(
+                    worker_self._capture_request_media,
+                    engine_prompt,
+                    admission=admission,
+                    splice=splice,
+                )
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Clamp after prefix replacement since the prompt length may have changed.
@@ -977,6 +1258,7 @@ class VllmAsyncGenerationWorkerImpl(
                     final_prompt_token_ids,
                     admission=admission,
                     prefix_token_ids=capture_prefix_token_ids,
+                    media=media,
                 )
 
                 return res
@@ -1024,19 +1306,44 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                cancelled = False
 
                 async def capture_result_generator():
-                    nonlocal final_res
-                    async for res in result_generator:
-                        final_res = res
-                        yield res
+                    nonlocal final_res, cancelled
+                    try:
+                        async for res in result_generator:
+                            final_res = res
+                            yield res
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
 
-                response = await super().chat_completion_full_generator(
-                    request,
-                    capture_result_generator(),
-                    *args,
-                    **kwargs,
+                # Capture stages the raw arrays below and strips OpenAI logprobs
+                # after the terminal PUT. Skip only their object construction;
+                # changing request.logprobs would also change engine sampling.
+                bypass_logprobs = bool(
+                    not request.stream
+                    and request.logprobs
+                    and return_as_token_id
+                    and id(request) in worker_self._capture_calls
                 )
+                with self._bypass_chat_logprobs(enabled=bypass_logprobs):
+                    response = await super().chat_completion_full_generator(
+                        request,
+                        capture_result_generator(),
+                        *args,
+                        **kwargs,
+                    )
+                if cancelled:
+                    # vLLM's chat_completion_full_generator catches the
+                    # CancelledError that with_cancellation throws into the
+                    # handler task on a client disconnect and returns
+                    # ErrorResponse("Client disconnected") instead of
+                    # re-raising. Nobody reads that response (the wrapper has
+                    # already returned), and letting it through would make the
+                    # route label the capture "error_response". Re-raise so the
+                    # task finishes cancelled and the route sees the disconnect.
+                    raise asyncio.CancelledError()
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1060,7 +1367,11 @@ class VllmAsyncGenerationWorkerImpl(
 
                 return response
 
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(
+            NeMoRLOpenAIServingChatMixin,
+            CapturedChatLogprobsMixin,
+            OpenAIServingChat,
+        ):
             pass
 
         class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
@@ -1140,6 +1451,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
+        # Like vLLM's own routes: cancel the handler (and with it the engine
+        # request) when the client disconnects, instead of generating for nobody.
+        @with_cancellation
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
@@ -1205,6 +1519,59 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except MediaCaptureRejected as e:
+                # Raised inside preprocess_chat before begin_call, so no capture
+                # state exists yet and the abort below is a no-op kept for
+                # symmetry. Return a 400 carrying a stable code so Gym and the
+                # worker log can distinguish a retained-media re-tile from a
+                # real engine error (which stays a 500 below).
+                worker_self._abort_request_capture(request, reason=e.code)
+                LOGGER.warning(
+                    "Rejected captured call before inference (%s): %s", e.code, e
+                )
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": e.code,
+                        }
+                    },
+                    status_code=400,
+                )
+            except ValueError as e:
+                # vLLM's get_max_tokens raises a plain ValueError ("Input length
+                # (N) exceeds model's maximum context length (M).") after
+                # preprocess_chat, e.g. when a token-in splice grows the prompt
+                # past max_model_len on a request with no max_tokens to clamp.
+                # Convert only that overflow to the same 400 as above; any other
+                # ValueError is a server bug and stays a 500. Must follow
+                # MediaCaptureRejected, which is also a ValueError.
+                if "maximum context length" not in str(e):
+                    # Re-raising here bypasses the BaseException handler below.
+                    worker_self._abort_request_capture(request, reason="engine_error")
+                    raise
+                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
+                worker_self._abort_request_capture(request, reason="context_length")
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
+            except asyncio.CancelledError:
+                # Client disconnected (see with_cancellation above). A cancel
+                # before generation starts propagates here directly; one that
+                # lands mid-generation is swallowed by vLLM and re-raised by
+                # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+                worker_self._abort_request_capture(request, reason="client_disconnect")
+                raise
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1223,9 +1590,17 @@ class VllmAsyncGenerationWorkerImpl(
                 # response; strips logprobs/ids (no-op when capture is off).
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                try:
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
+                except asyncio.CancelledError:
+                    # Queued executor work may never start after cancellation.
+                    # If staging already claimed the capture, abort is a no-op.
+                    worker_self._abort_request_capture(
+                        request, reason="client_disconnect"
+                    )
+                    raise
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
@@ -1337,6 +1712,10 @@ class VllmAsyncGenerationWorkerImpl(
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
+        # Present only when the driver generated a key (vllm_cfg.http_server_api_key_required).
+        http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
+        if http_server_api_key:
+            install_http_server_api_key_check(app, http_server_api_key)
 
         ########################################
         # Server spinup
@@ -1462,6 +1841,7 @@ class VllmAsyncGenerationWorkerImpl(
             """Process a single sample and return the result."""
             current_input_actual_length = input_lengths_batch[sample_idx].item()
             prompt = format_prompt_for_vllm_generation(data, sample_idx)
+            prompt = self._tokenize_prompt_with_bos(prompt)
 
             per_sample_stop_strings = None
             if batch_specific_stop_strings_list and sample_idx < len(
@@ -1553,6 +1933,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
+
+            validate_rollout_prompt(
+                input_ids_batch[sample_idx, :current_input_actual_length].tolist(),
+                final_request_output.prompt_token_ids,
+            )
 
             # Process the output
             generation_details = final_request_output.outputs[0]
@@ -1738,7 +2123,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Create tasks for each prompt
         async def process_single_prompt(prompt_idx):
             """Process a single prompt and return the result."""
-            prompt = prompts[prompt_idx]
+            prompt = self._tokenize_prompt_with_bos(prompts[prompt_idx])
 
             # Get stop strings for this specific prompt
             per_prompt_stop_strings = None
@@ -1825,9 +2210,20 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""

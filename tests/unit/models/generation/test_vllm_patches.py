@@ -46,8 +46,10 @@ import torch
 
 from nemo_rl.models.generation.vllm import patches
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
     vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
 )
 from tests.unit.models.generation.vllm_patch_source_utils import (
     patch_snippets,
@@ -59,7 +61,7 @@ _PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
 _MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
-_RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
+_RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
 _GLM_DSA_SOURCE = "model_executor/models/deepseek_v2.py"
 _GLM_DSA_PATCH_FN = "_patch_vllm_glm_decoder_sequence_parallel_moe"
 _GLM_DSA_MARKER = 'getattr(config, "model_type", None) != "glm_moe_dsa"'
@@ -408,7 +410,7 @@ def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
 def test_radio_layerscale_patch_anchor_still_matches_installed_vllm(
     patched_radio_source,
 ):
-    """Pin the vLLM 0.25.1 RADIO loader shape used by the source patch."""
+    """Pin the RADIO loader shape used by the source patch."""
     content = patched_radio_source.read_text()
     assert _RADIO_MARKER in content
     assert "Skip layer-scale entries that vLLM doesn't use" not in content
@@ -421,9 +423,71 @@ def test_radio_layerscale_patch_loads_explicit_and_initializes_folded_weights(
 ):
     content = patched_radio_source.read_text()
     assert 'vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"' in content
-    assert 'name.endswith((".ls1", ".ls2"))' in content
-    assert "param.data.fill_(initializer_factor)" in content
-    assert "loaded_params.add(name)" in content
+    assert 'ls_name.endswith((".ls1", ".ls2"))' in content
+    assert "ls_param.data.fill_(initializer_factor)" in content
+    assert "loaded_params.add(ls_name)" in content
+
+
+@pytest.mark.vllm
+def test_radio_layerscale_patch_keeps_values_loaded_by_earlier_refit_batches(
+    patched_radio_source,
+):
+    """Refit calls load_weights once per batch; a later batch must not reset LayerScale."""
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    tree = ast.parse(patched_radio_source.read_text())
+    radio_model = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "RadioModel"
+    )
+    load_weights = next(
+        node
+        for node in radio_model.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+    )
+    namespace = {"default_weight_loader": default_weight_loader}
+    exec(
+        compile(ast.Module(body=[load_weights], type_ignores=[]), "<radio>", "exec"),
+        namespace,
+    )
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ls1 = torch.nn.Parameter(torch.full((4,), float("nan")))
+            self.ls2 = torch.nn.Parameter(torch.full((4,), float("nan")))
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([_Layer()])
+
+    class _Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Encoder()
+
+    class _Radio(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(initializer_factor=1.0)
+            self.model = _Inner()
+
+    model = _Radio()
+    layer = model.model.encoder.layers[0]
+    with torch.no_grad():
+        namespace["load_weights"](
+            model, [("radio_model.model.blocks.0.ls1", torch.full((4,), 0.1))]
+        )
+        assert torch.allclose(layer.ls1, torch.full((4,), 0.1))
+        assert torch.allclose(layer.ls2, torch.ones(4))
+
+        # A later batch carrying no vision weights (e.g. LLM-only) must not
+        # reset the explicitly loaded ls1 back to initializer_factor.
+        namespace["load_weights"](model, [])
+    assert torch.allclose(layer.ls1, torch.full((4,), 0.1))
+    assert torch.allclose(layer.ls2, torch.ones(4))
 
 
 @pytest.mark.vllm
@@ -447,7 +511,7 @@ def test_radio_layerscale_patch_warns_on_unknown_source(monkeypatch, tmp_path, c
         patches._patch_vllm_radio_layerscale_loader(logging.getLogger(__name__))
 
     assert radio_source.read_text() == "class RadioModel:\n    pass\n"
-    assert "vLLM 0.25.1 source shape was not found" in caplog.text
+    assert "load_weights tail anchor was not found" in caplog.text
 
 
 @pytest.mark.vllm
@@ -780,6 +844,8 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_ray_executor_v2_tcpstore_port",
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
+        "_patch_vllm_radio_native_loader",
+        "_patch_vllm_radio_final_layernorm",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)

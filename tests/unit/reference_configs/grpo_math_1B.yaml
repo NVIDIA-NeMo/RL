@@ -40,6 +40,8 @@ grpo:
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     reward_weights: null  # GDPO-specific: one weight per reward component
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -58,6 +60,9 @@ grpo:
   deduplicate_multimodal_data: false
   # Debug-only exact Ray payload telemetry; serialization adds runtime overhead.
   debug_payload_metrics: false
+  # Optional per-prompt-group length penalties/bonuses for NeMo-Gym rollouts
+  # (binary-reward envs only). See docs/guides/length-penalty.md. null disables.
+  length_penalty: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -118,6 +123,8 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  metrics_level: "full"
+  enable_torch_compile: false
 
 checkpointing:
   enabled: true
@@ -150,10 +157,13 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  # Run the policy offload lifecycle before non-colocated refit.
+  offload_policy_before_refit: false
+  # Move optimizer state to CPU when the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
   worker_extension_cls_fqn: null
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
     checkpoint:
       model_save_format: "safetensors"
@@ -163,6 +173,7 @@ policy:
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -231,6 +242,7 @@ policy:
     moe_permute_fusion: true
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
@@ -243,6 +255,9 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -334,14 +349,20 @@ policy:
     env_vars: null
 
   draft:
-    speculator_type: eagle3
     enabled: false
     model_name: null
     loss_weight: 0.1
+    # Drafter family: "eagle3" (Megatron backend, or Automodel with the
+    # speculators-style TTT trainer), "dspark" / "dflash" (Automodel backend).
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
     token_chunk_size: 4096
     optimizer: null
+    learning_rate: 1.0e-04
+    ttt_steps: 3
+    ttt_step_loss_decay: 1.0
+    train_embed_and_head: true
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -361,7 +382,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -397,6 +418,13 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    disaggregation:
+      enabled: false
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      num_frontend_workers: 1
+      frontend_tokenize: false
+      frontend_base_port: 8300
     # null = topology default (IPC colocated, NCCL non-colocated). For
     # non-colocated Megatron generation it selects the packed collective; use
     # mcore for native refit.
@@ -442,13 +470,15 @@ policy:
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
-      offload_policy_before_refit: false  # Keep policy state on GPU by default. Enable when a non-colocated Megatron refit needs additional GPU headroom for transfer staging.
       parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
       expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
       http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
@@ -544,14 +574,20 @@ logger:
     project: "grpo-dev"
     name: "grpo-dev-logger"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
     tracking_uri: "http://localhost:5000"
+    run_id: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
@@ -575,11 +611,19 @@ data_plane:
   simple:
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+    storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    ssd_offload:
+      enabled: false
+      path: null
+      threshold_bytes: 1048576
   mooncake_cpu:
     global_segment_size: 68719476736 # 64 GiB/process
-    local_buffer_size:    4294967296 # 4 GiB/process
+    local_buffer_size:    2147483648 # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
-    staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    staging_buffer_size:   536870912 # 512 MiB/pool slot; bigger payloads register per transfer
+    storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
+    num_storage_units: null          # null = 2 per selected node
+    storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

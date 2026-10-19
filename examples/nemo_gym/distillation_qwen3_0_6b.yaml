@@ -23,9 +23,8 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
-    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:
@@ -59,9 +58,8 @@ teacher:
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
-    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:
@@ -99,6 +97,16 @@ env:
     config_paths:
       - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
       - resources_servers/example_multi_step/configs/example_multi_step.yaml
+
+    # Use legacy agent orchestration.
+    example_multi_step_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: example_multi_step_simple_agent
+
     policy_model:
       responses_api_models:
         vllm_model:
