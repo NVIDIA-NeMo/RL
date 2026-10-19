@@ -29,6 +29,15 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     resolve_rollout_rank,
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    _assert_drafter_owns_modules,
+    _draft_owns_speculator,
+    _is_full_draft_stream,
+    _validate_draft_refit_info,
+    disable_draft_module_sharing,
+)
+from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -65,11 +74,8 @@ UnsupportedNativeRefitTransport = Literal["checkpoint_engine", "sparse_delta"]
 WeightUpdateFinalizer = Callable[[], None]
 
 
-def _format_refit_key_error(label: str, keys: set[str]) -> str:
-    """Format a bounded refit-key diagnostic."""
-    ordered = sorted(keys)
-    suffix = " ..." if len(ordered) > 8 else ""
-    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+if os.environ.get(DRAFT_DISABLE_MODULE_SHARING_ENV) == "1":
+    disable_draft_module_sharing()
 
 
 class IPCWeightManifestError(RuntimeError):
@@ -719,6 +725,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     ) -> Optional[list[str]]:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
+        For co-trained speculative decoding (dspark/dflash/eagle3), the
+        trainer-provided ``draft.*`` keys are validated here against the
+        drafter's own loadable layout. Combined
+        with the per-refit manifests (the IPC path enforces every
+        ``state_dict_info`` key exactly once, and the collective path iterates
+        ``state_dict_info`` by construction), this proves on every transport
+        that the full expected draft key set is delivered.
+
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
@@ -737,6 +751,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         self._validate_native_layerwise_refit()
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        _validate_draft_refit_info(
+            self.model_runner,
+            self._get_drafter_model(),
+            self._speculative_method(),
+            state_dict_info,
+        )
 
         # Non-FP8 runs serialize no FP8 config; skip the fp8 module (and its
         # heavyweight vLLM imports) entirely so quant backends stubbed without
@@ -837,15 +857,20 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             trimmed.append((key, tensor))
         return trimmed
 
+    def _speculative_method(self) -> Optional[str]:
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        return getattr(spec_config, "method", None) if spec_config else None
+
     def _get_drafter_model(self) -> Any:
         """Return the vLLM drafter's underlying model, or None if absent.
 
-        The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
-        which vLLM keeps as a module separate from the main model, under
-        ``model_runner.drafter`` (legacy runner) or ``model_runner.speculator``
-        (v2 runner); see ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these
-        are dynamic vLLM model classes whose ``load_weights`` /
-        ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
+        The drafter holds the speculative-decoding draft model (Eagle3, MTP, or
+        DSpark), which vLLM keeps as a module separate from the main model,
+        under ``model_runner.drafter`` (legacy runner) or
+        ``model_runner.speculator`` (v2 runner, used by DSpark); see
+        ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these are dynamic vLLM
+        model classes whose ``load_weights`` / ``mtp_start_layer_idx`` members
+        are not visible through ``nn.Module``.
         """
         for owner_attr in self._DRAFTER_OWNER_ATTRS:
             draft_owner = getattr(self.model_runner, owner_attr, None)
@@ -866,12 +891,36 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if not draft_weights:
             return
 
+        method = self._speculative_method()
+        # A megatron partial stream (no embed_tokens) skips the alias guard
+        # below. The warn-and-skip branch further down for a missing drafter
+        # is now effectively unreachable for a cotrained, owning rank:
+        # prepare_refit_info's _validate_draft_refit_info hard-fails earlier
+        # in that case. It still guards non-cotrained methods and a drafter
+        # that disappears between prepare and load.
+        strict_cotraining = _is_full_draft_stream([name for name, _ in draft_weights])
         draft_model = self._get_drafter_model()
         if draft_model is None:
+            if strict_cotraining:
+                if _draft_owns_speculator(self.model_runner, method):
+                    # Draft co-training streams every draft weight on each
+                    # refit; an owning rank without a speculator would silently
+                    # generate with stale draft weights.
+                    raise RuntimeError(
+                        f"[draft] Received {method} draft weights but no "
+                        "drafter model was found at model_runner.drafter.model "
+                        "or model_runner.speculator.model. The pinned vLLM's "
+                        f"{method} speculator layout may have changed."
+                    )
+                # Non-owning pipeline stages legitimately have no speculator;
+                # draft payloads are not theirs to load.
+                return
             logger.warning(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
+        if strict_cotraining:
+            _assert_drafter_owns_modules(self.model_runner, draft_model, draft_weights)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
@@ -890,9 +939,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """
         if not self._mtp_drafter_weights_from_refit:
             return False
-        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
-        method = getattr(spec_config, "method", None) if spec_config else None
-        if method not in ("deepseek_mtp", "mtp"):
+        if self._speculative_method() not in ("deepseek_mtp", "mtp"):
             return False
         if self._get_drafter_model() is None:
             # Silently skipping here is how vLLM 0.29's runner rename went

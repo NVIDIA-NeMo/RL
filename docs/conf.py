@@ -115,6 +115,8 @@ html_extra_path = ["project.json", "versions1.json"]
 
 redirects = {
     "guides/eval": "../about/evaluation.html",
+    "guides/dtensor-tp-accuracy": "automodel-tp-accuracy.html",
+    "design-docs/fsdp2-parallel-plan": "automodel-parallel-plan.html",
 }
 
 
