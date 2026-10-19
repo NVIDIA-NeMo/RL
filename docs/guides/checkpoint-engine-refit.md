@@ -164,7 +164,7 @@ FP8 model weights and FP8 KV-cache scales are separate features:
 | NIXL with `shard_expert_weights: false` and FP8 vLLM weights | Supported through the existing full-weight `fp8.load_weights` path. |
 | NIXL with `shard_expert_weights: true` and FP8 or MXFP8 vLLM weights | Unsupported. Setup or loading fails explicitly because destination-local expert loading does not yet implement quantized, transposed, or shuffled weight-and-scale layouts. |
 | Megatron policy with FP8 KV-cache scales | Supported; the scales are appended to the checkpoint-engine weight stream and processed after loading. |
-| DTensor policy with FP8 KV-cache scales | Unsupported; the policy worker raises `NotImplementedError`. |
+| Automodel policy with FP8 KV-cache scales | Unsupported; the policy worker raises `NotImplementedError`. |
 
 Sharded FP8 expert refit is a loader-layout limitation, not a NIXL transport
 limitation. Supporting it requires a versioned destination-layout adapter for
