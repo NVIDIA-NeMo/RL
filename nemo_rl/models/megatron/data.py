@@ -286,6 +286,7 @@ def make_processed_microbatch_iterator(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    create_nonpacked_router_padding_mask: bool = False,
     shared_prefix_bin_capacity: Optional[int] = None,
     shared_prefix_execution_units: Optional[
         tuple["SharedPrefixExecutionUnit", ...]
@@ -309,6 +310,8 @@ def make_processed_microbatch_iterator(
         prepad_packed_seq_for_hybridep: Whether to align packed inputs across the
             HybridEP group before model forward
         mtp_enabled: Whether the model uses multi-token prediction layers.
+        create_nonpacked_router_padding_mask: Use input lengths to exclude dense
+            right padding from expert-bias statistics on supported MoE models.
         shared_prefix_execution_units: The planned shared-prefix forwards for
             the single raw batch this iterator wraps; required with sharing enabled.
         shared_prefix_stage: Consumer stage; logprobs may use evaluation packing
@@ -376,6 +379,7 @@ def make_processed_microbatch_iterator(
             straggler_timer=straggler_timer,
             direct_packed_metadata=direct_packed_metadata,
             create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+            create_nonpacked_router_padding_mask=create_nonpacked_router_padding_mask,
             prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
             mtp_enabled=mtp_enabled,
         )
@@ -453,6 +457,8 @@ def get_microbatch_iterator(
     delegate_mtp_loss_mask_to_model: bool = False,
     model_slices_context_parallel_inputs: bool = False,
     mtp_enabled: bool = False,
+    create_router_padding_mask: bool = False,
+    allow_unmasked_chunkwise_cp: bool = False,
     shared_prefix_bin_capacity: Optional[int] = None,
     shared_prefix_execution_units: Optional[
         tuple["SharedPrefixExecutionUnit", ...]
@@ -471,6 +477,10 @@ def get_microbatch_iterator(
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
         mtp_enabled: Whether the model uses multi-token prediction layers.
+        create_router_padding_mask: Exclude padding from expert-bias statistics
+            on supported MoE models, for packed and nonpacked inputs alike.
+        allow_unmasked_chunkwise_cp: Suppress router masks for prepacked HybridEP
+            inputs after setup warned about unsupported HybridBlock chunkwise CP.
         shared_prefix_execution_units: The output of
             :func:`plan_shared_prefix_execution_units` for ``data``; required in
             shared-prefix mode. The worker plans once under its own timer and
@@ -630,7 +640,7 @@ def get_microbatch_iterator(
         data_iterator_len = data.size
         micro_batch_size = 1
     elif prepacked:
-        create_packed_seq_padding_mask = bool(
+        create_packed_seq_padding_mask = create_router_padding_mask or bool(
             cfg["megatron_cfg"].get("moe_router_enable_expert_bias", False)
         )
         raw_iterator = data.make_microbatch_iterator(1)
@@ -640,12 +650,13 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif cfg["sequence_packing"]["enabled"]:
-        create_packed_seq_padding_mask = uses_hybridep_flex_dispatcher(
-            cfg["megatron_cfg"]
+        uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
+        # Alignment padding between packed sequences must not reach expert-bias
+        # statistics with any dispatcher, not only HybridEP.
+        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
+            "moe_hybridep_prepad_packed_inputs"
         )
-        prepad_packed_seq_for_hybridep = create_packed_seq_padding_mask and cfg[
-            "megatron_cfg"
-        ].get("moe_hybridep_prepad_packed_inputs")
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()
@@ -664,6 +675,16 @@ def get_microbatch_iterator(
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
 
+    if allow_unmasked_chunkwise_cp:
+        if not prepacked or not uses_hybridep_flex_dispatcher(cfg["megatron_cfg"]):
+            raise ValueError(
+                "Unmasked chunkwise CP requires prepacked HybridEP inputs."
+            )
+        # Override both legacy prepacked expert-bias and dispatcher mask creation.
+        # Remove this fallback when MCore HybridBlock supports chunkwise CP masks.
+        create_packed_seq_padding_mask = False
+        create_router_padding_mask = False
+
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(
         raw_iterator=raw_iterator,
@@ -674,6 +695,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         create_packed_seq_padding_mask=create_packed_seq_padding_mask,
+        create_nonpacked_router_padding_mask=create_router_padding_mask,
         prepad_packed_seq_for_hybridep=prepad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
         delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
@@ -1305,16 +1327,21 @@ def process_microbatch(
     create_packed_seq_padding_mask: bool = False,
     prepad_packed_seq_for_hybridep: bool = False,
     mtp_enabled: bool = False,
+    create_nonpacked_router_padding_mask: bool = False,
 ) -> ProcessedInputs:
-    """Process a microbatch for Megatron model forward pass."""
+    """Process a microbatch for Megatron model forward pass.
+
+    ``create_nonpacked_router_padding_mask`` opts supported MoE models into
+    right-padding exclusion using input lengths, independent of the loss mask.
+    """
     prepacked = "cu_seqlens" in data_dict
     if (
-        create_packed_seq_padding_mask
+        prepad_packed_seq_for_hybridep
         and model_slices_context_parallel_inputs
         and not prepacked
     ):
         raise NotImplementedError(
-            "HybridEP padding masks are not supported for models that perform "
+            "HybridEP input prepadding is not supported for models that perform "
             "context-parallel input slicing internally."
         )
     if prepad_packed_seq_for_hybridep and delegate_pack_to_model:
@@ -1453,6 +1480,11 @@ def process_microbatch(
                         )
                 attention_mask = None
             elif delegate_pack_to_model:
+                if create_packed_seq_padding_mask:
+                    raise NotImplementedError(
+                        "Router padding masks require real-token validity through "
+                        "model-owned sequence packing, which is not supported."
+                    )
                 has_mtp_loss_mask = "mtp_loss_mask" in data_dict
                 assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
                     "MTP training requires a self-packing VLM that advertises "
@@ -1781,6 +1813,18 @@ def process_microbatch(
                 else:
                     position_ids = None
         else:
+            if create_nonpacked_router_padding_mask:
+                # Count every real prompt/tool/response token, but no right padding.
+                lengths_key = seq_length_key or "input_lengths"
+                if lengths_key not in data_dict:
+                    raise ValueError(
+                        "Nonpacked router padding masks require input lengths "
+                        f"in {lengths_key!r}."
+                    )
+                lengths = data_dict[lengths_key].to(device=input_ids.device)
+                padding_mask = torch.arange(
+                    input_ids.shape[1], device=input_ids.device
+                ).unsqueeze(0) >= lengths.unsqueeze(1)
             if routed_experts is not None:
                 if "input_lengths" not in data_dict:
                     raise ValueError(

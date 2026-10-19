@@ -45,6 +45,14 @@ from nemo_rl.models.generation.vllm.metric_names import (
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
 
@@ -318,21 +326,15 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
-    default_route = torch.arange(
-        routed.shape[2],
+    full = torch.full(
+        (padded_length, routed.shape[1], routed.shape[2]),
+        R3_MISSING_ROUTE_SENTINEL,
         dtype=routed_experts_dtype,
         device=device,
-    )
-    full = (
-        default_route.view(1, 1, -1)
-        .expand(padded_length, routed.shape[1], routed.shape[2])
-        .clone()
     )
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
-    if stats["missing_routes"] > 0:
-        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 

@@ -50,22 +50,32 @@ for those cases.
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
 |---|---|---|---|
-| Colocated CUDA IPC | vLLM or SGLang | DTensor or Megatron | Uses the generation backend's standard loader. |
-| NCCL | vLLM or Megatron | DTensor or Megatron | Uses the standard full-weight loader. |
-| NCCL + reload API | vLLM | DTensor or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), and Eagle/MTP trainer-refit draft weights. |
+| Colocated CUDA IPC | vLLM or SGLang | Automodel or Megatron | Uses the generation backend's standard loader. |
+| NCCL | vLLM or Megatron | Automodel or Megatron | Uses the standard full-weight loader. |
+| NCCL + reload API | vLLM | Automodel or Megatron | Default non-colocated NCCL only. Rejects colocated refit, `nccl_reshard`, sparse delta, NIXL/checkpoint-engine transports, ModelOpt quantization (`real_quant` or `quant_cfg`), and Eagle/MTP trainer-refit draft weights. |
 | MCore native refit | Megatron | Megatron | Supports MCore's configured copy-service backend. |
 | SGLang NCCL weight-update group | SGLang | Megatron | Trainer rank 0 broadcasts finalized HF tensors to the engine leaders. |
 | NCCL reshard | vLLM or Megatron | Megatron | Supports BF16 and the documented FP8/MXFP8 combinations; see the [NCCL Reshard Refit design](../design-docs/nccl-reshard-refit.md). |
 | Sparse delta | vLLM | Megatron | BF16/FP16, unquantized rollout only. |
-| NIXL, full weights | vLLM | DTensor or Megatron | Supports the standard full-weight FP8 loader. DTensor FP8 KV-cache scale transfer is not yet supported. |
-| NIXL, sharded experts | vLLM | DTensor or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
+| NIXL, full weights | vLLM | Automodel or Megatron | Supports the standard full-weight FP8 loader. Automodel FP8 KV-cache scale transfer is not yet supported. |
+| NIXL, sharded experts | vLLM | Automodel or Megatron | Unquantized BF16/FP16 Triton MoE only; FP8/MXFP8 and dynamic expert placement are rejected. |
 
 Non-colocated SGLang generation is supported with a Megatron policy and
 `refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
-restrictions are on the generation backend; both Megatron and DTensor policy
+restrictions are on the generation backend; both Megatron and Automodel policy
 workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
+
+## Refit Performance Options
+
+These options are optional. Enable one only after you measure its effect on your
+refit workload.
+
+| Option | Applies to | Effect |
+|---|---|---|
+| `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
+| `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
 
 ## Minimal Configuration
 
@@ -83,11 +93,37 @@ For non-colocated NCCL, change the topology and leave the selector unset:
 
 ```yaml
 policy:
+  offload_policy_before_refit: false
   generation:
     colocated:
       enabled: false
     refit_transport: null
 ```
+
+Large quantized exports can temporarily need more memory than training itself.
+Set `offload_policy_before_refit: true` to drop completed gradient buffers before
+the collective export. The same lifecycle can also move the optimizer and clear
+Transformer Engine workspaces:
+
+```yaml
+policy:
+  offload_policy_before_refit: true
+  offload_optimizer_for_refit: true
+  megatron_cfg:
+    fp8_cfg:
+      enabled: true
+      force_clear_fp8_caches: true
+  generation:
+    colocated:
+      enabled: false
+    refit_transport: null
+```
+
+This option requires the Megatron policy backend. It applies to non-colocated
+vLLM collective and `nccl_reshard` transports, plus non-colocated Megatron
+generation. Unsupported combinations fail during synchronizer setup. It is
+disabled by default because CPU offload adds transfer overhead when the export
+already fits in trainer GPU memory.
 
 For native MCore refit, select it explicitly:
 
@@ -109,6 +145,10 @@ policy:
       enabled: false
     refit_transport: nccl_reshard
 ```
+
+`offload_policy_before_refit` also works with this transport. The reshard moves
+only parameters, so releasing gradient buffers, optimizer state, and caches
+before transfer is safe.
 
 For sparse delta, select one data plane and configure its scope:
 

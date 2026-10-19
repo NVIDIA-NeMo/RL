@@ -1217,13 +1217,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
@@ -1389,10 +1389,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if master_config.loss_fn.force_on_policy_ratio:
+        if (
+            master_config.loss_fn.force_on_policy_ratio
+            and not master_config.loss_fn.use_cispo
+        ):
             raise ValueError(
                 "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
@@ -1429,6 +1432,14 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         raise ValueError(
             "token_capture.defer_routed_experts_to_policy requires "
             "token_capture.enabled=true"
+        )
+    policy_config = master_config.policy
+    if token_capture_config.defer_routed_experts_to_policy and not (
+        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+    ):
+        raise NotImplementedError(
+            "token_capture.defer_routed_experts_to_policy is only wired for the Megatron "
+            "policy; the Automodel worker does not assemble deferred routes."
         )
     if (
         token_capture_config.enabled

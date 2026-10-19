@@ -199,6 +199,8 @@ policy:
   # PPO's pre-critic offload is handled separately by offload_to_cpu or
   # pause_train_step_with_offloading.
   offload_optimizer_for_logprob: true
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false
@@ -209,6 +211,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 

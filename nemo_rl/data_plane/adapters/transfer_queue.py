@@ -777,37 +777,38 @@ _STORAGE_UNITS_SC_ONLY = (
 def _pin_simple_storage_units(node_ids: list[str]) -> None:
     """Make TQ's SimpleStorage bootstrap start unit ``i`` on ``node_ids[i]``.
 
-    TQ (pin c51614308b) always places units with a SPREAD placement group,
-    which leaves the count per node to Ray. This replaces that registered
-    provider for this process; the rest mirrors TQ's
-    ``initialize_simple_storage``.
+    TQ (pin 05d4cc3377) round-robins units over the alive Ray nodes through
+    ``get_node_round_robin_scheduling_strategies``. Only that placement is
+    swapped here, for this process; TQ's own provider still builds the units
+    (config, run ID, SSD offload), so it cannot drift from the pin.
     """
-    import math
-
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-    from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
-    from transfer_queue.storage.simple_storage import SimpleStorageUnit
-    from transfer_queue.utils.zmq_utils import process_zmq_server_info
+    from transfer_queue.storage.bootstrap import simple_storage_bootstrap
 
-    @StorageBootstrapProvider.register_provider("SimpleStorage")
-    def initialize_simple_storage(conf: Any) -> dict[str, Any]:
-        simple = conf.backend.SimpleStorage
-        num_units = simple.num_data_storage_units
-        if len(node_ids) != num_units:
+    if not hasattr(
+        simple_storage_bootstrap, "get_node_round_robin_scheduling_strategies"
+    ):
+        raise _tq_shape_drift_error(
+            "simple_storage_bootstrap no longer has "
+            "get_node_round_robin_scheduling_strategies",
+            "SimpleStorage units could not be pinned to the planned nodes",
+            "placement hook",
+        )
+
+    def pinned_strategies(
+        num_actors: int, required_node_resource: str | None = None
+    ) -> list[NodeAffinitySchedulingStrategy]:
+        if len(node_ids) != num_actors:
             raise ValueError(
-                f"{len(node_ids)} node IDs for {num_units} SimpleStorage units"
+                f"{len(node_ids)} node IDs for {num_actors} SimpleStorage units"
             )
-        total = simple.get("total_storage_size", None)
-        unit_size = math.ceil(total / num_units) if total is not None else None
-        handles = {}
-        for rank, node_id in enumerate(node_ids):
-            name = f"TransferQueueStorageUnit#{rank}"
-            handles[name] = SimpleStorageUnit.options(  # type: ignore[attr-defined]
-                name=name,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
-            ).remote(storage_unit_size=unit_size)
-        simple.zmq_info = process_zmq_server_info(handles)
-        return handles
+        return [
+            NodeAffinitySchedulingStrategy(node_id, soft=False) for node_id in node_ids
+        ]
+
+    simple_storage_bootstrap.get_node_round_robin_scheduling_strategies = (
+        pinned_strategies
+    )
 
 
 def _init_tq(
@@ -850,11 +851,20 @@ def _init_tq(
                 "SimpleStorage": {
                     "total_storage_size": simple_cfg.storage_capacity,
                     "num_data_storage_units": simple_cfg.num_storage_units,
+                    # TQ round-robins units (num_cpus=1, hard node affinity)
+                    # over every alive Ray node. A node that offers no CPU,
+                    # e.g. a head started with --num-cpus=0, could never
+                    # start one, so only nodes that advertise CPU qualify.
+                    # Ignored when units are pinned to planned nodes below.
+                    "required_node_resource": "CPU",
                 },
             },
         }
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
+        ssd = simple_cfg.ssd_offload
+        if ssd.enabled:
+            overlay["backend"]["SimpleStorage"]["ssd_offload"] = ssd.model_dump()
     elif backend == "mooncake_cpu":
         # The mooncake-transfer-engine wheel ships `mooncake_master` at
         # <site-packages>/mooncake/, NOT on $PATH. TQ's
@@ -1413,6 +1423,14 @@ class TQDataPlaneClient(DataPlaneClient):
             partition_id=partition_id,
             select_fields=select_fields,
         )
+        missing = [name for name in select_fields if name not in td.keys()]
+        if missing:
+            raise KeyError(
+                f"TransferQueue returned no {missing} column(s) for a fetch of "
+                f"{len(sample_ids)} keys on partition {partition_id!r}: at least "
+                "one requested key never produced them, and TQ narrows a batch "
+                "fetch to the fields shared by every key instead of failing"
+            )
         return _from_wire(td)
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
