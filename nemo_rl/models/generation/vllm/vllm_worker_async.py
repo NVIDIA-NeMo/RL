@@ -1186,10 +1186,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Restores read routes and media with their prefix rows, so the
         # batcher coalesces the same route- and media-aware fetch.
         self._generation_prefix_reader = PrefixReadBatcher(
-            functools.partial(
-                GenerationCutCaptureMixin._fetch_generation_cut_rows, self
-            ),
-            max_rows=generation_prefix_batch_size,
+            self._fetch_generation_cut_rows, max_rows=generation_prefix_batch_size
         )
         self._chain_prefix.install(source)
         install_capture(
