@@ -159,8 +159,8 @@ def media_tensor_digests(
 ) -> dict[str, dict[str, Any]]:
     """Fingerprint each media tensor by its dtype, shape, and raw bytes."""
     digests: dict[str, dict[str, Any]] = {}
-    for name in sorted(tensors or {}):
-        tensor = tensors[name].detach().cpu().contiguous()
+    for name, value in sorted((tensors or {}).items()):
+        tensor = value.detach().cpu().contiguous()
         raw = tensor.reshape(-1).view(torch.uint8).numpy()
         digests[name] = {
             "dtype": str(tensor.dtype),
