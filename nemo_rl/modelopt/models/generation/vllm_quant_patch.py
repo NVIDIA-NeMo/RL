@@ -302,14 +302,17 @@ def _preserve_nvfp4_moe_reload_scales(model: torch.nn.Module) -> None:
 
     for layer in model.modules():
         method = getattr(layer, "quant_method", None)
-        if not isinstance(
-            method, ModelOptNvFp4FusedMoE
-        ) or method.nvfp4_backend not in (
+        if not isinstance(method, ModelOptNvFp4FusedMoE):
+            continue
+        if method.nvfp4_backend not in (
             NvFp4MoeBackend.VLLM_CUTLASS,
             NvFp4MoeBackend.FLASHINFER_TRTLLM,
             NvFp4MoeBackend.MARLIN,
         ):
-            continue
+            raise ValueError(
+                "Graph-safe ModelOpt real-quant refit does not support NVFP4 MoE "
+                f"backend {method.nvfp4_backend.name}. Choose a supported MoE backend."
+            )
         # Install after cold loading: checkpoint metadata excludes these derived
         # buffers. Persistent buffers participate in native reload copy-back;
         # nonpersistent buffers absent from the checkpoint would be skipped.

@@ -163,6 +163,103 @@ def test_real_quant_conversion_tasks_delegate_discovery_to_bridge():
 
 
 @requires_weight_folding
+def test_fake_quant_discovery_uses_installed_bridge_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Bridge and ModelOpt are optional; import only after the availability guard.
+    from megatron.bridge.models.conversion import model_bridge as conversion_bridge
+    from megatron.bridge.models.conversion.auto_bridge import AutoBridge
+    from megatron.bridge.models.conversion.mapping_registry import (
+        MegatronMappingRegistry,
+    )
+    from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+    from megatron.bridge.models.conversion.param_mapping import ColumnParallelMapping
+    from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+    from megatron.bridge.models.hf_pretrained.state import StateDict
+    from transformers import PretrainedConfig
+
+    monkeypatch.setenv("ENABLE_BRIDGE_QUANT_MAPPING", "1")
+
+    class ProjectionBridge(MegatronModelBridge):
+        def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> None:
+            raise NotImplementedError
+
+        def mapping_registry(self) -> MegatronMappingRegistry:
+            return MegatronMappingRegistry(
+                ColumnParallelMapping("projection.weight", "model.projection.weight")
+            )
+
+    implementation = ProjectionBridge()
+
+    class ProjectionAutoBridge(AutoBridge):
+        @property
+        def _model_bridge(self) -> ProjectionBridge:
+            return implementation
+
+    # Isolate singleton topology, but exercise the installed public API and
+    # its actual discovery/filtering instead of replacing get_conversion_tasks.
+    monkeypatch.setattr(
+        implementation,
+        "_megatron_global_adapters_info_all_pp_ranks",
+        lambda _models: [],
+    )
+    monkeypatch.setattr(
+        conversion_bridge,
+        "_get_pp_group",
+        lambda _model: SimpleNamespace(size=lambda: 1),
+    )
+    monkeypatch.setattr(conversion_bridge, "_get_pp_rank", lambda _model: 0)
+    monkeypatch.setattr(conversion_bridge, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(
+        conversion_bridge,
+        "_megatron_local_name_to_global",
+        lambda _models, _config, name, _vp: name,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda result, value, group: result.__setitem__(0, value),
+    )
+    monkeypatch.setattr(
+        conversion_bridge, "_get_pg_collection_from_model", lambda _model: None
+    )
+
+    model = nn.Module()
+    model.config = SimpleNamespace(share_embeddings_and_output_weights=False)
+    model.projection = nn.Linear(4, 4, bias=False)
+    model.projection.weight_quantizer = GroupedQuantizer(
+        TensorQuantizer(), TensorQuantizer()
+    )
+    for quantizer in model.projection.weight_quantizer:
+        quantizer.amax = torch.tensor(1.0)
+    model.projection.input_quantizer = TensorQuantizer()
+    model.projection.input_quantizer.amax = torch.tensor(2.0)
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.model = model
+    worker.fp8_cfg = {}
+    pretrained = PreTrainedCausalLM()
+    pretrained.config = PretrainedConfig()
+    pretrained._state_dict_accessor = StateDict(
+        {
+            "model.projection.weight": model.projection.weight,
+            "model.projection.input_quantizer._amax": model.projection.input_quantizer.amax,
+        }
+    )
+    worker.megatron_bridge = ProjectionAutoBridge(pretrained)
+    tasks = worker._build_refit_conversion_tasks()
+    assert {task.global_param_name for task in tasks} == {
+        "projection.weight",
+        "projection.input_quantizer._amax",
+    }
+    assert "projection.weight_quantizer.0._amax" in dict(model.named_buffers())
+    model.register_buffer("unmapped_buffer", torch.tensor(1.0))
+    with pytest.raises(ValueError, match="unmapped_buffer"):
+        worker._build_refit_conversion_tasks()
+
+
+@requires_weight_folding
 def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
     from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
 
