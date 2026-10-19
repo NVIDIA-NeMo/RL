@@ -7,7 +7,7 @@ policy:
   model_name: Qwen/Qwen2.5-Math-7B
   train_global_batch_size: 64
   max_total_sequence_length: 3200
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true

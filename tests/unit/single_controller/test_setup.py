@@ -17,18 +17,23 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import threading
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
-from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    OPDAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -51,11 +56,13 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import (
     OnPolicyDistillationConfig,
     get_opd_full_config,
     opd_full_teacher_index_field,
 )
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -79,6 +86,7 @@ from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -87,6 +95,7 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 
 # Captured at import, before the patched_factories fixture swaps it for a mock.
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
@@ -194,8 +203,8 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        logger=LoggerConfig(log_dir="/tmp/test-logs"),
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         loss_fn=loss_cfg if loss_cfg is not None else ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(
@@ -344,7 +353,7 @@ def test_build_generation_passes_sglang_config():
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -372,7 +381,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
     """Teacher nodes are removed before the student train/inference split."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
         "num_nodes": 1,
@@ -402,7 +411,7 @@ def test_build_clusters_leaves_dedicated_teacher_nodes(monkeypatch):
 def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     """One student node can split train/inference while node two hosts teacher."""
     master_config = _make_master_config(colocated=False)
-    master_config.cluster = {"num_nodes": 2, "gpus_per_node": 8}
+    master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 4,
         "num_nodes": 1,
@@ -470,6 +479,49 @@ def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch)
     )
 
 
+def test_single_controller_mopd_recipe_builds_tropd_estimator(monkeypatch):
+    """TROPD knobs reach the SC advantage estimator from the recipe YAML."""
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml"
+    )
+    overrides = OmegaConf.from_dotlist(
+        [
+            "grpo.adv_estimator.proximal_teacher_alpha=0.5",
+            "grpo.adv_estimator.subtract_global_baseline=true",
+        ]
+    )
+    resolved = OmegaConf.to_container(
+        OmegaConf.merge(load_config(recipe), overrides), resolve=True
+    )
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    estimator = sc_setup_mod._build_advantage_estimator(config)
+
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert estimator.proximal_teacher_alpha == 0.5
+    assert estimator.subtract_global_baseline is True
+
+
+@pytest.mark.parametrize(
+    "tropd_override",
+    [{"proximal_teacher_alpha": 0.2}, {"subtract_global_baseline": True}],
+)
+def test_fullvocab_recipe_rejects_tropd_before_allocation(tropd_override):
+    """Full-vocab MOPD ignores advantages, so SC rejects TROPD before allocating."""
+    config = _load_fullvocab_master_config()
+    config.grpo.adv_estimator = config.grpo.adv_estimator.model_copy(
+        update=tropd_override
+    )
+    with pytest.raises(ValueError, match="ignores advantages"):
+        validate_single_controller_config(config)
+
+
 def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     """The SC nightly exercises the overlong filtering inherited from its parent."""
     register_omegaconf_resolvers()
@@ -486,6 +538,39 @@ def test_single_controller_ppo_recipe_inherits_overlong_filtering():
     validate_single_controller_config(config)
     assert config.ppo is not None
     assert config.ppo.overlong_filtering is True
+
+
+def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_contract(
+    monkeypatch,
+):
+    """The token-capture nightly must pass the same validation the entrypoint runs.
+
+    Its in_order sampler keeps one dispatched batch in flight per lookahead
+    version plus the live one, so the buffer must hold two steps of prompt
+    groups; anything smaller fails validation before any GPU is allocated.
+    """
+    monkeypatch.setenv("HF_HOME", "/tmp/nemo-rl-test-hf")
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    recipe = repo_root / (
+        "examples/configs/recipes/llm/"
+        "grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-"
+        "single-controller-token_capture.yaml"
+    )
+    resolved = OmegaConf.to_container(load_config(recipe), resolve=True)
+
+    assert isinstance(resolved, dict)
+    config = MasterConfig.model_validate(resolved)
+    validate_single_controller_config(config)
+    assert config.token_capture.enabled is True
+    assert config.async_rl.sampler.name == "in_order"
+    assert config.async_rl.max_buffered_rollouts == (
+        config.grpo.num_prompts_per_step
+        * (config.async_rl.sampler.max_lookahead_versions + 1)
+    )
+    assert config.policy["train_global_batch_size"] == (
+        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
+    )
 
 
 @pytest.mark.parametrize(
@@ -536,7 +621,7 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
     )
     overrides = [
         "policy.model_name=Qwen/Qwen3-0.6B",
-        "policy.dtensor_cfg.enabled=false",
+        "policy.automodel_cfg.enabled=false",
         "policy.megatron_cfg.enabled=true",
         "policy.megatron_cfg.tensor_model_parallel_size=1",
         "policy.megatron_cfg.pipeline_model_parallel_size=1",
@@ -681,23 +766,32 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_vlm_token_capture_rejects_non_vllm_backend(self, patched_factories):
-        # Media capture is only implemented in the vLLM worker: a VLM run (any
-        # processor) with token capture must fail loudly on other backends.
-        mc = _make_master_config(
-            backend="megatron",
-            megatron_enabled=True,
-            env={"should_use_nemo_gym": True},
-        )
+    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
         mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
+        with pytest.raises(
+            ValueError, match="does not support.*penalize_malformed_think_tag"
+        ):
+            validate_single_controller_config(mc)
 
-        with pytest.raises(NotImplementedError, match="only implemented for the vLLM"):
-            setup_single_controller(
-                mc, MagicMock(pad_token_id=0), processor=MagicMock()
-            )
-
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
+    def test_capture_allows_text_and_token_penalties_without_warning(
+        self, patched_factories
+    ):
+        mc = _make_master_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.token_capture.enabled = True
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+        assert not [w for w in caught if "reward_penalties" in str(w.message)]
 
     def test_resolves_and_passes_reward_penalties(self, patched_factories):
         mc = _make_master_config()
@@ -965,7 +1059,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
@@ -1043,7 +1136,6 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger = {"log_dir": str(tmp_path / "logs")}
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
@@ -1223,11 +1315,37 @@ class TestSetup:
 
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_mopd_global_baseline_requires_one_streaming_chunk_per_step(
+        self, patched_factories
+    ):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.grpo.adv_estimator = AdvEstimatorConfig(
+            name="opd", subtract_global_baseline=True
+        )
+        mc.on_policy_distillation = OnPolicyDistillationConfig(
+            enabled=True,
+            teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+            default_teacher_alias="teacher",
+            non_colocated_teachers={"enabled": True},
+        )
+        # One chunk per step: the estimator's batch is the whole step.
+        validate_single_controller_config(mc)
+
+        mc.async_rl.min_groups_for_streaming_train = mc.grpo.num_prompts_per_step // 2
+        with pytest.raises(ValueError, match="subtract_global_baseline"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+
+        # Only the global baseline needs the whole step; plain MOPD may stream.
+        mc.grpo.adv_estimator = AdvEstimatorConfig(name="opd")
+        validate_single_controller_config(mc)
+
     def test_mopd_reserves_before_models_and_initializes_teacher_last(
         self, patched_factories, monkeypatch
     ):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.cluster = {"num_nodes": 3, "gpus_per_node": 8}
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
@@ -1300,7 +1418,7 @@ class TestSetup:
                 "must equal policy.train_global_batch_size",
             ),
             ("buffer_capacity", ValueError, "required capacity"),
-            ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
+            ("megatron_automodel_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_recompute_mismatch", ValueError, "kv_cache_management_mode"),
             ("megatron_fleet_health", NotImplementedError, "generation_fleet_health"),
             (
@@ -1314,6 +1432,11 @@ class TestSetup:
                 "deferred_routes_without_capture",
                 ValueError,
                 "defer_routed_experts_to_policy requires",
+            ),
+            (
+                "deferred_routes_on_automodel_policy",
+                NotImplementedError,
+                "only wired for the Megatron",
             ),
             (
                 "prompt_group_recovery_without_capture",
@@ -1352,7 +1475,11 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
-        elif invalid_case == "megatron_dtensor_trainer":
+        elif invalid_case == "deferred_routes_on_automodel_policy":
+            mc = _make_master_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
@@ -1494,7 +1621,7 @@ class TestSetup:
         self, patched_factories
     ):
         mc = _make_master_config(colocated=False)
-        mc.cluster = {"num_nodes": 2, "gpus_per_node": 8, "segment_size": 1}
+        mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
         mc.policy["generation"]["colocated"]["resources"] = {
             "gpus_per_node": 4,
             "num_nodes": 1,
@@ -1557,10 +1684,12 @@ class TestSetup:
         patched_factories,
     ):
         mc = _make_master_config()
-        mc.logger = {
-            "wandb_enabled": wandb_enabled,
-            "wandb": {"log_nemo_gym_full_result_tables": table_flag},
-        }
+        mc.logger = LoggerConfig.model_construct(
+            wandb_enabled=wandb_enabled,
+            wandb=WandbConfig.model_construct(
+                log_nemo_gym_full_result_tables=table_flag
+            ),
+        )
 
         with patch.object(sc_setup_mod, "RolloutManager") as mock_rollout_manager:
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1726,6 +1855,201 @@ class TestSetup:
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
 
+    def test_megatron_train_iters_helper_reads_without_writing(self):
+        """The trainer thread reads the config while this runs, so it must not write it."""
+        mc = _make_master_config(megatron_enabled=True, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (7, None)
+        assert "train_iters" not in mc.policy["megatron_cfg"]
+
+        mc = _make_master_config(megatron_enabled=False, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (None, None)
+
+    @staticmethod
+    def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+        """NeMo-Gym + vLLM + non-colocated: the path that overlaps the dataset load."""
+        mc = _make_master_config(backend="vllm", **kwargs)
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+            }
+        )
+        return mc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _gym_patches(gym_shards: Any = None):
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "build_nemo_gym_actors",
+                return_value=gym_shards if gym_shards is not None else MagicMock(),
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            yield
+
+    def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
+        """The dataset load waits for the trainer build to start; in the old order
+        (load first, then build) it would time out."""
+        mc = self._gym_vllm_config()
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            assert trainer_started.wait(timeout=30), (
+                "dataset loaded before the trainer build started"
+            )
+            return list(range(8)), None
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with self._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.dataloader is patched_factories["dataloader"]
+        assert patched_factories["_build_trainer"].call_count == 1
+
+    def test_native_path_loads_dataset_before_building(self, patched_factories):
+        """Outside NeMo-Gym + vLLM + non-colocated, the original order is kept."""
+        mc = _make_master_config(megatron_enabled=True)
+        trainer_started_before_load: list[bool] = []
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+        fake_return = patched_factories["setup_response_data"].return_value
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> Any:
+            trainer_started_before_load.append(trainer_started.is_set())
+            return fake_return
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_load == [False]
+
+    def test_gym_vllm_keeps_speculative_trainer_when_clamp_does_not_bind(
+        self, patched_factories
+    ):
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=2, max_num_epochs=1
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4, so 2 steps fit: no rebuild.
+        assert train_iters_at_build == [2]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 2
+
+    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds: the speculative trainer is replaced."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        stale_policy = MagicMock(name="stale_policy")
+        final_policy = patched_factories["fake_policy"]
+        policies = iter([stale_policy, final_policy])
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return next(policies), 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [1000, 8]
+        stale_policy.shutdown.assert_called_once()
+        final_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
+        mc = self._gym_vllm_config()
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
+        self, tmp_path, patched_factories
+    ):
+        """A resume restores Megatron's LR scheduler, which asserts that its saved
+        horizon equals train_iters, so the trainer is built only with the clamped value."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(_save_state())
+        # The trainer resumes from this checkpoint's weights and optimizer.
+        checkpointer.get_resume_paths.return_value = (
+            checkpoint_path / "policy" / "weights",
+            checkpoint_path / "policy" / "optimizer",
+        )
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+            patch.object(sc_setup_mod, "load_dataloader_state"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When enabled, the NeMo-Gym shard set is spun up and stored."""
         mc = _make_master_config(backend="vllm")
@@ -1766,6 +2090,8 @@ class TestSetup:
             tokenizer=tokenizer,
             enable_router_replay=False,
             use_fastokens=False,
+            # The vLLM server's bearer token, handed to the Gym model server.
+            policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
         )
         mock_validate.assert_called_once_with(
@@ -1779,8 +2105,9 @@ class TestSetup:
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
     @pytest.mark.parametrize("with_processor", [True, False])
+    @pytest.mark.parametrize("shaping_enabled", [False, True])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor
+        self, patched_factories, with_processor, shaping_enabled
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -1794,10 +2121,26 @@ class TestSetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-token-capture"}
+        mc.reward_penalties = RewardPenaltyConfig(
+            penalize_duplicated_reasoning=True,
+            penalize_empty_final_answer=True,
+            penalize_unwanted_tokens=True,
+            token_ids={"unwanted": [99]},
+        )
         mc.token_capture.enabled = True
+        effort = (
+            EffortLevelsConfig(
+                low_weight=1, low_penalty=2, low_ub=500, low_string="budget"
+            )
+            if shaping_enabled
+            else None
+        )
+        mc.env = {
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "effort_levels": effort.model_dump() if effort is not None else None
+            },
+        }
         mc.token_capture.num_reassembler_workers = 3
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -1830,6 +2173,8 @@ class TestSetup:
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_config.capture_media is with_processor
+        assert actor_config.reward_penalty_config == mc.reward_penalties
+        assert actor_config.effort_config == effort
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
@@ -2287,9 +2632,6 @@ class TestSetup:
     def _make_megatron_token_capture_config(self) -> MasterConfig:
         """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
         mc = self._make_gym_megatron_config()
-        # Extend, don't replace: setup_single_controller also indexes the
-        # wandb keys that _make_master_config populates.
-        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
         mc.token_capture.enabled = True
         return mc
 
@@ -2328,6 +2670,9 @@ class TestSetup:
         assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
             "megatron"
         )
+        # The Megatron exposed server checks no bearer token, so Gym's model
+        # server keeps the placeholder key.
+        assert mock_spinup.call_args.kwargs["policy_api_key"] is None
         mock_create_finalizer_actors.assert_called_once()
         assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
 
@@ -2516,7 +2861,6 @@ class TestNativeTQRecoverySetup:
                 "vllm_cfg": {"async_engine": True},
             }
         )
-        mc.logger["log_dir"] = str(tmp_path / "logs")
         mc.token_capture.enabled = True
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
@@ -2904,7 +3248,7 @@ class TestOPDFullValidation:
         _validate_opd_full_config(config, config.on_policy_distillation)
 
     def test_rejects_a_non_megatron_backend(self):
-        """DTensor has no vocabulary-parallel logit path for the kernels."""
+        """Automodel has no vocabulary-parallel logit path for the kernels."""
         config = _load_fullvocab_master_config()
         config.policy["megatron_cfg"]["enabled"] = False
         with pytest.raises(ValueError, match="requires the Megatron backend"):
@@ -2997,3 +3341,177 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+# ── multimodal token capture guards ──────────────────────────────────────────
+
+
+def _make_gym_megatron_capture_config() -> MasterConfig:
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    mc.policy["generation"]["stop_strings"] = None
+    mc.policy["generation"]["stop_token_ids"] = None
+    mc.policy["generation"]["top_k"] = None
+    mc.logger.log_dir = "/tmp/test-megatron-token-capture-mm"
+    mc.token_capture.enabled = True
+    return mc
+
+
+@pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
+    patched_factories, algorithm
+):
+    """Capture rows carry their own media, so dedup has nothing to share: a GRPO
+    run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
+    must not read it. The guard is the last check in the token-capture block,
+    so reaching the OPD lookup that follows it proves the guard let the PPO
+    config through.
+    """
+
+    class _PassedTokenCaptureBlock(Exception):
+        pass
+
+    mc = _make_gym_megatron_capture_config()
+    if algorithm == "grpo":
+        mc.grpo.deduplicate_multimodal_data = True
+        expectation = pytest.raises(ValueError, match="deduplicate_multimodal_data")
+    else:
+        mc.ppo = PPOConfig.model_construct(**dict(mc.grpo))
+        mc.grpo = None
+        mc.value = {"megatron_cfg": {"enabled": True}, "train_global_batch_size": 8}
+        mc.value_loss_fn = MseValueLossConfig()
+        expectation = pytest.raises(_PassedTokenCaptureBlock)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod.opd_module,
+            "get_opd_full_config",
+            side_effect=_PassedTokenCaptureBlock,
+        ) as mock_gate,
+        expectation,
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    if algorithm == "grpo":
+        mock_gate.assert_not_called()
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+    else:
+        mock_gate.assert_called_once()
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
+    patched_factories, multimodal
+):
+    """Only a multimodal Megatron capture run registers the engine-media
+    columns on the staging partition and turns media capture on in the
+    workers and the finalizer; a text run keeps the base schema."""
+    mc = _make_gym_megatron_capture_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gym_actor = MagicMock(name="nemo_gym_actor")
+    port_holders = [MagicMock(name="port_holder_rank_0")]
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+        ) as mock_spinup,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+        patch.object(sc_setup_mod, "ray"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        mock_megatron.reserve_http_server_addresses.return_value = (
+            ["http://10.0.0.1:5555/v1"],
+            {0: 5555},
+            port_holders,
+        )
+        actor_args, _ = setup_single_controller(
+            mc,
+            MagicMock(pad_token_id=0),
+            processor=MagicMock(name="processor") if multimodal else None,
+        )
+
+    assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+        "megatron"
+    )
+    dp_client = patched_factories["build_data_plane_client"].return_value
+    staging_calls = [
+        call
+        for call in dp_client.register_partition.call_args_list
+        if call.kwargs.get("partition_id") == mc.token_capture.staging_partition
+    ]
+    assert len(staging_calls) == 1
+    fields = set(staging_calls[0].kwargs["fields"])
+    if multimodal:
+        assert set(MEDIA_STAGING_FIELDS) <= fields
+    else:
+        assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+    finalizer_config = mock_finalizers.call_args.args[1]
+    assert finalizer_config.capture_media is multimodal
+    actor_args.gen_handle.setup_token_capture.assert_called_once_with(
+        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+    )
+    # What the workers pinned the media column to is what the finalizers get.
+    assert (
+        finalizer_config.media_columns
+        is actor_args.gen_handle.setup_token_capture.return_value
+    )
+
+
+@pytest.mark.mcore
+def test_offloaded_payload_exposes_multimodal_capture_fields():
+    """Pin the engine payload field the multimodal stager reads with getattr
+    defaults and the prefix-stitching keys the Megatron preparer writes."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    from megatron.core.inference import inference_request
+
+    if not hasattr(inference_request, "RequestPayloadStager"):
+        pytest.skip(
+            "pinned megatron-core predates MInf capture hooks (Megatron-LM #7015)"
+        )
+    names = {
+        field.name
+        for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
+    }
+    assert "media_tensors" in names
+    for name in ("PREFIX_MEDIA_COUNT_FIELD", "PREFIX_EXPANDED_TOKEN_COUNT_FIELD"):
+        assert hasattr(inference_request, name), name
+
+
+@pytest.mark.mcore
+def test_minf_image_preprocessing_emits_float32_pixels():
+    """Pin the premise behind the Megatron stager's pixel cast: MInf's wire
+    image path hands the payload stager float32 packed patches whatever the
+    model's params dtype, so the stager must cast them to the vision encoder's
+    weight dtype (the sink's pinned media column) rather than stage them as is."""
+    # Deferred import: megatron-core is a heavy, optional dependency.
+    Image = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    from megatron.core.inference.config import ImageProcessingConfig
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+        preprocess_image,
+    )
+
+    # 4x4 RGB with 2x2 patches: dynamic resolution keeps it at a 2x2 patch grid.
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_mean=[0.5, 0.5, 0.5],
+        pixel_std=[0.5, 0.5, 0.5],
+    )
+    imgs, imgs_sizes = preprocess_image(Image.new("RGB", (4, 4)), config)
+
+    assert imgs.dtype == torch.float32
+    assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
+    assert imgs_sizes.dtype == torch.int32
+    assert imgs_sizes.tolist() == [[4, 4]]

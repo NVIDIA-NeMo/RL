@@ -32,7 +32,11 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.models.policy import TokenizerConfig
-from nemo_rl.telemetry.vocabulary import RUN_WINDOW_WALL_CLOCK_CATEGORIES
+from nemo_rl.telemetry.vocabulary import (
+    EFFICIENCY_PCT_KEY,
+    EFFICIENCY_PCT_PER_STEP_KEY,
+    RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+)
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
@@ -121,7 +125,9 @@ def calculate_baseline_and_std_per_prompt(
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
     are not included in the baseline calculation.
 
-    prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device
+    prompts:    tensor (b, k)     Row equality keys defining prompt groups. GRPO uses
+                                  explicit rollout-group ids with shape (b, 1), not
+                                  prompt tokens. May be on any device.
     rewards:    tensor (b,)       Float-valued rewards. May be on any device
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
@@ -298,37 +304,24 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
-def mask_out_neg_inf_logprobs(
-    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+def mask_filtered_logprobs_outside_tokens(
+    logprobs: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    """Mask out negative infinity log probabilities.
+    """Zero top-k/top-p filtered log probabilities outside ``mask``.
 
-    Handling sampling mask mismatch:
-    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
-    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
-    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
-    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+    Prompt and padding tokens are often outside the filtered support and would
+    otherwise carry -inf (or NaN after multiplying by a mask) to every consumer.
+    Valid tokens keep -inf so the actor loss can exclude policy support
+    mismatches instead of treating them as log-probability zero.
 
     Args:
-        logprobs: Log probabilities.
-        mask: Mask.
-        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+        logprobs: Filtered log probabilities.
+        mask: Valid-token mask (token_mask * sample_mask).
 
     Returns:
-        Masked log probabilities.
+        Log probabilities with zeros outside ``mask``.
     """
-    is_neginf = torch.isinf(logprobs)
-    neginf_count = (is_neginf & mask.bool()).sum().item()
-    if neginf_count > 0:
-        print(
-            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
-            "(policy top-k/top-p mismatch). Masking out these positions."
-        )
-
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
-
-    return logprobs
+    return torch.where(mask.bool(), logprobs, 0.0)
 
 
 def masked_var(
@@ -344,7 +337,10 @@ def masked_var(
 
     if unbiased:
         normalization_factor = torch.sum(mask)
-        variance = variance * (normalization_factor / (normalization_factor - 1))
+        # A singleton has zero centered variance; avoid an undefined correction.
+        variance = variance * (
+            normalization_factor / (normalization_factor - 1).clamp(min=1)
+        )
     return variance
 
 
@@ -820,8 +816,8 @@ def print_performance_metrics(
             + policy_training_time
         )
 
-    num_nodes = master_config.cluster["num_nodes"]
-    gpus_per_node = master_config.cluster["gpus_per_node"]
+    num_nodes = master_config.cluster.num_nodes
+    gpus_per_node = master_config.cluster.gpus_per_node
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
@@ -1022,6 +1018,9 @@ def log_generation_metrics(
 
 
 WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    # Spelled out rather than INIT_TOTAL_CATEGORY: this list is the canonical
+    # declaration, and the telemetry suite parses it as string literals to keep
+    # the constants that restate it honest.
     "init/total",
     "idle/buffer_starvation",
     "idle/refit_bubble",
@@ -1138,13 +1137,13 @@ def print_efficiency_summary(
     loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
     loggable["efficiency/total_waste_s"] = wall_waste
     loggable["efficiency/productive_time_s"] = productive
-    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable[EFFICIENCY_PCT_KEY] = efficiency_pct
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
     # Carries the window of the ratio above to the OTel tee, which tags it. A
     # caller that supplies no per-step denominator gets a run-cumulative ratio,
     # and publishing that as per-step would state the opposite of what it is.
     # A float, not the string it represents, because everything in this dict is
     # also logged to WandB/TensorBoard as a scalar.
-    loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
+    loggable[EFFICIENCY_PCT_PER_STEP_KEY] = float(pct_is_per_step)
 
     return loggable

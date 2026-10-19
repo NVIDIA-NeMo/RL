@@ -132,11 +132,8 @@ class AutomodelBackendConfig(TypedDict):
     # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
     # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
     experts: NotRequired[str]
-    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter), "deepep", etc.
+    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter) or "hybridep".
     dispatcher: NotRequired[str]
-    # Enable DeepEP (Deep Expert Parallelism) for MoE models.
-    # Deprecated upstream: use dispatcher="deepep" and experts="gmm"/"torch_mm" instead.
-    enable_deepep: NotRequired[bool]
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
     # Enable HuggingFace state dict adapter for checkpoint saving/loading plus refit support for RL
@@ -174,7 +171,7 @@ class AutomodelKwargs(TypedDict):
     force_hf: NotRequired[bool]
 
 
-class DTensorConfigDisabled(TypedDict):
+class AutomodelConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
@@ -196,10 +193,9 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
-class DTensorConfig(TypedDict):
+class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
-    _v2: NotRequired[bool]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
@@ -221,6 +217,9 @@ class DTensorConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -383,6 +382,15 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # When True, offload_after_refit skips rerunning the full offload_before_refit
+    # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
+    # and only re-offloads the optimizer with a single allocator cleanup.
+    # When True, the reference-policy swap in use_reference_model stages the
+    # active weights in persistent pinned CPU buffers and keeps the reference
+    # state dict pinned from setup, so the three per-step full-model PCIe
+    # transfers run as non-blocking pinned copies instead of pageable ones.
+    # Costs 2x model-size pinned host RAM per worker. Default False keeps the
+    # current pageable-copy behavior.
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
@@ -457,6 +465,14 @@ class MegatronConfig(TypedDict):
     # Backend for grouped-GEMM during inference-optimized MoE forward.
     # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
     inference_grouped_gemm_backend: NotRequired[str]
+    # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
+    # every decode step processes the full NVLS dispatcher buffer
+    # (round_up(max_tokens) / TP * EP rows). MCore applies it only to decode-only
+    # steps when max_requests * (num_speculative_tokens + 1) * EP <= capacity.
+    # FlashInfer's TRT-LLM MXFP8 MoE also needs enough
+    # rows for the local expert count (Nano-30B: >=256 rows at 16 local experts,
+    # >=1024 at 64); smaller capacities fail CUDA-graph capture.
+    inference_flashinfer_mxfp8_token_capacity: NotRequired[int | None]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
@@ -498,6 +514,14 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Collective timeout (minutes) for the default process group and the
+    # Megatron model-parallel and replica groups. Raise it when one rank can stall for
+    # longer than the default, e.g. a dist-checkpoint shard write on a slow
+    # shared filesystem holds up the save-finalize / load collectives.
+    # Omitted or None: the torch.distributed / Megatron Bridge default (10 min).
+    # Set it in every megatron_cfg that runs Megatron workers (in PPO, both
+    # policy and value).
+    distributed_timeout_minutes: NotRequired[float | None]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
@@ -570,6 +594,17 @@ class MegatronConfig(TypedDict):
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.
     freeze_config: NotRequired[dict[str, Any]]
+    # Megatron-Core batch-invariant kernels (bitwise train/generation parity).
+    batch_invariant_mode: NotRequired[bool]
+    batch_invariant_backend: NotRequired[Literal["deepgemm", "te_native", "triton"]]
+    # Cross-rank EP combine: "ordered" is portable, "multimem" uses NVLS.
+    batch_invariant_collective: NotRequired[Literal["multimem", "ordered"]]
+    # FlashAttention generation. Defaults to 2 when unset (flash-attn-4 is installed,
+    # so TE's auto choice would be FA4); batch-invariant / zero-KL recipes set 4
+    # (3 or 4 are accepted under batch_invariant_mode).
+    flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
+    # flag to enable zero train/gen KL with generation.backend='megatron'.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class TokenizerConfig(TypedDict):
@@ -670,7 +705,7 @@ class PolicyConfig(TypedDict):
     ]  # used in static batched (framework) generation
     precision: str
     reward_model_cfg: NotRequired[RewardModelConfig]
-    dtensor_cfg: DTensorConfig | DTensorConfigDisabled
+    automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[Eagle3DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
@@ -683,9 +718,13 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
-    # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
+    # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: bool
+    # Move optimizer state to CPU when offload_before_refit runs.
+    offload_optimizer_for_refit: bool
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

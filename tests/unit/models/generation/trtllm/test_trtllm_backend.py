@@ -28,10 +28,22 @@ def _extension(backend):
     extension = backend.NcclExtension.__new__(backend.NcclExtension)
     module = MagicMock()
     module._weights_removed = False
+    # WorkerExtension._refit_modules skips any module whose `_orig_mod` is not
+    # None -- its marker for a torch.compile wrapper. A bare MagicMock
+    # auto-creates that attribute, so the module would be skipped and the
+    # finalize hooks would never fire. Delete it so the mock looks unwrapped.
+    del module._orig_mod
     model = MagicMock()
     model.modules.return_value = [module]
     model_loader = MagicMock()
-    model_engine = SimpleNamespace(model=model, model_loader=model_loader)
+    # begin_weight_update/finish_weight_update call these on the model engine;
+    # SimpleNamespace does not auto-create attributes the way MagicMock does.
+    model_engine = SimpleNamespace(
+        model=model,
+        model_loader=model_loader,
+        unwrap_compiled_model_for_refit=MagicMock(),
+        restore_compiled_model_after_refit=MagicMock(),
+    )
     engine = MagicMock()
     engine.model_engine = model_engine
     engine.control_action.side_effect = lambda **_: contextlib.nullcontext()
@@ -53,35 +65,6 @@ def _ipc_extension(backend):
         "b": (torch.Size([3]), torch.float32),
     }
     return extension, model_loader, engine
-
-
-@pytest.mark.parametrize(
-    ("hook_name", "is_available"),
-    [
-        ("begin_update_weights", True),
-        ("begin_update_weights", False),
-        ("finalize_update_weights", True),
-        ("finalize_update_weights", False),
-        ("abort_update_weights", True),
-        ("abort_update_weights", False),
-    ],
-)
-def test_model_loader_lifecycle_hooks_are_optional(hook_name, is_available):
-    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
-
-    hook = MagicMock()
-    model_loader = (
-        SimpleNamespace(**{hook_name: hook}) if is_available else SimpleNamespace()
-    )
-
-    assert (
-        backend._call_model_loader_hook_if_available(model_loader, hook_name)
-        is is_available
-    )
-    if is_available:
-        hook.assert_called_once_with()
-    else:
-        hook.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -113,13 +96,18 @@ def test_collective_refit_runs_at_async_engine_boundary(
     model_loader.finalize_update_weights.side_effect = lambda: call_order.append(
         "finalize"
     )
+    model_engine = engine.model_engine
+    model_engine.unwrap_compiled_model_for_refit.side_effect = (
+        lambda: call_order.append("unwrap")
+    )
+    model_engine.restore_compiled_model_after_refit.side_effect = (
+        lambda *_: call_order.append("restore")
+    )
+    engine.reset_prefix_cache.side_effect = lambda: call_order.append("reset_prefix")
     monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
     monkeypatch.setattr(
         backend.torch.cuda, "synchronize", lambda: call_order.append("cuda_sync")
     )
-    stream = MagicMock()
-    stream.synchronize.side_effect = lambda: call_order.append("stream_sync")
-    monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda: stream)
 
     assert (
         extension.update_weights_from_collective(
@@ -135,8 +123,11 @@ def test_collective_refit_runs_at_async_engine_boundary(
         {"model.weight": torch.tensor([1.0])},
         allow_partial_loading=True,
     )
+    # WorkerExtension's lifecycle: begin (unwrap -> begin_update_weights ->
+    # pre_reload_weights), the refit itself, finalize (finalize_update_weights
+    # -> process/post hooks), finish (reset_prefix_cache -> sync -> re-wrap).
     assert call_order == [
-        "cuda_sync",
+        "unwrap",
         "begin",
         "pre",
         "broadcast",
@@ -144,7 +135,9 @@ def test_collective_refit_runs_at_async_engine_boundary(
         "finalize",
         "process",
         "post",
-        "stream_sync",
+        "reset_prefix",
+        "cuda_sync",
+        "restore",
     ]
     model_loader.abort_update_weights.assert_not_called()
     engine.reset_prefix_cache.assert_called_once_with()
