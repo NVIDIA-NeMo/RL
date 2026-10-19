@@ -133,6 +133,7 @@ def test_prefetch_configs_exist():
 @pytest.mark.parametrize(
     "server_instance",
     [
+        "sav_tracks",
         "citation_if",
         # The simulation config installs both a resources server and an agent.
         "conversational_tool_use_simulation",
