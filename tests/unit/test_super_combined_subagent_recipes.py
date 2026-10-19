@@ -82,6 +82,18 @@ def test_mixed_recipe_admits_the_complete_avb_model_context(recipe: str) -> None
     assert config.token_capture.max_train_row_tokens == 131072
 
 
+@pytest.mark.parametrize("recipe", AVB_RECIPES + ("8n8g-megatron-claweval-sc.v1",))
+def test_super_recipes_select_native_weighted_relu_activation_fusion(
+    recipe: str,
+) -> None:
+    config = load_config(
+        REPO
+        / "examples/configs/recipes/vlm"
+        / f"vlm_grpo-nemotron-3.5-super-vl-120ba12b-{recipe}.yaml"
+    )
+    assert config.policy.megatron_cfg.use_fused_weighted_squared_relu is True
+
+
 def _capture_avb_launcher_arguments(
     tmp_path: Path, *, row_limit: str | None = None
 ) -> subprocess.CompletedProcess[bytes]:

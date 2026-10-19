@@ -34,6 +34,10 @@ policy:
     # Keep policy scoring and checkpoint recomputation on the qualified BF16
     # kernels. This requires the source-pinned native TE/MCore runtime.
     stable_policy_forward: true
+    # Use Bridge's native Super-VL activation fusion. The unfused weighted
+    # ReLU2 retains a full FP32 expert activation before its BF16 cast and
+    # exhausts H100 memory during long-row backward recomputation.
+    use_fused_weighted_squared_relu: true
     expert_model_parallel_size: 32
     optimizer:
       optimizer_cpu_offload: true
