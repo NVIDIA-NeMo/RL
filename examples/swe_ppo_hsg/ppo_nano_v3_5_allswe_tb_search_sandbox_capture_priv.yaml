@@ -12,7 +12,7 @@
 # - bash_command runs in a per-rollout OpenSandbox sandbox (python:3.12-slim, egress denied). Search
 #   (Exa behind a read-only cache), browse and the judge (GLM-5.1 on inference-api.nvidia.com) stay on
 #   the resources server.
-# - Context resets off (max_reset_count 0), 400 steps, 2 h per rollout.
+# - Context resets off (max_reset_count 0), 400 steps, 1 h per rollout (Ritu's run: 2 h).
 # - Masked: rollouts ending on max_steps / context_full / timeout (response.stop_reason), on top of the
 #   SWE / TB rules. A rule whose field a rollout lacks never matches, so the rule sets do not interact.
 # Keys (INFERENCE_API_KEY, BC_EXA_API_KEYS_JSON) come from the job environment (launcher SEARCH_ENV_FILE),
@@ -123,7 +123,9 @@ env:
           max_run_retries: 1
           progress: true
           snap_dir: null
-          rollout_timeout_s: 7200
+          # Per-rollout wall-clock cap (user, 2026-10-19: 3600, as the SWE agent). Ritu's run used 7200, but its
+          # 27,426 rollouts took 8.4 min median, 26.4 min p99, none over 60 min (token-capture call spans).
+          rollout_timeout_s: 3600
           # Off: the pre-call /tokenize count only drives context resets, which are off, and it bypasses capture.
           save_model_call_using_vllm_tokenize_endpoint: false
           datasets: []
