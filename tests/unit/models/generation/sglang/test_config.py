@@ -24,13 +24,13 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.models.generation.sglang.config import (
     SGLangFaultToleranceConfig,
     SGLangHttpClientConfig,
     SglangSpecificArgs,
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-from nemo_rl.models.generation.sglang import sglang_worker
 from nemo_rl.utils.config import load_config
 
 
