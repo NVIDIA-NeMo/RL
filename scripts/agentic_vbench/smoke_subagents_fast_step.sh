@@ -60,12 +60,14 @@ export AGENTIC_VBENCH_MAX_TURNS=${AGENTIC_VBENCH_MAX_TURNS:-32}
 # Full task budget (1800 s per episode); the GPU reaper exemption in launch_sc.sh
 # removes the kill-window reason for a shorter cap.
 export AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER=${AGENTIC_VBENCH_AGENT_TIMEOUT_MULTIPLIER:-1.0}
-# Without compaction a 32-turn episode is one training row of its whole context.
-# An 81,920-token ceiling was still unsafe on the 8-node TP8/EP16/CP1 learner:
-# run 2238533 completed step 0, then a near-80k multimodal row OOM'd the MoE
-# forward pass in step 1.  Keep the smoke at the production-tested 64k envelope;
-# rejected owners train nothing in that step instead of crashing all ranks.
-export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-65536}
+# Preserve every valid target in the declared OpenCode context. Memory and
+# generation/trainer parity must be repaired without rejecting longer rows.
+export SUBAGENT_MAX_ROW_TOKENS=${SUBAGENT_MAX_ROW_TOKENS:-$AGENTIC_VBENCH_CONTEXT_TOKENS}
+if ! [[ $SUBAGENT_MAX_ROW_TOKENS =~ ^[0-9]+$ && $AGENTIC_VBENCH_CONTEXT_TOKENS =~ ^[0-9]+$ ]] || \
+   (( 10#$SUBAGENT_MAX_ROW_TOKENS < 10#$AGENTIC_VBENCH_CONTEXT_TOKENS )); then
+  echo 'ERROR: SUBAGENT_MAX_ROW_TOKENS must cover the complete AGENTIC_VBENCH_CONTEXT_TOKENS window' >&2
+  exit 2
+fi
 export SAVE_PERIOD=${SAVE_PERIOD:-1}
 export JOB_CYCLES=${JOB_CYCLES:-6}
 export SLURM_QOS=${SLURM_QOS:-short}
@@ -77,19 +79,19 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.max_inflight_prompts=${NUM_PROMPTS}" \
   "async_rl.max_buffered_rollouts=${NUM_PROMPTS}" \
-  "+token_capture.max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS}" \
-  +env.nemo_gym.training_mode=subagent \
-  "+${agent}.opencode_training_mode=subagent" \
-  "+${agent}.opencode_subagents_enabled=true" \
-  "+${agent}.opencode_subagent_max_depth=1" \
-  "+${agent}.opencode_subagent_max_active=null" \
-  "+${agent}.max_turns=${AGENTIC_VBENCH_MAX_TURNS}" \
-  "+${agent}.model_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS}" \
-  "+${agent}.model_output_capability_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS}" \
-  "+${agent}.opencode_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT}" \
-  "+${agent}.opencode_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
-  "+${agent}.opencode_compaction_auto=false" \
-  "+${agent}.opencode_compaction_prune=false" \
+  "++token_capture.max_train_row_tokens=${SUBAGENT_MAX_ROW_TOKENS}" \
+  ++env.nemo_gym.training_mode=subagent \
+  "++${agent}.opencode_training_mode=subagent" \
+  "++${agent}.opencode_subagents_enabled=true" \
+  "++${agent}.opencode_subagent_max_depth=1" \
+  "++${agent}.opencode_subagent_max_active=null" \
+  "++${agent}.max_turns=${AGENTIC_VBENCH_MAX_TURNS}" \
+  "++${agent}.model_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS}" \
+  "++${agent}.model_output_capability_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS}" \
+  "++${agent}.opencode_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT}" \
+  "++${agent}.opencode_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
+  "++${agent}.opencode_compaction_auto=false" \
+  "++${agent}.opencode_compaction_prune=false" \
   "$@" \
   grpo.max_num_steps=1000000 \
   grpo.max_num_epochs=null

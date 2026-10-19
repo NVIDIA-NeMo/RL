@@ -125,7 +125,7 @@ export AGENTIC_VBENCH_CONTEXT_TOKENS=262144
 export AGENTIC_VBENCH_OUTPUT_TOKENS=8192
 export AGENTIC_VBENCH_TOOL_OUTPUT_MAX_LINES=400
 export AGENTIC_VBENCH_TOOL_OUTPUT_MAX_BYTES=8192
-export SUBAGENT_MAX_ROW_TOKENS=65536
+export SUBAGENT_MAX_ROW_TOKENS=$AGENTIC_VBENCH_CONTEXT_TOKENS
 
 # This diagnostic is observational only: it records exact rows above the hard
 # audit bound and never masks them or changes the loss.
