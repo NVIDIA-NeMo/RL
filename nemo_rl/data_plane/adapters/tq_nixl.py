@@ -175,8 +175,7 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
         "staging_bytes": staging,
         "pickup_s": pickup_s,
         "demote_after_s": None if after is None else float(after),
-        "high_wm": high,
-        "low_wm": low,
+        "watermarks": None if high is None else (high, low),
     }
 
 
