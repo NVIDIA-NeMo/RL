@@ -691,6 +691,55 @@ class TestAddSpecialTokensInText:
                 add_special_tokens_in_text=True,
             )
 
+    def test_cross_tokenizer_teacher_adds_and_counts_its_marker(self):
+        # Character-level student; the word-level teacher starts rows with <bos>.
+        student = _char_tokenizer()
+        teacher = _word_tokenizer(bos=True)
+        batch = [_datum("alpha beta", idx=5)]
+
+        def collate(
+            add_special_tokens_in_text: bool,
+            *,
+            teacher_length: int = 8,
+            reject_overlength_text: bool = False,
+        ):
+            return CrossTokenizerCollator(
+                config=CrossTokenizerCollatorConfig(),
+                student_tokenizer=student,
+                teacher_tokenizers=[teacher],
+                aligners=[
+                    TokenAligner(student, teacher, projection_matrix_path="unused.pt")
+                ],
+                ctx_length_student=64,
+                ctx_length_teachers=[teacher_length],
+                drop_first_assistant_chunk_kl_by_teacher=[False],
+                reject_overlength_text=reject_overlength_text,
+                add_special_tokens_in_text=add_special_tokens_in_text,
+            )(batch)
+
+        off, on = collate(False), collate(True)
+        assert off["teacher_0_input_lengths"].tolist() == [2]
+        assert on["teacher_0_input_lengths"].tolist() == [3]
+        assert on["teacher_0_input_ids"][0, 0] == teacher.bos_token_id
+        assert torch.equal(on["teacher_0_input_ids"][:, 1:], off["teacher_0_input_ids"])
+        # The character-level student adds no special tokens.
+        assert torch.equal(on["input_ids"], off["input_ids"])
+        # The teacher marker forms its own chunk with no student token.
+        assert on["alignment_0_teacher_chunk_id"][0, 0] == 0
+        assert torch.equal(
+            on["alignment_0_student_chunk_id"], off["alignment_0_student_chunk_id"] + 1
+        )
+        # Two words fill a 2-token teacher context; the marker makes a third.
+        assert collate(False, teacher_length=2, reject_overlength_text=True)[
+            "teacher_0_input_lengths"
+        ].tolist() == [2]
+        with pytest.raises(
+            ValueError,
+            match=r"^teacher 0, sample idx=5: text tokenization has 3 tokens, "
+            r"exceeding context length 2; overlength rows are rejected$",
+        ):
+            collate(True, teacher_length=2, reject_overlength_text=True)
+
 
 class TestCollatorSequenceDivisibility:
     @pytest.mark.parametrize(
