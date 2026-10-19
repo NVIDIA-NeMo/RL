@@ -74,6 +74,12 @@ _VLLM_CFG_FP8 = {
     "use_deep_gemm",
 }
 
+# Applied by the Dynamo worker actor as a vLLM source patch plus the engine
+# environment variable that enables it, as the vLLM backend does.
+_VLLM_CFG_ENGINE_PATCHES = {
+    "fp32_lm_head",
+}
+
 # Read by NeMo RL's worker extension inside each engine at refit time.
 _VLLM_CFG_REFIT = {
     "refit_with_reload_api",
@@ -290,6 +296,7 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             | _VLLM_CFG_UNSUPPORTED
             | _VLLM_CFG_MANAGED_RUNTIME
             | _VLLM_CFG_REFIT
+            | _VLLM_CFG_ENGINE_PATCHES
             | _VLLM_CFG_FP8
             | _VLLM_CFG_INAPPLICABLE
             | _VLLM_SINGLE_RANK_ONLY_FIELDS

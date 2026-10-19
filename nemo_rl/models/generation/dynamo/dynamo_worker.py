@@ -179,10 +179,27 @@ class DynamoVllmWorker:  # pragma: no cover
         # The same on-disk vLLM source fixes the vLLM backend applies (tool-parser
         # namespace, Eagle3 draft lm_head, model loaders). Imports only vLLM's logger, never CUDA: this
         # actor holds no GPU.
-        from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+        from nemo_rl.models.generation.vllm.config import (
+            vllm_nemotron_h_fp32_lm_head_enabled,
+        )
+        from nemo_rl.models.generation.vllm.patches import (
+            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+            ensure_vllm_source_compat,
+            require_nemotron_h_fp32_lm_head_patch,
+        )
 
         ensure_vllm_source_compat()
         vllm_cfg = validated_config.vllm_cfg.model_dump()
+        # As on the vLLM backend: Nemotron-H logits from an fp32 LM head, to match a
+        # trainer with megatron_cfg.fp32_lm_head. The source patch is inert unless
+        # the engine environment turns it on, so set the flag either way rather than
+        # inherit it from this actor.
+        fp32_lm_head = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+        if fp32_lm_head:
+            require_nemotron_h_fp32_lm_head_patch()
+        fp32_lm_head_env = {
+            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1" if fp32_lm_head else "0"
+        }
         vllm_kwargs = dict(validated_config.vllm_kwargs)
         engine_env_defaults: dict[str, str] = {}
         fp8_env: dict[str, str] = {}
@@ -208,6 +225,7 @@ class DynamoVllmWorker:  # pragma: no cover
                 **manager_env,
                 **fp8_env,
                 **draft_env,
+                **fp32_lm_head_env,
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
