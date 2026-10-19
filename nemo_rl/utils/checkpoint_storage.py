@@ -90,7 +90,7 @@ def path_isdir(path: str | os.PathLike[str]) -> bool:
 def listdir(path: str | os.PathLike[str]) -> list[str]:
     """``os.listdir`` that also understands ``msc://`` URLs."""
     if is_msc_path(path):
-        return msc.os.listdir(str(path))
+        return [entry.name for entry in msc.Path(str(path)).iterdir()]
     return os.listdir(path)
 
 

@@ -26,6 +26,7 @@ from nemo_rl.utils.checkpoint import (
 )
 from nemo_rl.utils.checkpoint_storage import (
     as_path,
+    listdir,
     load_checkpoint_object,
     maybe_enable_msc,
     open_path,
@@ -194,3 +195,10 @@ def test_warm_start_validation_accepts_msc_urls(manager):
     validate_warm_start_checkpoint(checkpoint, model_component="value")
     with pytest.raises(ValueError, match="no policy/weights subtree"):
         validate_warm_start_checkpoint(checkpoint, model_component="policy")
+
+
+def test_listdir_lists_msc_children(manager):
+    checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
+    with open_path(checkpoint + "/policy/weights/shard.bin", "w") as f:
+        f.write("weights")
+    assert sorted(listdir(checkpoint)) == ["policy", "training_info.json"]
