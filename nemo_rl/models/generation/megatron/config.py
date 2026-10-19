@@ -214,6 +214,10 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
         "activation_checkpointing": False,
         "context_parallel_size": 1,
     }
+    # Training-only: generation already runs the inference kernel, and MCore
+    # rejects the mode without the MoE recompute that generation disables.
+    if merged.get("moe_inference_training_forward"):
+        merged["moe_inference_training_forward"] = False
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this
     # merge is the only spot the inference cfg gets a named error instead of a

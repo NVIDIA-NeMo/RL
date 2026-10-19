@@ -1,0 +1,24 @@
+# Nemotron Nano v3 zero train/generation KL with per-token NVFP4 routed experts on
+# FlashInfer. Training and refit stay BF16; generation quantizes the experts to NVFP4,
+# and each training MoE forward runs the same kernel on the same quantization
+# (moe_inference_training_forward) with the backward from the TE recompute pass.
+#
+# Needs Megatron-LM PR #7798 on top of the zero-kl-mxfp8 parent's requirements, and
+# flashinfer-python>=0.7.0 (the per-token NVFP4 Relu2 MoE kernels).
+defaults: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8-flashinfer.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+policy:
+  megatron_cfg:
+    inference_moe_nvfp4_recipe: per_token
+    te_precision_config_file: null
+    fp8_cfg:
+      enabled: false
+  generation:
+    mcore_generation_config:
+      fp8_cfg:
+        enabled: false
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  wandb:
+    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer

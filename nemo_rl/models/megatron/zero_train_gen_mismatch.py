@@ -15,7 +15,8 @@
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
 The recipe sets every required value; this module only checks them. Supported
-precisions are BF16 and MXFP8 (the same on train and generation).
+precisions are BF16 and MXFP8 (the same on train and generation), and FlashInfer
+MXFP8 or per-token NVFP4 experts with moe_inference_training_forward.
 """
 
 from __future__ import annotations
@@ -487,19 +488,89 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         )
 
     fp8_cfg = inference_cfg.get("fp8_cfg") or {}
-    backend = inference_cfg.get("inference_grouped_gemm_backend")
-    backend = getattr(backend, "value", backend)
+    backend = _grouped_gemm_backend(inference_cfg)
+    quantized_experts = (
+        fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ) or inference_cfg.get("inference_moe_nvfp4_recipe") is not None
     if (
         impl == "inference_optimized"
         and backend == "flashinfer"
-        and fp8_cfg.get("enabled")
-        and fp8_cfg.get("fp8_recipe") == "mxfp8"
+        and quantized_experts
+        and not config["megatron_cfg"].get("moe_inference_training_forward")
     ):
         out.violations.append(
-            "zero_train_gen_mismatch does not support "
-            "inference_grouped_gemm_backend='flashinfer' with MXFP8: the FlashInfer "
+            "zero_train_gen_mismatch with inference_grouped_gemm_backend='flashinfer' "
+            "and MXFP8 or NVFP4 experts requires "
+            "policy.megatron_cfg.moe_inference_training_forward=true: the FlashInfer "
             "kernel is batch-invariant but not bitwise identical to TE training. "
-            "Use 'torch' or 'vllm'."
+            "Otherwise use 'torch' or 'vllm' with MXFP8."
+        )
+    if config["megatron_cfg"].get("moe_inference_training_forward"):
+        _validate_inference_training_forward(config, inference_cfg, out)
+
+
+def _grouped_gemm_backend(cfg: dict[str, Any]) -> Any:
+    backend = cfg.get("inference_grouped_gemm_backend")
+    return getattr(backend, "value", backend)
+
+
+def _validate_inference_training_forward(
+    config: PolicyConfig, inference_cfg: dict[str, Any], out: ZeroTrainGenValidation
+) -> None:
+    """The training MoE forward runs generation's FlashInfer kernel; TE recompute backs it."""
+    megatron_cfg = config["megatron_cfg"]
+    prefix = "moe_inference_training_forward=true requires"
+    if megatron_cfg.get("transformer_impl") != "inference_optimized":
+        out.violations.append(
+            f"{prefix} policy.megatron_cfg.transformer_impl='inference_optimized' "
+            f"(got {megatron_cfg.get('transformer_impl')!r})."
+        )
+    for label, cfg in (
+        ("policy.megatron_cfg", megatron_cfg),
+        ("policy.generation.mcore_generation_config", inference_cfg),
+    ):
+        if _grouped_gemm_backend(cfg) != "flashinfer":
+            out.violations.append(
+                f"{prefix} {label}.inference_grouped_gemm_backend='flashinfer' "
+                f"(got {_grouped_gemm_backend(cfg)!r})."
+            )
+    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
+    mxfp8 = fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    if not mxfp8 and megatron_cfg.get("inference_moe_nvfp4_recipe") is None:
+        out.violations.append(
+            f"{prefix} MXFP8 experts (policy.megatron_cfg.fp8_cfg with "
+            "fp8_recipe='mxfp8') or policy.megatron_cfg.inference_moe_nvfp4_recipe: "
+            "the FlashInfer BF16 kernel is not batch invariant."
+        )
+    recompute_modules = megatron_cfg.get("recompute_modules") or []
+    if not (
+        megatron_cfg.get("activation_checkpointing")
+        and megatron_cfg.get("recompute_granularity") == "selective"
+        and "moe" in recompute_modules
+    ):
+        out.violations.append(
+            f"{prefix} activation_checkpointing=true, "
+            "recompute_granularity='selective' and 'moe' in recompute_modules: the "
+            "backward comes from the TE recompute pass."
+        )
+    if megatron_cfg.get("cuda_graph_impl") == "local":
+        out.violations.append(
+            f"{prefix} a training cuda_graph_impl other than 'local', which disables "
+            "MoE-layer recompute."
+        )
+    mismatched = [
+        key
+        for key in (
+            "inference_moe_nvfp4_recipe",
+            "inference_moe_token_dispatcher_type",
+            "expert_model_parallel_size",
+        )
+        if megatron_cfg.get(key) != inference_cfg.get(key)
+    ]
+    if mismatched:
+        out.violations.append(
+            f"{prefix} the same training and generation values for: "
+            f"{', '.join(mismatched)}."
         )
 
 
