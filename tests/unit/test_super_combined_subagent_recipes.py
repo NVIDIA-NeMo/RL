@@ -126,3 +126,28 @@ def test_avb_launcher_rejects_a_hidden_shorter_training_window(tmp_path: Path) -
     assert launched.returncode == 2
     assert b"must cover the complete" in launched.stderr
     assert not launched.stdout
+
+
+def test_real_avb_launcher_preserves_role_prompt_punctuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = (
+        'Delegate one task, then verify the "original" deliverables.\nKeep [evidence].'
+    )
+    child = "Complete the subtask, then report the parent's result."
+    monkeypatch.setenv("AGENTIC_VBENCH_DELEGATION_PROMPT", parent)
+    monkeypatch.setenv("AGENTIC_VBENCH_SUBAGENT_PROMPT", child)
+    launched = _capture_avb_launcher_arguments(tmp_path)
+    assert launched.returncode == 0, launched.stderr.decode(errors="replace")
+    overrides = launched.stdout.decode().rstrip("\0").split("\0")
+    config = parse_hydra_overrides(
+        load_config(
+            REPO
+            / "examples/configs/recipes/vlm"
+            / f"vlm_grpo-nemotron-3.5-super-vl-120ba12b-{AVB_RECIPES[0]}.yaml"
+        ),
+        overrides,
+    )
+    agent = config.env.nemo_gym.agentic_vbench_agent.responses_api_agents.agentic_vbench_agent
+    assert agent.opencode_delegation_prompt == parent
+    assert agent.opencode_subagent_prompt == child

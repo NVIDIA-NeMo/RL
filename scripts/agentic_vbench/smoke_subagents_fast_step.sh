@@ -88,8 +88,8 @@ exec bash "$script_dir/smoke_off_32turns_256k.sh" \
   "++${agent}.max_turns=${AGENTIC_VBENCH_MAX_TURNS}" \
   "++${agent}.model_context_tokens=${AGENTIC_VBENCH_CONTEXT_TOKENS}" \
   "++${agent}.model_output_capability_tokens=${AGENTIC_VBENCH_OUTPUT_TOKENS}" \
-  "++${agent}.opencode_delegation_prompt=${AGENTIC_VBENCH_DELEGATION_PROMPT}" \
-  "++${agent}.opencode_subagent_prompt=${AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
+  "++${agent}.opencode_delegation_prompt=\${oc.env:AGENTIC_VBENCH_DELEGATION_PROMPT}" \
+  "++${agent}.opencode_subagent_prompt=\${oc.env:AGENTIC_VBENCH_SUBAGENT_PROMPT}" \
   "++${agent}.opencode_compaction_auto=false" \
   "++${agent}.opencode_compaction_prune=false" \
   "$@" \

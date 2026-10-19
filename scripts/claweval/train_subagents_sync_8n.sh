@@ -78,7 +78,7 @@ export NRL_R3_TRACE_DIR=${NRL_R3_TRACE_DIR:-$repo_dir/results/$BASE_NAME/r3_trac
 
 agent=env.nemo_gym.claweval_agent.responses_api_agents.claweval_agent
 exec bash "$script_dir/run_sc.sh" \
-  +policy.router_replay.enabled=true \
+  ++policy.router_replay.enabled=true \
   async_rl.sampler.name=in_order \
   async_rl.sampler.max_lookahead_versions=0 \
   "async_rl.min_groups_for_streaming_train=${NUM_PROMPTS}" \
@@ -87,18 +87,19 @@ exec bash "$script_dir/run_sc.sh" \
   async_rl.rollout_failure.on_dropped_prompt=replace \
   async_rl.rollout_failure.max_replacement_attempts=4 \
   async_rl.rollout_failure.replacement_reserve_prompts=1 \
-  "+token_capture.max_train_row_tokens=${CLAW_EVAL_MAX_ROW_TOKENS}" \
-  +env.nemo_gym.training_mode=subagent \
-  "+${agent}.opencode_training_mode=subagent" \
-  "+${agent}.opencode_subagents_enabled=true" \
-  "+${agent}.opencode_subagent_max_depth=1" \
-  "+${agent}.opencode_subagent_max_active=null" \
-  "+${agent}.max_turns=${CLAW_EVAL_MAX_TURNS}" \
-  "+${agent}.model_context_tokens=${CLAW_EVAL_CONTEXT_TOKENS}" \
-  "+${agent}.model_output_capability_tokens=${CLAW_EVAL_OUTPUT_TOKENS}" \
-  "+${agent}.opencode_delegation_prompt=${CLAW_EVAL_DELEGATION_PROMPT}" \
-  "+${agent}.opencode_compaction_auto=false" \
-  "+${agent}.opencode_compaction_prune=false" \
+  "++token_capture.max_train_row_tokens=${CLAW_EVAL_MAX_ROW_TOKENS}" \
+  ++env.nemo_gym.training_mode=subagent \
+  "++${agent}.opencode_training_mode=subagent" \
+  "++${agent}.opencode_subagents_enabled=true" \
+  "++${agent}.opencode_subagent_max_depth=1" \
+  "++${agent}.opencode_subagent_max_active=null" \
+  "++${agent}.max_turns=${CLAW_EVAL_MAX_TURNS}" \
+  "++${agent}.model_context_tokens=${CLAW_EVAL_CONTEXT_TOKENS}" \
+  "++${agent}.model_output_capability_tokens=${CLAW_EVAL_OUTPUT_TOKENS}" \
+  "++${agent}.opencode_delegation_prompt=\${oc.env:CLAW_EVAL_DELEGATION_PROMPT}" \
+  "++${agent}.opencode_subagent_prompt=\${oc.env:CLAW_EVAL_SUBAGENT_PROMPT}" \
+  "++${agent}.opencode_compaction_auto=false" \
+  "++${agent}.opencode_compaction_prune=false" \
   "$@" \
   grpo.max_num_steps=1000000 \
   grpo.max_num_epochs=null
