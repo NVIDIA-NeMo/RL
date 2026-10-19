@@ -16,6 +16,7 @@ Busy while committed blobs are demoted to files; reads of a demoted blob are
 pending until it is staged back, then pinned. CPU-only, no Ray actor.
 """
 
+import contextlib
 import os
 import threading
 import time
@@ -407,12 +408,24 @@ def _victim_count(u):
     return sum(r.victim or not r.in_slab for r in u.blobs.values())
 
 
+def _disk_only(u):
+    return sum(not r.in_slab for r in u.blobs.values())
+
+
+def _put_until_refused(u, n=6):
+    for i in range(n):
+        with contextlib.suppress(DataPlaneBusy, UnitFull):
+            _put(u, f"c{i}", 9)
+            continue
+        return
+
+
 def test_watermark_demotes_down_to_low_without_any_put(tmp_path):
     u = _unit(tmp_path)
     _fill(u, 5)  # 640 KiB of a 768 KiB put area: above the high mark
     _wm(u, 0.6, 0.3)
     u._tick_once()
-    _wait(lambda: sum(not r.in_slab for r in u.blobs.values()) == 4)  # oldest first
+    _wait(lambda: _disk_only(u) == 4)  # oldest first
     assert [b for b, r in u.blobs.items() if r.in_slab] == ["b4"]
     assert u.stats()["watermark_batches"] == 1
     _put(u, "new", 9)  # room without a Busy
@@ -484,16 +497,10 @@ def test_released_victims_do_not_let_queued_batches_pile_up(tmp_path):
     queued = u._demote_jobs
     assert queued == 4
     u.release_many([(f"b{i}", 1) for i in range(4)])  # victims leave _victims
-    for i in range(6):  # refill; Busy or UnitFull ends it
-        try:
-            _put(u, f"c{i}", 9)
-        except (DataPlaneBusy, UnitFull):
-            break
+    _put_until_refused(u)  # refill; Busy or UnitFull ends it
     u._tick_once()  # watermark path
-    try:
+    with contextlib.suppress(DataPlaneBusy, UnitFull):
         u.alloc("x", BLOB, 1)  # reactive path
-    except (DataPlaneBusy, UnitFull):
-        pass
     assert u._demote_jobs == queued and not u._victims - set(u.blobs)
     gate.set()
     _wait(lambda: u._demote_jobs == 0)
@@ -520,5 +527,21 @@ def test_alloc_starts_the_batch_without_waiting_for_a_tick(tmp_path):
     for i in range(5):
         _put(u, f"b{i}", i + 1)  # the 4th alloc crosses the high mark
     assert u.stats()["watermark_batches"] >= 1
-    _wait(lambda: sum(not r.in_slab for r in u.blobs.values()) >= 3)
+    _wait(lambda: _disk_only(u) >= 3)
     assert set(_read(u, "b0")[0]) == {1}
+
+
+def test_unit_rejects_bad_watermarks(tmp_path):
+    for bad in ((0.3, 0.6), (1.0, 0.5), (0.5, 0.0)):
+        with pytest.raises(ValueError, match="watermarks"):
+            _unit(tmp_path, watermarks=bad)
+
+
+def test_a_failed_submit_marks_nothing(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u, 5)
+    _wm(u, 0.6, 0.3)  # armed after the fill, or alloc would already have marked victims
+    u._demoter.shutdown(wait=True)  # what interpreter exit does before the ticker stops
+    with pytest.raises(RuntimeError):
+        u._tick_once()
+    assert not u._victims and not u._demote_jobs and not _victim_count(u)
