@@ -21,7 +21,7 @@ NeMo-RL uses the vLLM V1 runtime for both synchronous and asynchronous inference
 - Users can override to the V0 runtime by setting the environment variable `NRL_VLLM_USE_V1=0`.
 - **Important**: The async implementation always uses the V1 runtime. Users who need to use the V0 runtime must switch to synchronous inference by setting `policy.generation.vllm_cfg.async_engine=False`.
 
-### Context Parallel with FSDP2
+### Context Parallel with Automodel
 
 - NeMo-RL implemented this feature based on torch CP [implementation](https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/experimental/_attention.py). And we inherit its limitations.
 Whether model level support CP only depends on arguments passed to `torch.nn.functional.scaled_dot_product_attention`. Current NeMo-RL passed all ones attention mask to `model.forward`. For Gemma-3, it won't ignore attention mask as result `attn_bias` is not None which is not supported by torch CP. Please see [assertion](https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/tensor/experimental/_attention.py#L262) .
@@ -50,7 +50,7 @@ If you encounter timeout errors, the system will suggest doubling the current ti
 
 ## AutoModel Parameter Freezing (`freeze_config`)
 
-VLM/omni recipes on the AutoModel (DTensor) backend control which sub-towers
+VLM/omni recipes on the Automodel backend control which sub-towers
 train via a declarative `freeze_config` under
 `policy.model_kwargs.automodel_kwargs`:
 
