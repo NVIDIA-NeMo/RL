@@ -3095,6 +3095,66 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
 
 
+@pytest.mark.parametrize("kv_cache_mode", ["persist", "offload", "recompute"])
+@pytest.mark.parametrize(
+    ("async_enabled", "recompute"),
+    [(None, None), (False, False), (False, True), (True, False), (True, True)],
+)
+def test_setup_megatron_kv_consistency_only_applies_to_async_grpo(
+    mock_grpo_components: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_mode: str,
+    async_enabled: bool | None,
+    recompute: bool | None,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.grpo.async_grpo = (
+        None
+        if async_enabled is None
+        else AsyncGRPOConfig(
+            enabled=async_enabled,
+            recompute_kv_cache_after_weight_updates=recompute,
+        )
+    )
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="test-model",
+        automodel_cfg={"enabled": False},
+        megatron_cfg={"enabled": False},
+    )
+    master_config.policy["generation"].update(
+        backend="megatron",
+        mcore_generation_config={"kv_cache_management_mode": kv_cache_mode},
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class PolicyInitReached(Exception):
+        pass
+
+    policy_init = MagicMock(side_effect=PolicyInitReached)
+    monkeypatch.setattr(grpo_mod, "Policy", policy_init)
+    mismatch = async_enabled and recompute != (kv_cache_mode == "recompute")
+    with (
+        pytest.raises(ValueError, match="recompute_kv_cache_after_weight_updates")
+        if mismatch
+        else pytest.raises(PolicyInitReached)
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+    assert policy_init.call_count == int(not mismatch)
+
+
 @pytest.mark.parametrize(
     ("kv_cache_dtype", "precision", "error"),
     [
@@ -4070,7 +4130,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         },
         "mcore_generation_config": {
             "expose_http_server": True,
-            "kv_cache_management_mode": "persist",
+            "kv_cache_management_mode": "recompute",
         },
     }
     master_config.env = {"should_use_nemo_gym": True}
