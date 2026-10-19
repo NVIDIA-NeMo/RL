@@ -347,6 +347,80 @@ class MegatronGenerationMixin:
         self._token_capture_enabled = False
         self._request_payload_stager = None
         self._request_prompt_preparer = None
+        # Set by attach_dynamo_adapter before the engine exists; None means the
+        # engine serves NeMo RL directly without a Dynamo adapter.
+        self._dynamo_adapter: Optional[dict[str, str]] = None
+        self._dynamo_event_reporter = None
+
+    def attach_dynamo_adapter(
+        self,
+        *,
+        parent_event_address: str,
+        role: str,
+        kv_transport_backend: str = "nixl",
+    ) -> bool:
+        """Serve this engine through a Megatron Dynamo adapter in external launch mode.
+
+        Must run before the engine is built. From then on the engine is the
+        state-handoff variant, brings up the KV transfer agents for ``role``, binds
+        its coordinator on the node IP so the adapter and the peer role can reach
+        it, and rank zero reports readiness on ``parent_event_address``.
+        """
+        if role not in ("prefill", "decode"):
+            raise ValueError(f"role must be 'prefill' or 'decode', got {role!r}")
+        if self._inference_engine_initialized:
+            raise RuntimeError(
+                "attach_dynamo_adapter must be called before the inference engine "
+                "is initialized"
+            )
+        self._dynamo_adapter = {
+            "parent_event_address": parent_event_address,
+            "role": role,
+            "kv_transport_backend": kv_transport_backend,
+        }
+        return True
+
+    def pinned_handoff_block_count(self) -> int:
+        """Prefill KV blocks still pinned for decode handoffs (0 without an engine)."""
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            return 0
+        return int(engine.pinned_handoff_block_count)
+
+    def dynamo_coordinator_address(self) -> Optional[str]:
+        """This engine's coordinator address once it is listening, else None."""
+        return getattr(self, "coordinator_addr", None)
+
+    def _start_dynamo_event_reporter(self) -> None:
+        """Connect rank zero's engine events to the adapter before the coordinator starts."""
+        assert self._dynamo_adapter is not None
+        from megatron.inference.integrations.dynamo.telemetry import (
+            EngineEventReporter,
+        )
+
+        reporter = EngineEventReporter(
+            self.dynamic_inference_engine,
+            self._dynamo_adapter["parent_event_address"],
+        )
+        self.dynamic_inference_engine.set_progress_callback(
+            lambda: reporter.observe("progress", {})
+        )
+        reporter.start()
+        self._dynamo_event_reporter = reporter
+
+    def _report_dynamo_ready(self) -> None:
+        """Rank zero tells the adapter where the coordinator is and what it serves."""
+        reporter = self._dynamo_event_reporter
+        if reporter is None or torch.distributed.get_rank() != 0:
+            return
+        from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
+
+        endpoint = InferenceEngineEndpoint.from_engine(
+            self.coordinator_addr,
+            self.dynamic_inference_engine,
+            logical_data_parallel_size=1,
+        )
+        reporter.observe("ready", endpoint.to_dict())
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -696,6 +770,10 @@ class MegatronGenerationMixin:
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
+        if self._dynamo_adapter is not None:
+            inference_config_kwargs["kv_transport_backend"] = self._dynamo_adapter[
+                "kv_transport_backend"
+            ]
 
         inference_config = InferenceConfig(**inference_config_kwargs)
 
@@ -720,9 +798,24 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
-        )
+        if self._dynamo_adapter is not None:
+            # Prefill/decode behind Dynamo: the state-handoff engine pins prefill
+            # blocks until decode releases them and imports them on decode.
+            from megatron.inference.integrations.dynamo.dynamic_engine import (
+                DynamoDynamicInferenceEngine,
+            )
+
+            self.dynamic_inference_engine = DynamoDynamicInferenceEngine(
+                text_generation_controller, self.inference_context
+            )
+            # Collective over the engine's model-parallel ranks.
+            self.dynamic_inference_engine.setup_kv_transfer(
+                role=self._dynamo_adapter["role"]
+            )
+        else:
+            self.dynamic_inference_engine = DynamicInferenceEngine(
+                text_generation_controller, self.inference_context
+            )
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
@@ -730,9 +823,18 @@ class MegatronGenerationMixin:
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
+        coordinator_kwargs: dict[str, Any] = {}
+        if self._dynamo_adapter is not None:
+            from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+            # The adapter sidecar and the peer role's decode adapters connect to
+            # this coordinator from other processes and nodes.
+            coordinator_kwargs["hostname"] = _get_node_ip_local()
+            self._start_dynamo_event_reporter()
         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=None,
             launch_inference_coordinator=True,
+            **coordinator_kwargs,
         )
         if torch.distributed.get_rank() == 0:
             from megatron.core.inference.inference_client import InferenceClient
@@ -743,6 +845,8 @@ class MegatronGenerationMixin:
             result = self.inference_client.start()
             if result is not None:
                 await result
+        if self._dynamo_adapter is not None:
+            self._report_dynamo_ready()
 
         self._inference_engine_asleep = False
 

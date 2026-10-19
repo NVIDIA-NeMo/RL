@@ -3342,8 +3342,18 @@ class MegatronPolicyWorkerImpl(
             ]
 
     def _generation_needs_logical_weights(self) -> bool:
-        """Megatron's existing non-bulk export consumes logical model weights."""
-        return (self.cfg.get("generation") or {}).get("backend") == "megatron"
+        """Megatron's existing non-bulk export consumes logical model weights.
+
+        True for the Megatron backend and for Megatron engines served through
+        the Dynamo frontend; both receive with the Megatron collective path.
+        """
+        generation = self.cfg.get("generation") or {}
+        backend = generation.get("backend")
+        if backend == "megatron":
+            return True
+        if backend == "dynamo":
+            return (generation.get("dynamo_cfg") or {}).get("engine") == "megatron"
+        return False
 
     def _build_bulk_refit_conversion_tasks(self) -> list[Any]:
         """Use standard Bridge mappings and live parameters for bulk refit."""
