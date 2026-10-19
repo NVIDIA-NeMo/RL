@@ -1,5 +1,5 @@
 # CSD cross-tokenizer distillation. Build both tokenizer tables first; see
-# docs/guides/csd-cross-tokenizer-distillation.md for preparation and training.
+# the CSD section of docs/guides/xtoken-off-policy-distillation.md.
 defaults: distillation_math.yaml
 distillation:
   num_prompts_per_step: 64
