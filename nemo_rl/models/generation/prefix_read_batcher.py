@@ -24,37 +24,34 @@ class PrefixReadBatcher:
     """Share GETs across requests without sharing request cancellation.
 
     The fetch callback must validate row identity and return requested order
-    (TQTokenSource.fetch does both). Token estimates are upper bounds per key.
-    A single oversized row is allowed alone: splitting a stored row is not
-    supported. Shutdown fails waiters but cannot interrupt an executing GET.
+    (TQTokenSource.fetch does both). A GET holds at most ``max_rows`` distinct
+    keys. Shutdown fails waiters but cannot interrupt an executing GET.
     """
 
     def __init__(
         self,
         fetch: Callable[[list[str]], list[Any]],
         *,
-        max_rows: int = 256,
-        max_tokens: int = 4_194_304,
+        max_rows: int,
         max_pending: int = 1024,
         wait_seconds: float = 0.002,
     ) -> None:
-        if min(max_rows, max_tokens, max_pending) < 1 or wait_seconds < 0:
+        if min(max_rows, max_pending) < 1 or wait_seconds < 0:
             raise ValueError("prefix read limits must be positive and wait nonnegative")
         self._fetch = fetch
         self._max_rows = max_rows
-        self._max_tokens = max_tokens
         self._wait_seconds = wait_seconds
         self._slots = asyncio.Semaphore(max_pending)
-        self._queue: deque[tuple[str, int, asyncio.Future[Any]]] = deque()
+        self._queue: deque[tuple[str, asyncio.Future[Any]]] = deque()
         self._wake = asyncio.Event()
         self._pending: set[asyncio.Future[Any]] = set()
         self._runner: asyncio.Task[None] | None = None
         self._closed = False
 
-    async def fetch(self, keys: list[str], *, tokens_per_key: int) -> list[Any]:
+    async def fetch(self, keys: list[str]) -> list[Any]:
         """Read a chain in order; cancellation affects only this caller."""
-        if tokens_per_key < 1 or len(keys) != len(set(keys)):
-            raise ValueError("positive token estimate and unique keys required")
+        if len(keys) != len(set(keys)):
+            raise ValueError("prefix read keys must be unique")
         if (
             self._runner is not None
             and self._runner.get_loop() is not asyncio.get_running_loop()
@@ -70,7 +67,7 @@ class PrefixReadBatcher:
                 future = asyncio.get_running_loop().create_future()
                 self._pending.add(future)
                 futures.append(future)
-                self._queue.append((key, tokens_per_key, future))
+                self._queue.append((key, future))
                 self._wake.set()
                 if self._runner is None:
                     self._runner = asyncio.create_task(self._run())
@@ -95,15 +92,14 @@ class PrefixReadBatcher:
             if len(rows) != len(keys):
                 raise KeyError("incomplete prefix read")
             return dict(zip(keys, rows))
-        except KeyError as error:
+        except Exception as error:
             if len(keys) == 1:
                 return {keys[0]: error}
-            middle = len(keys) // 2
-            left = await self._read(keys[:middle])
-            left.update(await self._read(keys[middle:]))
-            return left
-        except Exception as error:
-            return dict.fromkeys(keys, error)
+        # One bad row must not fail other callers' keys: retry each key alone, once.
+        results: dict[str, Any | Exception] = {}
+        for key in keys:
+            results.update(await self._read([key]))
+        return results
 
     async def _run(self) -> None:
         try:
@@ -111,20 +107,14 @@ class PrefixReadBatcher:
                 await self._wake.wait()
                 await asyncio.sleep(self._wait_seconds)
                 batch: dict[str, list[asyncio.Future[Any]]] = {}
-                tokens = 0
                 while self._queue:
-                    key, estimate, future = self._queue[0]
+                    key, future = self._queue[0]
                     if future.done():
                         self._queue.popleft()
                         self._release(future)
                         continue
-                    if key not in batch:
-                        if batch and (
-                            len(batch) >= self._max_rows
-                            or tokens + estimate > self._max_tokens
-                        ):
-                            break
-                        tokens += estimate
+                    if key not in batch and len(batch) >= self._max_rows:
+                        break
                     self._queue.popleft()
                     batch.setdefault(key, []).append(future)
                 if not self._queue:
@@ -135,10 +125,9 @@ class PrefixReadBatcher:
                 results = await self._read(list(batch))
                 LOGGER.info(
                     "generation_prefix_read_batch keys=%d waiters=%d "
-                    "estimated_tokens=%d read_seconds=%.6f failed_keys=%d",
+                    "read_seconds=%.6f failed_keys=%d",
                     len(batch),
                     sum(len(waiters) for waiters in batch.values()),
-                    tokens,
                     time.monotonic() - started,
                     sum(isinstance(value, Exception) for value in results.values()),
                 )

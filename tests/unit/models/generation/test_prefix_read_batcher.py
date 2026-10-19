@@ -17,6 +17,9 @@ import pytest
 
 from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
 
+# The row limit is required: production passes rollout_recovery's batch size.
+LIMITS = {"max_rows": 256}
+
 pytestmark = pytest.mark.nemo_gym
 
 
@@ -28,10 +31,10 @@ def test_burst_deduplicates_keys_and_preserves_chain_order() -> None:
             calls.append(keys)
             return keys
 
-        reader = PrefixReadBatcher(fetch, wait_seconds=0.01)
+        reader = PrefixReadBatcher(fetch, **LIMITS, wait_seconds=0.01)
         try:
             results = await asyncio.gather(
-                *(reader.fetch([str(i), "shared"], tokens_per_key=1) for i in range(64))
+                *(reader.fetch([str(i), "shared"]) for i in range(64))
             )
             assert results == [[str(i), "shared"] for i in range(64)]
             assert len(calls) == 1
@@ -42,10 +45,8 @@ def test_burst_deduplicates_keys_and_preserves_chain_order() -> None:
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("rows,tokens,expected", [(2, 100, 3), (256, 20, 3)])
-def test_row_and_token_limits_split_long_chains(
-    rows: int, tokens: int, expected: int
-) -> None:
+@pytest.mark.parametrize("rows,expected", [(2, 3), (5, 1)])
+def test_row_limit_alone_splits_long_chains(rows: int, expected: int) -> None:
     async def run() -> None:
         calls = []
 
@@ -53,13 +54,11 @@ def test_row_and_token_limits_split_long_chains(
             calls.append(keys)
             return keys
 
-        reader = PrefixReadBatcher(
-            fetch, max_rows=rows, max_tokens=tokens, max_pending=10
-        )
+        reader = PrefixReadBatcher(fetch, max_rows=rows, max_pending=10)
         try:
-            assert await reader.fetch(list("abcde"), tokens_per_key=10) == list("abcde")
+            assert await reader.fetch(list("abcde")) == list("abcde")
             assert len(calls) == expected
-            assert max(map(len, calls)) <= 2
+            assert max(map(len, calls)) <= rows
         finally:
             await reader.aclose()
 
@@ -73,16 +72,63 @@ def test_missing_key_isolated_and_reader_remains_usable() -> None:
                 raise KeyError("missing")
             return keys
 
-        reader = PrefixReadBatcher(fetch)
+        reader = PrefixReadBatcher(fetch, **LIMITS)
         try:
             results = await asyncio.gather(
-                reader.fetch(["good"], tokens_per_key=1),
-                reader.fetch(["missing"], tokens_per_key=1),
+                reader.fetch(["good"]),
+                reader.fetch(["missing"]),
                 return_exceptions=True,
             )
             assert results[0] == ["good"]
             assert isinstance(results[1], KeyError)
-            assert await reader.fetch(["next"], tokens_per_key=1) == ["next"]
+            assert await reader.fetch(["next"]) == ["next"]
+        finally:
+            await reader.aclose()
+
+    asyncio.run(run())
+
+
+def test_bad_row_error_isolated_to_its_caller() -> None:
+    async def run() -> None:
+        calls: list[list[str]] = []
+
+        def fetch(keys: list[str]) -> list[str]:
+            calls.append(list(keys))
+            if "bad" in keys:
+                raise ValueError("corrupt row")
+            return keys
+
+        reader = PrefixReadBatcher(fetch, **LIMITS)
+        try:
+            results = await asyncio.gather(
+                reader.fetch(["good"]),
+                reader.fetch(["bad"]),
+                return_exceptions=True,
+            )
+            assert results[0] == ["good"]
+            assert isinstance(results[1], ValueError)
+            # One shared GET, then each key alone once.
+            assert sorted(map(tuple, calls)) == [("bad",), ("good",), ("good", "bad")]
+        finally:
+            await reader.aclose()
+
+    asyncio.run(run())
+
+
+def test_failed_batch_retries_each_key_once() -> None:
+    async def run() -> None:
+        calls: list[list[str]] = []
+
+        def fetch(keys: list[str]) -> list[str]:
+            calls.append(list(keys))
+            raise KeyError("store unavailable")
+
+        reader = PrefixReadBatcher(fetch, **LIMITS)
+        keys = [f"k{index}" for index in range(32)]
+        try:
+            with pytest.raises(KeyError):
+                await reader.fetch(keys)
+            assert len(calls) == len(keys) + 1
         finally:
             await reader.aclose()
 
@@ -99,9 +145,9 @@ def test_cancel_does_not_cancel_shared_read() -> None:
             assert release.wait(5)
             return keys
 
-        reader = PrefixReadBatcher(fetch)
-        first = asyncio.create_task(reader.fetch(["same"], tokens_per_key=1))
-        second = asyncio.create_task(reader.fetch(["same"], tokens_per_key=1))
+        reader = PrefixReadBatcher(fetch, **LIMITS)
+        first = asyncio.create_task(reader.fetch(["same"]))
+        second = asyncio.create_task(reader.fetch(["same"]))
         try:
             assert await asyncio.to_thread(started.wait, 5)
             first.cancel()
@@ -126,9 +172,9 @@ def test_shutdown_wakes_inflight_and_backpressured_requests() -> None:
             assert release.wait(5)
             return keys
 
-        reader = PrefixReadBatcher(fetch, max_pending=1)
-        first = asyncio.create_task(reader.fetch(["one"], tokens_per_key=1))
-        second = asyncio.create_task(reader.fetch(["two"], tokens_per_key=1))
+        reader = PrefixReadBatcher(fetch, **LIMITS, max_pending=1)
+        first = asyncio.create_task(reader.fetch(["one"]))
+        second = asyncio.create_task(reader.fetch(["two"]))
         try:
             assert await asyncio.to_thread(started.wait, 5)
             await reader.aclose()
@@ -145,11 +191,9 @@ def test_shutdown_wakes_inflight_and_backpressured_requests() -> None:
 
 def test_single_request_flushes_without_more_arrivals() -> None:
     async def run() -> None:
-        reader = PrefixReadBatcher(lambda keys: keys)
+        reader = PrefixReadBatcher(lambda keys: keys, **LIMITS)
         try:
-            assert await asyncio.wait_for(
-                reader.fetch(["one"], tokens_per_key=1), 1
-            ) == ["one"]
+            assert await asyncio.wait_for(reader.fetch(["one"]), 1) == ["one"]
         finally:
             await reader.aclose()
 
@@ -158,11 +202,11 @@ def test_single_request_flushes_without_more_arrivals() -> None:
 
 def test_chain_larger_than_queue_does_not_deadlock() -> None:
     async def run() -> None:
-        reader = PrefixReadBatcher(lambda keys: keys, max_pending=2)
+        reader = PrefixReadBatcher(lambda keys: keys, **LIMITS, max_pending=2)
         try:
-            assert await asyncio.wait_for(
-                reader.fetch(list("abcdef"), tokens_per_key=1), 1
-            ) == list("abcdef")
+            assert await asyncio.wait_for(reader.fetch(list("abcdef")), 1) == list(
+                "abcdef"
+            )
         finally:
             await reader.aclose()
 
@@ -171,14 +215,14 @@ def test_chain_larger_than_queue_does_not_deadlock() -> None:
 
 def test_shutdown_before_runner_starts() -> None:
     async def run() -> None:
-        reader = PrefixReadBatcher(lambda keys: keys)
-        request = asyncio.create_task(reader.fetch(["one"], tokens_per_key=1))
+        reader = PrefixReadBatcher(lambda keys: keys, **LIMITS)
+        request = asyncio.create_task(reader.fetch(["one"]))
         await asyncio.sleep(0)
         await reader.aclose()
         with pytest.raises(RuntimeError, match="closed"):
             await asyncio.wait_for(request, 1)
         with pytest.raises(RuntimeError, match="closed"):
-            await reader.fetch(["two"], tokens_per_key=1)
+            await reader.fetch(["two"])
 
     asyncio.run(run())
 
@@ -193,11 +237,11 @@ def test_shutdown_from_actor_loop_closes_serving_loop_reader() -> None:
         assert release.wait(5)
         return keys
 
-    reader = PrefixReadBatcher(fetch)
+    reader = PrefixReadBatcher(fetch, **LIMITS)
 
     async def serve() -> None:
         try:
-            await reader.fetch(["one"], tokens_per_key=1)
+            await reader.fetch(["one"])
         except RuntimeError as error:
             errors.append(error)
 
