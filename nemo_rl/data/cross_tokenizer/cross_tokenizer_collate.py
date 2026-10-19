@@ -671,7 +671,10 @@ class CrossTokenizerCollator:
         )
         input_ids: torch.Tensor = encoded["input_ids"]
         attention_mask: torch.Tensor = encoded["attention_mask"]
-        offset_mapping: torch.Tensor = encoded["offset_mapping"]
+        # An all-empty batch returns (B, 0) offsets; keep the (B, T, 2) layout.
+        offset_mapping: torch.Tensor = encoded["offset_mapping"].reshape(
+            *input_ids.shape, 2
+        )
 
         b, t = input_ids.shape
         pad = CrossTokenizerCollator._padded_width(t, make_seq_div_by) - t

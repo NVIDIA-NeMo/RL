@@ -797,6 +797,19 @@ class TestTextPadsToLongestRow:
             for key in ("alignment_0_pair_valid", "alignment_0_pair_is_correct"):
                 assert torch.equal(new[key][row, pairs], old[key][row, pairs]), key
 
+    def test_all_empty_batch_pads_to_the_divisor(self):
+        collator = _text_collator(ctx_length_student=8, ctx_length_teachers=[16, 8])
+        out = collator([_datum("", idx=0), _datum("", idx=1)])
+        # No row has tokens, so each side pads to one sequence-length multiple.
+        assert out["input_ids"].shape == (2, 4)
+        assert out["teacher_0_input_ids"].shape == (2, 3)
+        assert out["input_lengths"].tolist() == [0, 0]
+        assert out["teacher_0_input_lengths"].tolist() == [0, 0]
+        assert out["token_mask"].eq(0).all()
+        assert out["teacher_0_token_mask"].eq(0).all()
+        assert out["alignment_0_student_chunk_id"].eq(-1).all()
+        assert out["alignment_0_teacher_chunk_id"].eq(-1).all()
+
 
 class TestCollatorPadTokenFallback:
     def test_missing_pad_token_set_from_eos(self):
