@@ -636,11 +636,7 @@ _COLLATOR_OPTION_NAMES = (
         pytest.param(
             "csd",
             {"mode": "chat"},
-            {
-                "require_routed_experts": False,
-                "reject_overlength_text": True,
-                "ce_covers_assistant_turn": True,
-            },
+            {"require_routed_experts": False, "reject_overlength_text": True},
             id="csd-chat",
         ),
         pytest.param(
