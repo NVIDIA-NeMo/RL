@@ -1080,6 +1080,14 @@ Depending on your data shape, you may want to change these values."""
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
+        if not self._token_capture_enabled and any(
+            row.get("_nemo_rl_image_max_num_tiles") is not None
+            for row in nemo_gym_examples
+        ):
+            raise ValueError(
+                "image_max_num_tiles requires token_capture.enabled: legacy "
+                "Gym postprocessing cannot reproduce per-row image tile budgets."
+            )
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
         if self._tokenizer is None:

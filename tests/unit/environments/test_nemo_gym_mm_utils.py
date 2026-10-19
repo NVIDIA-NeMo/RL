@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from PIL import Image
+import pytest
 
 from nemo_rl.data.multimodal_utils import (
     extract_input_media_sources_from_responses_messages,
@@ -77,9 +78,12 @@ def test_extract_input_images_ignores_text_function_call_output():
     assert _extract_input_images_from_message(item) == []
 
 
-def test_extract_input_images_skips_unresolvable_sources(monkeypatch, capsys):
+@pytest.mark.parametrize("error_type", [FileNotFoundError, OSError, ValueError])
+def test_extract_input_images_rejects_unresolvable_declared_sources(
+    monkeypatch, error_type
+):
     def fail_to_resolve(_source):
-        raise FileNotFoundError("missing image")
+        raise error_type("missing image")
 
     monkeypatch.setattr(
         "nemo_rl.environments.nemo_gym_multimodal.resolve_to_image", fail_to_resolve
@@ -89,8 +93,8 @@ def test_extract_input_images_skips_unresolvable_sources(monkeypatch, capsys):
         "content": [{"type": "input_image", "image_url": "file:///missing/image.png"}],
     }
 
-    assert _extract_input_images_from_message(item) == []
-    assert "skipping non-image source in trajectory" in capsys.readouterr().out
+    with pytest.raises(error_type, match="missing image"):
+        _index_per_turn_images([_assistant([1])], input_messages=[item])
 
 
 def test_index_per_turn_images_bins_images():

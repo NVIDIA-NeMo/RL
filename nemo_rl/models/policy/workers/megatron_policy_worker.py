@@ -3509,23 +3509,20 @@ class MegatronPolicyWorkerImpl(
         A destination that requests logical weights consumes standard Bridge
         tasks. Otherwise, keep Bridge's physical FP8 data and scale tasks.
         """
-        # NRL_REFIT_SKIP_MTP=1: drop MTP params from refit entirely. The
-        # nemotron_omni bridge's megatron->HF mapping can miss MTP layer-norm
-        # params on the refit-export path ("Unrecognized mapping type" -> TP
-        # ranks desync -> ALLGATHER hangs to the NCCL watchdog in
-        # prepare_refit_info). Generation engines without speculative decoding
-        # never consume MTP weights, so skipping them here (identically on
-        # every rank) is safe.
+        # Optionally omit MTP tasks when the generator does not use speculative
+        # decoding. This filters exported tasks, not Bridge's mapping validation.
         skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
-                return self.megatron_bridge.get_export_fp8_tasks(self.model)
+                tasks = self.megatron_bridge.get_export_fp8_tasks(self.model)
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
             return [
                 task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                for task in tasks
                 if task is not None
                 and not (skip_mtp and "mtp." in task.global_param_name)
             ]
