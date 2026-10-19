@@ -1002,21 +1002,24 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
   backoff, logging one warning per waiting put, for up to 600 s. Sustained
   writes therefore run at most as fast as offload frees memory; bursts
   become stalls, not crashes. A new object can be evicted once its 1 s
-  lease expires; the 0.5 default `offload_threshold` leaves room for a
+  lease expires; that lease must cover one whole batch read (up to
+  `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The
+  0.5 default `offload_threshold` leaves room for a
   burst while offload catches up.
 - **Directories:** each owner writes to
   `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
   At the end of a run the SingleController asks each storage unit to delete
-  its directory. Any other owner deletes its own only when it exits
-  normally. Mooncake's SIGTERM handler exits without running Python
-  cleanup, so an owner that Ray stops with SIGTERM (such as a rollout actor
-  at the end of a run without storage units), crashes, or is killed leaves
-  its directory behind.
+  its directory, and every client deletes its own in `close()`. Mooncake's
+  SIGTERM handler exits without running Python cleanup, so an owner that
+  crashes or is killed before that leaves its directory behind. Each owner
+  holds a lock on its directory while it lives, and the next run's owners
+  on that node delete any directory whose lock is free.
 
-> **Warning: a full disk stops the run.** Offloaded files are not reclaimed
-> during the run. When a process's own offload files pass 90% of the disk
-> holding `path`, Mooncake's per-key backend deletes its oldest offloaded
-> files, and Mooncake 0.3.13 cannot turn this off. A deleted file can be the
+> **Warning: a full disk stops the run.** Offloaded files are deleted only
+> at shutdown; a reused key overwrites its file. When a process's own
+> offload files pass 90% of the disk holding `path`, Mooncake's per-key
+> backend deletes its oldest offloaded files, and Mooncake 0.3.13 cannot
+> turn this off. A deleted file can be the
 > only copy of an object. The master counts these deletions
 > (`master_evict_disk_replica_requests_total`). With offload on, the process
 > that started the master checks that counter every 30 s and stops the run
@@ -1024,7 +1027,8 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
 > 256 MiB, Mooncake fails the SSD write and keeps the object in memory;
 > memory then stops being freed, and a put that has waited 600 s for it
 > fails with an error naming `path`. Either way, give `path` enough free
-> disk for everything offloaded during the run.
+> disk: about (segment owners on the node) x (peak data offloaded at once),
+> since TQ reuses keys and an owner's files are overwritten.
 
 ### Experimental Mooncake storage checkpoints
 

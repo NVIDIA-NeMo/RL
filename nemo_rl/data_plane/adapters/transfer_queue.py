@@ -1145,6 +1145,8 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         else:
             _connect_existing_with_segment_size(segment_size)
+        # TQ has built this process's store by now; a no-op unless it owns memory.
+        mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.
@@ -1532,3 +1534,5 @@ class TQDataPlaneClient(DataPlaneClient):
             tq.close()
         except Exception:
             pass
+        # This process's store is closed, so its offload files are unreachable.
+        mooncake_ssd_offload.remove_dir()

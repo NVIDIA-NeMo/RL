@@ -16,7 +16,15 @@
 from __future__ import annotations
 
 import atexit
+import functools
+import http.client
+import http.server
+import importlib.util
+import multiprocessing
 import os
+import signal
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +102,8 @@ def fake_store(monkeypatch, tmp_path):
         monkeypatch.setenv(var, "")
         monkeypatch.delenv(var)
     monkeypatch.setattr(offload, "_dir", None)
+    monkeypatch.setattr(offload, "_lock_fd", None)
+    monkeypatch.setattr(offload, "_offloading_store_set_up", False)
     exit_hooks = []
     monkeypatch.setattr(atexit, "register", exit_hooks.append)
     return SimpleNamespace(
@@ -246,7 +256,9 @@ def test_other_put_errors_keep_tqs_own_retry(monkeypatch) -> None:
 def test_put_fails_once_memory_stays_full_for_the_whole_wait(monkeypatch) -> None:
     rounds = [[FULL]] * 100
     client, _, _ = _waiting_client(monkeypatch, *rounds, step_s=100.0)
-    with pytest.raises(RuntimeError, match="stayed full .* SSD offload.*'a'"):
+    with pytest.raises(
+        RuntimeError, match="(?s)stayed full .* SSD offload.*'a'.*larger than any"
+    ):
         client._batch_upsert_with_retry(["a"], [1], [8])
     assert len(client._store.calls) == offload.PUT_WAIT_S / 100 + 1
 
@@ -313,12 +325,21 @@ def _watch(reads, **kwargs):
 
 
 def test_watcher_stops_the_run_on_the_first_disk_eviction(caplog) -> None:
-    calls = _watch([0, 0, 2, 5])
+    calls = _watch([0, 0, 1])
 
     # Once only: the first deletion already means data may be lost.
     assert calls == ["evicted"]
     assert "deleted SSD copies" in caplog.text
     assert "/local/ssd" in caplog.text
+
+
+def test_watcher_survives_any_read_error(caplog) -> None:
+    # A dead watcher would hide data loss, so no read error may end it.
+    bad = http.client.IncompleteRead(b"")
+    assert _watch([bad, bad, ValueError("garbled"), 0, 1]) == ["evicted"]
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        "Cannot read the Mooncake SSD-eviction count; retrying"
+    ]
 
 
 def test_watcher_tolerates_an_unreachable_master() -> None:
@@ -344,3 +365,133 @@ def test_watcher_stops_when_asked() -> None:
     settled = len(reads)
     time.sleep(0.1)
     assert reads and len(reads) == settled
+
+
+@pytest.fixture
+def metrics_server():
+    """A local stand-in for the master's /metrics; set ``.body`` to change it."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = server.body.encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.body = "master_evict_disk_replica_requests_total 0\n"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server
+    server.shutdown()
+
+
+def test_watch_master_disk_evictions_reads_the_real_endpoint(
+    monkeypatch, metrics_server
+) -> None:
+    fired = threading.Event()
+    monkeypatch.setattr(offload, "_watch_stop", None)
+    monkeypatch.setattr(
+        offload,
+        "watch_disk_evictions",
+        functools.partial(
+            offload.watch_disk_evictions, interval_s=0.01, on_eviction=fired.set
+        ),
+    )
+    url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
+
+    offload.watch_master_disk_evictions(url, "/local/ssd")
+    assert not fired.wait(0.2)  # counter at 0: keep watching
+    metrics_server.body = "master_evict_disk_replica_requests_total 1\n"
+    assert fired.wait(5)
+
+
+def test_a_reinit_replaces_the_old_watcher(monkeypatch) -> None:
+    started = []
+    monkeypatch.setattr(offload, "_watch_stop", None)
+    monkeypatch.setattr(
+        offload,
+        "watch_disk_evictions",
+        lambda read, path: started.append(threading.Event()) or started[-1],
+    )
+
+    offload.watch_master_disk_evictions("http://unused/metrics", "/a")
+    offload.watch_master_disk_evictions("http://unused/metrics", "/b")
+
+    assert [stop.is_set() for stop in started] == [True, False]
+
+
+def test_an_owner_must_build_the_offloading_store(fake_store, tmp_path) -> None:
+    # If TQ stops building its store through the swapped class, the owner
+    # would silently never offload.
+    offload.install(_cfg(ssd_offload={**_SSD, "path": str(tmp_path)}), None)
+    with pytest.raises(RuntimeError, match="would never offload"):
+        offload.require_offloading_store()
+
+    fake_store.module.MooncakeDistributedStore().setup("h", "m", 1, 2, "tcp", "", "a")
+    offload.require_offloading_store()
+
+
+def test_a_process_that_owns_nothing_needs_no_offloading_store(fake_store) -> None:
+    offload.install(_cfg(ssd_offload=_SSD, storage_unit_segment_size=UNIT), None)
+    offload.require_offloading_store()
+
+
+def _own_dir(path, how, ready):
+    offload._hold_dir_lock(path)
+    ready.set()
+    if how == "exit":
+        os._exit(0)  # Mooncake's SIGTERM handler ends this way: no atexit
+    signal.pause()  # until killed
+
+
+def test_install_removes_only_dead_owners_dirs(fake_store, tmp_path) -> None:
+    parent = tmp_path / "nemo_rl_mooncake_offload"
+    parent.mkdir()
+    ctx = multiprocessing.get_context("fork")
+    owners = {}
+    for how in ("exit", "killed", "alive"):
+        (parent / how).mkdir()
+        ready = ctx.Event()
+        owners[how] = ctx.Process(target=_own_dir, args=(str(parent / how), how, ready))
+        owners[how].start()
+        assert ready.wait(10)
+    (parent / "starting").mkdir()  # no lock yet: its owner is still in install
+    owners["exit"].join(10)
+    os.kill(owners["killed"].pid, signal.SIGKILL)
+    owners["killed"].join(10)
+    try:
+        offload.install(_cfg(ssd_offload={**_SSD, "path": str(tmp_path)}), None)
+        left = {p.name for p in parent.iterdir()}
+        assert {"alive", "starting"} <= left
+        assert not {"exit", "killed"} & left
+        assert Path(offload._dir).name in left  # this process's own new dir
+    finally:
+        owners["alive"].kill()
+        owners["alive"].join(10)
+
+
+def test_copied_mooncake_names_exist_in_the_installed_mooncake() -> None:
+    """Names copied from Mooncake's C++ must still be in the shipped binaries.
+
+    Mooncake exports none of them to Python, so they cannot be imported, and a
+    rename on a Mooncake bump would be silent: an env var nothing reads, or a
+    metric the eviction watcher never finds.
+    """
+    spec = importlib.util.find_spec("mooncake")
+    assert spec is not None, "mooncake is a core dependency on Linux"
+    root = Path(spec.submodule_search_locations[0])
+    store = (root / "store.so").read_bytes()  # the client reads the env vars
+    master = (root / "mooncake_master").read_bytes()  # flags and /metrics
+
+    for name in offload.ENV_DEFAULTS:
+        assert name.encode() in store, name
+    backend = offload.ENV_DEFAULTS["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"]
+    assert backend.encode() in store, backend
+    assert offload.EVICTION_COUNTER.encode() in master, offload.EVICTION_COUNTER
+    for arg in offload.master_args(_cfg(ssd_offload=_SSD)):
+        flag = arg.removeprefix("--").split("=", 1)[0]
+        assert flag.encode() in master, flag

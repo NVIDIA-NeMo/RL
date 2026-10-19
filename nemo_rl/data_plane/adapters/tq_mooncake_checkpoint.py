@@ -833,13 +833,13 @@ class _CheckpointParticipant:
                     else min(eligible, key=lambda value: value.transport_endpoint)
                 )
                 # Only a pinned replica is read in place; others go through GET.
-                address = (
-                    getattr(replica, "buffer_address", None) if self._pinned else 0
-                )
-                if self._pinned and (type(address) is not int or address <= 0):
-                    raise RuntimeError(
-                        f"Mooncake replica has no CPU address for {key!r}"
-                    )
+                address = 0
+                if self._pinned:
+                    address = getattr(replica, "buffer_address", None)
+                    if type(address) is not int or address <= 0:
+                        raise RuntimeError(
+                            f"Mooncake replica has no CPU address for {key!r}"
+                        )
                 groups.setdefault(replica.transport_endpoint, []).append(
                     _StoredObject(key, size, address)
                 )

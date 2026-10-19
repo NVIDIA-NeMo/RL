@@ -106,6 +106,8 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     Offload runs in every segment owner: the storage units when they are on,
     otherwise every client with a segment (see
     ``nemo_rl.data_plane.adapters.mooncake_ssd_offload``).
+    Size ``path`` for about (segment owners on the node) x (peak data
+    offloaded at once): TQ reuses keys, so an owner's files are overwritten.
     Operation, cleanup and the full-disk data-loss risk are described under
     "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
     """

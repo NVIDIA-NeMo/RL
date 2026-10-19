@@ -290,6 +290,9 @@ def _fill_small_disk(ssd_root: str) -> None:  # pragma: no cover
 def test_mooncake_ssd_eviction_stops_the_run(monkeypatch, tmp_path) -> None:
     """Mooncake deletes SSD files once one owner's files pass 90% of the disk.
 
+    Manual only: mounting the small tmpfs needs CAP_SYS_ADMIN, which CI's
+    container lacks, so CI skips it. The CPU watcher tests cover the rest.
+
     (Below the free-space floor of one object + 256 MiB it fails the write
     instead, which ends the run through failed puts, so the disk must be big
     enough that the 90% quota is reached first: 10% > 256 MiB, i.e. > 2.6 GiB.)

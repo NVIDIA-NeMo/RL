@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import _thread
 import atexit
+import fcntl
 import logging
 import os
 import re
@@ -55,6 +56,12 @@ ENV_DEFAULTS = {
 
 # This process's offload directory, once installed.
 _dir: str | None = None
+# Held open for this process's lifetime: the kernel drops the lock when the
+# process exits, even on SIGKILL or Mooncake's _Exit, which marks the dir stale.
+_lock_fd: int | None = None
+# Set once the offloading store's setup has run; per process, because a second
+# client in one process reuses the first client's store.
+_offloading_store_set_up = False
 
 # Mooncake's ErrorCode::NO_AVAILABLE_HANDLE: no segment had room for the put.
 NO_AVAILABLE_HANDLE = -200
@@ -69,7 +76,9 @@ PUT_BACKOFF_MAX_S = 1.0
 # (FileStorage::NotifyEvictedDiskReplicas -> BatchEvictDiskReplica). NeMo-RL
 # and TQ never delete SSD copies themselves, so any count means data loss.
 EVICTION_COUNTER = "master_evict_disk_replica_requests_total"
-_COUNTER_LINE = re.compile(rf"^{EVICTION_COUNTER}(?:{{[^}}]*}})?\s+(\S+)", re.M)
+_COUNTER_LINE = re.compile(
+    rf"^{re.escape(EVICTION_COUNTER)}(?:{{[^}}]*}})?\s+(\S+)", re.M
+)
 # The running watcher in this process, if any.
 _watch_stop: threading.Event | None = None
 
@@ -84,8 +93,9 @@ def master_args(cfg: MooncakeCpuConfig) -> tuple[str, ...]:
     failed stays in memory rather than being dropped. A fresh object cannot
     be evicted until its lease expires: TQ's 999999 ms would pin ~17 min of
     writes, and even 10 s let a 512 MiB segment fill at 64 MiB/s before
-    anything was evictable (job 1321643). 1 s still covers a read, which
-    takes milliseconds and renews the lease.
+    anything was evictable (job 1321643). The 1 s lease must cover one whole
+    ``batch_get_into`` call (up to ``staging_buffer_size`` per call), not one
+    key: a slower call fails with LEASE_EXPIRED.
     """
     if not cfg.ssd_offload.enabled:
         return ()
@@ -106,9 +116,10 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
     (:func:`wait_for_memory_on_put`). A process that owns memory also offloads
     to its own SSD directory: TQ's client calls ``setup`` with no offload
     arguments, so this swaps the store class it builds for one that adds them.
-    Each owner gets a fresh, owner-only ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``:
-    no run can pick up, or wipe, another's files. Must run before the store
-    is set up.
+    Each owner gets a fresh, owner-only ``<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>``,
+    locked for its lifetime: no live run can pick up, or wipe, another's files,
+    and dirs whose owner died are removed here. Must run before the store is
+    set up.
     """
     global _dir
     if not cfg.ssd_offload.enabled:
@@ -135,8 +146,10 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
         os.environ.setdefault(name, value)
     parent = os.path.join(str(cfg.ssd_offload.path), "nemo_rl_mooncake_offload")
     os.makedirs(parent, exist_ok=True)
+    _remove_stale_dirs(parent)  # free disk left by earlier runs on this node
     job_id = ray.get_runtime_context().get_job_id()
     _dir = path = tempfile.mkdtemp(prefix=f"{job_id}-{os.getpid()}-", dir=parent)
+    _hold_dir_lock(path)
     # Runs at a normal exit only: Mooncake replaces the SIGTERM handler with
     # one that ends in _Exit, so a process Ray stops with SIGTERM skips it
     # (storage units are closed explicitly: stop_storage_units).
@@ -144,6 +157,8 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
 
     class _OffloadingStore(base):  # type: ignore[misc, valid-type]
         def setup(self, *args: Any, **kwargs: Any) -> Any:
+            global _offloading_store_set_up
+            _offloading_store_set_up = True
             return super().setup(
                 *args, enable_ssd_offload=True, ssd_offload_path=path, **kwargs
             )
@@ -161,8 +176,7 @@ def wait_for_memory_on_put(client_cls: Any) -> None:
     """
     if getattr(client_cls, "_nrl_waits_for_memory", False):
         return
-    tq_upsert = getattr(client_cls, "_batch_upsert_with_retry", None)
-    if tq_upsert is None:
+    if not hasattr(client_cls, "_batch_upsert_with_retry"):
         from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
 
         raise _tq_shape_drift_error(
@@ -170,6 +184,7 @@ def wait_for_memory_on_put(client_cls: Any) -> None:
             "puts would fail instead of waiting while SSD offload frees memory",
             "put retry",
         )
+    tq_upsert = client_cls._batch_upsert_with_retry
 
     def _batch_upsert_with_retry(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
         upsert_waiting_for_memory(
@@ -212,7 +227,7 @@ def upsert_waiting_for_memory(
             )
         failed = [i for i, r in enumerate(results) if r not in (0, NO_AVAILABLE_HANDLE)]
         if failed:
-            on_error(*_pick((keys, ptrs, sizes, results), failed))
+            on_error(*_pick((keys, ptrs, sizes, list(results)), failed))
         full = [i for i, r in enumerate(results) if r == NO_AVAILABLE_HANDLE]
         if not full:
             return
@@ -220,9 +235,10 @@ def upsert_waiting_for_memory(
             raise RuntimeError(
                 f"Mooncake memory stayed full for {PUT_WAIT_S:.0f} s with SSD "
                 f"offload on; {len(full)} key(s) not stored, e.g. "
-                f"{keys[full[0]]!r}. Offload is not freeing memory: check the "
-                "disk under data_plane.mooncake_cpu.ssd_offload.path and the "
-                "mooncake_master log."
+                f"{keys[full[0]]!r}. Either offload is not freeing memory "
+                "(check the disk under data_plane.mooncake_cpu.ssd_offload.path "
+                "and the mooncake_master log) or one object is larger than any "
+                "Mooncake segment."
             )
         if backoff == _FIRST_BACKOFF_S:
             LOGGER.warning(
@@ -239,6 +255,48 @@ def upsert_waiting_for_memory(
 
 def _pick(columns: tuple[list[Any], ...], indexes: list[int]) -> list[list[Any]]:
     return [[column[i] for i in indexes] for column in columns]
+
+
+def require_offloading_store() -> None:
+    """Raise if this process owns memory but TQ never built the offloading store.
+
+    The swap in :func:`install` works only while TQ looks the store class up by
+    name; call this after connecting, when TQ has built its store.
+    """
+    if _dir is not None and not _offloading_store_set_up:
+        raise RuntimeError(
+            "Mooncake SSD offload is on, but TQ did not build its store through "
+            "mooncake_client.MooncakeDistributedStore, so this process would "
+            "never offload. The TQ pin may have moved."
+        )
+
+
+def _hold_dir_lock(path: str) -> None:
+    global _lock_fd
+    tmp = os.path.join(path, ".lock.tmp")
+    _lock_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(_lock_fd, fcntl.LOCK_EX)
+    # Lock, then publish under the name other runs check, so no other process
+    # ever sees this dir unlocked.
+    os.rename(tmp, os.path.join(path, ".lock"))
+
+
+def _remove_stale_dirs(parent: str) -> None:
+    """Delete offload dirs whose owning process is gone (crash, kill, restart)."""
+    for name in os.listdir(parent):
+        path = os.path.join(parent, name)
+        try:
+            fd = os.open(os.path.join(path, ".lock"), os.O_RDONLY)
+        except OSError:
+            continue  # its owner is still starting, or it predates the lock
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            continue  # its owner is alive
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+        finally:
+            os.close(fd)
 
 
 def remove_dir() -> None:
@@ -274,11 +332,19 @@ def watch_disk_evictions(
     stop = threading.Event()
 
     def _watch() -> None:
+        failing = False
         while not stop.wait(interval_s):
             try:
                 count = read()
-            except OSError:
-                continue  # master briefly unreachable (startup, shutdown)
+            except Exception:  # keep watching: a dead watcher hides data loss
+                if not failing:
+                    LOGGER.warning(
+                        "Cannot read the Mooncake SSD-eviction count; retrying",
+                        exc_info=True,
+                    )
+                failing = True
+                continue
+            failing = False
             if count > 0:
                 LOGGER.error(
                     "Mooncake deleted SSD copies of offloaded objects (%d eviction "
