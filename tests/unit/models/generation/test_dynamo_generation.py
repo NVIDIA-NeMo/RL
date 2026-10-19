@@ -436,7 +436,7 @@ def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
 
 
 @pytest.mark.parametrize("clear_cache", [True, False])
-def test_refit_pause_drains_every_worker_and_resume_restores_them(
+def test_refit_pause_freezes_every_worker_and_resume_restores_them(
     monkeypatch, clear_cache: bool
 ) -> None:
     workers = [
@@ -456,10 +456,13 @@ def test_refit_pause_drains_every_worker_and_resume_restores_them(
     generation = pickle.loads(
         pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
     )
-    assert generation.pause_generation_for_refit(clear_cache=clear_cache)
-    assert [(call["route"], call["payload"]) for call in calls] == [
-        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
-        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
+    assert generation.pause_generation_for_refit(
+        clear_cache=clear_cache, timeout_s=30.0
+    )
+    pause = ("pause_generation", {"mode": "keep", "clear_cache": clear_cache}, 30.0)
+    assert [(call["route"], call["payload"], call["timeout_s"]) for call in calls] == [
+        pause,
+        pause,
     ]
 
     calls.clear()
@@ -494,7 +497,7 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     )
 
     with pytest.raises(RuntimeError, match="pause before weight update failed"):
-        channel.pause(clear_cache=True)
+        channel.pause(clear_cache=True, timeout_s=None)
 
     assert [(call["route"], call["system_url"]) for call in calls] == [
         ("pause_generation", "http://worker-a:4000"),

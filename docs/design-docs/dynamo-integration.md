@@ -42,7 +42,13 @@ through Dynamo's per-worker `/engine/*` RL routes, which forward an
 `engine_rpc` name to vLLM `collective_rpc`; Dynamo needs no NeMo RL code of its
 own. Setup calls go to `init_weights_update_group`, whose server deadline is
 `dynamo_cfg.control_timeout_s`, and refits go to
-`update_weights_from_distributed` with `allow_unpaused=True`.
+`update_weights_from_distributed` with `allow_unpaused=True` and
+`reset_prefix_cache=False`. A refit is one `collective_rpc` per engine. Under
+the SingleController, `pause_generation_for_refit` first freezes every engine
+through Dynamo's `pause_generation` route with vLLM's `keep` mode, exactly as
+the vLLM backend pauses its own engines: frozen requests continue on the new
+weights after the resume, and with `clear_cache` they recompute their KV. The
+legacy GRPO loop instead drains its trajectories before the refit.
 
 Each engine is one DP shard of `E = TP x PP` refit ranks
 (`get_refit_fleet_shape`), and engine `i` gets rank prefix `i * E`; the

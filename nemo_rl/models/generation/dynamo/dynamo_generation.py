@@ -182,14 +182,6 @@ class DynamoGeneration(GenerationInterface):
             )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
-        dynamo_cfg = generation["dynamo_cfg"]
-        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
-            raise ValueError(
-                "policy.generation.dynamo_cfg.control_timeout_s "
-                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
-                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
-                "which waits for running requests to finish."
-            )
         if (
             generation["vllm_cfg"]["enable_vllm_metrics_logger"]
             and master_config.rollout_checkpointing.telemetry_interval_s is None
@@ -823,7 +815,7 @@ class DynamoGeneration(GenerationInterface):
         return self._require_refit_channel().nccl_reshard_refit(refit_timeout_s)
 
     def invalidate_kv_cache(self) -> bool:
-        """Flush every fixed Dynamo worker's prefix/KV cache."""
+        """Drain every fixed Dynamo worker, then clear its prefix/KV cache."""
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
@@ -832,27 +824,21 @@ class DynamoGeneration(GenerationInterface):
     def pause_generation_for_refit(
         self, *, clear_cache: bool, timeout_s: Optional[float] = None
     ) -> bool:
-        """Drain and pause every worker; layerwise reload is unsafe mid-request.
+        """Freeze every engine's requests in place, as the vLLM backend does.
 
-        Unlike vLLM's frozen pause, running requests finish on the current
-        weights; queued and new requests wait and run on the new ones. Because
-        the drain waits for running requests, ``dynamo_cfg.control_timeout_s``
-        bounds it rather than ``timeout_s``.
+        Frozen requests continue on the new weights after
+        :meth:`resume_generation_after_refit`; with ``clear_cache`` their KV is
+        dropped at pause time, so they recompute it. ``timeout_s`` bounds each
+        engine's call; None falls back to ``dynamo_cfg.control_timeout_s``.
         """
-        del timeout_s
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.pause(clear_cache=clear_cache)
+        self._require_refit_channel().pause(
+            clear_cache=clear_cache, timeout_s=timeout_s
+        )
         return True
 
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
-        """Resume every worker after a weight update."""
-        del timeout_s
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.resume()
+        """Resume every engine paused by :meth:`pause_generation_for_refit`."""
+        self._require_refit_channel().resume(timeout_s=timeout_s)
         return True

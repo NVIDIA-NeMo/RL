@@ -68,10 +68,11 @@ uv run --no-sync coverage run -a \
   "$@" \
   2>&1 | tee "${RUN_LOG}"
 
-# Every weight sync drains Dynamo first (pause) and restores it afterwards (resume).
-# Dynamo accepts allow_unpaused updates, so a lost drain would not fail the refit.
+# Every weight sync freezes Dynamo in place (pause) and restores it afterwards
+# (resume). Dynamo accepts allow_unpaused updates, so a lost pause would not
+# fail the refit.
 sync_count=$(grep -Fc "_sync_weights: sync done" "${RUN_LOG}" || true)
-pause_count=$(grep -Fc "[RL] Engine paused (mode=wait, clear_cache=True)" "${RUN_LOG}" || true)
+pause_count=$(grep -Fc "[RL] Engine paused (mode=keep, clear_cache=True)" "${RUN_LOG}" || true)
 resume_count=$(grep -Fc "[RL] Engine resumed" "${RUN_LOG}" || true)
 if [[ "${sync_count}" -lt 2 || "${pause_count}" -lt "${sync_count}" || "${resume_count}" -lt "${sync_count}" ]]; then
   echo "Expected every weight sync to pause and resume Dynamo; syncs=${sync_count}, pauses=${pause_count}, resumes=${resume_count}" >&2

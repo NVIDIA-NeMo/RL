@@ -218,13 +218,12 @@ shards. No Dynamo-side component writes to TransferQueue.
 
 Start from
 [`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml)
-and launch it with `examples/run_grpo_single_controller.py`. Before every weight
-update the SingleController drains and pauses each Dynamo worker (requests the
-engine is running finish on the old weights; queued and new requests wait and
-run on the new weights), runs the NCCL refit, and then resumes the workers. With
-`async_rl.recompute_kv_cache_after_weight_updates` (the default), the drain also
-clears each worker's KV and prefix cache. The drain is bounded by
-`dynamo_cfg.control_timeout_s`.
+and launch it with `examples/run_grpo_single_controller.py`. Weight updates pause
+the engines in place, as on the vLLM backend: the SingleController stops new
+dispatches, freezes every engine's requests, runs the NCCL refit, and resumes
+them on the new weights. With `async_rl.recompute_kv_cache_after_weight_updates`
+(the default) the pause also clears each engine's KV and prefix cache, so frozen
+requests recompute their KV on the new weights; set it to false to keep both.
 
 Current limits on this path:
 
@@ -235,8 +234,6 @@ Current limits on this path:
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.
-- `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
-  because it bounds the drain.
 - `vllm_cfg.enable_vllm_metrics_logger` requires
   `rollout_checkpointing.telemetry_interval_s`: the rollout telemetry pump drains
   the Dynamo metrics sampler and reports each engine's generated tokens, running
