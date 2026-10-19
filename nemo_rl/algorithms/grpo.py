@@ -194,6 +194,7 @@ from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
     validate_offload_policy_before_refit,
 )
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -2017,11 +2018,10 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info(
-                refit_payload_mode=policy_generation.get_refit_payload_mode()
-            )
             if policy_generation is not None:
-                policy_generation.prepare_refit_info(state_dict_info)
+                initialize_refit_metadata(policy, policy_generation)
+            else:
+                policy.prepare_refit_info()
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2858,10 +2858,15 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
+        configured_buffer_size_bytes = (
+            None
+            if _refit_buffer_size_gb is None
+            else int(_refit_buffer_size_gb * 1024**3)
+        )
         if colocated_inference:
             # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
+            if configured_buffer_size_bytes is not None:
+                buffer_size_bytes = configured_buffer_size_bytes
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -2884,7 +2889,7 @@ def refit_policy_generation(
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM)
+            # update weights through collective transport
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )
@@ -4686,6 +4691,7 @@ def aggregate_rollout_metrics(
 
     Different metric types are aggregated according to their semantics:
     - Histogram observations: flattened into one step-level distribution
+    - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4704,6 +4710,10 @@ def aggregate_rollout_metrics(
             aggregated[k] = [observation for group in v for observation in group]
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
+        elif k.endswith("/std_in_group"):
+            aggregated[f"{k}/mean"] = sum(v) / len(v)
+            aggregated[f"{k}/p05"] = float(np.percentile(v, 5))
+            aggregated[f"{k}/p95"] = float(np.percentile(v, 95))
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
@@ -4928,6 +4938,7 @@ def async_grpo_train(
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
@@ -5128,6 +5139,7 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -5835,6 +5847,7 @@ def async_grpo_train(
                                 policy,
                                 policy_generation,
                                 colocated_inference,
+                                _refit_buffer_size_gb=refit_buffer_size_gb,
                             )
                             POLICY_GENERATION_STALE = False
 

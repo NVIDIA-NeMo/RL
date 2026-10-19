@@ -102,6 +102,7 @@ from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
     validate_offload_policy_before_refit,
 )
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -645,10 +646,7 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info(
-            refit_payload_mode=student_generation.get_refit_payload_mode()
-        )
-        student_generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(student_policy, student_generation)
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference and not managed_refit:
@@ -743,6 +741,7 @@ def _distillation_train_impl(
     val_at_start = master_config.distillation.val_at_start
     val_at_end = master_config.distillation.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     max_epochs = (
         master_config.distillation.max_num_epochs
     )  # max number of epochs to train for
@@ -755,7 +754,10 @@ def _distillation_train_impl(
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
-                student_policy, student_generation, colocated_inference
+                student_policy,
+                student_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -832,6 +834,7 @@ def _distillation_train_impl(
                             student_policy,
                             student_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
@@ -901,10 +904,13 @@ def _distillation_train_impl(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    # Train on generated assistant turns, excluding prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -996,7 +1002,10 @@ def _distillation_train_impl(
                 ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
