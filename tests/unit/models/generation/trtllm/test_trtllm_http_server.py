@@ -484,7 +484,12 @@ def test_cached_tokens_scale_reused_blocks_and_read_absence_as_zero():
     assert _tl_cached_tokens(SimpleNamespace(), tokens_per_block=32) is None
 
 
-def test_the_context_leg_emits_its_timeline_fields(stub_to_disaggregated_params):
+def test_the_context_leg_emits_its_timeline_fields(
+    stub_to_disaggregated_params, monkeypatch
+):
+    import nemo_rl.models.generation.trtllm.trtllm_http_server as server
+
+    monkeypatch.setattr(server, "_COLLECT_TIMELINE_FIELDS", True)
     gen = _perf_gen(reused_blocks=2)
     output = SimpleNamespace(ctx_computed_tokens=7, ctx_first_begin=0, ctx_num_chunks=1)
 
@@ -510,13 +515,9 @@ def test_the_context_leg_emits_its_timeline_fields(stub_to_disaggregated_params)
     assert body["nemo_ctx_num_chunks"] == 1
 
 
-def test_the_context_leg_omits_timeline_fields_when_disabled(
-    stub_to_disaggregated_params, monkeypatch
+def test_the_context_leg_omits_timeline_fields_by_default(
+    stub_to_disaggregated_params,
 ):
-    import nemo_rl.models.generation.trtllm.trtllm_http_server as server
-
-    monkeypatch.setattr(server, "_TL_EMIT_TIMELINE_FIELDS", False)
-
     body = json.loads(
         _context_leg_response("m", [1, 2, 3], _perf_gen(), False, arrival_ts_us=1).body
     )

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.utils.timer import timeline_collection_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +178,10 @@ _TOKENIZE_SHADOW_RATE = float(
 # (nemo_llm_* on every chat response, plus nemo_ctx_* on a context leg).
 # Under PD disaggregation they ride as top-level extras: the disagg server
 # relays worker output as RelayedChatCompletionResponse (extra="allow"), so
-# they survive the hop. Set NRL_TRTLLM_EMIT_TIMELINE_FIELDS=0 to suppress them,
-# e.g. against a tensorrt_llm build that still re-validates worker output with
-# the extra="forbid" ChatCompletionResponse.
-_TL_EMIT_TIMELINE_FIELDS = os.environ.get(
-    "NRL_TRTLLM_EMIT_TIMELINE_FIELDS", "1"
-).lower() not in ("0", "false", "no")
+# they survive the hop. Off by default; set NRL_COLLECT_TIMELINE_FIELDS=1 to
+# collect them. Leave it off against a tensorrt_llm build that still
+# re-validates worker output with the extra="forbid" ChatCompletionResponse.
+_COLLECT_TIMELINE_FIELDS = timeline_collection_enabled()
 
 
 def _tl_us(delta: Any, offset_s: float) -> int | None:
@@ -374,7 +373,7 @@ def _context_leg_response(
     else:
         response["prompt_token_ids"] = prompt_token_ids
 
-    if _TL_EMIT_TIMELINE_FIELDS:
+    if _COLLECT_TIMELINE_FIELDS:
         # Context-leg stamps, relayed onto the final (generation) response by
         # the disagg server, so a per-call timeline can split the pre-decode
         # path: ctx adapter receipt, engine queue entry, first schedule and
@@ -673,7 +672,7 @@ def create_app(
             stop_token_ids=stop_token_ids,
             max_tokens=max_tokens,
         )
-        if _TL_EMIT_TIMELINE_FIELDS:
+        if _COLLECT_TIMELINE_FIELDS:
             # Per-request RequestPerfMetrics feed the timeline fields. Set on
             # the instance so _build_sampling_params stays shared.
             sampling.return_perf_metrics = True
@@ -812,7 +811,7 @@ def create_app(
             },
         }
 
-        if _TL_EMIT_TIMELINE_FIELDS:
+        if _COLLECT_TIMELINE_FIELDS:
             response["nemo_llm_arrival_ts_us"] = _tl_arrival_ts_us
             response.update(_tl_timing_fields(gen, time.time()))
             cached = _tl_cached_tokens(gen, _tl_tpb)
@@ -863,7 +862,7 @@ def create_app(
                 ]
             }
 
-        if _TL_EMIT_TIMELINE_FIELDS:
+        if _COLLECT_TIMELINE_FIELDS:
             response["nemo_llm_response_ready_ts_us"] = time.time_ns() // 1_000
         return JSONResponse(content=response)
 

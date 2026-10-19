@@ -433,7 +433,10 @@ def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
     assert [c["function"]["name"] for c in tool_calls] == ["execute_bash"]
 
 
-def test_the_middleware_stamps_frontend_receipt_and_forward():
+def test_the_middleware_stamps_frontend_receipt_and_forward(monkeypatch):
+    import nemo_rl.models.generation.trtllm.trtllm_disagg_server as server
+
+    monkeypatch.setattr(server, "_COLLECT_TIMELINE_FIELDS", True)
     body = json.dumps(_warmup_payload()).encode()
     app = _CaptureApp()
 
@@ -445,10 +448,7 @@ def test_the_middleware_stamps_frontend_receipt_and_forward():
     assert 0 < recv <= fwd
 
 
-def test_the_middleware_skips_frontend_stamps_when_disabled(monkeypatch):
-    import nemo_rl.models.generation.trtllm.trtllm_disagg_server as server
-
-    monkeypatch.setattr(server, "_TL_EMIT_TIMELINE_FIELDS", False)
+def test_the_middleware_skips_frontend_stamps_by_default():
     body = json.dumps(_warmup_payload()).encode()
     app = _CaptureApp()
 
