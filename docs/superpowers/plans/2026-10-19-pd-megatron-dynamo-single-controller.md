@@ -4,7 +4,7 @@
 
 **Goal:** Run GRPO under the SingleController with a Dynamo frontend routing each rollout turn across a prefill pool and a decode pool of NeMo-RL Megatron inference engines, refit by the existing collective transport.
 
-**Architecture:** The spec is the local design page "13. Design: prefill/decode disaggregation under the Single Controller" (docsify site in `~/dev/adlr/disagg-playground`, served at http://localhost:8765). In one paragraph: `DynamoGeneration` (the `backend: dynamo` adapter from the aggregated-Dynamo work) grows an `engine: megatron` mode. Behind it sit two new ports, `DynamoEnginePool` and `EngineRefitChannel`. The Megatron implementations build one `MegatronGeneration` per engine (its own `Policy` worker group, DP = 1, `skip_weight_load=True`) plus one CPU Ray actor per engine that runs Megatron-LM's own Dynamo adapter in external launch mode. The Megatron worker gains a small mixin that does what Megatron's `engine_service` does (Dynamo-flavoured engine class, `setup_kv_transfer(role)`, event reporter, `ready`). The controller gains a request-grain quiesce (turn gate + outstanding counter) so no request is between the prefill and decode legs when the engines suspend; Megatron's suspend asserts that invariant. Rank offsets for the refit collective are cumulative over unequal engines and computed once in `DisaggRolePlan`.
+**Architecture:** The spec is the local design page "13. Design: prefill/decode disaggregation under the Single Controller" (docsify site in `~/dev/adlr/disagg-playground`, served at http://localhost:8765). In one paragraph: `DynamoGeneration` (the `backend: dynamo` adapter from the aggregated-Dynamo work) grows an `engine: megatron` mode. Behind it sit two new ports, `DynamoEnginePool` and `EngineRefitChannel`. The Megatron implementations build one `MegatronGeneration` per engine (its own `Policy` worker group, DP = 1, `skip_weight_load=True`) plus one CPU Ray actor per engine that runs Megatron-LM's own Dynamo adapter in external launch mode. The Megatron worker gains a small mixin that does what Megatron's `engine_service` does (Dynamo-flavoured engine class, `setup_kv_transfer(role)`, event reporter, `ready`). The controller gains a request-grain wait for idle rollouts (turn gate + outstanding counter) so no request is between the prefill and decode legs when the engines suspend; Megatron's suspend asserts that invariant. Rank offsets for the refit collective are cumulative over unequal engines and computed once in `DisaggRolePlan`.
 
 **Tech Stack:** Python 3.12, Ray, pydantic v2, Megatron-LM (merged PR 6675: `megatron.inference.integrations.dynamo`, `StateHandoffDynamicInferenceEngine`), ai-dynamo 1.5.1 (frontend, etcd, NATS), NIXL, pytest with fakes (no GPU, no Dynamo, no Megatron import needed for the unit tests).
 
@@ -30,17 +30,17 @@ export HF_HOME=/tmp/hf PYTHONPATH=$PWD
 | `nemo_rl/models/generation/dynamo/megatron_engine_pool.py` (new) | `DynamoMegatronAdapterActor` (Ray actor owning the `python -m megatron.inference.integrations.dynamo --engine-launch-mode external` subprocess), `build_megatron_adapter_argv`, `MegatronEnginePool`. |
 | `nemo_rl/models/generation/dynamo/megatron_refit_channel.py` (new) | `MegatronRefitChannel`: per-engine fan-out of the Megatron non-colocated refit sequence with cumulative offsets and a pinned-block idle wait. |
 | `nemo_rl/models/generation/dynamo/managed_runtime.py` (modify) | Accept an engine pool and expected components; split readiness out of `start()` so Megatron engines (which come up at the first refit) can be awaited later. |
-| `nemo_rl/models/generation/dynamo/dynamo_generation.py` (modify) | `engine: megatron` branch; `requires_quiesce_before_weight_update`; `quiesce_timeout_s`; drain = `wait_idle` + `pause`; readiness after the initial refit. |
-| `nemo_rl/models/generation/interfaces.py` (modify) | `requires_quiesce_before_weight_update` property (default `False`). |
-| `nemo_rl/experience/rollout_manager.py` (modify) | Turn gate + outstanding counter in `AsyncRolloutImpl._generate_response`; `RolloutManager.quiesce()` / `release_turn_gate()`. |
-| `nemo_rl/algorithms/single_controller.py` (modify) | `_sync_weights`: quiesce before the drain when the generation asks for it; reopen the turn gate in `finally`. |
+| `nemo_rl/models/generation/dynamo/dynamo_generation.py` (modify) | `engine: megatron` branch; `requires_idle_rollouts_before_weight_update`; `idle_rollouts_timeout_s`; drain = `wait_idle` + `pause`; readiness after the initial refit. |
+| `nemo_rl/models/generation/interfaces.py` (modify) | `requires_idle_rollouts_before_weight_update` property (default `False`). |
+| `nemo_rl/experience/rollout_manager.py` (modify) | Turn gate + outstanding counter in `AsyncRolloutImpl._generate_response`; `RolloutManager.wait for idle rollouts()` / `release_turn_gate()`. |
+| `nemo_rl/algorithms/single_controller.py` (modify) | `_sync_weights`: wait for idle rollouts before the drain when the generation asks for it; reopen the turn gate in `finally`. |
 | `nemo_rl/models/generation/megatron/megatron_worker.py` (modify) | `attach_dynamo_adapter`, `pinned_handoff_block_count`, `dynamo_coordinator_address`; engine class + `setup_kv_transfer` + routable coordinator + event reporter when attached. |
 | `nemo_rl/models/generation/megatron/megatron_generation.py` (modify) | One-line fan-outs for the three worker methods. |
 | `nemo_rl/models/policy/workers/megatron_policy_worker.py` (modify) | `_generation_needs_logical_weights` also true for Dynamo-fronted Megatron engines. |
 | `nemo_rl/algorithms/single_controller_utils/setup.py` (modify) | Pass the policy config and tokenizer into `DynamoGeneration` for Megatron engines; segment planning uses the largest engine; validation. |
 | `examples/configs/grpo_math_1B_dynamo_pd_megatron_single_controller.yaml` (new) | Exemplar: 1 train GPU, 1 prefill engine, 1 decode engine. |
 | `docs/guides/dynamo-generation.md` (modify) | Short section on the Megatron-engine prefill/decode mode. |
-| Tests | `tests/unit/models/generation/test_dynamo_role_plan.py`, `test_dynamo_pd_config.py`, `test_megatron_refit_channel.py`, `test_dynamo_megatron_adapter_argv.py`; `tests/unit/experience/test_rollout_quiesce.py`; new cases in `tests/unit/single_controller/test_single_controller_actor.py`. |
+| Tests | `tests/unit/models/generation/test_dynamo_role_plan.py`, `test_dynamo_pd_config.py`, `test_megatron_refit_channel.py`, `test_dynamo_megatron_adapter_argv.py`; `tests/unit/experience/test_rollout_wait for idle rollouts.py`; new cases in `tests/unit/single_controller/test_single_controller_actor.py`. |
 
 ---
 
@@ -68,11 +68,11 @@ export HF_HOME=/tmp/hf PYTHONPATH=$PWD
 - [ ] Implement `RolePoolConfig`, `DynamoDisaggregationConfig`, `DynamoCfg.engine`, `DynamoCfg.disaggregation`, `DynamoCfg.megatron_root`, `DynamoCfg.nixl_transport` fields; make `vllm_cfg` optional when `engine == "megatron"`; `DynamoConfig.role_plan(policy_megatron_cfg)`.
 - [ ] Run tests, commit.
 
-### Task 4: Controller quiesce
+### Task 4: Controller wait for idle rollouts
 
-**Files:** modify `nemo_rl/models/generation/interfaces.py`, `nemo_rl/experience/rollout_manager.py`, `nemo_rl/algorithms/single_controller.py`; tests `tests/unit/experience/test_rollout_quiesce.py`, `tests/unit/single_controller/test_single_controller_actor.py`.
+**Files:** modify `nemo_rl/models/generation/interfaces.py`, `nemo_rl/experience/rollout_manager.py`, `nemo_rl/algorithms/single_controller.py`; tests `tests/unit/experience/test_rollout_wait for idle rollouts.py`, `tests/unit/single_controller/test_single_controller_actor.py`.
 
-- [ ] Tests: a turn blocks on `generate_async` → `quiesce()` waits until it completes; new turns block while the gate is closed and proceed after `release_turn_gate()`; `quiesce` times out and reopens the gate; `_sync_weights` calls `quiesce` only when `requires_quiesce_before_weight_update` is true, and before `drain_for_weight_update`; gate reopens even when the sync fails.
+- [ ] Tests: a turn blocks on `generate_async` → `wait for idle rollouts()` waits until it completes; new turns block while the gate is closed and proceed after `release_turn_gate()`; `wait for idle rollouts` times out and reopens the gate; `_sync_weights` calls `wait for idle rollouts` only when `requires_idle_rollouts_before_weight_update` is true, and before `drain_for_weight_update`; gate reopens even when the sync fails.
 - [ ] Implement; run; commit.
 
 ### Task 5: Megatron refit channel
@@ -94,7 +94,7 @@ export HF_HOME=/tmp/hf PYTHONPATH=$PWD
 
 **Files:** modify `managed_runtime.py`, `dynamo_generation.py`, `dynamo/__init__.py`; extend `tests/unit/models/generation/test_dynamo_generation.py`.
 
-- [ ] Tests: existing vLLM tests unchanged; with `engine: megatron` the generation builds the Megatron pool and channel, `requires_quiesce_before_weight_update` is true, `drain_for_weight_update` calls `wait_idle` then `pause`, frontend readiness is awaited at `resume_after_weight_update` of the first refit, `__getstate__` keeps the channel.
+- [ ] Tests: existing vLLM tests unchanged; with `engine: megatron` the generation builds the Megatron pool and channel, `requires_idle_rollouts_before_weight_update` is true, `drain_for_weight_update` calls `wait_idle` then `pause`, frontend readiness is awaited at `resume_after_weight_update` of the first refit, `__getstate__` keeps the channel.
 - [ ] Implement; run; commit.
 
 ### Task 8: Worker hooks
@@ -121,4 +121,4 @@ export HF_HOME=/tmp/hf PYTHONPATH=$PWD
 
 ## Self-review
 
-Spec coverage: 13c (flow) → Tasks 4, 6, 7; 13e (quiesce) → Task 4; 13f (placement, one worker group per engine, sidecars) → Task 6; 13g (geometry) → Tasks 1, 5; 13h (config) → Task 3; 13i (startup, worker hook) → Tasks 7, 8; 13j (failures: quiesce timeout, pin wait, decode death) → Tasks 4, 5, 6; 13o (seam) → Task 2; 13u (class map) → names used verbatim. Not covered on purpose: Megatron bump, vLLM pool, layout-aware transports.
+Spec coverage: 13c (flow) → Tasks 4, 6, 7; 13e (wait for idle rollouts) → Task 4; 13f (placement, one worker group per engine, sidecars) → Task 6; 13g (geometry) → Tasks 1, 5; 13h (config) → Task 3; 13i (startup, worker hook) → Tasks 7, 8; 13j (failures: wait for idle rollouts timeout, pin wait, decode death) → Tasks 4, 5, 6; 13o (seam) → Task 2; 13u (class map) → names used verbatim. Not covered on purpose: Megatron bump, vLLM pool, layout-aware transports.

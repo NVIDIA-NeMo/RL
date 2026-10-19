@@ -491,7 +491,7 @@ class _Deadline:
         self._remaining = None
 
 
-class RolloutQuiesceTimeout(TimeoutError):
+class RolloutIdleTimeout(TimeoutError):
     """The turn gate closed, but outstanding requests did not return in time."""
 
 
@@ -502,7 +502,7 @@ class TurnGate:
     :meth:`admit` / :meth:`release`. The controller closes the gate and waits for
     the outstanding count to reach zero before a weight update on backends whose
     engines cannot drain themselves (see
-    ``GenerationInterface.requires_quiesce_before_weight_update``). Closing the
+    ``GenerationInterface.requires_idle_rollouts_before_weight_update``). Closing the
     gate holds *new turns*; requests already issued run to completion.
     """
 
@@ -542,11 +542,11 @@ class TurnGate:
         async with self._idle:
             await self._idle.wait_for(lambda: self._outstanding == 0)
 
-    async def quiesce(self, timeout_s: Optional[float]) -> None:
+    async def wait_for_idle(self, timeout_s: Optional[float]) -> None:
         """Close the gate and wait until no request is outstanding.
 
         On timeout the gate reopens so a failed refit leaves rollouts runnable,
-        and :class:`RolloutQuiesceTimeout` reports how many were still out.
+        and :class:`RolloutIdleTimeout` reports how many were still out.
         """
         self.close()
         try:
@@ -554,7 +554,7 @@ class TurnGate:
         except TimeoutError:
             outstanding = self._outstanding
             self.open()
-            raise RolloutQuiesceTimeout(
+            raise RolloutIdleTimeout(
                 f"{outstanding} generation request(s) still outstanding after "
                 f"{timeout_s}s; the engines cannot be paused safely"
             ) from None
@@ -1852,7 +1852,7 @@ class RolloutManager:
         """Engine requests issued by the native rollout path and not yet returned."""
         return self._turn_gate.outstanding
 
-    async def quiesce(self, timeout_s: Optional[float]) -> None:
+    async def wait_for_idle_rollouts(self, timeout_s: Optional[float]) -> None:
         """Hold new turns and wait until every outstanding engine request returned.
 
         Used before a weight update on backends whose engines cannot drain
@@ -1860,7 +1860,7 @@ class RolloutManager:
         The NeMo-Gym impl does not route its requests through this gate; the
         controller rejects that combination at setup.
         """
-        await self._turn_gate.quiesce(timeout_s)
+        await self._turn_gate.wait_for_idle(timeout_s)
 
     def release_turn_gate(self) -> None:
         """Let held turns proceed again after a weight update (or its failure)."""

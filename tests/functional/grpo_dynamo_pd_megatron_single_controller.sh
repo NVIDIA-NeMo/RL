@@ -68,7 +68,7 @@ uv run --no-sync coverage run -a \
   "$@" \
   2>&1 | tee "${RUN_LOG}"
 
-# Every weight sync quiesces generation, pauses both engines, and resumes them.
+# Every weight sync waits for in-flight rollouts, pauses both engines, and resumes them.
 sync_count=$(grep -Fc "_sync_weights: sync done" "${RUN_LOG}" || true)
 pause_count=$(grep -Fc "paused inference engine" "${RUN_LOG}" || true)
 resume_count=$(grep -Fc "resumed inference engine" "${RUN_LOG}" || true)

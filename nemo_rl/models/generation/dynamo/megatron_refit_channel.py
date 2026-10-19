@@ -186,7 +186,7 @@ class MegatronRefitChannel:
         """Suspend every engine, decode pool first, then prepare the weight swap.
 
         Decode engines are the readers of prefill KV, so they go down first;
-        with the quiesce done, every engine is idle and the order is defensive.
+        the controller already waited for in-flight rollouts, so the order is defensive.
         """
         for record in self._records:
             self._control(record).suspend_for_refit()

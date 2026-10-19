@@ -253,7 +253,7 @@ Refit and startup differ from the vLLM fleet:
 - A request spans two engines, and a Megatron engine refuses to suspend while a
   prefill block is still pinned for decode. Before every refit the
   SingleController therefore waits for every in-flight request and holds new
-  ones (the generation backend reports `requires_quiesce_before_weight_update`),
+  ones (the generation backend reports `requires_idle_rollouts_before_weight_update`),
   waits for the remaining handoff pins to clear, suspends decode then prefill,
   runs the collective refit, and resumes prefill then decode. Both waits are
   bounded by `dynamo_cfg.control_timeout_s`.

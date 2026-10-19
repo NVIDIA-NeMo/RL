@@ -37,7 +37,7 @@ policy:
       # covers that whole window.
       startup_timeout_s: 3600
       request_timeout_s: 900
-      # Bounds the pre-refit quiesce (in-flight requests finishing) and the
+      # Bounds the pre-refit wait for in-flight requests to finish and the
       # wait for prefill handoff pins to clear; must be >= request_timeout_s.
       control_timeout_s: 900
       metrics_include_prefixes: null

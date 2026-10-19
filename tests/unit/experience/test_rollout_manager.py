@@ -59,7 +59,7 @@ from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RolloutManager,
     RolloutOutcome,
-    RolloutQuiesceTimeout,
+    RolloutIdleTimeout,
     RolloutRetryPolicy,
     RolloutStats,
     TurnGate,
@@ -911,7 +911,7 @@ def _gated_turn(generation, gate: TurnGate):
     return asyncio.create_task(impl._generate_response(message_log, None))
 
 
-def test_turn_gate_quiesce_waits_for_outstanding_turns_then_holds_new_ones():
+def test_turn_gate_wait_for_idle_waits_for_outstanding_turns_then_holds_new_ones():
     async def scenario():
         gate = TurnGate()
         gen = _BlockingGeneration()
@@ -919,13 +919,13 @@ def test_turn_gate_quiesce_waits_for_outstanding_turns_then_holds_new_ones():
         await gen.started.wait()
         assert gate.outstanding == 1
 
-        quiesce = asyncio.create_task(gate.quiesce(timeout_s=5.0))
+        idle = asyncio.create_task(gate.wait_for_idle(timeout_s=5.0))
         await asyncio.sleep(0)
-        assert not quiesce.done() and not gate.is_open
+        assert not idle.done() and not gate.is_open
 
         gen.proceed.set()
         await turn
-        await quiesce
+        await idle
         assert gate.outstanding == 0
         assert not gate.is_open, "stays closed until the controller reopens it"
 
@@ -939,17 +939,17 @@ def test_turn_gate_quiesce_waits_for_outstanding_turns_then_holds_new_ones():
     _run(scenario())
 
 
-@pytest.mark.parametrize("failure", ["quiesce_timeout", "generation_error"])
+@pytest.mark.parametrize("failure", ["idle_wait_timeout", "generation_error"])
 def test_turn_gate_recovers_from_failures(failure):
     async def scenario():
         gate = TurnGate()
         gen = _BlockingGeneration(fail=failure == "generation_error")
         turn = _gated_turn(gen, gate)
         await gen.started.wait()
-        if failure == "quiesce_timeout":
-            with pytest.raises(RolloutQuiesceTimeout, match="1 generation request"):
-                await gate.quiesce(timeout_s=0.01)
-            assert gate.is_open, "a timed-out quiesce reopens the gate"
+        if failure == "idle_wait_timeout":
+            with pytest.raises(RolloutIdleTimeout, match="1 generation request"):
+                await gate.wait_for_idle(timeout_s=0.01)
+            assert gate.is_open, "a timed-out wait reopens the gate"
             gen.proceed.set()
             await turn
         else:

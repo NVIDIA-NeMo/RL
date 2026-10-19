@@ -372,7 +372,7 @@ class DynamoGeneration(GenerationInterface):
         return True
 
     @property
-    def requires_quiesce_before_weight_update(self) -> bool:
+    def requires_idle_rollouts_before_weight_update(self) -> bool:
         """Megatron engines cannot pause between a request's prefill and decode legs.
 
         vLLM workers drain themselves on pause; a Megatron prefill engine that is
@@ -383,7 +383,7 @@ class DynamoGeneration(GenerationInterface):
         return self._is_megatron_engine
 
     @property
-    def quiesce_timeout_s(self) -> float | None:
+    def idle_rollouts_timeout_s(self) -> float | None:
         return self._dynamo_cfg.control_timeout_s if self._is_megatron_engine else None
 
     @property
@@ -818,7 +818,7 @@ class DynamoGeneration(GenerationInterface):
         """Drain and pause every engine; a weight swap is unsafe mid-request.
 
         Megatron engines are paused only once no prefill engine holds a handoff
-        pin: the controller has already quiesced requests, and the decode
+        pin: the controller already waited for in-flight requests, and the decode
         adapter's release of the last handoff trails the final token slightly.
         """
         channel = self._refit_channel

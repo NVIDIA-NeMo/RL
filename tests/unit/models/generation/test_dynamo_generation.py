@@ -777,12 +777,14 @@ def _megatron_generation(monkeypatch, *, prefill_pinned: int = 0, gpus: int = 4)
     return generation, events, waits
 
 
-def test_megatron_engines_build_the_channel_and_require_quiesce(monkeypatch) -> None:
+def test_megatron_engines_build_the_channel_and_require_idle_rollouts(
+    monkeypatch,
+) -> None:
     generation, events, _ = _megatron_generation(monkeypatch)
     assert events == ["init", "start"]
     assert isinstance(generation._refit_channel, MegatronRefitChannel)
-    assert generation.requires_quiesce_before_weight_update is True
-    assert generation.quiesce_timeout_s == 10
+    assert generation.requires_idle_rollouts_before_weight_update is True
+    assert generation.idle_rollouts_timeout_s == 10
     assert generation.get_inference_world_size() == 4
     assert generation.get_collective_sender_spec().nccl_peer == "nemo"
     assert generation.dp_openai_server_base_urls == [None]
@@ -822,7 +824,7 @@ def test_megatron_drain_waits_for_pins_and_first_resume_awaits_frontend(
     if pickled:
         generation = pickle.loads(pickle.dumps(generation))
         assert generation._managed_runtime is None
-        assert generation.requires_quiesce_before_weight_update is True
+        assert generation.requires_idle_rollouts_before_weight_update is True
 
     generation.drain_for_weight_update()
     assert _MEGATRON_LOG == [

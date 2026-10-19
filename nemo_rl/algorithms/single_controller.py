@@ -5438,7 +5438,7 @@ class SingleControllerActor:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. rollout_manager.quiesce()  — only if the generation requires it: hold new
+          4. rollout_manager.wait_for_idle_rollouts()  — only if the generation requires it: hold new
              turns and wait for outstanding requests (prefill/decode pools)
           5. generation.drain_for_weight_update()  — no-op except managed Dynamo
           6. weight_synchronizer.sync_weights(kv_scales=...), retried once if recovery
@@ -5514,13 +5514,13 @@ class SingleControllerActor:
         # the two legs is invisible to every engine. For those the controller, as
         # the only client, closes its turn gate and waits for every outstanding
         # request to return first. The gate reopens in the finally below.
-        quiesce_required = bool(
-            getattr(self._gen, "requires_quiesce_before_weight_update", False)
+        idle_rollouts_required = bool(
+            getattr(self._gen, "requires_idle_rollouts_before_weight_update", False)
         )
-        if quiesce_required:
-            with self._timer.time("prepare_for_generation/generation_quiesce"):
-                await self._rollout_manager.quiesce(
-                    getattr(self._gen, "quiesce_timeout_s", None)
+        if idle_rollouts_required:
+            with self._timer.time("prepare_for_generation/wait_for_idle_rollouts"):
+                await self._rollout_manager.wait_for_idle_rollouts(
+                    getattr(self._gen, "idle_rollouts_timeout_s", None)
                 )
 
         # A no-op for engines that serve through the refit. Backends whose weight
@@ -5578,7 +5578,7 @@ class SingleControllerActor:
             try:
                 await asyncio.to_thread(self._gen.resume_after_weight_update)
             finally:
-                if quiesce_required:
+                if idle_rollouts_required:
                     self._rollout_manager.release_turn_gate()
         if self._async_cfg.recompute_kv_cache_after_weight_updates:
             # to_thread, like every other call into the workers here. Run directly on

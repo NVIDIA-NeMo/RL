@@ -753,7 +753,7 @@ class GenerationInterface(ABC):
         """Resume serving after :meth:`drain_for_weight_update`."""
 
     @property
-    def requires_quiesce_before_weight_update(self) -> bool:
+    def requires_idle_rollouts_before_weight_update(self) -> bool:
         """Whether the controller must stop issuing requests before the drain.
 
         Engines that serve a request across more than one process (prefill and
@@ -765,8 +765,8 @@ class GenerationInterface(ABC):
         return False
 
     @property
-    def quiesce_timeout_s(self) -> float | None:
-        """Bound for the controller's pre-drain quiesce; None waits indefinitely."""
+    def idle_rollouts_timeout_s(self) -> float | None:
+        """Bound for the controller's wait for in-flight rollouts; None waits indefinitely."""
         return None
 
     def blocks_training(self) -> bool:
