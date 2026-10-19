@@ -1762,7 +1762,7 @@ class VllmGeneration(GenerationInterface):
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             results = ray.get(futures)
-            return all(result for result in results if result is not None)
+            return bool(results) and all(result is True for result in results)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
             return False
@@ -1779,7 +1779,8 @@ class VllmGeneration(GenerationInterface):
             clear_cache=clear_cache,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        if not all(ray.get(futures)):
+        results = ray.get(futures)
+        if not results or not all(result is True for result in results):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
@@ -1796,7 +1797,8 @@ class VllmGeneration(GenerationInterface):
             "resume_generation_async",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        if not all(ray.get(futures)):
+        results = ray.get(futures)
+        if not results or not all(result is True for result in results):
             raise RuntimeError("Failed to resume every async vLLM engine")
         return True
 

@@ -492,7 +492,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     generation_router: GenerationRouterConfig = Field(
         default_factory=GenerationRouterConfig
     )
-    # Recompute generation KV caches after each weight update.
+    # Recompute generation caches after each weight update. With async vLLM,
+    # pause and clear active request caches before refit, preserving emitted tokens.
+    # Failures on this path end the run rather than retrying with partial weights.
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32

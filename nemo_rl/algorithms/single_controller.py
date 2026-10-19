@@ -5429,16 +5429,19 @@ class SingleControllerActor:
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
+        SC owns the dispatch gate. Async vLLM is paused with active caches cleared
+        when recompute_kv_cache_after_weight_updates is enabled.
         A colocated engine is instead already stood down: the synchronizer's sync is the wake,
-        and step 4 resumes dispatch.
+        and the final step resumes dispatch.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
           2. Optionally calibrate FP8 KV-cache scales.
           3. Materialize deferred policy parameter all-gathers.
-          4. weight_synchronizer.sync_weights(kv_scales=...)
-          5. _rollout_permitted.set()   — resume
+          4. Optionally pause async vLLM and clear active request caches.
+          5. weight_synchronizer.sync_weights(kv_scales=...)
+          6. Publish the weight version and resume paused engines.
+          7. _rollout_permitted.set()   — resume dispatch
 
         Args:
             calibration_data: Optional data used to calibrate FP8 KV-cache
@@ -5502,9 +5505,36 @@ class SingleControllerActor:
         with self._timer.time("prepare_for_generation/sync_policy_params"):
             await asyncio.to_thread(self._trainer.sync_params_before_refit)
 
+        # Preserve emitted tokens, but never continue with state computed by old weights.
+        pause_for_refit = (
+            self._async_cfg.recompute_kv_cache_after_weight_updates
+            and self._master_config.policy["generation"]["backend"] == "vllm"
+            and self._master_config.policy["generation"]["vllm_cfg"]["async_engine"]
+        )
+        if pause_for_refit:
+            paused = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._gen.pause_generation_for_refit, clear_cache=True
+                ),
+                timeout=self._async_cfg.generation_fleet_health.refit_timeout_s,
+            )
+            if paused is not True:
+                raise RuntimeError(
+                    "Refit cancelled: not every vLLM engine confirmed pause/cache clear"
+                )
+            print(
+                f"cache_refit: paused_and_cleared target_version={self._trainer_version}",
+                flush=True,
+            )
+
         try:
             await self._sync_weights_within(kv_scales, "first")
         except (RefitAborted, RayActorError) as failure:
+            if pause_for_refit:
+                # A restarted engine could serve partial weights or escape the pause.
+                # Fail closed; a later job resumes from the last durable checkpoint.
+                print("cache_refit: failed; generation remains paused", flush=True)
+                raise
             # DETECT AND FAIL FAST, because this one cannot be recovered from.
             #
             # sync_stream_within gives up on kernels already enqueued on THIS trainer's
@@ -5548,12 +5578,16 @@ class SingleControllerActor:
             # promoted inside its window, and everything below this must still run on
             # both paths.
             self._record_refit_landed(participants)
-        if self._async_cfg.recompute_kv_cache_after_weight_updates:
+        if (
+            self._async_cfg.recompute_kv_cache_after_weight_updates
+            and not pause_for_refit
+        ):
             # to_thread, like every other call into the workers here. Run directly on
             # the loop this is a blocking Ray call, and a wedged generation worker would
             # freeze the event loop itself -- taking the watchdog, which is an asyncio
             # task on that same loop, down with it.
-            await asyncio.to_thread(self._gen.invalidate_kv_cache)
+            if not await asyncio.to_thread(self._gen.invalidate_kv_cache):
+                raise RuntimeError("Generation cache invalidation failed after refit")
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
@@ -5563,6 +5597,14 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
+        if pause_for_refit:
+            resumed = await asyncio.wait_for(
+                asyncio.to_thread(self._gen.resume_generation_after_refit),
+                timeout=self._async_cfg.generation_fleet_health.refit_timeout_s,
+            )
+            if resumed is not True:
+                raise RuntimeError("Failed to resume every vLLM engine after refit")
+            print(f"cache_refit: resumed version={self._trainer_version}", flush=True)
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups
