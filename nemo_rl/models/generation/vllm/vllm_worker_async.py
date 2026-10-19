@@ -989,6 +989,16 @@ class VllmAsyncGenerationWorkerImpl(
         if state is not None and self.token_capture is not None:
             self.token_capture.fail_call(state.call, reason=reason)
 
+    def _context_refusal_headers(self, request: Any) -> dict[str, str]:
+        """Acknowledge a validation refusal after draining capture state, before staging."""
+        admission = self._capture_admission(request)
+        if admission is None:
+            return {}
+        # Deferred: Gym is optional outside framework-owned capture.
+        from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER
+
+        return {CAPTURE_REFUSAL_HEADER: admission.model_call_id}
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         worker_self = self
@@ -1577,6 +1587,7 @@ class VllmAsyncGenerationWorkerImpl(
                         }
                     },
                     status_code=400,
+                    headers=worker_self._context_refusal_headers(request),
                 )
             except MediaCaptureRejected as e:
                 # Raised inside preprocess_chat before begin_call, so no capture
@@ -1623,6 +1634,14 @@ class VllmAsyncGenerationWorkerImpl(
                         }
                     },
                     status_code=400,
+                    # Only vLLM's known pre-generation get_max_tokens refusal
+                    # can settle capture; an arbitrary ValueError cannot.
+                    headers=(
+                        worker_self._context_refusal_headers(request)
+                        if str(e).startswith("Input length (")
+                        and "exceeds model's maximum context length" in str(e)
+                        else None
+                    ),
                 )
             except asyncio.CancelledError:
                 # Client disconnected (see with_cancellation above). A cancel

@@ -1364,16 +1364,17 @@ Depending on your data shape, you may want to change these values."""
                     raise ValueError("Selection must identify its scored terminal")
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
-        if any(
-            r.response_status not in ("completed", "incomplete", "failed")
-            for r in selected
-        ):
+        if any(r.response_status is None for r in selected):
             raise ValueError("Selected capture is missing completion metadata")
         if any(
             r.response_status == "incomplete" and not r.finish_reason for r in selected
         ):
             raise ValueError("Incomplete capture is missing its finish reason")
-        if any(r.last_output_item is None for r in selected):
+        if any(
+            r.last_output_item is None
+            and r.response_status in ("completed", "incomplete")
+            for r in selected
+        ):
             raise ValueError("Selected capture is missing output validation evidence")
         truncated = any(
             r.finish_reason in ("length", "max_tokens", "max_output_tokens")
@@ -1388,7 +1389,7 @@ Depending on your data shape, you may want to change these values."""
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
         elif any(
-            r.response_status == "failed"
+            r.response_status in ("failed", "unknown")
             or (
                 r.response_status == "incomplete"
                 and r.finish_reason not in ("length", "max_tokens", "max_output_tokens")

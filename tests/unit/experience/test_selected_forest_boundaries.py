@@ -292,6 +292,156 @@ def test_all_captured_does_not_require_returned_execution_history(forest):
     assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
 
 
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("status", ["failed", "unknown"])
+@pytest.mark.parametrize("empty_output", [False, True])
+@pytest.mark.parametrize("failure_index", [0, -1])
+def test_unsuccessful_selected_completion_masks_the_owner(
+    forest, policy, status, empty_output, failure_index
+):
+    records, replies = forest.capture([None, 0, None, 2])
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    manifest = forest.harness.manifest("attempt").model_dump(mode="json")
+    manifest["records"][failure_index]["response_status"] = status
+    if empty_output:
+        manifest["records"][failure_index]["last_output_item"] = None
+    env._control = AsyncMock(return_value=manifest)
+    output = ordinary(replies)
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    assert processed["receipt"]["capture_poisoned"] is True
+    assert processed["receipt"]["failure_reason"] == "logical_execution_failure"
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+        execution_row_multiple=4,
+    )
+    assert result.valid_row_count == 0
+    assert_loss_once(forest, [], records)
+
+
+def test_ordinary_capture_reconstructs_without_framework_output_metadata(
+    monkeypatch, tmp_path
+):
+    from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
+    from nemo_gym.token_id_capture.staging.records import (
+        RolloutReceipt,
+        StagedCallBaseSnapshot,
+    )
+
+    harness = gym.make_capture_harness(
+        monkeypatch,
+        tmp_path,
+        decide_input=decide_capture_input,
+        framework_owned_context=False,
+    )
+    history = [{"role": "user", "content": "task"}]
+    first = gym.assert_clean(harness.post("attempt", history))
+    second = gym.assert_clean(
+        harness.post(
+            "attempt",
+            history + first["output"] + [{"role": "user", "content": "continue"}],
+        )
+    )
+    manifest = harness.manifest("attempt")
+    assert len(manifest.records) == 2
+    assert manifest.records[1].parent_call_id == manifest.records[0].model_call_id
+    assert all(
+        r.output_items is None
+        and r.response_status is None
+        and r.last_output_item is None
+        for r in manifest.records
+    )
+    env = _env(harness)
+    env._forest_training = False
+    processed = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "attempt"}, {"response": second, "reward": 1.0}
+        )
+    )
+    captured_receipt = RolloutReceipt.model_validate(processed["receipt"])
+    assert not captured_receipt.capture_poisoned
+    snapshots = [
+        StagedCallBaseSnapshot.model_validate(r.model_dump(exclude={"extras"}))
+        for r in harness.sink.records.values()
+    ]
+    row = verify_and_linearize(captured_receipt, snapshots)
+    assert row.token_ids == [10, 11, 1001, 20, 21, 1002]
+    assert row.token_mask == [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize("continuation", [False, True])
+def test_calls_after_lost_ack_remain_masked_and_preserve_uncertain_staging(
+    forest, policy, continuation
+):
+    _, replies = forest.capture([None])
+    forest.harness.omit_coords = True
+    assert (
+        forest.harness.post(
+            "attempt", [{"role": "user", "content": "subagent task"}]
+        ).status_code
+        == 500
+    )
+    failed = forest.harness.manifest("attempt")
+    assert len(failed.records) == 1 and len(failed.pending_call_ids) == 1
+    uncertain_key = f"attempt/{failed.pending_call_ids[0]}"
+    assert ("staged", uncertain_key) in forest.plane.rows
+
+    forest.harness.omit_coords = False
+    history = (
+        [{"role": "user", "content": "independent root 0"}]
+        + replies[0]["output"]
+        + [{"role": "user", "content": "continue healthy branch"}]
+        if continuation
+        else [{"role": "user", "content": "another independent task"}]
+    )
+    replies.append(gym.assert_clean(forest.harness.post("attempt", history)))
+    manifest = forest.harness.manifest("attempt")
+    assert len(manifest.records) == 2
+    assert manifest.pending_call_ids == failed.pending_call_ids
+    assert manifest.failures == failed.failures
+    assert manifest.records[1].parent_call_id == (
+        manifest.records[0].model_call_id if continuation else None
+    )
+
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    output = ordinary(replies)
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    assert processed["receipt"]["capture_poisoned"]
+    assert processed["receipt"]["pending_call_ids"] == failed.pending_call_ids
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert result.valid_row_count == 0
+    assert_loss_once(forest, [], manifest.records)
+    assert {key for partition, key in forest.plane.rows if partition == "staged"} == {
+        uncertain_key
+    }
+
+
 @pytest.mark.parametrize("response_id", [None, "exporter-local-response"])
 @pytest.mark.parametrize("cumulative", [False, True])
 @pytest.mark.parametrize("unique_output", [False, True])

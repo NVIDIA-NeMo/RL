@@ -15,6 +15,7 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 from nemo_gym.token_id_capture.completion import (
     completion_metadata,
     output_item_fingerprint,
+    output_validation_item,
 )
 from nemo_gym.token_id_capture.lineage import FileLineageStore, InMemoryLineageStore
 from nemo_gym.token_id_capture.staging.records import (
@@ -114,7 +115,7 @@ def call(index: int, items: list[dict], *, parent: int | None = None) -> CallRec
                 for item in items
             ],
             "response_status": "completed",
-            "last_output_item": items[-1],
+            "last_output_item": output_validation_item(items[-1]),
         }
     )
 
@@ -528,7 +529,10 @@ def test_common_validity_preserves_zero_reward_and_combines_masks(
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        ({}, (None, None)),
+        ({}, ("unknown", None)),
+        ({"status": "cancelled"}, ("failed", None)),
+        ({"status": "queued"}, ("unknown", None)),
+        ({"choices": [{"finish_reason": "abort"}]}, ("failed", "abort")),
         ({"status": "completed"}, ("completed", None)),
         ({"choices": [{"finish_reason": "stop"}]}, ("completed", "stop")),
         ({"choices": [{"finish_reason": "length"}]}, ("incomplete", "length")),
