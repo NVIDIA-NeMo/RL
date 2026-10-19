@@ -158,7 +158,7 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Drops partial restored targets; replacement rollouts use subsequent prompts.
     drop_incomplete_targets_on_restore: bool = False
 

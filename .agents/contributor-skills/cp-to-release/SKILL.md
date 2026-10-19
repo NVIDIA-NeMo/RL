@@ -1,7 +1,9 @@
 ---
 name: cp-to-release
 description: Manually cherry-pick a merged NVIDIA-NeMo/RL PR onto the current release branch (r0.X.0) and open a cp PR with matching CI labels and /ok to test.
-when_to_use: 'cp #N to release', 'cp #N to r0.8.0', '/cp-to-release N', backporting a PR that already landed on main into a release branch.
+when_to_use: >-
+  'cp #N to release', 'cp #N to r0.8.0', '/cp-to-release N', backporting a PR that already landed on main
+  into a release branch.
 ---
 
 # cp-to-release
