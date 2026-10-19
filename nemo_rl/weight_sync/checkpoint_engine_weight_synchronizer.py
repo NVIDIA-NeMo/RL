@@ -20,7 +20,7 @@ import ray
 
 from nemo_rl.models.generation.constants import SGLANG_BACKEND
 from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
-from nemo_rl.models.generation.sglang.config import get_sglang_fault_tolerance_config
+from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import (
     WeightSynchronizer,
@@ -97,8 +97,8 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             ) from self._terminal_error
 
     def _use_fault_tolerance(self) -> bool:
-        return get_sglang_fault_tolerance_config(
-            self._generation.sglang_cfg["sglang_cfg"]
+        return SGLangFaultToleranceConfig.model_validate(
+            self._generation.sglang_cfg["sglang_cfg"]["sglang_fault_tolerance_config"]
         ).use_fault_tolerance
 
     def _ensure_ready_and_consume_count(self) -> None:
