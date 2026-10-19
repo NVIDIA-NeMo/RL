@@ -115,7 +115,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
-- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/xtoken-off-policy-distillation.md#csd-common-support-distillation).
+- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/cross-tokenizer-distillation.md#csd-common-support-distillation).
 - ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
@@ -484,11 +484,11 @@ Cross-tokenizer distillation trains a student from a teacher that **does not sha
 1. **[X-Token](#x-token-off-policy-distillation)** projects the student's logits into the teacher's vocabulary through a precomputed (student, teacher) projection matrix. It runs on the DTensor backend.
 2. **[CSD](#csd-common-support-distillation)** (Common-Support Distillation) aligns the two tokenizations into chunks and compares the models only on the token and token-chain events that both tokenizers can express, using bidirectional sub-token tables. It runs on the DTensor or Megatron backend, chosen per model.
 
-Both methods share the off-policy trainer, token alignment, and colocated CUDA IPC teacher transport, and both support multiple teachers, including teachers that share the student's tokenizer. Their reference recipes train on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
+Both methods share the off-policy trainer, token alignment, and colocated CUDA IPC teacher transport, and both support multiple teachers, including teachers that share the student's tokenizer. Their reference recipes train on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset). The [cross-tokenizer distillation guide](docs/guides/cross-tokenizer-distillation.md) covers both methods.
 
 ### X-Token Off-Policy Distillation
 
-X-Token handles the vocabulary mismatch by projecting the student into the teacher's vocabulary. You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
+X-Token handles the vocabulary mismatch by projecting the student into the teacher's vocabulary. You can read about the details of the x-token distillation implementation [here](docs/guides/cross-tokenizer-distillation.md#x-token) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
@@ -546,7 +546,7 @@ sbatch \
 
 ### CSD (Common-Support Distillation)
 
-CSD compares the student and teacher on events that both tokenizers can express — a shared token, or a shared chain of tokens — and keeps the remaining probability mass in a REST category. You can read about the details of the CSD implementation [here](docs/guides/xtoken-off-policy-distillation.md#csd-common-support-distillation), including how the sub-token tables are built and how the loss treats each chunk type.
+CSD compares the student and teacher on events that both tokenizers can express — a shared token, or a shared chain of tokens — and keeps the remaining probability mass in a REST category. You can read about the details of the CSD implementation [here](docs/guides/cross-tokenizer-distillation.md#csd-common-support-distillation), including how the sub-token tables are built and how the loss treats each chunk type.
 
 Before launching a run, build both sub-token tables for your (student, teacher) tokenizer pair and validate them:
 

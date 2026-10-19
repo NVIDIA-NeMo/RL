@@ -171,7 +171,7 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 :::
 
 :::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
-:link: guides/xtoken-off-policy-distillation
+:link: guides/cross-tokenizer-distillation
 :link-type: doc
 
 Off-policy distillation across mismatched tokenizers with X-Token (projection matrix) or CSD (sub-token tables), via CUDA-IPC teacher logits.
@@ -335,7 +335,7 @@ guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
-guides/xtoken-off-policy-distillation.md
+guides/cross-tokenizer-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
