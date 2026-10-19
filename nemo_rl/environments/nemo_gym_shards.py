@@ -501,15 +501,19 @@ def apply_shard_overlay(
 def build_route_shard_map(
     entries_by_shard: Mapping[str, Mapping[str, list[str]]],
     allowed_duplicate_entries: frozenset[str] | set[str] = frozenset(),
+    *,
+    environment_server_routes: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Map each routable entry to its shard, rejecting ambiguous routes.
 
     Takes what each shard reported from ``NemoGym.list_entries()`` and returns
-    ``{route_name: shard_name}``, the lookup the router dispatches on. Legacy
+    ``{route_name: shard_name}``, the lookup the router dispatches on. Flat
     rows route either by ``agent_ref.name`` or by ``task_source``. The
     latter names the agent or resources-server entry that declared the dataset,
-    so both entry types must be included. Native tasksets resolve to an
-    Environment Server entry instead.
+    so both entry types must be included. Materialized task rows resolve to an
+    Environment Server entry selected by ``environment_server_routes`` instead.
+    Environment-only entries not selected by those routes are local to Gym and
+    excluded from both routing and cross-shard duplicate checks.
 
     Two failures are caught here rather than at first dispatch. A routable
     entry hosted by two shards is always an error: rows naming it could go to
@@ -520,6 +524,16 @@ def build_route_shard_map(
 
     Only names are compared. What an entry means is Gym's business.
     """
+    routed_environment_servers = set((environment_server_routes or {}).values())
+    entries_by_shard = {
+        shard_name: {
+            entry: types
+            for entry, types in entries.items()
+            if set(types) != {"environment_servers"}
+            or entry in routed_environment_servers
+        }
+        for shard_name, entries in entries_by_shard.items()
+    }
     route_to_shard: dict[str, str] = {}
     for shard_name, entries in entries_by_shard.items():
         for entry, types in entries.items():

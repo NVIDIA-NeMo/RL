@@ -104,6 +104,11 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -219,9 +224,9 @@ def _count_structured_response_tokens(
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     """Require real agent references for RL metrics and teacher attribution.
 
-    For legacy rows, ``run_examples`` resolves ``task_source`` to ``agent_ref``
-    in place before it returns. Native preparation reads the reference from the
-    selected Environment Server. Unguarded, a row
+    For flat rows, ``run_examples`` resolves ``task_source`` to ``agent_ref``
+    in place before it returns. Materialized task preparation reads the reference
+    from the selected Environment Server. Unguarded, a row
     that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
     inside an ExceptionGroup, forty lines from anything that names the cause.
 
@@ -260,19 +265,20 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     )
 
 
-def _prepare_native_nemo_gym_rows(
+def _prepare_materialized_nemo_gym_rows(
     rows: list[dict],
     global_config: Mapping[str, Any],
     environment_server_routes: Mapping[str, str],
 ) -> None:
-    """Resolve native destinations and the real agent used for RL attribution.
+    """Resolve materialized task destinations, episode IDs, and agent attribution.
 
-    Gym's in-memory collector expects the destination to be stamped on native
-    tasks. It constructs the episode request itself, but deliberately does not
+    Gym's in-memory collector expects the destination on materialized task rows.
+    It constructs the episode request itself, but deliberately does not
     attach the agent reference that RL uses for metrics and teacher selection.
     """
     # Gym is an optional worker dependency, unavailable in the training driver.
     from nemo_gym.episode_types import TaskId
+    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     for row in rows:
         if not is_nemo_gym_task(row):
@@ -302,16 +308,34 @@ def _prepare_native_nemo_gym_rows(
             )
         row["_ng_environment_server"] = server_name
         row["agent_ref"] = dict(agent_ref)
+        if maybe_rollout_id_from_run_body(row) is None:
+            # Sync training and validation carry RL group coordinates instead
+            # of Gym task indices. Include the retry attempt without using
+            # Gym's reserved '-a<N>' suffix.
+            row[_NG_ROLLOUT_ID_BODY_KEY] = (
+                f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{row[NEMO_GYM_ROLLOUT_INDEX_KEY]}"
+                f"-t{row[NEMO_GYM_GROUP_ATTEMPT_KEY]}"
+            )
 
 
 def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
-    """Validate a native episode reply and retain its training result and IDs.
+    """Validate an episode reply and retain its training result and IDs.
 
-    Legacy replies are opaque and must not be unwrapped just because a verifier
-    happens to return a field called ``result``. Handled native failures are
-    exceptions, never scored rollouts.
+    Replies to flat rows and flat compatibility-server replies are opaque and
+    must not be unwrapped just because a verifier returns a field called
+    ``result``. Reported episode failures are exceptions, never scored rollouts.
     """
     if not is_nemo_gym_task(row):
+        return reply
+
+    # Compatibility servers can accept episode requests but return flat results.
+    # Match Gym's collector: the request and response must both use episodes.
+    if not (
+        isinstance(reply, Mapping)
+        and isinstance(reply.get("episode_id"), Mapping)
+        and isinstance(reply.get("task_id"), Mapping)
+        and ("result" in reply or "failure" in reply)
+    ):
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
@@ -321,7 +345,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
     # Environment protocols may extend EpisodeFailure (single_agent_turn adds
     # partial_response). Validate the common contract without rejecting those
     # protocol-specific diagnostics.
-    failure_payload = reply.get("failure") if isinstance(reply, Mapping) else None
+    failure_payload = reply.get("failure")
     envelope = reply
     if isinstance(failure_payload, Mapping):
         envelope = {
@@ -348,7 +372,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
             detail += f" (stage={failure.stage})"
         if failure.terminal:
             raise GymTerminalEpisodeFailure(detail)
-        raise RuntimeError(detail)
+        raise GymTransportError(detail)
 
     result = response.result
     assert result is not None  # BaseEpisodeResponse enforces result XOR failure.
@@ -359,7 +383,7 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         or not math.isfinite(reward)
     ):
         raise RolloutDataFailure(
-            "NeMo-Gym native training results must contain a finite scalar reward"
+            "NeMo-Gym episode training results must contain a finite scalar reward"
         )
     return {
         **result,
@@ -975,6 +999,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_config: Any = None
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
+        self._environment_server_routes: dict[str, str] | None = None
         # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
@@ -1033,6 +1058,7 @@ class NemoGym(EnvironmentInterface):
         scheduled onto reserved nodes) and spun up explicitly once the vLLM
         server URLs are available, overlapping with vLLM model loading.
         """
+        self._environment_server_routes = None
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
@@ -1303,7 +1329,7 @@ Depending on your data shape, you may want to change these values."""
         return entries
 
     def list_environment_server_routes(self) -> dict[str, str]:
-        """Read taskset routes after Gym has merged config files and overlays.
+        """Cache taskset routes from Gym's merged config on first discovery.
 
         Shared maps can name servers hosted by other actors. The driver checks
         destinations against all actors after startup.
@@ -1313,13 +1339,15 @@ Depending on your data shape, you may want to change these values."""
                 "list_environment_server_routes() needs a running Gym stack; "
                 "call _spinup() first."
             )
+        if self._environment_server_routes is not None:
+            return dict(self._environment_server_routes)
 
         # Gym is installed only in the actor's runtime environment.
         from nemo_gym.global_config import get_global_config_dict
 
         routes = get_global_config_dict().get("environment_server_routes")
         if routes is None:
-            return {}
+            routes = {}
         if not isinstance(routes, Mapping) or not all(
             isinstance(taskset, str)
             and taskset
@@ -1331,7 +1359,8 @@ Depending on your data shape, you may want to change these values."""
                 "environment_server_routes must map non-empty taskset names "
                 "to non-empty Environment Server names."
             )
-        return dict(routes)
+        self._environment_server_routes = dict(routes)
+        return dict(self._environment_server_routes)
 
     @accepts_trace_context
     async def run_rollouts(
@@ -1432,7 +1461,7 @@ Depending on your data shape, you may want to change these values."""
             # Only the Gym worker imports Gym or reads its resolved config.
             from nemo_gym.global_config import get_global_config_dict
 
-            _prepare_native_nemo_gym_rows(
+            _prepare_materialized_nemo_gym_rows(
                 nemo_gym_examples,
                 get_global_config_dict(),
                 self.list_environment_server_routes(),
@@ -2653,17 +2682,22 @@ def _build_gym_actor_config(
     )
 
 
+def _get_materialized_taskset(row: Mapping[str, Any]) -> str:
+    taskset = row["task_id"].get("taskset")
+    if not isinstance(taskset, str) or not taskset:
+        raise ValueError(
+            "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
+        )
+    return taskset
+
+
 def get_nemo_gym_route_name(
     row: Mapping[str, Any],
     environment_server_routes: Mapping[str, str] | None = None,
 ) -> str:
-    """Resolve a native taskset or legacy row to its Gym server entry name."""
+    """Resolve a materialized task row or flat row to its Gym server entry name."""
     if is_nemo_gym_task(row):
-        taskset = row["task_id"].get("taskset")
-        if not isinstance(taskset, str) or not taskset:
-            raise ValueError(
-                "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
-            )
+        taskset = _get_materialized_taskset(row)
         if (
             environment_server_routes is None
             or taskset not in environment_server_routes
@@ -2686,7 +2720,7 @@ def get_nemo_gym_route_name(
         return task_source
 
     raise ValueError(
-        "A NeMo-Gym row must contain a native task_id.taskset and task_input, "
+        "A NeMo-Gym row must contain task_id.taskset and task_input, "
         "or a non-empty agent_ref.name or task_source"
     )
 
@@ -2701,9 +2735,9 @@ class NemoGymShardSet:
     Attributes:
         handles: Shard name to its replica handles, in replica order.
         route_to_shard: Agent or task-source entry name to the shard hosting
-            it, including Environment Server entries for native tasksets.
+            it, including Environment Server entries for materialized task rows.
             Empty when unsharded, where every row goes to the only actor.
-        environment_server_routes: Native taskset names to Environment Server
+        environment_server_routes: Taskset names to Environment Server
             names, read from the actors' resolved Gym configuration.
         placement_group: The STRICT_SPREAD group pinning shards to distinct
             nodes, or None when unsharded.
@@ -2781,6 +2815,35 @@ class NemoGymShardSet:
             index = self._next_replica.get(shard_name, 0)
             self._next_replica[shard_name] = (index + 1) % len(replicas)
         return replicas[index]
+
+    def pick_handle_for_group(self, rows: list[dict]) -> Any:
+        """Validate one prompt group's routes and select its Gym actor.
+
+        A bare actor resolves tasksets from its own Gym config. The driver
+        still validates row routing fields and rejects mixed-route groups.
+        """
+        resolve_in_actor = (
+            len(self.all_handles) == 1
+            and not self.environment_server_routes
+            and not self.route_to_shard
+        )
+        routes = {
+            ("taskset", _get_materialized_taskset(row))
+            if resolve_in_actor and is_nemo_gym_task(row)
+            else (
+                "server",
+                get_nemo_gym_route_name(row, self.environment_server_routes),
+            )
+            for row in rows
+        }
+        if len(routes) != 1:
+            raise ValueError(
+                f"NeMo-Gym prompt group mixes routes {sorted(routes)}. "
+                "A group must reference exactly one route."
+            )
+        if resolve_in_actor:
+            return self.sole_handle()
+        return self.pick_handle(next(iter(routes))[1])
 
     def instance_label(self, handle: Any) -> str:
         """Name one actor, for error messages and metric keys.
@@ -2939,7 +3002,7 @@ def _build_single_gym_actor(
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
-    """Start one actor and read its resolved native taskset routes."""
+    """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
         base_urls=base_urls,
@@ -2963,8 +3026,12 @@ def _build_single_gym_actor(
     shard_set = NemoGymShardSet(handles={DEFAULT_SHARD_NAME: [actor]})
     try:
         ray.get(actor._spinup.remote())
-        ray.get(actor.set_tokenizer.remote(tokenizer))
-        routes = ray.get(actor.list_environment_server_routes.remote())
+        _, routes = ray.get(
+            [
+                actor.set_tokenizer.remote(tokenizer),
+                actor.list_environment_server_routes.remote(),
+            ]
+        )
         if routes:
             shard_set.environment_server_routes = build_environment_server_routes(
                 {DEFAULT_SHARD_NAME: routes},
@@ -3175,6 +3242,10 @@ def _discover_shard_routes(
 
     Replicas of a shard are stamped from one merge, so they host identical
     entries and only the first needs to be asked.
+
+    Returns:
+        A pair of mappings: routable Gym entry names to hosting shard names,
+        and taskset names to Environment Server entry names, in that order.
     """
     entries_by_shard = {
         shard.name: ray.get(shard_set.handles[shard.name][0].list_entries.remote())
@@ -3186,9 +3257,16 @@ def _discover_shard_routes(
         )
         for shard in plan.shards
     }
+    environment_server_routes = build_environment_server_routes(
+        routes_by_shard, entries_by_shard
+    )
     return (
-        build_route_shard_map(entries_by_shard, plan.allowed_duplicate_entries),
-        build_environment_server_routes(routes_by_shard, entries_by_shard),
+        build_route_shard_map(
+            entries_by_shard,
+            plan.allowed_duplicate_entries,
+            environment_server_routes=environment_server_routes,
+        ),
+        environment_server_routes,
     )
 
 
@@ -3252,18 +3330,21 @@ def spinup_nemo_gym_actor(
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    *,
+    reject_materialized_tasks: bool = False,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
-    Rows can name a legacy ``agent_ref``, a Gym ``task_source``, or a native
-    ``task_id.taskset`` mapped to an Environment Server.
+    Flat rows name an ``agent_ref`` or ``task_source``. Materialized task rows
+    name a ``task_id.taskset`` mapped to an Environment Server.
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
     A sharded job checks against the route map built at setup. An unsharded
     job has one actor and no route map, so it asks that actor which entries
     its resolved Gym config spawned and keeps the routable ones: agents,
-    resources servers, and environment servers, as the sharded route map does.
+    resources servers, and selected environment servers, as the sharded route
+    map does.
     Model servers are not routes.
 
     Args:
@@ -3271,9 +3352,12 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        reject_materialized_tasks: Set when recovery overrides require the
+            agent or task-source fields that materialized rows do not provide.
 
     Raises:
-        ShardSetupError: A split references routes no shard hosts.
+        ShardSetupError: A split references routes no shard hosts or contains
+            materialized rows incompatible with the configured recovery overrides.
     """
     if shard_set.is_sharded:
         hosted = shard_set.hosted_routes
@@ -3281,11 +3365,18 @@ def validate_dataset_agent_coverage(
         # The same filter the sharded route map applies; with one shard its
         # duplicate checks are vacuous, so only the routable-type rule remains.
         entries = ray.get(shard_set.all_handles[0].list_entries.remote())
-        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
+        hosted = frozenset(
+            build_route_shard_map(
+                {DEFAULT_SHARD_NAME: entries},
+                environment_server_routes=shard_set.environment_server_routes,
+            )
+        )
     for split, dataset in datasets.items():
         try:
             referenced = _iter_dataset_agent_names(
-                dataset, shard_set.environment_server_routes
+                dataset,
+                shard_set.environment_server_routes,
+                reject_materialized_tasks=reject_materialized_tasks,
             )
         except ValueError as error:
             raise ShardSetupError(
@@ -3300,7 +3391,10 @@ def validate_dataset_agent_coverage(
 
 
 def _iter_dataset_agent_names(
-    dataset: Any, environment_server_routes: Mapping[str, str] | None = None
+    dataset: Any,
+    environment_server_routes: Mapping[str, str] | None = None,
+    *,
+    reject_materialized_tasks: bool = False,
 ) -> set[str]:
     """Collect the Gym entry names a dataset's rows reference.
 
@@ -3312,7 +3406,11 @@ def _iter_dataset_agent_names(
     if isinstance(dataset, Mapping):
         return set().union(
             *(
-                _iter_dataset_agent_names(nested, environment_server_routes)
+                _iter_dataset_agent_names(
+                    nested,
+                    environment_server_routes,
+                    reject_materialized_tasks=reject_materialized_tasks,
+                )
                 for nested in dataset.values()
             )
         )
@@ -3325,7 +3423,11 @@ def _iter_dataset_agent_names(
                 if environment_server_routes is not None
                 else ()
             )
-            names = _load_agent_names_from_source(source, routes_cache_key)
+            names = _load_agent_names_from_source(
+                source,
+                routes_cache_key,
+                reject_materialized_tasks=reject_materialized_tasks,
+            )
             if names is None:
                 break
             source_agent_names.update(names)
@@ -3340,7 +3442,11 @@ def _iter_dataset_agent_names(
         extra_env_info = row.get("extra_env_info") if hasattr(row, "get") else None
         if isinstance(extra_env_info, str):
             extra_env_info = json.loads(extra_env_info)
-        agent_name = _get_agent_name(extra_env_info, environment_server_routes)
+        agent_name = _get_agent_name(
+            extra_env_info,
+            environment_server_routes,
+            reject_materialized_tasks=reject_materialized_tasks,
+        )
         if agent_name is not None:
             names.add(agent_name)
     return names
@@ -3350,8 +3456,10 @@ def _iter_dataset_agent_names(
 def _load_agent_names_from_source(
     source: NemoGymSourceIdentity,
     environment_server_routes: tuple[tuple[str, str], ...] = (),
+    *,
+    reject_materialized_tasks: bool = False,
 ) -> frozenset[str] | None:
-    """Read a stable Gym source once per controller process and route mapping."""
+    """Read a stable Gym source once per route mapping and validation mode."""
     try:
         source_stat = os.stat(source.path)
         if not source.matches(source_stat):
@@ -3361,7 +3469,11 @@ def _load_agent_names_from_source(
         routes = dict(environment_server_routes)
         with open(source.path) as source_file:
             for raw_row in source_file:
-                agent_name = _get_agent_name(json.loads(raw_row), routes)
+                agent_name = _get_agent_name(
+                    json.loads(raw_row),
+                    routes,
+                    reject_materialized_tasks=reject_materialized_tasks,
+                )
                 if agent_name is not None:
                     names.add(agent_name)
 
@@ -3374,11 +3486,22 @@ def _load_agent_names_from_source(
 
 
 def _get_agent_name(
-    row: object, environment_server_routes: Mapping[str, str] | None = None
+    row: object,
+    environment_server_routes: Mapping[str, str] | None = None,
+    *,
+    reject_materialized_tasks: bool = False,
 ) -> str | None:
     if not isinstance(row, dict):
         return None
     if is_nemo_gym_task(row):
+        if reject_materialized_tasks:
+            raise ValueError(
+                "Materialized NeMo-Gym task rows do not support "
+                "rollout_recovery.agent_granularity_overrides or "
+                "rollout_recovery.task_source_granularity_overrides. "
+                "Remove these overrides and use rollout_recovery.default_granularity, "
+                "or use flat rows with agent_ref/task_source."
+            )
         return get_nemo_gym_route_name(row, environment_server_routes)
     agent_ref = row.get("agent_ref")
     if isinstance(agent_ref, dict) and agent_ref.get("name"):

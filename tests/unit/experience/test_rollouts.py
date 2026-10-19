@@ -115,10 +115,12 @@ def _initial_gym_image_batch() -> BatchedDataDict:
     )
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch, native):
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_attach_initial_nemo_gym_image_payloads_attaches_once(
+    monkeypatch, materialized
+):
     batch = _initial_gym_image_batch()
-    if native:
+    if materialized:
         batch["extra_env_info"][0] = {
             "task_id": {"taskset": "vision:train", "task_id": "image-1"},
             "task_input": batch["extra_env_info"][0],
@@ -2384,7 +2386,9 @@ def test_postprocess_nemo_gym_group_returns_task_index(
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
-@pytest.mark.parametrize("row_format", ["legacy", "flat_native", "canonical_native"])
+@pytest.mark.parametrize(
+    "row_format", ["flat", "materialized_flat_metadata", "materialized_task_data"]
+)
 def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
     log_full_result_tables: bool, row_format: str
 ) -> None:
@@ -2400,12 +2404,12 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
             "profiled_output_lengths": [2, 2],
             "profile_band": {"total": {"a": 2, "b": 6, "f": 0.5}},
         }
-        if row_format == "canonical_native":
+        if row_format == "materialized_task_data":
             task_input["task_data"] = profile_metadata
         else:
             task_input.update(profile_metadata)
         row = {"agent_ref": {"name": "agent"}, "_ng_task_index": 42}
-        if row_format == "legacy":
+        if row_format == "flat":
             row.update(task_input)
         else:
             row["task_id"] = {"taskset": "math:train", "task_id": "first"}
@@ -3023,8 +3027,8 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
 
 
-def test_prepare_nemo_gym_rows_updates_mixed_native_and_legacy_inputs():
-    native = {
+def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
+    materialized_row = {
         "task_id": {"taskset": "workplace:train", "task_id": "17"},
         "task_input": {
             "responses_create_params": {
@@ -3036,8 +3040,8 @@ def test_prepare_nemo_gym_rows_updates_mixed_native_and_legacy_inputs():
         },
     }
     rows = [
-        {"agent_ref": {"name": "legacy"}, "responses_create_params": {}},
-        native,
+        {"agent_ref": {"name": "flat_row_agent"}, "responses_create_params": {}},
+        materialized_row,
     ]
     rollouts_mod._prepare_nemo_gym_rows(
         rows,
@@ -3046,12 +3050,15 @@ def test_prepare_nemo_gym_rows_updates_mixed_native_and_legacy_inputs():
         num_generations=1,
     )
 
-    assert native["task_id"] == {"taskset": "workplace:train", "task_id": "17"}
-    assert native["task_input"]["task_data"] == {"state": ["meeting-1"]}
-    assert "responses_create_params" not in native
-    native_params = native["task_input"]["responses_create_params"]
-    assert native_params["metadata"] == {"extra_body": '{"seed": 8}'}
-    for params in (rows[0]["responses_create_params"], native_params):
+    assert materialized_row["task_id"] == {
+        "taskset": "workplace:train",
+        "task_id": "17",
+    }
+    assert materialized_row["task_input"]["task_data"] == {"state": ["meeting-1"]}
+    assert "responses_create_params" not in materialized_row
+    materialized_params = materialized_row["task_input"]["responses_create_params"]
+    assert materialized_params["metadata"] == {"extra_body": '{"seed": 8}'}
+    for params in (rows[0]["responses_create_params"], materialized_params):
         assert params["temperature"] == 0.7
         assert params["top_p"] == 0.9
         assert params["max_output_tokens"] == 64

@@ -21,11 +21,12 @@ from omegaconf import OmegaConf
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     _normalize_nemo_gym_episode_result,
-    _prepare_native_nemo_gym_rows,
+    _prepare_materialized_nemo_gym_rows,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
     GymTerminalEpisodeFailure,
+    GymTransportError,
     RolloutDataFailure,
     classify_rollout_failure,
 )
@@ -75,7 +76,7 @@ def _config():
 
 
 def _prepare(rows):
-    _prepare_native_nemo_gym_rows(
+    _prepare_materialized_nemo_gym_rows(
         rows, _config(), {"weather:train": "weather_environment"}
     )
 
@@ -98,7 +99,7 @@ def _reply(row: dict) -> dict:
     }
 
 
-def test_native_preparation_preserves_payload_and_resolves_actual_agent():
+def test_materialized_task_preparation_preserves_payload_and_resolves_actual_agent():
     row = _row()
     original_payload = deepcopy(row["task_input"])
     row["agent_ref"] = {"name": "stale_dataset_agent"}
@@ -112,21 +113,11 @@ def test_native_preparation_preserves_payload_and_resolves_actual_agent():
     assert "responses_create_params" not in row
 
 
-def test_native_preparation_does_not_create_episode_identity():
-    row = _row()
-    del row["_ng_rollout_id"]
-    row["_ng_group_attempt"] = 2
-    original = deepcopy(row)
-    _prepare([row])
-    assert row == {
-        **original,
-        "_ng_environment_server": "weather_environment",
-        "agent_ref": {"type": "responses_api_agents", "name": "weather_agent"},
+def test_flat_row_preparation_and_result_are_opaque():
+    row = {
+        "agent_ref": {"name": "flat_row_agent"},
+        "responses_create_params": {"input": "hi"},
     }
-
-
-def test_legacy_preparation_and_result_are_opaque():
-    row = {"agent_ref": {"name": "legacy"}, "responses_create_params": {"input": "hi"}}
     original = deepcopy(row)
     _prepare([row])
     reply = {"result": {"benchmark_specific": True}, "reward": 1}
@@ -134,22 +125,39 @@ def test_legacy_preparation_and_result_are_opaque():
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
-def test_native_preparation_rejects_bad_destination_and_agent_reference():
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"reward": 0.75, "result": {"benchmark_specific": True}},
+        {
+            "_ng_failure_class": "environment_server_failed",
+            "_ng_failure_terminal": True,
+            "_ng_failure_message": "verification failed",
+        },
+    ],
+)
+def test_materialized_task_keeps_flat_compatibility_results_opaque(reply: dict) -> None:
+    row = _row()
+    _prepare([row])
+    assert _normalize_nemo_gym_episode_result(row, reply) is reply
+
+
+def test_materialized_task_preparation_rejects_bad_destination_and_agent_reference():
     with pytest.raises(ValueError, match="No environment server route"):
-        _prepare_native_nemo_gym_rows([_row()], _config(), {})
+        _prepare_materialized_nemo_gym_rows([_row()], _config(), {})
     with pytest.raises(ValueError, match="exactly one Environment Server"):
-        _prepare_native_nemo_gym_rows(
+        _prepare_materialized_nemo_gym_rows(
             [_row()], _config(), {"weather:train": "weather_agent"}
         )
     config = _config()
     del config.weather_environment.environment_servers.single_agent_turn.agent_server
     with pytest.raises(ValueError, match="agent_server reference"):
-        _prepare_native_nemo_gym_rows(
+        _prepare_materialized_nemo_gym_rows(
             [_row()], config, {"weather:train": "weather_environment"}
         )
 
 
-def test_native_success_retains_reward_components_observations_and_identity():
+def test_episode_success_retains_reward_components_observations_and_identity():
     row = _row()
     _prepare([row])
     reply = _reply(row)
@@ -164,7 +172,7 @@ def test_native_success_retains_reward_components_observations_and_identity():
 
 
 @pytest.mark.parametrize("key", ["task_id", "episode_id"])
-def test_native_reply_identity_must_match_request(key):
+def test_episode_reply_identity_must_match_request(key):
     row = _row()
     _prepare([row])
     reply = _reply(row)
@@ -177,10 +185,15 @@ def test_native_reply_identity_must_match_request(key):
 
 
 @pytest.mark.parametrize(
-    "terminal,error_type",
-    [(True, GymTerminalEpisodeFailure), (False, RuntimeError)],
+    "terminal,error_type,failure_class",
+    [
+        (True, GymTerminalEpisodeFailure, FailureClass.DATA),
+        (False, GymTransportError, FailureClass.INFRA),
+    ],
 )
-def test_handled_native_failure_is_never_a_scored_result(terminal, error_type):
+def test_handled_episode_failure_is_never_a_scored_result(
+    terminal, error_type, failure_class
+):
     row = _row()
     _prepare([row])
     reply = _reply(row)
@@ -195,11 +208,11 @@ def test_handled_native_failure_is_never_a_scored_result(terminal, error_type):
         error_type, match="verification failed.*stage=verification"
     ) as error:
         _normalize_nemo_gym_episode_result(row, reply)
-    assert classify_rollout_failure(error.value) is FailureClass.DATA
+    assert classify_rollout_failure(error.value) is failure_class
 
 
 @pytest.mark.parametrize("reward", [None, "1.0", True, float("nan"), float("inf")])
-def test_native_training_requires_a_finite_scalar_reward(reward):
+def test_episode_training_requires_a_finite_scalar_reward(reward):
     row = _row()
     _prepare([row])
     reply = _reply(row)
@@ -209,12 +222,13 @@ def test_native_training_requires_a_finite_scalar_reward(reward):
 
 
 @pytest.mark.parametrize("attempt,capture_key", [(0, "17-0"), (2, "17-0-a2")])
-def test_native_receipt_uses_fallback_identity_without_response(attempt, capture_key):
+def test_episode_receipt_uses_fallback_identity_without_response(attempt, capture_key):
     row = _row()
     row["_ng_attempt_index"] = attempt
     del row["_ng_rollout_id"]
     row["_ng_task_index"] = 17
     _prepare([row])
+    assert "_ng_rollout_id" not in row
     reply = _reply(row)
     reply["episode_id"] = {"rollout_id": "17-0", "attempt": attempt}
     del reply["result"]["response"]

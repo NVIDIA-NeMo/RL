@@ -2024,6 +2024,10 @@ def setup_single_controller(
                 validate_dataset_agent_coverage(
                     nemo_gym_shards,
                     {"training": dataset, "validation": _val_dataset},
+                    reject_materialized_tasks=bool(
+                        master_config.rollout_recovery.agent_granularity_overrides
+                        or master_config.rollout_recovery.task_source_granularity_overrides
+                    ),
                 )
                 env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time

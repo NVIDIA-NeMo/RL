@@ -63,7 +63,6 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
-    get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
 from nemo_rl.environments.nemo_gym_task import (
@@ -2495,41 +2494,10 @@ def _bucket_nemo_gym_rows_by_instance(
     """
     if not rows:
         return []
-    if (
-        len(shard_set.all_handles) == 1
-        and not shard_set.environment_server_routes
-        and not shard_set.route_to_shard
-    ):
-        # A bare actor validates native taskset routes from its own Gym config.
-        # Still reject groups mixing tasksets or legacy routes before dispatch.
-        for start in range(0, len(rows), num_generations):
-            identities = {
-                ("taskset", row["task_id"]["taskset"])
-                if is_nemo_gym_task(row)
-                else ("legacy", get_nemo_gym_route_name(row))
-                for row in rows[start : start + num_generations]
-            }
-            if len(identities) != 1:
-                raise ValueError(
-                    f"NeMo-Gym prompt group at row {start} mixes routes "
-                    f"{sorted(identities)}. A group must reference exactly one route."
-                )
-        handle = shard_set.sole_handle()
-        return [(shard_set.instance_label(handle), handle, rows)]
-
     buckets: dict[int, tuple[str, Any, list[dict]]] = {}
     for start in range(0, len(rows), num_generations):
         group = rows[start : start + num_generations]
-        route_names = {
-            get_nemo_gym_route_name(row, shard_set.environment_server_routes)
-            for row in group
-        }
-        if len(route_names) != 1:
-            raise ValueError(
-                f"NeMo-Gym prompt group at row {start} mixes routes "
-                f"{sorted(route_names)}. A group must reference exactly one route."
-            )
-        handle = shard_set.pick_handle(next(iter(route_names)))
+        handle = shard_set.pick_handle_for_group(group)
         if id(handle) not in buckets:
             buckets[id(handle)] = (shard_set.instance_label(handle), handle, [])
         buckets[id(handle)][2].extend(group)

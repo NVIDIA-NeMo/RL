@@ -24,6 +24,7 @@ import sys
 import types
 import warnings
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -571,7 +572,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     ):
         mock_cls.options.return_value.remote.return_value = actor
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
-        mock_ray.get.return_value = {}
+        mock_ray.get.side_effect = [None, [None, {}]]
 
         result = build_nemo_gym_actors(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
@@ -604,26 +605,33 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     # wrapper once dropped it without any type or test catching it.
     assert cfg["token_capture"] == token_capture
 
-    # Spinup is deferred from __init__, so the factory must await it. The
-    # tokenizer install has to follow it, not race it.
+    # Wait for spinup before submitting tokenizer installation and route
+    # retrieval together.
     actor._spinup.remote.assert_called_once_with()
     actor.set_tokenizer.remote.assert_called_once_with(_TOKENIZER)
     assert mock_ray.get.call_args_list == [
         call("spinup-ref"),
-        call(actor.set_tokenizer.remote.return_value),
-        call(actor.list_environment_server_routes.remote.return_value),
+        call(
+            [
+                actor.set_tokenizer.remote.return_value,
+                actor.list_environment_server_routes.remote.return_value,
+            ]
+        ),
     ]
 
 
-@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref"])
+@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref", "routes-ref"])
 def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
     detected_uv_dirs, failed_ref
 ):
     actor = MagicMock()
     actor._spinup.remote.return_value = "spinup-ref"
     actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    actor.list_environment_server_routes.remote.return_value = "routes-ref"
 
     def get_or_fail(ref, **_kwargs):
+        if isinstance(ref, list):
+            return [get_or_fail(item, **_kwargs) for item in ref]
         if ref == failed_ref:
             raise RuntimeError("startup failed")
         return None
@@ -735,11 +743,11 @@ def _stub_gym_resolved_config(resolved):
     """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
-    module.get_global_config_dict = lambda: resolved
+    module.get_global_config_dict = MagicMock(return_value=resolved)
     with patch.dict(
         sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
     ):
-        yield
+        yield module.get_global_config_dict
 
 
 def _spun_up_actor():
@@ -821,18 +829,28 @@ def test_list_entries_before_spinup_raises():
         actor.list_entries()
 
 
-def test_list_environment_server_routes_reads_the_resolved_gym_config():
-    resolved = DictConfig(
-        {"environment_server_routes": {"workplace:train": "workplace_environment"}}
-    )
-    with _stub_gym_resolved_config(resolved):
-        assert _spun_up_actor().list_environment_server_routes() == {
-            "workplace:train": "workplace_environment"
-        }
+@pytest.mark.parametrize(
+    "routes", [None, {}, {"workplace:train": "workplace_environment"}]
+)
+def test_list_environment_server_routes_caches_the_resolved_gym_config(routes):
+    resolved = DictConfig({"environment_server_routes": routes})
+    with _stub_gym_resolved_config(resolved) as get_config:
+        actor = _spun_up_actor()
+        first_routes = actor.list_environment_server_routes()
+        assert first_routes == (routes or {})
+
+        # Discovery callers must not mutate the map used by later rollouts.
+        first_routes["extra:train"] = "other_environment"
+        assert actor.list_environment_server_routes() == (routes or {})
+        get_config.assert_called_once_with()
+
+        actor.shutdown()
+        with pytest.raises(RuntimeError, match="call _spinup"):
+            actor.list_environment_server_routes()
 
 
 @pytest.mark.parametrize(
-    "routes", [["native"], {"tasks": ""}, {"": "native"}, {"tasks": 3}]
+    "routes", [["environment"], {"tasks": ""}, {"": "environment"}, {"tasks": 3}]
 )
 def test_list_environment_server_routes_rejects_malformed_routes(routes):
     with _stub_gym_resolved_config(DictConfig({"environment_server_routes": routes})):
@@ -962,6 +980,8 @@ class _FakeGymCluster:
 
     def ray_get(self, reference, timeout=None):
         self.ray_get_calls.append((reference, timeout))
+        if isinstance(reference, list):
+            return [self.ray_get(item, timeout=timeout) for item in reference]
         if reference == "pg-ready":
             if self.pg_ready_error is not None:
                 raise self.pg_ready_error
@@ -1099,13 +1119,17 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
 
 
 @pytest.mark.parametrize("sharded", [False, True])
-def test_actor_factory_reads_native_routes_from_resolved_configs(
+def test_actor_factory_reads_environment_server_routes_from_resolved_configs(
     detected_uv_dirs, sharded
 ):
     routes = {"workplace:train": "workplace_environment"}
     cluster = _FakeGymCluster(
         entries_by_index={
-            0: {"workplace_environment": ["environment_servers"]},
+            0: {
+                "workplace_environment": ["environment_servers"],
+                "unused_environment": ["environment_servers"],
+            },
+            1: {"unused_environment": ["environment_servers"]},
         },
         environment_routes_by_index={0: routes},
     )
@@ -1120,16 +1144,24 @@ def test_actor_factory_reads_native_routes_from_resolved_configs(
             enable_router_replay=False,
             use_fastokens=False,
         )
+        row = {
+            "task_id": {"taskset": "workplace:train", "task_id": "1"},
+            "task_input": {},
+        }
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"train": [{"extra_env_info": json.dumps(row)}]}
+        )
 
     assert shard_set.environment_server_routes == routes
+    if sharded:
+        assert shard_set.route_to_shard == {"workplace_environment": "judged"}
     route_name = nemo_gym_mod.get_nemo_gym_route_name(
-        {"task_id": {"taskset": "workplace:train", "task_id": "1"}, "task_input": {}},
-        shard_set.environment_server_routes,
+        row, shard_set.environment_server_routes
     )
     assert shard_set.pick_handle(route_name) is cluster.actors[0]
 
 
-def test_actor_factory_cleans_up_when_native_route_target_is_not_an_environment(
+def test_actor_factory_cleans_up_when_environment_server_route_target_is_not_an_environment(
     detected_uv_dirs,
 ):
     cluster = _FakeGymCluster(
@@ -1536,7 +1568,7 @@ def _sharded_set(route_to_shard):
     )
 
 
-def test_native_taskset_routing_takes_precedence_over_agent_ref():
+def test_materialized_taskset_routing_takes_precedence_over_agent_ref():
     row = {
         "task_id": {"taskset": "workplace:train", "task_id": "1"},
         "task_input": {},
@@ -1551,7 +1583,7 @@ def test_native_taskset_routing_takes_precedence_over_agent_ref():
     )
 
 
-def test_native_taskset_without_route_fails_even_if_agent_ref_is_present():
+def test_materialized_taskset_without_route_fails_even_if_agent_ref_is_present():
     with pytest.raises(
         ValueError, match="No environment server route.*workplace:train"
     ):
@@ -1567,16 +1599,20 @@ def test_native_taskset_without_route_fails_even_if_agent_ref_is_present():
 @pytest.mark.parametrize(
     "task_id", [{}, {"taskset": ""}, {"taskset": ["workplace:train"]}]
 )
-def test_malformed_taskset_does_not_fall_back_to_legacy_agent(task_id):
+def test_malformed_taskset_does_not_fall_back_to_agent_ref(task_id):
     with pytest.raises(ValueError, match="non-empty task_id.taskset"):
         nemo_gym_mod.get_nemo_gym_route_name(
-            {"task_id": task_id, "task_input": {}, "agent_ref": {"name": "legacy"}},
+            {
+                "task_id": task_id,
+                "task_input": {},
+                "agent_ref": {"name": "fallback_agent"},
+            },
             {"workplace:train": "workplace_environment"},
         )
 
 
 @pytest.mark.parametrize("cached_source", [False, True])
-def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
+def test_materialized_dataset_coverage_resolves_tasksets_before_matching_shards(
     tmp_path, cached_source
 ):
     raw_row = {
@@ -1585,7 +1621,7 @@ def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
     }
     rows = [{"extra_env_info": json.dumps(raw_row)}]
     if cached_source:
-        source_path = tmp_path / "native.jsonl"
+        source_path = tmp_path / "materialized_tasks.jsonl"
         source_path.write_text(json.dumps(raw_row) + "\n")
         source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
             str(source_path), source_path.stat()
@@ -1608,6 +1644,89 @@ def test_native_dataset_coverage_resolves_tasksets_before_matching_shards(
         nemo_gym_mod.ShardSetupError, match="train.*No environment server route"
     ):
         nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+
+def test_materialized_rows_reject_recovery_overrides_in_nested_mixed_dataset() -> None:
+    shard_set = _sharded_set({"alpha": "left", "workplace_environment": "tools"})
+    shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
+    rows = [
+        *_gym_dataset("alpha"),
+        {
+            "extra_env_info": json.dumps(
+                {
+                    "task_id": {"taskset": "workplace:train", "task_id": "1"},
+                    "task_input": {},
+                }
+            )
+        },
+    ]
+    datasets = {
+        "train": _gym_dataset("alpha"),
+        "validation": {"mixed": SimpleNamespace(dataset=rows)},
+    }
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, datasets, reject_materialized_tasks=True
+        )
+
+    message = str(excinfo.value)
+    assert "validation" in message
+    assert "agent_granularity_overrides" in message
+    assert "task_source_granularity_overrides" in message
+    assert "default_granularity" in message
+
+
+@pytest.mark.parametrize("changed_source", [False, True])
+def test_materialized_recovery_guard_checks_cached_sources_and_loaded_fallback(
+    tmp_path: Path, changed_source: bool
+) -> None:
+    raw_row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "1"},
+        "task_input": {},
+    }
+    source_path = tmp_path / "materialized_tasks.jsonl"
+    source_path.write_text(json.dumps(raw_row) + "\n")
+    source = nemo_gym_mod.NemoGymSourceIdentity.from_stat(
+        str(source_path), source_path.stat()
+    )
+    # A stable source must be checked even if the loaded rows aren't traversed.
+    loaded_rows = (
+        [{"extra_env_info": json.dumps(raw_row)}] if changed_source else MagicMock()
+    )
+    dataset = SimpleNamespace(
+        dataset=loaded_rows, agent_name_sources=frozenset({source})
+    )
+    shard_set = _sharded_set({"workplace_environment": "tools"})
+    shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+
+    if changed_source:
+        source_path.write_text(
+            json.dumps({"agent_ref": {"name": "workplace_environment"}}) + "\n"
+        )
+
+    with pytest.raises(
+        nemo_gym_mod.ShardSetupError, match="validation.*agent_granularity_overrides"
+    ):
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, {"validation": dataset}, reject_materialized_tasks=True
+        )
+    if not changed_source:
+        loaded_rows.__iter__.assert_not_called()
+
+
+def test_flat_rows_still_allow_recovery_overrides() -> None:
+    rows = [
+        *_gym_dataset("alpha"),
+        {"extra_env_info": json.dumps({"task_source": "math_tools"})},
+    ]
+
+    nemo_gym_mod.validate_dataset_agent_coverage(
+        _sharded_set({"alpha": "left", "math_tools": "right"}),
+        {"train": rows},
+        reject_materialized_tasks=True,
+    )
 
 
 def test_an_agent_no_shard_hosts_is_caught_before_the_first_step():
