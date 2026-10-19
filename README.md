@@ -115,7 +115,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
-- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/cross-tokenizer-distillation.md).
+- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/csd-cross-tokenizer-distillation.md).
 - ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
@@ -152,7 +152,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
+    |[Cross-Tokenizer Distillation](#cross-tokenizer-distillation)|[X-Token Single Node](#x-token-off-policy-distillation-single-node), [CSD Single Node](#csd-single-node)|[X-Token Multi-node](#x-token-off-policy-distillation-multi-node), [CSD Multi-node](#csd-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -426,12 +426,13 @@ uv run python examples/run_grpo_sliding_puzzle.py
 
 ## Distillation
 
-NeMo RL supports two distillation recipes:
+NeMo RL supports three distillation recipes:
 
 | Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
 |---|---|---|---|---|---|---|
 | MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
 | xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor |
+| CSD | Yes | No (sync) | Off-policy | Common-support top-K (JSD) | Same or different | DTensor or Megatron |
 
 ## On-policy Distillation
 
@@ -476,13 +477,18 @@ sbatch \
 > [!NOTE]
 > For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
-## X-Token Off-Policy Distillation
+## Cross-Tokenizer Distillation
 
-For an overview of X-Token and CSD, including CSD sub-token table preparation and training, see the [cross-tokenizer distillation guide](docs/guides/cross-tokenizer-distillation.md).
+Cross-tokenizer distillation trains a student from a teacher that **does not share its tokenizer** — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The two models split the same text into different tokens, so their next-token distributions cover different vocabularies and cannot be compared directly. NeMo RL supports two off-policy methods that bridge this gap:
 
-We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
+1. **[X-Token](#x-token-off-policy-distillation)** projects the student's logits into the teacher's vocabulary through a precomputed (student, teacher) projection matrix. It runs on the DTensor backend.
+2. **[CSD](#csd-common-support-distillation)** (Common-Support Distillation) aligns the two tokenizations into chunks and compares the models only on the token and token-chain events that both tokenizers can express, using bidirectional sub-token tables. It runs on the DTensor or Megatron backend, chosen per model.
 
-You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
+Both methods share the off-policy trainer, token alignment, and colocated CUDA IPC teacher transport, and both support multiple teachers, including teachers that share the student's tokenizer. Their reference recipes train on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
+
+### X-Token Off-Policy Distillation
+
+X-Token handles the vocabulary mismatch by projecting the student into the teacher's vocabulary. You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
@@ -497,7 +503,7 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 > [!NOTE]
 > X-token distillation runs on the DTensor backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
 
-### X-Token Off-Policy Distillation Single Node
+#### X-Token Off-Policy Distillation Single Node
 
 To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
 
@@ -516,7 +522,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
   cluster.gpus_per_node=8
 ```
 
-### X-Token Off-Policy Distillation Multi-node
+#### X-Token Off-Policy Distillation Multi-node
 
 ```sh
 # Run from the root of NeMo RL repo
@@ -537,6 +543,71 @@ sbatch \
 
 > [!NOTE]
 > For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
+### CSD (Common-Support Distillation)
+
+CSD compares the student and teacher on events that both tokenizers can express — a shared token, or a shared chain of tokens — and keeps the remaining probability mass in a REST category. You can read about the details of the CSD implementation [here](docs/guides/csd-cross-tokenizer-distillation.md), including how the sub-token tables are built and how the loss treats each chunk type.
+
+Before launching a run, build both sub-token tables for your (student, teacher) tokenizer pair and validate them:
+
+```sh
+uv run python -m tools.csd.build_subtoks_table \
+  --source-tokenizer meta-llama/Llama-3.2-1B \
+  --destination-tokenizer Qwen/Qwen3-4B \
+  --output cross_tokenizer_data/csd/student_to_teacher.pt
+
+uv run python -m tools.csd.build_subtoks_table \
+  --source-tokenizer Qwen/Qwen3-4B \
+  --destination-tokenizer meta-llama/Llama-3.2-1B \
+  --output cross_tokenizer_data/csd/teacher_to_student.pt
+
+uv run python -m tools.csd.validate_subtoks_tables \
+  --student-tokenizer meta-llama/Llama-3.2-1B \
+  --teacher-tokenizer Qwen/Qwen3-4B \
+  --student-to-teacher cross_tokenizer_data/csd/student_to_teacher.pt \
+  --teacher-to-student cross_tokenizer_data/csd/teacher_to_student.pt
+```
+
+> [!NOTE]
+> Each CSD model runs on the DTensor or Megatron backend (the exemplar uses Megatron for both), and the student and teachers must be colocated on the same node (teacher logits travel via CUDA IPC).
+
+#### CSD Single Node
+
+To run CSD on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
+
+```sh
+uv run python examples/run_csd.py
+```
+
+By default, this uses the configuration in `examples/configs/csd.yaml`, whose table paths point at the files built above. Tables stored elsewhere are passed per teacher (`teachers.0.aligner.student_to_teacher_table_path=...` and `teachers.0.aligner.teacher_to_student_table_path=...`). You can customize other parameters with command-line overrides. For example, to send dense teacher logits instead of the default top-128 and train for 100 steps:
+
+```sh
+uv run python examples/run_csd.py \
+  loss_fn.teacher_topk_ipc_k=0 \
+  distillation.max_num_steps=100
+```
+
+#### CSD Multi-node
+
+```sh
+# Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_csd.py --config examples/configs/csd.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/csd_2nodes' logger.wandb_enabled=True logger.wandb.name='csd-2nodes'" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
+```
+
+> [!NOTE]
+> On more than one node, every teacher must use the student's data-parallel size and tensor × context × pipeline parallel group size, with each group inside one node. For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
 ## Supervised Fine-Tuning (SFT)
 
