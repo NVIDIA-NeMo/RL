@@ -2302,6 +2302,21 @@ def test_ppo_setup_warm_start_takes_weights_but_not_the_seeds_optimizer(
     assert value_kwargs["optimizer_path"] is None
 
 
+def test_ppo_setup_starts_the_policy_from_the_pretrained_checkpoint(monkeypatch):
+    """The Megatron worker reads only policy.pretrained_checkpoint, so without the
+    copy the policy would silently start from the Hugging Face weights."""
+    pretrained = {"path": "/ckpt/sft", "format": "megatron_bridge"}
+    config = _make_noncolocated_setup_config()
+    config.policy["automodel_cfg"]["enabled"] = False
+    config.policy["megatron_cfg"]["enabled"] = True
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+
+    *_, policy_factory, _, _, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    policy_config = policy_factory.call_args.kwargs["config"]
+    assert policy_config["pretrained_checkpoint"] == pretrained
+
+
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     """The default colocated setup remains unchanged by the cluster split."""
     config = _make_noncolocated_setup_config()

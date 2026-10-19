@@ -344,6 +344,22 @@ def test_setup_injects_vocab_sizes_into_loss_config():
     assert cfg.loss_fn == original_loss_cfg
 
 
+def test_setup_forwards_pretrained_checkpoint_to_the_student_only():
+    pretrained = {"path": "/ckpt/student", "format": "megatron_bridge"}
+    cfg = _make_master_config()
+    cfg.checkpointing["pretrained_checkpoint"] = pretrained
+
+    _, mocks = _patched_setup_call(cfg)
+
+    policy_configs = {
+        call.kwargs["name_prefix"]: call.kwargs["config"]
+        for call in mocks["policy"].call_args_list
+    }
+    assert policy_configs["student"]["pretrained_checkpoint"] == pretrained
+    # The student's checkpoint must not leak into a teacher.
+    assert "pretrained_checkpoint" not in policy_configs["teacher_0"]
+
+
 @pytest.mark.parametrize(
     "val_dataset, val_period, val_at_start, val_at_end, expect_loader",
     [

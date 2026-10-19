@@ -25,7 +25,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss import PreferenceLossFn
-from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
+from nemo_rl.algorithms.utils import (
+    forward_pretrained_checkpoint,
+    maybe_pad_last_batch,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -171,9 +175,9 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+    forward_pretrained_checkpoint(
+        checkpointing_config=checkpointing_config, policy_config=policy_config
+    )
 
     # ==========================
     #         Logger

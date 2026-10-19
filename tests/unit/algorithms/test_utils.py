@@ -28,6 +28,7 @@ from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    forward_pretrained_checkpoint,
     get_tokenizer,
     maybe_pad_last_batch,
     print_efficiency_summary,
@@ -241,6 +242,45 @@ def test_deepseek_v4_renderer_matches_single_turn_chat_format():
     assert (
         prompt == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
     )
+
+
+def test_forward_pretrained_checkpoint_copies_it_onto_the_policy_config():
+    pretrained = {"path": "/ckpt/sft", "format": "megatron_bridge"}
+    policy_config = {"model_name": "fake-model"}
+
+    forward_pretrained_checkpoint(
+        checkpointing_config={"pretrained_checkpoint": pretrained},
+        policy_config=policy_config,
+    )
+
+    assert policy_config == {
+        "model_name": "fake-model",
+        "pretrained_checkpoint": pretrained,
+    }
+
+
+@pytest.mark.parametrize("checkpointing_config", [{}, {"pretrained_checkpoint": None}])
+@pytest.mark.parametrize(
+    "policy_config",
+    [
+        {"model_name": "fake-model"},
+        {
+            "model_name": "fake-model",
+            "pretrained_checkpoint": {"path": "/ckpt/policy", "format": "megatron_lm"},
+        },
+    ],
+)
+def test_forward_pretrained_checkpoint_without_one_leaves_the_policy_config_alone(
+    checkpointing_config, policy_config
+):
+    """An unset or null entry neither adds the key nor clears a policy-level one."""
+    expected = dict(policy_config)
+
+    forward_pretrained_checkpoint(
+        checkpointing_config=checkpointing_config, policy_config=policy_config
+    )
+
+    assert policy_config == expected
 
 
 def test_maybe_pad_last_batch():

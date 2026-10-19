@@ -330,6 +330,20 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
         )
 
 
+def test_setup_forwards_pretrained_checkpoint_to_the_policy() -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    pretrained = {"path": "/ckpt/sft", "format": "megatron_bridge"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+
+    # Stop at the first validation error; the copy happens before it.
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+
+    assert config.policy["pretrained_checkpoint"] == pretrained
+
+
 @pytest.mark.parametrize(
     (
         "sequence_overrides",

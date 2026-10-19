@@ -31,7 +31,7 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import forward_pretrained_checkpoint, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -247,9 +247,9 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
-    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+    forward_pretrained_checkpoint(
+        checkpointing_config=checkpointing_config, policy_config=policy_config
+    )
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
