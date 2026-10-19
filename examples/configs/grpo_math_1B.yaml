@@ -64,7 +64,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -531,7 +531,7 @@ policy:
       prefix_cache_ttl_seconds: 300.0  # MCore default coordinator cache-entry lifetime.
       prefix_caching_routing_alpha: 1.0  # MCore default load penalty for prefix-affinity routing.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
+      kv_cache_management_mode: "recompute"  # Must agree with recompute_kv_cache_after_weight_updates. Options: "persist", "offload", "recompute".
       async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
       materialize_only_last_token_logits: true
       num_speculative_tokens: 0
