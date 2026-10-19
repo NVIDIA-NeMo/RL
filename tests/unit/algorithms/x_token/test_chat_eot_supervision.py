@@ -24,7 +24,10 @@ from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import PreTrainedTokenizerFast
 
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.algorithms.x_token.loss_utils import LocalizedAlignment
+from nemo_rl.algorithms.x_token.loss_utils import (
+    LocalizedAlignment,
+    same_tokenizer_topk_kl,
+)
 from nemo_rl.algorithms.x_token.token_aligner import TokenAligner
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.processors import kd_data_processor
@@ -129,7 +132,8 @@ def test_chat_loss_supervises_eot_predictor_only(loss_kind: str) -> None:
             student_input_ids=batch["input_ids"],
             student_token_mask=batch["token_mask"],
         )
-        loss = loss_fn._direct_topk_kl(
+        loss, _ = loss_fn._compute_same_vocab_kl(
+            0,
             logits,
             teacher_logits,
             alignment,
@@ -147,6 +151,48 @@ def test_chat_loss_supervises_eot_predictor_only(loss_kind: str) -> None:
     assert logits.grad[0, 10, tokenizer.eos_token_id] < 0
     assert torch.count_nonzero(logits.grad[0, :9]) == 0
     assert torch.count_nonzero(logits.grad[0, 11:]) == 0
+
+
+def test_same_vocab_kl_forwards_config() -> None:
+    vocab_size, topk = 12, 4
+    generator = torch.Generator().manual_seed(0)
+    student_logits = torch.randn(2, 6, vocab_size, generator=generator)
+    # Four lm_head padding columns past the shared vocab.
+    teacher_logits = torch.randn(2, 6, vocab_size + 4, generator=generator)
+    token_mask = torch.tensor([[0, 0, 1, 1, 1, 0], [0, 1, 1, 1, 1, 1]])
+    alignment = LocalizedAlignment(
+        sample_mask=torch.tensor([1.0, 0.0]), student_token_mask=token_mask
+    )
+    global_valid_toks = torch.tensor(3.0)
+    loss_fn = _loss_fn(vocab_size)
+    loss_fn.temperature = 2.0
+    loss_fn.reverse_kl = True
+    loss_fn.vocab_topk = topk
+
+    loss, metrics = loss_fn._compute_same_vocab_kl(
+        0,
+        student_logits,
+        teacher_logits,
+        alignment,
+        global_valid_toks,
+        tp_group=None,
+        cp_group=None,
+    )
+    expected = same_tokenizer_topk_kl(
+        student_logits,
+        teacher_logits,
+        kd_mask=token_mask,
+        sample_mask=alignment.sample_mask,
+        num_kd_tokens=global_valid_toks,
+        vocab_size=vocab_size,
+        vocab_topk=topk,
+        temperature=2.0,
+        reverse_kl=True,
+        tp_group=None,
+        cp_group=None,
+    )
+    assert torch.equal(loss, expected)
+    assert metrics["kl_loss"] == loss.item()
 
 
 def test_eot_supervision_mask_does_not_change_cross_tokenizer_kd(
