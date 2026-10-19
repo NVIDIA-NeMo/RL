@@ -1,7 +1,9 @@
 ---
 name: cp-to-main
 description: Manually cherry-pick a merged NVIDIA-NeMo/RL PR from a release branch (r0.X.0) back onto main when the auto cherry-pick bot failed. Stops at conflicts for the user to resolve, then verifies, pushes, opens a cp PR, copies CI labels and posts /ok to test.
-when_to_use: 'cp #N back to main', 'auto cp failed', '/cp-to-main N', cherry-picking a release-branch PR onto main; resuming after the user resolved conflicts ('continue').
+when_to_use: >-
+  'cp #N back to main', 'auto cp failed', '/cp-to-main N', cherry-picking a release-branch PR onto main;
+  resuming after the user resolved conflicts ('continue').
 ---
 
 # cp-to-main
