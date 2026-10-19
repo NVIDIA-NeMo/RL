@@ -649,11 +649,30 @@ class TestDynamicSamplingValidation:
         with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
             validate_single_controller_config(mc)
 
-    def test_ppo_still_rejects_dynamic_sampling_with_the_default_drop_policy(self):
+    def test_ppo_rejects_dynamic_sampling_outright(self):
+        # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
+        # by the GRPO-only guard at the top of the dynamic-sampling block instead.
         mc = _ppo_master_config()
         mc.ppo.use_dynamic_sampling = True
 
-        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_rejects_dynamic_sampling_even_when_grpo_requirements_are_met(self):
+        # The replace + stamping-sampler combo GRPO accepts must still be rejected for
+        # PPO: a dropped group shortens the step and breaks critic sharding (#2625).
+        # Without the explicit guard this config would slip through, since the PPO
+        # drop-budget check does not count dynamic-sampling drops.
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+        mc.async_rl = AsyncRLConfig(
+            min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+            max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+            sampler={"name": "in_order"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+
+        with pytest.raises(ValueError, match="GRPO-only"):
             validate_single_controller_config(mc)
 
 
