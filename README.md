@@ -115,7 +115,7 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
-- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/csd-cross-tokenizer-distillation.md).
+- ✅ **CSD** - Cross-tokenizer distillation using bidirectional sub-token tables; see the [preparation and training guide](docs/guides/xtoken-off-policy-distillation.md#csd-common-support-distillation).
 - ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
@@ -546,7 +546,7 @@ sbatch \
 
 ### CSD (Common-Support Distillation)
 
-CSD compares the student and teacher on events that both tokenizers can express — a shared token, or a shared chain of tokens — and keeps the remaining probability mass in a REST category. You can read about the details of the CSD implementation [here](docs/guides/csd-cross-tokenizer-distillation.md), including how the sub-token tables are built and how the loss treats each chunk type.
+CSD compares the student and teacher on events that both tokenizers can express — a shared token, or a shared chain of tokens — and keeps the remaining probability mass in a REST category. You can read about the details of the CSD implementation [here](docs/guides/xtoken-off-policy-distillation.md#csd-common-support-distillation), including how the sub-token tables are built and how the loss treats each chunk type.
 
 Before launching a run, build both sub-token tables for your (student, teacher) tokenizer pair and validate them:
 
