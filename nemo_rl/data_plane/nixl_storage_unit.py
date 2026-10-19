@@ -235,6 +235,10 @@ class NixlStorageUnit:
             raise ValueError(
                 f"ssd staging_bytes={staging_bytes} must be in (0, slab {slab_bytes})"
             )
+        if watermarks is not None and not 0 < watermarks[1] < watermarks[0] < 1:
+            raise ValueError(
+                f"ssd watermarks need 0 < low < high < 1, got {watermarks}"
+            )
         self.alloc_ = SlabAllocator(main, on_free=self._wipe_footer)
         self.staging_ = SlabAllocator(slab_bytes - main)
         self.staging_base = main
@@ -361,10 +365,10 @@ class NixlStorageUnit:
         return True
 
     def _mark_victim(self, b: str, rec: BlobRec) -> None:
+        self._demoter.submit(self._demote_job, b, rec)  # raises first: nothing marked
         rec.victim = True  # resolve stops granting slab pins (design §5.1)
         self._victims.add(b)
         self._demote_jobs += 1
-        self._demoter.submit(self._demote_job, b, rec)
 
     def _demote_job(self, b: str, rec: BlobRec) -> None:
         try:
