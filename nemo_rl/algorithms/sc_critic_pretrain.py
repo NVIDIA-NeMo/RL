@@ -193,6 +193,23 @@ def promote_rolling_resume(checkpoint_dir: str | os.PathLike, step: int) -> None
     shutil.rmtree(old, ignore_errors=True)
 
 
+def save_due(
+    step: int, *, is_last: bool, save_period: int, ft_save_period: Optional[int]
+) -> bool:
+    """Whether ``step`` (completed steps) saves a checkpoint.
+
+    The last step, every ``save_period`` steps, and, as in PPO / GRPO, every
+    ``checkpointing.ft_save_period`` steps for crash recovery. Retention keeps
+    the ``keep_top_k`` save_period-aligned checkpoints plus the newest
+    ``ft_keep_latest_k``, so the extra saves do not pile up.
+    """
+    return (
+        is_last
+        or step % save_period == 0
+        or (bool(ft_save_period) and step % ft_save_period == 0)
+    )
+
+
 def critic_resume_paths(
     checkpointer: Any,
     last_checkpoint_path: Optional[str | os.PathLike],
@@ -1368,8 +1385,11 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 save_state.get("consumed_samples", 0)
             ) + int(metrics["num_rollouts"])
             timeout.mark_iteration()
-            save_by_step = (
-                is_last or step % master_config.checkpointing["save_period"] == 0
+            save_by_step = save_due(
+                step,
+                is_last=is_last,
+                save_period=master_config.checkpointing["save_period"],
+                ft_save_period=master_config.checkpointing.get("ft_save_period"),
             )
             save_by_timeout = timeout.check_save()
             if master_config.checkpointing["enabled"] and (

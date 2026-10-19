@@ -687,3 +687,14 @@ def test_optimizer_state_setting():
     assert latest.optimizer_state == "latest_only"
     with pytest.raises(ValueError):
         cp.CriticPretrainConfig(bank_dirs=["b"], optimizer_state="never")
+
+
+def test_save_due_adds_fault_tolerance_saves():
+    def due(step, ft, last=False):
+        return cp.save_due(step, is_last=last, save_period=10, ft_save_period=ft)
+
+    assert [s for s in range(1, 25) if due(s, None)] == [10, 20]
+    assert [s for s in range(1, 25) if due(s, 0)] == [10, 20]
+    assert [s for s in range(1, 8) if due(s, 1)] == list(range(1, 8))
+    assert [s for s in range(1, 13) if due(s, 3)] == [3, 6, 9, 10, 12]
+    assert due(7, None, last=True)
