@@ -1,0 +1,129 @@
+# =============================================================================
+# ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml + BrowseComp search (Gym browsecomp_sandboxed_agent,
+# from Ritu Gala's ritu/browsecomp_sandboxed_agent), for collecting and training on the six-set SWE mix,
+# Terminal-Bench and search together. Rows carry their agent in `agent_ref`; search rows use
+# browsecomp_sandboxed_agent.
+#
+# SWE and TB are unchanged: OpenCode agents on policy_model with sequential_reasoning_allowed: false.
+# Search runs as in Ritu's run (bc-super-opdv1s25-tksc):
+# - Its agent calls policy_model_search (Gym rl_training_servers.yaml): the same engines with
+#   sequential_reasoning_allowed: true, which the browsecomp loop needs after a reasoning-only turn.
+#   Token capture is global and the ledger shared, so search rollouts are captured like the others.
+# - bash_command runs in a per-rollout OpenSandbox sandbox (python:3.12-slim, egress denied). Search
+#   (Exa behind a read-only cache), browse and the judge (GLM-5.1 on inference-api.nvidia.com) stay on
+#   the resources server.
+# - Context resets off (max_reset_count 0), 400 steps, 2 h per rollout.
+# - Masked: rollouts ending on max_steps / context_full / timeout (response.stop_reason), on top of the
+#   SWE / TB rules. A rule whose field a rollout lacks never matches, so the rule sets do not interact.
+# Keys (INFERENCE_API_KEY, BC_EXA_API_KEYS_JSON) come from the job environment (launcher SEARCH_ENV_FILE),
+# the search cache and opt-out registry paths from launcher overrides (??? until set).
+# PPO: value.swe_privileged_critic raises on prompts without a golden patch, so search rows need a reference
+# before a PPO run (data side, as TB, or the critic plan). Collection does not touch the critic.
+# =============================================================================
+defaults: ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml
+env:
+  # Lists are replaced, not merged: the SWE / TB rules plus the search stop reasons.
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+  - name: eval_incomplete
+    field: evaluation_completed
+    equals: false
+  - name: context_limited
+    field: opencode_context_limited
+    equals: true
+  - name: search_stop_max_steps
+    field: response.stop_reason
+    equals: max_steps
+  - name: search_stop_context_full
+    field: response.stop_reason
+    equals: context_full
+  - name: search_stop_timeout
+    field: response.stop_reason
+    equals: timeout
+  nemo_gym:
+    # Lists are replaced, not merged: the SWE + TB list plus the browsecomp agent and its RL servers.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+    - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+    - resources_servers/swemer_oml/configs/swemer_oml_opencode.yaml
+    - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+    - resources_servers/swe_next/configs/swe_next_opencode.yaml
+    - benchmarks/terminal_bench_2_1/opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    - responses_api_agents/browsecomp_sandboxed_agent/configs/browsecomp_sandboxed_agent.yaml
+    - responses_api_agents/browsecomp_sandboxed_agent/configs/rl_training_servers.yaml
+    # Search's own model server: rl_training_servers.yaml holds the Gym-side fields; the rest mirrors policy_model.
+    policy_model_search:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs: ${env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs}
+          max_rate_limit_attempts: ${env.nemo_gym.policy_model.responses_api_models.vllm_model.max_rate_limit_attempts}
+          sampling_overrides: ${env.nemo_gym.policy_model.responses_api_models.vllm_model.sampling_overrides}
+    # Judge: a hosted model, never the policy under training. Key: rl_training_servers.yaml.
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: https://inference-api.nvidia.com/v1
+          model: nvidia/zai-org/glm-5.1
+          return_token_id_information: false
+          uses_reasoning_parser: true
+    browsecomp_rl_resources_server:
+      resources_servers:
+        browsecomp_advanced_harness:
+          entrypoint: app.py
+          allowed_agents: [browsecomp_agent, browsecomp_sandboxed_agent]
+          domain: agent
+          debug: false
+          search_provider: exa
+          max_results: 10
+          search_max_total_length: 30000
+          exa_search_writes_pages: true
+          # Data-registry opt-out list: excluded domains are never searched or browsed. Launcher-set.
+          exclude_domains_file_path: ???
+          # Shared cache served read-only: hits come from it, misses go to Exa live and are not stored. Launcher-set.
+          search_cache_dir: ???
+          search_cache_fuzzy_threshold: 0.8
+          search_cache_read_only: true
+          workspace: per_session
+          use_judge: true
+          judge_model_server:
+            type: responses_api_models
+            name: judge_model
+          judge_responses_create_params:
+            input: []
+          verified: false
+    # Instance name = the agent_ref in the search rows.
+    browsecomp_sandboxed_agent:
+      responses_api_agents:
+        browsecomp_sandboxed_agent:
+          resources_server:
+            type: resources_servers
+            name: browsecomp_rl_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model_search
+          max_steps: 400
+          nudge_steps: true
+          max_context_tokens: ${policy.max_total_sequence_length}
+          context_reset_tokens: 256000
+          context_reset_keep_rounds: 3
+          max_reset_count: 0
+          max_run_retries: 1
+          progress: true
+          snap_dir: null
+          rollout_timeout_s: 7200
+          # Off: the pre-call /tokenize count only drives context resets, which are off, and it bypasses capture.
+          save_model_call_using_vllm_tokenize_endpoint: false
+          datasets: []
