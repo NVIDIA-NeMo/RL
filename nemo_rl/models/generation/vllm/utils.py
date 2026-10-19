@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass, replace
 from typing import Any, Optional
 
@@ -92,33 +92,55 @@ def _extract_selected_token_logprobs(
 
 
 def _snapshot_generation_logprob_details(
-    generation_logprob_details: Any,
+    generation_logprob_details: Any, start: int
 ) -> list[Any]:
-    """Copy only fully published positions from an append-only container."""
+    """Copy the fully published positions past ``start`` from an append-only container.
+
+    Positions are read one at a time: slicing a live ``FlatLogprobs`` reads its
+    start and end indices separately and can catch a position half-appended.
+    """
     position_count = len(generation_logprob_details)
     end_indices = getattr(generation_logprob_details, "end_indices", None)
     if end_indices is not None:
         position_count = min(position_count, len(end_indices))
-    return [generation_logprob_details[index] for index in range(position_count)]
+    return [generation_logprob_details[index] for index in range(start, position_count)]
 
 
-def extract_selected_token_logprobs(generation_details: Any) -> list[float]:
-    """Return the sampled log probability for each published output token."""
-    generation_token_ids = list(getattr(generation_details, "token_ids", ()) or ())
-    details = getattr(generation_details, "logprobs", None)
-    if details is None:
-        if generation_token_ids:
+def extract_published_generation(
+    token_ids: Sequence[int], logprobs: Any, *, start: int
+) -> tuple[list[int], list[float]]:
+    """Copy the generated tokens past ``start`` that vLLM has published with logprobs.
+
+    A cumulative vLLM output holds the engine's live lists, which its engine
+    loop keeps appending to while another thread reads them. The engine appends
+    each token before its logprob, so the logprobs are read first and bound the
+    tokens taken: a token whose logprob is still pending is left for the next
+    output.
+
+    Args:
+        token_ids: The output's generated token IDs.
+        logprobs: The output's per-position logprobs, or None if vLLM sent none.
+        start: Generated positions already taken from earlier outputs.
+
+    Returns:
+        The newly published token IDs and their sampled log probabilities.
+    """
+    if logprobs is None:
+        if len(token_ids) > start:
             raise RuntimeError(
                 "vLLM generation output with token IDs did not include logprobs"
             )
-        return []
-    details = _snapshot_generation_logprob_details(details)
+        return [], []
+    details = _snapshot_generation_logprob_details(logprobs, start)
+    generation_token_ids = list(token_ids[start : start + len(details)])
     if len(generation_token_ids) != len(details):
         raise RuntimeError(
             "vLLM returned mismatched generation token IDs and log probabilities: "
             f"token_count={len(generation_token_ids)}, logprob_count={len(details)}"
         )
-    return _extract_selected_token_logprobs(generation_token_ids, details)
+    return generation_token_ids, _extract_selected_token_logprobs(
+        generation_token_ids, details
+    )
 
 
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (

@@ -67,6 +67,8 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
     _classify_restored_prefix_terminal,
+    _count_restored_prefix_as_completion,
+    _generation_cut_blockers,
     _RestoredPrefixTerminal,
 )
 
@@ -136,6 +138,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _restored_generation_prefix_calls=0,
         _restored_generation_prefix_tokens=0,
         _token_capture_snapshot_gate=_TokenCaptureSnapshotGate(),
+        _generation_cut_cleanup_executor=ThreadPoolExecutor(max_workers=1),
         _staging_source=None,
         _capture_media=False,
     )
@@ -376,6 +379,51 @@ def test_restored_prefix_reduces_remaining_output_limits(
     )
 
 
+def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int | None):
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+    )
+
+
+def test_resumed_call_reports_its_restored_prefix_as_completion():
+    # Prompt [1, 2, 3], restored generated prefix [4, 5], regenerated tail of 3.
+    usage = _usage(prompt_tokens=5, completion_tokens=3, cached_tokens=5)
+
+    prompt_token_ids = _count_restored_prefix_as_completion(
+        usage, [1, 2, 3, 4, 5], restored_token_count=2, terminal=None
+    )
+
+    assert (usage.prompt_tokens, usage.completion_tokens) == (3, 5)
+    assert usage.total_tokens == 8
+    assert usage.prompt_tokens_details.cached_tokens == 3
+    assert prompt_token_ids == [1, 2, 3]
+
+
+def test_terminal_restored_prefix_is_the_whole_completion():
+    terminal = _RestoredPrefixTerminal(
+        prompt_token_ids=(1, 2, 3, 4, 5),
+        prefix_token_count=2,
+        reason="eos",
+        finish_reason="stop",
+    )
+    # vLLM served a one-token request on the prefix-extended prompt.
+    usage = _usage(prompt_tokens=4, completion_tokens=1, cached_tokens=None)
+
+    prompt_token_ids = _count_restored_prefix_as_completion(
+        usage, terminal.prompt_token_ids, restored_token_count=2, terminal=terminal
+    )
+
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
+        3,
+        2,
+        5,
+    )
+    assert prompt_token_ids == [1, 2, 3]
+
+
 def test_restored_prefix_at_output_limit_is_terminal():
     terminal = _classify_restored_prefix_terminal(
         prompt_token_ids=[1, 2, 3, 4],
@@ -500,6 +548,64 @@ def test_cumulative_outputs_are_observed_once_per_token():
     assert state.generated_token_ids == [12, 13, 14]
     assert state.generated_logprobs == [-0.1, -0.2, -0.3]
     assert state.terminal_finish_reason == "stop"
+
+
+def test_token_read_before_its_logprob_is_observed_with_the_next_output():
+    """vLLM's engine loop appends while the HTTP thread reads; a lagging logprob waits."""
+    worker = _worker_with_capture(_MemorySink())
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    # Caught between the engine appending token 13 and appending its logprob.
+    token_ids = [12, 13]
+    logprobs = [{12: SimpleNamespace(logprob=-0.1)}]
+    output = SimpleNamespace(token_ids=token_ids, logprobs=logprobs)
+
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        worker, request, SimpleNamespace(outputs=[output])
+    )
+
+    state = worker._capture_calls[id(request)]
+    assert state.observation_error is None
+    assert state.generated_token_ids == [12]
+
+    logprobs.append({13: SimpleNamespace(logprob=-0.2)})
+    output.finish_reason = "stop"
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(
+        worker, request, SimpleNamespace(outputs=[output])
+    )
+
+    assert state.observation_error is None
+    assert state.generated_token_ids == [12, 13]
+    assert state.generated_logprobs == [-0.1, -0.2]
+    assert state.terminal_finish_reason == "stop"
+
+
+def test_terminal_token_without_a_logprob_makes_its_call_uncuttable():
+    worker = _worker_with_capture(_MemorySink())
+    request = _FakeRequest(
+        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    # Nothing appends after the terminal step, so this logprob never arrives.
+    final = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                token_ids=[12, 13],
+                logprobs=[{12: SimpleNamespace(logprob=-0.1)}],
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    VllmAsyncGenerationWorkerImpl._observe_request_capture(worker, request, final)
+
+    state = worker._capture_calls[id(request)]
+    assert "token_count=2, logprob_count=1" in state.observation_error
+    assert state.terminal_finish_reason is None
 
 
 def test_generation_cut_stages_only_tokens_past_the_last_sealed_cut():
@@ -909,7 +1015,7 @@ def test_completed_retry_is_matched_by_its_attempt_qualified_capture_key(
     assert ack.prefix_token_count == 3
 
 
-def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging():
+def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(caplog):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
@@ -937,15 +1043,17 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging():
     )
 
     # Gym has already stopped waiting: the queued cut must not stage rows.
-    receipt = worker._checkpoint_generation_cut(
-        inventory, deadline=time.monotonic() - 1.0
-    )
+    with caplog.at_level(logging.WARNING):
+        receipt = worker._checkpoint_generation_cut(
+            inventory, deadline=time.monotonic() - 1.0
+        )
 
     receipt.validate_for(inventory)
     assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
     assert sink.generation_prefix_records == []
     assert state.frozen_cut is None
     assert state.generated_token_ids == [11, 12]
+    assert "uncut=1 of 1 model_call_ids=['c1']" in caplog.text
 
 
 def _active_call_inventory(
@@ -986,7 +1094,7 @@ def _active_call_inventory(
     return inventory, states
 
 
-def test_generation_cut_refuses_a_prefix_ending_inside_a_character():
+def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     worker._generation_prefix_cuts_enabled = True
@@ -997,7 +1105,8 @@ def test_generation_cut_refuses_a_prefix_ending_inside_a_character():
         ("whole", list(b"Sure ") + dinosaur),
     )
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    with caplog.at_level(logging.WARNING):
+        receipt = worker._checkpoint_generation_cut(inventory)
 
     # vLLM would prime the resumed tail on half a character and echo the
     # prompt into the response, so that call regenerates instead.
@@ -1009,6 +1118,79 @@ def test_generation_cut_refuses_a_prefix_ending_inside_a_character():
     assert split.frozen_cut is None
     assert split.generated_token_ids == list(b"Sure ") + dinosaur[:2]
     assert whole.generation_cut_staging_keys == sink.generation_prefix_keys
+    assert (
+        "cannot cut model call split: its 7 generated tokens end inside a "
+        "multi-byte character"
+    ) in caplog.text
+    assert "model call whole" not in caplog.text
+
+
+def test_generation_cut_of_a_call_with_no_tokens_logs_at_debug(caplog):
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    inventory, (empty,) = _active_call_inventory(worker, ("empty", []))
+
+    with caplog.at_level(
+        logging.DEBUG, logger="nemo_rl.models.generation.generation_cut_capture"
+    ):
+        receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    assert sink.generation_prefix_records == []
+    assert empty.frozen_cut is None
+    # Still prefilling is expected, so it stays out of WARNING.
+    [record] = [r for r in caplog.records if "model call empty" in r.getMessage()]
+    assert record.levelno == logging.DEBUG
+    assert "it has no generated tokens yet" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    ("completed", "reason"),
+    [
+        (None, "its terminal result is no longer retained"),
+        (
+            {"disposition": "capture_failed"},
+            "its terminal write ended as 'capture_failed'",
+        ),
+        (
+            {"effective_output_limit": None},
+            "vLLM did not resolve its effective output limit",
+        ),
+        (
+            {"terminal_finish_reason": None},
+            "it finished without a stop or length finish reason",
+        ),
+    ],
+)
+def test_completed_call_that_cannot_be_cut_logs_why(completed, reason, caplog):
+    worker = _worker_with_capture(_MemorySink())
+    if completed is not None:
+        worker._remember_completed_capture(
+            "c2",
+            SimpleNamespace(
+                rollout_id="r0",
+                disposition=completed.get("disposition", "staged"),
+                staging_key="terminal-key",
+                digest="a" * 64,
+            ),
+            3,
+            effective_output_limit=completed.get("effective_output_limit", 128),
+            terminal_finish_reason=completed.get("terminal_finish_reason", "stop"),
+        )
+    prefix = GenerationCutPrefix(
+        ticket_id="ticket-1",
+        rollout_id="r0",
+        attempt=0,
+        model_call_id="c2",
+        admitted_at=1.0,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ack = worker._completed_generation_cut_ack(prefix, "checkpoint-1")
+
+    assert ack.disposition == "durable_failure"
+    assert f"cannot cut completed model call c2: {reason}" in caplog.text
 
 
 def test_dropped_output_delta_keeps_its_call_uncuttable():
@@ -1054,6 +1236,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
         {"bad_words": ["forbidden word"]},
         {"presence_penalty": 0.5},
         {"frequency_penalty": -0.2},
+        {"seed": 7, "temperature": 1.0},
     ],
 )
 def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
@@ -1085,6 +1268,25 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
     assert constrained.frozen_cut is None
     assert constrained.generated_token_ids == [11, 12]
     assert plain.generation_cut_staging_keys == sink.generation_prefix_keys
+
+
+@pytest.mark.parametrize(
+    ("seed", "temperature", "blocked"),
+    [
+        # A restored call would restart the seeded generator and reuse its draws.
+        (7, 1.0, True),
+        # Greedy decoding draws nothing, so the seed is irrelevant.
+        (7, 0.0, False),
+        # Unseeded calls draw from the engine's shared generator.
+        (None, 1.0, False),
+    ],
+)
+def test_only_a_seeded_sampled_call_is_kept_out_of_cuts(seed, temperature, blocked):
+    blockers = _generation_cut_blockers(
+        _sampling_params(seed=seed, temperature=temperature)
+    )
+
+    assert ("seed" in blockers) is blocked
 
 
 def test_uncuttable_sampling_settings_warn_once_per_reason(monkeypatch, caplog):
@@ -1131,29 +1333,176 @@ def test_generation_cut_rolls_back_tokens_after_staging_failure():
     with state.lock:
         state.effective_output_limit = 8
         state.observe([11, 12], [-0.1, -0.2])
-    inventory = GenerationCutInventory.build(
-        checkpoint_id="checkpoint-1",
-        server_name="policy_model",
-        active_prefixes=[
-            GenerationCutPrefix(
-                ticket_id="ticket-1",
-                rollout_id="r0",
-                attempt=0,
-                model_call_id="c1",
-                admitted_at=1.0,
-            )
-        ],
-    )
 
-    with pytest.raises(RuntimeError, match="injected generation-prefix"):
-        worker._checkpoint_generation_cut(inventory)
+    def inventory(checkpoint_id: str) -> GenerationCutInventory:
+        return GenerationCutInventory.build(
+            checkpoint_id=checkpoint_id,
+            server_name="policy_model",
+            active_prefixes=[
+                GenerationCutPrefix(
+                    ticket_id="ticket-1",
+                    rollout_id="r0",
+                    attempt=0,
+                    model_call_id="c1",
+                    admitted_at=1.0,
+                )
+            ],
+        )
+
+    # The failed call is acknowledged, not raised, and its buffer rolls back.
+    failed = worker._checkpoint_generation_cut(inventory("checkpoint-1"))
+    assert [ack.disposition for ack in failed.prefixes] == ["durable_failure"]
     assert state.frozen_cut is None
     assert state.generated_token_ids == [11, 12]
     assert state.staged_token_count == 0
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    receipt = worker._checkpoint_generation_cut(inventory("checkpoint-2"))
     assert receipt.prefixes[0].prefix_token_count == 2
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 11, 12]
+
+
+def test_one_failed_call_does_not_fail_the_rest_of_the_cut():
+    sink = _FailOncePrefixSink()
+    worker = _worker_with_capture(sink)
+    inventory, (failing, healthy) = _active_call_inventory(
+        worker, ("failing", [11, 12]), ("healthy", [13, 14])
+    )
+
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_failure",
+        "durable_prefix",
+    ]
+    assert failing.frozen_cut is None
+    assert healthy.generation_cut_staging_keys == sink.generation_prefix_keys
+
+
+def test_call_without_an_output_limit_is_not_frozen_for_the_cut():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    inventory, (state,) = _active_call_inventory(worker, ("c1", [11, 12]))
+    with state.lock:
+        state.effective_output_limit = None
+
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    assert state.frozen_cut is None
+    assert sink.generation_prefix_records == []
+
+
+def test_unexpected_error_after_the_freeze_rolls_the_call_back():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    inventory, (state,) = _active_call_inventory(worker, ("c1", [11, 12]))
+
+    class _BrokenTokenizer:
+        def decode(self, token_ids, **kwargs):
+            raise ValueError("injected decode failure")
+
+    worker._generation_cut_tokenizer = _BrokenTokenizer()
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    # Without the rollback, every later cut of this call would fail to freeze.
+    assert state.frozen_cut is None
+    worker._generation_cut_tokenizer = _ByteTokenizer()
+    retried = worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="checkpoint-2",
+            server_name="policy_model",
+            active_prefixes=list(inventory.active_prefixes),
+        )
+    )
+    assert [ack.disposition for ack in retried.prefixes] == ["durable_prefix"]
+
+
+def _restorable_cut(sink: _MemorySink):
+    """Cut one call at weight version 7 and return what a restore would send."""
+    worker = _worker_with_capture(sink)
+    worker._rollout_weight_version = 7
+    inventory, (state,) = _active_call_inventory(worker, ("c1", [12, 13]))
+    receipt = worker._checkpoint_generation_cut(inventory)
+    (ack,) = receipt.prefixes
+    (cut_key,) = ack.staging_keys
+    cut_record = sink.generation_prefix_records[-1][1]
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0-a1",
+            "model_call_id": "c2",
+            "mode": "text",
+            "generation_cut": {
+                "source_capture_key": "r0",
+                "source_model_call_id": "c1",
+                "staging_keys": [cut_key],
+                "prefix_token_count": ack.prefix_token_count,
+                "prefix_digest": cut_record.digest,
+                "effective_output_limit": ack.effective_output_limit,
+            },
+        },
+        stream=False,
+    )
+    return cut_key, cut_record, request
+
+
+def _resumed_worker(sink, *, records, weight_version: int = 9):
+    worker = _worker_with_capture(sink)
+    worker._rollout_weight_version = weight_version
+    worker._staging_source = _MemoryPrefixSource({}, records=records)
+    return worker
+
+
+def test_usable_restored_prefix_is_resumed():
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(sink, records={cut_key: cut_record})
+    admission = worker._capture_admission(request)
+
+    served, snapshot = worker._resolve_usable_generation_cut(admission, [])
+
+    assert served is admission
+    assert snapshot.digest == cut_record.digest
+    _drain_cleanup(worker)
+    assert sink.cleared_generation_prefix_keys == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing chunk", "chunk newer than the worker", "digest mismatch"],
+)
+def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog):
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(
+        sink,
+        records={} if failure == "missing chunk" else {cut_key: cut_record},
+        weight_version=0 if failure == "chunk newer than the worker" else 9,
+    )
+    admission = worker._capture_admission(request)
+    if failure == "digest mismatch":
+        admission = admission.model_copy(
+            update={
+                "generation_cut": admission.generation_cut.model_copy(
+                    update={"prefix_digest": "0" * 64}
+                )
+            }
+        )
+
+    with caplog.at_level(logging.WARNING):
+        served, snapshot = worker._resolve_usable_generation_cut(admission, [])
+
+    assert snapshot is None
+    assert served.generation_cut is None
+    assert "regenerating it from its turn boundary" in caplog.text
+    # The regenerated call is admitted as an ordinary call from its boundary.
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [10], admission=served, prefix_token_ids=[]
+    )
+    assert worker._capture_calls[id(request)].generation_cut_staging_keys == []
+    # The restored rows it will never extend are retired through the gate.
+    _drain_cleanup(worker)
+    assert sink.cleared_generation_prefix_keys == [cut_key]
 
 
 def test_restored_generation_cut_is_extended_and_retired_on_completion(
@@ -1525,6 +1874,103 @@ def test_request_capture_is_a_noop_without_context_or_capture(
     assert sink.records == []
 
 
+def _cut_active_call(worker, sink, model_call_id: str = "c1"):
+    """Begin one captured call and stage its prefix at a generation cut."""
+    request = _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": model_call_id,
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
+    state = worker._capture_calls[id(request)]
+    with state.lock:
+        state.effective_output_limit = 8
+        state.observe([20, 21], [-0.1, -0.2])
+    inventory = GenerationCutInventory.build(
+        checkpoint_id="checkpoint-1",
+        server_name="policy_model",
+        active_prefixes=[
+            GenerationCutPrefix(
+                ticket_id="ticket-1",
+                rollout_id="r0",
+                attempt=0,
+                model_call_id=model_call_id,
+                admitted_at=1.0,
+            )
+        ],
+    )
+    worker._checkpoint_generation_cut(inventory)
+    assert state.generation_cut_staging_keys == sink.generation_prefix_keys
+    return request
+
+
+def _drain_cleanup(worker) -> None:
+    worker._generation_cut_cleanup_executor.submit(lambda: None).result(timeout=5)
+
+
+def test_aborted_call_clears_the_rows_its_cuts_staged():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    request = _cut_active_call(worker, sink)
+
+    VllmAsyncGenerationWorkerImpl._abort_request_capture(
+        worker, request, reason="client_disconnected"
+    )
+    _drain_cleanup(worker)
+
+    assert sink.generation_prefix_keys
+    assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
+
+
+def test_aborted_call_clears_its_rows_only_after_the_snapshot_fence():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    request = _cut_active_call(worker, sink)
+    gate = worker._token_capture_snapshot_gate
+    gate.close_and_wait(gate.begin_epoch())
+
+    # The abort itself never waits for the fence.
+    assert VllmAsyncGenerationWorkerImpl._abort_request_capture(
+        worker, request, reason="client_disconnected", blocking=False
+    )
+    time.sleep(0.2)
+    assert sink.cleared_generation_prefix_keys == []
+
+    gate.reopen()
+    _drain_cleanup(worker)
+    assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
+
+
+class _FailingTerminalSink(_MemorySink):
+    def stage(
+        self, record: StagedCallRecord, *, attachments: dict | None = None
+    ) -> StageResult:
+        return StageResult(ok=False, error="tq unavailable")
+
+
+def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
+    sink = _FailingTerminalSink()
+    worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
+    request = _cut_active_call(worker, sink)
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker,
+        request,
+        _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
+
+
 def test_request_capture_abort_fails_the_call_and_drains_state():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
@@ -1544,6 +1990,9 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     )
     assert worker._capture_calls == {}
     assert sink.records == []
+    # A call that was never cut has no chunk rows to clear.
+    _drain_cleanup(worker)
+    assert sink.cleared_generation_prefix_keys == []
     # A late finish after abort is a no-op (state already drained).
     out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, _served_content([3], [-0.1])

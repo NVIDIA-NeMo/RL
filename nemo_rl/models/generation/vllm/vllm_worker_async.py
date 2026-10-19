@@ -77,7 +77,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
-    extract_selected_token_logprobs,
+    extract_published_generation,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -103,6 +103,10 @@ _GENERATION_CUT_ROUTE = "/ng-control/v1/generation-cut"
 _LOGGED_UNCUTTABLE_REASONS: set[str] = set()
 
 
+# vLLM's _SAMPLING_EPS: below this temperature a request decodes greedily.
+_GREEDY_TEMPERATURE = 1e-5
+
+
 def _generation_cut_blockers(sampling_params: Any) -> list[str]:
     """Sampling settings a resumed tail cannot honor across a generation cut.
 
@@ -110,6 +114,12 @@ def _generation_cut_blockers(sampling_params: Any) -> list[str]:
     strings and bad words, and counts presence/frequency penalties, over the
     output tokens only. A resumed tail would therefore miss a stop string or
     bad word that straddles the cut and stop penalizing the prefix's tokens.
+
+    A request-level ``seed`` gives the call its own random generator, seeded
+    when vLLM admits it. The restored call would start that generator over and
+    reuse the draws that chose its prefix. Greedy decoding draws nothing, and
+    an unseeded call draws from the engine's shared generator, so neither is
+    affected.
     """
     blockers = []
     if getattr(sampling_params, "stop", None):
@@ -120,6 +130,11 @@ def _generation_cut_blockers(sampling_params: Any) -> list[str]:
         blockers.append("presence_penalty")
     if getattr(sampling_params, "frequency_penalty", 0.0):
         blockers.append("frequency_penalty")
+    if (
+        getattr(sampling_params, "seed", None) is not None
+        and getattr(sampling_params, "temperature", 1.0) >= _GREEDY_TEMPERATURE
+    ):
+        blockers.append("seed")
     return blockers
 
 
@@ -136,6 +151,39 @@ class _RestoredPrefixTerminal:
     @property
     def original_prompt_token_count(self) -> int:
         return len(self.prompt_token_ids) - self.prefix_token_count
+
+
+def _count_restored_prefix_as_completion(
+    usage: Any,
+    prompt_token_ids: Sequence[int] | None,
+    *,
+    restored_token_count: int,
+    terminal: _RestoredPrefixTerminal | None,
+) -> list[int] | None:
+    """Report a restored call's usage the way the uninterrupted call would.
+
+    The engine served the restored prefix as part of the prompt, so vLLM counts
+    it as prompt tokens and only the regenerated tail as completion tokens,
+    while the reasoning count covers prefix and tail. Gym adds usage across
+    turns, so the prefix moves back to the completion side. Updates ``usage``
+    in place and returns ``prompt_token_ids`` without the prefix.
+    """
+    if terminal is not None:
+        # Nothing was generated after the restore: the prefix is the completion.
+        prompt_tokens = terminal.original_prompt_token_count
+        completion_tokens = terminal.prefix_token_count
+    else:
+        prompt_tokens = usage.prompt_tokens - restored_token_count
+        completion_tokens = usage.completion_tokens + restored_token_count
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    usage.total_tokens = prompt_tokens + completion_tokens
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None and details.cached_tokens is not None:
+        details.cached_tokens = min(details.cached_tokens, prompt_tokens)
+    if prompt_token_ids is None:
+        return None
+    return list(prompt_token_ids[:prompt_tokens])
 
 
 def _classify_restored_prefix_terminal(
@@ -534,6 +582,12 @@ class VllmAsyncGenerationWorkerImpl(
         self._token_capture_fence_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="nrl-token-capture-fence",
+        )
+        # An aborted call's chunk rows are cleared here, off the serving loop;
+        # the clear waits at the snapshot gate like a terminal write.
+        self._generation_cut_cleanup_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-cut-cleanup",
         )
         self._capture_media = False
         self._capture_patch_size: int | None = None
@@ -1052,18 +1106,23 @@ class VllmAsyncGenerationWorkerImpl(
         try:
             output = outputs[0]
             # Cumulative output: slice off what earlier steps already observed.
-            # The lists are vLLM's live ones, so copy only the new tail.
+            # The lists are vLLM's live ones, appended to on the engine loop
+            # while this HTTP thread reads them, so copy only the new tail.
             token_ids = getattr(output, "token_ids", None) or ()
-            logprobs = getattr(output, "logprobs", None)
-            generation_token_ids = list(token_ids[observed:])
-            generation_logprobs = extract_selected_token_logprobs(
-                SimpleNamespace(
-                    token_ids=generation_token_ids,
-                    logprobs=None if logprobs is None else logprobs[observed:],
-                )
+            generation_token_ids, generation_logprobs = extract_published_generation(
+                token_ids, getattr(output, "logprobs", None), start=observed
             )
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
+            unpaired_token_count = len(token_ids) - observed - len(generation_token_ids)
+            if finish_reason is not None and unpaired_token_count:
+                # Nothing appends after the terminal step, so a token still
+                # without its logprob was never given one.
+                raise RuntimeError(
+                    "vLLM finished a generation with tokens that have no log "
+                    f"probabilities: token_count={len(token_ids)}, "
+                    f"logprob_count={observed + len(generation_token_ids)}"
+                )
         except (RuntimeError, TypeError, ValueError) as error:
             with state.lock:
                 state.observation_error = f"{type(error).__name__}: {error}"
@@ -1370,15 +1429,9 @@ class VllmAsyncGenerationWorkerImpl(
                     state, request, content
                 )
             )
-        sink = self._capture_sink
-        if obsolete_staging_keys and sink is not None:
-            try:
-                sink.clear(list(obsolete_staging_keys))
-            except Exception:  # noqa: BLE001 - completion is already durable
-                LOGGER.exception(
-                    "failed to clear obsolete generation chunks for model call %s",
-                    state.call.model_call_id,
-                )
+        GenerationCutCaptureMixin._clear_generation_cut_rows(
+            self, state.call.model_call_id, obsolete_staging_keys
+        )
         return content
 
     def _finish_request_capture_with_lifecycle_owned(
@@ -1452,11 +1505,9 @@ class VllmAsyncGenerationWorkerImpl(
             terminal_stop_reason=terminal_stop_reason,
         )
         self._pop_request_capture(request)
-        obsolete_staging_keys = (
-            tuple(state.generation_cut_staging_keys)
-            if coords.disposition == "staged"
-            else ()
-        )
+        # A failed call is retried from its task or its previous boundary, never
+        # from these rows, so they go whether or not the terminal row staged.
+        obsolete_staging_keys = tuple(state.generation_cut_staging_keys)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -1675,8 +1726,8 @@ class VllmAsyncGenerationWorkerImpl(
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, admission
                     )
-                    generation_cut = await asyncio.to_thread(
-                        worker_self._resolve_generation_cut,
+                    admission, generation_cut = await asyncio.to_thread(
+                        worker_self._resolve_usable_generation_cut,
                         admission,
                         capture_prefix_token_ids,
                     )
@@ -2075,25 +2126,32 @@ class VllmAsyncGenerationWorkerImpl(
                     return response
 
                 restored_prefix_terminal = request._restored_prefix_terminal
-                if (
-                    isinstance(restored_prefix_terminal, _RestoredPrefixTerminal)
-                    and response.usage is not None
+                if not isinstance(restored_prefix_terminal, _RestoredPrefixTerminal):
+                    restored_prefix_terminal = None
+                restored_token_count = (
+                    len(request._restored_generation_token_ids)
+                    if response.usage is not None
+                    else 0
+                )
+                if response.usage is not None and (
+                    restored_prefix_terminal is not None or restored_token_count
                 ):
-                    response.usage.prompt_tokens = (
-                        restored_prefix_terminal.original_prompt_token_count
+                    prompt_token_ids = response.prompt_token_ids
+                    if (
+                        prompt_token_ids is not None
+                        and restored_prefix_terminal is not None
+                    ):
+                        # Its engine prompt may have dropped a token to fit
+                        # max_model_len; the terminal record keeps the full one.
+                        prompt_token_ids = restored_prefix_terminal.prompt_token_ids
+                    prompt_token_ids = _count_restored_prefix_as_completion(
+                        response.usage,
+                        prompt_token_ids,
+                        restored_token_count=restored_token_count,
+                        terminal=restored_prefix_terminal,
                     )
-                    response.usage.completion_tokens = (
-                        restored_prefix_terminal.prefix_token_count
-                    )
-                    response.usage.total_tokens = (
-                        response.usage.prompt_tokens + response.usage.completion_tokens
-                    )
-                    if response.prompt_token_ids is not None:
-                        response.prompt_token_ids = list(
-                            restored_prefix_terminal.prompt_token_ids[
-                                : restored_prefix_terminal.original_prompt_token_count
-                            ]
-                        )
+                    if prompt_token_ids is not None:
+                        response.prompt_token_ids = prompt_token_ids
                     request_metadata = (
                         args[4] if len(args) >= 5 else kwargs.get("request_metadata")
                     )
@@ -3296,6 +3354,7 @@ class VllmAsyncGenerationWorkerImpl(
             for executor_name in (
                 "_generation_cut_control_executor",
                 "_token_capture_fence_executor",
+                "_generation_cut_cleanup_executor",
             ):
                 executor = getattr(self, executor_name, None)
                 if executor is not None:

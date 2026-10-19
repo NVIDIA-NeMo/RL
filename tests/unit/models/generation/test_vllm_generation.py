@@ -1203,7 +1203,10 @@ def _track_request_capture(worker, request):
     """Register in-flight capture state for request; return the sink and its call."""
     call = types.SimpleNamespace(model_call_id="call")
     worker._capture_calls[id(request)] = types.SimpleNamespace(
-        call=call, lifecycle_lock=threading.Lock(), terminal_started=False
+        call=call,
+        lifecycle_lock=threading.Lock(),
+        terminal_started=False,
+        generation_cut_staging_keys=[],
     )
     worker._capture_calls_by_model_call_id = {}
     worker._completed_capture_calls = {}

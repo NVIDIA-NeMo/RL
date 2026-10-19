@@ -36,6 +36,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
+    extract_published_generation,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -748,6 +749,58 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
 
     with pytest.raises(RuntimeError, match=error_match):
         attach_token_information_to_chat_response_choices(response, final_res)
+
+
+def _position(token_id: int, logprob: float) -> dict:
+    return {token_id: SimpleNamespace(logprob=logprob)}
+
+
+class _HalfAppendedLogprobs(list):
+    """A FlatLogprobs caught mid-append: its last position has no end index yet."""
+
+    def __init__(self, positions: list[dict]):
+        super().__init__(positions)
+        self.end_indices = list(range(1, len(positions)))
+
+
+def test_extract_published_generation_leaves_a_token_without_its_logprob():
+    # vLLM appends a token before its logprob; another thread can read between.
+    token_ids = [12, 13, 14]
+    logprobs = [_position(12, -0.1), _position(13, -0.2)]
+
+    assert extract_published_generation(token_ids, logprobs, start=0) == (
+        [12, 13],
+        [-0.1, -0.2],
+    )
+    assert extract_published_generation(token_ids, logprobs, start=1) == (
+        [13],
+        [-0.2],
+    )
+    assert extract_published_generation(token_ids, logprobs, start=2) == ([], [])
+
+
+def test_extract_published_generation_skips_a_half_appended_position():
+    logprobs = _HalfAppendedLogprobs([_position(12, -0.1), _position(13, -0.2)])
+
+    assert extract_published_generation([12, 13], logprobs, start=0) == (
+        [12],
+        [-0.1],
+    )
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        ([12], None, "did not include logprobs"),
+        ([12], [_position(12, -0.1), _position(13, -0.2)], "token_count=1"),
+        ([12], [_position(99, -0.1)], "did not include the selected token"),
+    ],
+)
+def test_extract_published_generation_rejects_inconsistent_outputs(
+    token_ids, logprobs, error_match
+):
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_published_generation(token_ids, logprobs, start=0)
 
 
 def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
