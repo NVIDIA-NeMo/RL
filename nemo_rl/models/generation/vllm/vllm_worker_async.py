@@ -1235,6 +1235,14 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
                 final_prompt_token_ids = splice.token_ids
+                # Reject overflows before media validation can mask the length error.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
+
                 media = await asyncio.to_thread(
                     worker_self._capture_request_media,
                     engine_prompt,
@@ -1257,14 +1265,6 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
-
-                # Clamp after prefix replacement since the prompt length may have changed.
-                if actual_request_max_tokens is not None:
-                    self._clamp_max_tokens(
-                        request,
-                        actual_request_max_tokens,
-                        final_prompt_token_ids,
-                    )
 
                 # Token capture, token-in mode: the spliced prompt is the
                 # exact engine prompt; begin_call re-checks the prefix it

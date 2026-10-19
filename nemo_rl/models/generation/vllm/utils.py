@@ -204,6 +204,7 @@ def remap_multimodal_placeholders(
             entries.append((offset, modality, item_index, placeholder_range, length))
 
     search_start = 0
+    previous_old = previous_end = previous_new = 0
     resolved: dict[tuple[int, int], int] = {}
     for old_offset, modality, item_index, placeholder_range, length in sorted(
         entries, key=lambda entry: entry[0]
@@ -239,10 +240,18 @@ def remap_multimodal_placeholders(
                     search_end = splice.model_cut_end
             if new_offset is None:
                 max_start = search_end - length
+                candidates = range(search_start, max_start + 1)
+                if old_offset < previous_end:
+                    # Gemma can share a delimiter token between adjacent ranges.
+                    # Preserve their overlap without reusing unrelated pad runs.
+                    start = previous_new + old_offset - previous_old
+                    candidates = (
+                        range(start, start + 1) if 0 <= start <= max_start else range(0)
+                    )
                 new_offset = next(
                     (
                         candidate
-                        for candidate in range(search_start, max_start + 1)
+                        for candidate in candidates
                         if final_token_ids[candidate] == expected[0]
                         and final_token_ids[candidate : candidate + length] == expected
                     ),
@@ -255,6 +264,8 @@ def remap_multimodal_placeholders(
                 )
             resolved[(old_offset, length)] = new_offset
             search_start = new_offset + length
+            previous_old, previous_end = old_offset, old_offset + length
+            previous_new = new_offset
 
         if isinstance(placeholder_range, Mapping):
             updated_range = dict(placeholder_range)
