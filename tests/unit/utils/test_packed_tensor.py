@@ -302,3 +302,79 @@ def test_packed_broadcast_multiple_batches():
     total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
     expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
     assert total_broadcasted_size == expected_total_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_producer_carries_export_dependency_across_streams(
+    monkeypatch,
+):
+    """Each buffer's stream must wait for the previous buffer's export before packing.
+
+    ``full_tensor()`` registers the completion of its all-gather only on the
+    stream that was current when it ran. When the iterator yields several views
+    of one gathered tensor (per-expert weights) and the packer switches streams
+    between them, the new stream has to inherit that dependency, and it must do
+    so through an event recorded *before* the previous broadcast so the two
+    buffers still overlap. The old code only synchronized the reused buffer's
+    own stream and fails this test.
+    """
+    # Streams are identified by their CUDA handle: torch.cuda.current_stream()
+    # returns a fresh Python wrapper on every call, so object identity would
+    # never match the Stream objects the packer holds.
+    events: list = []  # ("record", event_id, cuda_stream) / ("wait", cuda_stream, event_id) / ("broadcast", cuda_stream)
+
+    real_event_cls = torch.cuda.Event
+
+    class _Event(real_event_cls):
+        def record(self, stream=None):
+            stream = stream if stream is not None else torch.cuda.current_stream()
+            events.append(("record", id(self), stream.cuda_stream))
+            return super().record(stream)
+
+    real_wait_event = torch.cuda.Stream.wait_event
+
+    def wait_event(self, event):
+        events.append(("wait", self.cuda_stream, id(event)))
+        return real_wait_event(self, event)
+
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", wait_event)
+
+    params = [(name, t.cuda()) for name, t in create_mock_model_params()]
+
+    class _Group:
+        def broadcast(self, tensor, src):
+            events.append(("broadcast", torch.cuda.current_stream().cuda_stream))
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=2000,
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=_Group(),
+            src=0,
+            post_iter_func=lambda x: x[1],
+            num_buffers=2,
+        )
+
+    broadcasts = [i for i, e in enumerate(events) if e[0] == "broadcast"]
+    assert len(broadcasts) >= 3, "need at least one buffer reuse to be meaningful"
+    for prev_b, next_b in zip(broadcasts[:-1], broadcasts[1:]):
+        prev_stream = events[prev_b][1]
+        next_stream = events[next_b][1]
+        assert prev_stream != next_stream, "buffers must alternate streams"
+        # An event recorded on the previous stream before its broadcast ...
+        recorded = {
+            e[1] for e in events[:prev_b] if e[0] == "record" and e[2] == prev_stream
+        }
+        # ... is waited on by the next stream before the next broadcast.
+        waited = {
+            e[2]
+            for e in events[prev_b:next_b]
+            if e[0] == "wait" and e[1] == next_stream
+        }
+        assert recorded & waited, (
+            "next buffer's stream did not wait on an export event recorded on the "
+            "previous stream before the previous broadcast"
+        )
