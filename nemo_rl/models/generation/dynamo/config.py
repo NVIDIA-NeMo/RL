@@ -70,6 +70,7 @@ _VLLM_CFG_FP8 = {
     "pow2_weight_scaling_factors",
     "quantization_ignore_patterns",
     "quantization_ignored_layer_kws",
+    "refit_prequantize",
     "use_deep_gemm",
 }
 
@@ -246,6 +247,12 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "policy.generation.vllm_cfg.http_server_api_key_required is not "
                 "supported by backend='dynamo'; the managed Dynamo frontend checks "
                 "no bearer token, so the exposed server would stay open"
+            )
+        if extra.get("refit_prequantize"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.refit_prequantize is not supported by "
+                "backend='dynamo'; managed Dynamo requests no trainer-side MXFP8 "
+                "pre-quantization"
             )
         if self.precision != "fp8":
             active_fp8_fields = sorted(key for key in _VLLM_CFG_FP8 if extra.get(key))
