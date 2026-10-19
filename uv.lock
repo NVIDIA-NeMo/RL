@@ -4031,7 +4031,6 @@ dependencies = [
     { name = "httptools" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
-    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "mcp" },
     { name = "omegaconf" },
@@ -4045,7 +4044,7 @@ dependencies = [
     { name = "pydot" },
     { name = "pyjwt" },
     { name = "python-multipart" },
-    { name = "ray", extra = ["default"], marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
+    { name = "requests" },
     { name = "rich" },
     { name = "scipy" },
     { name = "tqdm" },
@@ -4075,7 +4074,6 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'dev'", specifier = "<2" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
-    { name = "jinja2", specifier = ">=3.1" },
     { name = "jinja2", marker = "extra == 'ray'", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.18,<5" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
@@ -4088,7 +4086,6 @@ requires-dist = [
     { name = "openai", specifier = "==2.44.0" },
     { name = "opensandbox", marker = "extra == 'sandbox'", specifier = ">=0.1.15" },
     { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.92,<0.1" },
-    { name = "opentelemetry-instrumentation-aiohttp-client", marker = "extra == 'telemetry'", specifier = ">=0.60b0" },
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'telemetry'", specifier = ">=0.60b0" },
     { name = "orjson", specifier = ">=3.11.6" },
     { name = "packaging", specifier = ">=24.2" },
@@ -4105,8 +4102,8 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
     { name = "python-multipart", specifier = ">=0.0.27" },
-    { name = "ray", extras = ["default"], specifier = ">=2.58.0" },
     { name = "ray", extras = ["default"], marker = "extra == 'ray'", specifier = ">=2.58.0" },
+    { name = "requests" },
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
@@ -7606,7 +7603,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "sphinx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/8d/0e39fe2740d7d71417edf9a6424aa80ca2c27c17fc21282cdc39f90d5a40/sphinx_reredirects-1.1.0.tar.gz", hash = "sha256:fb9b195335ab14b43f8273287d0c7eeb637ba6c56c66581c11b47202f6718b29", size = 614624, upload-time = "2025-12-22T08:28:02.792248Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/8d/0e39fe2740d7d71417edf9a6424aa80ca2c27c17fc21282cdc39f90d5a40/sphinx_reredirects-1.1.0.tar.gz", hash = "sha256:fb9b195335ab14b43f8273287d0c7eeb637ba6c56c66581c11b47202f6718b29", size = 614624, upload-time = "2025-12-22T08:28:02.792Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/81/b5dd07067f3daac6d23687ec737b2d593740671ebcd145830c8f92d381c5/sphinx_reredirects-1.1.0-py3-none-any.whl", hash = "sha256:4b5692273c72cd2d4d917f4c6f87d5919e4d6114a752d4be033f7f5f6310efd9", size = 6351, upload-time = "2025-12-22T08:27:59.724893Z" },
 ]
