@@ -177,11 +177,18 @@ Parameter-efficient fine-tuning with LoRA: backend support, Automodel vs Megatro
 Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
 :::
 
-:::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
-:link: guides/cross-tokenizer-distillation
+:::{grid-item-card} {octicon}`git-compare` X-Token Cross-Tokenizer Distillation
+:link: guides/xtoken-off-policy-distillation
 :link-type: doc
 
-Choose X-Token projection matrices or CSD sub-token tables, prepare the tokenizer artifacts, and launch cross-tokenizer training.
+Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
+:::
+
+:::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation with CSD
+:link: guides/csd-cross-tokenizer-distillation
+:link-type: doc
+
+Common-Support Distillation across mismatched tokenizers — build the (student, teacher) sub-token tables and run CSD on Automodel or Megatron.
 :::
 
 :::{grid-item-card} {octicon}`arrow-both` Weight Refit
@@ -345,8 +352,8 @@ guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/automodel-speculative-decoding.md
 guides/yarn-long-context.md
-guides/cross-tokenizer-distillation.md
 guides/xtoken-off-policy-distillation.md
+guides/csd-cross-tokenizer-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
