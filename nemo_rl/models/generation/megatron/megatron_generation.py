@@ -655,7 +655,7 @@ class MegatronGeneration(GenerationInterface):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int,
         generation_prefix_batch_max_tokens: int,
-        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
@@ -666,7 +666,7 @@ class MegatronGeneration(GenerationInterface):
             raise NotImplementedError(
                 "Megatron generation does not capture sampler top-k"
             )
-        if generation_prefix_cleanup is not None and generation_prefix_cleanup.enabled:
+        if generation_prefix_cleanup.enabled:
             raise NotImplementedError(
                 "background prefix cleanup requires vLLM prefix recovery"
             )
