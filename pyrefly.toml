@@ -24,6 +24,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/megatron/stable_forward.py",
   "nemo_rl/environments/gym_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",

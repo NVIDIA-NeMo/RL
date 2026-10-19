@@ -1285,6 +1285,9 @@ class MegatronPolicyWorkerImpl(
                             ),
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
+                            stable_policy_forward=self.cfg["megatron_cfg"].get(
+                                "stable_policy_forward", False
+                            ),
                         )
 
                 # Clear mtp_grad_scale_func after the forward-backward pass so
@@ -1956,6 +1959,9 @@ class MegatronPolicyWorkerImpl(
                     ),
                     use_router_replay=use_router_replay,
                     router_replay_train=True,
+                    stable_policy_forward=self.cfg["megatron_cfg"].get(
+                        "stable_policy_forward", False
+                    ),
                 )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -2419,6 +2425,9 @@ class MegatronPolicyWorkerImpl(
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
+                stable_policy_forward=self.cfg["megatron_cfg"].get(
+                    "stable_policy_forward", False
+                ),
             )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
@@ -2727,6 +2736,9 @@ class MegatronPolicyWorkerImpl(
             straggler_timer=self.mcore_state.straggler_timer,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
             enable_opd_full_capture=(payload == "hidden_states"),
+            stable_policy_forward=self.cfg["megatron_cfg"].get(
+                "stable_policy_forward", False
+            ),
         )
 
         teacher_full_payload = None
@@ -2946,6 +2958,9 @@ class MegatronPolicyWorkerImpl(
             sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+            stable_policy_forward=self.cfg["megatron_cfg"].get(
+                "stable_policy_forward", False
+            ),
         )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):

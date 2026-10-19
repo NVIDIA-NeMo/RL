@@ -66,6 +66,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
+from nemo_rl.models.megatron.stable_forward import stabilized_forward
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
     set_router_replay_backward,
@@ -337,7 +338,15 @@ def forward_with_post_processing_fn(
             raise RuntimeError(
                 "Router replay is enabled but routed_experts is missing from the microbatch."
             )
-        set_router_replay_forward(model, routed_experts_cp_sharded)
+        replay_padding_mask = None
+        if packed_seq_params is None:
+            replay_padding_mask = torch.arange(
+                routed_experts_cp_sharded.shape[1],
+                device=routed_experts_cp_sharded.device,
+            ).unsqueeze(0) >= data_dict["input_lengths"].unsqueeze(1)
+        set_router_replay_forward(
+            model, routed_experts_cp_sharded, padding_mask=replay_padding_mask
+        )
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
     #
@@ -497,6 +506,8 @@ def megatron_forward_backward(
     use_router_replay: bool = False,
     router_replay_train: bool = False,
     model_slices_context_parallel_inputs: bool = False,
+    *,
+    stable_policy_forward: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -512,6 +523,7 @@ def megatron_forward_backward(
         mbs: Micro batch size
         post_processing_fn: Post-processing function to post-process the logits
         forward_only: If True, skip backward pass
+        stable_policy_forward: Use source-pinned BF16 forwards in all scheduler phases.
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         global_valid_seqs: Global valid sequence count for loss normalization
         global_valid_toks: Global valid token count for loss normalization
@@ -545,7 +557,10 @@ def megatron_forward_backward(
     forward_backward_func = get_forward_backward_func()
     if use_router_replay:
         clear_router_replay(model)
-    with suspend_activation_offload_for_forward_only(model, forward_only):
+    with (
+        suspend_activation_offload_for_forward_only(model, forward_only),
+        stabilized_forward(enabled=stable_policy_forward),
+    ):
         try:
             return forward_backward_func(
                 forward_step_func=forward_step,

@@ -450,6 +450,8 @@ def build_router_replay_tensors(
 def build_router_replay_assignments(
     model: Any,
     routed_experts: torch.Tensor,
+    *,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> list[tuple[Any, torch.Tensor]]:
     """Pair model-owned MCore RouterReplay instances with their replay tensors."""
     local_routed_experts = _normalize_routed_experts_for_mcore(routed_experts)
@@ -465,6 +467,13 @@ def build_router_replay_assignments(
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )
+    local_padding = None
+    if padding_mask is not None:
+        if tuple(padding_mask.shape) != tuple(routed_experts.shape[:2]):
+            raise ValueError("Dense replay padding mask must match [batch, seq].")
+        local_padding = _split_for_sequence_parallel(
+            model_config, padding_mask.transpose(0, 1).reshape(-1)
+        )
     global_moe_layers = _global_moe_layer_numbers(model_config)
     total_num_layers = int(getattr(model_config, "num_layers"))
     num_payload_layers = local_routed_experts.shape[1]
@@ -497,6 +506,10 @@ def build_router_replay_assignments(
         replay_tensor = (
             local_routed_experts[:, payload_idx, :].to(dtype=torch.long).contiguous()
         )
+        if local_padding is not None:
+            replay_tensor = _balance_replay_padding(
+                replay_tensor, local_padding, model_config
+            )
         setattr(replay_instance, "_nrl_layer_number", layer_number)
         _validate_replay_tensor(
             replay_tensor,
@@ -519,12 +532,61 @@ def build_router_replay_assignments(
     return replay_assignments
 
 
-def set_router_replay_forward(model: Any, routed_experts: torch.Tensor) -> None:
+def _balance_replay_padding(
+    replay_tensor: torch.Tensor,
+    padding_mask: torch.Tensor,
+    model_config: Any,
+) -> torch.Tensor:
+    """Spread ignored dense padding across experts without changing real routes.
+
+    Constant arange(topk) padding overloads the first expert ranks on long,
+    unequal rows. Only independent, dropless routers may change dummy routes;
+    capacity, auxiliary losses, or bias updates could couple them to real tokens.
+    """
+    independent_settings = {
+        "moe_expert_capacity_factor": None,
+        "moe_expert_rank_capacity_factor": None,
+        "moe_pad_experts_for_cuda_graph_inference": False,
+        "moe_token_dropping": False,
+        "moe_router_load_balancing_type": "none",
+        "moe_router_bias_update_rate": 0.0,
+    }
+    if any(
+        not hasattr(model_config, name) or getattr(model_config, name) != expected
+        for name, expected in independent_settings.items()
+    ):
+        return replay_tensor
+    num_experts = model_config.num_moe_experts
+    topk = replay_tensor.shape[-1]
+    if num_experts is None or not 0 < topk <= num_experts:
+        raise ValueError("Padding routes require 0 < topk <= num_moe_experts.")
+    padding_positions = padding_mask.nonzero(as_tuple=True)[0]
+    if padding_positions.numel() == 0:
+        return replay_tensor
+    routes = (
+        torch.arange(
+            padding_positions.numel() * topk,
+            device=replay_tensor.device,
+            dtype=replay_tensor.dtype,
+        ).reshape(-1, topk)
+        % num_experts
+    )
+    balanced = replay_tensor.clone()
+    balanced[padding_positions] = routes
+    return balanced
+
+
+def set_router_replay_forward(
+    model: Any,
+    routed_experts: torch.Tensor,
+    *,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
     _install_missing_route_fallback_patch()
     for replay_instance, replay_tensor in build_router_replay_assignments(
-        model, routed_experts
+        model, routed_experts, padding_mask=padding_mask
     ):
         replay_instance.set_target_indices(replay_tensor)
         trace_router_replay_action(

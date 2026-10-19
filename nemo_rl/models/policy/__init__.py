@@ -375,6 +375,8 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
+    # Opt in to source-pinned BF16 policy forwards for scoring and training.
+    stable_policy_forward: NotRequired[bool]
     env_vars: NotRequired[dict[str, str] | None]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
