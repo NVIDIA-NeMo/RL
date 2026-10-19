@@ -1229,9 +1229,21 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
     # The default on_dropped_prompt="shrink" would silently shrink the step instead.
     if algo_cfg.use_dynamic_sampling:
-        # The block keys on algo_cfg, so it governs whichever algorithm is configured;
-        # name the offending key accordingly instead of always saying `grpo`.
-        algo_prefix = "ppo" if is_ppo_run(master_config) else "grpo"
+        # Dynamic-sampling drops shorten the training step. PPO's critic shards that
+        # step against value.train_global_batch_size, so the first short step fails a
+        # divisibility assert inside the value workers (#2625) -- and the PPO drop-budget
+        # guard below does not catch this, since dynamic-sampling drops are counted
+        # separately from max_skipped_prompts/max_consecutive_dropped_prompts. Reject it
+        # at setup rather than letting the run fail deep in. Dynamic sampling is GRPO-only.
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "ppo.use_dynamic_sampling is not supported on the SingleController "
+                "path: a dropped group shortens the training step and the critic shards "
+                "it against value.train_global_batch_size, failing a divisibility assert "
+                "in the value workers (#2625). Dynamic sampling is GRPO-only."
+            )
+        # Reached only for GRPO (PPO is rejected above); name the key accordingly.
+        algo_prefix = "grpo"
         rollout_failure = async_config.rollout_failure
         if rollout_failure.on_dropped_prompt != "replace":
             raise ValueError(
