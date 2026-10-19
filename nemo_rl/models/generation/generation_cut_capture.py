@@ -432,6 +432,52 @@ class GenerationCutCaptureMixin:
             admission, prefix_token_ids, snapshots
         )
 
+    def _resolve_usable_generation_cut(
+        self, admission: Any, prefix_token_ids: list[int]
+    ) -> tuple[Any, Any | None]:
+        """Resolve an admission's restored prefix, or drop it so the call regenerates.
+
+        Gym has already consumed the restored cut when it sends this call, and
+        generating the whole response from the turn boundary is always valid,
+        so a prefix that cannot be fetched or does not match its admission
+        costs time, not the rollout. Returns the admission to serve and the
+        verified prefix snapshot, or the admission without its cut and None.
+        """
+        continuation = admission.generation_cut
+        if continuation is None:
+            return admission, None
+        try:
+            snapshot = GenerationCutCaptureMixin._resolve_generation_cut(
+                self, admission, prefix_token_ids
+            )
+            # Checked here, before the prefix is spliced into the prompt; Gym's
+            # begin_call repeats it and would otherwise fail the call.
+            if snapshot.digest != continuation.prefix_digest:
+                raise RuntimeError("rebuilt prefix digest does not match the admission")
+            generated = sum(mask == 1.0 for mask in snapshot.token_mask_delta)
+            if generated != continuation.prefix_token_count:
+                raise RuntimeError(
+                    f"rebuilt prefix has {generated} generated tokens, "
+                    f"admission expects {continuation.prefix_token_count}"
+                )
+            return admission, snapshot
+        except Exception:  # noqa: BLE001 - any unusable prefix regenerates
+            LOGGER.warning(
+                "cannot restore the generation prefix of model call %s; "
+                "regenerating it from its turn boundary",
+                admission.model_call_id,
+                exc_info=True,
+            )
+        # The regenerated call will not extend these rows, so they are retired
+        # here instead of by its terminal write.
+        self._generation_cut_cleanup_executor.submit(
+            GenerationCutCaptureMixin._clear_generation_cut_rows_after_snapshot_fence,
+            self,
+            admission.model_call_id,
+            tuple(continuation.staging_keys),
+        )
+        return admission.model_copy(update={"generation_cut": None}), None
+
     def get_generation_prefix_restore_counts(self) -> dict[str, int]:
         """Calls resumed from a restored generation prefix since this process started.
 
@@ -459,6 +505,7 @@ class GenerationCutCaptureMixin:
             return True
         if not state.lifecycle_lock.acquire(blocking=blocking):
             return False
+        obsolete_staging_keys: tuple[str, ...] = ()
         try:
             if not state.terminal_started:
                 state.terminal_started = True
@@ -468,9 +515,52 @@ class GenerationCutCaptureMixin:
                     self._remember_completed_capture(
                         state.call.model_call_id, coords, 0
                     )
+                    obsolete_staging_keys = tuple(state.generation_cut_staging_keys)
         finally:
             state.lifecycle_lock.release()
+        if obsolete_staging_keys:
+            # Off the caller's thread: the clear may wait at the snapshot gate,
+            # and the fast abort runs on the serving event loop.
+            self._generation_cut_cleanup_executor.submit(
+                GenerationCutCaptureMixin._clear_generation_cut_rows_after_snapshot_fence,
+                self,
+                state.call.model_call_id,
+                obsolete_staging_keys,
+            )
         return True
+
+    def _clear_generation_cut_rows_after_snapshot_fence(
+        self, model_call_id: str, staging_keys: tuple[str, ...]
+    ) -> None:
+        """Delete an ended call's chunk rows outside any cut-to-snapshot window."""
+        gate = self._token_capture_snapshot_gate
+        gate.enter()
+        try:
+            GenerationCutCaptureMixin._clear_generation_cut_rows(
+                self, model_call_id, staging_keys
+            )
+        finally:
+            gate.exit()
+
+    def _clear_generation_cut_rows(
+        self, model_call_id: str, staging_keys: tuple[str, ...]
+    ) -> None:
+        """Delete a call's chunk rows; the caller holds a snapshot-gate permit.
+
+        Once the call has ended no live reader needs them, and a committed
+        snapshot that names them saved its own copy of TransferQueue, so only a
+        snapshot still in progress must be waited out.
+        """
+        sink = self._capture_sink
+        if not staging_keys or sink is None:
+            return
+        try:
+            sink.clear(list(staging_keys))
+        except Exception:  # noqa: BLE001 - the call has already ended
+            LOGGER.exception(
+                "failed to clear obsolete generation chunks for model call %s",
+                model_call_id,
+            )
 
     async def _run_generation_cut_control(
         self,
@@ -504,12 +594,17 @@ class GenerationCutCaptureMixin:
                 "generation-prefix inventory identity does not match the "
                 f"completed call: model_call_id={prefix.model_call_id!r}"
             )
-        if (
-            completed is not None
-            and completed.coords.disposition == "staged"
-            and completed.effective_output_limit is not None
-            and completed.terminal_finish_reason is not None
-        ):
+        if completed is None:
+            unusable_reason = "its terminal result is no longer retained"
+        elif completed.coords.disposition != "staged":
+            unusable_reason = (
+                f"its terminal write ended as {completed.coords.disposition!r}"
+            )
+        elif completed.effective_output_limit is None:
+            unusable_reason = "vLLM did not resolve its effective output limit"
+        elif completed.terminal_finish_reason is None:
+            unusable_reason = "it finished without a stop or length finish reason"
+        else:
             return GenerationCutPrefixAck(
                 **prefix.model_dump(mode="json"),
                 disposition="durable_prefix",
@@ -522,7 +617,12 @@ class GenerationCutCaptureMixin:
                 terminal_finish_reason=completed.terminal_finish_reason,
                 terminal_stop_reason=completed.terminal_stop_reason,
             )
-        # Evidence for this completion aged out; restart it from its prior boundary.
+        # The call regenerates from its previous boundary after a restore.
+        LOGGER.warning(
+            "cannot cut completed model call %s: %s",
+            prefix.model_call_id,
+            unusable_reason,
+        )
         return GenerationCutPrefixAck.failure(prefix)
 
     def _checkpoint_active_generation_cut(
@@ -568,7 +668,11 @@ class GenerationCutCaptureMixin:
                 effective_output_limit = state.effective_output_limit
                 terminal_finish_reason = state.terminal_finish_reason
                 terminal_stop_reason = state.terminal_stop_reason
-                if uncuttable_reason is None and observation_error is None:
+                if (
+                    uncuttable_reason is None
+                    and observation_error is None
+                    and effective_output_limit is not None
+                ):
                     (
                         frozen_buffer_id,
                         chunk_sequence,
@@ -600,6 +704,17 @@ class GenerationCutCaptureMixin:
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
+            if effective_output_limit is None:
+                # Checked before freezing, so the call's buffer is untouched.
+                LOGGER.warning(
+                    "cannot cut model call %s: vLLM did not resolve its "
+                    "effective output limit",
+                    prefix.model_call_id,
+                )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_failure",
+                )
             inherited_prefix_token_count = (
                 state.call.admission.generation_cut.prefix_token_count
                 if state.call.admission.generation_cut is not None
@@ -608,25 +723,32 @@ class GenerationCutCaptureMixin:
             total_generation_token_count = inherited_prefix_token_count + len(
                 generated_token_ids
             )
-            if total_generation_token_count == 0 or (
-                generated_token_ids
-                and _ends_inside_character(
-                    self._generation_cut_tokenizer,
-                    state.resumed_generation_token_ids + generated_token_ids,
+            unusable_prefix = True
+            if total_generation_token_count == 0:
+                # Expected for a call still prefilling; nothing to keep yet.
+                LOGGER.debug(
+                    "not cutting model call %s: it has no generated tokens yet",
+                    prefix.model_call_id,
                 )
+            elif generated_token_ids and _ends_inside_character(
+                self._generation_cut_tokenizer,
+                state.resumed_generation_token_ids + generated_token_ids,
             ):
+                LOGGER.warning(
+                    "cannot cut model call %s: its %d generated tokens end inside "
+                    "a multi-byte character",
+                    prefix.model_call_id,
+                    total_generation_token_count,
+                )
+            else:
+                unusable_prefix = False
+            if unusable_prefix:
                 with state.lock:
                     state.rollback_frozen_cut(checkpoint_id)
                 return GenerationCutPrefixAck(
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
-            if effective_output_limit is None:
-                raise RuntimeError(
-                    f"cannot cut model call {prefix.model_call_id!r}: "
-                    "vLLM did not resolve its effective output limit"
-                )
-
             staged_key = None
             try:
                 cumulative_record = capture.build_prefix_record(
@@ -729,10 +851,11 @@ class GenerationCutCaptureMixin:
                 remaining = inventory.active_prefixes[index:]
                 LOGGER.warning(
                     "generation cut passed its control deadline: checkpoint_id=%s "
-                    "uncut=%d of %d",
+                    "uncut=%d of %d model_call_ids=%s",
                     inventory.checkpoint_id,
                     len(remaining),
                     len(inventory.active_prefixes),
+                    [uncut.model_call_id for uncut in remaining],
                 )
                 acknowledgements.extend(
                     GenerationCutPrefixAck.failure(uncut) for uncut in remaining
@@ -740,18 +863,32 @@ class GenerationCutCaptureMixin:
                 break
             with self._capture_registry_lock:
                 state = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
-            if state is None:
-                acknowledgements.append(
-                    self._completed_generation_cut_ack(prefix, inventory.checkpoint_id)
+            try:
+                acknowledgement = (
+                    self._checkpoint_active_generation_cut(
+                        prefix, state, inventory.checkpoint_id
+                    )
+                    if state is not None
+                    else None
                 )
-                continue
-            acknowledgement = self._checkpoint_active_generation_cut(
-                prefix, state, inventory.checkpoint_id
-            )
-            if acknowledgement is None:
-                acknowledgement = self._completed_generation_cut_ack(
-                    prefix, inventory.checkpoint_id
+                if acknowledgement is None:
+                    acknowledgement = self._completed_generation_cut_ack(
+                        prefix, inventory.checkpoint_id
+                    )
+            # Gym acknowledges cuts per call, so one call's failure (a TQ write,
+            # an identity mismatch) regenerates that call alone after a restore
+            # instead of failing the receipt for every call on this worker.
+            except Exception:  # noqa: BLE001 - see above
+                LOGGER.exception(
+                    "cannot cut model call %s; it regenerates after a restore",
+                    prefix.model_call_id,
                 )
+                if state is not None:
+                    with state.lock:
+                        frozen = state.frozen_cut
+                        if frozen is not None and frozen[0] == inventory.checkpoint_id:
+                            state.rollback_frozen_cut(inventory.checkpoint_id)
+                acknowledgement = GenerationCutPrefixAck.failure(prefix)
             acknowledgements.append(acknowledgement)
         receipt = GenerationCutReceipt(
             checkpoint_id=inventory.checkpoint_id,
