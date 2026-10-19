@@ -84,7 +84,7 @@ training remains in BF16, and this setting does not change optimizer-state
 precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
 blocks and FP32 scales. By default only the routed-expert weights are converted;
 attention, routers, shared experts, embeddings, and the output head remain in
-BF16 (see [Quantized scope](#quantized-scope) to change this).
+BF16.
 
 This path starts from a BF16 policy checkpoint. Direct loading of a
 pre-quantized ModelOpt FP8 checkpoint is outside its scope.
@@ -98,50 +98,15 @@ policy:
       precision: fp8
 ```
 
-The path is not gated on model type. It quantizes routed-expert weights, either
-fused (`mlp.experts.gate_up_proj` / `down_proj`, the Qwen3.5 layout) or per-expert
-(`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout). With the
-default scope, setup fails if no routed-expert weight is found, or if the model
-has dense MLP weights that would stay BF16.
+Supported models are Qwen3.5 MoE (`qwen3_5_moe`) and Qwen3 MoE (`qwen3_moe`);
+setup fails for any other model type. The path quantizes routed-expert weights,
+either fused (`mlp.experts.gate_up_proj` / `down_proj`, the Qwen3.5 layout) or
+per-expert (`mlp.experts.{i}.{gate,up,down}_proj.weight`, the Qwen3 MoE layout).
+Setup also fails if no routed-expert weight is found, or if the model has dense
+MLP weights that would stay BF16. Supporting another model means extending the
+routed-expert name patterns in `quantization/fp8.py`.
 
-#### Quantized scope
-
-Set `quantization_ignore_patterns` under `trtllm_cfg` (the same key as
-`vllm_cfg`) to choose which modules stay BF16. Patterns are matched against
-module names with `fnmatch` or a `re:` regex, and a module is ignored if it or any
-ancestor matches. A list replaces the default scope: every 2-D linear weight and
-routed expert that is not ignored is quantized. `lm_head`, embeddings, routers
-(`mlp.gate`, `mlp.shared_expert_gate`), and linear-attention `in_proj_*` always stay
-BF16. Patterns are HF module names (on Qwen3.5, `model.language_model.layers.*`).
-
-```yaml
-policy:
-  generation:
-    trtllm_cfg:
-      precision: fp8
-      quantization_ignore_patterns:
-        - model.language_model.layers.*.linear_attn*  # keep linear attention in BF16
-```
-
-This quantizes attention, shared experts, and the routed experts of a Qwen3.5 MoE
-model, and keeps linear attention and the always-BF16 modules in BF16.
-
-Unlike `vllm_cfg.quantization_ignore_patterns`, the default scope is routed experts
-only (vLLM quantizes every linear layer and the experts), and a list replaces that
-default instead of being appended to vLLM's ignore set. For example,
-`["*attn*"]` quantizes everything except attention and the always-BF16 modules,
-including shared experts, unless they are also listed. The key is accepted for
-both block-FP8 and MXFP8 (vLLM requires MXFP8).
-
-List shared experts, vision, or MTP modules explicitly to keep them in BF16 for
-models that have them. Setup fails if the patterns ignore every weight.
-
-Tested models:
-
-| Model | Status |
-| --- | --- |
-| Qwen3.5 MoE | Verified |
-| Qwen3 MoE | Verified (Qwen3-30B-A3B, block-FP8 and MXFP8; attention + experts scope with block-FP8) |
+Verified: Qwen3.5 MoE, and Qwen3 MoE (Qwen3-30B-A3B, block-FP8 and MXFP8).
 
 NeMo RL initializes the TensorRT-LLM model with `load_format` set
 to `dummy`, then populates it from the first BF16 policy refit. By default
@@ -172,9 +137,7 @@ The installed TensorRT-LLM must provide the incremental-refit lifecycle APIs
 `begin_update_weights`, `finalize_update_weights`, `abort_update_weights`, and
 `WorkerExtension.finalize_weight_update`. NeMo RL fails during setup if any of
 the three model-loader hooks is missing; `finalize_weight_update` is called
-directly and is not checked up front. Supporting another model architecture
-with a different expert layout requires extending the weight-name patterns in
-`quantization/fp8.py`.
+directly and is not checked up front.
 
 ## Minimal Configuration
 

@@ -122,27 +122,11 @@ class NcclExtension(WorkerExtension):
     #  Refit metadata (weight name → (shape, dtype) mapping)
     # ------------------------------------------------------------------ #
 
-    def prepare_refit_info(
-        self,
-        state_dict_info: dict[str, Any],
-        quantization_ignore_patterns: list[str] | None = None,
-    ) -> None:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
         model = self.engine.model_engine.model
-        quant_config = model.model_config.quant_config
-        if fp8_quantization.is_quantized_expert_refit(quant_config):
-            # None: routed experts only. Otherwise quantize what the built engine
-            # model holds as FP8 (it applies its own excludes on top of the patterns).
-            self._fp8_quantized_names = (
-                None
-                if quantization_ignore_patterns is None
-                else fp8_quantization.resolve_quantized_weights(
-                    model, quant_config, state_dict_info
-                )
-            )
-            fp8_quantization.validate_routed_experts(
-                state_dict_info, quantized_names=self._fp8_quantized_names
-            )
+        if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+            fp8_quantization.validate_routed_experts(state_dict_info)
             _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     # ------------------------------------------------------------------ #
@@ -185,7 +169,6 @@ class NcclExtension(WorkerExtension):
                     is_mx=fp8_quantization.is_mxfp8_model(
                         model.model_config.quant_config
                     ),
-                    quantized_names=getattr(self, "_fp8_quantized_names", None),
                 )
             else:
                 weights = dict(weight_list)
@@ -298,7 +281,6 @@ class NcclExtension(WorkerExtension):
                         is_mx=fp8_quantization.is_mxfp8_model(
                             model.model_config.quant_config
                         ),
-                        quantized_names=getattr(self, "_fp8_quantized_names", None),
                     )
                     # The mapper may retain split QKVZ/BA views across IPC chunks;
                     # detach them before ACK lets the trainer reuse the buffer.

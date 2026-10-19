@@ -336,29 +336,26 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         if engine_cfg.get("is_mx") and engine_cfg["precision"] != "fp8":
             raise ValueError("engine_cfg.is_mx=True requires precision='fp8'")
-        if (
-            engine_cfg.get("quantization_ignore_patterns") is not None
-            and engine_cfg["precision"] != "fp8"
-        ):
-            raise ValueError(
-                "engine_cfg.quantization_ignore_patterns requires precision='fp8'"
-            )
 
         if engine_cfg["precision"] == "fp8":
             # Imported here: TRT-LLM is an optional dependency.
             from tensorrt_llm.llmapi.llm_args import MoeConfig
+            from transformers import AutoConfig
 
             from nemo_rl.models.generation.trtllm.quantization.fp8 import (
                 configure_fp8_llm_kwargs,
                 configure_fp8_moe_backend,
+                validate_model_type,
+            )
+
+            validate_model_type(
+                AutoConfig.from_pretrained(
+                    self.model_name, trust_remote_code=True
+                ).model_type
             )
 
             is_mx = bool(engine_cfg.get("is_mx"))
-            configure_fp8_llm_kwargs(
-                llm_kwargs,
-                is_mx=is_mx,
-                ignore_patterns=engine_cfg.get("quantization_ignore_patterns"),
-            )
+            configure_fp8_llm_kwargs(llm_kwargs, is_mx=is_mx)
 
             # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
             # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
@@ -526,11 +523,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         assert self.llm is not None
-        patterns = self.cfg["trtllm_cfg"].get("quantization_ignore_patterns")
-        kwargs = {} if patterns is None else {"quantization_ignore_patterns": patterns}
-        await self.llm.collective_rpc(
-            "prepare_refit_info", args=(state_dict_info,), kwargs=kwargs
-        )
+        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def update_weights_from_collective_async(
         self, *, drain: bool = True, recompute_kv: bool = False
