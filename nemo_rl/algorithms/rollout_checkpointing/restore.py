@@ -478,13 +478,7 @@ class RolloutRestorer(_UsesRolloutParts):
         self._rollout_runtime.sampler_stamps_target_steps = (
             parsed_state.sampler_stamps_target_steps
             if parsed_state.sampler_stamps_target_steps is not None
-            else any(
-                group.target_step is not None for group in recovery_ledger.groups()
-            )
-            or any(
-                group.get("target_step") is not None
-                for group in canonical_state["groups"]
-            )
+            else bool(recovery_ledger.groups()) or bool(canonical_state["groups"])
         )
 
         groups_to_recover = recovery_ledger.groups()
