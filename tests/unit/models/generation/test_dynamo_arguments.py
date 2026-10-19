@@ -164,6 +164,10 @@ def test_config_accepts_collective_and_nccl_reshard_refit(refit_transport) -> No
         ({"precision": "fp8", "kv_cache_dtype": "fp8"}, "kv_cache_dtype"),
         ({"is_mx": True}, "require precision='fp8'"),
         ({"num_last_layers_in_bf16": 2}, "require precision='fp8'"),
+        (
+            {"precision": "fp8", "is_mx": True, "refit_prequantize": True},
+            "refit_prequantize is not supported",
+        ),
     ],
 )
 def test_config_rejects_unsupported_parallelism_and_precision(vllm_cfg, match) -> None:

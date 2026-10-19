@@ -35,6 +35,10 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_environment,
 )
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    draft_module_sharing_disable_required,
+)
 
 
 def _fp8_engine_args(
@@ -189,6 +193,13 @@ class DynamoVllmWorker:  # pragma: no cover
                 vllm_kwargs,
                 validated_config.engine_world_size,
             )
+        # As on the vLLM backend: a full-stream co-trained drafter refits its own
+        # embed_tokens/lm_head, so they must not alias the target model's.
+        draft_env = (
+            {DRAFT_DISABLE_MODULE_SHARING_ENV: "1"}
+            if draft_module_sharing_disable_required(config)
+            else {}
+        )
         configured_env = dict(vllm_cfg.get("env_vars") or {})
         worker_env = build_managed_worker_env(
             base_env={**os.environ, **engine_env_defaults},
@@ -196,6 +207,7 @@ class DynamoVllmWorker:  # pragma: no cover
             manager_env={
                 **manager_env,
                 **fp8_env,
+                **draft_env,
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
