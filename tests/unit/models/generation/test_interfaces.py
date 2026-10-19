@@ -18,6 +18,9 @@ import pytest
 import torch
 
 from nemo_rl.data.captured_media import MediaColumnSpec
+from nemo_rl.data_plane.background_prefix_cleanup import (
+    GenerationPrefixCleanupConfig,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     agreed_media_columns,
@@ -51,6 +54,7 @@ def test_setup_token_capture_default_names_the_backend():
             "staging",
             generation_prefix_batch_size=256,
             generation_prefix_batch_max_tokens=4_194_304,
+            generation_prefix_cleanup=GenerationPrefixCleanupConfig(),
         )
 
 

@@ -322,11 +322,13 @@ def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bo
 
 
 class _TokenCaptureSnapshotGate:
-    """Drain active terminal writes and block new ones across a TQ snapshot.
+    """Fence terminal writes and background prefix CLEARs across a TQ snapshot.
 
-    Each fence takes an epoch before its close is queued. ``reopen`` releases
-    every epoch issued so far, so a close that runs after the driver already
-    timed out and released its fence is a no-op instead of a stuck gate.
+    A closed gate waits for active permit holders and blocks new ones until
+    ``reopen``. Each fence takes an epoch before its close is queued.
+    ``reopen`` releases every epoch issued so far, so a close that runs after
+    the driver already timed out and released its fence is a no-op instead of
+    a stuck gate.
     """
 
     def __init__(self) -> None:

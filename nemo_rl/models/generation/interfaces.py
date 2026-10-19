@@ -680,7 +680,7 @@ class GenerationInterface(ABC):
         generation_cut_control_timeout_s: float | None = None,
         generation_prefix_batch_size: int,
         generation_prefix_batch_max_tokens: int,
-        generation_prefix_cleanup: GenerationPrefixCleanupConfig | None = None,
+        generation_prefix_cleanup: GenerationPrefixCleanupConfig,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -700,12 +700,12 @@ class GenerationInterface(ABC):
                 coordinator to authorize generation-cut requests.
             generation_cut_control_timeout_s: Bound on one generation-cut
                 request; calls not cut by then are acknowledged as failures.
-            generation_prefix_cleanup: Optional checkpoint-coordinated background
-                deletion of obsolete prefix keys (vLLM prefix recovery only).
             generation_prefix_batch_size: Maximum active calls per cut-time TQ put,
                 and maximum prefix keys per restore-time TQ get.
             generation_prefix_batch_max_tokens: Maximum token rows accumulated in
                 one cut-time TQ put; a single larger row is not split.
+            generation_prefix_cleanup: Checkpoint-coordinated background deletion
+                of obsolete prefix keys; only vLLM prefix recovery may enable it.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

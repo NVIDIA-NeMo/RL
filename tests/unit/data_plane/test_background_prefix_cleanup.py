@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Background deletes obey snapshot epochs and bounded terminal admission."""
+"""Background deletes run under the snapshot gate and never block its fence."""
 
+import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 
 import pytest
 
@@ -25,9 +26,40 @@ from nemo_rl.data_plane.background_prefix_cleanup import (
 from nemo_rl.models.generation.generation_cut_capture import _TokenCaptureSnapshotGate
 
 
-def test_fence_waits_only_for_active_batch_and_resume_drains_queue():
-    entered, release = threading.Event(), threading.Event()
-    calls = []
+def _wait_for(predicate, timeout_s=5.0):
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, "condition was not reached"
+        time.sleep(0.005)
+
+
+def _fence(gate):
+    """Close the gate the way a checkpoint fence does."""
+    gate.close_and_wait(gate.begin_epoch())
+
+
+def test_closed_gate_defers_clears_until_reopen():
+    gate = _TokenCaptureSnapshotGate()
+    cleared, done = [], threading.Event()
+
+    def clear(keys):
+        cleared.append(keys)
+        done.set()
+
+    cleanup = BackgroundPrefixCleanup(
+        clear, gate, config=GenerationPrefixCleanupConfig(batch_size=1)
+    )
+    _fence(gate)
+    cleanup.submit(["a"])
+    assert not done.wait(0.2)
+    gate.reopen()
+    assert done.wait(5)
+    assert cleared == [["a"]]
+
+
+def test_fence_waits_for_a_running_clear_and_blocks_the_next():
+    gate = _TokenCaptureSnapshotGate()
+    calls, entered, release = [], threading.Event(), threading.Event()
 
     def clear(keys):
         calls.append(keys)
@@ -35,139 +67,123 @@ def test_fence_waits_only_for_active_batch_and_resume_drains_queue():
         assert release.wait(5)
 
     cleanup = BackgroundPrefixCleanup(
-        clear,
+        clear, gate, config=GenerationPrefixCleanupConfig(batch_size=1)
+    )
+    cleanup.submit(["running"])
+    assert entered.wait(5)
+    fenced = threading.Event()
+    fence = threading.Thread(target=lambda: (_fence(gate), fenced.set()))
+    fence.start()
+    # The fence has closed the gate and is waiting for the running CLEAR.
+    assert not fenced.wait(0.2)
+    entered.clear()
+    cleanup.submit(["queued"])
+    release.set()
+    assert fenced.wait(5)
+    # No CLEAR starts while the fence holds the gate closed.
+    assert not entered.wait(0.2)
+    gate.reopen()
+    assert entered.wait(5)
+    fence.join(5)
+    assert calls == [["running"], ["queued"]]
+
+
+def test_full_queue_blocks_producers_without_holding_a_gate_permit():
+    gate = _TokenCaptureSnapshotGate()
+    cleared = []
+    cleanup = BackgroundPrefixCleanup(
+        cleared.append,
+        gate,
         config=GenerationPrefixCleanupConfig(
-            batch_size=2, max_pending=4, wait_seconds=0
+            batch_size=1, max_pending=1, wait_seconds=0
         ),
     )
-    try:
-        cleanup.reserve().submit(["first"])
-        assert entered.wait(5)
-        cleanup.pause(1)
-        cleanup.reserve().submit(["second"])
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fence = pool.submit(cleanup.wait_paused, 1)
-            assert not fence.done()
-            release.set()
-            fence.result(5)
-        assert calls == [["first"]]
-        assert cleanup.stats().queued_requests == 1
-        cleanup.resume()
-    finally:
-        release.set()
-        cleanup.resume()
-        cleanup.close()
-    assert calls == [["first"], ["second"]]
+    _fence(gate)
+    # The cleanup thread takes "first" and blocks at the closed gate; "second"
+    # fills the queue, so "third" blocks its producer.
+    cleanup.submit(["first"])
+    cleanup.submit(["second"])
+    producer = threading.Thread(target=cleanup.submit, args=(["third"],))
+    producer.start()
+    producer.join(0.2)
+    assert producer.is_alive()
+    # Neither the blocked producer nor the waiting thread holds a permit, so a
+    # later fence still completes at once.
+    second_fence = threading.Thread(target=_fence, args=(gate,))
+    second_fence.start()
+    second_fence.join(5)
+    assert not second_fence.is_alive()
+    gate.reopen()
+    producer.join(5)
+    assert not producer.is_alive()
+    _wait_for(lambda: len(cleared) == 3)
+    assert cleared == [["first"], ["second"], ["third"]]
 
 
-def test_full_queue_backpressure_cannot_hold_terminal_gate():
+def test_failed_clear_is_dropped_without_retry_and_cleanup_keeps_serving(caplog):
     gate = _TokenCaptureSnapshotGate()
-    cleanup = BackgroundPrefixCleanup(
-        lambda keys: None,
-        config=GenerationPrefixCleanupConfig(batch_size=1, max_pending=1),
-    )
-    cleanup.pause(1)
-    cleanup.reserve().submit(["queued"])
-    attempting = threading.Event()
-
-    def terminal():
-        attempting.set()
-        reservation = cleanup.reserve()
-        try:
-            gate.enter()
-            try:
-                reservation.submit(["later"])
-            finally:
-                gate.exit()
-        finally:
-            reservation.close()
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            writer = pool.submit(terminal)
-            assert attempting.wait(5)
-            try:
-                fence = pool.submit(gate.close_and_wait, gate.begin_epoch())
-                fence.result(5)
-                cleanup.wait_paused(1)
-                assert not writer.done()
-            finally:
-                gate.reopen()
-                cleanup.resume()
-            writer.result(5)
-    finally:
-        cleanup.resume()
-        cleanup.close()
-    assert cleanup.stats().peak_pending_requests == 1
-
-
-def test_reserved_slot_can_enqueue_while_cleanup_paused_and_deduplicates():
-    calls = []
-    cleanup = BackgroundPrefixCleanup(
-        calls.append, config=GenerationPrefixCleanupConfig(batch_size=2, max_pending=2)
-    )
-    first, second = cleanup.reserve(), cleanup.reserve()
-    cleanup.pause(1)
-    first.submit(["a", "shared"])
-    second.submit(["b", "shared"])
-    first.close()
-    second.close()
-    cleanup.wait_paused(1)
-    assert calls == []
-    cleanup.resume()
-    cleanup.close()
-    assert calls == [["a", "shared", "b"]]
-
-
-def test_unused_reservation_releases_capacity_and_old_epoch_cannot_reclose():
-    calls = []
-    cleanup = BackgroundPrefixCleanup(
-        calls.append, config=GenerationPrefixCleanupConfig(batch_size=1, max_pending=1)
-    )
-    reservation = cleanup.reserve()
-    reservation.close()
-    reservation.close()
-    assert cleanup.stats().pending_requests == 0
-    cleanup.pause(1)
-    cleanup.resume()
-    cleanup.pause(1)
-    cleanup.reserve().submit(["after-abort"])
-    cleanup.close()
-    assert calls == [["after-abort"]]
-
-
-def test_failed_delete_is_latched_and_never_retried():
-    calls = []
+    calls, done = [], threading.Event()
 
     def clear(keys):
         calls.append(keys)
-        raise RuntimeError("transport failed")
+        if keys == ["failed"]:
+            raise RuntimeError("transport failed")
+        done.set()
 
     cleanup = BackgroundPrefixCleanup(
-        clear, config=GenerationPrefixCleanupConfig(batch_size=1, max_pending=1)
+        clear, gate, config=GenerationPrefixCleanupConfig(batch_size=1, max_pending=1)
     )
-    cleanup.reserve().submit(["failed"])
-    with pytest.raises(RuntimeError, match="background prefix cleanup failed"):
-        cleanup.close()
-    with pytest.raises(RuntimeError, match="background prefix cleanup failed"):
-        cleanup.reserve()
-    with pytest.raises(RuntimeError, match="background prefix cleanup failed"):
-        cleanup.wait_paused(1)
-    assert calls == [["failed"]]
-    assert cleanup.stats().failed_keys == 1
+    with caplog.at_level(logging.ERROR):
+        cleanup.submit(["failed"])
+        cleanup.submit(["next"])
+        assert done.wait(5)
+    assert calls == [["failed"], ["next"]]
+    assert "background prefix cleanup failed for 1 keys" in caplog.text
+    # The failed CLEAR released its permit: a fence does not wait on it.
+    _fence(gate)
+    gate.reopen()
 
 
-def test_close_refuses_to_delete_under_a_snapshot():
+def test_submitted_keys_are_copied_and_deduplicated():
+    gate = _TokenCaptureSnapshotGate()
+    cleared, done = [], threading.Event()
+
+    def clear(keys):
+        cleared.append(keys)
+        done.set()
+
     cleanup = BackgroundPrefixCleanup(
-        lambda keys: None, config=GenerationPrefixCleanupConfig()
+        clear, gate, config=GenerationPrefixCleanupConfig(batch_size=1)
     )
-    cleanup.pause(1)
-    try:
-        with pytest.raises(RuntimeError, match="resume"):
-            cleanup.close()
-    finally:
-        cleanup.resume()
-        cleanup.close()
+    _fence(gate)
+    keys = ["a", "b", "a"]
+    cleanup.submit(keys)
+    keys.append("added-after-submit")
+    cleanup.submit([])
+    gate.reopen()
+    assert done.wait(5)
+    time.sleep(0.1)
+    assert cleared == [["a", "b"]]
+
+
+def test_many_completed_calls_coalesce_into_bounded_clears():
+    gate = _TokenCaptureSnapshotGate()
+    calls = []
+    cleanup = BackgroundPrefixCleanup(
+        calls.append,
+        gate,
+        config=GenerationPrefixCleanupConfig(
+            batch_size=32, max_pending=1024, wait_seconds=5.0
+        ),
+    )
+    _fence(gate)
+    for request in range(1024):
+        cleanup.submit([f"prefix-{request}-0", f"prefix-{request}-1"])
+    gate.reopen()
+    _wait_for(lambda: sum(len(batch) for batch in calls) == 2048)
+    assert len(calls) == 32
+    assert all(len(batch) == 64 for batch in calls)
+    assert len({key for batch in calls for key in batch}) == 2048
 
 
 @pytest.mark.parametrize(
@@ -185,130 +201,3 @@ def test_close_refuses_to_delete_under_a_snapshot():
 def test_invalid_limits_fail_before_creating_a_worker(changes):
     with pytest.raises(ValueError):
         GenerationPrefixCleanupConfig.model_validate(changes)
-
-
-def test_released_fence_wait_does_not_block_on_new_epoch_work():
-    entered, release = threading.Event(), threading.Event()
-
-    def clear(keys):
-        entered.set()
-        assert release.wait(5)
-
-    cleanup = BackgroundPrefixCleanup(
-        clear, config=GenerationPrefixCleanupConfig(batch_size=1)
-    )
-    cleanup.pause(1)
-    cleanup.resume()
-    try:
-        cleanup.reserve().submit(["new-work"])
-        assert entered.wait(5)
-        # A late wait from an aborted checkpoint must not reclose the queue.
-        cleanup.pause(1)
-        cleanup.wait_paused(1)
-        assert cleanup.stats().active_batch
-        assert not cleanup.stats().paused
-    finally:
-        release.set()
-        cleanup.close()
-
-
-def test_batch_bound_deduplicates_without_losing_keys():
-    calls = []
-    cleanup = BackgroundPrefixCleanup(
-        calls.append, config=GenerationPrefixCleanupConfig(batch_size=2, max_pending=5)
-    )
-    cleanup.pause(1)
-    for key in ["a", "b", "c", "d", "e"]:
-        cleanup.reserve().submit([key, "shared"])
-    cleanup.resume()
-    cleanup.close()
-    assert len(calls) == 3
-    assert set(key for batch in calls for key in batch) == {
-        "a",
-        "b",
-        "c",
-        "d",
-        "e",
-        "shared",
-    }
-    assert all(len(batch) == len(set(batch)) for batch in calls)
-    assert cleanup.stats().requests == 5
-    assert cleanup.stats().pending_requests == 0
-
-
-def test_close_wakes_a_producer_waiting_for_capacity():
-    cleanup = BackgroundPrefixCleanup(
-        lambda keys: None,
-        config=GenerationPrefixCleanupConfig(batch_size=1, max_pending=1),
-    )
-    first = cleanup.reserve()
-    attempting = threading.Event()
-
-    def reserve():
-        attempting.set()
-        return cleanup.reserve()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        waiter = pool.submit(reserve)
-        assert attempting.wait(5)
-        cleanup.close()
-        with pytest.raises(RuntimeError, match="closed"):
-            waiter.result(5)
-    first.close()
-    assert cleanup.stats().pending_requests == 0
-
-
-def test_submitted_keys_are_owned_and_a_slot_cannot_be_reused():
-    calls = []
-    cleanup = BackgroundPrefixCleanup(
-        calls.append, config=GenerationPrefixCleanupConfig()
-    )
-    cleanup.pause(1)
-    reservation = cleanup.reserve()
-    keys = ["original"]
-    reservation.submit(keys)
-    keys[0] = "mutated"
-    with pytest.raises(RuntimeError, match="already consumed"):
-        reservation.submit(["second"])
-    cleanup.resume()
-    cleanup.close()
-    assert calls == [["original"]]
-
-
-def test_nonblocking_close_does_not_wait_for_stalled_clear():
-    entered, release = threading.Event(), threading.Event()
-
-    def clear(keys):
-        entered.set()
-        assert release.wait(5)
-
-    cleanup = BackgroundPrefixCleanup(
-        clear, config=GenerationPrefixCleanupConfig(batch_size=1)
-    )
-    try:
-        cleanup.reserve().submit(["obsolete"])
-        assert entered.wait(5)
-        cleanup.close(wait=False)
-        assert cleanup.stats().active_batch
-        with pytest.raises(RuntimeError, match="closed"):
-            cleanup.reserve()
-    finally:
-        release.set()
-        cleanup.close()
-
-
-def test_many_completed_calls_coalesce_into_bounded_clears():
-    calls = []
-    cleanup = BackgroundPrefixCleanup(
-        calls.append,
-        config=GenerationPrefixCleanupConfig(batch_size=32, max_pending=1024),
-    )
-    cleanup.pause(1)
-    for request in range(1024):
-        cleanup.reserve().submit([f"prefix-{request}-0", f"prefix-{request}-1"])
-    cleanup.resume()
-    cleanup.close()
-    assert len(calls) == 32
-    assert all(len(batch) == 64 for batch in calls)
-    assert len({key for batch in calls for key in batch}) == 2048
-    assert cleanup.stats().pending_requests == 0
