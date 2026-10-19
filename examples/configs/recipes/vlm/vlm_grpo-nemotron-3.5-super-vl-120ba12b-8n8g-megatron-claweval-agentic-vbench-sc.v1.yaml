@@ -6,7 +6,28 @@ defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-claweval-sc.v1
 env:
   nemo_gym:
     agent_name: null
+    training_mode: subagent
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/agentic_vbench_agent/configs/agentic_vbench_train.yaml
     - responses_api_agents/claweval_agent/configs/claweval_train.yaml
+    # Mixed tasks need task-independent instructions. Resolve the run's prompts
+    # here so an inherited assembly-only override cannot shadow Gym's YAML.
+    agentic_vbench_agent:
+      responses_api_agents:
+        agentic_vbench_agent:
+          opencode_training_mode: subagent
+          opencode_subagents_enabled: true
+          opencode_compaction_auto: false
+          opencode_compaction_prune: false
+          opencode_delegation_prompt: ${oc.env:AGENTIC_VBENCH_DELEGATION_PROMPT,Delegate one well-defined part of the user task to a general subagent then integrate its work and verify every required deliverable. Preserve the task instructions and use the media tools when needed.}
+          opencode_subagent_prompt: ${oc.env:AGENTIC_VBENCH_SUBAGENT_PROMPT,Complete the delegated task using the available tools. Preserve the task instructions and report the outputs and any limitations clearly.}
+    claweval_agent:
+      responses_api_agents:
+        claweval_agent:
+          opencode_training_mode: subagent
+          opencode_subagents_enabled: true
+          opencode_compaction_auto: false
+          opencode_compaction_prune: false
+          opencode_delegation_prompt: ${oc.env:CLAW_EVAL_DELEGATION_PROMPT,Delegate one well-defined part of the user task to a general subagent then integrate its work and verify every required deliverable. Preserve the task instructions and use the media tools when needed.}
+          opencode_subagent_prompt: ${oc.env:CLAW_EVAL_SUBAGENT_PROMPT,Complete the delegated task using the available tools. Preserve the task instructions and report the outputs and any limitations clearly.}
