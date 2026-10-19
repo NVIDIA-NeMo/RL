@@ -43,10 +43,7 @@ from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    as_nemo_gym_shard_set,
-    get_nemo_gym_route_name,
-)
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -1595,19 +1592,11 @@ class AsyncNemoGymRolloutImpl:
         # These rows are all one prompt's generations.
         # They share one Gym route and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        if gym_instance_id is not None:
-            nemo_gym_env = shard_set.handle_for_checkpoint_instance(gym_instance_id)
-        elif (
-            len(shard_set.all_handles) == 1
-            and not shard_set.environment_server_routes
-            and not shard_set.route_to_shard
-        ):
-            # A bare actor validates native taskset routes from its own Gym config.
-            nemo_gym_env = shard_set.sole_handle()
-        else:
-            nemo_gym_env = shard_set.pick_handle(
-                get_nemo_gym_route_name(inputs[0], shard_set.environment_server_routes)
-            )
+        nemo_gym_env = (
+            shard_set.pick_handle_for_group(inputs)
+            if gym_instance_id is None
+            else shard_set.handle_for_checkpoint_instance(gym_instance_id)
+        )
         instance_label = shard_set.instance_label(nemo_gym_env)
         instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
         total_rows = self._num_generations_per_prompt
@@ -1807,9 +1796,7 @@ class AsyncNemoGymRolloutImpl:
         if not isinstance(extra_env_info, Mapping):
             raise ValueError("NeMo-Gym input must contain extra_env_info")
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        handle = shard_set.pick_handle(
-            get_nemo_gym_route_name(extra_env_info, shard_set.environment_server_routes)
-        )
+        handle = shard_set.pick_handle_for_group([dict(extra_env_info)])
         return shard_set.checkpoint_instance_for_handle(handle).instance_id
 
     def _results_to_completions(
