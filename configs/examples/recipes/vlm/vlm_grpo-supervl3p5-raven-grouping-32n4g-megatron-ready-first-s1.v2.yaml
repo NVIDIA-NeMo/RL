@@ -1,0 +1,44 @@
+defaults: vlm_grpo-supervl3p5-unified-teachers-ready-first-32n4g.yaml
+
+async_rl:
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  max_buffered_rollouts: 256
+  max_inflight_prompts: 128
+  min_groups_for_streaming_train: 128
+  rollout_failure:
+    on_dropped_prompt: shrink
+
+grpo:
+  max_num_steps: 50
+  max_num_epochs: 3
+
+policy:
+  megatron_cfg:
+    train_iters: 50
+    freeze_vision_model: true
+    freeze_vision_projection: true
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    freeze_moe_router: true
+  router_replay:
+    enabled: false
+  generation:
+    vllm_kwargs:
+      enable_return_routed_experts: false
+
+checkpointing:
+  checkpoint_must_save_by: 00:03:45:00
+  save_period: 20
+
+logger:
+  wandb:
+    resume: allow
+
+loss_fn:
+  response_length_normalization_constant: null
+
+token_capture:
+  control_auth_token: null
+  capture_dir: ${oc.env:MM_TRAINER_RESULTS_DIR}/logs/gym_token_capture

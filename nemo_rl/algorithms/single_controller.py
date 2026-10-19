@@ -1943,7 +1943,7 @@ class SingleControllerActor:
         log_step_metrics(self._logger, metrics, self._train_steps, "driver")
 
     @staticmethod
-    def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
+    def _group_ids_from_meta(meta: KVBatchMeta, *, unique: bool = True) -> list[str]:
         """Return stable prompt-group IDs in canonical sample order."""
         group_ids: list[str] = []
         seen_group_ids: set[str] = set()
@@ -1953,7 +1953,7 @@ class SingleControllerActor:
                 candidate, generation_index = sample_id.rsplit("_g", 1)
                 if candidate and generation_index.isdigit():
                     group_id = candidate
-            if group_id not in seen_group_ids:
+            if not unique or group_id not in seen_group_ids:
                 group_ids.append(group_id)
                 seen_group_ids.add(group_id)
         return group_ids
@@ -5181,6 +5181,17 @@ class SingleControllerActor:
         )
 
         prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        # Token-identical prompts can contain different images. Preserve the
+        # dispatched rollout groups when computing per-prompt baselines.
+        group_ids = self._group_ids_from_meta(meta, unique=False)
+        group_indices = {
+            group_id: i for i, group_id in enumerate(dict.fromkeys(group_ids))
+        }
+        prompt_ids = torch.tensor(
+            [[group_indices[group_id]] for group_id in group_ids],
+            dtype=torch.long,
+            device=prompt_ids.device,
+        )
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()

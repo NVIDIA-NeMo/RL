@@ -27,6 +27,10 @@ from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
 
 import nemo_rl.algorithms.single_controller as single_controller
+from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
+    GRPOAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
@@ -2607,3 +2611,79 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+@pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("normalize_rewards", [False, True])
+def test_advantage_stage_keeps_raven_puzzles_separate(
+    interleave: bool, normalize_rewards: bool
+) -> None:
+    batch_size, sequence_length = 32, 5
+    rewards = torch.tensor([1.0] * 8 + [0.0] * 8 + [1.0] * 2 + [0.0] * 14)
+    groups = torch.tensor([[0]] * 16 + [[1]] * 16)
+    sample_ids = [f"puzzle-{i // 16}_g{i % 16}" for i in range(batch_size)]
+    order = torch.arange(batch_size)
+    if interleave:
+        order = order.reshape(2, 16).T.flatten()
+    rewards = rewards[order]
+    groups = groups[order]
+    sample_ids = [sample_ids[i] for i in order.tolist()]
+    sample_mask = torch.ones(batch_size)
+    sample_mask[3] = 0.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.ones(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": rewards,
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": sample_mask,
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    estimator = GRPOAdvantageEstimator(
+        AdvEstimatorConfig(normalize_rewards=normalize_rewards), ClippedPGLossConfig()
+    )
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = data_plane = _AdvantageDataPlane(data)
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._algo_cfg = GRPOConfig(
+        seq_logprob_error_threshold=None, overlong_filtering=True
+    )
+    ctrl._step_log_dict = {
+        key: []
+        for key in [
+            "rewards",
+            "sample_masks",
+            "masked_advantages",
+            "num_mask_sample_filtered",
+            "sequence_lengths",
+            "seq_logprob_error_metrics",
+        ]
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=sample_ids,
+        fields=list(data.keys()),
+    )
+    _, has_valid_tokens = asyncio.run(ctrl._advantage_stage(meta))
+    mask = data["token_mask"] * sample_mask.unsqueeze(-1)
+    expected = estimator.compute_advantage(
+        groups, rewards, mask, valid_mask=sample_mask
+    )
+    merged = estimator.compute_advantage(
+        data["prompt_ids_for_adv"], rewards, mask, valid_mask=sample_mask
+    )
+    assert has_valid_tokens
+    assert not torch.allclose(expected, merged)
+    torch.testing.assert_close(data_plane.written_fields["advantages"], expected)
