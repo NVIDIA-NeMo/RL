@@ -127,3 +127,12 @@ env:
           # Off: the pre-call /tokenize count only drives context resets, which are off, and it bypasses capture.
           save_model_call_using_vllm_tokenize_endpoint: false
           datasets: []
+    # Gym requires an environment server per agent instance (AgentWithoutEnvironmentServerError otherwise); the
+    # SWE / TB configs ship theirs, the browsecomp agent config does not.
+    browsecomp_sandboxed_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: browsecomp_sandboxed_agent
