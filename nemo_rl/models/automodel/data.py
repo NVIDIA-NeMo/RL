@@ -26,6 +26,8 @@ from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data_plane.codec import pad_field
+from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -182,6 +184,14 @@ def make_processed_microbatch_iterator(
     enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
 
     for data_dict in raw_iterator:
+        # The data plane leaves these fields jagged when a replica group has more
+        # than one rank; pad each microbatch to its own width, as megatron/data.py does.
+        for key, pad in MICROBATCH_PADDED_FIELDS.items():
+            if key in data_dict:
+                data_dict[key] = pad_field(
+                    key, data_dict[key], pad, data_dict["input_ids"].shape[1]
+                )
+
         # Store original shapes before processing
         original_batch_size = data_dict.get("input_ids").shape[0]
         original_seq_len = data_dict.get("input_ids").shape[1]
@@ -426,7 +436,9 @@ def check_sequence_dim(
         # call sites need it and none of them should know the wire format.
         if k in PACKED_MULTIMODAL_FIELDS:
             continue
-        if torch.is_tensor(v) and len(v.shape) > 1:
+        # Jagged MICROBATCH_PADDED_FIELDS (e.g. routed_experts) are padded per
+        # microbatch in make_processed_microbatch_iterator.
+        if torch.is_tensor(v) and not v.is_nested and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"
             )

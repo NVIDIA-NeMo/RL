@@ -382,6 +382,15 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # When True, offload_after_refit skips rerunning the full offload_before_refit
+    # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
+    # and only re-offloads the optimizer with a single allocator cleanup.
+    # When True, the reference-policy swap in use_reference_model stages the
+    # active weights in persistent pinned CPU buffers and keeps the reference
+    # state dict pinned from setup, so the three per-step full-model PCIe
+    # transfers run as non-blocking pinned copies instead of pageable ones.
+    # Costs 2x model-size pinned host RAM per worker. Default False keeps the
+    # current pageable-copy behavior.
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
@@ -505,6 +514,14 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Collective timeout (minutes) for the default process group and the
+    # Megatron model-parallel and replica groups. Raise it when one rank can stall for
+    # longer than the default, e.g. a dist-checkpoint shard write on a slow
+    # shared filesystem holds up the save-finalize / load collectives.
+    # Omitted or None: the torch.distributed / Megatron Bridge default (10 min).
+    # Set it in every megatron_cfg that runs Megatron workers (in PPO, both
+    # policy and value).
+    distributed_timeout_minutes: NotRequired[float | None]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
