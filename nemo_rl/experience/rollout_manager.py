@@ -930,6 +930,23 @@ class AsyncRolloutImpl:
         return rollout_metrics
 
 
+class _HookUnresolved:
+    """Marker for a rollout-metrics hook not yet read from the Gym actor's configuration.
+
+    It is distinct from None, the resolved "no hook" answer. The implementation
+    carrying the marker is built on the driver and pickled
+    into the controller actor. ``__reduce__`` returning the attribute name
+    pickles the marker as a reference to this module's global, so the
+    unpickled marker is the same object and the identity check still holds.
+    """
+
+    def __reduce__(self) -> str:
+        return "_HOOK_UNRESOLVED"
+
+
+_HOOK_UNRESOLVED = _HookUnresolved()
+
+
 class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
@@ -980,11 +997,7 @@ class AsyncNemoGymRolloutImpl:
         self._effort_config = effort_config
         # Resolved from the Gym actor's rollout_config on first use, exactly
         # like the driver path, so both paths apply the same configured hook.
-        # A flag marks the unresolved state rather than a sentinel object: the
-        # implementation is built on the driver and pickled into the controller
-        # actor, and a sentinel compared by identity does not survive that trip.
-        self._rollout_metrics_hook: Optional[RolloutMetricsHook] = None
-        self._rollout_metrics_hook_resolved = False
+        self._rollout_metrics_hook: Any = _HOOK_UNRESOLVED
 
         self._validate_init_params()
 
@@ -1534,10 +1547,9 @@ class AsyncNemoGymRolloutImpl:
         path, so both paths apply the same configured hook; ``None`` (no hook)
         is cached the same way.
         """
-        if not self._rollout_metrics_hook_resolved:
+        if self._rollout_metrics_hook is _HOOK_UNRESOLVED:
             env_config = await _nemo_gym_rollout_config(self._task_to_env["nemo_gym"])
             self._rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(env_config)
-            self._rollout_metrics_hook_resolved = True
         return self._rollout_metrics_hook
 
     def _results_to_completions(

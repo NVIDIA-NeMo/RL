@@ -1639,13 +1639,19 @@ def test_nemo_gym_sc_hook_resolution_survives_pickling():
     """The rollout implementation is built on the driver and pickled into the
     controller actor. A hook not yet resolved there must still be read from the
     actor's rollout_config instead of being taken for an already-resolved one,
-    which a sentinel compared by identity would be after unpickling."""
+    which a plain ``object()`` marker compared by identity would be after
+    unpickling. Ray pickles with cloudpickle, so both picklers are checked."""
     import pickle
 
+    import cloudpickle
+
+    from nemo_rl.experience.rollout_manager import _HOOK_UNRESOLVED
     from nemo_rl.experience.rollouts import Timer
 
-    restored = pickle.loads(pickle.dumps(_nemo_gym_impl(False)))
-    assert restored._rollout_metrics_hook_resolved is False
+    for pickler in (pickle, cloudpickle):
+        copy = pickler.loads(pickler.dumps(_nemo_gym_impl(False)))
+        assert copy._rollout_metrics_hook is _HOOK_UNRESOLVED, pickler.__name__
+    restored = copy
 
     restored._num_generations_per_prompt = 2
     restored._task_to_env = {
@@ -1674,7 +1680,7 @@ def test_nemo_gym_sc_hook_resolution_survives_pickling():
         )
     )
     assert metrics["reward_sum"] == 2.0
-    assert restored._rollout_metrics_hook_resolved is True
+    assert callable(restored._rollout_metrics_hook)
 
 
 def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
@@ -1809,7 +1815,6 @@ def test_nemo_gym_sc_rollout_metrics_hook_runs_after_the_built_in_metrics(
     # Resolution from rollout_config is pinned by
     # test_nemo_gym_sc_path_applies_the_rollout_metrics_hook.
     impl._rollout_metrics_hook = hook
-    impl._rollout_metrics_hook_resolved = True
 
     with caplog.at_level(logging.WARNING):
         _completions, _prompt, metrics = _run(
