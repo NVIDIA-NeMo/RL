@@ -208,6 +208,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "drop_reason",
         "valid_row_count",
         "total_row_count",
+        "zero_variance",
     }
 
 
