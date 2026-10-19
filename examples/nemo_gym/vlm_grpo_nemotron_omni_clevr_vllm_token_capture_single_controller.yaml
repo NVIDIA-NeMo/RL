@@ -40,6 +40,13 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/string_match/configs/string_match.yaml
+    string_match_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: string_match_simple_agent
     string_match_simple_agent:
       responses_api_agents:
         simple_agent:

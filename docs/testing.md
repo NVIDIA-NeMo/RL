@@ -40,7 +40,7 @@ Usage:
 uv run --group test pytest --testmon tests/unit
 
 # You can also combine with markers/paths
-uv run --group test pytest --hf-gated --testmon tests/unit/models/policy/test_dtensor_worker.py
+uv run --group test pytest --hf-gated --testmon tests/unit/models/policy/test_automodel_worker.py
 ```
 
 What to expect:

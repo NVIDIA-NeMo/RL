@@ -151,6 +151,7 @@ tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-noncolocated-async-gym-single-cont
 
 # Nano-v3.5
 tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.sh
+tests/test_suites/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r3.sh
 
 # Nemotron 3 Super pipeline sanity checks (RLVR / SWE1 / RLHF environments)
 # Data paths and genrm model path require cluster-specific TODO items in each YAML.

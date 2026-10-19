@@ -42,7 +42,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
 )
 from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
@@ -57,6 +56,7 @@ from nemo_rl.models.policy.interfaces import (
     TopkLogitsOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
@@ -360,6 +360,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
+            if config["automodel_cfg"].get("deterministic"):
+                env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
 
         # If a worker extension class is provided, use it instead of the default worker builder class
         if extension_fqn is not None:
@@ -1223,21 +1225,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(
-        self,
-        *,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info", refit_payload_mode=refit_payload_mode
-        )
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Enable trainer-side MXFP8 quantization of the listed params for refit.
+
+        Returns:
+            dict: Refit info updated with quantized dtypes and scale entries.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "enable_refit_prequantize", param_names=param_names
+        )
+        results = ray.get(futures)
         return results[0]
 
     def finish_inference(self) -> None:
@@ -1452,8 +1462,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_parallelism: dict[str, Any],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: RefitPayloadMode,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1462,7 +1470,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
-            refit_payload_mode=refit_payload_mode,
         )
         results = ray.get(futures)
         return results[0]

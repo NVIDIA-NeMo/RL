@@ -67,6 +67,16 @@ workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 
+## Refit Performance Options
+
+These options are optional. Enable one only after you measure its effect on your
+refit workload.
+
+| Option | Applies to | Effect |
+|---|---|---|
+| `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
+| `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
+
 ## Minimal Configuration
 
 Colocated vLLM and SGLang refit need no transport configuration:
