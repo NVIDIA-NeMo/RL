@@ -489,11 +489,8 @@ def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
     records, _, _ = build_fixture_artifacts("single_call")
     record = records[0]
 
-    first = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=0
-    )
-    second = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=1
+    written = sink.stage_generation_prefix_batch(
+        [record, record], checkpoint_id="checkpoint-1", chunk_sequences=[0, 1]
     )
     keys = [
         generation_cut_staging_key(
@@ -505,8 +502,7 @@ def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
         for sequence in (0, 1)
     ]
 
-    assert first.ok and second.ok
-    assert [first.staging_key, second.staging_key] == keys
+    assert written == keys
     assert [snapshot.model_dump() for snapshot in source.fetch(keys)] == [
         record.model_dump(exclude={"extras"}),
         record.model_dump(exclude={"extras"}),
@@ -761,21 +757,18 @@ def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_part
         "single_call", rollout_id="a-different-length-rollout-id"
     )
     records.extend(more_records)
-    results = sink.stage_generation_prefix_batch(
+    keys = sink.stage_generation_prefix_batch(
         records,
         checkpoint_id="batch-checkpoint",
         chunk_sequences=list(range(len(records))),
     )
 
-    assert all(result.ok for result in results)
     assert len(client.calls) == 1
-    assert client.calls[0]["sample_ids"] == [result.staging_key for result in results]
+    assert client.calls[0]["sample_ids"] == keys
     assert [tag["digest"] for tag in client.calls[0]["tags"]] == [
         record.digest for record in records
     ]
-    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
-        [result.staging_key for result in results]
-    )
+    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(keys)
     assert [row.model_dump() for row in restored] == [
         record.model_dump(exclude={"extras"}) for record in records
     ]
@@ -818,28 +811,23 @@ def test_generation_prefix_batch_matches_single_rows_with_media_and_routes(
 
     single_keys = []
     for sequence, (record, bundle) in enumerate(zip(records, bundles, strict=True)):
-        result = sink.stage_generation_prefix(
-            record,
+        single_keys += sink.stage_generation_prefix_batch(
+            [record],
             checkpoint_id="single-cut",
-            chunk_sequence=sequence,
-            attachments=bundle,
+            chunk_sequences=[sequence],
+            attachments=[bundle],
         )
-        assert result.ok
-        single_keys.append(result.staging_key)
     puts_before = len(client.puts)
-    results = sink.stage_generation_prefix_batch(
+    batched_keys = sink.stage_generation_prefix_batch(
         records,
         checkpoint_id="batched-cut",
         chunk_sequences=list(range(len(records))),
         attachments=bundles,
     )
-    assert all(result.ok for result in results)
     assert len(client.puts) - puts_before < len(records)
 
     single = source.fetch_for_finalization(single_keys, include_route_fragments=True)
-    batched = source.fetch_for_finalization(
-        [result.staging_key for result in results], include_route_fragments=True
-    )
+    batched = source.fetch_for_finalization(batched_keys, include_route_fragments=True)
     for expected, actual, bundle in zip(single, batched, bundles, strict=True):
         assert actual.snapshot == expected.snapshot
         assert actual.extras == expected.extras
@@ -877,7 +865,12 @@ def test_generation_prefix_batch_rejects_bad_inventory_before_writing():
         )
 
 
-def test_generation_prefix_batch_failure_does_not_advertise_success():
+@pytest.mark.parametrize("failing_put", [1, 2])
+def test_generation_prefix_batch_failure_discards_every_key_and_raises(failing_put):
+    """A routed row and plain rows go in two puts; whichever put fails, rows the
+    other put already wrote are discarded too, and nothing is returned."""
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
     class FailingClient:
         def __init__(self):
             self.calls = 0
@@ -885,7 +878,8 @@ def test_generation_prefix_batch_failure_does_not_advertise_success():
 
         def put_samples(self, **kwargs):
             self.calls += 1
-            raise RuntimeError("injected partial batch write")
+            if self.calls == failing_put:
+                raise RuntimeError("injected partial batch write")
 
         def clear_samples(self, **kwargs):
             self.cleared.extend(kwargs["sample_ids"])
@@ -893,18 +887,27 @@ def test_generation_prefix_batch_failure_does_not_advertise_success():
     client = FailingClient()
     sink = TQTokenSink(client, staging_partition="test")
     records, _, _ = build_fixture_artifacts("worked_example")
-    results = sink.stage_generation_prefix_batch(
-        records,
-        checkpoint_id="checkpoint",
-        chunk_sequences=list(range(len(records))),
+    routes = torch.zeros(len(records[0].token_ids_delta), 2, 2, dtype=torch.int16)
+    records[0] = records[0].model_copy(
+        update={"extras": {"routed_experts": encode_routed_experts(routes)}}
     )
+    with pytest.raises(RuntimeError, match="injected partial batch write"):
+        sink.stage_generation_prefix_batch(
+            records,
+            checkpoint_id="checkpoint",
+            chunk_sequences=list(range(len(records))),
+        )
 
-    assert client.calls == 1
-    assert len(results) == len(records)
-    assert all(not result.ok for result in results)
-    assert all(result.staging_key for result in results)
-    assert all("injected partial batch write" in result.error for result in results)
-    assert client.cleared == [result.staging_key for result in results]
+    assert client.calls == failing_put
+    assert client.cleared == [
+        generation_cut_staging_key(
+            "checkpoint",
+            record.rollout_id,
+            record.model_call_id,
+            chunk_sequence=sequence,
+        )
+        for sequence, record in enumerate(records)
+    ]
 
 
 def _split_delta(record) -> tuple[list[int], list[int], list[float]]:

@@ -1091,8 +1091,8 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
-        generation_prefix_batch_size: int = 256,
-        generation_prefix_batch_max_tokens: int = 4_194_304,
+        generation_prefix_batch_size: int,
+        generation_prefix_batch_max_tokens: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -1129,11 +1129,9 @@ class VllmAsyncGenerationWorkerImpl(
             raise ValueError(
                 "generation-prefix cuts require a non-empty control bearer token"
             )
-        GenerationCutCaptureMixin._configure_generation_prefix_batching(
-            self,
-            max_rows=generation_prefix_batch_size,
-            max_tokens=generation_prefix_batch_max_tokens,
-        )
+        # Before the sink below: a cut requires the sink, then reads these.
+        self._generation_prefix_batch_max_rows = generation_prefix_batch_size
+        self._generation_prefix_batch_max_tokens = generation_prefix_batch_max_tokens
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -1192,7 +1190,6 @@ class VllmAsyncGenerationWorkerImpl(
                 GenerationCutCaptureMixin._fetch_generation_cut_rows, self
             ),
             max_rows=generation_prefix_batch_size,
-            max_tokens=generation_prefix_batch_max_tokens,
         )
         self._chain_prefix.install(source)
         install_capture(
@@ -2106,10 +2103,7 @@ class VllmAsyncGenerationWorkerImpl(
                         try:
                             cut_chunks = (
                                 await worker_self._generation_prefix_reader.fetch(
-                                    list(admission.generation_cut.staging_keys),
-                                    tokens_per_key=max(
-                                        1, self.model_config.max_model_len
-                                    ),
+                                    list(admission.generation_cut.staging_keys)
                                 )
                             )
                         except Exception:  # noqa: BLE001 - retried below

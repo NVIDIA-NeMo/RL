@@ -76,7 +76,6 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
-    GenerationPrefixBatchLimits,
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
     _ResolvedGenerationCut,
@@ -106,6 +105,12 @@ from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
+# ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
+_PREFIX_BATCH_LIMITS = {
+    "generation_prefix_batch_size": 256,
+    "generation_prefix_batch_max_tokens": 4_194_304,
+}
+
 
 class _MemorySink:
     def __init__(self) -> None:
@@ -123,14 +128,14 @@ class _MemorySink:
         self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
-    def stage_generation_prefix(
+    def _stage_prefix_row(
         self,
         record: StagedCallRecord,
         *,
         checkpoint_id: str,
         chunk_sequence: int,
         attachments: dict | None = None,
-    ) -> StageResult:
+    ) -> str:
         self.generation_prefix_records.append((checkpoint_id, record))
         self.generation_prefix_attachments.append(attachments)
         key = (
@@ -138,7 +143,7 @@ class _MemorySink:
             f"{record.model_call_id}/{chunk_sequence}"
         )
         self.generation_prefix_keys.append(key)
-        return StageResult(ok=True, staging_key=key)
+        return key
 
     def stage_generation_prefix_batch(
         self,
@@ -147,20 +152,27 @@ class _MemorySink:
         checkpoint_id: str,
         chunk_sequences: list[int],
         attachments: list[dict | None] | None = None,
-    ) -> list[StageResult]:
+    ) -> list[str]:
         if attachments is None:
             attachments = [None] * len(records)
-        return [
-            self.stage_generation_prefix(
-                record,
-                checkpoint_id=checkpoint_id,
-                chunk_sequence=sequence,
-                attachments=row_attachments,
-            )
+        written: list[str] = []
+        try:
             for record, sequence, row_attachments in zip(
                 records, chunk_sequences, attachments, strict=True
-            )
-        ]
+            ):
+                written.append(
+                    self._stage_prefix_row(
+                        record,
+                        checkpoint_id=checkpoint_id,
+                        chunk_sequence=sequence,
+                        attachments=row_attachments,
+                    )
+                )
+        except Exception:
+            # Like TQTokenSink: a failed batch discards what it wrote, then raises.
+            self.clear(written)
+            raise
+        return written
 
     def clear(self, staging_keys: list[str]) -> None:
         self.cleared_generation_prefix_keys.extend(staging_keys)
@@ -187,9 +199,8 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         _capture_calls_by_model_call_id={},
         _completed_capture_calls={},
         _generation_cut_receipts={},
-        _generation_prefix_batch_limits=GenerationPrefixBatchLimits(
-            max_rows=256, max_tokens=4_194_304
-        ),
+        _generation_prefix_batch_max_rows=256,
+        _generation_prefix_batch_max_tokens=4_194_304,
         _capture_registry_lock=threading.Lock(),
         _capture_sink=None,
         _generation_prefix_cuts_enabled=False,
@@ -235,7 +246,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
 
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={"backend": "simple"}, staging_partition="rollout_staging"
+            worker,
+            dp_cfg={"backend": "simple"},
+            staging_partition="rollout_staging",
+            generation_prefix_batch_size=17,
+            generation_prefix_batch_max_tokens=4096,
         )
     )
 
@@ -244,9 +259,11 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     assert segment_sizes == [0]
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert isinstance(worker._generation_prefix_reader, PrefixReadBatcher)
-    assert worker._generation_prefix_batch_limits == GenerationPrefixBatchLimits(
-        max_rows=256, max_tokens=4_194_304
-    )
+    # The batch size bounds cut-time puts and restore-time gets; the token
+    # limit bounds only cut-time puts.
+    assert worker._generation_prefix_batch_max_rows == 17
+    assert worker._generation_prefix_batch_max_tokens == 4096
+    assert worker._generation_prefix_reader._max_rows == 17
     assert worker.token_capture.adapter is not None
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
@@ -257,7 +274,10 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     worker = _fake_worker(is_model_owner=False)
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker,
+            dp_cfg={},
+            staging_partition="rollout_staging",
+            **_PREFIX_BATCH_LIMITS,
         )
     )
     assert installed is None
@@ -281,7 +301,10 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     worker = _fake_worker()
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker,
+            dp_cfg={},
+            staging_partition="rollout_staging",
+            **_PREFIX_BATCH_LIMITS,
         )
     )
 
@@ -341,7 +364,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
 def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
-        gen.setup_token_capture({}, "rollout_staging")
+        gen.setup_token_capture({}, "rollout_staging", **_PREFIX_BATCH_LIMITS)
 
 
 @pytest.mark.parametrize(
@@ -410,6 +433,7 @@ def test_prefix_capture_setup_requires_control_token(monkeypatch):
                 {},
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
+                **_PREFIX_BATCH_LIMITS,
             )
         )
 
@@ -447,6 +471,7 @@ def test_prefix_capture_with_router_replay_fails_at_setup_without_route_state(
                 "rollout_staging",
                 generation_prefix_cuts_enabled=True,
                 generation_cut_control_token="secret",
+                **_PREFIX_BATCH_LIMITS,
             )
         )
 
@@ -917,7 +942,7 @@ class _BatchPrefixSink(_MemorySink):
     def __init__(self) -> None:
         super().__init__()
         self.batches: list[list[int]] = []
-        self.failure: str | None = None
+        self.fail_after_write = False
         self.before_write = lambda: None
 
     def stage_generation_prefix_batch(
@@ -925,34 +950,24 @@ class _BatchPrefixSink(_MemorySink):
     ):
         self.batches.append([len(record.token_ids_delta) for record in records])
         self.before_write()
-        results = super().stage_generation_prefix_batch(
+        keys = super().stage_generation_prefix_batch(
             records,
             checkpoint_id=checkpoint_id,
             chunk_sequences=chunk_sequences,
             attachments=attachments,
         )
-        if self.failure == "raise":
+        if self.fail_after_write:
+            # Like TQTokenSink after a failed put: discard the batch, then raise.
+            self.clear(keys)
             raise RuntimeError("injected batch transport failure after writes")
-        if self.failure == "short":
-            return results[:-1]
-        if self.failure == "partial":
-            results[-1] = StageResult(
-                ok=False,
-                staging_key=results[-1].staging_key,
-                error="injected partial failure",
-            )
-        if self.failure == "wrong-key":
-            results[-1] = StageResult(ok=True, staging_key="wrong-key")
-        return results
+        return keys
 
 
 def _batch_worker_fixture(lengths, *, batch_size=256, max_tokens=4_194_304):
     sink = _BatchPrefixSink()
     worker = _worker_with_capture(sink)
-    worker._generation_prefix_batch_limits = GenerationPrefixBatchLimits(
-        max_rows=batch_size,
-        max_tokens=max_tokens,
-    )
+    worker._generation_prefix_batch_max_rows = batch_size
+    worker._generation_prefix_batch_max_tokens = max_tokens
     requests, prefixes = [], []
     for i, length in enumerate(lengths):
         request = _FakeRequest(
@@ -1008,10 +1023,9 @@ def test_worker_batch_token_limit_handles_ragged_and_oversized_rows():
     assert sink.batches == [[2, 3], [9], [2]]  # First chunks include the prompt.
 
 
-@pytest.mark.parametrize("failure", ["raise", "short", "partial", "wrong-key"])
-def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
+def test_worker_batch_failure_rolls_back_every_unsealed_row():
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
-    sink.failure = failure
+    sink.fail_after_write = True
 
     with pytest.raises(RuntimeError):
         worker._checkpoint_generation_cut(inventory)
@@ -1027,7 +1041,7 @@ def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
         assert state.lifecycle_lock.acquire(blocking=False)
         state.lifecycle_lock.release()
 
-    sink.failure = None
+    sink.fail_after_write = False
     receipt = worker._checkpoint_generation_cut(inventory)
     assert [ack.prefix_token_count for ack in receipt.prefixes] == [2, 3, 4]
 
@@ -1035,7 +1049,9 @@ def test_worker_batch_failure_rolls_back_every_unsealed_row(failure):
 def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
     from nemo_gym._checkpoint import generation_cut
 
-    worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
+    # The middle row's ack fails, so the last row is written but never receives
+    # its key: only the batch-level clear can discard it.
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
     original = generation_cut.GenerationCutPrefixAck
 
     def reject_second(**kwargs):
@@ -1052,6 +1068,7 @@ def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
         assert state.frozen_cut is None
         assert state.staged_token_count == 0
         assert not state.generation_cut_staging_keys
+    assert len(sink.generation_prefix_keys) == 3
     assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
 
 
@@ -1060,7 +1077,7 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
 
     def fail_second():
         if len(sink.batches) == 2:
-            sink.failure = "partial"
+            sink.fail_after_write = True
 
     sink.before_write = fail_second
     with pytest.raises(RuntimeError):
@@ -1068,7 +1085,7 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
 
     earlier_keys = set(sink.generation_prefix_keys[:2])
     assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
-    sink.failure = None
+    sink.fail_after_write = False
     sink.before_write = lambda: None
     for request in requests:
         state = worker._capture_calls[id(request)]
@@ -1202,6 +1219,8 @@ def test_worker_batch_consecutive_cuts_reuse_then_append(batch_size):
         ack.staging_keys for ack in first.prefixes
     ]
     assert len(sink.generation_prefix_keys) == 2
+    if batch_size == 1:
+        assert sink.batches == [[3], [4]]
 
     for request in requests:
         state = worker._capture_calls[id(request)]
@@ -1862,10 +1881,10 @@ class _BlockingPrefixSink(_MemorySink):
         self.prefix_write_started = threading.Event()
         self.release_prefix_write = threading.Event()
 
-    def stage_generation_prefix(self, *args, **kwargs) -> StageResult:
+    def _stage_prefix_row(self, *args, **kwargs) -> str:
         self.prefix_write_started.set()
         assert self.release_prefix_write.wait(5)
-        return super().stage_generation_prefix(*args, **kwargs)
+        return super()._stage_prefix_row(*args, **kwargs)
 
 
 def test_media_terminal_completion_waits_for_prefix_cut_then_replaces_it():
@@ -1982,11 +2001,11 @@ class _FailOncePrefixSink(_MemorySink):
         super().__init__()
         self._fail_next_prefix = True
 
-    def stage_generation_prefix(self, *args, **kwargs) -> StageResult:
+    def _stage_prefix_row(self, *args, **kwargs) -> str:
         if self._fail_next_prefix:
             self._fail_next_prefix = False
             raise RuntimeError("injected generation-prefix staging failure")
-        return super().stage_generation_prefix(*args, **kwargs)
+        return super()._stage_prefix_row(*args, **kwargs)
 
 
 def test_generation_cut_rolls_back_tokens_after_staging_failure():
@@ -2897,9 +2916,10 @@ def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
     assert [record.prev_len for record in cut_records] == [3, 3]
     assert [_staged_routes(record) for record in cut_records] == [[4, 5, 6, -1], [7]]
     for sequence, record in enumerate(cut_records):
-        assert validating_sink.stage_generation_prefix(
-            record, checkpoint_id="checkpoint", chunk_sequence=sequence
-        ).ok
+        # Raises if the row's route length does not match its tokens.
+        validating_sink.stage_generation_prefix_batch(
+            [record], checkpoint_id="checkpoint", chunk_sequences=[sequence]
+        )
 
     resumed, resumed_request, resolved = _resume(
         sink, ack, source=ng_capture, prefix_token_ids=(10, 11, 12)
@@ -3260,7 +3280,11 @@ def test_omni_capture_setup_rejects_video_pruning(
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
-    kwargs = {"staging_partition": "staging", "capture_media": True}
+    kwargs = {
+        "staging_partition": "staging",
+        "capture_media": True,
+        **_PREFIX_BATCH_LIMITS,
+    }
     if prefix_cuts:
         kwargs.update(
             generation_prefix_cuts_enabled=True,
