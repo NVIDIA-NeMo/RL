@@ -483,6 +483,11 @@ class SGLangGenerationWorker:
         nnodes = max(1, _gpus_per_engine // self.gpus_per_node)
         node_rank = self.rank % nnodes
         local_gpu_id = self._to_local_gpu_id(self.base_gpu_id)
+        disable_outlines_disk_cache = sglang_cfg_inner.get(
+            "disable_outlines_disk_cache", True
+        )
+        if not isinstance(disable_outlines_disk_cache, bool):
+            raise ValueError("sglang_cfg.disable_outlines_disk_cache must be a boolean")
         kwargs = {
             "model_path": sglang_cfg_inner["model_path"],
             "trust_remote_code": True,
@@ -490,6 +495,8 @@ class SGLangGenerationWorker:
             # memory
             "enable_memory_saver": sglang_server_cfg["needs_offload"],
             "enable_weights_cpu_backup": sglang_server_cfg["cpu_weight_backup"],
+            # Avoid the legacy pickle-based cache unless explicitly enabled.
+            "disable_outlines_disk_cache": disable_outlines_disk_cache,
             # distributed
             "host": host,
             "port": port,

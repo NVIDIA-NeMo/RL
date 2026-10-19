@@ -162,7 +162,8 @@ class SglangSpecificArgs(TypedDict):
     cuda_graph_backend_prefill: NotRequired[str]
     # Enable NCCL NVLS for prefill-heavy requests when available.
     enable_nccl_nvls: NotRequired[bool]
-    # Disable on-disk cache for the outlines grammar backend (avoids FS-related crashes).
+    # Defaults to True. Set False to opt into the legacy pickle-based Outlines
+    # disk cache only when its files are controlled by trusted writers.
     disable_outlines_disk_cache: NotRequired[bool]
     # Disable the custom all-reduce kernel and fall back to NCCL.
     disable_custom_all_reduce: NotRequired[bool]
