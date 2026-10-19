@@ -55,3 +55,28 @@ def test_mixed_recipe_resolves_task_independent_opencode_roles(
     resolved = OmegaConf.to_container(settings, resolve=True)
     assert resolved["opencode_delegation_prompt"] == parent
     assert resolved["opencode_subagent_prompt"] == child
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    RECIPES
+    + (
+        "8n8g-megatron-agentic-vbench-sc.v1",
+        "16n8g-megatron-agentic-vbench-async-sc.v1",
+    ),
+)
+def test_mixed_recipe_admits_the_complete_avb_model_context(recipe: str) -> None:
+    config = load_config(
+        REPO
+        / "examples/configs/recipes/vlm"
+        / f"vlm_grpo-nemotron-3.5-super-vl-120ba12b-{recipe}.yaml"
+    )
+    assert config.policy.max_total_sequence_length == 262144
+    assert (
+        config.token_capture.max_train_row_tokens
+        == config.policy.max_total_sequence_length
+    )
+    # The admission limit must follow the model window rather than retaining
+    # an independent limit inherited from the shorter-context benchmark.
+    config.policy.max_total_sequence_length = 131072
+    assert config.token_capture.max_train_row_tokens == 131072

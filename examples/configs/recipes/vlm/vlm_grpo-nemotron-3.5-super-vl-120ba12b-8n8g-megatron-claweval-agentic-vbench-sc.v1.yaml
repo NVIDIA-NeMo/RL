@@ -3,6 +3,11 @@
 # Mixed rows must retain task_source=agentic_vbench_agent or claweval_agent.
 defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-claweval-sc.v1.yaml
 
+token_capture:
+  # AVB uses the full model context; ClawEval's shorter row limit must not
+  # reject otherwise valid AVB targets before policy scoring and TMPE.
+  max_train_row_tokens: ${policy.max_total_sequence_length}
+
 env:
   nemo_gym:
     agent_name: null

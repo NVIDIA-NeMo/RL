@@ -9,6 +9,10 @@ defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-agentic-vbench-
 grpo:
   num_prompts_per_step: 4
 
+token_capture:
+  # Keep every valid AVB row within the model's full native context.
+  max_train_row_tokens: ${policy.max_total_sequence_length}
+
 checkpointing:
   save_period: 20
   ft_save_period: 10

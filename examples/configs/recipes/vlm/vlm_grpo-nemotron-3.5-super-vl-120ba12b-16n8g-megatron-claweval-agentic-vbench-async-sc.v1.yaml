@@ -4,7 +4,8 @@
 defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-agentic-vbench-async-sc.v1.yaml
 
 token_capture:
-  max_train_row_tokens: 65536
+  # Preserve valid AVB targets throughout the full model context.
+  max_train_row_tokens: ${policy.max_total_sequence_length}
 
 env:
   nemo_gym:
