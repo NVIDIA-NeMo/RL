@@ -421,3 +421,89 @@ def test_ce_turn_rejects_targets_before_the_turn():
         ValueError, match="assistant targets precede the final assistant turn"
     ):
         collator._final_turn_start(datum, doc)
+
+
+def test_ce_turn_history_keeps_reasoning_the_full_rendering_keeps():
+    student = _tokenizer(suffix="<eot>")
+    # Earlier reasoning is rendered only when the template is asked to
+    # preserve it, as history-preserving templates do.
+    student.chat_template = (
+        "{% for message in messages %}"
+        "{% set content = message['content'] %}"
+        "{% if message['role'] == 'assistant' and not loop.last"
+        " and not preserve_thinking %}"
+        "{% set content = content.split('</think>')[-1] %}"
+        "{% endif %}"
+        "{{ '<' + message['role'] + '>' + content + '<eot>' }}"
+        "{% endfor %}"
+    )
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think> Why </think> Answer"},
+        {"role": "user", "content": "Again"},
+        {"role": "assistant", "content": "<think> Why </think> Done"},
+    ]
+    batch = [kd_data_processor({"messages": messages}, TaskDataSpec(), None, None, 0)]
+
+    def collate(**options: bool):
+        return CrossTokenizerCollator(
+            config=CrossTokenizerCollatorConfig(
+                mode="chat", include_thinking_in_loss=True
+            ),
+            student_tokenizer=student,
+            teacher_tokenizers=[None],
+            aligners=[None],
+            ctx_length_student=64,
+            ctx_length_teachers=[64],
+            drop_first_assistant_chunk_kl_by_teacher=[False],
+            make_seq_div_by_student=8,
+            make_seq_div_by_teachers=[8],
+            **options,
+        )(batch)
+
+    default = collate()
+    actual = collate(ce_covers_assistant_turn=True)
+    tokens = student.convert_ids_to_tokens(
+        actual["input_ids"][0][: int(actual["input_lengths"][0])].tolist()
+    )
+    # The earlier turn keeps its reasoning as context.
+    assert tokens.count("Why") == 2
+    assert _supervised_tokens(student, actual, "token_mask") == [
+        "<assistant>",
+        "<think>",
+        "Why",
+        "</think>",
+        "Done",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, default, "token_mask") == [
+        "Why",
+        "</think>",
+        "Done",
+        "<eot>",
+    ]
+    assert torch.equal(actual["kd_token_mask"], default["token_mask"])
+
+
+def test_ce_turn_history_renders_the_same_tools():
+    student = _tokenizer(suffix="<eot>")
+    # Tool names precede the conversation only when tools are passed.
+    student.chat_template = (
+        "{% for tool in tools or [] %}{{ tool['function']['name'] }} {% endfor %}"
+        + student.chat_template
+    )
+    datum = {
+        **_datum(multiple_turns=True),
+        "tools": [{"type": "function", "function": {"name": "Why"}}],
+    }
+    batch = _collator(student, None, ce_covers_assistant_turn=True)([datum])
+    tokens = student.convert_ids_to_tokens(
+        batch["input_ids"][0][: int(batch["input_lengths"][0])].tolist()
+    )
+    assert tokens[0] == "Why"
+    assert _supervised_tokens(student, batch, "token_mask") == [
+        "<assistant>",
+        "Done",
+        "<eot>",
+    ]
+    assert _supervised_tokens(student, batch, "kd_token_mask") == ["Done", "<eot>"]
