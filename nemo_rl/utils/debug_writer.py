@@ -34,7 +34,7 @@ def json_safe_nonfinite(value: Any) -> Any:
     return value
 
 
-class BaseDebugWriter:
+class DebugWriter:
     def __init__(self) -> None:
         self.step: int | None = None
         self.rows: int = 0
@@ -116,7 +116,7 @@ class BaseDebugWriter:
         raise NotImplementedError
 
 
-class TrainDataDump(BaseDebugWriter):
+class JsonDebugWriter(DebugWriter):
     """Write chunks to a partial file, publishing only a completed optimizer step.
 
     Sequence columns are trimmed to input_lengths (padding only). Scalar

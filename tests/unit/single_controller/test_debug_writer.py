@@ -7,11 +7,11 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.utils.debug_writer import JsonDebugWriter
 
 
 def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     size = 262144
     tokens = torch.arange(size).reshape(1, -1)
     for sid, length, mask in [("long", size, 1), ("masked", 3, 0)]:
@@ -42,7 +42,7 @@ def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
     # it rather than appending to a half-written file.
     stale = tmp_path / "train_data_step8.jsonl.partial"
     stale.write_text("interrupted attempt\n")
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     args = dict(
         sample_ids=["resumed"],
         tags=None,
@@ -79,7 +79,7 @@ def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
         sequences={"token_ids": torch.tensor([[1]])},
         scalars={},
     )
-    shards = [TrainDataDump(str(tmp_path), shard_id=str(i)) for i in range(3)]
+    shards = [JsonDebugWriter(str(tmp_path), shard_id=str(i)) for i in range(3)]
     for i, shard in enumerate(shards):
         shard.add_chunk(step=0, sample_ids=[f"s{i}"], **args)
     assert sorted(p.name for p in tmp_path.glob("*.part-*")) == [
@@ -106,7 +106,7 @@ def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
     count check the merge would publish whatever happened to be local and the
     dump would look complete while silently missing a shard.
     """
-    reachable = TrainDataDump(str(tmp_path), shard_id="0")
+    reachable = JsonDebugWriter(str(tmp_path), shard_id="0")
     reachable.add_chunk(
         step=0,
         sample_ids=["here"],
@@ -115,7 +115,7 @@ def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
         sequences={"token_ids": torch.tensor([[1]])},
         scalars={},
     )
-    controller = TrainDataDump(str(tmp_path))
+    controller = JsonDebugWriter(str(tmp_path))
     # Two shards reported a row each; only one part landed on this filesystem.
     with pytest.raises(RuntimeError, match="must share this filesystem"):
         controller.finish_step(0, 2)
@@ -132,7 +132,7 @@ def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
     It calls finish_step without a single add_chunk of its own, which the
     pre-pool writer rejected because it keyed off its own row counter.
     """
-    worker = TrainDataDump(str(tmp_path), shard_id="7")
+    worker = JsonDebugWriter(str(tmp_path), shard_id="7")
     worker.add_chunk(
         step=2,
         sample_ids=["only"],
@@ -141,7 +141,7 @@ def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
         sequences={"token_ids": torch.tensor([[3]])},
         scalars={},
     )
-    controller = TrainDataDump(str(tmp_path))
+    controller = JsonDebugWriter(str(tmp_path))
     controller.finish_step(2)
     rows = (tmp_path / "train_data_step3.jsonl").read_text().splitlines()
     assert [json.loads(line)["sample_id"] for line in rows] == [["only"]]
@@ -176,7 +176,7 @@ def test_dump_preserves_singleton_batch_schema(
     tmp_path: Path, chunk: dict[str, Any]
 ) -> None:
     original_advantages = chunk["sequences"]["advantages"].detach().clone()
-    writer = TrainDataDump(str(tmp_path / "nested" / "logs"))
+    writer = JsonDebugWriter(str(tmp_path / "nested" / "logs"))
     writer.add_chunk(step=0, **chunk)
     writer.finish_step(0)
     rows = [
@@ -228,7 +228,7 @@ def test_invalid_chunk_leaves_dump_unchanged(
     invalid_column: str,
     existing_chunk: bool,
 ) -> None:
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     if existing_chunk:
         writer.add_chunk(step=0, **chunk)
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
@@ -269,7 +269,7 @@ def test_jagged_columns_dump_real_rows_without_padding(tmp_path: Path) -> None:
         sequences={"token_ids": jagged(tokens)},
         scalars={"prompt_ids": jagged(prompts)},
     )
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     with pytest.raises(ValueError, match="input length"):
         # Validation is per row: 5 fits row 0 but exceeds jagged row 3.
         writer.add_chunk(step=0, input_lengths=torch.tensor([5, 4, 3, 5]), **args)
@@ -286,7 +286,7 @@ def test_jagged_columns_dump_real_rows_without_padding(tmp_path: Path) -> None:
 def test_zero_length_and_missing_optional_columns(
     tmp_path: Path, chunk: dict[str, Any]
 ) -> None:
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     chunk["input_lengths"] = torch.tensor([[0], [1]])
     chunk["tags"] = None
     chunk["scalars"] = {}
@@ -307,7 +307,7 @@ def test_zero_length_and_missing_optional_columns(
 def test_consecutive_steps_reset_row_indices_and_preserve_prior_dump(
     tmp_path: Path, chunk: dict[str, Any]
 ) -> None:
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     writer.add_chunk(step=0, **chunk)
     writer.finish_step(0)
     first = tmp_path / "train_data_step1.jsonl"
@@ -327,7 +327,7 @@ def test_consecutive_steps_reset_row_indices_and_preserve_prior_dump(
 
 
 def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     writer.add_chunk(
         step=0,
         sample_ids=[],
@@ -343,7 +343,7 @@ def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
 
 def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     values = torch.tensor([[0.0, -torch.inf, torch.inf, torch.nan]])
-    writer = TrainDataDump(str(tmp_path))
+    writer = JsonDebugWriter(str(tmp_path))
     writer.add_chunk(
         step=0,
         sample_ids=["sample"],

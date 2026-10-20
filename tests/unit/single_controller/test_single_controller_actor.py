@@ -80,9 +80,9 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
@@ -1667,7 +1667,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
-    ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+    ctrl._train_data_dump = JsonDebugWriter(str(tmp_path))
     ctrl._timer = Timer()
     ctrl._train_steps = 0
     ctrl._is_ppo = False
@@ -4128,7 +4128,7 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
     final = tmp_path / "train_data_step1.jsonl"
     if dump_enabled:
-        ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+        ctrl._train_data_dump = JsonDebugWriter(str(tmp_path))
         ctrl._train_data_dump.add_chunk(
             step=0,
             sample_ids=meta.sample_ids,
