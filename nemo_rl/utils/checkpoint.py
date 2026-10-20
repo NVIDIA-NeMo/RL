@@ -48,6 +48,7 @@ from nemo_rl.telemetry.instrumentation import (
     remote_trace_context,
 )
 from nemo_rl.utils.checkpoint_storage import (
+    CheckpointStorage,
     as_path,
     is_msc_path,
     make_storage,
@@ -420,10 +421,6 @@ class CheckpointManager:
 
         return save_dir
 
-    def _rename_checkpoint(self, checkpoint_path: PathLike) -> None:
-        """Publish a finished checkpoint (see ``CheckpointStorage.publish``)."""
-        self._storage.publish(checkpoint_path)
-
     def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Complete a checkpoint synchronously (rename + delete old).
 
@@ -434,7 +431,7 @@ class CheckpointManager:
         Args:
             checkpoint_path (PathLike): Path to the temporary checkpoint directory.
         """
-        self._rename_checkpoint(checkpoint_path)
+        self._storage.publish(checkpoint_path)
         self.remove_old_checkpoints()
 
     def begin_finalization(
@@ -478,7 +475,7 @@ class CheckpointManager:
                 with _finalize_telemetry(carrier, step):
                     if wait_fn is not None:
                         wait_fn()
-                    self._rename_checkpoint(checkpoint_path)
+                    self._storage.publish(checkpoint_path)
                     # Prune old checkpoints off the critical path. Surface any
                     # failure via a done-callback so a broken delete is not
                     # silently swallowed (the discarded Future would otherwise
@@ -588,7 +585,7 @@ class CheckpointManager:
             exclude_latest (bool): Whether to protect the most recent checkpoint
                 from deletion.
         """
-        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
+        checkpoint_history = _load_checkpoint_history(self._storage)
         if not checkpoint_history:
             return
         if self.keep_top_k is None and self.ft_keep_latest_k is None:
@@ -646,7 +643,7 @@ class CheckpointManager:
         Returns:
             Optional[str]: Path to the best checkpoint, or None if no checkpoints exist.
         """
-        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
+        checkpoint_history = _load_checkpoint_history(self._storage)
         if len(checkpoint_history) == 0:
             return None
 
@@ -714,18 +711,18 @@ class CheckpointManager:
 
 
 def _load_checkpoint_history(
-    checkpoint_dir: PathLike,
+    storage: CheckpointStorage,
 ) -> list[tuple[int, PathLike, dict[str, Any]]]:
     """Load the history of checkpoints and their metrics.
 
     Args:
-        checkpoint_dir (PathLike): Directory (or ``msc://`` prefix) containing the checkpoints.
+        storage (CheckpointStorage): Storage holding the checkpoints.
 
     Returns:
         list[tuple[int, PathLike, dict[str, Any]]]: List of tuples containing
             (step_number, checkpoint_path, info) for each checkpoint.
     """
-    steps = make_storage(checkpoint_dir).published_steps()
+    steps = storage.published_steps()
 
     def read_info(step_dir: str) -> Optional[dict[str, Any]]:
         try:

@@ -176,7 +176,7 @@ def test_history_lists_only_published_steps_with_their_info(manager):
     for step in (1, 2):
         manager.finalize_checkpoint(manager.init_tmp_checkpoint(step, {"step": step}))
     manager.init_tmp_checkpoint(3, {"step": 3})  # never published
-    history = _load_checkpoint_history(manager.checkpoint_dir)
+    history = _load_checkpoint_history(manager._storage)
     assert sorted((step, info["step"]) for step, _, info in history) == [(1, 1), (2, 2)]
     assert manager.get_latest_checkpoint_path().endswith("/step_2")
 

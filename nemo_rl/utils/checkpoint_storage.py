@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -109,7 +110,13 @@ def rmtree(path: str | os.PathLike[str]) -> None:
         shutil.rmtree(path)
 
 
-_STEP_DIR = re.compile(r"step_\d+")
+_STEP_DIR = re.compile(r"step_(\d+)")
+
+
+def _parse_step(dir_name: str) -> int | None:
+    """Return N for a published ``step_N`` directory name, else ``None``."""
+    match = _STEP_DIR.fullmatch(dir_name)
+    return int(match.group(1)) if match else None
 
 
 class CheckpointStorage(Protocol):
@@ -133,9 +140,9 @@ class CheckpointStorage(Protocol):
         ...
 
 
+@dataclass
 class LocalStorage:
-    def __init__(self, root: Path):
-        self.root = root
+    root: Path
 
     def begin(self, step: int) -> Path:
         save_dir = self.root / f"tmp_step_{step}"
@@ -168,17 +175,15 @@ class LocalStorage:
             os.rename(tmp_path, final_path)
 
     def published_steps(self) -> list[tuple[int, str]]:
-        dirs = glob.glob(str(self.root / "step_*"))
-        return sorted(
-            (int(Path(d).name.split("_")[1]), d)
-            for d in dirs
-            if _STEP_DIR.fullmatch(Path(d).name)
-        )
+        steps = [
+            (_parse_step(Path(d).name), d) for d in glob.glob(str(self.root / "step_*"))
+        ]
+        return sorted((step, d) for step, d in steps if step is not None)
 
 
+@dataclass
 class MscStorage:
-    def __init__(self, root: Path):
-        self.root = root
+    root: Path
 
     def begin(self, step: int) -> str:
         save_dir = self.root / f"step_{step}"
@@ -203,8 +208,9 @@ class MscStorage:
         steps = []
         for marker in msc.glob(str(self.root) + "/step_*/_SUCCESS"):
             step_dir = msc.Path(marker).parent
-            if _STEP_DIR.fullmatch(step_dir.name):
-                steps.append((int(step_dir.name.split("_")[1]), str(step_dir)))
+            step = _parse_step(step_dir.name)
+            if step is not None:
+                steps.append((step, str(step_dir)))
         return sorted(steps)
 
 

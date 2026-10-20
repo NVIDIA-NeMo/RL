@@ -1176,7 +1176,7 @@ class TestContextManager:
 
 
 class TestRenameCheckpointSwap:
-    """Tests for _rename_checkpoint when the target step dir already exists."""
+    """Tests for publishing a checkpoint when the target step dir already exists."""
 
     def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
         """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
