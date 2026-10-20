@@ -3518,13 +3518,27 @@ def test_nemo_gym_stream_accumulator_budgets_infra_attempts():
         )
 
 
+def _actor_timing(await_results, postprocess_results):
+    """One actor timing payload as ``NemoGym.run_rollouts`` attaches it to a
+    stream's last tuple: the two summed time labels and the share of the
+    postprocessing in the stream's whole run."""
+    return {
+        "timing/rollout/await_results": await_results,
+        "timing/rollout/postprocess_results": postprocess_results,
+        "timing/rollout/postprocess_results_pct": (
+            100.0 * postprocess_results / (await_results + postprocess_results)
+        ),
+    }
+
+
 def test_run_async_nemo_gym_rollout_redispatches_infra_failures(monkeypatch):
     """A row whose /run failed at the infrastructure level is dispatched again
     as its own stream while the other rows keep running; the group completes
     from both streams and the re-dispatch is counted in the metrics. The actor
     attaches its timing to the stream's last tuple, here the failure marker,
     and the gate makes the one-row retry finish last: the bucket's totals must
-    survive, with the retry reporting under its own label."""
+    survive, with the retry reporting under its own label, and the retry's
+    percentage, the share of one re-run row, never becomes the step's."""
     gate = asyncio.Event()
     rows = [_gym_row(), _gym_row()]
     actor = _FakeGymActor(
@@ -3535,11 +3549,19 @@ def test_run_async_nemo_gym_rollout_redispatches_infra_failures(monkeypatch):
                     1,
                     {"name": "agent"},
                     {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
-                    {"timing/remote": 100.0},
+                    _actor_timing(await_results=75.0, postprocess_results=25.0),
                 ),
                 _SetEvent(gate),
             ],
-            [gate, (1, {"name": "agent"}, _gym_result(1), {"timing/remote": 1.0})],
+            [
+                gate,
+                (
+                    1,
+                    {"name": "agent"},
+                    _gym_result(1),
+                    _actor_timing(await_results=1.0, postprocess_results=1.0),
+                ),
+            ],
         ]
     )
     captured = []
@@ -3557,15 +3579,14 @@ def test_run_async_nemo_gym_rollout_redispatches_infra_failures(monkeypatch):
     assert actor.dispatched_rows == [rows, [rows[1]]]
     assert captured == [[0, 1]]
     assert len(results) == 1
-    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
-    assert results[0].rollout_metrics["timing/remote"] == 100.0
+    metrics = results[0].rollout_metrics
+    assert metrics["nemo_gym_infra_redispatches"] == 1
+    assert metrics["timing/rollout/await_results"] == 75.0
+    assert metrics["timing/rollout/postprocess_results_pct"] == 25.0
+    assert metrics["timing/rollout/shard/nemo_gym/await_results"] == 75.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/await_results"] == 1.0
     assert (
-        results[0].rollout_metrics["timing/rollout/shard/nemo_gym/timing/remote"]
-        == 100.0
-    )
-    assert (
-        results[0].rollout_metrics["timing/rollout/shard/nemo_gym/retry1/timing/remote"]
-        == 1.0
+        metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results_pct"] == 50.0
     )
 
 
@@ -3705,22 +3726,43 @@ def test_a_data_failure_is_not_hidden_by_a_sibling_markers_exhausted_budget(
     assert replica_b.dispatched_rows == [rows[2:]]
 
 
-def test_run_async_nemo_gym_rollout_retries_a_failed_retry_under_its_own_label(
+def test_run_async_nemo_gym_rollout_folds_every_retry_of_an_instance_into_one_label(
     monkeypatch,
 ):
     """A retry stream can itself report a marker. The row is dispatched again on
-    the same instance while the budget lasts, each retry stream reports its
-    timing under its own ``retry<n>`` label, and the bucket's totals survive."""
+    the same instance while the budget lasts, and every retry stream of the
+    instance reports under one ``retry`` label: the time keys are summed, the
+    percentage is recomputed from the sums, the label count does not grow with
+    the re-dispatches, and the bucket's totals survive."""
     rows = [_gym_row(), _gym_row()]
     marker = {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"}
     actor = _FakeGymActor(
         scripts=[
             [
                 (0, {"name": "agent"}, _gym_result(0), None),
-                (1, {"name": "agent"}, marker, {"timing/remote": 100.0}),
+                (
+                    1,
+                    {"name": "agent"},
+                    marker,
+                    _actor_timing(await_results=75.0, postprocess_results=25.0),
+                ),
             ],
-            [(1, {"name": "agent"}, marker, {"timing/remote": 5.0})],
-            [(1, {"name": "agent"}, _gym_result(1), {"timing/remote": 1.0})],
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    marker,
+                    _actor_timing(await_results=5.0, postprocess_results=1.0),
+                )
+            ],
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    _gym_result(1),
+                    _actor_timing(await_results=1.0, postprocess_results=3.0),
+                )
+            ],
         ]
     )
     monkeypatch.setattr(
@@ -3735,10 +3777,15 @@ def test_run_async_nemo_gym_rollout_retries_a_failed_retry_under_its_own_label(
     assert len(results) == 1
     metrics = results[0].rollout_metrics
     assert metrics["nemo_gym_infra_redispatches"] == 2
-    assert metrics["timing/remote"] == 100.0
-    assert metrics["timing/rollout/shard/nemo_gym/timing/remote"] == 100.0
-    assert metrics["timing/rollout/shard/nemo_gym/retry1/timing/remote"] == 5.0
-    assert metrics["timing/rollout/shard/nemo_gym/retry2/timing/remote"] == 1.0
+    assert metrics["timing/rollout/await_results"] == 75.0
+    assert metrics["timing/rollout/postprocess_results_pct"] == 25.0
+    assert metrics["timing/rollout/shard/nemo_gym/await_results"] == 75.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/await_results"] == 6.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results"] == 4.0
+    assert (
+        metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results_pct"] == 40.0
+    )
+    assert not any("retry1" in key or "retry2" in key for key in metrics)
 
 
 def test_run_async_nemo_gym_rollout_raises_when_infra_attempts_are_exhausted(
