@@ -130,15 +130,16 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
 def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
 
-    ``ssd: {enabled, dir, staging_bytes, pickup_s, high_watermark, low_watermark,
-    demote_after_s}``: each unit demotes committed blobs to files under ``dir``
-    (node-local NVMe) when its slab is full, and stages them back into
-    ``staging_bytes`` carved from its slab. ``high_watermark`` / ``low_watermark``
-    (fractions of the put area, off by default) also demote oldest-first in the
-    background once live bytes pass the high mark, down to the low mark, so puts
-    rarely wait. ``demote_after_s`` (off by default, testing) demotes every blob
-    that old, to exercise the tier without a full slab; not combinable with the
-    watermarks.
+    ``ssd: {enabled, dir, staging_bytes, pickup_s}``: when a unit's put area cannot
+    take a put, the put goes to a file under ``dir`` (node-local NVMe) from birth,
+    through an IO area of ``staging_bytes`` carved from the slab; reads of such
+    blobs are staged back into the same area. Data already in the put area never
+    moves.
+
+    Contract: data is read roughly oldest first (the ``weight_fifo``,
+    ``in_order`` and ``ready_first`` samplers), so the oldest data stays in RAM
+    and the newest goes to disk. The ``windowed`` sampler with freshest-first
+    selection works but spills the data it reads next.
     """
     ssd = _as_dict(cfg.get("ssd") or {})
     if not ssd.get("enabled", False):
@@ -158,24 +159,10 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
         raise ValueError(
             f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
         )
-    after = ssd.get("demote_after_s")  # testing: demote every blob this old
-    high, low = ssd.get("high_watermark"), ssd.get("low_watermark")
-    if (high is None) != (low is None):
-        raise ValueError("NixlStore ssd.high_watermark and low_watermark go together")
-    if high is not None:
-        high, low = float(high), float(low)
-        if not 0 < low < high < 1:
-            raise ValueError(
-                f"NixlStore ssd watermarks need 0 < low < high < 1, got low={low} high={high}"
-            )
-        if after is not None:
-            raise ValueError("NixlStore ssd.demote_after_s excludes the watermarks")
     return {
         "ssd_dir": str(ssd.get("dir", "/tmp/nvdp-ssd")),
         "staging_bytes": staging,
         "pickup_s": pickup_s,
-        "demote_after_s": None if after is None else float(after),
-        "watermarks": None if high is None else (high, low),
     }
 
 
