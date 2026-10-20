@@ -86,6 +86,10 @@ docker buildx build -f docker/Dockerfile \
 > [!NOTE]
 > On a long-lived local builder, BuildKit's cache mount (keyed by base image, uv version, and the HybridEP setting) persists across builds regardless of `STRIP_UV_CACHE` -- it just controls whether a copy also ships in the image layers. To reset that mount, run `docker buildx prune --filter type=exec.cachemount`.
 
+## Using a Local TensorRT-LLM Checkout
+
+To skip the hour-long TensorRT-LLM wheel build, set `NRL_TRTLLM_EDITABLE` to the path of a TensorRT-LLM checkout you have already built (comma-separated for several). NeMo RL then installs it editable (`uv pip install --no-deps -e`) into the TensorRT-LLM worker environment instead of building the pinned wheel. The path must be reachable from every node.
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
