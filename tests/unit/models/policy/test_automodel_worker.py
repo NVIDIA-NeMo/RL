@@ -710,7 +710,9 @@ class TestAutomodelParamsGenerator:
     @staticmethod
     def _expected_merge(proj) -> torch.Tensor:
         w = proj.weight.detach().float()
-        delta = proj.lora_B.weight.detach().float() @ proj.lora_A.weight.detach().float()
+        delta = (
+            proj.lora_B.weight.detach().float() @ proj.lora_A.weight.detach().float()
+        )
         return (w + proj.scale * delta).to(proj.weight.dtype)
 
     def test_merges_lora_inside_activation_checkpoint_wrapper(self):
