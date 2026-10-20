@@ -559,7 +559,8 @@ def test_build_route_shard_map_routes_agents_and_task_sources():
                 "bash_tools": ["resources_servers"],
                 "bash_environment": ["environment_servers"],
             },
-        }
+        },
+        environment_server_routes={"bash:train": "bash_environment"},
     )
 
     assert route_to_shard == {
@@ -584,14 +585,64 @@ def test_environment_server_routes_are_shared_settings_not_entry_overlays():
         )
 
 
-def test_environment_servers_cannot_be_duplicated_across_shards():
+@pytest.mark.parametrize(
+    "environment_server_routes", [None, {"tools:train": "tools_environment"}]
+)
+def test_unrouted_environment_servers_can_be_duplicated_across_shards(
+    environment_server_routes: dict[str, str] | None,
+) -> None:
+    route_to_shard = build_route_shard_map(
+        {
+            "first": {
+                "math_simple_agent": ["responses_api_agents"],
+                "math_environment_server": ["environment_servers"],
+            },
+            "second": {
+                "math_agent": ["responses_api_agents"],
+                "math_environment_server": ["environment_servers"],
+                "tools_environment": ["environment_servers"],
+            },
+        },
+        environment_server_routes=environment_server_routes,
+    )
+
+    expected = {"math_simple_agent": "first", "math_agent": "second"}
+    if environment_server_routes:
+        expected["tools_environment"] = "second"
+    assert route_to_shard == expected
+
+
+@pytest.mark.parametrize("allowlisted", [False, True])
+def test_routed_environment_servers_cannot_be_duplicated_across_shards(
+    allowlisted: bool,
+) -> None:
     with pytest.raises(ShardSetupError, match="hosted by both shard"):
         build_route_shard_map(
             {
                 "first": {"shared_environment": ["environment_servers"]},
                 "second": {"shared_environment": ["environment_servers"]},
             },
-            allowed_duplicate_entries={"shared_environment"},
+            allowed_duplicate_entries={"shared_environment"} if allowlisted else set(),
+            environment_server_routes={"tasks": "shared_environment"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("other_type", "expected"),
+    [
+        ("responses_api_agents", "hosted by both shard"),
+        ("responses_api_models", "allowed_duplicate_entries"),
+    ],
+)
+def test_unrouted_environment_entries_with_other_server_types_keep_duplicate_checks(
+    other_type: str, expected: str
+) -> None:
+    with pytest.raises(ShardSetupError, match=expected):
+        build_route_shard_map(
+            {
+                "first": {"shared": ["environment_servers", other_type]},
+                "second": {"shared": [other_type]},
+            }
         )
 
 
@@ -617,6 +668,17 @@ def test_environment_server_routes_reject_conflicting_taskset_destinations():
             {
                 "left": {"first": ["environment_servers"]},
                 "right": {"second": ["environment_servers"]},
+            },
+        )
+
+
+def test_environment_server_route_rejects_multiple_destination_shards() -> None:
+    with pytest.raises(ShardSetupError, match="exactly one shard"):
+        build_environment_server_routes(
+            {"first": {"tasks": "shared"}, "second": {"tasks": "shared"}},
+            {
+                "first": {"shared": ["environment_servers"]},
+                "second": {"shared": ["environment_servers"]},
             },
         )
 

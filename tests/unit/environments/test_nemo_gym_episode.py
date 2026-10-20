@@ -125,6 +125,23 @@ def test_flat_row_preparation_and_result_are_opaque():
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"reward": 0.75, "result": {"benchmark_specific": True}},
+        {
+            "_ng_failure_class": "environment_server_failed",
+            "_ng_failure_terminal": True,
+            "_ng_failure_message": "verification failed",
+        },
+    ],
+)
+def test_materialized_task_keeps_flat_compatibility_results_opaque(reply: dict) -> None:
+    row = _row()
+    _prepare([row])
+    assert _normalize_nemo_gym_episode_result(row, reply) is reply
+
+
 def test_materialized_task_preparation_rejects_bad_destination_and_agent_reference():
     with pytest.raises(ValueError, match="No environment server route"):
         _prepare_materialized_nemo_gym_rows([_row()], _config(), {})

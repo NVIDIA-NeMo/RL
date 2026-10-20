@@ -72,12 +72,20 @@ def _model_response(*, episode_protocol: bool) -> gym_openai.NeMoGymResponse:
 
 
 @pytest.mark.parametrize(
-    ("token_capture", "group_attempt"), [(False, 0), (False, 2), (True, 3)]
+    ("token_capture", "group_attempt", "compatibility_response"),
+    [
+        (False, 0, False),
+        (False, 2, False),
+        (True, 3, False),
+        (False, 0, True),
+        (True, 3, True),
+    ],
 )
 def test_real_collector_streams_episode_and_flat_http_results(
     monkeypatch: pytest.MonkeyPatch,
     token_capture: bool,
     group_attempt: int,
+    compatibility_response: bool,
 ) -> None:
     async def run() -> None:
         received_episode = []
@@ -96,6 +104,11 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     reward=0.75,
                 ),
             )
+            if compatibility_response:
+                return web.json_response(
+                    reply.result.model_dump(mode="json")
+                    | {"agent_ref": {"name": "episode_agent"}}
+                )
             return web.json_response(reply.model_dump(mode="json"))
 
         async def flat_run(request: web.Request) -> web.Response:
@@ -127,7 +140,11 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     "legacy_agent": {"responses_api_agents": {"simple_agent": {}}},
                     "episode_environment": {
                         "environment_servers": {
-                            "single_agent_turn": {
+                            (
+                                "single_agent_turn_legacy"
+                                if compatibility_response
+                                else "single_agent_turn"
+                            ): {
                                 "host": episode_server.host,
                                 "port": episode_server.port,
                                 "agent_server": {
@@ -293,13 +310,18 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 "name": "episode_agent",
             }
             assert result["full_result"]["reward"] == 0.75
-            assert (
-                result["full_result"]["_ng_episode_id"] == expected_episode_ids[index]
-            )
-            assert result["full_result"]["_ng_task_id"] == materialized_task["task_id"]
-            assert (
-                result["full_result"]["_ng_environment_server"] == "episode_environment"
-            )
+            if not compatibility_response:
+                assert (
+                    result["full_result"]["_ng_episode_id"]
+                    == expected_episode_ids[index]
+                )
+                assert (
+                    result["full_result"]["_ng_task_id"] == materialized_task["task_id"]
+                )
+                assert (
+                    result["full_result"]["_ng_environment_server"]
+                    == "episode_environment"
+                )
             if not token_capture:
                 assert result["message_log"][0]["token_ids"].tolist() == [1, 2, 3]
                 assert result["message_log"][1]["token_ids"].tolist() == [11, 12]
