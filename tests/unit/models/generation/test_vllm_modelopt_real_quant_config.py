@@ -336,6 +336,8 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
     [
         "VLLM_CUTLASS",
         "FLASHINFER_TRTLLM",
+        "FLASHINFER_CUTLASS",
+        "FLASHINFER_CUTEDSL_BATCHED",
         "MARLIN",
     ],
 )
@@ -413,6 +415,8 @@ def test_real_quant_moe_rejects_unhandled_reload_backends() -> None:
     supported = {
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTLASS,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
         NvFp4MoeBackend.MARLIN,
     }
     for backend in set(NvFp4MoeBackend) - supported:

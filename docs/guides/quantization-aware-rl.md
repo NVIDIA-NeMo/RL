@@ -137,7 +137,7 @@ Real-quant rollout exercises deployment-style vLLM kernels during RL, not only t
 
 NVFP4 W4A4 and W4A16 are supported recipe examples of this general path; see the validation matrix above for their current status. The policy recipe must select only formats and tensors supported by the target model and pinned vLLM loader; no separate generation-side recipe or ignore list is applied.
 
-For NVFP4 MoE refit, the resolved vLLM backend must be `VLLM_CUTLASS`, `FLASHINFER_TRTLLM`, or `MARLIN`. Other backends, including `FLASHINFER_CUTLASS` and `FLASHINFER_CUTEDSL_BATCHED`, are rejected at model load because their CUDA-graph scale storage is not preserved by the refit integration. This restriction also applies when CUDA graphs are disabled.
+For NVFP4 MoE refit, the resolved vLLM backend must be `VLLM_CUTLASS`, `FLASHINFER_TRTLLM`, `FLASHINFER_CUTLASS`, `FLASHINFER_CUTEDSL_BATCHED`, or `MARLIN`. Other backends are rejected at model load because their CUDA-graph scale storage is not preserved by the refit integration. This restriction also applies when CUDA graphs are disabled.
 
 ### Minimal Configuration
 

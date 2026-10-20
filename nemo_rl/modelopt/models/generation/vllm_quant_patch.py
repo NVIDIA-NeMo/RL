@@ -307,6 +307,8 @@ def _preserve_nvfp4_moe_reload_scales(model: torch.nn.Module) -> None:
         if method.nvfp4_backend not in (
             NvFp4MoeBackend.VLLM_CUTLASS,
             NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.FLASHINFER_CUTLASS,
+            NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
             NvFp4MoeBackend.MARLIN,
         ):
             raise ValueError(
