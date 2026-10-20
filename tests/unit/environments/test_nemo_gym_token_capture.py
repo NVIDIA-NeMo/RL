@@ -217,7 +217,6 @@ def test_receipt_assembly_still_poisons_when_the_terminal_call_died_uncommitted(
 def test_a_failed_call_keeps_pending_write_custody() -> None:
     """Failure masks the rollout without transferring unfinished writes to cleanup."""
     from nemo_rl.environments.nemo_gym import _mask_undrained_receipt
-
     from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
 
     env = _capture_env()
@@ -781,3 +780,117 @@ def test_cc_failed_pending_was_already_masked() -> None:
     receipt = result["receipt"]
     assert receipt["capture_poisoned"] and receipt["pending_call_ids"] == ["c1"]
     assert _receipt_staging_keys(receipt) == []
+
+
+def _session_result_fixture() -> tuple[dict, dict]:
+    from nemo_gym.token_id_capture.completion import output_item_fingerprint
+
+    item = {
+        "id": "message-c1",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Finished the task."}],
+    }
+    record = _manifest_record("c1") | {
+        "output_items": [
+            {"id": item["id"], "fingerprint": output_item_fingerprint(item)}
+        ],
+        "response_status": "completed",
+        "finish_reason": "stop",
+        "last_output_item": item,
+    }
+    manifest = {
+        "rollout_id": "r0",
+        "records": [record],
+        "failures": [],
+        "attempted_call_ids": ["c1"],
+        "pending_call_ids": [],
+    }
+    result = {
+        "reward": 0.2,
+        "response": {"id": "resp-c1", "output": [item]},
+        "terminal_response_id": "resp-c1",
+        "session_traces": [
+            {
+                "session_id": "parent",
+                "session_role": "parent",
+                "parent_session_id": None,
+                "spawn_call_id": None,
+                "response_ids": ["resp-c1"],
+            }
+        ],
+        "compaction_summaries": 1,
+    }
+    return manifest, result
+
+
+@pytest.mark.parametrize("mask_location", ["top_level", "instance_config"])
+def test_already_invalid_harness_history_is_rejected_before_session_validation(
+    mask_location: str,
+) -> None:
+    from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+    from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+
+    env = _capture_env()
+    env._context_compaction, env._training_mode, env.cfg = True, "subagent", {}
+    manifest, gym_result = _session_result_fixture()
+    gym_result["failure_kind"] = "claweval:model_call_failed"
+    if mask_location == "top_level":
+        gym_result["mask_sample"] = True
+    else:
+        gym_result["instance_config"] = {"mask_sample": True}
+    env._control = AsyncMock(return_value=manifest)
+    result = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, gym_result)
+    )
+    assert result["full_result"]["instance_config"]["mask_sample"] is True
+    assert result["full_result"]["reward"] == gym_result["reward"] == 0.2
+    assert result["full_result"]["failure_kind"] == "claweval:model_call_failed"
+    assert result["receipt"]["capture_poisoned"] is True
+    assert result["receipt"]["failure_reason"] == "harness_invalid"
+    assert result["logical_selection"].response_ids == ()
+    # Keep all original staging ownership. The existing finalizer gets a rejected
+    # owner, never a partial trajectory relabeled as valid training data.
+    assert _receipt_staging_keys(result["receipt"]) == ["r0/c1"]
+    plans = RolloutReassembler._plan_selected_calls(
+        ["r0"], [result["receipt"]], [result["logical_selection"]]
+    )
+    assert len(plans) == 1 and len(plans[0]) == 1
+    assert plans[0][0].selected_response_ids == ()
+
+
+def test_unmasked_subagent_compaction_still_fails_session_validation() -> None:
+    env = _capture_env()
+    env._context_compaction, env._training_mode, env.cfg = True, "subagent", {}
+    manifest, result = _session_result_fixture()
+    env._control = AsyncMock(return_value=manifest)
+    with pytest.raises(
+        ValueError, match="subagent training forbids OpenCode compaction"
+    ):
+        asyncio.run(env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, result))
+
+
+def test_unmasked_subagent_history_keeps_its_selected_calls_and_session_tags() -> None:
+    env = _capture_env()
+    env._context_compaction, env._training_mode, env.cfg = True, "subagent", {}
+    manifest, gym_result = _session_result_fixture()
+    gym_result["compaction_summaries"] = 0
+    env._control = AsyncMock(return_value=manifest)
+    result = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, gym_result)
+    )
+    assert result["full_result"]["instance_config"]["mask_sample"] is False
+    assert result["receipt"]["capture_poisoned"] is False
+    assert result["logical_selection"].response_ids == ("resp-c1",)
+    assert result["logical_selection"].session_ids == ("parent",)
+
+
+def test_already_invalid_harness_cannot_claim_another_attempts_manifest() -> None:
+    env = _capture_env()
+    env._context_compaction, env._training_mode, env.cfg = True, "subagent", {}
+    manifest, gym_result = _session_result_fixture()
+    gym_result["mask_sample"] = True
+    manifest["rollout_id"] = "foreign-attempt"
+    env._control = AsyncMock(return_value=manifest)
+    with pytest.raises(ValueError, match="another dispatched attempt"):
+        asyncio.run(env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, gym_result))

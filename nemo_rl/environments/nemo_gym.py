@@ -59,7 +59,6 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.gym_sessions import session_trace_metadata
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.session_traces import validate_session_training_config
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
     _index_per_turn_images,
@@ -85,6 +84,7 @@ from nemo_rl.environments.nemotron_utils import (
     predicted_static_image_num_tokens,
     supports_image_placeholder_run_parity,
 )
+from nemo_rl.environments.session_traces import validate_session_training_config
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
     GymTransportError,
@@ -1152,8 +1152,13 @@ Depending on your data shape, you may want to change these values."""
         # attempt is untrainable, not a controller failure. Keep pending IDs in
         # the receipt: their writes may still arrive and must not be cleaned here.
         capture_failed = bool(parsed.pending_call_ids or parsed.failures)
+        # A request can fail before capture admission (for example a context
+        # overflow). Gym has already marked that attempt invalid, even when all
+        # admitted calls committed successfully. Honor the existing mask before
+        # selecting training history or validating its session membership.
+        harness_invalid = result["instance_config"]["mask_sample"]
         selected = []
-        if not capture_failed:
+        if not capture_failed and not harness_invalid:
             try:
                 selected = select_captured_calls(parsed.records, result)
             except ValueError as error:
@@ -1181,6 +1186,8 @@ Depending on your data shape, you may want to change these values."""
         )
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif harness_invalid:
+            receipt.update(capture_poisoned=True, failure_reason="harness_invalid")
         elif any(
             r.response_status == "failed"
             or (
