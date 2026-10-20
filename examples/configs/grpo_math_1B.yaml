@@ -696,6 +696,12 @@ data_plane:
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
     num_storage_units: null          # null = 2 per selected node
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+    # Spill Mooncake memory to node-local SSD.
+    # Each segment owner (storage unit, or client) writes under its own subdir of path.
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      offload_threshold: 0.5         # offload above this share of segment memory
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

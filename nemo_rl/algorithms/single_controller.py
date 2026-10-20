@@ -150,6 +150,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     is_metrics_client,
     log_step_metrics,
@@ -527,6 +528,7 @@ class SingleControllerActor:
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        self._storage_units = tuple(actor_args.storage_units)
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
             self._available_finalizers.put_nowait(actor)
@@ -918,6 +920,7 @@ class SingleControllerActor:
                     ray.kill(actor, no_restart=True)
                 except Exception as error:
                     print(f"finalizer actor termination failed: {error}", flush=True)
+            await stop_storage_units(self._storage_units)
             try:
                 self._weight_synchronizer.shutdown()
             except Exception as e:  # teardown must not mask the original failure
