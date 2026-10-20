@@ -23,6 +23,7 @@ policy:
     backend: megatron
     refit_transport: mcore
     mcore_generation_config:
+      kv_cache_management_mode: recompute
       refit_backend: nccl
       tensor_model_parallel_size: 4
       expert_model_parallel_size: 4

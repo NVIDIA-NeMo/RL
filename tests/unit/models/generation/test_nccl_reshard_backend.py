@@ -35,6 +35,7 @@ pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
     VllmInternalWorkerExtension,
+    VllmReshardParamSpecCollection,
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
@@ -649,7 +650,7 @@ def test_build_hf_to_local_param_map_stages_qwen35_wrapped_experts():
 
 
 def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
-    """A missing NCCL communicator fails before staged expert placement."""
+    """TRTLLM staging is built only after refit communicator initialization."""
     expert_name = "model.layers.0.mlp.experts.down_proj.weight"
     refit_info = {
         "gen_tp_size": 1,
@@ -674,85 +675,91 @@ def test_build_hf_to_local_param_map_requires_pp_groups_for_trtllm_staging():
     ext.pp_comm_groups = None
     _enable_trtllm_staging(ext)
 
-    with pytest.raises(RuntimeError, match="before.*per-PP-stage groups"):
+    with pytest.raises(AssertionError):
         ext.build_hf_to_local_param_map(refit_info)
 
 
-def test_build_hf_to_local_param_map_rejects_missing_trtllm_destination():
-    """The staged load must report the fused destination parameter."""
-    hidden_size, num_experts, intermediate_size = 16, 4, 32
-    expert_name = "model.layers.0.mlp.experts.down_proj.weight"
-    refit_info = {
-        "gen_tp_size": 2,
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {
-            "model.layers.0": [
-                {
-                    "name": expert_name,
-                    "global_shape": [
-                        num_experts,
-                        hidden_size,
-                        intermediate_size,
-                    ],
-                    "dtype": "torch.bfloat16",
-                    "grouped_expert_proj": "down_proj",
-                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
-                    "dst_placements": [Shard(0)],
-                }
-            ]
-        },
+@pytest.mark.parametrize(
+    "loaded_names",
+    [
+        {"model.layers.0.mlp.experts.routed_experts.w2_weight"},
+        {"model.layers.0.mlp.experts.w2_weight"},
+        None,
+        {"model.layers.0.mlp.experts.w13_weight"},
+    ],
+)
+def test_trtllm_grouped_expert_spec_loads_local_experts(
+    loaded_names: set[str] | None,
+) -> None:
+    """The native loader may report a fused name, its alias, or no loaded names."""
+    param_info = {
+        "name": "model.layers.0.mlp.experts.down_proj.weight",
+        "global_shape": [4, 16, 32],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "down_proj",
+        "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+        "dst_placements": [Shard(0)],
+        "pp_stage": 1,
     }
-    ext = _make_ext(
-        {
-            "model.layers.0.mlp.experts.routed_experts.w2_weight": torch.empty(
-                128, 16, 24, 64
-            ),
-        }
+    load_weights = MagicMock(return_value=loaded_names)
+    spec = VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
+        param_info,
+        torch.bfloat16,
+        refit_comm_groups={0: SimpleNamespace(rank=8), 1: SimpleNamespace(rank=9)},
+        device=torch.device("cpu"),
+        registered_vllm_name="model.layers.0.mlp.experts.routed_experts.w2_weight",
+        load_weights=load_weights,
     )
-    ext.device = torch.device("cpu")
-    ext.pp_comm_groups = {0: SimpleNamespace(rank=9)}
-    _enable_trtllm_staging(ext)
-    ext._load_full_hf_weights = MagicMock(
-        return_value={"model.layers.0.mlp.experts.w13_weight"}
-    )
+    assert spec.base is None and spec.pre is not None and spec.post is not None
+    for cycle in (1, 2):
+        ctx = spec.materialize()
+        assert ctx.buf.shape == (2, 16, 32)
+        assert ctx.buf.dtype == spec.wire_dtype == torch.bfloat16
+        ctx.buf[0].fill_(cycle)
+        ctx.buf[1].fill_(-cycle)
+        if loaded_names == {"model.layers.0.mlp.experts.w13_weight"}:
+            with pytest.raises(RuntimeError, match="w2_weight"):
+                spec.post(ctx)
+        else:
+            spec.post(ctx)
+        assert load_weights.call_count == cycle
+        loaded_weights = load_weights.call_args.args[0]
+        assert [name for name, _ in loaded_weights] == [
+            "model.layers.0.mlp.experts.2.down_proj.weight",
+            "model.layers.0.mlp.experts.3.down_proj.weight",
+        ]
+        torch.testing.assert_close(loaded_weights[0][1], ctx.buf[0])
+        torch.testing.assert_close(loaded_weights[1][1], ctx.buf[1])
 
-    spec = ext.build_hf_to_local_param_map(refit_info).get(expert_name)
-    assert spec is not None and spec.pre is not None and spec.post is not None
 
-    with pytest.raises(RuntimeError, match="w2_weight"):
-        spec.post(spec.materialize())
-
-
-def test_build_hf_to_local_param_map_rejects_trtllm_tensor_sharding():
-    """TRTLLM expert staging supports expert-parallel destination shards only."""
-    expert_name = "model.layers.0.mlp.experts.gate_proj.weight"
-    refit_info = {
-        "gen_tp_size": 2,
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {
-            "model.layers.0": [
-                {
-                    "name": expert_name,
-                    "global_shape": [4, 32, 16],
-                    "dtype": "torch.bfloat16",
-                    "grouped_expert_proj": "gate_proj",
-                    "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
-                    "dst_placements": [Shard(1)],
-                }
-            ]
-        },
+@pytest.mark.parametrize(
+    "num_experts, placement, message",
+    [
+        (4, Shard(1), "unsupported tensor shard dimensions"),
+        (5, Shard(0), "global expert count to divide evenly"),
+    ],
+)
+def test_trtllm_grouped_expert_spec_rejects_unsupported_sharding(
+    num_experts, placement, message
+):
+    """The factory rejects layouts that vLLM cannot load onto the same experts."""
+    param_info = {
+        "name": "model.layers.0.mlp.experts.gate_proj.weight",
+        "global_shape": [num_experts, 32, 16],
+        "dtype": "torch.bfloat16",
+        "grouped_expert_proj": "gate_proj",
+        "dst_mesh_info": MeshInfo(torch.tensor([8, 9])),
+        "dst_placements": [placement],
     }
-    ext = _make_ext(
-        {
-            "model.layers.0.mlp.experts.routed_experts.w13_weight": torch.empty(
-                128, 16, 24, 64
-            ),
-        }
-    )
-    _enable_trtllm_staging(ext)
-
-    with pytest.raises(ValueError, match="unsupported tensor shard dimensions"):
-        ext.build_hf_to_local_param_map(refit_info)
+    with pytest.raises(ValueError, match=message):
+        VllmReshardParamSpecCollection._trtllm_grouped_expert_spec(
+            param_info,
+            torch.bfloat16,
+            refit_comm_groups={0: SimpleNamespace(rank=9)},
+            device=torch.device("cpu"),
+            registered_vllm_name="model.layers.0.mlp.experts.routed_experts.w13_weight",
+            load_weights=MagicMock(),
+        )
 
 
 def test_prepare_nccl_reshard_refit_info_validates_before_building_map(monkeypatch):
@@ -1267,23 +1274,31 @@ def test_build_hf_to_local_param_map_rejects_invalid_mxfp8_metadata(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_receiver_commits_wire_dtype_to_live_nonquantized_storage(dtype, wire_dtype):
-    name = "model.layers.0.mlp.down_proj.weight"
-    param = torch.nn.Parameter(torch.full((4, 8), -1, dtype=dtype), requires_grad=False)
-    info = {
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {
-            "model.layers.0": [
-                {"name": name, "global_shape": [4, 8], "dtype": str(wire_dtype)}
-            ]
-        },
-    }
-    spec = _make_ext({name: param}).build_hf_to_local_param_map(info).get(name)
-    # Preserve values that would be rounded by an intermediate BF16 conversion.
-    expected = (torch.arange(32, dtype=torch.float32).reshape(4, 8) / 1000 + 1).to(
-        wire_dtype
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("merged", [False, True])
+def test_param_specs_commit_wire_dtype_to_live_nonquantized_storage(
+    dtype: torch.dtype, wire_dtype: torch.dtype, grouped: bool, merged: bool
+) -> None:
+    shape = (2, 4, 8) if grouped else (4, 8)
+    param = torch.nn.Parameter(torch.full(shape, -1, dtype=dtype), requires_grad=False)
+    merged_slice = None
+    if merged:
+        merged_slice = (slice(None),) * (param.ndim - 2) + (slice(0, 2), slice(None))
+    direct = dtype == wire_dtype and not merged
+    spec = (
+        VllmReshardParamSpecCollection._direct_param_spec(param, wire_dtype)
+        if direct
+        else VllmReshardParamSpecCollection._default_staged_param_spec(
+            param, merged_slice, wire_dtype
+        )
     )
-    if dtype == wire_dtype:
+    region = param if merged_slice is None else param[merged_slice]
+    # Preserve values that would be rounded by an intermediate BF16 conversion.
+    expected = (
+        torch.arange(region.numel(), dtype=torch.float32).reshape(region.shape) / 1000
+        + 1
+    ).to(wire_dtype)
+    if direct:
         assert spec.pre is None and spec.post is None
         for received in (expected, -expected):
             ctx = spec.materialize()
@@ -1292,16 +1307,23 @@ def test_receiver_commits_wire_dtype_to_live_nonquantized_storage(dtype, wire_dt
             ctx.buf.copy_(received)
             torch.testing.assert_close(param, received, rtol=0, atol=0)
         return
-    old_storage = param.data
-    param.data = torch.full_like(param, -2)
-    ctx = spec.materialize()
-    assert spec.pre is not None and spec.post is not None
-    assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
-    ctx.buf.copy_(expected)
-    assert torch.all(param == -2)
-    spec.post(ctx)
-    torch.testing.assert_close(param, expected.to(dtype), rtol=0, atol=0)
-    assert torch.all(old_storage == -1)
+
+    assert spec.base is param and spec.pre is not None and spec.post is not None
+    for received in (expected, -expected):
+        old_storage = param.data
+        old_values = old_storage.clone()
+        param.data = torch.full_like(param, -2)
+        ctx = spec.materialize()
+        assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
+        assert ctx.buf.data_ptr() != param.data_ptr()
+        ctx.buf.copy_(received)
+        assert torch.all(param == -2)
+        spec.post(ctx)
+        region = param if merged_slice is None else param[merged_slice]
+        torch.testing.assert_close(region, received.to(dtype), rtol=0, atol=0)
+        torch.testing.assert_close(old_storage, old_values, rtol=0, atol=0)
+        if merged:
+            assert torch.all(param[..., 2:, :] == -2)
 
 
 @pytest.mark.parametrize("grouped", [False, True])
@@ -1315,41 +1337,24 @@ def test_receiver_quantizes_blockwise_fused_weights(
     monkeypatch.setattr(
         fp8, "global_fp8_config", fp8.FP8Config(use_weight_pow2_scale=pow2_scale)
     )
-    prefix = "model.layers.0.mlp.experts" if grouped else "model.layers.0.mlp"
     local_shape = (2, 128, 256) if grouped else (128, 256)
     full_shape = (2, 256, 256) if grouped else (256, 256)
     scale_shape = (2, 2, 2) if grouped else (2, 2)
-    param_name = prefix + (".w13_weight" if grouped else ".gate_up_proj.weight")
     weight = torch.full(full_shape, -1, dtype=torch.float8_e4m3fn)
     scales = torch.full(scale_shape, 9, dtype=torch.float32)
-    params = []
-    for projection in ("gate_proj", "up_proj"):
-        metadata = {
-            "name": f"{prefix}.{projection}.weight",
-            "global_shape": list(local_shape),
-            "dtype": str(wire_dtype),
-        }
-        if grouped:
-            metadata["grouped_expert_proj"] = projection
-        params.append(metadata)
-    info = {
-        "gen_tp_size": 1,
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {"model.layers.0": params},
-    }
-    ext = _make_ext({param_name: weight, param_name + "_scale_inv": scales})
-    ext.model_runner.model.named_modules = lambda: [
-        (
-            param_name.rsplit(".", 1)[0],
-            SimpleNamespace(
-                weight_block_size=(128, 128), quant_method=SimpleNamespace()
-            ),
+    specs = [
+        VllmReshardParamSpecCollection._blockwise_fp8_receiver_quant_spec(
+            weight,
+            scales,
+            (slice(None),) * (weight.ndim - 2)
+            + (slice(part * 128, (part + 1) * 128), slice(None)),
+            (128, 128),
+            wire_dtype,
         )
+        for part in range(2)
     ]
-    specs = ext.build_hf_to_local_param_map(info)
     for cycle in (1, 2):
-        for projection, magnitude in (("gate_proj", 3), ("up_proj", 67)):
-            spec = specs.get(f"{prefix}.{projection}.weight")
+        for spec, magnitude in zip(specs, (3, 67), strict=True):
             ctx = spec.materialize()
             assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
             ctx.buf.fill_(cycle * magnitude)
@@ -1369,7 +1374,7 @@ def test_receiver_quantizes_blockwise_fused_weights(
         assert not torch.any(scales == 9)
 
 
-@pytest.mark.parametrize("block_size", [32, 64])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
     block_size: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1381,7 +1386,8 @@ def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
     monkeypatch.setattr(fp8, "cast_tensor_to_fp8_blockwise", quantize_spy)
 
     # vLLM refines a checkpoint's 128x128 grid for an intermediate shard
-    # aligned to 32 or 64 rows, but not to 128 rows.
+    # aligned to 32 or 64 rows, but not to 128 rows. The 128-row case uses
+    # only the module's weight_block_size fallback.
     experts, hidden_size, intermediate_size = 2, 256, 3 * block_size
     prefix = "model.layers.0.mlp.experts"
     gate_up = torch.full(
@@ -1410,9 +1416,13 @@ def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
             prefix,
             SimpleNamespace(
                 weight_block_size=(128, 128),
-                quant_method=SimpleNamespace(
-                    moe_block_shape=(block_size, block_size),
-                    quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+                quant_method=(
+                    SimpleNamespace(
+                        moe_block_shape=(block_size, block_size),
+                        quant_config=SimpleNamespace(weight_block_size=(128, 128)),
+                    )
+                    if block_size != 128
+                    else SimpleNamespace()
                 ),
             ),
         )
@@ -1490,34 +1500,23 @@ def test_receiver_quantizes_experts_with_refined_blockwise_scale_grid(
 def test_mxfp8_receiver_quantizes_wire_weights_on_gpu(grouped, wire_dtype):
     from nemo_rl.models.generation.vllm.quantization import fp8
 
-    prefix = "model.layers.0.mlp.experts" if grouped else "model.layers.0.mlp"
     local_shape = (2, 128, 128) if grouped else (128, 128)
     full_shape = (2, 256, 128) if grouped else (256, 128)
-    param_name = prefix + (".w13_weight" if grouped else ".gate_up_proj.weight")
     weight = torch.zeros(full_shape, dtype=torch.float8_e4m3fn, device="cuda")
     scales = torch.zeros((*full_shape[:-1], 4), dtype=torch.uint8, device="cuda")
     pointers = (weight.data_ptr(), scales.data_ptr())
-    metadata = []
-    for projection in ("gate_proj", "up_proj"):
-        info = {
-            "name": f"{prefix}.{projection}.weight",
-            "global_shape": list(local_shape),
-            "dtype": str(wire_dtype),
-        }
-        if grouped:
-            info["grouped_expert_proj"] = projection
-        metadata.append(info)
-    refit_info = {
-        "gen_tp_size": 1,
-        "layer_names": ["model.layers.0"],
-        "per_layer_params": {"model.layers.0": metadata},
-    }
-    specs = _make_ext(
-        {param_name: weight, param_name + "_scale_from_checkpoint": scales}
-    ).build_hf_to_local_param_map(refit_info)
+    specs = [
+        VllmReshardParamSpecCollection._mxfp8_receiver_quant_spec(
+            weight,
+            scales,
+            (slice(None),) * (weight.ndim - 2)
+            + (slice(part * 128, (part + 1) * 128), slice(None)),
+            wire_dtype,
+        )
+        for part in range(2)
+    ]
     for cycle in (1, 2):
-        for part, info in enumerate(metadata):
-            spec = specs.get(info["name"])
+        for part, spec in enumerate(specs):
             ctx = spec.materialize()
             assert spec.wire_dtype == ctx.buf.dtype == wire_dtype
             expected = (
