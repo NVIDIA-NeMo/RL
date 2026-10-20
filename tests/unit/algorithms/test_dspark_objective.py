@@ -104,6 +104,20 @@ def _distributed_inputs(
     }
 
 
+_STRUCTURAL_MISMATCH = "must agree on DSpark shapes, dtypes, and chunk size"
+_METADATA_MISMATCH = "must agree on DSpark token metadata"
+_DISTRIBUTED_CONTRACT_ERRORS = {
+    "zero_rows": _STRUCTURAL_MISMATCH,
+    "chunk_size": _STRUCTURAL_MISMATCH,
+    "previous_token_ids": _METADATA_MISMATCH,
+    "hard_labels": _METADATA_MISMATCH,
+    "valid_mask": _METADATA_MISMATCH,
+    "slot_weights": "must agree on DSpark slot_weights",
+    "rank_local_validation": "even rank-local TP partition",
+    "slot_bins_range": "slot_bins must be inside the configured slot bins",
+}
+
+
 def _run_distributed_contract_case(
     rank: int,
     world_size: int,
@@ -135,9 +149,11 @@ def _run_distributed_contract_case(
                 [1.0, 0.5 if rank == 0 else 0.25, 0.125]
             )
         elif case == "rank_local_validation" and rank == 0:
+            inputs["draft_vocab_start_index"] = 1
+        elif case == "slot_bins_range":
             inputs["slot_bins"] = torch.tensor([[-1, 1, 2]])
 
-        with pytest.raises(ValueError, match="tensor-parallel ranks"):
+        with pytest.raises(ValueError, match=_DISTRIBUTED_CONTRACT_ERRORS[case]):
             dspark_tiled_objective(**inputs)
     finally:
         torch.distributed.destroy_process_group()
@@ -263,7 +279,7 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
         .squeeze(-1)
     )
     tv_rows = 0.5 * (target_probs - draft_probs).abs().sum(dim=-1)
-    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1)
+    acceptance_targets = torch.minimum(target_probs, draft_probs).sum(dim=-1).detach()
     confidence_rows = F.binary_cross_entropy_with_logits(
         confidence_logits.float(),
         acceptance_targets,
@@ -424,6 +440,89 @@ def test_dspark_objective_stops_teacher_but_trains_all_draft_inputs() -> None:
         assert torch.isfinite(tensor.grad).all()
 
 
+def test_tiled_gradients_match_dense_reference_with_markov_and_confidence() -> None:
+    """Chunked backward must match dense autograd for every trained input."""
+    loss_weights = (1.25, 0.5, 2.0)
+    trained_names = ("draft_hidden", "markov_w1", "markov_w2", "confidence_logits")
+    inputs = _inputs()
+    reference_inputs = dict(inputs)
+    for name in trained_names:
+        tensor = inputs[name]
+        assert isinstance(tensor, torch.Tensor)
+        reference_inputs[name] = tensor.detach().clone().requires_grad_()
+    assert inputs["token_chunk_size"] == 2
+    markov_w1 = inputs["markov_w1"]
+    assert isinstance(markov_w1, torch.Tensor)
+    assert markov_w1.abs().sum() > 0
+
+    actual = dspark_tiled_objective(**inputs, loss_weights=loss_weights)
+    actual.combined.normalized(normalization_counts=actual.combined.counts).backward()
+
+    reference_components = _dense_oracle(reference_inputs)
+    reference_combined = DSparkLossBins(
+        numerators=sum(
+            weight * component.numerators
+            for weight, component in zip(
+                loss_weights, reference_components, strict=True
+            )
+        ),
+        counts=reference_components[0].counts,
+        weights=torch.ones_like(reference_components[0].counts),
+    )
+    reference_combined.normalized(
+        normalization_counts=reference_combined.counts
+    ).backward()
+
+    for name in trained_names:
+        actual_tensor = inputs[name]
+        reference_tensor = reference_inputs[name]
+        assert isinstance(actual_tensor, torch.Tensor)
+        assert isinstance(reference_tensor, torch.Tensor)
+        assert reference_tensor.grad is not None
+        assert reference_tensor.grad.abs().sum() > 0, name
+        torch.testing.assert_close(
+            actual_tensor.grad,
+            reference_tensor.grad,
+            rtol=1e-5,
+            atol=1e-6,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        pytest.param(
+            "slot_bins",
+            torch.zeros(2, 2, dtype=torch.long),
+            "slot_bins must match DSpark slots",
+            id="slot_bins_shape",
+        ),
+        pytest.param(
+            "slot_bins",
+            torch.tensor([[0, 1, 3], [0, 1, 2]]),
+            "slot_bins must be inside the configured slot bins",
+            id="slot_bins_range",
+        ),
+        pytest.param(
+            "draft_vocab_start_index",
+            7,
+            "even rank-local TP partition",
+            id="vocab_start",
+        ),
+    ],
+)
+def test_objective_rejects_inconsistent_local_layout(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    inputs = _inputs()
+    inputs[field] = value
+    with pytest.raises(ValueError, match=match):
+        dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
+
+
 def test_invalid_nonfinite_rows_are_excluded_before_probability_math() -> None:
     """Masked NaN/Inf values cannot poison numerators or gradients."""
     inputs = _inputs()
@@ -559,6 +658,50 @@ def test_raw_stats_add_across_dp_splits_with_one_zero_rank() -> None:
     assert not torch.equal(full.combined.counts, combined.combined.counts)
 
 
+def test_raw_stats_add_across_two_nonempty_dp_splits() -> None:
+    """Two ranks with different bin occupancy must sum to the full batch."""
+    inputs = _inputs()
+    valid_mask = inputs["valid_mask"]
+    assert isinstance(valid_mask, torch.Tensor)
+    assert valid_mask[0].tolist() != valid_mask[1].tolist()
+    assert bool(valid_mask[0].any()) and bool(valid_mask[1].any())
+    full = dspark_tiled_objective(**inputs, loss_weights=(1.25, 0.5, 2.0))
+    rank_stats = []
+    for block_index in range(2):
+        rank_inputs = {
+            name: value[block_index : block_index + 1]
+            if name
+            in {
+                "target_logits",
+                "draft_hidden",
+                "hard_labels",
+                "previous_token_ids",
+                "confidence_logits",
+                "valid_mask",
+                "slot_bins",
+            }
+            and isinstance(value, torch.Tensor)
+            else value
+            for name, value in inputs.items()
+        }
+        rank_stats.append(
+            dspark_tiled_objective(**rank_inputs, loss_weights=(1.25, 0.5, 2.0))
+        )
+
+    combined = rank_stats[0] + rank_stats[1]
+    for name in ("ce", "tv", "confidence", "combined"):
+        actual = getattr(combined, name)
+        expected = getattr(full, name)
+        torch.testing.assert_close(actual.numerators, expected.numerators)
+        torch.testing.assert_close(actual.counts, expected.counts)
+    local = rank_stats[0].combined
+    assert not torch.equal(local.counts, full.combined.counts)
+    assert not torch.allclose(
+        local.normalized(normalization_counts=local.counts),
+        local.normalized(normalization_counts=full.combined.counts),
+    )
+
+
 def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -575,9 +718,10 @@ def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(dspark, "_tile_log_normalizers", record_tiles)
-    saved_shapes = []
+    saved_tensors = []
     with torch.autograd.graph.saved_tensors_hooks(
-        lambda tensor: saved_shapes.append(tuple(tensor.shape)) or tensor,
+        lambda tensor: saved_tensors.append((tensor.numel(), tensor.data_ptr()))
+        or tensor,
         lambda tensor: tensor,
     ):
         actual = dspark_tiled_objective(
@@ -589,8 +733,14 @@ def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
             normalization_counts=actual.combined.counts
         ).backward()
 
-    vocab_shape = (2, 3, 7)
-    assert saved_shapes.count(vocab_shape) <= 1
+    target_logits = inputs["target_logits"]
+    assert isinstance(target_logits, torch.Tensor)
+    vocab_sized_pointers = {
+        data_ptr for numel, data_ptr in saved_tensors if numel == target_logits.numel()
+    }
+    # Only the caller-owned teacher logits may be retained at full vocab size;
+    # any probability or log-probability buffer would have a new storage.
+    assert vocab_sized_pointers <= {target_logits.data_ptr()}
 
 
 def test_confidence_can_be_disabled_without_changing_ce_or_tv() -> None:
@@ -835,7 +985,7 @@ def test_invalid_slots_may_carry_out_of_range_sentinel_tokens() -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["zero_rows", "chunk_size", "rank_local_validation"],
+    ["zero_rows", "chunk_size", "rank_local_validation", "slot_bins_range"],
 )
 def test_tp_contract_mismatch_fails_synchronously_on_every_rank(
     tmp_path: Path,

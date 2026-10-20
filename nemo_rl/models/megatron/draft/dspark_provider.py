@@ -186,12 +186,15 @@ class _DSparkProviderAdapter(nn.Module):
             # slot-shape checks in dspark_tiled_objective fail loudly first.
             markov_embeddings = None
             if self.confidence_head.with_markov:
-                safe_previous_token_ids = torch.where(
-                    valid_mask,
-                    previous_token_ids,
-                    torch.zeros_like(previous_token_ids),
-                ).clamp(0, self.markov_head.target_vocab_size - 1)
-                markov_embeddings = self.markov_head.markov_w1(safe_previous_token_ids)
+                # Clamp so an out-of-range valid ID reaches the objective's range
+                # check instead of a device-side assert in the embedding lookup.
+                markov_embeddings = self.markov_head.embed_previous_tokens(
+                    previous_token_ids=previous_token_ids.clamp(
+                        0, self.markov_head.target_vocab_size - 1
+                    ),
+                    slot_valid=valid_mask,
+                    reduce_across_tensor_parallel=False,
+                )
             confidence_logits = self.confidence_head(
                 draft_hidden,
                 slot_valid=valid_mask,
