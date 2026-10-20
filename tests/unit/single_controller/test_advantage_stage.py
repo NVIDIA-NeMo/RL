@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -51,7 +52,6 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
-from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 

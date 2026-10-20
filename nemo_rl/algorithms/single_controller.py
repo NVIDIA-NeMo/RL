@@ -117,6 +117,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -213,7 +214,6 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
-from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
     Logger,

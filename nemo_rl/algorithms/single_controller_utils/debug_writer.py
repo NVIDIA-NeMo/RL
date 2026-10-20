@@ -15,23 +15,13 @@
 """Stream untruncated training tensors without retaining a second step batch."""
 
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any, Iterable
 
 import torch
 
-
-def json_safe_nonfinite(value: Any) -> Any:
-    """Represent nonfinite diagnostic values as JSON null without mutating data."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, dict):
-        return {key: json_safe_nonfinite(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe_nonfinite(item) for item in value]
-    return value
+from nemo_rl.utils.json_utils import json_safe_nonfinite
 
 
 class DebugWriter:
