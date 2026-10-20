@@ -16,6 +16,7 @@
 
 import json
 import os
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,7 +25,7 @@ import torch
 from nemo_rl.utils.json_utils import json_safe_nonfinite
 
 
-class DebugWriter:
+class DebugWriter(ABC):
     """Base class for writers that store a step's training rows chunk by chunk.
 
     Each shard calls add_chunk on its own instance, and the controller calls
@@ -107,12 +108,6 @@ class DebugWriter:
             replace=is_first_chunk,
         )
 
-    def _write_rows(
-        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
-    ) -> int:
-        """Write one chunk's rows to storage and return how many were written."""
-        raise NotImplementedError
-
     def finish_step(self, step: int, expected_rows: int | None = None) -> None:
         """Publish a completed optimizer step and reset the per-step state.
 
@@ -125,9 +120,15 @@ class DebugWriter:
         self.step = None
         self.rows = 0
 
+    @abstractmethod
+    def _write_rows(
+        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
+    ) -> int:
+        """Write one chunk's rows to storage and return how many were written."""
+
+    @abstractmethod
     def _publish_step(self, step: int, expected_rows: int | None) -> None:
         """Publish a completed step's rows, raising on a row-count mismatch."""
-        raise NotImplementedError
 
 
 class JsonDebugWriter(DebugWriter):
