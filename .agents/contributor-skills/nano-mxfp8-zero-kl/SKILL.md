@@ -83,7 +83,7 @@ run trains normally but the KL is nonzero.
 | `moe_permute_fusion` | `false` | validated |
 | `tensor_model_parallel_size` / `context_parallel_size` | `1` / `1` | validated |
 | `env_vars.CUBLASLT_WORKSPACE_SIZE` / `env_vars.CUBLAS_WORKSPACE_CONFIG` | `'0'` / `':0:0'` | validated |
-| `env_vars.MAMBA_DETERMINISTIC` | `'1'` | validated |
+| `env_vars.MAMBA_DETERMINISTIC` | `'1'` | validated. Megatron-LM with [#6076](https://github.com/NVIDIA/Megatron-LM/pull/6076) (`megatron/core/tuning/`) ignores the variable; NeMo-RL then turns on deterministic mode itself (`_enable_mcore_deterministic_tuning`). Without that, model build fails with `requires MAMBA_DETERMINISTIC=1` even when it is set |
 | `env_vars.TRITON_CACHE_AUTOTUNING` | `'1'` | validated by `aabe7131a`; without it KL is about 0.003 |
 | `fp8_cfg.fp8_recipe` (with `enabled: true`) | `mxfp8` | validated |
 | `fp8_cfg.fp8_param` | `true` | validated indirectly: rejected if `false` while the precision file sets `fp8_param: true` |

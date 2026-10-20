@@ -556,6 +556,25 @@ def test_generation_config_never_runs_the_inference_training_forward():
     )
 
 
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_dedicated_generation_policy_passes_validation(precision):
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    config = _inference_training_forward_config(precision)
+    generation_policy = {
+        **config,
+        "megatron_cfg": merged_inference_megatron_cfg(config),
+    }
+
+    assert _validate(generation_policy, generation_only=True).violations == []
+    assert any(
+        "requires policy.megatron_cfg.moe_inference_training_forward=true" in v
+        for v in _validate(generation_policy).violations
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Package and platform gates
 # --------------------------------------------------------------------------- #
@@ -771,15 +790,58 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     monkeypatch.setattr(
         zgm, "_use_fused_log_softmax_at_tp1", lambda: shimmed.append(True)
     )
+    tuned: list[bool] = []
+    monkeypatch.setattr(
+        zgm, "_enable_mcore_deterministic_tuning", lambda: tuned.append(True)
+    )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
+    assert tuned == [True]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
     ]
+
+
+def _fake_tuning(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    calls: list[tuple] = []
+    tuning = types.ModuleType("megatron.core.tuning")
+    tuning.set_deterministic_mode = lambda value: calls.append(("set", value))  # type: ignore[attr-defined]
+    tuning.install = lambda *a, **k: calls.append(("install", a, k))  # type: ignore[attr-defined]
+    _install_fake_module(monkeypatch, tuning.__name__, tuning)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1", [("set", True), ("install", (), {"deterministic": True})]),
+        ("0", []),
+        (None, []),
+    ],
+)
+def test_mamba_deterministic_turns_on_mcore_deterministic_tuning(
+    monkeypatch, value, expected
+):
+    calls = _fake_tuning(monkeypatch)
+    if value is None:
+        monkeypatch.delenv("MAMBA_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("MAMBA_DETERMINISTIC", value)
+
+    zgm._enable_mcore_deterministic_tuning()
+
+    assert calls == expected
+
+
+def test_mcore_without_tuning_relies_on_mamba_deterministic(monkeypatch):
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setitem(sys.modules, "megatron.core.tuning", None)
+
+    zgm._enable_mcore_deterministic_tuning()
 
 
 def test_validate_kl_is_a_noop_when_everything_is_off():

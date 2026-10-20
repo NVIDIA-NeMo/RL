@@ -103,14 +103,21 @@ def validate_zero_train_gen_mismatch(
     *,
     check_packages: bool = True,
     check_platform: bool = True,
+    generation_only: bool = False,
 ) -> ZeroTrainGenValidation:
-    """Run all zero-KL gates; return violations and non-fatal warnings."""
+    """Run all zero-KL gates; return violations and non-fatal warnings.
+
+    ``generation_only`` is for a dedicated generation policy, whose
+    ``megatron_cfg`` is the merged inference config: the training-only
+    ``moe_inference_training_forward`` is cleared there, so the checks on the
+    training side's value are left to the driver, which sees the full config.
+    """
     out = ZeroTrainGenValidation()
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
     _validate_required_values(config, out)
-    _validate_backend(config, out)
+    _validate_backend(config, out, generation_only=generation_only)
     _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
@@ -318,6 +325,27 @@ def _use_fused_log_softmax_at_tp1() -> None:
             setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
 
 
+def _enable_mcore_deterministic_tuning() -> None:
+    """Pin Megatron-Core's Triton kernel configs when MAMBA_DETERMINISTIC=1 is set.
+
+    Megatron-Core with ``megatron.core.tuning`` (NVIDIA/Megatron-LM#6076) no longer
+    reads MAMBA_DETERMINISTIC. Its SSM kernels, and the hybrid batch-invariant check
+    in TransformerConfig, follow ``set_deterministic_mode``, and ``install`` pins
+    every in-scope autotuner without timing, so training and generation pick the
+    same config per shape. Megatron's own training sets these from
+    --deterministic-mode, which NeMo-RL does not go through. Older Megatron-Core
+    reads the variable itself.
+    """
+    if not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"):
+        return
+    try:
+        from megatron.core import tuning
+    except ImportError:
+        return
+    tuning.set_deterministic_mode(True)
+    tuning.install(deterministic=True)
+
+
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     """Pin TE FA support and call MCore ``enable_batch_invariant_mode``."""
     megatron_cfg = config["megatron_cfg"]
@@ -336,6 +364,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
+    _enable_mcore_deterministic_tuning()
     _use_fused_log_softmax_at_tp1()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
@@ -348,13 +377,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
 
 
 def validate_zero_train_gen_kl(
-    config: PolicyConfig, *, check_environment: bool
+    config: PolicyConfig, *, check_environment: bool, generation_only: bool = False
 ) -> None:
     """Raise if the zero-KL / batch-invariant config is invalid.
 
     ``check_environment=False`` runs only the config checks, so the driver can
     call it before Ray allocates GPUs; workers also check the installed
-    packages and the GPU.
+    packages and the GPU. ``generation_only`` is as in
+    :func:`validate_zero_train_gen_mismatch`.
     """
     if "megatron_cfg" not in config:  # DTensor / Automodel policies
         return
@@ -362,6 +392,7 @@ def validate_zero_train_gen_kl(
         config,
         check_packages=check_environment,
         check_platform=check_environment,
+        generation_only=generation_only,
     )
     result.emit_warnings()
     result.raise_if_invalid(
@@ -397,7 +428,9 @@ def _validate_required_values(
             )
 
 
-def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
+def _validate_backend(
+    config: PolicyConfig, out: ZeroTrainGenValidation, *, generation_only: bool = False
+) -> None:
     generation = config.get("generation")
     if generation is None or generation.get("backend") != "megatron":
         out.violations.append(
@@ -425,7 +458,8 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
     ) or inference_cfg.get("inference_moe_nvfp4_recipe") is not None
     if (
-        impl == "inference_optimized"
+        not generation_only
+        and impl == "inference_optimized"
         and backend == "flashinfer"
         and quantized_experts
         and not config["megatron_cfg"].get("moe_inference_training_forward")
