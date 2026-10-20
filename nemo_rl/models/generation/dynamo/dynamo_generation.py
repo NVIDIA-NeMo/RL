@@ -20,6 +20,8 @@ seam (``EngineRefitChannel``) and the frontend URL.
 
 import asyncio
 import logging
+import threading
+import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -75,6 +77,76 @@ def _is_retryable_http_response(response: Any) -> bool:
     return isinstance(status, int) and (
         status in _RETRYABLE_HTTP_STATUS_CODES or 500 <= status < 600
     )
+
+
+class RequestGateTimeout(TimeoutError):
+    """Requests were still in flight when the drain's wait expired."""
+
+
+class _RequestGate:
+    """Admission gate and in-flight counter for the requests this object sends.
+
+    Under the SingleController this object is the only client of the frontend,
+    so counting its own requests is the same as knowing what the fleet has in
+    flight, including a request that is between its prefill and decode legs and
+    therefore visible to no engine. ``generate_async`` runs on the actor's event
+    loop while the drain runs in a worker thread, hence threading primitives;
+    the async side waits on them through an executor.
+    """
+
+    def __init__(self) -> None:
+        self._open = threading.Event()
+        self._open.set()
+        self._cv = threading.Condition()
+        self._outstanding = 0
+
+    @property
+    def outstanding(self) -> int:
+        return self._outstanding
+
+    @property
+    def is_open(self) -> bool:
+        return self._open.is_set()
+
+    def _enter(self) -> None:
+        """Block until the gate is open, then count one request in."""
+        while True:
+            self._open.wait()
+            with self._cv:
+                if self._open.is_set():
+                    self._outstanding += 1
+                    return
+
+    async def enter(self) -> None:
+        await asyncio.get_running_loop().run_in_executor(None, self._enter)
+
+    def exit(self) -> None:
+        with self._cv:
+            self._outstanding -= 1
+            if self._outstanding == 0:
+                self._cv.notify_all()
+
+    def open(self) -> None:
+        self._open.set()
+
+    def close_and_wait_idle(self, timeout_s: float) -> None:
+        """Stop admitting requests and wait for the in-flight ones to return.
+
+        On timeout the gate reopens so a failed refit leaves rollouts runnable.
+        """
+        self._open.clear()
+        deadline = time.monotonic() + timeout_s
+        with self._cv:
+            while self._outstanding > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cv.wait(remaining):
+                    if self._outstanding > 0:
+                        outstanding = self._outstanding
+                        self._open.set()
+                        raise RequestGateTimeout(
+                            f"{outstanding} generation request(s) still in flight "
+                            f"after {timeout_s}s; the engines cannot be paused safely"
+                        )
 
 
 def _parse_dynamo_completion_response(
@@ -304,6 +376,7 @@ class DynamoGeneration(GenerationInterface):
         # copy that runs resume_after_weight_update waits for that registration.
         self._fleet_ready = not self._is_megatron_engine
         self._frontend_wait: Optional[dict[str, Any]] = None
+        self._request_gate = _RequestGate()
         try:
             self._managed_runtime.start()
             url = self._managed_runtime.frontend_url
@@ -370,21 +443,6 @@ class DynamoGeneration(GenerationInterface):
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
-
-    @property
-    def requires_idle_rollouts_before_weight_update(self) -> bool:
-        """Megatron engines cannot pause between a request's prefill and decode legs.
-
-        vLLM workers drain themselves on pause; a Megatron prefill engine that is
-        suspended while decode still reads its KV would corrupt the handoff, and
-        the engine refuses the suspend, so the controller must empty the pipeline
-        first.
-        """
-        return self._is_megatron_engine
-
-    @property
-    def idle_rollouts_timeout_s(self) -> float | None:
-        return self._dynamo_cfg.control_timeout_s if self._is_megatron_engine else None
 
     @property
     def frontend_url(self) -> str:
@@ -489,6 +547,8 @@ class DynamoGeneration(GenerationInterface):
         self._is_megatron_engine = validated_config.is_megatron_engine
         self._fleet_ready = state["_fleet_ready"]
         self._frontend_wait = state["_frontend_wait"]
+        # Fresh per process: the copy that serves requests is the copy that drains.
+        self._request_gate = _RequestGate()
 
     def _completion_url(self) -> str:
         base_url = self._dynamo_frontend_base_url
@@ -613,26 +673,32 @@ class DynamoGeneration(GenerationInterface):
             stop_strings=stop_strings,
             max_new_tokens=max_new_tokens,
         )
-        response: dict[str, Any] = {}
-        for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
-            response = await async_http_post_json(
-                request_url,
-                payload,
-                self._request_timeout_s(),
-            )
-            if not _is_retryable_http_response(response):
-                break
-            if attempt == _HTTP_MAX_ATTEMPTS:
-                break
-            LOGGER.warning(
-                "Dynamo completion attempt %d/%d failed; retrying in %.1fs: %s",
-                attempt,
-                _HTTP_MAX_ATTEMPTS,
-                _HTTP_RETRY_DELAY_S,
-                format_dynamo_error(response),
-            )
-            await asyncio.sleep(_HTTP_RETRY_DELAY_S)
-        return _parse_dynamo_completion_response(response, request_url=request_url)
+        # Counted in flight from first attempt to parsed response: a retry is
+        # still the same request as far as the engines are concerned.
+        await self._request_gate.enter()
+        try:
+            response: dict[str, Any] = {}
+            for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
+                response = await async_http_post_json(
+                    request_url,
+                    payload,
+                    self._request_timeout_s(),
+                )
+                if not _is_retryable_http_response(response):
+                    break
+                if attempt == _HTTP_MAX_ATTEMPTS:
+                    break
+                LOGGER.warning(
+                    "Dynamo completion attempt %d/%d failed; retrying in %.1fs: %s",
+                    attempt,
+                    _HTTP_MAX_ATTEMPTS,
+                    _HTTP_RETRY_DELAY_S,
+                    format_dynamo_error(response),
+                )
+                await asyncio.sleep(_HTTP_RETRY_DELAY_S)
+            return _parse_dynamo_completion_response(response, request_url=request_url)
+        finally:
+            self._request_gate.exit()
 
     def _single_sample_output(
         self,
@@ -817,29 +883,38 @@ class DynamoGeneration(GenerationInterface):
     def drain_for_weight_update(self) -> None:
         """Drain and pause every engine; a weight swap is unsafe mid-request.
 
-        Megatron engines are paused only once no prefill engine holds a handoff
-        pin: the controller already waited for in-flight requests, and the decode
-        adapter's release of the last handoff trails the final token slightly.
+        vLLM workers drain themselves: ``pause`` waits for the requests they are
+        running and queues new ones. Prefill/decode Megatron engines cannot: one
+        request runs on two engines in turn and is invisible to both between the
+        legs, and a prefill engine refuses to suspend while a handoff is pinned.
+        So for them this object, as the frontend's only client, first stops
+        sending and waits for its own in-flight requests, then waits for the
+        last handoff pins to clear, then suspends the engines. Both waits are
+        bounded by ``control_timeout_s``.
         """
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         if self._is_megatron_engine:
+            self._request_gate.close_and_wait_idle(self._dynamo_cfg.control_timeout_s)
             channel.wait_idle(self._dynamo_cfg.control_timeout_s)
         channel.pause()
 
     def resume_after_weight_update(self) -> None:
-        """Resume every engine after a weight update.
+        """Resume every engine after a weight update and admit requests again.
 
         The first resume of a Megatron fleet is also its startup: the engines
         were built by this refit and only now register with the frontend, so
-        rollouts wait here until the frontend routes the model.
+        requests are admitted only once the frontend routes the model.
         """
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.resume()
-        self._await_fleet_ready()
+        try:
+            channel.resume()
+            self._await_fleet_ready()
+        finally:
+            self._request_gate.open()
 
     def _await_fleet_ready(self) -> None:
         if self._fleet_ready:

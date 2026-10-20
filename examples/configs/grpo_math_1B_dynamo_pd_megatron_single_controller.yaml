@@ -7,10 +7,10 @@
 # Megatron-LM's Dynamo adapter, which registers the engine with the frontend.
 #
 # Weight updates use the collective transport, as for backend: megatron with
-# colocated.enabled: false. Because a request spans two engines, the
-# SingleController first waits for every in-flight request and holds new ones
-# (bounded by dynamo_cfg.control_timeout_s), then suspends the engines, runs
-# the refit, resumes them, and reopens generation.
+# colocated.enabled: false. Because a request spans two engines, the drain
+# before each refit first stops sending and waits for this client's in-flight
+# requests to return (bounded by dynamo_cfg.control_timeout_s), then suspends
+# the engines; after the refit they resume and requests are admitted again.
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
 async_rl:

@@ -777,14 +777,10 @@ def _megatron_generation(monkeypatch, *, prefill_pinned: int = 0, gpus: int = 4)
     return generation, events, waits
 
 
-def test_megatron_engines_build_the_channel_and_require_idle_rollouts(
-    monkeypatch,
-) -> None:
+def test_megatron_engines_build_the_channel(monkeypatch) -> None:
     generation, events, _ = _megatron_generation(monkeypatch)
     assert events == ["init", "start"]
     assert isinstance(generation._refit_channel, MegatronRefitChannel)
-    assert generation.requires_idle_rollouts_before_weight_update is True
-    assert generation.idle_rollouts_timeout_s == 10
     assert generation.get_inference_world_size() == 4
     assert generation.get_collective_sender_spec().nccl_peer == "nemo"
     assert generation.dp_openai_server_base_urls == [None]
@@ -824,7 +820,7 @@ def test_megatron_drain_waits_for_pins_and_first_resume_awaits_frontend(
     if pickled:
         generation = pickle.loads(pickle.dumps(generation))
         assert generation._managed_runtime is None
-        assert generation.requires_idle_rollouts_before_weight_update is True
+        assert generation._request_gate.is_open
 
     generation.drain_for_weight_update()
     assert _MEGATRON_LOG == [
@@ -878,3 +874,88 @@ def test_megatron_engine_settings_require_the_megatron_trainer(megatron_trainer)
     else:
         with pytest.raises(ValueError, match="policy.megatron_cfg.enabled=true"):
             DynamoGeneration.validate_settings(master_config)
+
+
+def test_megatron_drain_waits_for_this_clients_requests_and_holds_new_ones(
+    monkeypatch,
+) -> None:
+    """The facade is the frontend's only client, so it drains its own requests.
+
+    A request already sent finishes before the engines pause; a request issued
+    during the drain is held until resume, so it runs on the new weights.
+    """
+    generation, _, _ = _megatron_generation(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_post(url, payload, timeout_s):
+        started.set()
+        await release.wait()
+        return _completion_response([4])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", slow_post)
+
+    async def one_request():
+        return [item async for item in generation.generate_async(_data())]
+
+    async def scenario():
+        in_flight = asyncio.create_task(one_request())
+        await started.wait()
+        assert generation._request_gate.outstanding == 1
+
+        drain = asyncio.create_task(
+            asyncio.to_thread(generation.drain_for_weight_update)
+        )
+        await asyncio.sleep(0.05)
+        assert not drain.done(), "the drain waits for the request already sent"
+        assert not generation._request_gate.is_open
+        assert "d0.suspend" not in _MEGATRON_LOG
+
+        started.clear()
+        held = asyncio.create_task(one_request())
+        await asyncio.sleep(0.05)
+        assert not started.is_set(), "a new request is held at the gate"
+
+        release.set()
+        await in_flight
+        await drain
+        assert (
+            "d0.suspend" in _MEGATRON_LOG and generation._request_gate.outstanding == 0
+        )
+        assert not started.is_set()
+
+        generation.resume_after_weight_update()
+        assert generation._request_gate.is_open
+        await held
+        assert started.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_megatron_drain_timeout_reopens_the_gate(monkeypatch) -> None:
+    generation, _, _ = _megatron_generation(monkeypatch)
+    monkeypatch.setattr(generation._dynamo_cfg, "control_timeout_s", 0.05)
+    release = asyncio.Event()
+
+    async def slow_post(url, payload, timeout_s):
+        await release.wait()
+        return _completion_response([4])
+
+    monkeypatch.setattr(generation_module, "async_http_post_json", slow_post)
+
+    async def scenario():
+        async def one_request():
+            return [item async for item in generation.generate_async(_data())]
+
+        in_flight = asyncio.create_task(one_request())
+        await asyncio.sleep(0.02)
+        with pytest.raises(
+            generation_module.RequestGateTimeout, match="1 generation request"
+        ):
+            await asyncio.to_thread(generation.drain_for_weight_update)
+        assert generation._request_gate.is_open, "a timed-out drain reopens the gate"
+        assert "d0.suspend" not in _MEGATRON_LOG, "the engines were never paused"
+        release.set()
+        await in_flight
+
+    asyncio.run(scenario())

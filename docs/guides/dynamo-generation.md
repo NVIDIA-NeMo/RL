@@ -251,12 +251,15 @@ Refit and startup differ from the vLLM fleet:
   first refit. `dynamo_cfg.startup_timeout_s` must cover trainer construction
   plus the first refit.
 - A request spans two engines, and a Megatron engine refuses to suspend while a
-  prefill block is still pinned for decode. Before every refit the
-  SingleController therefore waits for every in-flight request and holds new
-  ones (the generation backend reports `requires_idle_rollouts_before_weight_update`),
-  waits for the remaining handoff pins to clear, suspends decode then prefill,
-  runs the collective refit, and resumes prefill then decode. Both waits are
-  bounded by `dynamo_cfg.control_timeout_s`.
+  prefill block is still pinned for decode. vLLM workers drain themselves on
+  pause, but no single Megatron engine can see a request that is between its
+  prefill and decode legs. Under the SingleController, `DynamoGeneration` is
+  the frontend's only client, so its `drain_for_weight_update` stops sending,
+  waits for its own in-flight requests to return, waits for the remaining
+  handoff pins to clear, then suspends decode and prefill. After the collective
+  refit it resumes prefill then decode and admits requests again. Both waits
+  are bounded by `dynamo_cfg.control_timeout_s`. The controller's refit sequence
+  is unchanged.
 - The collective is one NCCL group over trainer plus all engines, with each
   engine's ranks offset by the cumulative width of the engines before it. The
   engines receive logical (unfused) weights, as the Megatron backend does.

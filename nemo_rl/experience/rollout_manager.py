@@ -491,75 +491,6 @@ class _Deadline:
         self._remaining = None
 
 
-class RolloutIdleTimeout(TimeoutError):
-    """The turn gate closed, but outstanding requests did not return in time."""
-
-
-class TurnGate:
-    """Admission gate and outstanding counter for engine requests.
-
-    Every ``generate_async`` call made by the native rollout path passes through
-    :meth:`admit` / :meth:`release`. The controller closes the gate and waits for
-    the outstanding count to reach zero before a weight update on backends whose
-    engines cannot drain themselves (see
-    ``GenerationInterface.requires_idle_rollouts_before_weight_update``). Closing the
-    gate holds *new turns*; requests already issued run to completion.
-    """
-
-    def __init__(self) -> None:
-        self._open = asyncio.Event()
-        self._open.set()
-        self._outstanding = 0
-        self._idle = asyncio.Condition()
-
-    @property
-    def outstanding(self) -> int:
-        return self._outstanding
-
-    @property
-    def is_open(self) -> bool:
-        return self._open.is_set()
-
-    def close(self) -> None:
-        self._open.clear()
-
-    def open(self) -> None:
-        self._open.set()
-
-    async def admit(self) -> None:
-        """Wait for the gate, then count this request as outstanding."""
-        await self._open.wait()
-        async with self._idle:
-            self._outstanding += 1
-
-    async def release(self) -> None:
-        async with self._idle:
-            self._outstanding -= 1
-            if self._outstanding == 0:
-                self._idle.notify_all()
-
-    async def wait_idle(self) -> None:
-        async with self._idle:
-            await self._idle.wait_for(lambda: self._outstanding == 0)
-
-    async def wait_for_idle(self, timeout_s: Optional[float]) -> None:
-        """Close the gate and wait until no request is outstanding.
-
-        On timeout the gate reopens so a failed refit leaves rollouts runnable,
-        and :class:`RolloutIdleTimeout` reports how many were still out.
-        """
-        self.close()
-        try:
-            await asyncio.wait_for(self.wait_idle(), timeout_s)
-        except TimeoutError:
-            outstanding = self._outstanding
-            self.open()
-            raise RolloutIdleTimeout(
-                f"{outstanding} generation request(s) still outstanding after "
-                f"{timeout_s}s; the engines cannot be paused safely"
-            ) from None
-
-
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
@@ -577,7 +508,6 @@ class AsyncRolloutImpl:
         policy_generation: GenerationInterface,
         timeouts: RolloutTimeouts = RolloutTimeouts(),
         deadline_registry: Optional[RequestDeadlineRegistry] = None,
-        turn_gate: Optional[TurnGate] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -588,17 +518,6 @@ class AsyncRolloutImpl:
         self._policy_generation = policy_generation
         self._timeouts = timeouts
         self._deadline_registry = deadline_registry
-        self._turn_gate = turn_gate if turn_gate is not None else TurnGate()
-
-    @property
-    def turn_gate(self) -> TurnGate:
-        # Tests build this class with object.__new__ and set attributes by hand;
-        # give them a gate too rather than failing on the first turn.
-        gate = getattr(self, "_turn_gate", None)
-        if gate is None:
-            gate = TurnGate()
-            self._turn_gate = gate
-        return gate
 
     async def run_rollout(
         self,
@@ -881,22 +800,15 @@ class AsyncRolloutImpl:
         # Generate response
         # TODO: update generate_async to return a single item directly
         output = None
-        # Admission sits outside the per-turn deadline: time spent held at a
-        # closed gate during a refit is not the request's own latency.
-        turn_gate = self.turn_gate
-        await turn_gate.admit()
-        try:
-            async with _Deadline(
-                self._timeouts.generation_s,
-                "generation turn",
-                registry=self._deadline_registry,
+        async with _Deadline(
+            self._timeouts.generation_s,
+            "generation turn",
+            registry=self._deadline_registry,
+        ):
+            async for _idx, output in self._policy_generation.generate_async(
+                generation_input_data
             ):
-                async for _idx, output in self._policy_generation.generate_async(
-                    generation_input_data
-                ):
-                    pass
-        finally:
-            await turn_gate.release()
+                pass
 
         # Build assistant message
         input_len = int(input_lengths[0].item())
@@ -1777,9 +1689,6 @@ class RolloutManager:
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
-        # Shared with the native impl so the controller can hold new turns and
-        # wait for outstanding engine requests before a weight update.
-        self._turn_gate = TurnGate()
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -1808,7 +1717,6 @@ class RolloutManager:
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),
             deadline_registry=self._request_deadlines,
-            turn_gate=self._turn_gate,
             # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
             stats=self._stats,
@@ -1846,25 +1754,6 @@ class RolloutManager:
     def resume_request_deadlines(self) -> None:
         """Resume live request-deadline clocks when a colocated engine exits training mode."""
         self._request_deadlines.resume()
-
-    @property
-    def outstanding_requests(self) -> int:
-        """Engine requests issued by the native rollout path and not yet returned."""
-        return self._turn_gate.outstanding
-
-    async def wait_for_idle_rollouts(self, timeout_s: Optional[float]) -> None:
-        """Hold new turns and wait until every outstanding engine request returned.
-
-        Used before a weight update on backends whose engines cannot drain
-        themselves. The gate stays closed until :meth:`release_turn_gate`.
-        The NeMo-Gym impl does not route its requests through this gate; the
-        controller rejects that combination at setup.
-        """
-        await self._turn_gate.wait_for_idle(timeout_s)
-
-    def release_turn_gate(self) -> None:
-        """Let held turns proceed again after a weight update (or its failure)."""
-        self._turn_gate.open()
 
     @property
     def recovery_ledger(self) -> RolloutRecoveryLedger:
