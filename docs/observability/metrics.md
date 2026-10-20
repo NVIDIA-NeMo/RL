@@ -3,34 +3,6 @@
 For live prefix-checkpoint spans, pending-phase diagnostics, and their timing
 boundaries, see [Prefix rollout checkpoint telemetry](rollout-checkpoint.md).
 
-## Rollout checkpoint metrics
-
-The logger's `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries
-also reach Lens. They reuse the controller's existing measurements; telemetry does
-not retime the save or restore. These series need no prefix-recovery branch.
-
-| Metric | Kind / unit | Dimensions and meaning |
-|---|---|---|
-| `rl.checkpoint.duration` | Histogram / seconds | `rl.checkpoint.operation` (`save`, `restore`) and `rl.checkpoint.phase` |
-| `rl.checkpoint.rows` | Gauge / rows | Latest replay, staging, or total snapshot rows |
-| `rl.checkpoint.groups` | Gauge / groups | Saved replay/ledger groups or restored complete/unfinished groups |
-| `rl.checkpoint.siblings` | Gauge / rollouts | Sealed siblings reused or unfinished siblings redispatched |
-| `rl.checkpoint.sidecar_bytes` | Gauge / bytes | Controller sidecar size |
-
-Checkpoint durations include total, TQ, barrier wait, exclusive hold, sidecar save,
-publication, snapshot selection, dataloader load, replay metadata load, recovery
-preparation, and redispatch scheduling, when the corresponding logger key exists.
-Counts use `rl.checkpoint.category`. Missing phases are absent, not zero. Phase
-durations nest and overlap: **do not sum them into checkpoint latency or goodput**.
-The restore total retains the existing logger's definition (sum of its measured
-restore phases); it is not allocation-to-ready wall time. These metrics describe
-completed operations, not a pending checkpoint's current phase.
-
-Histograms can be aggregated across processes; do not average worker p95s.
-Percentile resolution depends on the SDK/exporter's aggregation and bucket
-boundaries. No step, checkpoint, rollout, or model-call IDs are metric labels.
-Use the existing telemetry/exporter configuration to enable these measurements.
-
 NeMo-RL emits training, setup, generation, host-memory, completed checkpoint, and async runtime metrics. Metrics export through the instrumented process's Lens provider.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
@@ -223,6 +195,8 @@ Every point carries `rl.checkpoint.operation`. Durations add
 | `exclusive_hold_seconds` | `rl.checkpoint.duration` | `save` | `exclusive_hold` |
 | `sidecar_save_seconds` | `rl.checkpoint.duration` | `save` | `sidecar_save` |
 | `snapshot_commit_seconds` | `rl.checkpoint.duration` | `save` | `publication` |
+| `gym_parked_seconds` | `rl.checkpoint.duration` | `save` | `gym_parked` |
+| `generation_cut_fence_hold_seconds` | `rl.checkpoint.duration` | `save` | `generation_cut_fence_hold` |
 | `total_load_seconds` | `rl.checkpoint.duration` | `restore` | `total` |
 | `snapshot_resolution_seconds` | `rl.checkpoint.duration` | `restore` | `snapshot_resolution` |
 | `dataloader_load_seconds` | `rl.checkpoint.duration` | `restore` | `dataloader_load` |
@@ -239,6 +213,8 @@ Every point carries `rl.checkpoint.operation`. Durations add
 | `groups_unfinished_found` | `rl.checkpoint.groups` | `restore` | `unfinished` |
 | `siblings_reused` | `rl.checkpoint.siblings` | `restore` | `reused` |
 | `siblings_rerun` | `rl.checkpoint.siblings` | `restore` | `rerun` |
+| `siblings_continued` | `rl.checkpoint.siblings` | `restore` | `continued` |
+| `siblings_restarted` | `rl.checkpoint.siblings` | `restore` | `restarted` |
 | `controller_sidecar_bytes` | `rl.checkpoint.sidecar_bytes` | `save` | `controller` |
 
 Missing phases are absent, not zero. Save phases nest inside `total` (barrier

@@ -223,6 +223,7 @@ _CHECKPOINT_OUTCOME_PREFIX = "rollout/checkpoint_outcome"
 _CHECKPOINT_ATTEMPT_OUTCOMES = ("completed", "failed", "skipped")
 _CHECKPOINT_ATTEMPT_REASONS = (
     "completed",
+    "gym_unavailable",
     "invariant_error",
     "io_error",
     "missing_trainer_anchor",
@@ -251,6 +252,8 @@ _CHECKPOINT_DURATION_PHASES = {
     "replay_metadata_load_seconds": "replay_metadata_load",
     "recovery_prepare_seconds": "recovery_prepare",
     "redispatch_schedule_seconds": "redispatch_schedule",
+    "gym_parked_seconds": "gym_parked",
+    "generation_cut_fence_hold_seconds": "generation_cut_fence_hold",
 }
 _CHECKPOINT_LEVELS = {
     "replay_rows": (_CHECKPOINT_ROWS_KEY, "replay"),
@@ -262,6 +265,8 @@ _CHECKPOINT_LEVELS = {
     "groups_unfinished_found": (_CHECKPOINT_GROUPS_KEY, "unfinished"),
     "siblings_reused": (_CHECKPOINT_SIBLINGS_KEY, "reused"),
     "siblings_rerun": (_CHECKPOINT_SIBLINGS_KEY, "rerun"),
+    "siblings_continued": (_CHECKPOINT_SIBLINGS_KEY, "continued"),
+    "siblings_restarted": (_CHECKPOINT_SIBLINGS_KEY, "restarted"),
     "controller_sidecar_bytes": (_CHECKPOINT_SIDECAR_BYTES_KEY, "controller"),
 }
 

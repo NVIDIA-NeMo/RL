@@ -195,6 +195,8 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
         {
             "total_save_seconds": 30,
             "tq_save_seconds": 12,
+            "gym_parked_seconds": 18,
+            "generation_cut_fence_hold_seconds": 10,
             "snapshot_sequence": 99,
             "replay_rows": 256,
             "controller_sidecar_bytes": 4096,
@@ -206,7 +208,13 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
         "timing/rollout_checkpoint",
     )
     tee_rl_metrics_to_otel(
-        {"total_load_seconds": 8, "tq_load_seconds": 5, "siblings_reused": 16},
+        {
+            "total_load_seconds": 8,
+            "tq_load_seconds": 5,
+            "siblings_reused": 16,
+            "siblings_continued": 4,
+            "siblings_restarted": 2,
+        },
         "timing/rollout_recovery",
     )
     data = reader.get_metrics_data()
@@ -220,13 +228,18 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
     } == {
         ("save", "total"): 30,
         ("save", "tq"): 12,
+        ("save", "gym_parked"): 18,
+        ("save", "generation_cut_fence_hold"): 10,
         ("restore", "total"): 8,
         ("restore", "tq"): 5,
     }
     assert all(p.count == 1 for p in durations)
     assert all("rl.bucket" not in p.attributes for p in durations)
     assert _gauge_points(data, "rl.checkpoint.rows")[0].value == 256
-    assert _gauge_points(data, "rl.checkpoint.siblings")[0].value == 16
+    assert {
+        p.attributes["rl.checkpoint.category"]: p.value
+        for p in _gauge_points(data, "rl.checkpoint.siblings")
+    } == {"reused": 16, "continued": 4, "restarted": 2}
     assert _gauge_points(data, "rl.checkpoint.sidecar_bytes")[0].value == 4096
 
 
@@ -822,6 +835,9 @@ def test_tee_emits_the_training_scalars(monkeypatch):
 
 
 def test_tee_emits_the_vllm_engine_metrics(monkeypatch):
+    # The owner declares these instruments at import; standalone telemetry
+    # tests do not collect the generation suites that normally import it.
+    pytest.importorskip("nemo_rl.models.generation.vllm.metric_names")
     import nemo_rl.telemetry.metrics as metrics_mod
     from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 

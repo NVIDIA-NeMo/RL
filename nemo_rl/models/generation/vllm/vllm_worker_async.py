@@ -2820,7 +2820,9 @@ class VllmAsyncGenerationWorkerImpl(
                 try:
                     content = await run_in_thread(
                         "generation_terminal",
-                        worker_self._finish_request_capture, request, content
+                        worker_self._finish_request_capture,
+                        request,
+                        content,
                     )
                 except asyncio.CancelledError:
                     # Queued executor work may never start after cancellation.
