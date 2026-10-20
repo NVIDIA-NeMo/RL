@@ -1669,6 +1669,12 @@ class VllmAsyncGenerationWorkerImpl(
             host="0.0.0.0",
             port=free_port,
             timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
+            # Gym's policy proxy saw thousands of "Cannot connect to host ... Connect call
+            # failed" per GDPval run against these servers (every shard, all run long): the
+            # default accept backlog (2048) overflows when the loop is busy with ~100 concurrent
+            # 100k-token requests, and each failed connect costs the rollout a 10-minute read
+            # timeout. Let the kernel queue connections instead (capped by somaxconn).
+            backlog=65535,
         )
         server = uvicorn.Server(config=config)
 

@@ -1,0 +1,151 @@
+# =============================================================================
+# ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml + GDPval (Gym gdpval_sandboxed_agent + gdpval_disaggregated,
+# ported from hiteshis's gdpval_ohv2_localjudge), for collecting and training on the six-set SWE mix,
+# Terminal-Bench and GDPval together. Rows carry their agent in `agent_ref`; GDPval rows use gdpval_train.
+#
+# SWE and TB are unchanged. GDPval runs as in hiteshis's OpenHands arm (gdpval-oh-web-gopo-mercor-02, step 46):
+# - OpenHands v3 (CodeAct) runs inside a per-rollout OpenSandbox sandbox (image gdpval:aa-v2-amd64, 8 CPU /
+#   48 GiB / 60 GiB) and calls the policy through the rollout-prefixed Gym URL, so token capture (the ledger) sees
+#   every call; up to 200 turns and 80 min per rollout, 900 s per model call, the whole trajectory within
+#   policy.max_total_sequence_length (no compaction).
+# - The resources server seeds the task (prompt + reference files), collects /workspace deliverables and judges
+#   them against the task's rubric through the upstream gdpval server: reward = rubric points / max points in
+#   [0, 1], no pass threshold. Judge: a local Qwen3.8-Flash-Next (launchers/gdpval/serve_judge_qwen38_flash_next
+#   .sbatch); the endpoint file (JUDGE_ENDPOINT_FILE) is re-read per verdict.
+# - Masked: no verdict (judge/infrastructure failure, agent timeout: evaluation_completed false), an unfinished
+#   harness (agent_finished false) and, from the judge server, context / iteration-limit rollouts
+#   (mask_policy_failures) so the policy is not graded on length. A rule whose field a rollout lacks never
+#   matches, so the SWE / TB and GDPval rule sets do not interact.
+# - Web tools (Exa) are off until we have our own key set (the keys are visible inside the sandbox).
+# Paths and the endpoint come from the job environment (launcher v2.sh, NRL_CONFIG *gdpval*): GDPVAL_TRAIN_DATA,
+# GDPVAL_JUDGE_DATASET, GDPVAL_SANDBOX_IMAGE, GDPVAL_HARNESS_DIR, GDPVAL_ARTIFACT_ROOT, JUDGE_ENDPOINT_FILE,
+# JUDGE_BASE_URL / JUDGE_MODEL_NAME / JUDGE_API_KEY.
+# =============================================================================
+defaults: ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      # Harness install (<= 900 s) + agent (4800 s) + judge (<= 1200 s) + sandbox create; SWE / TB end far sooner.
+      rollout_timeout_s: 8400
+  stall_watchdog:
+    # A GDPval group can take ~2 h; warn-only either way.
+    stall_timeout_s: 10800.0
+env:
+  # Lists are replaced, not merged: the SWE / TB rules plus GDPval's unfinished harness.
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+  - name: eval_incomplete
+    field: evaluation_completed
+    equals: false
+  - name: context_limited
+    field: opencode_context_limited
+    equals: true
+  - name: gdpval_harness_unfinished
+    field: agent_finished
+    equals: false
+  nemo_gym:
+    # Lists are replaced, not merged: the SWE + TB list plus the GDPval agent and judge server.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+    - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+    - resources_servers/swemer_oml/configs/swemer_oml_opencode.yaml
+    - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+    - resources_servers/swe_next/configs/swe_next_opencode.yaml
+    - benchmarks/terminal_bench_2_1/opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    - responses_api_agents/gdpval_sandboxed_agent/configs/training.yaml
+    - resources_servers/gdpval_disaggregated/configs/training.yaml
+    # Instance name = the agent_ref in the GDPval rows.
+    gdpval_train:
+      responses_api_agents:
+        gdpval_sandboxed_agent: &gdpval_agent
+          token_id_capture: true
+          model_server:
+            type: responses_api_models
+            name: policy_model
+          sandbox_provider: sandbox
+          sandbox_python: /opt/gdpval-openhands/venv/bin/python
+          remote_openhands_install_script_path: ${oc.env:GDPVAL_HARNESS_DIR}/install.sh
+          remote_openhands_archive_path: ${oc.env:GDPVAL_HARNESS_DIR}/runtime.tar.gz
+          harness_install_timeout: 900
+          agent_max_turns: 200
+          agent_timeout: 4800
+          max_context: ${policy.max_total_sequence_length}
+          max_output_tokens: ${policy.max_total_sequence_length}
+          checkpoint: ${policy.model_name}
+          # 900 s (was 1800 in the base): 600 s cut 32k-token calls at 35-55 tok/s; 900 s removed most timeouts.
+          model_read_timeout_s: 900
+          model_read_retries: 1
+          web_tools_enabled: false
+          # Rollouts in flight per Gym (a multiple of num_workers); sized to the engines like the SWE agents'.
+          concurrency: 64
+          num_workers: 4
+          resources_server:
+            type: resources_servers
+            name: gdpval_train_resources
+          # The agent seeds each rollout on the least-loaded judge server (sessions are sticky).
+          resources_servers:
+          - {type: resources_servers, name: gdpval_train_resources}
+          - {type: resources_servers, name: gdpval_train_resources_1}
+    gdpval_val:
+      responses_api_agents:
+        gdpval_sandboxed_agent:
+          <<: *gdpval_agent
+          concurrency: 4
+          num_workers: 1
+          resources_server:
+            type: resources_servers
+            name: gdpval_val_resources
+          resources_servers: []
+    gdpval_train_resources:
+      resources_servers:
+        gdpval_disaggregated: &gdpval_judge
+          entrypoint: app.py
+          # The full task set (rows look tasks up by task_id); references under data_root/references/<key>.
+          dataset_path: ${oc.env:GDPVAL_JUDGE_DATASET}
+          data_root: ${oc.env:GDPVAL_TRAIN_DATA}
+          # Per-rollout deliverables, traces and judge requests (never deleted by Gym: prune them).
+          artifact_root: ${oc.env:GDPVAL_ARTIFACT_ROOT}
+          sandbox_image: ${oc.env:GDPVAL_SANDBOX_IMAGE}
+          sandbox_provider: sandbox
+          sandbox_config:
+            derive_cpu_env: true
+            ttl_s: 18000
+            ready_timeout_s: 1200
+            resources:
+              cpu: 8
+              # 48 GiB: at 32 GiB ~0.5% of sandboxes were OOM-killed (hiteshis, 2026-10-05).
+              memory_mib: 49152
+              disk_gib: 60
+            metadata:
+              workload: gdpval-training
+          judge_timeout: 1200
+          judge_max_attempts: 1
+          judge_retry_delay_s: 5.0
+          judge_concurrency: 4
+          judge_media_mode: images_and_text
+          judge_url: ${oc.env:JUDGE_BASE_URL}
+          judge_model: ${oc.env:JUDGE_MODEL_NAME}
+          mask_policy_failures: [agent_context_limit, agent_iteration_limit]
+          domain: other
+          verified: false
+          num_workers: 1
+    gdpval_train_resources_1:
+      resources_servers:
+        gdpval_disaggregated: *gdpval_judge
+    gdpval_val_resources:
+      resources_servers:
+        gdpval_disaggregated:
+          <<: *gdpval_judge
+          judge_concurrency: 4
