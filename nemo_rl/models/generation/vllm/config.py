@@ -98,6 +98,16 @@ class VllmSpecificArgs(TypedDict):
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # Store each request's logprobs in vLLM's FlatLogprobs (a few flat lists per
+    # request) instead of a dict plus one Logprob object per generated token. Same
+    # values; avoids long full GC pauses on the generation actor when many requests
+    # with logprobs are in flight (the async engine's HTTP server path). Default false.
+    flat_logprobs: NotRequired[bool]
+    # Bound how long vLLM's front-end output loops may hold the generation actor's
+    # event loop under a backlog: output_handler yields once per engine step and the
+    # output-socket reader after this many ms of continuous work (20 is a good value).
+    # Keeps refit and other control calls responsive. None (default) disables it.
+    output_loop_yield_budget_ms: NotRequired[float | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
