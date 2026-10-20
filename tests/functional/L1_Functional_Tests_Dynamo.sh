@@ -35,6 +35,7 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dynamo.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_single_controller.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_gym_single_controller.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_nccl_reshard.sh
 
 cd "${PROJECT_ROOT}/tests"

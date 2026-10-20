@@ -226,12 +226,26 @@ them on the new weights. With `async_rl.recompute_kv_cache_after_weight_updates`
 (the default) the pause also clears each engine's KV and prefix cache, so frozen
 requests recompute their KV on the new weights; set it to false to keep both.
 
+NeMo-Gym rollouts work too: start from
+[`examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml`](../../examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml).
+Gym reaches Dynamo through the token wrapper that `vllm_cfg.expose_http_server`
+starts. The wrapper renders each prompt with the policy tokenizer and forwards it
+to the frontend as token input. Like NeMo RL's vLLM server, it also does three things:
+
+- caps a request's output tokens so the prompt and output fit `max_model_len`, and
+  answers an overflowing prompt with the 400 Gym treats as a context-length refusal;
+- rejects requests whose sampling matches neither the train nor the validation
+  profile;
+- aborts the engine request when Gym drops the call.
+
 Current limits on this path:
 
-- Native rollouts only. NeMo-Gym under the SingleController supports only
-  `backend: vllm` and `backend: megatron`.
 - Text policies only, and no MoE router replay: `policy.is_vlm` and
   `policy.router_replay.enabled` must be false.
+- NeMo-Gym runs without token capture: `token_capture.enabled` must stay false, so
+  rollout snapshots and non-default `rollout_recovery` policies are unavailable.
+- `async_rl.generation_router.enabled` must stay false, because the Dynamo
+  frontend routes the whole fleet behind the wrapper's one URL.
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.

@@ -19,9 +19,11 @@ import pytest
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.dynamo.token_wrapper import (
+    ContextLengthExceededError,
     DynamoTokenWrapperServer,
     _inject_gym_token_metadata,
     _validate_engine_data,
+    clamp_max_output_tokens,
     prepare_dynamo_chat_completion_request,
 )
 
@@ -632,6 +634,8 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
         tokenizer_chat_template_kwargs=None,
         exclude_tools_when_tool_choice_none=True,
         request_timeout_s=30,
+        max_model_len=1024,
+        generation_config={},
     )
     session = FakeSession()
     server._client_session = session
@@ -644,3 +648,25 @@ def test_forward_chat_completion_reuses_loop_bound_session() -> None:
 
     assert len(session.calls) == 2
     assert session.calls[1][2]["Authorization"] == "Bearer token"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"max_tokens": 100}, {"max_tokens": 24}),
+        # max_completion_tokens wins when both are set, as on the vLLM server.
+        (
+            {"max_completion_tokens": 100, "max_tokens": 100},
+            {"max_completion_tokens": 24, "max_tokens": 100},
+        ),
+        ({"max_tokens": 8}, {"max_tokens": 8}),
+        ({}, {}),
+    ],
+)
+def test_clamp_max_output_tokens_fits_the_context(body, expected) -> None:
+    clamp_max_output_tokens(body, prompt_token_count=1000, max_model_len=1024)
+    assert body == expected
+
+    # A prompt that fills the window is a length refusal Gym recognizes.
+    with pytest.raises(ContextLengthExceededError, match="maximum context length"):
+        clamp_max_output_tokens(body, prompt_token_count=1024, max_model_len=1024)

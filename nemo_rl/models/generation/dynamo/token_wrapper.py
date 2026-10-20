@@ -17,6 +17,8 @@
 import asyncio
 import json
 import threading
+import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from typing import Any, Optional
@@ -28,6 +30,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.models.generation.vllm.utils import off_policy_sampling_error
 
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
@@ -35,6 +38,7 @@ _GYM_TOKEN_METADATA_FIELDS = (
     "generation_log_probs",
 )
 _TOOL_ARGUMENT_MAPPING_ERROR = "Can only get item pairs from a mapping."
+_STARTUP_TIMEOUT_S = 30.0
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -299,6 +303,41 @@ def _inject_gym_token_metadata(response_body: dict[str, Any]) -> None:
     message["generation_log_probs"] = generation_logprobs
 
 
+class ContextLengthExceededError(ValueError):
+    """The rendered prompt leaves no room for output tokens within max_model_len."""
+
+
+def clamp_max_output_tokens(
+    request_body: dict[str, Any], *, prompt_token_count: int, max_model_len: int
+) -> None:
+    """Cap a request's output tokens so prompt + output fit max_model_len.
+
+    The same clamp NeMo RL's vLLM server applies: ``max_completion_tokens`` when the
+    request sets it, otherwise ``max_tokens``.
+
+    Raises:
+        ContextLengthExceededError: The prompt alone fills max_model_len.
+    """
+    remaining = max_model_len - prompt_token_count
+    if remaining <= 0:
+        # Keep "maximum context length": Gym treats a 400 naming the context window
+        # as a length refusal rather than an engine failure.
+        raise ContextLengthExceededError(
+            f"Prompt length ({prompt_token_count}) fills or exceeds this model's "
+            f"maximum context length ({max_model_len}). No room for output tokens."
+        )
+    for field in ("max_completion_tokens", "max_tokens"):
+        if request_body.get(field) is not None:
+            request_body[field] = min(int(request_body[field]), remaining)
+            return
+
+
+async def _wait_for_disconnect(request: Any) -> None:
+    """Return once the client disconnects; the request body has already been read."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
 def prepare_dynamo_chat_completion_request(
     request_body: dict[str, Any],
     *,
@@ -402,12 +441,18 @@ class DynamoTokenWrapperServer:
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
         exclude_tools_when_tool_choice_none: bool,
         request_timeout_s: Optional[float],
+        max_model_len: int,
+        generation_config: Mapping[str, Any],
     ) -> None:
         self.dynamo_frontend_base_url = dynamo_frontend_base_url
         self.tokenizer = tokenizer
         self.tokenizer_chat_template_kwargs = tokenizer_chat_template_kwargs
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.request_timeout_s = request_timeout_s
+        self.max_model_len = max_model_len
+        # policy.generation: the train and validation sampling profiles requests
+        # must match.
+        self.generation_config = generation_config
         self.base_url: Optional[str] = None
         self.server: Any = None
         self.thread: Optional[threading.Thread] = None
@@ -418,7 +463,7 @@ class DynamoTokenWrapperServer:
         import aiohttp
         import uvicorn
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, Response
 
         @asynccontextmanager
         async def lifespan(_: FastAPI):
@@ -449,7 +494,7 @@ class DynamoTokenWrapperServer:
             }
 
         @app.post("/v1/chat/completions")
-        async def chat_completions(request: Request) -> JSONResponse:
+        async def chat_completions(request: Request) -> Response:
             try:
                 request_body = await request.json()
             except json.JSONDecodeError as e:
@@ -459,6 +504,15 @@ class DynamoTokenWrapperServer:
                     status_code=400,
                     detail="Chat completion body must be a JSON object.",
                 )
+            # The same on-policy check as NeMo RL's vLLM server.
+            sampling_error = off_policy_sampling_error(
+                temperature=request_body.get("temperature"),
+                top_p=request_body.get("top_p"),
+                top_k=request_body.get("top_k"),
+                generation_config=self.generation_config,
+            )
+            if sampling_error is not None:
+                raise HTTPException(status_code=400, detail=sampling_error)
 
             try:
                 prepared_body = await asyncio.to_thread(
@@ -468,13 +522,49 @@ class DynamoTokenWrapperServer:
                     tokenizer_chat_template_kwargs=self.tokenizer_chat_template_kwargs,
                     exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
                 )
+                clamp_max_output_tokens(
+                    prepared_body,
+                    prompt_token_count=len(prepared_body["nvext"]["token_data"]),
+                    max_model_len=self.max_model_len,
+                )
+            except ContextLengthExceededError as e:
+                # The envelope NeMo RL's vLLM server returns for the same overflow.
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "param": "input_tokens",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
-            status_code, response_body = await self._forward_chat_completion(
-                prepared_body,
-                authorization=request.headers.get("authorization"),
+            forward = asyncio.ensure_future(
+                self._forward_chat_completion(
+                    prepared_body,
+                    authorization=request.headers.get("authorization"),
+                )
             )
+            disconnect = asyncio.ensure_future(_wait_for_disconnect(request))
+            try:
+                await asyncio.wait(
+                    {forward, disconnect}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                disconnect.cancel()
+                if not forward.done():
+                    # The client disconnected (or the server is stopping): closing the
+                    # upstream connection makes the Dynamo frontend abort the engine
+                    # request instead of generating for nobody.
+                    forward.cancel()
+            # A cancelled forward is not done until the loop runs it again.
+            if not forward.done() or forward.cancelled():
+                return Response(status_code=499)
+            status_code, response_body = forward.result()
             if 200 <= status_code < 300:
                 try:
                     _inject_gym_token_metadata(response_body)
@@ -490,7 +580,8 @@ class DynamoTokenWrapperServer:
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
         )
-        self.base_url = f"http://{node_ip}:{free_port}/v1"
+        base_url = f"http://{node_ip}:{free_port}/v1"
+        self.base_url = base_url
 
         config = uvicorn.Config(
             app,
@@ -505,7 +596,16 @@ class DynamoTokenWrapperServer:
             daemon=True,
         )
         self.thread.start()
-        return self.base_url
+        # Callers hand the URL to NeMo-Gym right away, so return only once the
+        # server accepts connections.
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+        while not self.server.started:
+            if not self.thread.is_alive() or time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Dynamo token wrapper did not start serving on {base_url}"
+                )
+            time.sleep(0.05)
+        return base_url
 
     async def _forward_chat_completion(
         self,

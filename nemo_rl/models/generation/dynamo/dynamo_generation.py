@@ -180,6 +180,14 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
+        if master_config.async_rl.generation_router.enabled:
+            # The router spreads NeMo-Gym traffic over a backend's servers; Dynamo
+            # serves one token-wrapper URL and its frontend routes the whole fleet.
+            raise ValueError(
+                "async_rl.generation_router.enabled=true is not supported with "
+                "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
+                "routing. Set async_rl.generation_router.enabled=false."
+            )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         if (
@@ -264,6 +272,8 @@ class DynamoGeneration(GenerationInterface):
                         dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
                     ),
                     request_timeout_s=dynamo_cfg.request_timeout_s,
+                    max_model_len=vllm_cfg.max_model_len,
+                    generation_config=self.cfg,
                 )
                 wrapper_url = self._token_wrapper_server.start()
                 self.dp_openai_server_base_urls = [wrapper_url]

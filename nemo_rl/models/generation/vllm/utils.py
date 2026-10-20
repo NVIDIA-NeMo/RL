@@ -149,6 +149,57 @@ def spec_decode_max_tokens(
     )
 
 
+def off_policy_sampling_error(
+    *,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    generation_config: Any,
+) -> Optional[str]:
+    """Why an HTTP rollout request would sample off-policy, or None if it would not.
+
+    Request sampling must match NeMo RL's exactly, or inference runs off-policy and
+    destabilizes training. Validation rollouts are the one exception: they carry the
+    validation profile (``val_temperature`` / ``val_top_p``), which is metric-only.
+    Multi-turn agents issue their own requests, so the serving HTTP endpoint is the
+    one chokepoint they all pass.
+
+    Args:
+        temperature: The request's temperature.
+        top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
+            from the model's generation_config.json, not to 1.0.
+        top_k: The request's top_k, which must be unset or -1 (disabled), matching
+            ``BaseVllmGenerationWorker._build_sampling_params``.
+        generation_config: ``policy.generation``, with the train and validation
+            sampling parameters.
+    """
+    if top_k not in (None, -1):
+        return f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
+    if top_p is None:
+        return (
+            "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+            "resolved by vLLM from the model's generation_config.json and would "
+            "bypass the on-policy sampling check."
+        )
+    is_train_sampling = (
+        temperature == generation_config["temperature"]
+        and top_p == generation_config["top_p"]
+    )
+    is_val_sampling = (
+        temperature == generation_config["val_temperature"]
+        and top_p == generation_config["val_top_p"]
+    )
+    if is_train_sampling or is_val_sampling:
+        return None
+    return (
+        f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
+        f"the train sampling params (temperature={generation_config['temperature']}, "
+        f"top_p={generation_config['top_p']}) nor the validation sampling params "
+        f"(val_temperature={generation_config['val_temperature']}, "
+        f"val_top_p={generation_config['val_top_p']})"
+    )
+
+
 def mtp_drafter_setup(
     speculative_config: Optional[dict[str, Any]],
     *,
