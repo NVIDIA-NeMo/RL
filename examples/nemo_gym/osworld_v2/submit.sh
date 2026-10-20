@@ -39,7 +39,9 @@ fi
 
 OSWORLD_DRIVER_SCRIPT="${OSWORLD_DRIVER_SCRIPT:-driver.sh}"
 OSWORLD_NUM_NODES="${OSWORLD_NUM_NODES:-4}"
-OSWORLD_RECIPE="${OSWORLD_RECIPE:-flash-b8n8-dr-grpo}"
+# This branch is the qualified async run-ahead profile: eight prompt groups
+# execute concurrently while TransferQueue can retain four optimizer windows.
+OSWORLD_RECIPE="${OSWORLD_RECIPE:-molt-b8n8-buffer32-checkpoint}"
 case "$OSWORLD_RECIPE" in
   molt-b8n8-checkpoint|molt-b8n8-buffer32-checkpoint|flash-b8n8-reinforce|flash-b8n8-dr-grpo|flash-b17n16-dr-grpo|flash-b17n16-reinforce) ;;
   *)
