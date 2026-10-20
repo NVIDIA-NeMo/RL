@@ -24,7 +24,7 @@ from nemo_rl.utils.checkpoint import (
     _load_checkpoint_history,
     validate_warm_start_checkpoint,
 )
-from nemo_rl.utils.checkpoint_storage import (
+from nemo_rl.utils.path_utils import (
     as_path,
     listdir,
     load_checkpoint_object,
@@ -202,3 +202,23 @@ def test_listdir_lists_msc_children(manager):
     with open_path(checkpoint + "/policy/weights/shard.bin", "w") as f:
         f.write("weights")
     assert sorted(listdir(checkpoint)) == ["policy", "training_info.json"]
+
+
+def test_get_resume_paths_enables_msc_before_megatron_load(manager, monkeypatch):
+    from megatron.core.msc_utils import MultiStorageClientFeature
+
+    checkpoint = manager.init_tmp_checkpoint(1, {"step": 1})
+    with open_path(checkpoint + "/value/weights/iter_0000000/metadata.json", "w") as f:
+        f.write("{}")
+    MultiStorageClientFeature.disable()
+    enabled_at_load = []
+
+    def fake_load(iteration_dir):
+        enabled_at_load.append(MultiStorageClientFeature.is_enabled())
+        return {"optimizer": {}}
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.checkpoint._load_megatron_common_state_dict", fake_load
+    )
+    CheckpointManager.get_resume_paths(checkpoint, model_component="value")
+    assert enabled_at_load == [True]

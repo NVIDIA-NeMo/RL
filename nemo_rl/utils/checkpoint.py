@@ -47,11 +47,10 @@ from nemo_rl.telemetry.instrumentation import (
     current_trace_carrier,
     remote_trace_context,
 )
-from nemo_rl.utils.checkpoint_storage import (
-    CheckpointStorage,
+from nemo_rl.utils.checkpoint_storage import CheckpointStorage, make_storage
+from nemo_rl.utils.path_utils import (
     as_path,
     is_msc_path,
-    make_storage,
     maybe_enable_msc,
     open_path,
     rmtree,
@@ -298,7 +297,6 @@ class CheckpointManager:
                 "internally."
             )
 
-        maybe_enable_msc(config["checkpoint_dir"])
         if is_msc_path(config["checkpoint_dir"]) and config.get("save_data_plane"):
             raise ValueError(
                 "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
@@ -352,6 +350,7 @@ class CheckpointManager:
                 iteration_dir / "metadata.json"
             ).exists()
             if is_megatron_checkpoint:
+                maybe_enable_msc(iteration_dir)
                 common_state_dict = _load_megatron_common_state_dict(iteration_dir)
                 if "optimizer" in common_state_dict:
                     # In Megatron, optimizer_path is only a flag to indicate that the optimizer

@@ -175,12 +175,6 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
-from nemo_rl.utils.checkpoint_storage import (
-    load_checkpoint_object,
-    open_path,
-    path_exists,
-    save_checkpoint_object,
-)
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
     Logger,
@@ -196,6 +190,12 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (

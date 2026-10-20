@@ -127,7 +127,6 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
-from nemo_rl.utils.checkpoint_storage import path_exists
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
@@ -136,6 +135,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import path_exists
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.factory import (

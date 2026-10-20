@@ -145,8 +145,8 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
-from nemo_rl.utils.checkpoint_storage import is_msc_path
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.path_utils import is_msc_path
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 

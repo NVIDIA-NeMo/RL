@@ -66,12 +66,12 @@ from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
-from nemo_rl.utils.checkpoint_storage import (
+from nemo_rl.utils.logger import Logger, LoggerConfig
+from nemo_rl.utils.path_utils import (
     load_checkpoint_object,
     path_exists,
     save_checkpoint_object,
 )
-from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker
 
 LOADER_LATENCY_MAX_KEY = "loader_latency_max"

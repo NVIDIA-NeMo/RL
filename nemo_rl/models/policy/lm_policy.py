@@ -61,7 +61,6 @@ from nemo_rl.models.policy.utils import (
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
-from nemo_rl.utils.checkpoint_storage import checkpoint_abspath
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -71,6 +70,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]

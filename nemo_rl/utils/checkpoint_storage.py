@@ -17,98 +17,20 @@ import glob
 import json
 import os
 import re
-import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
-import multistorageclient as msc
-import torch
-
-
-def is_msc_path(path: str | os.PathLike[str]) -> bool:
-    """Return whether a path explicitly selects an MSC storage profile."""
-    return str(path).startswith("msc://")
-
-
-def maybe_enable_msc(*paths: str | os.PathLike[str] | None) -> None:
-    """Enable MSC in Megatron(-Bridge) for this process if any path is ``msc://``.
-
-    Megatron(-Bridge) only treats ``msc://`` as remote once its process-global
-    MSC flag is on, so call this at every entry point that is handed a
-    checkpoint path (load or save). Local-path runs never import Megatron.
-    """
-    if any(path and is_msc_path(path) for path in paths):
-        # Megatron is optional for the other policy backends.
-        from megatron.core.msc_utils import MultiStorageClientFeature
-
-        MultiStorageClientFeature.enable()
-
-
-def checkpoint_abspath(path: str | os.PathLike[str]) -> str:
-    """Preserve MSC URLs when normalizing a checkpoint location."""
-    return str(path) if is_msc_path(path) else os.path.abspath(path)
-
-
-def save_checkpoint_object(value: Any, path: str | os.PathLike[str]) -> None:
-    """Save controller checkpoint state beside local or MSC model shards."""
-    if is_msc_path(path):
-        msc.torch.save(value, str(path))
-    else:
-        torch.save(value, path)
-
-
-def load_checkpoint_object(path: str | os.PathLike[str], **kwargs: Any) -> Any:
-    """Load controller checkpoint state saved by ``save_checkpoint_object``."""
-    if is_msc_path(path):
-        return msc.torch.load(str(path), **kwargs)
-    return torch.load(path, **kwargs)
-
-
-def path_exists(path: str | os.PathLike[str]) -> bool:
-    """``os.path.exists`` that also understands ``msc://`` URLs."""
-    if is_msc_path(path):
-        return msc.os.path.exists(str(path))
-    return os.path.exists(path)
-
-
-def open_path(path: str | os.PathLike[str], mode: str = "r") -> Any:
-    """``open`` that also understands ``msc://`` URLs."""
-    if is_msc_path(path):
-        return msc.open(str(path), mode)
-    return open(path, mode)
-
-
-def as_path(path: str | os.PathLike[str]) -> Path:
-    """``Path(path)``, or the MSC path class for ``msc://`` URLs."""
-    return (msc.Path if is_msc_path(path) else Path)(path)
-
-
-def path_isdir(path: str | os.PathLike[str], strict: bool = True) -> bool:
-    """``os.path.isdir`` that also understands ``msc://`` URLs.
-
-    ``strict=False`` treats a missing MSC prefix as "not a directory" instead of raising.
-    """
-    if is_msc_path(path):
-        return msc.os.path.isdir(str(path), strict=strict)
-    return os.path.isdir(path)
-
-
-def listdir(path: str | os.PathLike[str]) -> list[str]:
-    """``os.listdir`` that also understands ``msc://`` URLs."""
-    if is_msc_path(path):
-        return [entry.name for entry in msc.Path(str(path)).iterdir()]
-    return os.listdir(path)
-
-
-def rmtree(path: str | os.PathLike[str]) -> None:
-    """``shutil.rmtree`` that also understands ``msc://`` URLs."""
-    if is_msc_path(path):
-        msc.delete(str(path), recursive=True)
-    else:
-        shutil.rmtree(path)
-
+from nemo_rl.utils.path_utils import (
+    as_path,
+    is_msc_path,
+    open_path,
+    path_exists,
+    path_isdir,
+    rmtree,
+)
 
 _STEP_DIR = re.compile(r"step_(\d+)")
 
@@ -205,13 +127,20 @@ class MscStorage:
             json.dump({"version": 1}, stream)
 
     def published_steps(self) -> list[tuple[int, str]]:
-        steps = []
-        for marker in msc.glob(str(self.root) + "/step_*/_SUCCESS"):
-            step_dir = msc.Path(marker).parent
-            step = _parse_step(step_dir.name)
-            if step is not None:
-                steps.append((step, str(step_dir)))
-        return sorted(steps)
+        # List step prefixes only, then probe each marker, so the cost scales
+        # with the number of steps rather than the shard objects inside them.
+        candidates = [
+            (step, step_dir)
+            for step_dir in self.root.iterdir()
+            if (step := _parse_step(step_dir.name)) is not None
+        ]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            published = pool.map(lambda c: (c[1] / "_SUCCESS").exists(), candidates)
+        return sorted(
+            (step, str(step_dir))
+            for (step, step_dir), ok in zip(candidates, published)
+            if ok
+        )
 
 
 def make_storage(root: str | os.PathLike[str]) -> CheckpointStorage:

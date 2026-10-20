@@ -35,7 +35,7 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
-from nemo_rl.utils.checkpoint_storage import (
+from nemo_rl.utils.path_utils import (
     load_checkpoint_object,
     open_path,
     path_exists,

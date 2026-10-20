@@ -217,18 +217,18 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
-from nemo_rl.utils.checkpoint_storage import (
-    is_msc_path,
-    load_checkpoint_object,
-    path_exists,
-    save_checkpoint_object,
-)
 from nemo_rl.utils.logger import (
     TELEMETRY_WALL_TIME_METRIC,
     Logger,
     should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    is_msc_path,
+    load_checkpoint_object,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 

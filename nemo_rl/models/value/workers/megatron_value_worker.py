@@ -91,8 +91,8 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
-from nemo_rl.utils.checkpoint_storage import maybe_enable_msc
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 from nemo_rl.utils.tensor_ops import pad_and_concat
 

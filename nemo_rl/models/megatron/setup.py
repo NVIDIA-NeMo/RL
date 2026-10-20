@@ -89,7 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
-from nemo_rl.utils.checkpoint_storage import (
+from nemo_rl.utils.path_utils import (
     listdir,
     maybe_enable_msc,
     open_path,
@@ -844,6 +844,7 @@ def _create_peft_warm_start_hook(
         # A disabled machine ignores donor rerun state, and setup is serialized,
         # so temporarily disabling it makes this adapter load weights-only.
         rerun_state_machine.set_mode(RerunMode.DISABLED)
+        maybe_enable_msc(restore_dir)
         try:
             _load_checkpoint_from_path(
                 load_dir=restore_dir,

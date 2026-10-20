@@ -57,10 +57,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
-from nemo_rl.utils.checkpoint_storage import (
-    load_checkpoint_object,
-    save_checkpoint_object,
-)
+from nemo_rl.utils.path_utils import load_checkpoint_object, save_checkpoint_object
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"

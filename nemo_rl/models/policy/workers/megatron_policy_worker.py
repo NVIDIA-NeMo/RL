@@ -156,11 +156,11 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
-from nemo_rl.utils.checkpoint_storage import maybe_enable_msc
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
