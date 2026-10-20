@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -153,6 +154,31 @@ def suspend_activation_offload_for_forward_only(
                 model_config.fine_grained_activation_offloading = original_value
 
 
+def _compute_mtp_loss_override(model: GPTModel) -> Optional[bool]:
+    """Skip zero-weight auxiliary work only through an explicit native control.
+
+    Retain loaded MTP parameters for checkpointing and rollout refits. Models
+    without this forward parameter keep their existing behavior; accepting
+    arbitrary kwargs is insufficient because wrappers may discard them.
+    """
+    core_model = unwrap_model(model)
+    try:
+        parameters = inspect.signature(core_model.forward).parameters
+    except (TypeError, ValueError):
+        return None
+    if "compute_mtp_loss" not in parameters:
+        return None
+    model_config = get_model_config(model)
+    mtp_num_layers = model_config.mtp_num_layers
+    if (
+        mtp_num_layers is not None
+        and mtp_num_layers > 0
+        and model_config.mtp_loss_scaling_factor == 0.0
+    ):
+        return False
+    return None
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -207,6 +233,9 @@ def model_forward(
         position_ids = None
 
     additional_kwargs = {}
+    compute_mtp_loss = _compute_mtp_loss_override(model)
+    if compute_mtp_loss is not None:
+        additional_kwargs["compute_mtp_loss"] = compute_mtp_loss
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params

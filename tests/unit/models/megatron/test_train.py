@@ -39,6 +39,61 @@ pytestmark = pytest.mark.mcore
 class TestModelForward:
     """Tests for model_forward function."""
 
+    @pytest.mark.parametrize(
+        ("mtp_layers", "mtp_weight", "expected_compute"),
+        [(2, 0.0, False), (2, 0.1, True), (None, 0.0, True), (0, 0.0, True)],
+    )
+    def test_model_forward_zero_weight_mtp_control(
+        self, mtp_layers, mtp_weight, expected_compute
+    ):
+        """Only an inactive auxiliary objective uses the native runtime switch."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        class ControlledModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+                self.config = SimpleNamespace(
+                    mtp_num_layers=mtp_layers,
+                    mtp_loss_scaling_factor=mtp_weight,
+                )
+                self.compute_mtp_loss = None
+
+            def forward(self, input_ids, *, compute_mtp_loss=True, **kwargs):
+                self.compute_mtp_loss = compute_mtp_loss
+                return input_ids.float() * self.weight
+
+        model = ControlledModel()
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        ids = torch.tensor([[1, 2, 3]])
+        result = model_forward(model, data, ids, None, None)
+        result.sum().backward()
+
+        assert model.compute_mtp_loss is expected_compute
+        assert torch.equal(result, ids * 2)
+        assert model.weight.grad.item() == ids.sum().item()
+
+    def test_model_forward_does_not_send_mtp_control_to_kwargs_only_wrapper(self):
+        """A wrapper swallowing kwargs must not appear to support this switch."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        class LegacyWrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    mtp_num_layers=2, mtp_loss_scaling_factor=0.0
+                )
+
+            def forward(self, input_ids, **kwargs):
+                assert "compute_mtp_loss" not in kwargs
+                return input_ids.float()
+
+        data = MagicMock()
+        data.get_multimodal_dict.return_value = {}
+        ids = torch.tensor([[1, 2, 3]])
+        assert torch.equal(model_forward(LegacyWrapper(), data, ids, None, None), ids)
+
     def test_model_forward_basic(self):
         """Test basic model_forward without multimodal data."""
         from nemo_rl.models.megatron.train import model_forward
