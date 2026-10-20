@@ -82,6 +82,21 @@ _COUNTER_LINE = re.compile(
 # The running watcher in this process, if any.
 _watch_stop: threading.Event | None = None
 
+# Mooncake's remove drops only the master's record: the owner keeps the file of
+# a cleared key until the key is offloaded again or the owner exits. Each owner
+# sweeps those files itself (Mooncake 0.3.13 has no per-key disk delete).
+SWEEP_INTERVAL_S = 30.0
+# Unlink only this soon after the existence check: a key re-put after the
+# check stays in memory for at least its 1 s lease (master_args) before it can
+# be offloaded again, so no new file for it can appear within this window.
+_SWEEP_UNLINK_WINDOW_S = 0.5
+_SWEEP_BATCH = 1000
+# Files store the tenant-scoped key, ``<tenant>\0<key>``; TQ uses the default
+# tenant. Measured on 0.3.13 (job 1338878): b"\n\x0edefault\x0098@big...".
+_TENANT_PREFIX = "default\0"
+# The running sweep in this process, if any.
+_sweep_stop: threading.Event | None = None
+
 
 def master_args(cfg: MooncakeCpuConfig) -> tuple[str, ...]:
     """mooncake_master flags for ``ssd_offload``; empty when it is off.
@@ -159,9 +174,12 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
         def setup(self, *args: Any, **kwargs: Any) -> Any:
             global _offloading_store_set_up
             _offloading_store_set_up = True
-            return super().setup(
+            result = super().setup(
                 *args, enable_ssd_offload=True, ssd_offload_path=path, **kwargs
             )
+            if result == 0:
+                _start_sweep(self, path)
+            return result
 
     mooncake_client.MooncakeDistributedStore = _OffloadingStore
     LOGGER.info("Mooncake SSD offload for this process under %s", path)
@@ -305,8 +323,98 @@ def remove_dir() -> None:
     Call only once nothing will read this process's data again: the files
     may be the only copy of offloaded objects.
     """
+    if _sweep_stop is not None:
+        _sweep_stop.set()
     if _dir is not None:
         shutil.rmtree(_dir, ignore_errors=True)
+
+
+def _file_key(path: str) -> str | None:
+    """The default tenant's key in a per-key offload file, or None.
+
+    The file holds a protobuf KVEntry whose field 1 is the tenant, a NUL, then
+    the key; the file name replaces the NUL and filesystem-unsafe characters
+    with ``_``, so it cannot be mapped back. Other tenants' files are skipped.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return None
+    if not head or head[0] != 0x0A:
+        return None
+    length, shift, i = 0, 0, 1
+    while i < min(len(head), 11):
+        byte = head[i]
+        length |= (byte & 0x7F) << shift
+        i += 1
+        if not byte & 0x80:
+            break
+        shift += 7
+    else:
+        return None
+    key = head[i : i + length]
+    if len(key) != length:
+        return None
+    try:
+        scoped = key.decode()
+    except UnicodeDecodeError:
+        return None
+    if not scoped.startswith(_TENANT_PREFIX):
+        return None
+    return scoped[len(_TENANT_PREFIX) :] or None
+
+
+def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> int:
+    """Delete offload files under ``root`` whose key the master no longer has.
+
+    ``exists`` is ``batch_is_exist``: 1 present, 0 absent, negative on error.
+    Only an explicit 0 deletes, and only within ``_SWEEP_UNLINK_WINDOW_S`` of
+    the check. Returns the number of files deleted.
+    """
+    files = []
+    for dirpath, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(dirpath, name)
+            key = None if name.startswith(".lock") else _file_key(path)
+            if key is not None:
+                files.append((path, key))
+    removed = 0
+    for start in range(0, len(files), _SWEEP_BATCH):
+        batch = files[start : start + _SWEEP_BATCH]
+        checked = time.monotonic()
+        results = exists([key for _, key in batch])
+        if len(results) != len(batch):
+            continue
+        for (path, _), result in zip(batch, results):
+            if time.monotonic() - checked > _SWEEP_UNLINK_WINDOW_S:
+                break
+            if result != 0:
+                continue
+            try:
+                os.unlink(path)
+                removed += 1
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def _start_sweep(store: Any, root: str) -> None:
+    global _sweep_stop
+    stop = threading.Event()
+
+    def _sweep() -> None:
+        while not stop.wait(SWEEP_INTERVAL_S):
+            try:
+                removed = sweep_cleared_files(root, store.batch_is_exist)
+            except Exception:
+                LOGGER.warning("Mooncake SSD offload sweep failed", exc_info=True)
+                continue
+            if removed:
+                LOGGER.debug("Deleted %d SSD files of cleared keys", removed)
+
+    threading.Thread(target=_sweep, name="mooncake-ssd-sweep", daemon=True).start()
+    _sweep_stop = stop
 
 
 def disk_evictions(metrics_text: str) -> int:

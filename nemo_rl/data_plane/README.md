@@ -1014,21 +1014,27 @@ memory > offload_threshold ──> SSD copy written ──> memory copy dropped
   crashes or is killed before that leaves its directory behind. Each owner
   holds a lock on its directory while it lives, and the next run's owners
   on that node delete any directory whose lock is free.
+- **Cleared data:** Mooncake's remove drops only the master's record, so
+  each owner deletes the SSD files of cleared keys itself, every 30 s.
+  Mooncake still counts those files toward its 90% disk quota until the
+  key is offloaded again; see the warning below.
 
 > **Warning: a full disk stops the run.** Offloaded files are deleted only
-> at shutdown; a reused key overwrites its file. When a process's own
+> by the 30 s sweep of cleared keys or at shutdown. When a process's own
 > offload files pass 90% of the disk holding `path`, Mooncake's per-key
 > backend deletes its oldest offloaded files, and Mooncake 0.3.13 cannot
-> turn this off. A deleted file can be the
-> only copy of an object. The master counts these deletions
+> turn this off. A deleted file can be the only copy of an object. The
+> master counts these eviction requests
 > (`master_evict_disk_replica_requests_total`). With offload on, the process
 > that started the master checks that counter every 30 s and stops the run
 > at the first deletion. If instead free space falls below one object plus
 > 256 MiB, Mooncake fails the SSD write and keeps the object in memory;
 > memory then stops being freed, and a put that has waited 600 s for it
 > fails with an error naming `path`. Either way, give `path` enough free
-> disk: about (segment owners on the node) x (peak data offloaded at once),
-> since TQ reuses keys and an owner's files are overwritten.
+> disk: about (segment owners on the node) x (peak data offloaded at once).
+> Mooncake's own quota count still includes swept files (it has no per-key
+> delete), so its 90% eviction can fire on files already gone and stop the
+> run although nothing live was lost.
 
 ### Experimental Mooncake storage checkpoints
 

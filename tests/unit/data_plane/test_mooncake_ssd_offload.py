@@ -104,15 +104,18 @@ def fake_store(monkeypatch, tmp_path):
     monkeypatch.setattr(offload, "_dir", None)
     monkeypatch.setattr(offload, "_lock_fd", None)
     monkeypatch.setattr(offload, "_offloading_store_set_up", False)
+    monkeypatch.setattr(offload, "_sweep_stop", None)
     exit_hooks = []
     monkeypatch.setattr(atexit, "register", exit_hooks.append)
-    return SimpleNamespace(
+    yield SimpleNamespace(
         module=mooncake_client,
         cls=FakeStore,
         client_cls=FakeClient,
         calls=calls,
         exit_hooks=exit_hooks,
     )
+    if offload._sweep_stop is not None:
+        offload._sweep_stop.set()  # a fake store has nothing to sweep
 
 
 @pytest.mark.parametrize(
@@ -495,3 +498,103 @@ def test_copied_mooncake_names_exist_in_the_installed_mooncake() -> None:
     for arg in offload.master_args(_cfg(ssd_offload=_SSD)):
         flag = arg.removeprefix("--").split("=", 1)[0]
         assert flag.encode() in master, flag
+
+
+def _kv_file(
+    path: Path, key: str, value: bytes = b"v" * 300, tenant: str | None = "default"
+) -> Path:
+    """A file as Mooncake's per-key backend writes it: KVEntry{tenant\\0key, value}."""
+
+    def field(tag: int, data: bytes) -> bytes:
+        n, out = len(data), bytearray([tag])
+        while True:
+            out.append((n & 0x7F) | (0x80 if n > 0x7F else 0))
+            n >>= 7
+            if not n:
+                return bytes(out) + data
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stored = key if tenant is None else f"{tenant}\0{key}"
+    path.write_bytes(field(0x0A, stored.encode()) + field(0x12, value))
+    return path
+
+
+def test_file_key_reads_the_key_stored_in_the_file(tmp_path) -> None:
+    # The file name is the key with / \\ : * ? " < > | replaced by _, so only
+    # the stored key is trustworthy.
+    long_key = "7@" + "f" * 200  # a two-byte length varint
+    assert offload._file_key(str(_kv_file(tmp_path / "a", "3@a/b"))) == "3@a/b"
+    assert offload._file_key(str(_kv_file(tmp_path / "b", long_key))) == long_key
+    (tmp_path / "c").write_bytes(b"not a kv entry")
+    (tmp_path / "d").write_bytes(b"\x0a\x09short")  # length past the end
+    assert offload._file_key(str(tmp_path / "c")) is None
+    assert offload._file_key(str(tmp_path / "d")) is None
+    # Only the default tenant's keys are TQ's; an unscoped key is not a key
+    # the master knows (querying it would wrongly report it absent).
+    assert offload._file_key(str(_kv_file(tmp_path / "e", "1@x", tenant="t2"))) is None
+    assert offload._file_key(str(_kv_file(tmp_path / "f", "1@x", tenant=None))) is None
+
+
+def test_file_key_reads_a_file_as_mooncake_0_3_13_writes_it(tmp_path) -> None:
+    # Header bytes of a real file from job 1338878.
+    real = tmp_path / "default_98@big"
+    real.write_bytes(b"\n\x0edefault\x0098@big\x12\x80\x80\x80\x02" + b"\x00" * 64)
+    assert offload._file_key(str(real)) == "98@big"
+
+
+def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
+    live = _kv_file(tmp_path / "a" / "b" / "1@x", "1@x")
+    cleared = _kv_file(tmp_path / "c" / "d" / "2@x", "2@x")
+    unknown = _kv_file(tmp_path / "e" / "f" / "3@x", "3@x")
+    (tmp_path / ".lock").write_bytes(b"")
+    (tmp_path / "foreign").write_bytes(b"not mooncake's")
+    answers = {"1@x": 1, "2@x": 0, "3@x": -1}  # exists, absent, RPC error
+
+    removed = offload.sweep_cleared_files(
+        str(tmp_path), lambda keys: [answers[k] for k in keys]
+    )
+
+    assert removed == 1
+    assert not cleared.exists()
+    assert live.exists() and unknown.exists()
+    assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()
+
+
+def test_sweep_keeps_files_once_the_existence_check_is_stale(
+    monkeypatch, tmp_path
+) -> None:
+    # A key cleared at the check may be re-put after it; it cannot be offloaded
+    # again within the 1 s lease, so unlinking is safe only shortly after.
+    cleared = _kv_file(tmp_path / "2@x", "2@x")
+    now = [0.0]
+    monkeypatch.setattr(
+        offload, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=None)
+    )
+
+    def exists(keys):
+        now[0] += offload._SWEEP_UNLINK_WINDOW_S + 0.01  # a slow RPC
+        return [0] * len(keys)
+
+    assert offload.sweep_cleared_files(str(tmp_path), exists) == 0
+    assert cleared.exists()
+
+
+def test_sweep_keeps_everything_on_a_short_result_list(tmp_path) -> None:
+    kept = _kv_file(tmp_path / "2@x", "2@x")
+    assert offload.sweep_cleared_files(str(tmp_path), lambda keys: []) == 0
+    assert kept.exists()
+
+
+def test_an_owners_store_sweeps_until_its_dir_is_removed(
+    fake_store, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(offload, "_sweep_stop", None)
+    offload.install(_cfg(ssd_offload={**_SSD, "path": str(tmp_path)}), None)
+    assert offload._sweep_stop is None  # the store is not set up yet
+
+    fake_store.module.MooncakeDistributedStore().setup("h", "m", 1, 2, "tcp", "", "a")
+    stop = offload._sweep_stop
+    assert stop is not None and not stop.is_set()
+
+    offload.remove_dir()
+    assert stop.is_set()
