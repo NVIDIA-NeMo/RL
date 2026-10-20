@@ -14,18 +14,14 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Any, Literal, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-
-# The universal contract is hf_export: the source exports an HF-named,
-# backend-independent representation that each destination converts locally.
-# logical_weights is a Megatron-to-Megatron exception, read only by the Megatron
-# policy worker; new backends should not inherit that coupling implicitly.
-RefitPayloadMode = Literal["hf_export", "logical_weights"]
+from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -199,6 +195,33 @@ class OptionalResourcesConfig(TypedDict):
     num_nodes: int | None
 
 
+class DisaggConfig(BaseModel, extra="allow"):
+    """Prefill/decode disaggregation, in the terms every backend shares."""
+
+    enabled: bool = False
+
+    # Engines per replica; independent, so the P:D ratio is free.
+    num_prefill_engines: int = 1
+    num_decode_engines: int = 1
+
+    # Frontend servers per replica, each its own actor with a distinct URL. The
+    # rollout client shards conversations across them by session, so one
+    # frontend's CPU stops being the replica's throughput ceiling.
+    num_frontend_workers: int = 1
+
+    # Render and tokenize on the frontends instead of the prefill adapter,
+    # which is one thread per engine and scales only by adding GPUs.
+    # Frontends are CPU-only -- this is what num_frontend_workers buys.
+    frontend_tokenize: bool = False
+
+    # base + replica_idx * num_frontend_workers + frontend_idx. Deterministic
+    # so a restarted frontend re-binds the same port and its URL stays valid.
+    # Like every service port it must stay below 9000, the ephemeral floor on
+    # some DGX/GB200 nodes; the default band is virtual_cluster's
+    # DEFAULT_DISAGG_FRONTEND_PORT_RANGE_*.
+    frontend_base_port: int = DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+
+
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
@@ -245,9 +268,17 @@ class GenerationConfig(TypedDict):
     _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # The trainer streams the drafter's full weight set (incl. embed/lm_head)
+    # on refit (Automodel draft co-training); drafter module sharing must be
+    # disabled and the draft manifest is validated exactly.
+    _draft_full_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
+
+    # The layout, in the terms every backend shares. How a backend *implements*
+    # disaggregation goes in that backend's own block.
+    disaggregation: NotRequired[DisaggConfig]
 
 
 def should_use_async_rollouts(
@@ -563,8 +594,17 @@ class GenerationInterface(ABC):
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            Optionally, the parameter names the backend wants pre-quantized on
+            the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -592,10 +632,6 @@ class GenerationInterface(ABC):
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
         return None
-
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Return the backend's required representation for transferred weights."""
-        return "hf_export"
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
@@ -676,41 +712,63 @@ class GenerationInterface(ABC):
             f"token_capture.enabled is not supported for {type(self).__name__}"
         )
 
-    # Optional hook; backends may override to invalidate any reusable caches
-    # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
+        """Confirm stale KV state cannot be reused after a weight update.
+
+        Backends may implement this by invalidating active-request KV state directly or
+        by performing equivalent engine-side handling atomically with refit. Clearing
+        only unreferenced prefix-cache entries is insufficient while requests are active.
+
+        Returns:
+            True only when the backend guarantees the recompute contract; False when it
+            is unsupported or could not be completed.
+        """
         return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
-        """Pause in-flight generation while preserving request state.
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Arrange a safe generation pause around the upcoming weight refit.
 
         Backends with native in-flight refit support override this hook. The default
         implementation warns once per backend type and lets the refit continue with
-        the backend's existing in-flight behavior. On supported backends, in-flight
-        requests are frozen rather than aborted and resume from
-        :meth:`resume_generation_after_refit`; new requests queue until then.
+        the backend's existing in-flight behavior. Native pause implementations
+        freeze requests until :meth:`resume_generation_after_refit`. A backend
+        may instead acknowledge a lifecycle owned by its weight synchronizer,
+        which must pause and handle the requested cache clearing before transfer
+        and resume before returning. Such backends document their request handling
+        and timeout semantics; for example, SGLang may retract or abort requests.
 
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
                 preserved requests recompute their KV after the weight update.
+            timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
 
         Returns:
-            True if every engine paused; False when the backend has no native pause
-            support. Backends with native support raise when pausing fails.
+            True if every engine paused or the weight synchronizer guarantees the
+            lifecycle above; False when neither is supported. Pause failures raise
+            from this hook or the synchronizer that owns the pause.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def resume_generation_after_refit(self) -> bool:
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
         """Resume generation paused by :meth:`pause_generation_for_refit`.
 
         The default implementation shares the once-per-backend warning emitted by
         :meth:`pause_generation_for_refit` and lets the refit continue for backends
         without native pause/resume support.
 
+        Args:
+            timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
+
         Returns:
-            True if every engine resumed; False when the backend has no native resume
-            support. Backends with native support raise when resuming fails.
+            True if every surviving engine resumed, including when the weight
+            synchronizer already performed the resume; False when neither path is
+            supported. With fleet health, confirmed dead engines may be excluded
+            if enough survivors remain. Other resume failures raise.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False

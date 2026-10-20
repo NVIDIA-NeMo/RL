@@ -43,12 +43,13 @@ from nemo_rl.environments.nemo_gym import (
 )
 
 
-@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron"])
+@pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
 def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     generation = {
         "backend": backend,
         "vllm_cfg": {"async_engine": False, "expose_http_server": False},
         "mcore_generation_config": {"expose_http_server": False},
+        "trtllm_cfg": {"async_engine": False, "expose_http_server": False},
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
@@ -56,12 +57,17 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
 
     setup_nemo_gym_config(config, tokenizer=None)
 
+    is_vllm_like = backend in ("vllm", "dynamo")
     assert generation["vllm_cfg"] == {
-        "async_engine": backend != "megatron",
-        "expose_http_server": backend != "megatron",
+        "async_engine": is_vllm_like,
+        "expose_http_server": is_vllm_like,
     }
     assert generation["mcore_generation_config"] == {
         "expose_http_server": backend == "megatron"
+    }
+    assert generation["trtllm_cfg"] == {
+        "async_engine": backend == "trtllm",
+        "expose_http_server": backend == "trtllm",
     }
     assert generation["stop_strings"] is None
     assert generation["stop_token_ids"] is None
@@ -882,6 +888,49 @@ def test_build_nemo_gym_actors_unsharded_makes_exactly_one_actor(detected_uv_dir
         cluster.actor_options[0]["scheduling_strategy"],
         nemo_gym_mod.NodeAffinitySchedulingStrategy,
     )
+
+
+def test_build_nemo_gym_config_keeps_the_policy_api_key_out_of_gyms_config(
+    detected_uv_dirs,
+):
+    """The key is an actor field that Gym's servers receive through their
+    environment at spin-up, never a value in the serialized global config."""
+    cfg = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        policy_api_key="per-job-key",
+    )
+
+    assert cfg["policy_api_key"] == "per-job-key"
+    assert "policy_api_key" not in cfg["initial_global_config_dict"]
+
+
+@pytest.mark.parametrize(
+    "env_configs", [_env_configs, _shard_env_configs], ids=["unsharded", "sharded"]
+)
+def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
+    detected_uv_dirs, env_configs
+):
+    """Both builders forward the key: a dropped line in either would leave Gym
+    sending the placeholder against workers that enforce the real key."""
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            policy_api_key="per-job-key",
+        )
+
+    assert cluster.actor_configs
+    assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
 
 
 def test_build_nemo_gym_actors_spreads_every_replica_onto_its_own_node(

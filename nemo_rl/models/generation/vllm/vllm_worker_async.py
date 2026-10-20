@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -27,7 +28,8 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 import ray
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
@@ -90,6 +92,44 @@ class CapturedRequest:
     call: "ActiveCall"
     prompt_token_ids: list[int]
     media: CapturedMedia | None
+
+
+# Paths the bearer-token check protects: the OpenAI-compatible routes this module
+# registers, which NeMo-Gym's model server calls. The sparse-refit routes the
+# receiver registers on the same app carry their own header token
+# (vllm_sparse_refit.setup_api_server) and are not covered.
+HTTP_SERVER_PROTECTED_PATH_PREFIXES = ("/v1/", "/tokenize")
+
+
+def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
+    """Refuse OpenAI-route requests that do not carry ``Authorization: Bearer <api_key>``.
+
+    Registers an HTTP middleware on ``app``. For a request whose path starts with one
+    of ``HTTP_SERVER_PROTECTED_PATH_PREFIXES``, the ``Authorization`` header is
+    compared in constant time with ``Bearer <api_key>``; a missing or different
+    value is answered with HTTP 401 in OpenAI's error envelope and never reaches the
+    route. Requests to other paths pass through unchanged.
+    """
+    expected = f"Bearer {api_key}".encode()
+
+    @app.middleware("http")
+    async def _require_bearer_token(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if request.url.path.startswith(HTTP_SERVER_PROTECTED_PATH_PREFIXES):
+            supplied = (request.headers.get("Authorization") or "").encode()
+            if not secrets.compare_digest(supplied, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "missing or invalid bearer token",
+                            "type": "authentication_error",
+                            "code": 401,
+                        }
+                    },
+                )
+        return await call_next(request)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -956,6 +996,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -1265,12 +1306,17 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                cancelled = False
 
                 async def capture_result_generator():
-                    nonlocal final_res
-                    async for res in result_generator:
-                        final_res = res
-                        yield res
+                    nonlocal final_res, cancelled
+                    try:
+                        async for res in result_generator:
+                            final_res = res
+                            yield res
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
 
                 # Capture stages the raw arrays below and strips OpenAI logprobs
                 # after the terminal PUT. Skip only their object construction;
@@ -1288,6 +1334,16 @@ class VllmAsyncGenerationWorkerImpl(
                         *args,
                         **kwargs,
                     )
+                if cancelled:
+                    # vLLM's chat_completion_full_generator catches the
+                    # CancelledError that with_cancellation throws into the
+                    # handler task on a client disconnect and returns
+                    # ErrorResponse("Client disconnected") instead of
+                    # re-raising. Nobody reads that response (the wrapper has
+                    # already returned), and letting it through would make the
+                    # route label the capture "error_response". Re-raise so the
+                    # task finishes cancelled and the route sees the disconnect.
+                    raise asyncio.CancelledError()
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1395,6 +1451,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
+        # Like vLLM's own routes: cancel the handler (and with it the engine
+        # request) when the client disconnects, instead of generating for nobody.
+        @with_cancellation
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
@@ -1506,6 +1565,13 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except asyncio.CancelledError:
+                # Client disconnected (see with_cancellation above). A cancel
+                # before generation starts propagates here directly; one that
+                # lands mid-generation is swallowed by vLLM and re-raised by
+                # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+                worker_self._abort_request_capture(request, reason="client_disconnect")
+                raise
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1524,9 +1590,17 @@ class VllmAsyncGenerationWorkerImpl(
                 # response; strips logprobs/ids (no-op when capture is off).
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                try:
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
+                except asyncio.CancelledError:
+                    # Queued executor work may never start after cancellation.
+                    # If staging already claimed the capture, abort is a no-op.
+                    worker_self._abort_request_capture(
+                        request, reason="client_disconnect"
+                    )
+                    raise
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
@@ -1638,6 +1712,10 @@ class VllmAsyncGenerationWorkerImpl(
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
+        # Present only when the driver generated a key (vllm_cfg.http_server_api_key_required).
+        http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
+        if http_server_api_key:
+            install_http_server_api_key_check(app, http_server_api_key)
 
         ########################################
         # Server spinup
@@ -2132,9 +2210,20 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""

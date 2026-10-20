@@ -158,7 +158,6 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
                 torch.cuda.current_stream().synchronize()
                 load_time += time.time() - load_start
                 del weight_batch
-
             finalize()
 
         total_time = time.time() - start_time

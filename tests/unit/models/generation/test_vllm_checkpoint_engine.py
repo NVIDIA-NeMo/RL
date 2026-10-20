@@ -15,6 +15,7 @@
 """Tests for vLLM checkpoint-engine worker lifecycle helpers."""
 
 import asyncio
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -98,12 +99,18 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     )
 
     @contextmanager
-    def lifecycle(transport):
-        events.append(("lifecycle_enter", transport))
-        yield lambda: events.append(("finalize",))
-        events.append(("lifecycle_exit",))
+    def weight_update_lifecycle(
+        transport: str,
+    ) -> Iterator[Callable[[], None]]:
+        events.append(("setup", transport))
 
-    worker._weight_update_lifecycle = lifecycle
+        def finalize() -> None:
+            events.append(("finalize",))
+
+        yield finalize
+        events.append(("teardown", transport))
+
+    worker._weight_update_lifecycle = weight_update_lifecycle
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
@@ -112,13 +119,13 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
 
     assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
     assert events == [
-        ("lifecycle_enter", "checkpoint_engine"),
+        ("setup", "checkpoint_engine"),
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
         ("finalize",),
-        ("lifecycle_exit",),
+        ("teardown", "checkpoint_engine"),
     ]
 
 
