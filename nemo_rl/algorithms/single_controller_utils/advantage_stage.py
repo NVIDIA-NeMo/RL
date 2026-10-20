@@ -62,7 +62,7 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.utils.debug_writer import JsonDebugWriter
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -317,7 +317,7 @@ class AdvantageComputer:
         # One writer per shard: the pool runs these concurrently, so they must
         # not share a file. The controller merges them on publish.
         self._train_data_dump = (
-            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+            JsonDebugWriter(config.train_data_dump_dir, shard_id=shard_id)
             if config.train_data_dump_dir is not None
             else None
         )

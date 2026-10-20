@@ -225,6 +225,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
+from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.logger import (
     Logger,
     should_log_nemo_gym_full_result_tables,
@@ -237,7 +238,6 @@ from nemo_rl.utils.path_utils import (
     save_checkpoint_object,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -784,7 +784,7 @@ class SingleControllerActor:
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
         self._train_data_dump = (
-            TrainDataDump(self._logger.base_log_dir)
+            JsonDebugWriter(self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
             else None
         )
