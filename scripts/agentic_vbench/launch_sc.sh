@@ -4,7 +4,7 @@
 # Submit AgenticVBench SingleController GRPO (token capture, optional context
 # compaction) on Slurm with the container built for this checkout.
 # Adapted from pivot-rl-video/RL/scripts/run_crop_video_pivot.sh.
-# DRY_RUN=1 writes the driver/setup commands and prints the sbatch line only.
+# DRY_RUN=1 writes the driver/setup commands and previews the dependency chain.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -732,7 +732,6 @@ fi
 COMMAND_EOF
 export COMMAND
 
-last_array_task=$((job_cycles - 1))
 # The cluster's OccupiedIdleGPUsJobReaper cancels jobs whose GPUs look idle;
 # model loading, Harbor container setup and the first long-episode wave keep the
 # training GPUs idle for a whole generation phase. Preserve the supported
@@ -764,24 +763,21 @@ submit_args=(
   --gres="gpu:${gpus_per_node}"
   --exclusive
   --time="${slurm_time_limit}"
-  --dependency="${SLURM_DEPENDENCY:-singleton}"
-  --array="0-${last_array_task}%1"
   --account="${SLURM_ACCOUNT}"
   --partition="${SLURM_PARTITION}"
   --job-name="${candidate_name}"
-  --output="${slurm_log_dir}/%A_%a-${SLURM_ACCOUNT}.out"
-  --error="${slurm_log_dir}/%A_%a-${SLURM_ACCOUNT}.out"
+  --output="${slurm_log_dir}/%j-${SLURM_ACCOUNT}.out"
+  --error="${slurm_log_dir}/%j-${SLURM_ACCOUNT}.out"
 )
 if [[ -n ${SLURM_QOS:-} ]]; then
   submit_args+=(--qos="${SLURM_QOS}")
 fi
-submit_args+=("${code_dir}/ray.sub")
 
 echo "candidate=${candidate_name}"
 echo "sbatch_comment=${sbatch_comment}"
 echo "time_limit=${slurm_time_limit} checkpoint_must_save_by=${checkpoint_must_save_by}"
 echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS:-default} nodes=${num_nodes} gpus_per_node=${gpus_per_node} generation_nodes=${num_gen_nodes} segment_size=${segment_size} prompts=${num_prompts} generations=${num_generations} steps=${max_steps} cycles=${job_cycles} save_period=${save_period} keep_top_k=${checkpoint_keep_top_k} tokenizer_chat_template=${tokenizer_chat_template} vllm_chat_template=${vllm_chat_template} vllm_load_format=${vllm_load_format}"
-echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_array=0-${last_array_task}%1"
+echo "allocation_boundary_seconds=${slurm_time_seconds} controller_boundary_seconds=${checkpoint_budget_seconds} grpo_horizon_steps=${max_steps} continuation_chain=afterany cycles=${job_cycles}"
 echo "slurm_dependency=${SLURM_DEPENDENCY:-singleton}"
 echo "context_compaction=${context_compaction}"
 if [[ $launch_benchmark == claweval ]]; then
@@ -811,10 +807,32 @@ bash -n "${results_dir}/setup_command.sh"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "driver_preview=${results_dir}/training_command.sh"
-  printf 'sbatch '
-  printf '%q ' "${submit_args[@]}"
-  printf '\n'
-  exit 0
+else
+  cycle_receipts=$(mktemp "${results_dir}/job_cycles.XXXXXX")
+  echo "job_cycle_receipts=${cycle_receipts}"
 fi
 
-sbatch "${submit_args[@]}"
+# Array throttling does not express predecessor completion and can leave every
+# pending cycle showing Priority. Chain standalone jobs with afterany to resume
+# from the last checkpoint even after a failed allocation or walltime limit.
+cycle_dependency=${SLURM_DEPENDENCY:-singleton}
+for ((cycle = 1; cycle <= job_cycles; cycle++)); do
+  cycle_args=("${submit_args[@]}" "--dependency=${cycle_dependency}" "${code_dir}/ray.sub")
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    printf 'sbatch '
+    printf '%q ' "${cycle_args[@]}"
+    printf '\n'
+    cycle_dependency="afterany:<cycle-${cycle}-job-id>"
+    continue
+  fi
+  cycle_response=$(sbatch "${cycle_args[@]}")
+  cycle_job_id=${cycle_response%%;*}
+  if [[ ! ${cycle_job_id} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${cycle_response}" >"${cycle_receipts}.unexpected-response"
+    echo "ERROR: sbatch returned no numeric job ID; inspect ${cycle_receipts}.unexpected-response before submitting again" >&2
+    exit 1
+  fi
+  printf '%s\t%s\t%s\n' "${cycle}" "${cycle_job_id}" "${cycle_dependency}" >>"${cycle_receipts}"
+  echo "cycle=${cycle}/${job_cycles} job_id=${cycle_job_id} dependency=${cycle_dependency}"
+  cycle_dependency="afterany:${cycle_job_id}"
+done
