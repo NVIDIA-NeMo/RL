@@ -39,10 +39,13 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     disable_draft_module_sharing,
 )
 from nemo_rl.models.generation.vllm.speculator_runtime import (
+    DRAFTER_OWNER_ATTRS,
+    SPECULATOR_TYPES,
     DraftRuntimeAdapter,
     ModelUpdateCoverage,
     ModelUpdateManifest,
     SpeculatorRuntimeError,
+    find_draft_model,
 )
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
@@ -663,11 +666,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     # False for a checkpoint-loaded static MTP drafter; True only when the
     # trainer exports MTP weights in every policy refit stream.
     _mtp_drafter_weights_from_refit: bool = True
-    # vLLM's legacy GPUModelRunner keeps the speculative proposer as ``drafter``;
-    # the v2 model runner (vllm/v1/worker/gpu/model_runner.py, the default since
-    # vLLM 0.29) keeps it as ``speculator``. Both expose the draft nn.Module as
-    # ``.model``. Checked in this order so a legacy runner is never shadowed.
-    _DRAFTER_OWNER_ATTRS: tuple[str, ...] = ("drafter", "speculator")
     # Each worker reports a missing drafter for a co-trained MTP head at most once.
     _warned_missing_mtp_drafter: bool = False
     # Each worker logs the Gemma 4 Unified multimodal filtering at most once.
@@ -1008,7 +1006,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
         speculator_type = getattr(spec_config, "method", None)
         self._draft_runtime_adapter = None
-        if speculator_type in ("eagle3", "dflash", "dspark"):
+        if speculator_type in SPECULATOR_TYPES:
             self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
                 self.model_runner,
                 speculator_type=speculator_type,
@@ -1151,21 +1149,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         DSpark), which vLLM keeps as a module separate from the main model,
         under ``model_runner.drafter`` (legacy runner) or
         ``model_runner.speculator`` (v2 runner, used by DSpark); see
-        ``_DRAFTER_OWNER_ATTRS``. Typed ``Any`` because these are dynamic vLLM
+        ``find_draft_model``. Typed ``Any`` because these are dynamic vLLM
         model classes whose ``load_weights`` / ``mtp_start_layer_idx`` members
         are not visible through ``nn.Module``.
         """
-        accessor = getattr(self.model_runner, "get_draft_model", None)
-        if callable(accessor):
-            return accessor()
-        for owner_attr in self._DRAFTER_OWNER_ATTRS:
-            draft_owner = getattr(self.model_runner, owner_attr, None)
-            draft_model = (
-                getattr(draft_owner, "model", None) if draft_owner is not None else None
-            )
-            if draft_model is not None:
-                return draft_model
-        return None
+        found = find_draft_model(self.model_runner)
+        return None if found is None else found[1]
 
     def configure_mtp_drafter_weight_source(self, weights_from_refit: bool) -> None:
         """Record whether the trainer owns and refreshes the MTP weights."""
@@ -1250,7 +1239,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     "but vLLM exposes no drafter model (looked for model_runner.%s); "
                     "the drafter keeps its load-time weights, so speculative "
                     "acceptance will collapse.",
-                    " / model_runner.".join(self._DRAFTER_OWNER_ATTRS),
+                    " / model_runner.".join(attr for attr, _ in DRAFTER_OWNER_ATTRS),
                 )
             return False
         return True
@@ -1571,6 +1560,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "bypasses the model's prepare/finalize refit hooks. Use IPC "
                 "or collective refit with refit_with_reload_api=False."
             )
+        manifest = self._model_update_manifest
+        if manifest is not None and manifest.draft is not None:
+            raise RuntimeError(
+                f"{label} refit does not support co-trained draft weights: the "
+                "drafter would skip process_weights_after_loading and the "
+                "refit completeness check. Use IPC or collective refit."
+            )
 
     @contextmanager
     def _weight_update_lifecycle(
@@ -1702,6 +1698,17 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         """Whether transport errors should propagate instead of returning False."""
         return self._uses_unquantized_flashinfer_trtllm() or (
             self._nrl_layerwise_reload_failure is not None
+        )
+
+    def _weight_update_error_must_raise(self, error: BaseException) -> bool:
+        """Whether a transport error must propagate instead of returning False.
+
+        ``SpeculatorRuntimeError`` carries the speculator type, vLLM version,
+        and missing keys; a bare ``False`` would hide that from the driver.
+        """
+        return (
+            isinstance(error, SpeculatorRuntimeError)
+            or self._weight_update_errors_are_fatal()
         )
 
     def _synchronize_before_ipc_data_ack(self) -> None:
@@ -1866,7 +1873,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in native IPC reload for VllmInternalWorkerExtension: %s",
@@ -1981,7 +1988,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
@@ -2013,9 +2020,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             hold_refit_for_fault_injection,
         )
 
-        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
-            hold_refit_for_fault_injection()
-            result = self._update_weights_from_collective(refit_with_reload_api)
+        guard = RefitAbortWatchdog(self.model_update_group, refit_timeout_s)
+        try:
+            with guard:
+                hold_refit_for_fault_injection()
+                result = self._update_weights_from_collective(refit_with_reload_api)
+        except SpeculatorRuntimeError as error:
+            # An aborted broadcast leaves survivors with missing keys; the
+            # abort, not the coverage gap, is the recoverable root cause.
+            if guard.fired:
+                raise RefitAborted(
+                    f"refit receive exceeded {refit_timeout_s}s and was aborted; "
+                    "this engine now holds partial weights and must not serve "
+                    "until refit"
+                ) from error
+            raise
         if guard.fired:
             raise RefitAborted(
                 f"refit receive exceeded {refit_timeout_s}s and was aborted; "
@@ -2089,7 +2108,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     finalize()
 
         except Exception as e:
-            if self._weight_update_errors_are_fatal():
+            if self._weight_update_error_must_raise(e):
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
@@ -2496,7 +2515,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     "was aborted; this engine now holds partial weights and must "
                     "not serve until refit"
                 ) from error
-            if self._weight_update_errors_are_fatal():
+            if self._weight_update_error_must_raise(error):
                 raise
             logger.exception(
                 "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",

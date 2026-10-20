@@ -16,10 +16,12 @@
 import os
 from typing import Any, Optional
 
+from nemo_rl.models.generation.vllm.speculator_runtime import SPECULATOR_TYPES
+
 # Speculative methods whose drafter is co-trained by the trainer and refit
 # through the ``draft.*`` weight stream (dspark/dflash block drafters and the
 # eagle3 TTT drafter). MTP is co-trained too but streams without the prefix.
-COTRAINED_SPECULATIVE_METHODS = ("dspark", "dflash", "eagle3")
+COTRAINED_SPECULATIVE_METHODS = SPECULATOR_TYPES
 
 # Env flag that requests disable_draft_module_sharing() at import time in
 # every process that resolves vllm_backend.py (the driver actor and any
