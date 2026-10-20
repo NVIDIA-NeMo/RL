@@ -106,9 +106,8 @@ Setup also fails if no routed-expert weight is found, or if the model has dense
 MLP weights that would stay BF16. Supporting another model means extending the
 routed-expert name patterns in `quantization/fp8.py`.
 
-Verified end to end: Qwen3.5 MoE with MXFP8 (the Qwen3.5-35B-A3B
-MXFP8 TRT-LLM nightlies). Unit-tested only: Qwen3 MoE (weight conversion and name mapping for
-block-FP8 and MXFP8); it has not been run end to end.
+Verified end to end: Qwen3.5 MoE with MXFP8 (`Qwen/Qwen3.5-35B-A3B-Base` and
+`Qwen/Qwen3.5-397B-A17B`).
 
 NeMo RL initializes the TensorRT-LLM model with `load_format` set
 to `dummy`, then populates it from the first BF16 policy refit. By default
