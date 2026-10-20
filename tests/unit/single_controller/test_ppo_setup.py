@@ -642,9 +642,16 @@ class TestDynamicSamplingValidation:
         with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
             validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize("sampler", ["windowed", "ready_first", "weight_fifo"])
+    @pytest.mark.parametrize("sampler", ["windowed", "ready_first"])
     def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
         validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
+
+    def test_rejects_weight_fifo(self):
+        """A replacement carries a newer start_weight, so the oldest version never fills."""
+        mc = _dynamic_sampling_config(sampler="weight_fifo")
+
+        with pytest.raises(ValueError, match="cannot be combined with.*weight_fifo"):
+            validate_single_controller_config(mc)
 
     def test_windowed_needs_no_replacement(self):
         """Its rollout keeps producing, so a filtered group does not shrink a step."""
@@ -652,9 +659,8 @@ class TestDynamicSamplingValidation:
 
         validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize("sampler", ["ready_first", "weight_fifo"])
-    def test_a_gated_sampler_still_requires_replace(self, sampler):
-        mc = _dynamic_sampling_config(sampler=sampler, on_dropped_prompt="shrink")
+    def test_a_gated_sampler_still_requires_replace(self):
+        mc = _dynamic_sampling_config(sampler="ready_first", on_dropped_prompt="shrink")
 
         with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
             validate_single_controller_config(mc)

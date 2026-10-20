@@ -386,13 +386,15 @@ Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations al
 - `async_rl.rollout_failure.max_replacement_attempts >= 1`. Each slot gets at most this many replacements. If the last one is also dropped, that step closes one group short, and if too many groups are lost the step falls below `min_step_batch_fraction` and the run raises. At high drop rates, raise `max_replacement_attempts` or lower `min_step_batch_fraction`.
 - `grpo.num_generations_per_prompt >= 2`.
 
-Every built-in sampler works. Each decides what it costs to lose a group for good, which is when no spare is left or the replacement budget is spent:
+`in_order`, `ready_first` and `windowed` work; `weight_fifo` is rejected at setup (see below). Each decides what it costs to lose a group for good, which is when no spare is left or the replacement budget is spent:
 
 | `sampler.name` | Spare pool | A group lost for good |
 | --- | --- | --- |
 | `in_order` | Yes | Shrinks the step the group was stamped for. |
-| `ready_first`, `weight_fifo` | Yes | Shrinks the step being assembled at that moment, or the next one if that step has already finished selecting. These samplers stamp no step, and their gate would otherwise wait on a group nobody is generating. The shrunk step is not necessarily the batch that lost the group, so batch boundaries can shift, but the total consumed is right. |
+| `ready_first` | Yes | Shrinks the step being assembled at that moment, or the next one if that step has already finished selecting. These samplers stamp no step, and their gate would otherwise wait on a group nobody is generating. The shrunk step is not necessarily the batch that lost the group, so batch boundaries can shift, but the total consumed is right. |
 | `windowed` | No | Nothing. Rollout keeps producing, so later groups make up for it and every step still fills. The data runs out sooner, so the run can end before `len(dataloader)` steps; the last step closes on the groups left, subject to `min_step_batch_fraction`. |
+
+`weight_fifo` is not supported: it drains only the oldest in-window `start_weight` and waits for that version alone to fill a step, but a replacement is generated later and carries a newer version. The older version then stays short for good while the gate is closed and nothing is in flight, and the run stalls. Use `ready_first` for the same gated admission with completion-order selection.
 
 A `custom` sampler is treated like `ready_first` unless it implements `DropAccountingSampler`.
 

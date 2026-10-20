@@ -1177,6 +1177,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         rollout_failure = async_config.rollout_failure
+        if async_config.sampler.name == "weight_fifo":
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling cannot be combined with "
+                "async_rl.sampler.name='weight_fifo'. weight_fifo builds each step "
+                "only from groups generated under the same weight version, and a "
+                "replacement for a filtered group is generated later, under a newer "
+                "version. The step can then never fill, and training hangs. "
+                "Set async_rl.sampler.name to 'in_order' or 'ready_first', or turn "
+                f"off {algo_prefix}.use_dynamic_sampling."
+            )
         if (
             async_config.sampler.name != "windowed"
             and rollout_failure.on_dropped_prompt != "replace"
