@@ -11,6 +11,7 @@
 
 ## 📣 News
 
+* [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
 * [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
 * [08/26/2026] Qwen3.8-Flash-Next RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/qwen3-8-flash-next-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).

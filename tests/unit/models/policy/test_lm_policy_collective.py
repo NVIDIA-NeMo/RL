@@ -301,6 +301,7 @@ def test_policy_forwards_packed_collective_options_to_workers():
                 "refit_timeout_s": None,
                 "buffer_size_bytes": 1024**3,
                 "num_buffers": 2,
+                "use_legacy_packing": False,
             },
         )
     ]
