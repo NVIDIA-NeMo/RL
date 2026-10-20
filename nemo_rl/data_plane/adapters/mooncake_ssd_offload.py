@@ -39,8 +39,9 @@ from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
 
 LOGGER = logging.getLogger(__name__)
 
-# Read by mooncake at store setup; a launcher may still override them.
-ENV_DEFAULTS = {
+# Read by mooncake at store setup. install() refuses a launcher value that
+# differs: either one would let mooncake delete the only copy of an object.
+REQUIRED_ENV = {
     # The default bucket backend writes nothing until a bucket holds 256 MB
     # or 500 keys; until then the queued objects stay pinned in memory, so an
     # owner whose eviction batch is smaller than one bucket fills up and every
@@ -153,8 +154,12 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
             "Mooncake SSD offload could not be enabled",
             "store class",
         )
-    for name, value in ENV_DEFAULTS.items():
-        os.environ.setdefault(name, value)
+    for name, value in REQUIRED_ENV.items():
+        if os.environ.setdefault(name, value) != value:
+            raise ValueError(
+                f"Mooncake SSD offload needs {name}={value}, but the environment "
+                f"sets {os.environ[name]!r}; unset it or turn ssd_offload off"
+            )
     parent = os.path.join(str(cfg.ssd_offload.path), "nemo_rl_mooncake_offload")
     os.makedirs(parent, exist_ok=True)
     _remove_stale_dirs(parent)  # free disk left by earlier runs on this node

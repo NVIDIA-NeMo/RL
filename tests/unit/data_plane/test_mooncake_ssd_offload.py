@@ -97,7 +97,7 @@ def fake_store(monkeypatch, tmp_path):
         "get_runtime_context",
         lambda: SimpleNamespace(get_job_id=lambda: "05000000"),
     )
-    for var in offload.ENV_DEFAULTS:
+    for var in offload.REQUIRED_ENV:
         # setenv first so monkeypatch restores the var even if it was unset.
         monkeypatch.setenv(var, "")
         monkeypatch.delenv(var)
@@ -154,7 +154,7 @@ def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
     ]
     # The bucket backend holds objects in memory until a 256 MB bucket fills,
     # and disk watermark eviction would delete the only copy of an object.
-    assert {var: os.environ[var] for var in offload.ENV_DEFAULTS} == {
+    assert {var: os.environ[var] for var in offload.REQUIRED_ENV} == {
         "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR": "file_per_key_storage_backend",
         "MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION": "false",
     }
@@ -165,10 +165,20 @@ def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
     assert not owner_dir.exists()
 
 
-def test_install_keeps_a_launcher_override(fake_store, monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "custom")
-    offload.install(_cfg(ssd_offload={**_SSD, "path": str(tmp_path)}), None)
-    assert os.environ["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"] == "custom"
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "bucket_storage_backend"),
+        ("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION", "true"),
+    ],
+)
+def test_install_rejects_a_launcher_override(
+    fake_store, monkeypatch, tmp_path, name, value
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=f"needs {name}="):
+        offload.install(_cfg(ssd_offload={**_SSD, "path": str(tmp_path)}), None)
+    assert not (tmp_path / "nemo_rl_mooncake_offload").exists()
 
 
 def test_remove_dir_without_install_is_a_noop(fake_store) -> None:
@@ -490,9 +500,9 @@ def test_copied_mooncake_names_exist_in_the_installed_mooncake() -> None:
     store = (root / "store.so").read_bytes()  # the client reads the env vars
     master = (root / "mooncake_master").read_bytes()  # flags and /metrics
 
-    for name in offload.ENV_DEFAULTS:
+    for name in offload.REQUIRED_ENV:
         assert name.encode() in store, name
-    backend = offload.ENV_DEFAULTS["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"]
+    backend = offload.REQUIRED_ENV["MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"]
     assert backend.encode() in store, backend
     assert offload.EVICTION_COUNTER.encode() in master, offload.EVICTION_COUNTER
     for arg in offload.master_args(_cfg(ssd_offload=_SSD)):
