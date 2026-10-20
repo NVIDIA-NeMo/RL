@@ -74,6 +74,10 @@ class ValueConfig(TypedDict):
     # packing token budgets must then cover policy length + the block budget.
     swe_privileged_critic: NotRequired[dict[str, Any]]
 
+    # Output head: scalar (MSE, the default) or HL-Gauss bins trained by cross-entropy.
+    # Schema: ValueHeadConfig in nemo_rl.algorithms.value_head (Megatron critic only).
+    head: NotRequired[dict[str, Any]]
+
     # Gradient clipping
     max_grad_norm: NotRequired[float | int | None]
 

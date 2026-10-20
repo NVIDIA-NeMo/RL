@@ -35,6 +35,12 @@ from nemo_rl.algorithms.utils import (
     compute_seq_logprob_errors,
     masked_mean,
 )
+from nemo_rl.algorithms.value_head import (
+    ValueHeadConfig,
+    bin_centers,
+    hl_gauss_targets,
+    resolve_value_head,
+)
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
     build_exact_token_map,
@@ -2058,58 +2064,158 @@ class MseValueLossFn(LossFunction):
             )
             vf_clipfrac = 0.0
 
-        with torch.no_grad():
-            # Use global_valid_toks so each MB contributes local_sum/global_total.
-            # Summing across MBs in ppo.py then gives the correct global mean.
-            returns_mean = masked_mean(
-                returns,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-            values_mean = masked_mean(
-                values,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-
-            # Min/max are per-MB; ppo.py takes min/max across MBs.
-            masked_values = values[mask.bool()]
-            values_min = (
-                masked_values.min().item() if masked_values.numel() > 0 else 0.0
-            )
-            values_max = (
-                masked_values.max().item() if masked_values.numel() > 0 else 0.0
-            )
-
-            # Explained variance sufficient statistics.
-            # EV = 1 - Var(residual) / Var(returns)
-            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
-            # sum correctly across MBs).  ppo.py combines them with returns_mean
-            # and values_mean to compute exact global EV.
-            returns_sq_mean = masked_mean(
-                returns**2,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-            residual_sq_mean = masked_mean(
-                (returns - values) ** 2,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            ).item()
-
         metrics = {
             "loss": float(loss.item()),
             "vf_clipfrac": vf_clipfrac,
-            "returns_mean": returns_mean,
-            "values_mean": values_mean,
-            "values_min": values_min,
-            "values_max": values_max,
-            "returns_sq_mean": returns_sq_mean,
-            "residual_sq_mean": residual_sq_mean,
+            **_value_fit_metrics(values, returns, mask, global_valid_toks),
             "num_valid_samples": int(values.shape[0]),
         }
 
         return loss, metrics
+
+
+def _value_fit_metrics(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    mask: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+) -> dict[str, float]:
+    """How well per-token values fit the returns; shared by the value losses."""
+    with torch.no_grad():
+        # Use global_valid_toks so each MB contributes local_sum/global_total.
+        # Summing across MBs in ppo.py then gives the correct global mean.
+        returns_mean = masked_mean(
+            returns,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+        values_mean = masked_mean(
+            values,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+        # Min/max are per-MB; ppo.py takes min/max across MBs.
+        masked_values = values[mask.bool()]
+        values_min = masked_values.min().item() if masked_values.numel() > 0 else 0.0
+        values_max = masked_values.max().item() if masked_values.numel() > 0 else 0.0
+
+        # Explained variance sufficient statistics.
+        # EV = 1 - Var(residual) / Var(returns)
+        # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+        # sum correctly across MBs).  ppo.py combines them with returns_mean
+        # and values_mean to compute exact global EV.
+        returns_sq_mean = masked_mean(
+            returns**2,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+        residual_sq_mean = masked_mean(
+            (returns - values) ** 2,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        ).item()
+
+    return {
+        "returns_mean": returns_mean,
+        "values_mean": values_mean,
+        "values_min": values_min,
+        "values_max": values_max,
+        "returns_sq_mean": returns_sq_mean,
+        "residual_sq_mean": residual_sq_mean,
+    }
+
+
+class HLGaussValueLossFn(LossFunction):
+    """HL-Gauss value loss: cross-entropy of the critic's bins against smoothed returns.
+
+    The critic head outputs ``value.head.num_bins`` logits per token
+    (nemo_rl/algorithms/value_head.py). Each return is clamped to the support and spread
+    over the bins as a Gaussian of width ``value.head.sigma``; the loss is
+    ``scale * token-mean CE``. There is no value clipping: the target does not depend on
+    the previous prediction. The metrics carry MseValueLossFn's keys, computed on the
+    decoded value (the expectation over bin centers), so explained variance and the
+    critic dashboards read the same for both heads.
+    """
+
+    input_type = LossInputType.LOGIT
+
+    def __init__(self, cfg: MseValueLossConfig, head: ValueHeadConfig):
+        if not head.categorical:
+            raise ValueError(
+                f"HLGaussValueLossFn needs an hl_gauss head, got {head.type}"
+            )
+        if cfg.cliprange:
+            raise ValueError(
+                "value_loss_fn.cliprange clips a scalar value prediction, but "
+                "value.head.type=hl_gauss trains the critic by cross-entropy: set "
+                "value_loss_fn.cliprange=null."
+            )
+        self.scale = cfg.scale
+        # Read by critic pretraining, which turns clipping off where it cannot bind.
+        self.cliprange = None
+        self.head = head
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Cross-entropy of ``logits`` ``[B, S, num_bins]`` against ``data["returns"]``."""
+        if logits.shape[-1] != self.head.num_bins:
+            raise ValueError(
+                f"HL-Gauss expects {self.head.num_bins} logits per token, got shape "
+                f"{tuple(logits.shape)}"
+            )
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        targets = hl_gauss_targets(returns, self.head)
+        token_ce = -(targets * log_probs).sum(dim=-1)
+        loss = self.scale * masked_mean(
+            token_ce, mask, global_normalization_factor=global_valid_toks
+        )
+
+        with torch.no_grad():
+            probs = log_probs.exp()
+            values = (probs * bin_centers(self.head, device=probs.device)).sum(dim=-1)
+            # Spread of the predicted distribution (0 = one bin, log(num_bins) = uniform).
+            entropy = -(probs * log_probs).sum(dim=-1)
+            # Returns the support cannot represent (clamped before smoothing).
+            outside = (returns < self.head.v_min) | (returns > self.head.v_max)
+            hl_gauss_metrics = {
+                "hl_gauss_entropy": masked_mean(
+                    entropy, mask, global_normalization_factor=global_valid_toks
+                ).item(),
+                "hl_gauss_clip_frac": masked_mean(
+                    outside.float(), mask, global_normalization_factor=global_valid_toks
+                ).item(),
+            }
+
+        metrics = {
+            "loss": float(loss.item()),
+            "vf_clipfrac": 0.0,
+            **_value_fit_metrics(values, returns, mask, global_valid_toks),
+            **hl_gauss_metrics,
+            "num_valid_samples": int(values.shape[0]),
+        }
+        return loss, metrics
+
+
+def build_value_loss_fn(
+    cfg: MseValueLossConfig, value_config: Optional[dict[str, Any]]
+) -> LossFunction:
+    """The critic loss ``value.head`` calls for: MSE (scalar head) or HL-Gauss CE."""
+    head = resolve_value_head(value_config)
+    if head.categorical:
+        return HLGaussValueLossFn(cfg, head)
+    return MseValueLossFn(cfg)
 
 
 # =====================================================================

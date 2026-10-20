@@ -56,7 +56,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import build_value_loss_fn
 from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -82,6 +82,7 @@ from nemo_rl.algorithms.swe_privileged_critic import (
     resolve_config as resolve_swe_privileged_critic_config,
 )
 from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.value_head import check_warm_start_value_head
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -1387,6 +1388,7 @@ def setup_single_controller(
         )
         if warm_start is not None:
             validate_warm_start_checkpoint(warm_start)
+            check_warm_start_value_head(warm_start, master_config.value)
             print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
         value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
             trainer_checkpoint_path or warm_start,
@@ -2016,7 +2018,7 @@ def setup_single_controller(
         opd_full=opd_module.get_opd_full_config(master_config),
     )
     value_loss_fn: Optional[LossFunction] = (
-        MseValueLossFn(master_config.value_loss_fn)  # type: ignore
+        build_value_loss_fn(master_config.value_loss_fn, master_config.value)  # type: ignore
         if is_ppo_run(master_config) and not collecting
         else None
     )

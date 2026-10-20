@@ -249,6 +249,28 @@ Key parameters:
 - **`value_loss_fn.cliprange`**: Clip range $\epsilon_v$ for value predictions (default: `null` / disabled; reference recipe overrides to 0.2). Set to `null` to disable clipping.
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
+### HL-Gauss Categorical Critic
+
+`value.head` replaces the scalar value head with a categorical one (Megatron critic only), following Zhou et al., "Start Classifying: Categorical Critics for LLM Reinforcement Learning" (arXiv 2608.02181). The head outputs `num_bins` logits per token over equal-width bins on `[v_min, v_max]`, and is trained by [HLGaussValueLossFn](../../nemo_rl/algorithms/loss/loss_functions.py): the cross-entropy against the return $R$ (clamped to the support) smoothed by a Gaussian of width $\sigma$,
+
+$$q_i \propto \Phi\Big(\frac{z_i + \Delta/2 - R}{\sigma}\Big) - \Phi\Big(\frac{z_i - \Delta/2 - R}{\sigma}\Big), \qquad L_V = -\sum_i q_i \log p_i,$$
+
+where $z_i$ are the bin centers and $\Delta$ the bin width. The critic's value is the expectation $\sum_i p_i z_i$, so GAE, the actor loss and every other value consumer are unchanged.
+
+```yaml
+value:
+  head:
+    type: hl_gauss    # default: scalar (MSE)
+    num_bins: 101
+    v_min: -0.1       # leave a margin around the reachable returns (0/1 rewards with gamma = lambda = 1)
+    v_max: 1.1
+    sigma: null       # null: 0.75 bin widths (0.009 here, the paper's setting)
+value_loss_fn:
+  cliprange: null     # value clipping does not apply to the cross-entropy and is rejected
+```
+
+The head starts at zero logits, so every value starts at $(v_\min + v_\max)/2$. A warm-start checkpoint must have the same head and bins (`num_bins`, `v_min`, `v_max`); setup compares them with the seed's saved `config.yaml`. `critic/loss` is then the cross-entropy, and two more metrics are logged: `critic/hl_gauss_entropy` (entropy of the predicted distribution; $\log(\text{num\_bins})$ when uniform) and `critic/hl_gauss_clip_frac` (fraction of returns outside the support).
+
 ## Configuration
 
 ```yaml
@@ -337,7 +359,7 @@ PPO logs all the same metrics as GRPO (see [GRPO Metrics](grpo.md#metrics)). It 
 
 | Metric | Description |
 |--------|-------------|
-| `critic/loss` | Value function MSE loss |
+| `critic/loss` | Value function loss (MSE, or cross-entropy with the HL-Gauss head) |
 | `critic/grad_norm` | Gradient norm of the value model |
 | `critic/values_mean` | Mean of predicted values across valid tokens |
 | `critic/values_min` | Minimum predicted value |
@@ -363,6 +385,7 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 - **InstructGPT**: [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
 - **GAE Paper**: [High-Dimensional Continuous Control Using Generalized Advantage Estimation](https://arxiv.org/abs/1506.02438)
 - **VAPO Paper**: [VAPO: Efficient and Reliable Reinforcement Learning for Advanced Reasoning Tasks](https://arxiv.org/abs/2504.05118)
+- **HL-Gauss Critic**: [Start Classifying: Categorical Critics for LLM Reinforcement Learning](https://arxiv.org/abs/2608.02181)
 - **veRL**: [veRL: An Efficient and Flexible Library for Post-Training of LLMs](https://arxiv.org/abs/2412.09613)
 - **[NeMo RL GRPO Guide](grpo.md)**
 - **[NeMo RL DAPO Guide](dapo.md)**

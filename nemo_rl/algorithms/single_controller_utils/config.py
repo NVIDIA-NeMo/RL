@@ -1247,6 +1247,13 @@ def _validate_swe_privileged_critic(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_value_head(master_config: MasterConfig) -> None:
+    """Check value.head parses and fits value_loss_fn before any worker starts."""
+    from nemo_rl.algorithms.loss.loss_functions import build_value_loss_fn
+
+    build_value_loss_fn(master_config.value_loss_fn, master_config.value)  # type: ignore
+
+
 def _validate_rollout_collection(master_config: MasterConfig) -> None:
     """Check a collection run's settings (see RolloutCollectionConfig)."""
     if not rollout_collection_enabled(master_config):
@@ -1464,6 +1471,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     _validate_swe_privileged_critic(master_config)
+    _validate_value_head(master_config)
 
     sampler_name = async_config.sampler.name
     if sampler_name == "ready_first":

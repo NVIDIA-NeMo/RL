@@ -65,6 +65,7 @@ from pydantic import BaseModel, Field, model_validator
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import GeneralizedAdvantageEstimator
+from nemo_rl.algorithms.legacy_ppo_diagnostics import calibration_ece
 from nemo_rl.algorithms.single_controller_utils.rollout_bank import (
     BANK_FIELDS,
     BankGroup,
@@ -782,8 +783,9 @@ class HeldoutStats:
     legacy yardstick, which ignores ``sample_mask``) and the trained ones
     (``critic/explained_var_masked``). Trajectory metrics use each rollout's
     canonical row once: ``terminal_auc`` (last response token's value vs
-    success) and ``within_group_auc_q1..q4`` (sibling ranking by mean value per
-    progress quarter, mixed-outcome groups only).
+    success), ``terminal_brier`` / ``terminal_ece`` (that value as P(success):
+    squared error and 10-bin calibration error) and ``within_group_auc_q1..q4``
+    (sibling ranking by mean value per progress quarter, mixed-outcome groups only).
     """
 
     sums: dict[str, float] = field(default_factory=dict)
@@ -875,7 +877,12 @@ class HeldoutStats:
         if not self.labels:
             return out
         labels = torch.tensor(self.labels)
-        out["critic/terminal_auc"] = _rank_auc(torch.tensor(self.last_values), labels)
+        last_values = torch.tensor(self.last_values, dtype=torch.float64)
+        out["critic/terminal_auc"] = _rank_auc(last_values, labels)
+        out["critic/terminal_brier"] = float(
+            ((last_values - labels.double()) ** 2).mean()
+        )
+        out["critic/terminal_ece"] = calibration_ece(last_values, labels.double())
         out["reward"] = float(torch.tensor(self.rewards).mean())
         groups = torch.tensor(self.group_ids)
         buckets = torch.tensor(self.bucket_values, dtype=torch.float64)
@@ -1315,9 +1322,10 @@ def _load_step_groups(
 
 def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     """Fit the PPO critic on rollout banks; see the module docstring."""
-    from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+    from nemo_rl.algorithms.loss.loss_functions import build_value_loss_fn
     from nemo_rl.algorithms.single_controller_utils.config import (
         _validate_swe_privileged_critic,
+        _validate_value_head,
         is_ppo_run,
     )
     from nemo_rl.algorithms.single_controller_utils.setup import (
@@ -1327,6 +1335,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         SwePrivilegePrefixStore,
         resolve_config,
     )
+    from nemo_rl.algorithms.value_head import check_warm_start_value_head
     from nemo_rl.data_plane import build_data_plane_client
     from nemo_rl.distributed.virtual_cluster import (
         RayVirtualCluster,
@@ -1347,6 +1356,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     if not value_config.get("megatron_cfg", {}).get("enabled"):
         raise ValueError("the TQ critic needs value.megatron_cfg.enabled=true")
     _validate_swe_privileged_critic(master_config)
+    _validate_value_head(master_config)
     estimator = _build_advantage_estimator(master_config)
     if not isinstance(estimator, GeneralizedAdvantageEstimator):
         raise ValueError(
@@ -1442,6 +1452,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
     elif master_config.ppo.warm_start_value_checkpoint is not None:
         warm_start = master_config.ppo.warm_start_value_checkpoint
         validate_warm_start_checkpoint(warm_start)
+        check_warm_start_value_head(warm_start, value_config)
         weights_path, _ = checkpointer.get_resume_paths(
             warm_start, model_component="value"
         )
@@ -1492,7 +1503,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         value=value,
         dp_client=dp_client,
         estimator=estimator,
-        loss_fn=MseValueLossFn(master_config.value_loss_fn),
+        loss_fn=build_value_loss_fn(master_config.value_loss_fn, value_config),
         privilege_store=(
             SwePrivilegePrefixStore(tokenizer, privilege_cfg)
             if privilege_cfg is not None

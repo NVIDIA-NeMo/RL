@@ -21,7 +21,8 @@ They cover the PPO-specific value-worker behavior:
     integration with the Megatron backbone
   * `get_values` forward pass (output shape + finite values), incl. TP / SP /
     dynamic batching
-  * `train` step with `MseValueLossFn` (loss is finite + non-negative)
+  * `train` step with `MseValueLossFn` / `HLGaussValueLossFn` (loss is finite +
+    non-negative)
   * Sequence-parallel equivalence (SP must not change values)
   * Checkpoint save+load round-trip preserves the trained value head
 
@@ -39,10 +40,12 @@ import ray
 import torch
 
 from nemo_rl.algorithms.loss.loss_functions import (
+    HLGaussValueLossFn,
     MseValueLossConfig,
-    MseValueLossFn,
+    build_value_loss_fn,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.value_head import resolve_value_head
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
@@ -250,6 +253,8 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": mbt,
                 "algorithm": "modified_first_fit_decreasing",
             }
+        elif k == "head":
+            config["head"] = {"type": v}
         elif k == "context_parallel_size":
             config["megatron_cfg"]["context_parallel_size"] = v
             # CP splits each packed sequence into 2*CP load-balanced chunks, so
@@ -376,7 +381,11 @@ def value_setup(request, tiny_qwen2_model_path):
             }
         )
 
-        loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.5))
+        categorical = resolve_value_head(config).categorical
+        loss_fn = build_value_loss_fn(
+            MseValueLossConfig(scale=1.0, cliprange=None if categorical else 0.5),
+            config,
+        )
 
         yield value, cluster, data, loss_fn
 
@@ -402,6 +411,8 @@ def value_setup(request, tiny_qwen2_model_path):
         (2, 1, 1, 1, {"precision": "bfloat16"}),
         (2, 2, 1, 1, {"sequence_parallel": True}),
         (2, 1, 1, 1, {"dynamic_batching": True}),
+        (2, 1, 1, 1, {"head": "hl_gauss"}),
+        (2, 2, 1, 1, {"sequence_parallel": True, "head": "hl_gauss"}),
     ],
     indirect=True,
     ids=[
@@ -410,6 +421,8 @@ def value_setup(request, tiny_qwen2_model_path):
         "2gpu_dp2_bf16",
         "2gpu_tp2sp",
         "2gpu_dp2_dynbatch",
+        "2gpu_dp2_hlgauss",
+        "2gpu_tp2sp_hlgauss",
     ],
 )
 def test_value_worker_init_and_get_values(value_setup):
@@ -437,6 +450,14 @@ def test_value_worker_init_and_get_values(value_setup):
     )
     assert not torch.isnan(values).any(), "Values should not contain NaN"
     assert not torch.isinf(values).any(), "Values should not contain Inf"
+    loss_fn = value_setup[3]
+    if isinstance(loss_fn, HLGaussValueLossFn):
+        # The zero-initialized HL-Gauss head is uniform over the bins: every
+        # state's value is the support's midpoint (position 0 is the shift-in).
+        midpoint = (loss_fn.head.v_min + loss_fn.head.v_max) / 2
+        torch.testing.assert_close(
+            values[:, 1:], torch.full_like(values[:, 1:], midpoint), atol=1e-5, rtol=0
+        )
 
 
 @pytest.mark.hf_gated
@@ -461,6 +482,19 @@ def test_value_worker_init_and_get_values(value_setup):
                 "precision": "bfloat16",
             },
         ),
+        (2, 1, 1, 1, {"sequence_packing": True, "head": "hl_gauss"}),
+        (
+            2,
+            1,
+            1,
+            2,
+            {
+                "sequence_packing": True,
+                "context_parallel_size": 2,
+                "precision": "bfloat16",
+                "head": "hl_gauss",
+            },
+        ),
     ],
     indirect=True,
     ids=[
@@ -471,6 +505,8 @@ def test_value_worker_init_and_get_values(value_setup):
         "2gpu_dp2_seqpack",
         "2gpu_pp2_seqpack",
         "2gpu_cp2_seqpack",
+        "2gpu_dp2_seqpack_hlgauss",
+        "2gpu_cp2_seqpack_hlgauss",
     ],
 )
 def test_value_worker_train_step(value_setup):
@@ -484,8 +520,8 @@ def test_value_worker_train_step(value_setup):
     loss_tensor = results["loss"]
     assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
     assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
-    # MSE-based value loss is always non-negative.
-    assert (loss_tensor >= 0).all(), "MSE-derived value loss should be non-negative"
+    # The MSE and HL-Gauss cross-entropy value losses are both non-negative.
+    assert (loss_tensor >= 0).all(), "Value loss should be non-negative"
     assert "grad_norm" in results, "Train results should contain 'grad_norm'"
     grad_norm = results["grad_norm"]
     assert grad_norm is None or torch.isfinite(torch.as_tensor(grad_norm)).all(), (
@@ -734,6 +770,81 @@ def test_value_loss_prepare_fn_shift_and_truncate():
     torch.testing.assert_close(out_3d["logits"], expected)
 
 
+def test_value_loss_prepare_fn_keeps_hl_gauss_bins():
+    """HL-Gauss bin logits [B, S, K] keep their bins through the shift and truncation."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    logits = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    data = BatchedDataDict({"returns": torch.zeros(2, 3)})
+    out, _ = _value_loss_prepare_fn(logits, data, context_parallel_group=None)
+    expected = torch.cat([torch.zeros(2, 1, 3), logits[:, :2]], dim=1)
+    torch.testing.assert_close(out["logits"], expected)
+
+
+class _HeadlessChunk(torch.nn.Module):
+    """Stands in for a last-stage model chunk: an output_layer and a sharded state dict."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.output_layer = torch.nn.Linear(hidden_size, 32, bias=False)
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return {
+            f"{prefix}output_layer.weight": self.output_layer.weight,
+            f"{prefix}decoder.weight": None,
+        }
+
+
+@pytest.mark.parametrize(
+    ("head", "out_features"),
+    [(None, 1), ({"type": "hl_gauss", "num_bins": 11}, 11)],
+    ids=["scalar", "hl_gauss"],
+)
+def test_make_value_head_hook_sizes_the_head(head, out_features):
+    """The hook installs a hidden->output_size head; HL-Gauss starts at zero logits."""
+    from megatron.bridge.training.utils.train_utils import LinearForLastLayer
+
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        make_value_head_hook,
+    )
+
+    chunk = _HeadlessChunk(hidden_size=16)
+    heads_parallel_state = "megatron.bridge.models.common.heads.parallel_state"
+    with (
+        patch(
+            f"{heads_parallel_state}.get_pipeline_model_parallel_world_size",
+            return_value=1,
+        ),
+        patch(f"{heads_parallel_state}.is_pipeline_last_stage", return_value=True),
+    ):
+        hook = make_value_head_hook(
+            hidden_size=16,
+            sequence_parallel=False,
+            head=resolve_value_head({"head": head}),
+        )
+        [chunk] = hook([chunk])
+
+    layer = chunk.output_layer
+    assert isinstance(layer, LinearForLastLayer)
+    assert (layer.in_features, layer.out_features) == (16, out_features)
+    assert layer.bias is None
+    if out_features > 1:
+        assert torch.count_nonzero(layer.weight) == 0
+        # Re-initialization (meta-device materialization) keeps the zero init.
+        with torch.no_grad():
+            layer.weight.fill_(1.0)
+        layer.reset_parameters()
+        assert torch.count_nonzero(layer.weight) == 0
+    else:
+        assert torch.count_nonzero(layer.weight) > 0
+    # Base-checkpoint loads still skip the fresh head.
+    with chunk.hide_loss_modules():
+        assert list(chunk.sharded_state_dict()) == ["decoder.weight"]
+    assert "output_layer.weight" in chunk.sharded_state_dict()
+
+
 def test_loss_post_processor_rejects_fuse_loss_with_custom_prepare_fn():
     """The fused sequence-packing path prepares loss via
     ``prepare_packed_loss_input`` and cannot honor a custom ``prepare_fn``. The
@@ -763,9 +874,9 @@ def test_loss_post_processor_rejects_fuse_loss_with_custom_prepare_fn():
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
     "value_setup",
-    [(2, 1, 1, 1, {})],
+    [(2, 1, 1, 1, {}), (2, 1, 1, 1, {"head": "hl_gauss"})],
     indirect=True,
-    ids=["2gpu_dp2"],
+    ids=["2gpu_dp2", "2gpu_dp2_hlgauss"],
 )
 def test_value_worker_train_decreases_loss(value_setup):
     """A few training steps on a fixed batch should drive the value MSE loss down.

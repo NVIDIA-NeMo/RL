@@ -312,6 +312,9 @@ def test_heldout_stats_legacy_metrics():
     )
     m = stats.metrics()
     assert m["critic/terminal_auc"] == pytest.approx(1.0)
+    # Last values 0.9/0.8 for winners, 0.1/0.2 for losers: errors 0.1 and 0.2.
+    assert m["critic/terminal_brier"] == pytest.approx(0.025)
+    assert 0.0 < m["critic/terminal_ece"] < 0.2
     assert m["critic/within_group_auc_q4"] == pytest.approx(1.0)
     assert m["critic/n_mixed_groups"] == 1.0
     assert m["num_heldout_samples"] == 6.0

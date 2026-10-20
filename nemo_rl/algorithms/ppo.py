@@ -45,7 +45,10 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    MseValueLossConfig,
+    build_value_loss_fn,
+)
 from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
@@ -56,6 +59,7 @@ from nemo_rl.algorithms.utils import (
     print_performance_metrics,
     set_seed,
 )
+from nemo_rl.algorithms.value_head import check_warm_start_value_head
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import CyclingDataLoader
@@ -350,7 +354,7 @@ def setup(
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
-    MseValueLossFn,
+    LossFunction,
     Logger,
     CheckpointManager,
     PPOSaveState,
@@ -521,7 +525,7 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
+    value_loss_fn = build_value_loss_fn(master_config.value_loss_fn, value_config)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -781,6 +785,7 @@ def setup(
     )
     if warm_start is not None:
         validate_warm_start_checkpoint(warm_start)
+        check_warm_start_value_head(warm_start, value_config)
         print(f"🔥 Warm-starting the value model from {warm_start} (weights only)")
     value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
         last_checkpoint_path or warm_start,
