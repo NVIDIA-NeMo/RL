@@ -40,6 +40,9 @@ import torch
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import (
     PACKED_MULTIMODAL_FIELDS,
+    ROW_GEOMETRY_PREPROCESS_KWARGS,
+    ROW_GEOMETRY_PREPROCESS_MODE,
+    ROW_GEOMETRY_SHAPES,
     PackedTensor,
     row_shapes_key,
 )
@@ -402,6 +405,68 @@ def _expand_sparse_packed_rows(
     return PackedTensor.concat(rows)
 
 
+def _coerce_sparse_packed_field(
+    value: Any,
+    tags: list[dict[str, Any]] | None,
+    field: str,
+) -> PackedTensor:
+    """Restore packed row geometry when materialization densifies equal rows."""
+    if isinstance(value, PackedTensor):
+        return value
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(
+            f"Sparse packed field {field!r} materialized as "
+            f"{type(value).__name__}, expected PackedTensor or Tensor"
+        )
+    if tags is None or value.ndim == 0 or value.shape[0] != len(tags):
+        raise ValueError(
+            f"Sparse packed field {field!r} cannot align dense shape "
+            f"{tuple(value.shape)} with {0 if tags is None else len(tags)} tag rows"
+        )
+
+    tag_key = row_shapes_key(field)
+    geometry = [tag.get(tag_key) for tag in tags]
+    if not geometry or any(item is None for item in geometry):
+        raise ValueError(
+            f"Sparse packed field {field!r} is dense but lacks {tag_key!r} "
+            "geometry for one or more rows"
+        )
+    first = geometry[0]
+    assert first is not None
+    if any(
+        item[ROW_GEOMETRY_PREPROCESS_MODE] != first[ROW_GEOMETRY_PREPROCESS_MODE]
+        or item[ROW_GEOMETRY_PREPROCESS_KWARGS] != first[ROW_GEOMETRY_PREPROCESS_KWARGS]
+        for item in geometry[1:]
+        if item is not None
+    ):
+        raise ValueError(
+            f"Sparse packed field {field!r} has inconsistent preprocessing metadata"
+        )
+
+    shapes = [item[ROW_GEOMETRY_SHAPES] for item in geometry if item is not None]
+    flat_rows: list[torch.Tensor] = []
+    for row, row_shapes in zip(value, shapes):
+        required = sum(torch.Size(shape).numel() for shape in row_shapes)
+        flattened = row.reshape(-1)
+        if flattened.numel() < required:
+            raise ValueError(
+                f"Sparse packed field {field!r} row has {flattened.numel()} "
+                f"elements but its geometry requires {required}"
+            )
+        flat_rows.append(flattened[:required])
+
+    nested = torch.nested.as_nested_tensor(flat_rows, layout=torch.jagged)
+    packed = PackedTensor.from_wire(
+        nested,
+        shapes,
+        preprocess_mode=first[ROW_GEOMETRY_PREPROCESS_MODE],
+        preprocess_kwargs=first[ROW_GEOMETRY_PREPROCESS_KWARGS],
+    )
+    if packed is None:
+        raise ValueError(f"Sparse packed field {field!r} unexpectedly has no rows")
+    return packed
+
+
 def _fetch_remote_materialized(
     dp_client: "DataPlaneClient",
     meta: "KVBatchMeta",
@@ -470,12 +535,9 @@ def _fetch_remote_materialized(
             tags=sparse_meta.tags,
         )
         for field in fields:
-            value = sparse_data.get(field)
-            if not isinstance(value, PackedTensor):
-                raise TypeError(
-                    f"Sparse packed field {field!r} materialized as "
-                    f"{type(value).__name__}, expected PackedTensor"
-                )
+            value = _coerce_sparse_packed_field(
+                sparse_data.get(field), sparse_meta.tags, field
+            )
             data[field] = _expand_sparse_packed_rows(
                 value, present_positions, len(meta.sample_ids)
             )
