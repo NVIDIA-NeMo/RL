@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = nrl-r0.8.0
+	url = https://github.com/kajalj22/Megatron-Bridge.git
+	branch = kajalj/r0.8.0-mlm-copyright-fix
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
