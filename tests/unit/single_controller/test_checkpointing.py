@@ -2215,8 +2215,8 @@ class TestDataPlaneCheckpoint:
     ) -> None:
         ledger = _forest_sealed_ledger()
         keys = sorted(ledger.expected_staging_keys()) + ["orphan"]
-        from nemo_rl.experience.rollout_recovery import build_rollout_recovery_state
         from nemo_rl.experience.reward_penalties import CaptureRewardSettings
+        from nemo_rl.experience.rollout_recovery import build_rollout_recovery_state
 
         config = _actor_master_config(tmp_path, token_capture_enabled=True)
         state = build_rollout_recovery_state(
