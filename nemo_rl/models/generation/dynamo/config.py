@@ -91,6 +91,49 @@ _VLLM_SINGLE_RANK_ONLY_FIELDS = {
     "prefill_context_parallel_size",
 }
 
+# Top-level ``policy.generation`` keys outside the declared fields that are accounted
+# for; any other active key would be silently dropped, so it is warned about.
+_GENERATION_CLASSIFIED = {
+    # Read by Dynamo generation, or validated in DynamoConfig.
+    "model_name",
+    "max_new_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_token_ids",
+    "stop_strings",
+    "_pad_token_id",
+    "colocated",
+    "refit_transport",
+    "quant_cfg",
+    "real_quant",
+    "sglang_cfg",
+    "trtllm_cfg",
+    # Read by the algorithm, rollouts, or NeMo-Gym rather than the engine.
+    "val_temperature",
+    "val_top_p",
+    "val_top_k",
+    "port_range_low",
+    "port_range_high",
+    "use_async_rollouts",
+    "_debug_payload_metrics",
+    "_draft_weights_from_refit",
+    "_mtp_weights_from_refit",
+    "_draft_full_refit",
+    # Shared-YAML sections for other backends and refit paths.
+    "mcore_generation_config",
+    "refit_cfg",
+    "real_quant_export_cpu_offload",
+    "real_quant_ignore",
+}
+
+
+def _is_active(value: Any) -> bool:
+    """Whether a setting is on; a block with an ``enabled`` switch counts only then."""
+    if isinstance(value, dict) and "enabled" in value:
+        return bool(value["enabled"])
+    return bool(value)
+
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
     """Structured arguments passed to every managed ``dynamo.vllm`` worker."""
@@ -335,5 +378,15 @@ class DynamoConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "policy.generation.stop_strings supports at most 32 values when "
                 "backend='dynamo'"
+            )
+        ignored = sorted(
+            key
+            for key, value in extra.items()
+            if key not in _GENERATION_CLASSIFIED and _is_active(value)
+        )
+        if ignored:
+            warnings.warn(
+                f"policy.generation keys ignored by backend='dynamo': {ignored}",
+                stacklevel=2,
             )
         return self

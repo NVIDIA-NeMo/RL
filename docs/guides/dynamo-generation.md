@@ -110,7 +110,9 @@ Service ports and the namespace are runtime-owned rather than public config.
 The shared GRPO base config also supplies `mcore_generation_config` and
 `refit_cfg`. Dynamo accepts these inherited sections but does not use them;
 worker arguments come from `vllm_cfg`, and refit uses the collective weight
-synchronizer.
+synchronizer. Any other active top-level `policy.generation` setting that
+Dynamo does not honor, such as `bad_words` or `ignore_eos`, draws a startup
+warning.
 
 Enable and filter worker telemetry with both managed configuration sections:
 
@@ -189,6 +191,8 @@ Current limits on this path:
 
 - Native rollouts only. NeMo-Gym under the SingleController supports only
   `backend: vllm` and `backend: megatron`.
+- Text policies only, and no MoE router replay: `policy.is_vlm` and
+  `policy.router_replay.enabled` must be false.
 - Fleet health is not supported: keep `async_rl.generation_fleet_health.enabled`
   false (the Dynamo frontend owns request routing) and set
   `async_rl.generation_fleet_health.refit_timeout_s: null` (default 300), since
