@@ -18,7 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 
@@ -34,7 +34,74 @@ def json_safe_nonfinite(value: Any) -> Any:
     return value
 
 
-class TrainDataDump:
+class BaseDebugWriter:
+    def __init__(self) -> None:
+        self.step: int | None = None
+        self.rows: int = 0
+
+    def add_chunk(
+        self,
+        *,
+        step: int,
+        sample_ids: list[str],
+        tags: list[dict[str, Any]] | None,
+        input_lengths: torch.Tensor,
+        sequences: dict[str, torch.Tensor],
+        scalars: dict[str, torch.Tensor],
+    ) -> None:
+        # unbind() splits dense and jagged columns alike into per-row tensors.
+        columns = {
+            k: list(v.detach().cpu().unbind())
+            for k, v in {**sequences, **scalars}.items()
+        }
+
+        # Validate column lengths
+        lengths = input_lengths.detach().cpu().reshape(-1).tolist()
+        if (
+            len(lengths) != len(sample_ids)
+            or any(len(v) != len(sample_ids) for v in columns.values())
+            or (tags is not None and len(tags) != len(sample_ids))
+        ):
+            raise ValueError("Training dump column lengths do not match sample ids")
+        for i, length in enumerate(lengths):
+            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
+                raise ValueError("Training dump input length exceeds a sequence column")
+
+        # Truncate on the first chunk of a step so a retried step replaces its
+        # rows instead of appending a second copy to the previous attempt's.
+        is_first_chunk = self.step != step
+        if is_first_chunk:
+            self.rows = 0
+        self.step = step
+
+        # Write rows
+        def _iter_rows() -> Iterable[dict[str, Any]]:
+            for i, length in enumerate(lengths):
+                row = {
+                    "step": step + 1,
+                    "sample_id": [sample_ids[i]],
+                    "input_lengths": [length],
+                    "metadata": [tags[i] if tags is not None else {}],
+                }
+                for key in sequences:
+                    row[key] = [columns[key][i][:length].tolist()]
+                for key in scalars:
+                    row[key] = [columns[key][i].tolist()]
+                yield row
+
+        self.rows += self._write_rows(
+            step=step,
+            rows=_iter_rows(),
+            replace=is_first_chunk,
+        )
+
+    def _write_rows(
+        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
+    ) -> int:
+        raise NotImplementedError
+
+
+class TrainDataDump(BaseDebugWriter):
     """Write chunks to a partial file, publishing only a completed optimizer step.
 
     Sequence columns are trimmed to input_lengths (padding only). Scalar
@@ -57,63 +124,25 @@ class TrainDataDump:
     """
 
     def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
+        super().__init__()
         self.log_dir = Path(log_dir)
         self.shard_id = shard_id
-        self.step: int | None = None
-        self.rows = 0
 
-    def _part_path(self, step: int, shard_id: str) -> Path:
-        return self.log_dir / f"train_data_step{step + 1}.jsonl.part-{shard_id}"
-
-    def add_chunk(
-        self,
-        *,
-        step: int,
-        sample_ids: list[str],
-        tags: list[dict[str, Any]] | None,
-        input_lengths: torch.Tensor,
-        sequences: dict[str, torch.Tensor],
-        scalars: dict[str, torch.Tensor],
-    ) -> None:
-        lengths = input_lengths.detach().cpu().reshape(-1).tolist()
-        # unbind() splits dense and jagged columns alike into per-row tensors.
-        columns = {
-            k: list(v.detach().cpu().unbind())
-            for k, v in {**sequences, **scalars}.items()
-        }
-        if (
-            len(lengths) != len(sample_ids)
-            or any(len(v) != len(sample_ids) for v in columns.values())
-            or (tags is not None and len(tags) != len(sample_ids))
-        ):
-            raise ValueError("Training dump column lengths do not match sample ids")
-        for i, length in enumerate(lengths):
-            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
-                raise ValueError("Training dump input length exceeds a sequence column")
+    def _write_rows(
+        self, step: int, rows: Iterable[dict[str, Any]], replace: bool
+    ) -> int:
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        part = self._part_path(step, self.shard_id)
-        # Truncate on the first chunk of a step so a retried step replaces its
-        # rows instead of appending a second copy to the previous attempt's.
-        if self.step != step:
-            self.rows = 0
-        mode = "a" if self.step == step else "w"
-        self.step = step
+        part = self.log_dir / f"train_data_step{step + 1}.jsonl.part-{self.shard_id}"
+        mode = "w" if replace else "a"
+
+        num_rows = 0
         with part.open(mode) as stream:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": step + 1,
-                    "sample_id": [sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [tags[i] if tags is not None else {}],
-                }
-                for key in sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in scalars:
-                    row[key] = [columns[key][i].tolist()]
+            for row in rows:
                 stream.write(
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )
-                self.rows += 1
+                num_rows += 1
+        return num_rows
 
     def finish_step(self, step: int, expected_rows: int | None = None) -> None:
         """Merge every shard's part file and publish the step atomically.
