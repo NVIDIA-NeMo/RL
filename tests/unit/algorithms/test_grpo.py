@@ -3493,7 +3493,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     validated = DynamoConfig.model_validate(dynamo_config)
-    assert validated.engine_world_size == 4
+    assert validated.engine_world_size() == 4
     assert validated.disaggregation.enabled is disaggregation
     synchronizer.init_communicator.assert_called_once_with()
     # The trainers abort at the engines' deadline instead of hanging in NCCL.

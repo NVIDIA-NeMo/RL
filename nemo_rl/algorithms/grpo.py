@@ -1222,9 +1222,10 @@ def setup(
                 elif generation_config["backend"] == "dynamo":
                     # Under PD disaggregation, a replica's prefill and decode
                     # engines, as for TRT-LLM.
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).replica_width
+                    dynamo_config = DynamoConfig.model_validate(generation_config)
+                    gpus_per_instance = dynamo_config.replica_width(
+                        dynamo_config.engine_world_size(policy_config)
+                    )
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)

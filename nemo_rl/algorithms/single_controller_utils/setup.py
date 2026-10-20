@@ -516,9 +516,10 @@ def _build_clusters(
                     "pipeline_parallel_size", 1
                 )
             elif backend == "dynamo":
-                gpus_per_instance = DynamoConfig.model_validate(
-                    generation_config_dict
-                ).replica_width
+                dynamo_config = DynamoConfig.model_validate(generation_config_dict)
+                gpus_per_instance = dynamo_config.replica_width(
+                    dynamo_config.engine_world_size(master_config.policy)
+                )
             elif backend == "sglang":
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
