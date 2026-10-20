@@ -24,6 +24,8 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+pytestmark = pytest.mark.automodel
+
 import torch
 import torch.nn as nn
 from nemo_automodel.components._peft.lora import (

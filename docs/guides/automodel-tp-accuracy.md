@@ -1,12 +1,12 @@
-# DTensor Tensor Parallel Accuracy Issue
+# Automodel Tensor Parallel Accuracy Issue
 
 During reinforcement learning (RL) post-training, maintaining accuracy is both **critical and challenging**. Minor numerical deviations can propagate and amplify across policy updates, ultimately distorting reward signals and affecting convergence. Consequently, understanding and mitigating accuracy issues is central to ensuring consistent and reliable training behavior in large-scale distributed RL settings.
 
-## Observed Accuracy Issues Under Tensor Parallelism with DTensor Backend
+## Observed Accuracy Issues Under Tensor Parallelism with the Automodel Backend
 
 During our development, we identified that the **tensor parallel (TP)** strategy can be a significant factor contributing to accuracy problems.
 
-We have encountered several accuracy issues related to TP in **DTensor**, including:
+We have encountered several accuracy issues related to TP in **Automodel**, including:
 
 1. **For policy models**: We observed severe `token_mult_prob_error` spikes when TP was enabled during post-training of a Qwen3 dense model (e.g., [Qwen/Qwen3-4B-Instruct-2507 · Hugging Face](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507)), indicating a significant difference between the training and inference engines.
 2. **For reward models**: The reward model exhibited large discrepancies under different TP configurations.
@@ -32,7 +32,7 @@ In general, **generation logprobs** and **policy logprobs** should align closely
 
 As shown in Figure 1, numerous spikes can be observed during training. Occasional spikes are acceptable if the `token_mult_prob_error` quickly returns to around 1.0. However, in this case, even with EMA smoothing applied, the figure reveals an overall upward trend, which is unacceptable and indicates a persistent misalignment between the training and inference behaviors.
 
-![](../assets/dtensor-tp-accuracy/token_mult_prob_error_qwen3_4B.png)
+![](../assets/automodel-tp-accuracy/token_mult_prob_error_qwen3_4B.png)
 
 <p align="center"><em>Fig 1: The token_mult_prob_error of Qwen3-4B</em></p>
 
@@ -60,11 +60,11 @@ Combining the three images for observation, it is not necessarily true that abno
 2. **Stochastic occurrence of spikes**: The abnormal `token_mult_prob_error` is itself unstable; even with the same batch of data, spikes may not appear in every run.
 3. **Dilution effect with large datasets**: When the dataset is sufficiently large and no critical samples are repeatedly affected, these extreme but sporadic spikes may have limited impact on aggregate metrics, so the final reward and validation accuracy may not exhibit significant deviations.
 
-![](../assets/dtensor-tp-accuracy/image-20260111142255534.png)
+![](../assets/automodel-tp-accuracy/image-20260111142255534.png)
 
 <p align="center"><em>Fig 2: The reward of Qwen3-4B</em></p>
 
-![](../assets/dtensor-tp-accuracy/validation_accuracy.png)
+![](../assets/automodel-tp-accuracy/validation_accuracy.png)
 
 <p align="center"><em>Fig 3: The validation accuracy of Qwen3-4B</em></p>
 
@@ -92,11 +92,11 @@ $$
 
 This ratio is the standard importance ratio used in off-policy RL to reweight returns when the data are collected under an older behavior policy. In on-policy training, this ratio should be exactly 1. However, in our experiments, we observed cases where the ratio deviates from 1, indicating a mismatch between the intended on-policy setting and the actual behavior of the system. Figure 4 and Figure 5 illustrate this phenomenon by showing the mismatch between `prev_logprobs` and `current_logprobs` under TP=4, as well as the reward curves under TP=4 and TP=1 for the `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` model.
 
-![](../assets/dtensor-tp-accuracy/logprobs_unequal_1.png)
+![](../assets/automodel-tp-accuracy/logprobs_unequal_1.png)
 
 <p align="center"><em>Fig 4: The mismatch of prev_logprobs and current_logprobs under TP=4</em></p>
 
-![](../assets/dtensor-tp-accuracy/image-20260111160656891-1768118824549-2.png)
+![](../assets/automodel-tp-accuracy/image-20260111160656891-1768118824549-2.png)
 
 <p align="center"><em>Fig 5: The reward of deepseek-ai/DeepSeek-R1-Distill-Qwen-7B under TP=4 and TP=1</em></p>
 
@@ -110,7 +110,7 @@ After aligning `train_micro_batch_size` and `logprob_batch_size` so that the sam
 
 ### Recommended Solutions
 
-When using DTensor with TP > 1, or when `probs_ratio != 1` is observed in an on-policy setting, the following mitigation strategies are recommended to restore numerical consistency and stabilize training:
+When using Automodel with TP > 1, or when `probs_ratio != 1` is observed in an on-policy setting, the following mitigation strategies are recommended to restore numerical consistency and stabilize training:
 
 - **Align micro-batch sizes**:
   Configure `train_micro_batch_size` and `logprob_batch_size` to be exactly equal so that both the training forward pass and the logprob evaluation traverse identical kernel configurations and batching patterns. This alignment minimizes batch-variant behavior in underlying kernels and ensures that `current_logprobs` and `prev_logprobs` are computed under the same numerical conditions, which in turn drives `probs_ratio` back toward 1.
@@ -226,7 +226,7 @@ Beyond the TP-related issues discussed above, our experiments also highlight tha
 
 Figure 6 reports the KL divergence between the logits produced by the Hugging Face stack and those produced by NeMo‑RL for the same input sequence. The plot shows that, even with identical data and model weights, the resulting logit distributions differ noticeably across the two execution engines. In our experiments, similar behavior appeared when varying attention implementations and hardware configurations, where we consistently observed measurable numerical discrepancies, although we did not attempt to systematically eliminate every such source of variation.
 
-![](../assets/dtensor-tp-accuracy/kl_hf_prev.png)
+![](../assets/automodel-tp-accuracy/kl_hf_prev.png)
 
 <p align="center"><em>Fig 6: The KL divergence between hugging face and nemorl</em></p>
 
