@@ -48,6 +48,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    warn_if_custom_sampler_lacks_drop_accounting,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
@@ -1123,6 +1124,8 @@ def setup_single_controller(
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
+    if algo_cfg.use_dynamic_sampling:
+        warn_if_custom_sampler_lacks_drop_accounting(master_config.async_rl.sampler)
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (

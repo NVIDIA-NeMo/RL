@@ -44,6 +44,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+import warnings
 from typing import (
     Annotated,
     Callable,
@@ -191,8 +192,9 @@ class DropAccountingSampler(Protocol):
 
     A group is lost when its rollout is dropped (a failure, or dynamic sampling
     filtering a zero-variance group) and no replacement is available. Optional: for a
-    sampler without these members the controller charges the group's ``target_step``
-    and only uses the spare pool once the sampler has stamped a step.
+    sampler without these members the controller uses the gated defaults: the spare
+    pool is on, the last step cannot close short, and the group is charged to its own
+    ``target_step`` (or to the step being assembled if the sampler stamps none).
     """
 
     uses_replacement_pool: ClassVar[bool]
@@ -950,6 +952,48 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
             f"boolean class attribute, got {capability!r}"
         )
     return capability
+
+
+_DROP_ACCOUNTING_MEMBERS = (
+    "uses_replacement_pool",
+    "closes_short_at_exhaustion",
+    "charge_step_for_lost_group",
+)
+
+
+def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
+    """Warn when a custom sampler gets the gated drop defaults by omission.
+
+    Imports the class but does not construct it, so it can run during setup. Built-in
+    samplers are skipped. ``DropAccountingSampler`` is all-or-nothing under
+    ``isinstance``, so a class with only some of the members is treated as having none.
+    That is easy to do by accident and changes behaviour silently, so name the members
+    that are missing.
+    """
+    if not isinstance(cfg, CustomSamplerConfig):
+        return
+    sampler_cls = _custom_sampler_class(cfg)
+    if isinstance(sampler_cls, DropAccountingSampler):
+        return
+    present = [m for m in _DROP_ACCOUNTING_MEMBERS if hasattr(sampler_cls, m)]
+    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if m not in present]
+    detail = (
+        f"it defines only {present} and is missing {missing}, and a partial "
+        "implementation is ignored"
+        if present
+        else "it does not implement DropAccountingSampler"
+    )
+    warnings.warn(
+        f"{sampler_cls.__name__} is used with dynamic sampling but {detail}. "
+        "Dropped groups are handled with the gated defaults: a spare pool is used, "
+        "the last step cannot close short at data exhaustion, and a lost group is "
+        "charged to its own target_step (or the step being assembled if the sampler "
+        "stamps none). That is right for a gated sampler. A sampler that keeps "
+        "producing without a gate, like windowed, should implement "
+        "DropAccountingSampler with uses_replacement_pool = False and "
+        "closes_short_at_exhaustion = True.",
+        stacklevel=2,
+    )
 
 
 def create_sampler(

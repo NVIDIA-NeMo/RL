@@ -396,7 +396,9 @@ Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations al
 
 `weight_fifo` is not supported: it drains only the oldest in-window `start_weight` and waits for that version alone to fill a step, but a replacement is generated later and carries a newer version. The older version then stays short for good while the gate is closed and nothing is in flight, and the run stalls. Use `ready_first` for the same gated admission with completion-order selection.
 
-A `custom` sampler is treated like `ready_first` unless it implements `DropAccountingSampler`.
+A `custom` sampler that does not implement `DropAccountingSampler` (all three members; a partial implementation is ignored) gets the gated defaults: it uses the spare pool, cannot close its last step short at data exhaustion, and a lost group is charged to the group's own `target_step`, or to the step being assembled if the sampler stamps none. So a stamping `custom` sampler behaves like `in_order`, and a non-stamping one like `ready_first`.
+
+A `custom` sampler that keeps producing without a gate, like `windowed`, should implement `DropAccountingSampler` with `uses_replacement_pool = False` and `closes_short_at_exhaustion = True`. Otherwise it fills a spare pool it does not need and fails at the end of the data instead of closing the last step on the groups left.
 
 The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect here; `max_replacement_attempts` is the budget instead. Dropped groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)), and a dropped group that cannot be replaced shortens the step.
 

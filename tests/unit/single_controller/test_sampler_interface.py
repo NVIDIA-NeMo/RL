@@ -23,6 +23,7 @@ and FQN loading of an out-of-repo sampler.
 from __future__ import annotations
 
 import asyncio
+import warnings
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -46,6 +47,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     required_buffer_capacity_for_config,
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    warn_if_custom_sampler_lacks_drop_accounting,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
@@ -554,6 +556,44 @@ class TestCustomFqnSampler:
         assert isinstance(s, EchoSampler)
         assert isinstance(s, PromptGroupSampler)
         assert s.max_lookahead_versions == 1
+
+
+def _custom(cls_name: str) -> CustomSamplerConfig:
+    return CustomSamplerConfig(target=f"{__name__}:{cls_name}")
+
+
+class TestWarnIfCustomSamplerLacksDropAccounting:
+    def test_warns_when_no_member_is_defined(self):
+        with pytest.warns(
+            UserWarning, match="does not implement DropAccountingSampler"
+        ):
+            warn_if_custom_sampler_lacks_drop_accounting(_custom("NoDropAccounting"))
+
+    def test_names_the_missing_members_of_a_partial_implementation(self):
+        with pytest.warns(UserWarning) as record:
+            warn_if_custom_sampler_lacks_drop_accounting(
+                _custom("PartialDropAccounting")
+            )
+        text = str(record[0].message)
+        assert "only ['uses_replacement_pool']" in text
+        assert "closes_short_at_exhaustion" in text
+        assert "charge_step_for_lost_group" in text
+        assert "partial implementation is ignored" in text
+
+    @pytest.mark.parametrize(
+        "cfg",
+        [
+            _custom("FullDropAccounting"),
+            _custom("EchoSampler"),
+            WindowedSamplerConfig(max_staleness_versions=1),
+            InOrderSamplerConfig(max_lookahead_versions=1),
+        ],
+        ids=["full-protocol", "base-sampler-subclass", "windowed", "in_order"],
+    )
+    def test_silent_when_the_protocol_is_implemented_or_sampler_is_built_in(self, cfg):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warn_if_custom_sampler_lacks_drop_accounting(cfg)
 
 
 class TestWindowedSelect:
@@ -1130,6 +1170,24 @@ class TestInflightAbortPolicy:
             start_weight_version=0,
             current_train_weight=5,
         )
+
+
+class NoDropAccounting:
+    """Defines none of the DropAccountingSampler members."""
+
+
+class PartialDropAccounting:
+    """Defines one member, which isinstance ignores because the rest are missing."""
+
+    uses_replacement_pool = False
+
+
+class FullDropAccounting:
+    uses_replacement_pool = False
+    closes_short_at_exhaustion = True
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
 
 
 class EchoSampler(InOrderSampler):
