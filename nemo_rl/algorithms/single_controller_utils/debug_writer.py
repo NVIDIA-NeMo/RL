@@ -41,8 +41,10 @@ class DebugWriter(ABC):
     finish_step on another once the step completes.
     """
 
-    def __init__(self) -> None:
-        """Initialize the current step and the number of rows written for it."""
+    def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
+        """Store the log directory and shard id and start with no rows written."""
+        self.log_dir = Path(log_dir)
+        self.shard_id = shard_id
         self.step: int | None = None
         self.rows: int = 0
 
@@ -147,12 +149,6 @@ class JsonDebugWriter(DebugWriter):
     them with idx across the merged file. A failed step leaves part files, never a
     completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
-
-    def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
-        """Set the directory to write under and the shard whose part files this owns."""
-        super().__init__()
-        self.log_dir = Path(log_dir)
-        self.shard_id = shard_id
 
     def _write_rows(
         self, step: int, rows: Iterable[dict[str, Any]], replace: bool
