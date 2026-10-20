@@ -991,3 +991,41 @@ def test_actor_registry_honors_system_flag(use_system_executable):
             "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
         ].startswith("uv run")
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
+
+
+def test_init_ray_drops_mpi_launcher_env_in_trtllm_workers_only():
+    """TRT-LLM's MPI_Init breaks under srun's launcher env; other workers keep it."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            init_ray()
+        hook = mock_ray_init.call_args_list[0][1]["runtime_env"][
+            "worker_process_setup_hook"
+        ]
+
+    launcher = {
+        "SLURM_JOBID": "14",
+        "SLURM_JOB_ID": "14",
+        "SLURM_STEP_ID": "0",
+        "PMIX_NAMESPACE": "x",
+        "PMI_FD": "3",
+        "MPI_LOCALRANKID": "0",
+        "OMPI_MCA_plm": "s",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+    }
+    kept = {"PRTE_ALLOW_RUN_AS_ROOT": "1", "HOME": "/root"}
+    env = {**launcher, **kept}
+    spec = "importlib.util.find_spec"
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=object()):
+        hook()
+        assert dict(os.environ) == kept
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=None):
+        hook()
+        assert dict(os.environ) == env
