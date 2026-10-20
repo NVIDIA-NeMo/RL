@@ -137,6 +137,11 @@ _SHARED_GENRM_METRICS = (
     "genrm_max_output_tokens_hit_rate_per_group",
 )
 
+# The metric key both NeMo-Gym rollout paths report (``run_async_nemo_gym_rollout``
+# here and ``AsyncNemoGymRolloutImpl._run_rollouts`` in rollout_manager.py): the
+# number of rows a failure marker named that were dispatched again.
+NEMO_GYM_INFRA_REDISPATCHES_METRIC = "nemo_gym_infra_redispatches"
+
 
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
@@ -2680,11 +2685,15 @@ async def _merge_nemo_gym_instance_streams(
 
     Every timing payload a stream delivers is handed to ``record_timing``
     under that stream's label as it arrives, failure markers included. A
-    marker is never yielded, so the callback is the only timing channel; a
-    retry stream reports under ``<instance_label>/retry<n>``, so a one-row
-    retry never replaces its bucket's totals. Both callbacks are required:
-    the actor always returns a failed ``/run`` as a marker, so a merge that
-    yielded one would hand the consumer a row with no message log.
+    marker is never yielded, so the callback is the only timing channel. The
+    retry streams of one instance report together under one
+    ``<instance_label>/retry`` label: each payload is added to the instance's
+    running total (``_add_timing_payload``) and the total is recorded again,
+    so a one-row retry never replaces its bucket's totals and the number of
+    timing labels does not grow with the number of re-dispatches. Both
+    callbacks are required: the actor always returns a failed ``/run`` as a
+    marker, so a merge that yielded one would hand the consumer a row with
+    no message log.
 
     Yields:
         ``(row_index, resolved_agent_ref, result, instance_label)``.
@@ -2692,8 +2701,9 @@ async def _merge_nemo_gym_instance_streams(
     iterators: dict[Any, str] = {}
     streams_by_iterator: dict[Any, Any] = {}
     handles_by_iterator: dict[Any, Any] = {}
-    timing_labels_by_iterator: dict[Any, str] = {}
-    retry_counts: dict[str, int] = {}
+    retry_iterators: set[Any] = set()
+    # Instance label -> the summed timing of its retry streams so far.
+    retry_timing: dict[str, dict[str, Any]] = {}
     active_iterators: set[Any] = set()
     pending: dict[asyncio.Task, Any] = {}
 
@@ -2701,7 +2711,7 @@ async def _merge_nemo_gym_instance_streams(
         instance_label: str,
         handle: Any,
         rows: list[dict],
-        timing_label: Optional[str] = None,
+        retry: bool = False,
     ) -> None:
         ray_arguments = (
             rows,
@@ -2725,7 +2735,8 @@ async def _merge_nemo_gym_instance_streams(
         iterators[iterator] = instance_label
         streams_by_iterator[iterator] = stream
         handles_by_iterator[iterator] = handle
-        timing_labels_by_iterator[iterator] = timing_label or instance_label
+        if retry:
+            retry_iterators.add(iterator)
         active_iterators.add(iterator)
         pending[asyncio.ensure_future(anext(iterator))] = iterator
 
@@ -2772,8 +2783,16 @@ async def _merge_nemo_gym_instance_streams(
                         enabled=debug_payload_metrics,
                     )
                 )
-                if timing_metrics is not None:
-                    record_timing(timing_labels_by_iterator[iterator], timing_metrics)
+                if timing_metrics is not None and iterator in retry_iterators:
+                    retry_timing[instance_label] = _add_timing_payload(
+                        retry_timing.get(instance_label, {}), timing_metrics
+                    )
+                    record_timing(
+                        nemo_gym_retry_timing_label(instance_label),
+                        retry_timing[instance_label],
+                    )
+                elif timing_metrics is not None:
+                    record_timing(instance_label, timing_metrics)
                 if GYM_INFRA_FAILURE_KEY in result:
                     if first_failure is not None:
                         # The rollout already ends with first_failure once the
@@ -2790,13 +2809,8 @@ async def _merge_nemo_gym_instance_streams(
                         f"{result[GYM_INFRA_FAILURE_KEY]}",
                         flush=True,
                     )
-                    retries = retry_counts.get(instance_label, 0) + 1
-                    retry_counts[instance_label] = retries
                     _start_stream(
-                        instance_label,
-                        handles_by_iterator[iterator],
-                        [row],
-                        timing_label=f"{instance_label}/retry{retries}",
+                        instance_label, handles_by_iterator[iterator], [row], retry=True
                     )
                     pending[asyncio.ensure_future(anext(iterator))] = iterator
                     continue
@@ -2821,6 +2835,46 @@ async def _merge_nemo_gym_instance_streams(
                 ray.cancel(stream)
 
 
+_RETRY_TIMING_SUFFIX = "/retry"
+
+
+def nemo_gym_retry_timing_label(label: str) -> str:
+    """The timing label under which the rows dispatched again under ``label`` report.
+
+    ``label`` is an instance label on the driver path and an instance timer
+    prefix on the single-controller path. The timing payloads of every
+    re-dispatch under it are added up (``_add_timing_payload``) and reported
+    under this one label, so the two paths name the retry timing the same way.
+    """
+    return f"{label}{_RETRY_TIMING_SUFFIX}"
+
+
+def _add_timing_payload(
+    total: Mapping[str, Any], payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Add one retry stream's actor timing to the running total of its instance's retries.
+
+    Every key of an actor's timing payload but the percentages is a time in
+    seconds and is summed. A key ending in ``_pct`` is the share of the time
+    under the key without that suffix in the stream's whole run, which the
+    actor does not report, so it is recomputed from the sums as that key's
+    share of every summed time key. The returned mapping replaces ``total``.
+    """
+    summed: dict[str, float] = {
+        key: float(value) for key, value in total.items() if not key.endswith("_pct")
+    }
+    for key, value in payload.items():
+        if not key.endswith("_pct"):
+            summed[key] = summed.get(key, 0.0) + float(value)
+    elapsed = sum(summed.values())
+    folded: dict[str, Any] = dict(summed)
+    for key in {*total, *payload}:
+        if key.endswith("_pct"):
+            share = summed.get(key[: -len("_pct")], 0.0)
+            folded[key] = 100.0 * share / elapsed if elapsed else 0.0
+    return folded
+
+
 def _merge_nemo_gym_timing_metrics(
     timing_by_instance: dict[str, dict[str, Any]], timer_prefix: str
 ) -> dict[str, Any]:
@@ -2838,21 +2892,26 @@ def _merge_nemo_gym_timing_metrics(
     over instances with different row counts would not mean anything.
 
     With one label this returns exactly what it reported, so an unsharded step
-    without a re-dispatch is unchanged. A re-dispatched row adds a
-    ``<instance_label>/retry<n>`` label (see
+    without a re-dispatch is unchanged. A re-dispatched row adds one
+    ``<instance_label>/retry`` label per instance (see
     ``_merge_nemo_gym_instance_streams``), so such a step reports per-label
-    keys and the roll-up is the maximum over the bucket and its retries.
+    keys too. The time keys roll up as the maximum over the bucket and its
+    retries; a retry label's percentages stay under that label, because the
+    share of the few rows a retry re-ran is not comparable with the bucket's.
     """
     if len(timing_by_instance) <= 1:
         return dict(next(iter(timing_by_instance.values()), {}))
 
     merged: dict[str, Any] = {}
     for instance_label, metrics in timing_by_instance.items():
+        is_retry = instance_label.endswith(_RETRY_TIMING_SUFFIX)
         for key, value in metrics.items():
             suffix = (
                 key[len(timer_prefix) + 1 :] if key.startswith(timer_prefix) else key
             )
             merged[f"{timer_prefix}/shard/{instance_label}/{suffix}"] = value
+            if is_retry and key.endswith("_pct"):
+                continue
             merged[key] = max(merged[key], value) if key in merged else value
     return merged
 
@@ -3179,7 +3238,7 @@ async def run_async_nemo_gym_rollout(
     )
     # Reported on every rollout, zero included, so a mean over steps is a rate
     # and not an average over the steps that happened to re-dispatch.
-    final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+    final_rollout_result.rollout_metrics[NEMO_GYM_INFRA_REDISPATCHES_METRIC] = (
         accumulator.infra_redispatches
     )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))

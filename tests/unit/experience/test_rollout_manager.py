@@ -46,7 +46,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
-from nemo_rl.experience.failures import GenerationUnavailable
+from nemo_rl.experience.failures import GenerationUnavailable, GymTransportError
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1437,6 +1437,102 @@ def test_nemo_gym_run_rollouts_reports_zero_redispatches_for_a_clean_group():
     assert metrics["nemo_gym_infra_redispatches"] == 0
 
 
+def test_nemo_gym_run_rollouts_counts_only_marked_rows_as_infra_redispatches():
+    """A row sent again because its stream ended without it is a stream-death
+    re-send: the attempt counter records it, but ``nemo_gym_infra_redispatches``
+    counts only rows a failure marker named, the meaning the driver path gives
+    the same key."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [(0, {"name": "agent"}, _streamed_gym_result(), None)],
+            [(1, {"name": "agent"}, _streamed_gym_result(), None)],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+    impl._stats = RolloutStats()
+
+    completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert len(completions) == 2
+    assert metrics["nemo_gym_infra_redispatches"] == 0
+    assert impl._stats.gym_row_redispatches == 1
+
+
+def test_nemo_gym_run_rollouts_never_redispatches_a_captured_row_under_its_gate_id():
+    """A row that carries a gate rollout id runs under token capture, and the
+    capture ledger is keyed by that id: a second session under it would add a
+    second chain to the first session's ledger. The marked row is therefore
+    not dispatched again here whatever the attempt budget; the stream drains
+    so the sibling that lands is delivered to the completion callback, and the
+    attempt ends with the transport error the recovery loop retries under a
+    fresh attempt, which mints a fresh gate rollout id."""
+    from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _streamed_gym_result(), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+            ],
+            # A second dispatch would consume this script; it must stay unused.
+            [(1, {"name": "agent"}, _streamed_gym_result(), None)],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=3)
+    impl._stats = RolloutStats()
+    landed = []
+
+    async def on_completion(rowidx, completion):
+        landed.append(rowidx)
+
+    with pytest.raises(
+        GymTransportError,
+        match=r"rows \[1\] of 2 failed at the infrastructure level on every attempt \(1\)",
+    ):
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {
+                        "_rowidx": 0,
+                        "agent_ref": {"name": "agent"},
+                        "_ng_rollout_id": "group_g0_a1",
+                    },
+                    {
+                        "_rowidx": 1,
+                        "agent_ref": {"name": "agent"},
+                        "_ng_rollout_id": "group_g1_a1",
+                    },
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+                on_completion=on_completion,
+            )
+        )
+
+    assert env.dispatched == [[0, 1]]
+    assert landed == [0]
+    assert impl._stats.gym_row_redispatches == 0
+    assert len(env.scripts) == 1
+
+
 def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
     """When the budget is one attempt, nothing would dispatch a marked row
     again, so the marker ends the attempt at once with its own detail and the
@@ -1537,8 +1633,8 @@ def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
 
 def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
     """The actor attaches its timing to the last tuple of each attempt's stream.
-    A one-row re-dispatch reports under its own ``retry<n>`` label, so the
-    first attempt's timing, the group's, is what the instance label reports."""
+    A one-row re-dispatch reports under the ``retry`` label, so the first
+    attempt's timing, the group's, is what the instance label reports."""
     from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
     from nemo_rl.experience.rollouts import Timer
 
@@ -1572,7 +1668,7 @@ def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
 
     assert env.dispatched == [[0, 1], [1]]
     assert metrics[key] == 100.0
-    assert metrics["timing/test/shard/nemo_gym/retry1/await_results"] == 1.0
+    assert metrics["timing/test/shard/nemo_gym/retry/await_results"] == 1.0
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

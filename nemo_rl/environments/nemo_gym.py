@@ -26,7 +26,17 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from time import monotonic, sleep
-from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, TypedDict
+from typing import (
+    Any,
+    Dict,
+    List,
+    NotRequired,
+    Optional,
+    Protocol,
+    Self,
+    TypedDict,
+    cast,
+)
 
 import ray
 import torch
@@ -315,7 +325,6 @@ def _has_nan_generation_logprobs(result: dict) -> bool:
 # when a ``/run`` call fails and ``route_failures_to_sidecar`` is on
 # (``nemo_gym/rollout_collection.py``, ``_agent_request_failure_row``). Spelled here
 # rather than imported so ``run_rollouts`` can be exercised without the Gym package.
-GYM_FAILURE_CLASS_KEY = "_ng_failure_class"
 GYM_FAILURE_STATUS_KEY = "_ng_failure_http_status"
 GYM_FAILURE_TYPE_KEY = "_ng_failure_type"
 GYM_FAILURE_MESSAGE_KEY = "_ng_failure_message"
@@ -1209,11 +1218,13 @@ Depending on your data shape, you may want to change these values."""
                 timing_metrics = timer.get_timing_metrics("sum")
                 total_time = timing_metrics.pop("_run_rollouts_total")
                 # Absent when every row of the batch failed before postprocessing.
-                postprocess_time = timing_metrics.get(
-                    f"{timer_prefix}/postprocess_results", 0.0
+                # The "sum" reduction yields one float per label.
+                postprocess_time = cast(
+                    float,
+                    timing_metrics.get(f"{timer_prefix}/postprocess_results", 0.0),
                 )
                 timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100 * postprocess_time / total_time
+                    100 * postprocess_time / cast(float, total_time)
                 )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
