@@ -127,6 +127,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -225,7 +226,6 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
 )
-from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.logger import (
     Logger,
     should_log_nemo_gym_full_result_tables,

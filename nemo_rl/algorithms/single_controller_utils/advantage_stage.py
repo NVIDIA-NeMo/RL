@@ -49,6 +49,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -62,7 +63,6 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.debug_writer import JsonDebugWriter
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle

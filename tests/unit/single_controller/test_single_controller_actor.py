@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
@@ -85,7 +86,6 @@ from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
-from nemo_rl.utils.debug_writer import JsonDebugWriter
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (

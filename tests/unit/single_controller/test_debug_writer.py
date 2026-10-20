@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 
 
 def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
