@@ -25,7 +25,14 @@ from nemo_rl.utils.json_utils import json_safe_nonfinite
 
 
 class DebugWriter:
+    """Base class for writers that store a step's training rows chunk by chunk.
+
+    Each shard calls add_chunk on its own instance, and the controller calls
+    finish_step on another once the step completes.
+    """
+
     def __init__(self) -> None:
+        """Initialize the current step and the number of rows written for it."""
         self.step: int | None = None
         self.rows: int = 0
 
@@ -39,6 +46,21 @@ class DebugWriter:
         sequences: dict[str, torch.Tensor],
         scalars: dict[str, torch.Tensor],
     ) -> None:
+        """Validate one chunk of per-sample rows and write it to storage.
+
+        The first chunk of a step replaces any rows already stored for it; later
+        chunks append to them.
+
+        Args:
+            step: Optimizer step the rows belong to.
+            sample_ids: One id per sample in the chunk.
+            tags: Per-sample metadata dicts, or None for empty metadata.
+            input_lengths: Valid token count per sample, used to trim sequence columns.
+            sequences: Per-sample columns trimmed to input_lengths, such as token ids
+                and advantages.
+            scalars: Per-sample columns written as given; variable-length values must
+                be jagged tensors rather than padded.
+        """
         # unbind() splits dense and jagged columns alike into per-row tensors.
         columns = {
             k: list(v.detach().cpu().unbind())
@@ -88,6 +110,7 @@ class DebugWriter:
     def _write_rows(
         self, step: int, rows: Iterable[dict[str, Any]], replace: bool
     ) -> int:
+        """Write one chunk's rows to storage and return how many were written."""
         raise NotImplementedError
 
     def finish_step(self, step: int, expected_rows: int | None = None) -> None:
@@ -103,32 +126,20 @@ class DebugWriter:
         self.rows = 0
 
     def _publish_step(self, step: int, expected_rows: int | None) -> None:
+        """Publish a completed step's rows, raising on a row-count mismatch."""
         raise NotImplementedError
 
 
 class JsonDebugWriter(DebugWriter):
-    """Write chunks to a partial file, publishing only a completed optimizer step.
+    """Write each shard's rows to JSONL part files, merged into one file per step.
 
-    Sequence columns are trimmed to input_lengths (padding only). Scalar
-    columns are written per row as given, so variable-length values such as
-    prompt_ids must be passed as jagged tensors rather than padded. Masked rows
-    are retained. Values use the legacy train_data JSONL singleton-batch shape.
-    A failed step leaves part files, never a completed-looking JSONL file.
-
-    The advantage stage that produces these rows runs either in the controller
-    or across a pool of Ray actors, so a step's rows are written by one writer
-    per shard and merged on publish. Each writer owns
-    ``train_data_step<N>.jsonl.part-<shard_id>`` and never touches another's,
-    which is what makes concurrent shards safe; ``finish_step`` concatenates
-    them in shard order and assigns ``idx`` across the merged file. Writers
-    therefore omit ``idx`` -- only the merge sees every row, so only the merge
-    can number them.
-
-    Sharded writes assume the pool shares a filesystem with the controller,
-    which is already true of the log dir the trainer checkpoints into.
+    Rows use the legacy train_data singleton-batch shape, and publishing numbers
+    them with idx across the merged file. A failed step leaves part files, never a
+    completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
 
     def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
+        """Set the directory to write under and the shard whose part files this owns."""
         super().__init__()
         self.log_dir = Path(log_dir)
         self.shard_id = shard_id
@@ -136,6 +147,7 @@ class JsonDebugWriter(DebugWriter):
     def _write_rows(
         self, step: int, rows: Iterable[dict[str, Any]], replace: bool
     ) -> int:
+        """Write the rows to this shard's part file, starting it over if replace is set."""
         self.log_dir.mkdir(parents=True, exist_ok=True)
         part = self.log_dir / f"train_data_step{step + 1}.jsonl.part-{self.shard_id}"
         mode = "w" if replace else "a"
@@ -150,18 +162,7 @@ class JsonDebugWriter(DebugWriter):
         return num_rows
 
     def _publish_step(self, step: int, expected_rows: int | None) -> None:
-        """Merge every shard's part file and publish the step atomically.
-
-        Called on the controller, which may not itself have written anything:
-        with a pool the rows come from the actors, so the parts on disk are the
-        only record of what the step produced.
-
-        ``expected_rows`` is what the shards reported writing. A pool that does
-        not share this filesystem with the controller still runs and still
-        reports, and its parts are simply not here -- which would publish a
-        short dump that looks complete. Checking the count is what turns that
-        into a failure.
-        """
+        """Merge the shards' part files into one JSONL file and publish it atomically."""
         parts = sorted(self.log_dir.glob(f"train_data_step{step + 1}.jsonl.part-*"))
         if not parts:
             raise RuntimeError("Completed optimizer step has no training dump")
