@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SSD tier on a storage unit (design PR 2, minimal): a full slab answers
-Busy while committed blobs are demoted to files; reads of a demoted blob are
-pending until it is staged back, then pinned. CPU-only, no Ray actor.
+"""SSD tier on a storage unit: a put the put area cannot take is spilled to a
+file from birth (its commit is pending until the file is written); data already
+in the put area never moves; reads of a spilled blob are pending until it is
+staged back, then pinned. CPU-only, no Ray actor.
 """
 
-import contextlib
 import os
 import threading
 import time
@@ -39,32 +39,15 @@ KB = 1 << 10
 BLOB = 128 * KB
 
 
-def _unit(
-    tmp_path,
-    *,
-    slab=1 << 20,
-    staging=256 * KB,
-    pickup_s=10.0,
-    read_pin_s=60.0,
-    watermarks=None,
-):
-    """1 MiB slab: 768 KiB for puts (six 128 KiB blobs), 256 KiB staging (two)."""
+def _unit(tmp_path, *, slab=1 << 20, staging=256 * KB, pickup_s=10.0, read_pin_s=60.0):
+    """1 MiB slab: 768 KiB put area (six 128 KiB blobs), 256 KiB IO area (two)."""
     return bare_unit(
         slab,
         read_pin_s=read_pin_s,
         ssd_dir=str(tmp_path),
         staging_bytes=staging,
         pickup_s=pickup_s,
-        watermarks=watermarks,
     )
-
-
-def _put(u, b, fill, n=BLOB, commit=True):
-    off = u.alloc(b, n, 1)
-    u.slab[off : off + n] = fill
-    if commit:
-        assert u.commit(b)
-    return off
 
 
 def _wait(pred, timeout=5.0):
@@ -74,20 +57,25 @@ def _wait(pred, timeout=5.0):
         time.sleep(0.005)
 
 
+def _commit(u, b):
+    """What the client does: ask again while the unit says pending."""
+    end = time.monotonic() + 5
+    while (status := u.commit(b)) == "pending":
+        assert time.monotonic() < end, "commit still pending"
+        time.sleep(0.005)
+    return status
+
+
+def _put(u, b, fill, n=BLOB):
+    off = u.alloc(b, n, 1)
+    u.slab[off : off + n] = fill
+    assert _commit(u, b) == "done"
+    return off
+
+
 def _fill(u, n=6):
     for i in range(n):
         _put(u, f"b{i}", i + 1)
-
-
-def _alloc_eventually(u, b, n=BLOB):
-    """What the client does: retry Busy until the unit admits the put."""
-    end = time.monotonic() + 5
-    while True:
-        try:
-            return u.alloc(b, n, 1)
-        except DataPlaneBusy:
-            assert time.monotonic() < end
-            time.sleep(0.005)
 
 
 def _read(u, b):
@@ -103,169 +91,249 @@ def _read(u, b):
         time.sleep(0.005)
 
 
-def test_full_slab_is_busy_while_demoting_then_admits(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u)
-    with pytest.raises(DataPlaneBusy):
-        u.alloc("new", BLOB, 1)
-    _alloc_eventually(u, "new")
-    st = u.stats()
-    assert st["demotions"] >= 1 and st["busy_replies"] >= 1
-    rec = u.blobs["b0"]  # oldest first
-    assert not rec.in_slab and rec.disk is not None
-    assert set(os.pread(rec.disk, BLOB, 0)) == {1}
-    assert not os.listdir(u.ssd_dir)  # unlinked at once: nothing left on disk
-
-
-def test_demoted_blob_reads_back_through_staging(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u)
-    _alloc_eventually(u, "new")
-    r = u.resolve(["b0"])
-    assert r["pending"] == ["b0"] and not r["offsets"]
-    data, pin = _read(u, "b0")
-    assert set(data) == {1}
-    assert u.resolve(["b0"])["offsets"]["b0"] >= u.staging_base
-    u.unpin(pin)
-    assert u.stats()["stages"] == 1
-
-
-def test_victim_keeps_its_slab_copy_until_its_pins_end(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u)
-    pin = u.resolve(["b0"])["pin_id"]  # a reader holds b0's slab copy
-    with pytest.raises(DataPlaneBusy):
-        u.alloc("new", BLOB, 1)
-    _wait(lambda: u.blobs["b0"].disk is not None)
-    rec = u.blobs["b0"]
-    assert rec.in_slab  # still pinned: not dropped
-    assert u.resolve(["b0"])["pending"] == ["b0"]  # no new slab pins (§5.1)
-    u.unpin(pin)
-    assert not rec.in_slab
-
-
-def test_uncommitted_blobs_are_never_demoted(tmp_path):
-    u = _unit(tmp_path)
-    for i in range(6):
-        _put(u, f"w{i}", 1, commit=False)  # WRITEs not yet DONE
-    with pytest.raises(UnitFull):
-        u.alloc("new", BLOB, 1)
-    assert u.stats()["demotions"] == 0
-
-
-def test_release_during_demotion_frees_slab_and_file(tmp_path, monkeypatch):
-    u = _unit(tmp_path)
-    _fill(u)
-    free0 = u.alloc_.free_bytes
+def _gate_pwrite(monkeypatch):
+    """Make the first disk write block until ``go`` is set."""
     go, entered = threading.Event(), threading.Event()
     real = os.pwrite
 
-    def slow_pwrite(fd, data, off):
+    def gated(fd, data, off):
         entered.set()
         go.wait(5)
         return real(fd, data, off)
 
-    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", slow_pwrite)
-    with pytest.raises(DataPlaneBusy):
-        u.alloc("new", BLOB, 1)
-    assert entered.wait(5)
-    u.release_many([("b0", 1)])  # cleared mid-copy: the demotion owns the free
-    assert u.alloc_.free_bytes == free0
-    go.set()
-    _wait(lambda: not u._victims)
-    _wait(lambda: not os.listdir(u.ssd_dir))
-    assert "b0" not in u.blobs and not u._released_held
-    assert u.alloc_.free_bytes == free0 + BLOB
+    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", gated)
+    return go, entered
 
 
-def test_staging_evicts_only_copies_already_picked_up(tmp_path):
+def _open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+# ------------------------------------------------------------------ spill
+def test_a_put_the_put_area_cannot_take_spills_and_reads_back(tmp_path):
     u = _unit(tmp_path)
-    _fill(u)
-    for b in ("x", "y", "z"):  # demote b0, b1, b2 (one per Busy round)
-        _alloc_eventually(u, b)
-    assert all(not u.blobs[f"b{i}"].in_slab for i in range(3))
-    _, p0 = _read(u, "b0")
-    _read(u, "b1")  # staging (two blobs) now full; b1 stays pinned
-    r = u.resolve(["b2"])
-    assert r["pending"] == ["b2"]
-    u.unpin(r["pin_id"])
-    assert u.blobs["b2"].staged_off is None  # nothing evictable yet
-    u.unpin(p0)  # b0 was picked up and is unpinned: evictable
-    data, _ = _read(u, "b2")
-    assert set(data) == {3}
-    assert u.blobs["b0"].staged_off is None and u.blobs["b1"].staged_off is not None
+    _fill(u)  # six blobs fill the put area
+    off = _put(u, "s", 7)
+    assert off >= u.staging_base  # the client wrote into the IO area
+    rec = u.blobs["s"]
+    assert not rec.in_slab and rec.disk is not None
+    assert set(os.pread(rec.disk, BLOB, 0)) == {7}
+    assert not os.listdir(u.ssd_dir)  # unlinked at once: nothing left on disk
+    assert u.staging_.used_bytes == 0  # the IO region went back at once
+    assert u.stats()["spills"] == 1
 
-
-def test_unreadable_file_is_reported_missing(tmp_path, monkeypatch):
-    u = _unit(tmp_path)
-    _fill(u)
-    _alloc_eventually(u, "new")
-
-    def eio(*a):
-        raise OSError(5, "Input/output error")
-
-    monkeypatch.setattr(nixl_storage_unit.os, "preadv", eio)
-    assert u.resolve(["b0"])["pending"] == ["b0"]
-    _wait(lambda: u.resolve(["b0"])["missing"] == ["b0"])
-
-
-def test_released_disk_only_blob_closes_its_file(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u)
-    _alloc_eventually(u, "new")
-    rec = u.blobs["b0"]
-    u.release_many([("b0", 1)])
-    assert rec.disk is None and "b0" not in u.blobs
-
-
-def test_demote_after_s_demotes_old_blobs_without_pressure(tmp_path):
-    u = _unit(tmp_path)
-    u.demote_after_s = 0.0
-    _put(u, "b0", 7)
-    _wait(lambda: not u.blobs["b0"].in_slab, timeout=5)  # the ticker demoted it
-    data, _ = _read(u, "b0")
+    r = u.resolve(["s"])
+    assert r["pending"] == ["s"] and not r["offsets"]
+    data, pin = _read(u, "s")
     assert set(data) == {7}
+    assert u.resolve(["s"])["offsets"]["s"] >= u.staging_base
+    u.unpin(pin)
+    assert u.stats()["stages"] == 1
+
+
+def test_data_in_the_put_area_never_moves_so_the_newest_goes_to_disk(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    for i in range(4):  # the IO area is free again after each write
+        _put(u, f"s{i}", 10 + i)
+    assert all(u.blobs[f"b{i}"].in_slab for i in range(6))  # FIFO: oldest stay in RAM
+    assert all(u.blobs[f"s{i}"].disk is not None for i in range(4))
+    assert u.stats()["spills"] == 4
+    assert set(_read(u, "b0")[0]) == {1}
+
+
+def test_commit_is_pending_until_the_file_is_written_and_enqueues_once(
+    tmp_path, monkeypatch
+):
+    u = _unit(tmp_path)
+    _fill(u)
+    go, entered = _gate_pwrite(monkeypatch)
+    off = u.alloc("s", BLOB, 1)
+    u.slab[off : off + BLOB] = 5
+    assert u.commit("s") == "pending"
+    assert entered.wait(5)
+    assert u.commit("s") == "pending" and u._io_jobs == 1  # asked again: no 2nd job
+    assert u.resolve(["s"])["missing"] == ["s"]  # not acknowledged yet: invisible
+    go.set()
+    assert _commit(u, "s") == "done"
+    assert u.stats()["spills"] == 1
+
+
+@pytest.mark.parametrize(
+    "fail",
+    [
+        pytest.param(
+            lambda *a: (_ for _ in ()).throw(OSError(28, "ENOSPC")), id="enospc"
+        ),
+        pytest.param(lambda *a: (_ for _ in ()).throw(ValueError("bug")), id="bug"),
+        pytest.param(lambda *a: 0, id="zero-progress"),
+    ],
+)
+def test_a_failed_write_fails_the_put_and_frees_the_io_area(
+    tmp_path, monkeypatch, fail
+):
+    u = _unit(tmp_path)
+    _fill(u)
+    fds = _open_fds()
+    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", fail)
+    u.alloc("s", BLOB, 1)
+    assert _commit(u, "s") == "lost"  # never acknowledged, so nothing is lost
+    assert "s" not in u.blobs and u._io_jobs == 0
+    assert u.staging_.used_bytes == 0 and u.stats()["spill_failures"] == 1
+    assert _open_fds() == fds  # the partial file's fd is closed
+
+
+def test_a_put_that_fits_nowhere_is_unitfull_and_a_full_io_area_is_busy(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    with pytest.raises(UnitFull):  # bigger than the IO area, put area full
+        u.alloc("big", u.staging_.capacity + BLOB, 1)
+    u.alloc("s", u.staging_.capacity, 1)  # a put in progress holds the IO area
+    with pytest.raises(DataPlaneBusy):
+        u.alloc("t", BLOB, 1)
+    assert u.stats()["busy_replies"] == 1
+
+
+def test_commit_waits_when_too_many_io_jobs_are_running(tmp_path, monkeypatch):
+    u = _unit(tmp_path)
+    u._max_io_jobs = 1
+    _fill(u)
+    go, entered = _gate_pwrite(monkeypatch)
+    for b in ("s0", "s1"):
+        u.alloc(b, 64 * KB, 1)
+    assert u.commit("s0") == "pending" and entered.wait(5)
+    assert u.commit("s1") == "pending" and not u.blobs["s1"].staging  # not queued yet
+    go.set()
+    assert _commit(u, "s0") == "done" and _commit(u, "s1") == "done"
+
+
+# ------------------------------------------------------------------ abort / release
+def test_abort_before_commit_restores_the_io_area(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    cap = u.staging_.capacity
+    u.alloc("s", cap, 1)
+    u.abort("s", in_flight=False)  # no WRITE was posted
+    u.alloc("t", cap, 1)  # the whole area is back
+
+
+def test_abort_with_a_write_in_flight_retires_the_io_region(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    cap = u.staging_.capacity
+    u.alloc("s", cap, 1)
+    u.abort("s", in_flight=True)  # a late WRITE may still land: never reused
+    assert u.retired_bytes == cap and u.staging_.used_bytes == cap
+
+
+@pytest.mark.parametrize("how", ["abort", "release"])
+def test_abort_or_release_during_the_write_leaves_the_cleanup_to_the_job(
+    tmp_path, monkeypatch, how
+):
+    u = _unit(tmp_path)
+    _fill(u)
+    fds = _open_fds()
+    go, entered = _gate_pwrite(monkeypatch)
+    u.alloc("s", BLOB, 1)
+    u.commit("s")
+    assert entered.wait(5)
+    used = u.staging_.used_bytes
+    if how == "abort":
+        u.abort("s", in_flight=False)  # the client gave up on a slow commit
+    else:
+        u.release("s", 1)
+    assert u.staging_.used_bytes == used  # the job still reads the region
+    go.set()
+    _wait(lambda: u._io_jobs == 0)
+    assert u.staging_.used_bytes == 0 and "s" not in u.blobs
+    assert u.stats()["spills"] == 0 and _open_fds() == fds
+
+
+def test_released_disk_blob_closes_its_file(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    _put(u, "s", 7)
+    rec = u.blobs["s"]
+    u.release_many([("s", 1)])
+    assert rec.disk is None and "s" not in u.blobs
 
 
 def test_abort_after_a_lost_commit_reply_frees_each_copy_once(tmp_path):
     u = _unit(tmp_path)
     _fill(u)
-    _alloc_eventually(u, "new")  # b0 committed, then demoted: slab copy freed
-    rec = u.blobs["b0"]
-    u.abort("b0", in_flight=False)  # the client never saw the commit reply
-    assert rec.disk is None
-    ranges = [(r.off, r.off + r.size) for r in u.alloc_._free]
-    assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))  # no overlap
-    assert u.alloc_.used_bytes == 6 * BLOB  # b1..b5 + "new"
+    _put(u, "s", 7)  # committed and on disk, but the client never saw "done"
+    rec = u.blobs["s"]
+    u.abort("s", in_flight=False)
+    assert rec.disk is None and "s" not in u.blobs
+    assert u.staging_.used_bytes == 0 and u.alloc_.used_bytes == 6 * BLOB
 
 
-def test_failed_demotion_is_not_retried_so_a_full_disk_ends_in_unitfull(
+# ------------------------------------------------------------------ submit failure
+def test_a_failed_commit_submit_leaves_the_blob_reserved(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    u.alloc("s", BLOB, 1)
+    u._worker.shutdown(wait=True)
+    with pytest.raises(RuntimeError):
+        u.commit("s")
+    assert not u.blobs["s"].staging and u._io_jobs == 0  # nothing to undo
+    u.abort("s", in_flight=False)
+    assert u.staging_.used_bytes == 0
+
+
+def test_a_failed_stage_submit_rolls_the_staging_back(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    _put(u, "s", 7)
+    u._worker.shutdown(wait=True)
+    with pytest.raises(RuntimeError):
+        u.resolve(["s"])
+    rec = u.blobs["s"]
+    assert u.staging_.used_bytes == 0 and rec.staged_off is None
+    assert not rec.staging and "s" not in u._staged and u._io_jobs == 0
+
+
+# ------------------------------------------------------------------ reads
+def test_staged_copies_are_evicted_only_after_pickup(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    for i in range(3):
+        _put(u, f"s{i}", 10 + i)
+    _, p0 = _read(u, "s0")
+    _read(u, "s1")  # the IO area (two blobs) is now full; s1 stays pinned
+    r = u.resolve(["s2"])
+    assert r["pending"] == ["s2"]
+    u.unpin(r["pin_id"])
+    assert u.blobs["s2"].staged_off is None  # nothing evictable yet
+    u.unpin(p0)  # s0 was picked up and is unpinned: evictable
+    data, _ = _read(u, "s2")
+    assert set(data) == {12}
+    assert u.blobs["s0"].staged_off is None and u.blobs["s1"].staged_off is not None
+
+
+def test_a_failed_stage_read_keeps_the_file_and_the_retry_succeeds(
     tmp_path, monkeypatch
 ):
     u = _unit(tmp_path)
     _fill(u)
+    _put(u, "s", 7)
+    real, calls = os.preadv, []
 
-    def enospc(*a):
-        raise OSError(28, "No space left on device")
+    def flaky(fd, bufs, off):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(5, "Input/output error")
+        return real(fd, bufs, off)
 
-    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", enospc)
-    with pytest.raises(UnitFull):
-        _alloc_eventually(u, "new")
-    assert u.stats()["demote_failures"] == 6
-
-
-def test_unexpected_demotion_error_fails_like_a_disk_error(tmp_path, monkeypatch):
-    u = _unit(tmp_path)
-    _fill(u)
-
-    def bug(*a):
-        raise ValueError("not an OSError")
-
-    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", bug)
-    with pytest.raises(UnitFull):  # not Busy forever on a stuck victim
-        _alloc_eventually(u, "new")
-    assert u.stats()["demote_failures"] == 6
-    assert all(r.holds == 0 and not r.victim for r in u.blobs.values())
+    monkeypatch.setattr(nixl_storage_unit.os, "preadv", flaky)
+    assert u.resolve(["s"])["pending"] == ["s"]
+    _wait(lambda: u.blobs["s"].stage_failed)
+    r = u.resolve(["s"])
+    assert r["failed"] == ["s"] and not r["pending"] and not r["offsets"]
+    assert u.blobs["s"].disk is not None  # the only copy is kept
+    data, _ = _read(u, "s")  # reported once; the next resolve retries
+    assert set(data) == {7}
+    assert u.stats()["stage_failures"] == 1
 
 
 def test_freed_region_loses_its_footer():
@@ -287,7 +355,7 @@ def test_checkpoint_is_refused_with_ssd_on(tmp_path):
 
 # ------------------------------------------------------------------ client
 def test_put_commits_only_with_ssd_on():
-    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: True})
+    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "done"})
     _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
     assert ctl.calls == ["alloc", "commit"]
     ctl = _Ctl({"alloc": lambda a: 64})
@@ -295,8 +363,16 @@ def test_put_commits_only_with_ssd_on():
     assert ctl.calls == ["alloc"]
 
 
+def test_commit_is_asked_again_while_the_unit_writes_the_file():
+    replies = iter(["pending", "pending", "done"])
+    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: next(replies)})
+    _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert ctl.calls == ["alloc", "commit", "commit", "commit"]
+    assert not [n for n in ctl.notified if n[0] == "abort"]
+
+
 def test_failed_commit_fails_the_put_and_frees_the_region():
-    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: False})
+    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "lost"})
     with pytest.raises(blobstore.TransferFailed):
         _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
     assert ("abort", {"blob_id": "b", "in_flight": False}) in ctl.notified
@@ -327,6 +403,20 @@ def test_pending_blobs_are_asked_again_until_ready():
         "p2",
         "p3",
     ]
+
+
+def test_a_failed_disk_read_is_retryable_and_releases_the_pin():
+    reply = {
+        "pin_id": "p",
+        "offsets": {},
+        "missing": [],
+        "pending": [],
+        "failed": ["b"],
+    }
+    ctl = _Ctl({"resolve": lambda a: reply})
+    with pytest.raises(blobstore.TransferFailed):
+        _store(ctl)._read_pinned({"b": [(0, 8, 1000)]}, deadline=time.monotonic() + 5)
+    assert [a["pin_id"] for op, a in ctl.notified if op == "unpin"] == ["p"]
 
 
 def test_pending_reads_reask_at_once_after_progress_and_reset_the_backoff(monkeypatch):
@@ -377,171 +467,10 @@ def test_ssd_config_validation():
         "ssd_dir": "/x",
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,
-        "demote_after_s": None,
-        "watermarks": None,
     }
-    wm = {**on, "ssd": {"enabled": True, "high_watermark": 0.8, "low_watermark": 0.5}}
-    assert tq_nixl.ssd_config(wm)["watermarks"] == (0.8, 0.5)
-    for bad in (
-        {"high_watermark": 1.0, "low_watermark": 0.5},  # high=1 can never trigger
-        {"high_watermark": 0.5, "low_watermark": 0.5},
-        {"high_watermark": 0.5},  # needs both
-        {"high_watermark": 0.8, "low_watermark": 0.5, "demote_after_s": 1.0},
-    ):
-        with pytest.raises(ValueError, match="watermark|demote_after_s"):
-            tq_nixl.ssd_config({**on, "ssd": {"enabled": True, **bad}})
     with pytest.raises(ValueError, match="pickup_s"):
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "pickup_s": 1.0}})
     with pytest.raises(ValueError, match="staging_bytes"):
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "staging_bytes": 1 << 30}})
     with pytest.raises(ValueError, match="store.kind"):
         tq_nixl.ssd_config({**on, "store": {"kind": "file"}})
-
-
-# ------------------------------------------------------------------ watermark demotion
-def _wm(u, high, low):
-    """Arm the watermarks after filling: ``alloc`` starts a batch as soon as they are set."""
-    u.watermarks = (high, low)
-
-
-def _victim_count(u):
-    return sum(r.victim or not r.in_slab for r in u.blobs.values())
-
-
-def _disk_only(u):
-    return sum(not r.in_slab for r in u.blobs.values())
-
-
-def _put_until_refused(u, n=6):
-    for i in range(n):
-        with contextlib.suppress(DataPlaneBusy, UnitFull):
-            _put(u, f"c{i}", 9)
-            continue
-        return
-
-
-def test_watermark_demotes_down_to_low_without_any_put(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u, 5)  # 640 KiB of a 768 KiB put area: above the high mark
-    _wm(u, 0.6, 0.3)
-    u._tick_once()
-    _wait(lambda: _disk_only(u) == 4)  # oldest first
-    assert [b for b, r in u.blobs.items() if r.in_slab] == ["b4"]
-    assert u.stats()["watermark_batches"] == 1
-    _put(u, "new", 9)  # room without a Busy
-    assert u.stats()["busy_replies"] == 0
-    assert set(_read(u, "b0")[0]) == {1}
-
-
-def test_watermarks_are_off_by_default_and_below_high_does_nothing(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u, 5)
-    u._tick_once()
-    assert _victim_count(u) == 0
-    w = _unit(tmp_path)
-    _fill(w, 5)  # 0.83 < 0.9
-    _wm(w, 0.9, 0.5)
-    w._tick_once()
-    assert _victim_count(w) == 0
-
-
-def test_watermark_counts_aligned_bytes(tmp_path):
-    # 1000-byte blobs occupy 1024: raw sizes would pick one blob too many.
-    u = _unit(tmp_path, slab=24576, staging=16384)
-    for i in range(6):
-        _put(u, f"b{i}", i + 1, n=1000)
-    _wm(u, 0.5, 0.38)
-    assert u.alloc_.used_bytes == 6 * 1024 and u.alloc_.capacity == 8192
-    u._tick_once()
-    assert _victim_count(u) == 3
-
-
-def test_watermark_ignores_quarantined_bytes(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u, 5)
-    _wm(u, 0.6, 0.3)
-    a = u.alloc_
-    for b in (
-        "b0",
-        "b1",
-        "b2",
-    ):  # as a hinted release would: kept in used_bytes until reclaimed
-        rec = u.blobs.pop(b)
-        a.quarantine(rec.off, rec.nbytes, time.monotonic() + 60)
-    assert a.used_bytes > 0.6 * a.capacity > a.used_bytes - a.quarantined_bytes
-    u._tick_once()
-    assert _victim_count(u) == 0
-
-
-def test_watermark_starts_one_batch_while_pinned_victims_hold_slab(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u, 5)
-    r = u.resolve(["b0"])  # a live pin keeps b0's slab copy after its write
-    _wm(u, 0.6, 0.3)
-    u._tick_once()
-    _wait(lambda: u._demote_jobs == 0 and u.blobs["b0"].disk is not None)
-    assert u.blobs["b0"].in_slab and "b0" in u._victims  # pinned: slab copy held
-    u._tick_once()
-    u._tick_once()
-    assert u.stats()["watermark_batches"] == 1  # no second batch without new puts
-    u.unpin(r["pin_id"])
-
-
-def test_released_victims_do_not_let_queued_batches_pile_up(tmp_path):
-    u = _unit(tmp_path)
-    gate = threading.Event()
-    u._demote = lambda b, rec: gate.wait(10)  # a stalled disk write
-    _fill(u, 5)
-    _wm(u, 0.6, 0.3)
-    u._tick_once()
-    queued = u._demote_jobs
-    assert queued == 4
-    u.release_many([(f"b{i}", 1) for i in range(4)])  # victims leave _victims
-    _put_until_refused(u)  # refill; Busy or UnitFull ends it
-    u._tick_once()  # watermark path
-    with contextlib.suppress(DataPlaneBusy, UnitFull):
-        u.alloc("x", BLOB, 1)  # reactive path
-    assert u._demote_jobs == queued and not u._victims - set(u.blobs)
-    gate.set()
-    _wait(lambda: u._demote_jobs == 0)
-
-
-def test_read_of_a_victim_is_pending_until_its_demotion_ends(tmp_path):
-    u = _unit(tmp_path)
-    gate = threading.Event()
-    real = u._demote
-    u._demote = lambda b, rec: (gate.wait(10), real(b, rec))[1]
-    _fill(u, 5)
-    _wm(u, 0.6, 0.3)
-    u._tick_once()
-    r = u.resolve(["b0"])
-    assert "b0" in r["pending"] and "b0" not in r["offsets"]
-    u.unpin(r["pin_id"])
-    gate.set()
-    assert set(_read(u, "b0")[0]) == {1}
-
-
-def test_alloc_starts_the_batch_without_waiting_for_a_tick(tmp_path):
-    u = _unit(tmp_path, watermarks=(0.6, 0.3))
-    u._tick_once = lambda: None  # the ticker must not be what demotes
-    for i in range(5):
-        _put(u, f"b{i}", i + 1)  # the 4th alloc crosses the high mark
-    assert u.stats()["watermark_batches"] >= 1
-    _wait(lambda: _disk_only(u) >= 3)
-    assert set(_read(u, "b0")[0]) == {1}
-
-
-def test_unit_rejects_bad_watermarks(tmp_path):
-    for bad in ((0.3, 0.6), (1.0, 0.5), (0.5, 0.0)):
-        with pytest.raises(ValueError, match="watermarks"):
-            _unit(tmp_path, watermarks=bad)
-
-
-def test_a_failed_submit_marks_nothing(tmp_path):
-    u = _unit(tmp_path)
-    _fill(u, 5)
-    _wm(u, 0.6, 0.3)  # armed after the fill, or alloc would already have marked victims
-    u._demoter.shutdown(wait=True)  # what interpreter exit does before the ticker stops
-    with pytest.raises(RuntimeError):
-        u._tick_once()
-    assert not u._victims and not u._demote_jobs and not _victim_count(u)

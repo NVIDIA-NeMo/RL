@@ -54,25 +54,25 @@ def _stats(conf):
     return ray.get(ray.get_actor("NixlStorageUnit#0", namespace=ns).stats.remote())
 
 
-def test_puts_beyond_the_slab_demote_and_read_back_exact(ssd_sys):
+def test_puts_beyond_the_slab_spill_and_read_back_exact(ssd_sys):
     tq, conf, root = ssd_sys
     keys = [f"d{i}" for i in range(12)]  # 12 MiB through a 4 MiB put area
     vals = [torch.randn(1, MiB // 4) for _ in keys]
     for k, v in zip(keys, vals):
         tq.kv_batch_put([k], "train", fields=TensorDict({"x": v}, batch_size=[1]))
     st = _stats(conf)
-    assert st["demotions"] >= 8 and st["busy_replies"] >= 1, st
-    for k, v in zip(keys, vals):  # one get per key, oldest (demoted) first
+    assert st["spills"] >= 8, st  # the oldest stay in the put area, the rest go to disk
+    for k, v in zip(keys, vals):  # one get per key, oldest (in RAM) first
         got = tq.kv_batch_get([k], "train", select_fields=["x"])
         assert torch.equal(dense(got["x"]), v), k
-    got = tq.kv_batch_get(keys[:3], "train", select_fields=["x"])  # one get, 3 staged
-    assert torch.equal(dense(got["x"]), torch.cat(vals[:3]))
+    got = tq.kv_batch_get(keys[-3:], "train", select_fields=["x"])  # 3 staged at once
+    assert torch.equal(dense(got["x"]), torch.cat(vals[-3:]))
     st = _stats(conf)
     assert st["stages"] >= 3 and st["disk_only_blobs"] >= 1, st
 
     tq.kv_clear(keys, "train")
     end = time.monotonic() + 10
     while any(os.listdir(os.path.join(root, d)) for d in os.listdir(root)):
-        assert time.monotonic() < end, "demoted files left after clear"
+        assert time.monotonic() < end, "spilled files left after clear"
         time.sleep(0.05)
     assert _stats(conf)["blobs"] == 0

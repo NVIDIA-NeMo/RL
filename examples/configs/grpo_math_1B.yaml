@@ -687,7 +687,7 @@ data_plane:
     graveyard_max_bytes: 4294967296  # memory unfinished transfers may retain before fatal
     placement: {policy: local_first} # local_first | spread
     store: {kind: unit}              # unit | file (file: add root: <shared dir>)
-    ssd: {enabled: false}            # SSD tier: {enabled, dir, staging_bytes, pickup_s, high_watermark, low_watermark}
+    ssd: {enabled: false}            # SSD tier: {enabled, dir, staging_bytes, pickup_s}
     nixl: {backend_name: UCX, backend_init_params: {}}
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
