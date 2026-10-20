@@ -1633,8 +1633,8 @@ def test_nemo_gym_run_rollouts_names_marked_and_unmarked_missing_rows():
 
 def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
     """The actor attaches its timing to the last tuple of each attempt's stream.
-    A one-row re-dispatch reports under its own ``retry<n>`` label, so the
-    first attempt's timing, the group's, is what the instance label reports."""
+    A one-row re-dispatch reports under the ``retry`` label, so the first
+    attempt's timing, the group's, is what the instance label reports."""
     from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY
     from nemo_rl.experience.rollouts import Timer
 
@@ -1668,7 +1668,7 @@ def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
 
     assert env.dispatched == [[0, 1], [1]]
     assert metrics[key] == 100.0
-    assert metrics["timing/test/shard/nemo_gym/retry1/await_results"] == 1.0
+    assert metrics["timing/test/shard/nemo_gym/retry/await_results"] == 1.0
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

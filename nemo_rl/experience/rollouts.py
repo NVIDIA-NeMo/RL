@@ -137,6 +137,11 @@ _SHARED_GENRM_METRICS = (
     "genrm_max_output_tokens_hit_rate_per_group",
 )
 
+# The metric key both NeMo-Gym rollout paths report (``run_async_nemo_gym_rollout``
+# here and ``AsyncNemoGymRolloutImpl._run_rollouts`` in rollout_manager.py): the
+# number of rows a failure marker named that were dispatched again.
+NEMO_GYM_INFRA_REDISPATCHES_METRIC = "nemo_gym_infra_redispatches"
+
 
 def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
@@ -2687,7 +2692,8 @@ async def _merge_nemo_gym_instance_streams(
                         retry_timing.get(instance_label, {}), timing_metrics
                     )
                     record_timing(
-                        f"{instance_label}/retry", retry_timing[instance_label]
+                        nemo_gym_retry_timing_label(instance_label),
+                        retry_timing[instance_label],
                     )
                 elif timing_metrics is not None:
                     record_timing(instance_label, timing_metrics)
@@ -2731,6 +2737,20 @@ async def _merge_nemo_gym_instance_streams(
             stream = streams_by_iterator[iterator]
             if isinstance(stream, ray.ObjectRefGenerator):
                 ray.cancel(stream)
+
+
+_RETRY_TIMING_SUFFIX = "/retry"
+
+
+def nemo_gym_retry_timing_label(label: str) -> str:
+    """The timing label under which the rows dispatched again under ``label`` report.
+
+    ``label`` is an instance label on the driver path and an instance timer
+    prefix on the single-controller path. The timing payloads of every
+    re-dispatch under it are added up (``_add_timing_payload``) and reported
+    under this one label, so the two paths name the retry timing the same way.
+    """
+    return f"{label}{_RETRY_TIMING_SUFFIX}"
 
 
 def _add_timing_payload(
@@ -2788,7 +2808,7 @@ def _merge_nemo_gym_timing_metrics(
 
     merged: dict[str, Any] = {}
     for instance_label, metrics in timing_by_instance.items():
-        is_retry = instance_label.endswith("/retry")
+        is_retry = instance_label.endswith(_RETRY_TIMING_SUFFIX)
         for key, value in metrics.items():
             suffix = (
                 key[len(timer_prefix) + 1 :] if key.startswith(timer_prefix) else key
@@ -3104,7 +3124,7 @@ async def run_async_nemo_gym_rollout(
     )
     # Reported on every rollout, zero included, so a mean over steps is a rate
     # and not an average over the steps that happened to re-dispatch.
-    final_rollout_result.rollout_metrics["nemo_gym_infra_redispatches"] = (
+    final_rollout_result.rollout_metrics[NEMO_GYM_INFRA_REDISPATCHES_METRIC] = (
         accumulator.infra_redispatches
     )
     final_rollout_result.rollout_metrics.update(timer.get_timing_metrics("sum"))
