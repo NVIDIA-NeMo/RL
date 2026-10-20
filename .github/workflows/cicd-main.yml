@@ -1092,8 +1092,6 @@ jobs:
       - sphinx-build
       - build-container
       - build-container-gb200
-      - update-uv-cache
-      - update-uv-cache-gb200
       - cicd-doc-tests
       - cicd-unit-tests
       - unit-test-script-check
