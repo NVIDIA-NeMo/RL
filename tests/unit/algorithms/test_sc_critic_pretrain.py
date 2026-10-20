@@ -663,13 +663,22 @@ def test_resume_uses_the_rolling_full_checkpoint_only_for_the_latest_step(tmp_pa
     assert weights == current / "value" / "weights"
     assert optimizer == current / "value" / "optimizer"
 
-    # Crash between finalizing step_40 and promoting its rolling checkpoint: the
-    # weights-only step_40 resumes (get_resume_paths finds no optimizer there).
+    # No rolling checkpoint for step_40 (e.g. deleted): the weights-only
+    # milestone step_40 resumes (get_resume_paths finds no optimizer there).
+    (tmp_path / "step_40" / "value" / "weights").mkdir(parents=True)
     weights, _, source = cp.critic_resume_paths(
         ckpt, tmp_path / "step_40", 40, "latest_only"
     )
     assert source == str(tmp_path / "step_40")
     assert weights == tmp_path / "step_40" / "value" / "weights"
+
+    # A fault-tolerance-only step_41 has no weights: the older rolling
+    # checkpoint (step 30) resumes, with its optimizer.
+    (tmp_path / "step_41").mkdir()
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_41", 41, "latest_only"
+    )
+    assert (source, optimizer) == (str(current), current / "value" / "optimizer")
 
     # The default keeps resuming from step_N itself.
     _, _, source = cp.critic_resume_paths(
@@ -677,6 +686,51 @@ def test_resume_uses_the_rolling_full_checkpoint_only_for_the_latest_step(tmp_pa
     )
     assert source == str(tmp_path / "step_30")
     assert cp.critic_resume_paths(ckpt, None, 0, "latest_only") == (None, None, None)
+
+
+def test_resume_finishes_an_interrupted_rolling_promotion(tmp_path):
+    ckpt = _Checkpointer(tmp_path)
+    current, tmp = cp.resume_state_dirs(tmp_path)
+    tmp.mkdir(parents=True)
+    cp.promote_rolling_resume(tmp_path, 30)
+    # Stopped after step_31 was finalized, before its complete (marked) rolling
+    # checkpoint was promoted: the resume promotes it.
+    (tmp / "shard").parent.mkdir(parents=True)
+    (tmp / "shard").write_text("step 31")
+    cp.mark_rolling_complete(tmp_path, 31)
+    weights, optimizer, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_31", 31, "latest_only"
+    )
+    assert source == str(current) and optimizer == current / "value" / "optimizer"
+    assert cp.rolling_resume_step(tmp_path) == 31 and not tmp.exists()
+    assert (current / "shard").read_text() == "step 31"
+
+    # A marked tmp newer than the latest step_N (stopped before step_32 was
+    # finalized) is not promoted: the rolling step_31 matches.
+    tmp.mkdir()
+    cp.mark_rolling_complete(tmp_path, 32)
+    _, _, source = cp.critic_resume_paths(
+        ckpt, tmp_path / "step_31", 31, "latest_only"
+    )
+    assert source == str(current) and cp.rolling_resume_step(tmp_path) == 31
+
+    # No weights at step_N and no rolling checkpoint: nothing to resume from.
+    empty = tmp_path / "empty"
+    (empty / "step_5").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="no critic weights"):
+        cp.critic_resume_paths(
+            _Checkpointer(empty), empty / "step_5", 5, "latest_only"
+        )
+
+
+def test_train_step_can_keep_the_training_state_on_the_gpus():
+    plane = _Plane()
+    value = _Value(plane)
+    trainer = _trainer(plane, value, train_on_env_masked=True, train_on_truncated=True)
+    trainer.train_step([_group("A", 2)], offload=False)
+    trainer.close()
+    # The caller saves from it, then offloads.
+    assert value.calls == ["prepare_for_training", "train"]
 
 
 def test_optimizer_state_setting():
@@ -706,12 +760,6 @@ class _SavingValue:
     def __init__(self, events: list) -> None:
         self.events = events
         self.fail_finalize = False
-
-    def prepare_for_training(self):
-        self.events.append("prepare")
-
-    def finish_training(self):
-        self.events.append("finish")
 
     def save_checkpoint(
         self, *, weights_path, optimizer_path, defer_finalize, timeout, **_
@@ -763,39 +811,58 @@ def _saver(tmp_path, *, rolling, async_save):
     return saver, value, events
 
 
-def _save(saver, step):
-    saver.save(step, {"total_steps": step}, None, {"files": []}, is_last=False)
+def _save(saver, step, milestone=True):
+    return saver.save(
+        step,
+        {"total_steps": step},
+        None,
+        {"files": []},
+        is_last=False,
+        milestone=milestone,
+    )
 
 
 def test_sync_critic_save_is_complete_on_return(tmp_path):
     saver, _, events = _saver(tmp_path, rolling=True, async_save=False)
-    _save(saver, 1)
-    # step_N weights only; the optimizer goes to the rolling checkpoint, which is
-    # promoted after step_N is finalized.
+    assert _save(saver, 1) >= 0.0
+    # Milestone: step_N weights only; the optimizer goes to the rolling
+    # checkpoint, marked complete and promoted after step_N is finalized.
     assert events == [
         ("init", 1),
-        "prepare",
         ("save", "tmp_step_1", False, False),
         ("save", "tmp", True, False),
-        "finish",
         ("finalize", "tmp_step_1"),
     ]
-    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) == 1
+    assert (tmp_path / "step_1" / "value" / "weights").exists()
+    assert cp.rolling_resume_step(tmp_path) == 1
     saver.wait(terminate=True)
     saver.close(timeout=1.0)
-    assert len(events) == 6  # nothing pending, no async writer to stop
+    assert len(events) == 4  # nothing pending, no async writer to stop
 
+    # Fault-tolerance-only step: the weights are only in the rolling checkpoint.
+    events.clear()
+    _save(saver, 2, milestone=False)
+    assert events == [
+        ("init", 2),
+        ("save", "tmp", True, False),
+        ("finalize", "tmp_step_2"),
+    ]
+    assert (tmp_path / "step_2").exists()
+    assert not (tmp_path / "step_2" / "value").exists()
+    assert cp.rolling_resume_step(tmp_path) == 2
+
+    # Without the rolling checkpoint every step_N is complete.
     saver, _, events = _saver(tmp_path / "every", rolling=False, async_save=False)
-    _save(saver, 1)
+    _save(saver, 1, milestone=False)
     assert ("save", "tmp_step_1", True, False) in events
     assert not cp.resume_state_dirs(tmp_path / "every")[1].exists()
 
 
 def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
     saver, _, events = _saver(tmp_path, rolling=True, async_save=True)
-    _save(saver, 1)
+    _save(saver, 1, milestone=False)
     # Scheduled, not finalized: neither step_1 nor the rolling checkpoint exists.
-    assert events[-2:] == [("save", "tmp", True, True), "finish"]
+    assert events == [("init", 1), ("save", "tmp", True, True)]
     assert (tmp_path / "tmp_step_1").exists() and not (tmp_path / "step_1").exists()
     assert cp.rolling_resume_step(tmp_path) is None
 
@@ -819,6 +886,28 @@ def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
     assert cp.rolling_resume_step(tmp_path) == 2
     saver.close(timeout=1.0)  # nothing pending after a normal exit
     assert len(events) == 2
+
+
+def test_rolling_checkpoint_is_marked_complete_before_step_n_is_finalized(
+    tmp_path, monkeypatch
+):
+    saver, _, _ = _saver(tmp_path, rolling=True, async_save=True)
+    _save(saver, 1, milestone=False)
+
+    def stop(*args):
+        raise RuntimeError("stopped")
+
+    # Stopped between finalizing step_1 and promoting its rolling checkpoint.
+    monkeypatch.setattr(cp, "promote_rolling_resume", stop)
+    with pytest.raises(RuntimeError, match="stopped"):
+        saver.wait()
+    monkeypatch.undo()
+    assert (tmp_path / "step_1").exists() and cp.rolling_resume_step(tmp_path) is None
+    _, _, source = cp.critic_resume_paths(
+        _Checkpointer(tmp_path), tmp_path / "step_1", 1, "latest_only"
+    )
+    assert source == str(cp.resume_state_dirs(tmp_path)[0])
+    assert cp.rolling_resume_step(tmp_path) == 1
 
 
 def test_async_critic_save_lands_after_an_error_without_raising(tmp_path):

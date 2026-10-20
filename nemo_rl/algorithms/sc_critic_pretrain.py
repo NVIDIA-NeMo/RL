@@ -167,24 +167,38 @@ def resume_state_dirs(checkpoint_dir: str | os.PathLike) -> tuple[Path, Path]:
     return root / "current", root / "tmp"
 
 
+def _recorded_step(state_dir: Path) -> Optional[int]:
+    try:
+        return int(json.loads((state_dir / RESUME_STEP_FILENAME).read_text())["step"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return None
+
+
 def rolling_resume_step(checkpoint_dir: str | os.PathLike) -> Optional[int]:
     """The step the rolling full checkpoint was saved at, or None if there is none."""
     current, _ = resume_state_dirs(checkpoint_dir)
-    try:
-        return int(json.loads((current / RESUME_STEP_FILENAME).read_text())["step"])
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
-        return None
+    return _recorded_step(current)
+
+
+def mark_rolling_complete(checkpoint_dir: str | os.PathLike, step: int) -> None:
+    """Record that resume_state/tmp holds the complete checkpoint for ``step``.
+
+    Written once its write is on disk and before step_N is finalized, so a resume
+    can finish an interrupted promotion (see ``critic_resume_paths``).
+    """
+    _, tmp = resume_state_dirs(checkpoint_dir)
+    (tmp / RESUME_STEP_FILENAME).write_text(json.dumps({"step": step}))
 
 
 def promote_rolling_resume(checkpoint_dir: str | os.PathLike, step: int) -> None:
     """Make the just-written resume_state/tmp the rolling full checkpoint for ``step``.
 
-    Called after step_N is finalized, so a crash in between leaves the previous
-    rolling checkpoint, which no longer matches the latest step; resuming then
-    falls back to step_N's weights with a fresh optimizer.
+    Called after step_N is finalized. A stop in between leaves the previous
+    rolling checkpoint as current and the marked, complete one in tmp, which
+    the next resume promotes.
     """
     current, tmp = resume_state_dirs(checkpoint_dir)
-    (tmp / RESUME_STEP_FILENAME).write_text(json.dumps({"step": step}))
+    mark_rolling_complete(checkpoint_dir, step)
     old = current.with_name("old")
     shutil.rmtree(old, ignore_errors=True)
     if current.exists():
@@ -216,13 +230,46 @@ def critic_resume_paths(
     last_step: int,
     optimizer_state: str,
 ) -> tuple[Optional[Path], Optional[Path], Optional[str]]:
-    """(weights_path, optimizer_path, source) to resume the critic from."""
+    """(weights_path, optimizer_path, source) to resume the critic from.
+
+    With ``latest_only`` the rolling full checkpoint is used when it was saved
+    at ``last_step``. A run stopped between finalizing step_N and promoting its
+    rolling checkpoint left that checkpoint complete (marked) in resume_state/tmp:
+    the promotion is finished here. Otherwise step_N's weights resume with a
+    fresh optimizer; a fault-tolerance-only step_N has no weights (they are only
+    in the rolling checkpoint), so the older rolling checkpoint resumes instead,
+    losing the updates since it.
+    """
     if last_checkpoint_path is None:
         return None, None, None
     if optimizer_state == "latest_only":
-        current, _ = resume_state_dirs(checkpointer.checkpoint_dir)
+        current, tmp = resume_state_dirs(checkpointer.checkpoint_dir)
         rolling = rolling_resume_step(checkpointer.checkpoint_dir)
+        if rolling != last_step and _recorded_step(tmp) == last_step:
+            print(
+                f"♻️ Promoting the complete rolling checkpoint for step {last_step} "
+                "left in resume_state/tmp.",
+                flush=True,
+            )
+            promote_rolling_resume(checkpointer.checkpoint_dir, last_step)
+            rolling = last_step
         if rolling == last_step:
+            weights, optimizer = checkpointer.get_resume_paths(
+                current, model_component="value"
+            )
+            return weights, optimizer, str(current)
+        if not (Path(last_checkpoint_path) / "value" / "weights").exists():
+            if rolling is None:
+                raise RuntimeError(
+                    f"{last_checkpoint_path} has no critic weights (a fault-tolerance-"
+                    "only save) and there is no rolling checkpoint to resume from"
+                )
+            print(
+                f"⚠️ {last_checkpoint_path} has no critic weights and the rolling "
+                f"checkpoint is from step {rolling}: resuming from it, so the updates "
+                f"of steps {rolling + 1}-{last_step} are lost.",
+                flush=True,
+            )
             weights, optimizer = checkpointer.get_resume_paths(
                 current, model_component="value"
             )
@@ -247,19 +294,28 @@ ASYNC_SAVE_TIMEOUT_S = 1800.0
 
 
 class CriticCheckpointSaver:
-    """Writes stage-B checkpoints: step_N, plus the rolling full one when ``rolling``.
+    """Writes stage-B checkpoints from the critic's training state on the GPUs.
+
+    The caller saves right after the optimizer step, before offloading the
+    training state, so a save does not reload and re-offload it. With
+    ``rolling`` (optimizer_state latest_only) every save writes the full
+    rolling checkpoint (weights + optimizer) to resume_state, and step_N gets
+    the weights only on ``milestone`` saves (every save_period steps and the
+    last): fault-tolerance-only step_N dirs hold the step's training info and
+    data record, their weights live in the rolling checkpoint, and retention
+    drops them at the next save. Without ``rolling`` each step_N is complete.
 
     Synchronous by default. With ``async_save`` (Megatron
     ``value.megatron_cfg.checkpoint.async_save``) a save returns once the
     writes are staged to host memory and training goes on while they land on
-    disk; ``wait()`` then completes the save: it blocks on the writes, renames
-    tmp_step_N to step_N and promotes resume_state/tmp. The loop calls it
-    before the next save and before exiting, so step_N and the rolling
-    checkpoint only appear once fully on disk, and a crash mid-write leaves the
-    previous ones. The trainer's Ray calls to the value workers run one at a
-    time, so the wait is deferred instead of handed to the checkpointer's
-    background finalization thread (which would block the next training step
-    on the write).
+    disk; ``wait()`` then completes the save: it blocks on the writes, marks
+    resume_state/tmp complete, renames tmp_step_N to step_N and promotes
+    resume_state/tmp. The loop calls it before the next save and before
+    exiting, so step_N and the rolling checkpoint only appear once fully on
+    disk, and a crash mid-write leaves the previous ones. The trainer's Ray
+    calls to the value workers run one at a time, so the wait is deferred
+    instead of handed to the checkpointer's background finalization thread
+    (which would block the next training step on the write).
     """
 
     def __init__(
@@ -280,23 +336,25 @@ class CriticCheckpointSaver:
         files_record: Any,
         *,
         is_last: bool,
-    ) -> None:
+        milestone: bool,
+    ) -> float:
+        """Save ``step``; returns the seconds training was blocked."""
         self.wait()
         started = time.perf_counter()
         checkpoint_path = self.checkpointer.init_tmp_checkpoint(
             step, save_state, master_config
         )
-        self.value.prepare_for_training()
-        self.value.save_checkpoint(
-            weights_path=os.path.join(checkpoint_path, "value", "weights"),
-            optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
-            if self.checkpointer.save_optimizer and not self.rolling
-            else None,
-            tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-            is_final_checkpoint=is_last,
-            defer_finalize=self.async_save,
-            timeout=self._timeout,
-        )
+        if milestone or not self.rolling:
+            self.value.save_checkpoint(
+                weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                if self.checkpointer.save_optimizer and not self.rolling
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                is_final_checkpoint=is_last,
+                defer_finalize=self.async_save,
+                timeout=self._timeout,
+            )
         if self.rolling:
             _, resume_tmp = resume_state_dirs(self.checkpointer.checkpoint_dir)
             shutil.rmtree(resume_tmp, ignore_errors=True)
@@ -308,18 +366,19 @@ class CriticCheckpointSaver:
                 defer_finalize=self.async_save,
                 timeout=self._timeout,
             )
-        self.value.finish_training()
         with open(os.path.join(checkpoint_path, FILE_LIST_NAME), "w") as f:
             json.dump(files_record, f)
         self._pending = (str(checkpoint_path), step)
         if not self.async_save:
             self.wait()
+        blocked = time.perf_counter() - started
         print(
             f"💾 Critic checkpoint for step {step} "
-            f"{'scheduled' if self.async_save else 'saved'} in "
-            f"{time.perf_counter() - started:.1f}s",
+            f"{'scheduled' if self.async_save else 'saved'} in {blocked:.1f}s"
+            f"{'' if milestone or not self.rolling else ' (rolling only)'}",
             flush=True,
         )
+        return blocked
 
     def wait(self, *, terminate: bool = False, timeout: Optional[float] = None) -> None:
         """Complete the pending save, if any; ``terminate`` also stops the writer."""
@@ -333,6 +392,8 @@ class CriticCheckpointSaver:
         if pending is None:
             return
         checkpoint_path, step = pending
+        if self.rolling:
+            mark_rolling_complete(self.checkpointer.checkpoint_dir, step)
         self.checkpointer.finalize_checkpoint(checkpoint_path)
         if self.rolling:
             promote_rolling_resume(self.checkpointer.checkpoint_dir, step)
@@ -1022,8 +1083,14 @@ class _CriticPretrainer:
 
     # -- step / eval --
 
-    def train_step(self, groups: Sequence[BankGroup]) -> dict[str, float]:
-        """One critic optimizer step on ``groups``."""
+    def train_step(
+        self, groups: Sequence[BankGroup], *, offload: bool = True
+    ) -> dict[str, float]:
+        """One critic optimizer step on ``groups``.
+
+        ``offload=False`` leaves the training state on the GPUs (to save a
+        checkpoint from it); the caller then calls ``value.finish_training()``.
+        """
         meta, staged = self._put(groups, id_prefix="s")
         try:
             scored = self._score(meta, train=True)
@@ -1046,7 +1113,8 @@ class _CriticPretrainer:
                 gbs=staged.num_rows,
                 **self._privilege_kwargs(meta),
             )
-            self.value.finish_training()
+            if offload:
+                self.value.finish_training()
             # Deferred: ppo pulls in the legacy training stack.
             from nemo_rl.algorithms.legacy_ppo_diagnostics import critic_gnorm_metrics
             from nemo_rl.algorithms.ppo import _compute_critic_metrics
@@ -1479,7 +1547,8 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                     f"value.train_global_batch_size={rollouts_per_step}: a bank group "
                     f"has other than {gpp} rollouts"
                 )
-            metrics = trainer.train_step(groups)
+            # The training state stays on the GPUs until a due save is taken.
+            metrics = trainer.train_step(groups, offload=False)
             step += 1
             metrics["total_step_time"] = time.perf_counter() - started
             logger.log_metrics(metrics, step, prefix="train")
@@ -1491,6 +1560,37 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                 flush=True,
             )
             is_last = step == planned_steps
+
+            save_state["total_steps"] = step
+            save_state["consumed_samples"] = int(
+                save_state.get("consumed_samples", 0)
+            ) + int(metrics["num_rollouts"])
+            timeout.mark_iteration()
+            save_period = master_config.checkpointing["save_period"]
+            save_by_step = save_due(
+                step,
+                is_last=is_last,
+                save_period=save_period,
+                ft_save_period=master_config.checkpointing.get("ft_save_period"),
+            )
+            save_by_timeout = timeout.check_save()
+            if master_config.checkpointing["enabled"] and (
+                save_by_step or save_by_timeout
+            ):
+                print(f"💾 Saving critic checkpoint for step {step}...", flush=True)
+                blocked = saver.save(
+                    step,
+                    save_state,
+                    master_config,
+                    files_record,
+                    is_last=is_last,
+                    milestone=is_last or step % save_period == 0,
+                )
+                logger.log_metrics(
+                    {"checkpoint_blocked_time": blocked}, step, prefix="train"
+                )
+            value.finish_training()
+
             if is_last or (cfg.eval_period > 0 and step % cfg.eval_period == 0):
                 for prefix, paths, start, end in (
                     ("validation", heldout_eval, 0, gpp),
@@ -1514,26 +1614,6 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                         f"q4={eval_metrics.get('critic/within_group_auc_q4', float('nan')):.4f}",
                         flush=True,
                     )
-
-            save_state["total_steps"] = step
-            save_state["consumed_samples"] = int(
-                save_state.get("consumed_samples", 0)
-            ) + int(metrics["num_rollouts"])
-            timeout.mark_iteration()
-            save_by_step = save_due(
-                step,
-                is_last=is_last,
-                save_period=master_config.checkpointing["save_period"],
-                ft_save_period=master_config.checkpointing.get("ft_save_period"),
-            )
-            save_by_timeout = timeout.check_save()
-            if master_config.checkpointing["enabled"] and (
-                save_by_step or save_by_timeout
-            ):
-                print(f"💾 Saving critic checkpoint for step {step}...", flush=True)
-                saver.save(
-                    step, save_state, master_config, files_record, is_last=is_last
-                )
             if save_by_timeout:
                 print(
                     "⏰ Walltime budget reached; stopping after the save.", flush=True
