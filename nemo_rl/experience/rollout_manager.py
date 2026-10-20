@@ -1268,9 +1268,11 @@ class AsyncNemoGymRolloutImpl:
         timing is reported under the instance label and every later attempt's
         under ``<instance label>/retry<n>``, the rule the driver path's stream
         merge applies, so a one-row re-dispatch never replaces the group's totals.
-        The metrics also carry ``nemo_gym_infra_redispatches``, the number of rows
-        sent again after an attempt ended without them, zero included; the driver
-        path reports the same key from its stream merge.
+        The metrics also carry ``nemo_gym_infra_redispatches``, zero included: the
+        number of rows a failure marker named that were sent again, the same
+        count the driver path reports from its stream merge. A row sent again
+        because its stream ended without it is counted by the attempt counter
+        (``RolloutStats.record_gym_row_redispatch``) alone.
         """
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
@@ -1322,12 +1324,15 @@ class AsyncNemoGymRolloutImpl:
             # row that failed on every attempt would be reported as "stream
             # ended before all rows arrived" with no cause attached.
             infra_failures: dict[int, str] = {}
+            # The markers of the attempt just finished; a re-dispatch counts
+            # only when the previous attempt marked the row.
+            attempt_markers: dict[int, str] = {}
             max_row_attempts = (
                 1
                 if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
-            # Rows sent again across every later attempt, reported per rollout.
+            # Marked rows sent again across every later attempt, reported per rollout.
             infra_redispatches = 0
             async with _Deadline(
                 self._timeouts.rollout_s,
@@ -1344,12 +1349,15 @@ class AsyncNemoGymRolloutImpl:
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
                             flush=True,
                         )
-                        infra_redispatches += len(pending)
+                        infra_redispatches += sum(
+                            1 for row in pending if row["_rowidx"] in attempt_markers
+                        )
                         # Row re-dispatches are invisible in redispatch_total -- they
                         # recover a partial group instead of retrying the prompt -- so
                         # gym could retry rows all run with every counter flat.
                         if self._stats is not None:
                             self._stats.record_gym_row_redispatch(len(pending))
+                    attempt_markers = {}
                     try:
                         timing_metrics = await self._stream_rows(
                             nemo_gym_env,
@@ -1359,7 +1367,7 @@ class AsyncNemoGymRolloutImpl:
                             total_rows,
                             instance_timer_prefix,
                             on_completion=on_completion,
-                            infra_failures=infra_failures,
+                            infra_failures=attempt_markers,
                             # Nothing re-dispatches a marked row after the last
                             # attempt, so a marker ends it at once (see _stream_rows).
                             stop_on_infra_failure=attempt == max_row_attempts,
@@ -1394,6 +1402,7 @@ class AsyncNemoGymRolloutImpl:
                                         else key
                                     )
                                     env_timing_metrics[relabeled] = value
+                    infra_failures.update(attempt_markers)
 
             missing = [index for index in expected_indices if results[index] is None]
             if missing:

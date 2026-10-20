@@ -1437,6 +1437,39 @@ def test_nemo_gym_run_rollouts_reports_zero_redispatches_for_a_clean_group():
     assert metrics["nemo_gym_infra_redispatches"] == 0
 
 
+def test_nemo_gym_run_rollouts_counts_only_marked_rows_as_infra_redispatches():
+    """A row sent again because its stream ended without it is a stream-death
+    re-send: the attempt counter records it, but ``nemo_gym_infra_redispatches``
+    counts only rows a failure marker named, the meaning the driver path gives
+    the same key."""
+    from nemo_rl.experience.rollouts import Timer
+
+    env = _ScriptedGymEnv(
+        scripts=[
+            [(0, {"name": "agent"}, _streamed_gym_result(), None)],
+            [(1, {"name": "agent"}, _streamed_gym_result(), None)],
+        ]
+    )
+    impl = _run_rollouts_impl(env, max_attempts=2)
+    impl._stats = RolloutStats()
+
+    completions, _message_log, metrics = _run(
+        impl._run_rollouts(
+            inputs=[
+                {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+            ],
+            timer=Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert env.dispatched == [[0, 1], [1]]
+    assert len(completions) == 2
+    assert metrics["nemo_gym_infra_redispatches"] == 0
+    assert impl._stats.gym_row_redispatches == 1
+
+
 def test_nemo_gym_run_rollouts_names_the_infra_failure_when_attempts_run_out():
     """When the budget is one attempt, nothing would dispatch a marked row
     again, so the marker ends the attempt at once with its own detail and the
