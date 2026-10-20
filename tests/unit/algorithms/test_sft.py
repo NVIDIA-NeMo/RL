@@ -33,6 +33,7 @@ from nemo_rl.algorithms.sft import (
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 def test_get_sft_save_state_handles_legacy_checkpoint_and_filters_metrics():
@@ -146,11 +147,13 @@ def mock_components():
             "train_global_batch_size": 1,
             "make_sequence_length_divisible_by": 8,
         },
-        checkpointing={
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-        },
+        checkpointing=CheckpointingConfig.model_construct(
+            **{
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+            }
+        ),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )
 
@@ -226,8 +229,8 @@ def test_exit_on_timeout(mock_components, capsys, tmp_path):
     # Set max steps and epochs to large numbers
     mock_components["master_config"].sft.max_num_steps = 100
     mock_components["master_config"].sft.max_num_epochs = 10
-    mock_components["master_config"].checkpointing["enabled"] = True
-    mock_components["master_config"].checkpointing["metric_name"] = None
+    mock_components["master_config"].checkpointing.enabled = True
+    mock_components["master_config"].checkpointing.metric_name = None
     mock_components["checkpointer"].init_tmp_checkpoint.return_value = str(
         tmp_path / "tmp_step"
     )
@@ -340,10 +343,10 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
     cfg.sft.val_period = 0
     cfg.sft.max_num_steps = 5
     cfg.sft.max_num_epochs = 1
-    cfg.checkpointing["enabled"] = True
-    cfg.checkpointing["save_period"] = 100  # only the final step would save
-    cfg.checkpointing["ft_save_period"] = 2
-    cfg.checkpointing["metric_name"] = None
+    cfg.checkpointing.enabled = True
+    cfg.checkpointing.save_period = 100  # only the final step would save
+    cfg.checkpointing.ft_save_period = 2
+    cfg.checkpointing.metric_name = None
 
     checkpointer = mock_components["checkpointer"]
     checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"

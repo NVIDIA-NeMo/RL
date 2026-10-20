@@ -140,6 +140,9 @@ checkpointing:
   load_replay_buffer: true
   save_data_plane: false
   save_optimizer: true
+  ft_keep_latest_k: null
+  ft_save_period: null
+  pretrained_checkpoint: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
