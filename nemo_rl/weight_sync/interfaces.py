@@ -62,7 +62,7 @@ def initialize_refit_metadata(
     if megatron_cfg is None or not megatron_cfg["enabled"]:
         raise ValueError(
             "vllm_cfg.refit_prequantize requires the Megatron policy backend "
-            "(policy.megatron_cfg.enabled=true); the DTensor workers do not "
+            "(policy.megatron_cfg.enabled=true); the Automodel workers do not "
             "implement trainer-side pre-quantized refit."
         )
 

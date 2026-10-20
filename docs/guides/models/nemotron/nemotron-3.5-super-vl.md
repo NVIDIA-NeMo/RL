@@ -24,7 +24,7 @@ Notes:
   `NemotronH_Omni_Reasoning_V3` and loads the checkpoint's RADIO weights from
   disk (`load_format=auto`). The policy is refit from the trainer every step.
 - The DAPO recipe drives the model text-only: the tokenizer path (no processor)
-  is used, so the DTensor worker runs with `is_vlm=false` and vLLM never
+  is used, so the Automodel worker runs with `is_vlm=false` and vLLM never
   receives images. The image GRPO recipe uses the checkpoint's processor and
   sends CLEVR images through vLLM; which towers train is controlled by
   `automodel_kwargs.freeze_config`.
