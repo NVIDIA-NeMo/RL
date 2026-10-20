@@ -13,7 +13,7 @@
 # limitations under the License.
 import json
 import os
-import random
+import socket
 import time
 import unittest.mock
 from datetime import datetime
@@ -493,8 +493,11 @@ def distributed_test_runner():
                 f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
             )
 
-        # Generate a single random port in the main process
-        port = random.randint(10000, 20000)
+        # Ask the OS for a free port. A random one in 10000-20000 can collide
+        # with the session's Ray workers, which listen in 10002-19999.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("localhost", 0))
+            port = sock.getsockname()[1]
 
         # Run the test on multiple processes
         mp.spawn(
