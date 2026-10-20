@@ -97,6 +97,12 @@ class SGLangRouterConfig(TypedDict):
     cb_failure_threshold: NotRequired[int]
 
 
+class SGLangOutlinesCachePolicy(BaseModel, extra="allow", strict=True):
+    """Disable the legacy disk cache unless trusted-cache use is requested."""
+
+    disable_outlines_disk_cache: bool = True
+
+
 class SGLangHttpClientConfig(BaseModel, extra="allow", strict=True):
     """NeMo-RL HTTP settings, including when the router is externally managed.
 

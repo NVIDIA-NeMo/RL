@@ -38,7 +38,10 @@ from nemo_rl.utils.config import load_config
     "setting, expected", [(None, True), (True, True), (False, False)]
 )
 def test_worker_outlines_cache_default_and_opt_in(monkeypatch, setting, expected):
-    config = load_config("examples/configs/grpo_math_1B_sglang.yaml").policy.generation
+    config = load_config(
+        Path(__file__).resolve().parents[5]
+        / "examples/configs/grpo_math_1B_sglang.yaml"
+    ).policy.generation
     # Exercise the worker fallback independently of the recipe's default.
     config.sglang_cfg.pop("disable_outlines_disk_cache")
     if setting is not None:
