@@ -45,6 +45,10 @@ from nemo_rl.distributed import numa_utils
 
 log = logging.getLogger(__name__)
 
+# IO jobs (spill writes, stage reads) queued or running at once. Each holds an IO-area
+# region, so the area bounds it; this caps the count when blobs are tiny.
+_MAX_IO_JOBS = 256
+
 
 @dataclass
 class BlobRec:
@@ -54,14 +58,20 @@ class BlobRec:
     created_at: float
     last_resolve_at: float = 0.0
     pins: dict[str, float] = field(default_factory=dict)  # pin_id → expiry (monotonic)
-    holds: int = 0  # copies of the slab region running now (save_shard, demotion)
-    # SSD tier (only with ssd enabled; design PR 2, minimal):
-    demotable: bool = False  # set by commit (the put's WRITE is DONE)
-    in_slab: bool = True  # False once the slab copy is dropped after demotion
-    victim: bool = False  # chosen for demotion: no new slab pins
-    disk: int | None = None  # fd of the (already unlinked) file holding a copy
-    staged_off: int | None = None  # slab offset of the staged copy
-    staging: bool = False  # stage READ from disk running
+    holds: int = 0  # copies of the slab region running now (save_shard)
+    # SSD tier (only with ssd enabled). A blob lives in the put area (in_slab), or
+    # in the IO area while its put is written to disk (staged_off set, disk None),
+    # or on disk (disk = fd of an already unlinked file) with an optional staged
+    # copy in the IO area (staged_off).
+    in_slab: bool = True
+    disk: int | None = None
+    staged_off: int | None = (
+        None  # offset in the IO area: the put's region or the staged copy
+    )
+    staging: bool = False  # an IO job (spill write or stage read) owns staged_off now
+    stage_failed: bool = (
+        False  # the last stage read failed; the next resolve says so once
+    )
     staged_at: float = 0.0
     picked_up: bool = False  # a reader pinned the staged copy since it was staged
     wait_since: float = 0.0  # first pending reply of the current stage
@@ -78,16 +88,20 @@ def _free_at(a: SlabAllocator, off: int, nbytes: int, at: float, now: float) -> 
         a.quarantine(off, nbytes, at)
 
 
-def _movable(rec: "BlobRec") -> bool:
-    """May demotion pick this blob now?"""
-    return rec.in_slab and rec.demotable and not rec.victim
-
-
 def _close(fd: int) -> None:
     try:
         os.close(fd)
     except OSError:
         pass
+
+
+def _write_all(fd: int, view: memoryview) -> None:
+    done = 0
+    while done < len(view):
+        n = os.pwrite(fd, view[done:], done)
+        if n <= 0:
+            raise OSError("write made no progress")
+        done += n
 
 
 def _locked(fn):
@@ -128,8 +142,6 @@ class NixlStorageUnit:
         ssd_dir: str | None = None,
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
-        demote_after_s: float | None = None,
-        watermarks: tuple[float, float] | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
@@ -152,14 +164,7 @@ class NixlStorageUnit:
         if self.numa_node is not None:
             numa_utils.first_touch(self.slab)
         self._mu = threading.RLock()
-        self._init_ssd(
-            int(slab_bytes),
-            ssd_dir,
-            int(staging_bytes),
-            float(pickup_s),
-            demote_after_s,
-            watermarks,
-        )
+        self._init_ssd(int(slab_bytes), ssd_dir, int(staging_bytes), float(pickup_s))
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
             backend=nixl_backend,
@@ -192,40 +197,39 @@ class NixlStorageUnit:
         self._start_ticker()
 
     # ------------------------------------------------------------------ SSD tier
-    # Design PR 2, minimal: a put that finds no room gets Busy while committed
-    # blobs are demoted (oldest first) to a local file; a read of a demoted
-    # blob gets "pending" while it is staged back into a staging area carved
-    # from the slab, then reads it pinned. Disk I/O is plain blocking file I/O
-    # on worker threads, outside _mu: it always returns, so nothing is left
-    # running that could still touch a freed region.
+    # Spill, not demote. Data is read oldest first (the FIFO contract), so a put
+    # the put area cannot take goes to disk from birth and data already in the put
+    # area never moves: no victims, no pin drain, no eviction policy. The put's
+    # WRITE lands in the IO area (carved from the slab, as the staging area was);
+    # its commit is "pending" while ONE worker thread writes the file, and
+    # "done" once it is on disk. A read of a disk blob gets "pending" while the
+    # same worker reads the file into the IO area, then reads it pinned. Disk
+    # I/O is plain blocking file I/O on that worker, outside _mu: a hung disk
+    # stalls spills and cold reads, never the put area. An IO job owns its
+    # IO-area region until it ends, so a region is never freed under it.
     def _init_ssd(
         self,
         slab_bytes: int,
         ssd_dir: str | None,
         staging_bytes: int,
         pickup_s: float,
-        demote_after_s: float | None,
-        watermarks: tuple[float, float]
-        | None = None,  # (high, low) fractions of the put area
     ) -> None:
         self.ssd_dir: str | None = None
         self.staging_: SlabAllocator | None = None
         self.staging_base = slab_bytes
         self.pickup_s = pickup_s
         self.ssd_stats: dict[str, float] = {
-            "demoted_bytes": 0,
-            "demotions": 0,
-            "demote_failures": 0,
+            "spilled_bytes": 0,
+            "spills": 0,
+            "spill_failures": 0,
             "staged_bytes": 0,
             "stages": 0,
             "stage_failures": 0,
             "stage_wait_ms_max": 0.0,
             "busy_replies": 0,
-            "watermark_batches": 0,
         }
-        self._victims: set[str] = set()  # victims whose slab copy is still held
-        self._demote_jobs = 0  # demotions queued or running, released victims included
-        self.watermarks = watermarks
+        self._io_jobs = 0  # IO jobs queued or running
+        self._max_io_jobs = _MAX_IO_JOBS
         self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
         if not ssd_dir:
             self.alloc_ = SlabAllocator(slab_bytes, on_free=self._wipe_footer)
@@ -235,10 +239,6 @@ class NixlStorageUnit:
             raise ValueError(
                 f"ssd staging_bytes={staging_bytes} must be in (0, slab {slab_bytes})"
             )
-        if watermarks is not None and not 0 < watermarks[1] < watermarks[0] < 1:
-            raise ValueError(
-                f"ssd watermarks need 0 < low < high < 1, got {watermarks}"
-            )
         self.alloc_ = SlabAllocator(main, on_free=self._wipe_footer)
         self.staging_ = SlabAllocator(slab_bytes - main)
         self.staging_base = main
@@ -246,9 +246,7 @@ class NixlStorageUnit:
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
         )
         os.makedirs(self.ssd_dir, exist_ok=True)
-        self._demoter = ThreadPoolExecutor(1, thread_name_prefix="nvdp-demote")
-        self._stager = ThreadPoolExecutor(2, thread_name_prefix="nvdp-stage")
-        self.demote_after_s = demote_after_s
+        self._worker = ThreadPoolExecutor(1, thread_name_prefix="nvdp-io")
 
     def _start_ticker(self) -> None:
         """Start the SSD ticker; call once the unit is fully built."""
@@ -258,17 +256,13 @@ class NixlStorageUnit:
             ).start()
 
     def _tick(self, every: float = 1.0, report_s: float = 30.0) -> None:
-        """SSD ticker thread.
-
-        Drops victims' slab copies whose pins expired, retries the headroom batch
-        (``alloc`` starts it; the tick catches blobs that committed since), demotes blobs
-        older than ``demote_after_s`` (opt-in, testing), and prints stats when they change.
-        """
+        """SSD ticker thread: free what has aged out, print stats when they change."""
         last, last_at = None, 0.0
         while True:
             time.sleep(every)
             try:
-                self._tick_once()
+                with self._mu:
+                    self._reclaim(time.monotonic())
             except Exception:  # noqa: BLE001 - keep ticking; the next tick retries
                 log.exception("unit %d: SSD tick failed", self.unit_id)
                 continue
@@ -282,163 +276,93 @@ class NixlStorageUnit:
                 print(f"[nvdp-ssd] unit {self.unit_id} stats {st}", flush=True)
                 last = st
 
-    def _tick_once(self) -> None:
-        with self._mu:
-            now = time.monotonic()
-            self._reclaim(now)
-            if self.demote_after_s is not None:
-                for b, r in self.blobs.items():
-                    if _movable(r) and now - r.created_at >= self.demote_after_s:
-                        self._mark_victim(b, r)
-            self._demote_to_low_watermark()
-
-    def _demote_to_low_watermark(self) -> None:
-        """Background headroom: one batch at a time, oldest first, so puts rarely see Busy.
-
-        No-op unless watermarks are set. ``_room`` stays the fallback
-        (fragmentation, bursts). Quarantined bytes are not counted: they free
-        by time, demotion cannot help them.
-        """
-        if self.watermarks is None or self._demotion_running():
-            return
-        high, low = self.watermarks
-        a = self.alloc_
-        live = a.used_bytes - a.quarantined_bytes
-        if live > high * a.capacity and self._mark_oldest(live - low * a.capacity):
-            self.ssd_stats["watermark_batches"] += 1
-
-    def _mark_oldest(self, want: int) -> int:
-        """Mark the oldest movable blobs as victims until ``want`` aligned bytes are covered."""
-        picked = 0
-        movable = sorted(
-            ((b, r) for b, r in self.blobs.items() if _movable(r)),
-            key=lambda t: t[1].created_at,
-        )
-        for b, r in movable:
-            if picked >= want:
-                break
-            self._mark_victim(b, r)
-            picked += align_up(r.nbytes, self.alloc_.align)
-        return picked
-
-    def _demotion_running(self) -> bool:
-        """A batch is queued or running, or its victims still hold slab copies."""
-        return bool(self._victims or self._demote_jobs)
-
     def _ssd_stats(self) -> dict[str, Any]:
         return {
             **self.ssd_stats,
             "staging_used_bytes": self.staging_.used_bytes,
-            "disk_only_blobs": sum(not r.in_slab for r in self.blobs.values()),
+            "disk_only_blobs": sum(r.disk is not None for r in self.blobs.values()),
         }
 
     def _reclaim(self, now: float) -> None:
         self.alloc_.reclaim(now)
         if self.staging_ is not None:
             self.staging_.reclaim(now)
-        for b in list(self._victims):
-            rec = self.blobs.get(b)
-            if rec is None:
-                self._victims.discard(b)
-            else:
-                self._maybe_drop_slab(b, rec, now)
 
-    def _room(self, nbytes: int, now: float) -> bool:
-        """Can demotion make room for ``nbytes``? True → Busy, False → UnitFull.
+    def _alloc_io(self, nbytes: int, now: float) -> int:
+        """IO-area region for a put the put area cannot take.
 
-        Starts a demotion batch (oldest demotable blobs first, at
-        least ``nbytes`` and an eighth of the slab) unless one is running.
+        Busy if something will free room (jobs, staged copies, pins, quarantine),
+        UnitFull if nothing will.
         """
-        movable = [(b, r) for b, r in self.blobs.items() if _movable(r)]
-        held = sum(self.blobs[b].nbytes for b in self._victims if b in self.blobs)
-        a = self.alloc_
-        if a.free_bytes + a.quarantined_bytes + held + sum(
-            r.nbytes for _, r in movable
-        ) < align_up(nbytes, a.align):
-            return False
-        if self._demotion_running():
-            return True  # a running or queued batch frees its slab copies soon
-        if not movable:
-            # Nothing left to demote: only quarantine (free at a known time) helps.
-            return a.quarantined_bytes > 0
-        self._mark_oldest(max(nbytes, a.capacity // 8))
-        return True
+        io = self.staging_
+        busy = False
+        if align_up(nbytes, io.align) <= io.capacity:
+            try:
+                return io.alloc(nbytes)
+            except UnitFull:
+                self._evict_staged(nbytes, now)
+            try:
+                return io.alloc(nbytes)
+            except UnitFull:
+                busy = io.used_bytes > 0
+        if busy or self.alloc_.quarantined_bytes:
+            self.ssd_stats["busy_replies"] += 1
+            raise DataPlaneBusy(
+                f"unit {self.unit_id} has no room for {nbytes} B yet", reason="pressure"
+            )
+        raise UnitFull(
+            f"unit {self.unit_id}: {nbytes} B fits neither the put area nor the IO area"
+        )
 
-    def _mark_victim(self, b: str, rec: BlobRec) -> None:
-        self._demoter.submit(self._demote_job, b, rec)  # raises first: nothing marked
-        rec.victim = True  # resolve stops granting slab pins (design §5.1)
-        self._victims.add(b)
-        self._demote_jobs += 1
+    def _submit_io(self, fn: Any, b: str, rec: BlobRec) -> None:
+        """Queue an IO job that owns ``rec.staged_off`` (caller holds ``_mu``).
 
-    def _demote_job(self, b: str, rec: BlobRec) -> None:
-        try:
-            self._demote(b, rec)
-        finally:
-            with self._mu:
-                self._demote_jobs -= 1
+        Raises before any state changes, so a failed submit leaves nothing to undo.
+        """
+        self._worker.submit(fn, b, rec)
+        self._io_jobs += 1
+        rec.staging = True
 
-    def _demote(self, b: str, rec: BlobRec) -> None:
-        """Demoter thread: copy the slab copy to a file, then drop the slab copy."""
-        with self._mu:
-            if self.blobs.get(b) is not rec:  # released before we started
-                self._victims.discard(b)
-                return
-            rec.holds += 1  # a release now defers the free to us
-        # The file is unlinked at once and kept by its fd: nothing is left on
-        # the node's disk when the unit dies, however it dies. Named by a fresh
-        # uuid, not the client-supplied blob id, so no id can steer the path.
-        path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
+    def _spill(self, b: str, rec: BlobRec) -> None:
+        """IO worker: write a put's IO-area region to a file, then publish it as a disk blob."""
         fd = None
-        ok = True
+        ok = False
         try:
+            # The file is unlinked at once and kept by its fd: nothing is left on
+            # the node's disk when the unit dies, however it dies. Named by a fresh
+            # uuid, not the client-supplied blob id, so no id can steer the path.
+            path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
             fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
             os.unlink(path)
-            view = memoryview(self.slab)[rec.off : rec.off + rec.nbytes]
-            done = 0
-            while done < rec.nbytes:
-                done += os.pwrite(fd, view[done:], done)
-        except Exception as e:  # noqa: BLE001 - anything else would leave the hold
-            ok = False
-            log.warning("unit %d: demoting %s failed: %s", self.unit_id, b, e)
+            at = self.staging_base + rec.staged_off
+            _write_all(fd, memoryview(self.slab)[at : at + rec.nbytes])
+            ok = True
+        except Exception as e:  # noqa: BLE001 - anything else would leave the job owning the region
+            log.warning("unit %d: spilling %s failed: %s", self.unit_id, b, e)
+        now = time.monotonic()
         with self._mu:
-            rec.holds -= 1
+            self._io_jobs -= 1
+            rec.staging = False
             gone = self.blobs.get(b) is not rec
+            self._drop_staged(b, rec, now, now)  # nobody ever read the IO region
             if ok and not gone:
                 rec.disk = fd
-                self.ssd_stats["demoted_bytes"] += rec.nbytes
-                self.ssd_stats["demotions"] += 1
-                self._maybe_drop_slab(b, rec, time.monotonic())
-            else:
-                # Failed or released: the slab copy stays the only copy. A blob
-                # that failed is not picked again, so a full disk ends in
-                # UnitFull instead of Busy until the deadline.
-                rec.victim = False
-                self._victims.discard(b)
-                if not ok:
-                    rec.demotable = False
-                    self.ssd_stats["demote_failures"] += 1
-            if gone and self._released_held.pop(b, None) is rec:
-                self._dispose(b, rec)
-        if fd is not None and (gone or not ok):
+                self.ssd_stats["spilled_bytes"] += rec.nbytes
+                self.ssd_stats["spills"] += 1
+            elif not gone:
+                # Not acknowledged, so nothing is lost: the put fails ("lost") and
+                # the client tries another unit.
+                del self.blobs[b]
+                self.ssd_stats["spill_failures"] += 1
+        if fd is not None and not (ok and not gone):
             _close(fd)
 
-    def _maybe_drop_slab(self, b: str, rec: BlobRec, now: float) -> None:
-        """Drop a victim's slab copy once its file is written and no pin is live."""
-        if (
-            rec.in_slab
-            and rec.disk is not None
-            and rec.holds == 0
-            and rec.pin_expiry(now) <= now
-        ):
-            self.alloc_.free(rec.off, rec.nbytes)
-            rec.in_slab = False
-            rec.pins.clear()
-            self._victims.discard(b)
-
     def _start_stage(self, b: str, rec: BlobRec, now: float) -> None:
-        """Stage a disk-only blob into the staging area, if room can be found."""
+        """Stage a disk blob into the IO area, if room can be found."""
         if not rec.wait_since:
             rec.wait_since = now
+        if self._io_jobs >= self._max_io_jobs:
+            return
         try:
             off = self.staging_.alloc(rec.nbytes)
         except UnitFull:
@@ -446,11 +370,15 @@ class NixlStorageUnit:
             try:
                 off = self.staging_.alloc(rec.nbytes)
             except UnitFull:
-                return  # staging full: stays pending until pins end / copies age
+                return  # IO area full: stays pending until pins end / copies age
         rec.staged_off = off
-        rec.staging = True
+        try:
+            self._submit_io(self._stage, b, rec)
+        except BaseException:
+            rec.staged_off = None
+            self.staging_.free(off, rec.nbytes)
+            raise
         self._staged[b] = rec
-        self._stager.submit(self._stage, b, rec)
 
     def _evict_staged(self, nbytes: int, now: float) -> None:
         """Drop unpinned staged copies, oldest first.
@@ -473,14 +401,14 @@ class NixlStorageUnit:
             r.pins.clear()
 
     def _drop_staged(self, b: str, rec: BlobRec, at: float, now: float) -> None:
-        """Free a blob's staged copy at ``at`` (caller holds ``_mu``)."""
+        """Free a blob's IO-area region at ``at`` (caller holds ``_mu``)."""
         _free_at(self.staging_, rec.staged_off, rec.nbytes, at, now)
         rec.staged_off = None
         if self._staged.get(b) is rec:
             del self._staged[b]
 
     def _stage(self, b: str, rec: BlobRec) -> None:
-        """Stager thread: read a demoted blob's file into its staging region.
+        """IO worker: read a disk blob's file into its IO-area region.
 
         While a stage runs, the fd is closed only here (``_dispose`` skips it).
         """
@@ -500,24 +428,28 @@ class NixlStorageUnit:
             log.error("unit %d: staging %s failed: %s", self.unit_id, b, e)
         now = time.monotonic()
         with self._mu:
+            self._io_jobs -= 1
             rec.staging = False
             gone = self.blobs.get(b) is not rec
             if gone or not ok:
                 self._drop_staged(b, rec, now, now)
-                if not gone:
-                    # Unreadable: the blob is lost (resolve → missing).
+                if gone:
+                    rec.disk = None
+                else:
+                    # The file may be fine: keep it and tell the next resolve once.
+                    rec.stage_failed = True
                     self.ssd_stats["stage_failures"] += 1
-                rec.disk = None
-                self._stager.submit(_close, fd)
-                return
-            rec.staged_at = now
-            rec.picked_up = False
-            wait_ms = (now - rec.wait_since) * 1000.0
-            rec.wait_since = 0.0
-            st = self.ssd_stats
-            st["staged_bytes"] += rec.nbytes
-            st["stages"] += 1
-            st["stage_wait_ms_max"] = max(st["stage_wait_ms_max"], wait_ms)
+            else:
+                rec.staged_at = now
+                rec.picked_up = False
+                wait_ms = (now - rec.wait_since) * 1000.0
+                rec.wait_since = 0.0
+                st = self.ssd_stats
+                st["staged_bytes"] += rec.nbytes
+                st["stages"] += 1
+                st["stage_wait_ms_max"] = max(st["stage_wait_ms_max"], wait_ms)
+        if gone:
+            _close(fd)
 
     # ------------------------------------------------------------------ identity
     @_locked
@@ -550,35 +482,44 @@ class NixlStorageUnit:
             off = self.alloc_.alloc(nbytes)
         except UnitFull:
             # The client spills to the next unit on UnitFull, retries on Busy.
-            if self.ssd_dir is None or not self._room(int(nbytes), now):
+            if self.ssd_dir is None:
                 raise
-            self.ssd_stats["busy_replies"] += 1
-            raise DataPlaneBusy(
-                f"unit {self.unit_id} is demoting to make room for {nbytes} B",
-                reason="pressure",
-            ) from None
+            # Spill: the put goes to disk from birth, through the IO area. The
+            # client cannot tell: it just WRITEs at the offset it is given.
+            io_off = self._alloc_io(int(nbytes), now)
+            self.blobs[blob_id] = BlobRec(
+                off=0,
+                nbytes=nbytes,
+                refs=int(n_entries),
+                created_at=now,
+                in_slab=False,
+                staged_off=io_off,
+            )
+            return self.staging_base + io_off
         self.blobs[blob_id] = BlobRec(
             off=off,
             nbytes=nbytes,
             refs=int(n_entries),
             created_at=now,
         )
-        self._demote_to_low_watermark()  # like Mooncake's PutEnd: no tick lag
         return off
 
     @_locked
-    def commit(self, blob_id: str) -> bool:
-        """The put's WRITE is DONE: the blob may be demoted from now on.
+    def commit(self, blob_id: str) -> str:
+        """The put's WRITE is DONE: ``"done"`` once the blob is durable.
 
-        False if the blob is gone (aborted); the put then fails.
+        A spilled blob is ``"pending"`` while its disk write runs (the client asks
+        again); ``"lost"`` if the blob is gone (aborted or its write failed), and
+        the put then fails.
         """
         rec = self.blobs.get(blob_id)
         if rec is None:
-            return False
-        rec.demotable = (
-            align_up(rec.nbytes, self.staging_.align) <= self.staging_.capacity
-        )
-        return True
+            return "lost"
+        if rec.in_slab or rec.disk is not None:
+            return "done"
+        if not rec.staging and self._io_jobs < self._max_io_jobs:
+            self._submit_io(self._spill, blob_id, rec)  # exactly once: staging is set
+        return "pending"
 
     @_locked
     def abort(self, blob_id: str, in_flight: bool = True) -> None:
@@ -591,11 +532,14 @@ class NixlStorageUnit:
         rec = self.blobs.pop(blob_id, None)
         if rec is None:
             return
-        if in_flight:
+        if rec.staging:
+            self._drop(blob_id, rec)  # its IO job frees the region when it ends
+        elif in_flight:
             self.retired_bytes += rec.nbytes
         elif self.ssd_dir is not None:
-            # A committed blob (commit reply lost) may be demoted, staged or
-            # being copied by now: drop it like a release.
+            # A committed blob (commit reply lost) may be on disk or staged by
+            # now, a spill not yet committed still holds its IO region: drop it
+            # like a release.
             self._drop(blob_id, rec)
         else:
             self.alloc_.free(rec.off, rec.nbytes)
@@ -621,8 +565,7 @@ class NixlStorageUnit:
     def _drop(self, blob_id: str, rec: BlobRec) -> None:
         """Free a gone blob's copies, or after the running copy of it ends."""
         if rec.holds:
-            # A checkpoint or a demotion is still copying it: free it when
-            # that copy is done.
+            # A checkpoint is still copying it: free it when that copy is done.
             self._released_held[blob_id] = rec
         else:
             self._dispose(blob_id, rec)
@@ -644,9 +587,8 @@ class NixlStorageUnit:
         elif self._staged.get(blob_id) is rec:
             # A running stage frees its own region when it sees the blob gone.
             del self._staged[blob_id]
-        self._victims.discard(blob_id)
         if rec.disk is not None and not rec.staging:
-            self._stager.submit(_close, rec.disk)  # no blocking syscall under _mu
+            self._worker.submit(_close, rec.disk)  # no blocking syscall under _mu
             rec.disk = None
 
     def _free_region(self, rec: BlobRec) -> None:
@@ -685,26 +627,27 @@ class NixlStorageUnit:
         missing: list[str] = []
         pinned: list[str] = []
         pending: list[str] = []
+        failed: list[str] = []
         for b in blob_ids:
             rec = self.blobs.get(b)
             if rec is None:
                 missing.append(b)
                 continue
             rec.last_resolve_at = now
-            if rec.victim:
-                self._maybe_drop_slab(b, rec, now)  # its pins may have just expired
-            if rec.in_slab and not rec.victim:
+            if rec.in_slab:
                 off = rec.off
+            elif rec.disk is None:
+                missing.append(b)  # a spill whose put is not acknowledged yet
+                continue
             elif rec.staged_off is not None and not rec.staging:
                 off = self.staging_base + rec.staged_off
                 rec.picked_up = True
-            elif rec.in_slab or rec.staging:
-                # A victim (demote WRITE running, or its last slab pins not yet
-                # ended), or a stage running: ask again shortly.
-                pending.append(b)
+            elif rec.staging:
+                pending.append(b)  # a stage is running: ask again shortly
                 continue
-            elif rec.disk is None:
-                missing.append(b)  # its file was lost (failed stage READ)
+            elif rec.stage_failed:
+                rec.stage_failed = False  # reported once; the next resolve retries
+                failed.append(b)
                 continue
             else:
                 self._start_stage(b, rec, now)
@@ -720,6 +663,7 @@ class NixlStorageUnit:
             "offsets": offsets,
             "missing": missing,
             "pending": pending,
+            "failed": failed,
             "slab_base": self.slab_base,
         }
 
@@ -729,8 +673,6 @@ class NixlStorageUnit:
             rec = self.blobs.get(b)
             if rec is not None:
                 rec.pins.pop(pin_id, None)
-                if rec.victim:
-                    self._maybe_drop_slab(b, rec, time.monotonic())
 
     # ------------------------------------------------------------------ introspection
     @_locked
