@@ -58,6 +58,7 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MEDIA_TENSOR_DIGESTS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
+    MediaCaptureRejected,
     MediaColumnSpec,
     media_tensor_digests,
 )
@@ -1797,7 +1798,12 @@ def test_usable_restored_prefix_is_resumed():
 
 @pytest.mark.parametrize(
     "failure",
-    ["missing chunk", "chunk newer than the worker", "digest mismatch"],
+    [
+        "missing chunk",
+        "chunk newer than the worker",
+        "digest mismatch",
+        "media row unreadable",
+    ],
 )
 def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog):
     sink = _MemorySink()
@@ -1816,6 +1822,12 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
                 )
             }
         )
+    if failure == "media row unreadable":
+        # The media comes from the same fetch, inside the same fallback.
+        def unreadable_media(chunks):
+            raise MediaCaptureRejected("Generation-prefix media metadata is missing")
+
+        worker._restore_generation_cut_media = unreadable_media
 
     with caplog.at_level(logging.WARNING):
         served, resolved = worker._resolve_usable_generation_cut(admission, [])

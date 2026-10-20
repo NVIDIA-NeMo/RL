@@ -584,7 +584,10 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   of each packed tensor, not the pixels; later token chunks carry no media.
   Recovery reprocesses the reissued request, checks its metadata and tensor
   digests against that row, and stages the reprocessed tensors in the canonical
-  terminal row. The original image or video must therefore still be resolvable
+  terminal row. A row whose media metadata cannot be read makes the call
+  regenerate from its turn boundary, like any unusable prefix; reprocessed
+  media that does not match the digests is rejected with
+  `retained_media_changed`. The original image or video must therefore still be resolvable
   by vLLM when the request is reissued: this path does not provide
   source-free media prefill if the original media has disappeared.
   Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
