@@ -37,6 +37,7 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    vllm_timeline_fields,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
@@ -1179,3 +1180,31 @@ def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
 
     assert isinstance(metrics, dict)
     assert stub._step_metrics_snapshot is None
+
+
+def test_timeline_fields_convert_engine_monotonic_stats_to_epoch_us():
+    stats = SimpleNamespace(
+        queued_ts=10.0, scheduled_ts=10.5, first_token_ts=11.0, last_token_ts=12.25
+    )
+    offset_ns = 1_700_000_000_000_000_000
+
+    fields = vllm_timeline_fields(SimpleNamespace(metrics=stats), offset_ns)
+
+    assert fields == {
+        "nemo_llm_queued_ts_us": 1_700_000_010_000_000,
+        "nemo_llm_first_scheduled_ts_us": 1_700_000_010_500_000,
+        "nemo_llm_first_token_ts_us": 1_700_000_011_000_000,
+        "nemo_llm_last_token_ts_us": 1_700_000_012_250_000,
+    }
+
+
+def test_timeline_fields_omit_unset_stats_and_missing_metrics():
+    stats = SimpleNamespace(
+        queued_ts=10.0, scheduled_ts=0.0, first_token_ts=0.0, last_token_ts=0.0
+    )
+
+    assert vllm_timeline_fields(SimpleNamespace(metrics=stats), 0) == {
+        "nemo_llm_queued_ts_us": 10_000_000
+    }
+    # disable_log_stats=True leaves RequestOutput.metrics unset.
+    assert vllm_timeline_fields(SimpleNamespace(metrics=None), 0) == {}
