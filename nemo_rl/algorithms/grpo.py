@@ -298,7 +298,7 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -1353,13 +1353,15 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
-    if generation_config["backend"] == "megatron":
-        async_grpo_config = grpo_config.async_grpo
-        recompute_kv_cache = bool(
-            async_grpo_config is not None
-            and async_grpo_config.recompute_kv_cache_after_weight_updates
-        )
+    # `kv_cache_management_mode="recompute"`; the async loop's flag must agree.
+    # Synchronous GRPO does not consume this flag.
+    async_grpo_config = grpo_config.async_grpo
+    if (
+        generation_config["backend"] == "megatron"
+        and async_grpo_config is not None
+        and async_grpo_config.enabled
+    ):
+        recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
         kv_cache_mode = generation_config["mcore_generation_config"][
             "kv_cache_management_mode"
         ]
