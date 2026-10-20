@@ -242,7 +242,6 @@ def test_packed_broadcast_producer_consumer_roundtrip(
         assert consumer_group.current_index == 6
         assert producer_group.broadcasted_tensors[0].item() == 0
 
-
     # Verify all parameters were unpacked
     assert len(unpacked_tensors) == len(params)
 
@@ -468,6 +467,50 @@ def test_packed_broadcast_preflight_checked_skips_readiness_token():
     assert consumer_group.current_index == checked_group.broadcast_count
     for name, tensor in params:
         assert torch.equal(unpacked[name], tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    ("producer_checked", "consumer_checked"), [(True, False), (False, True)]
+)
+def test_packed_broadcast_preflight_checked_mismatch_is_detected(
+    producer_checked, consumer_checked
+):
+    params = [
+        ("layer1.weight", torch.randn(4, 4, device="cuda")),
+        ("layer1.bias", torch.randn(4, device="cuda")),
+    ]
+    producer_group = MockCommunicationGroup()
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=producer_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+        preflight_checked=producer_checked,
+    )
+
+    consumer_group = MockConsumerCommunicationGroup(producer_group.broadcasted_tensors)
+    unpacked = {}
+
+    def consume():
+        packed_broadcast_consumer(
+            iterator=iter(create_mock_state_dict_info(params).items()),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=lambda batch: unpacked.update(batch),
+            preflight_checked=consumer_checked,
+        )
+
+    if producer_checked:
+        # The consumer reads the first payload buffer as the readiness token.
+        with pytest.raises(RuntimeError):
+            consume()
+        return
+
+    # The consumer reads the token as payload and leaves the last frame unread.
+    consume()
+    assert consumer_group.current_index < producer_group.broadcast_count
+    assert not all(torch.equal(unpacked[name], tensor) for name, tensor in params)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

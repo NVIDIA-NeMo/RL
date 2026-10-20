@@ -881,3 +881,95 @@ def test_raise_export_status_maps_codes_and_unknown_to_protocol_error() -> None:
         )
     with pytest.raises(ValueError, match="PROTOCOL_ERROR"):
         _raise_export_status(99, "unknown", cp_rank=1, pp_ranks=(2,))
+
+
+def _raise_in_exporter() -> list[tuple[str, torch.Tensor]]:
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize(
+    ("items", "limits", "expected_status", "detail"),
+    [
+        (_raise_in_exporter, {}, "EXPORTER_ERROR", "exporter raised RuntimeError"),
+        ([], {}, "MANIFEST_INVALID", "no tensors"),
+        (
+            [("a", torch.zeros(1)), ("b", torch.zeros(1))],
+            {"_DRAFT_REFIT_MAX_TENSORS": 1},
+            "MANIFEST_INVALID",
+            "more than 1 tensors",
+        ),
+        ([("a", torch.zeros(1), 0)], {}, "MANIFEST_INVALID", "not a (name, tensor)"),
+        ([("", torch.zeros(1))], {}, "MANIFEST_INVALID", "empty or non-string"),
+        ([(7, torch.zeros(1))], {}, "MANIFEST_INVALID", "empty or non-string"),
+        (
+            [("a", torch.zeros(1)), ("a", torch.zeros(1))],
+            {},
+            "MANIFEST_INVALID",
+            "duplicate tensor name: a",
+        ),
+        ([("a", [0.0])], {}, "MANIFEST_INVALID", "non-tensor value for a"),
+        (
+            [("a", torch.zeros(2).to_sparse())],
+            {},
+            "MANIFEST_INVALID",
+            "non-strided tensor for a",
+        ),
+        (
+            [("a", torch.zeros(1, dtype=torch.float8_e4m3fn))],
+            {},
+            "MANIFEST_INVALID",
+            "unsupported dtype",
+        ),
+        (
+            [("a", torch.zeros(1))],
+            {"_DRAFT_REFIT_DEVICE_TO_CODE": {"cuda": 1, "meta": 2}},
+            "MANIFEST_INVALID",
+            "unsupported device cpu for a",
+        ),
+        (
+            [("a", torch.zeros((1,) * 3))],
+            {"_DRAFT_REFIT_MAX_NDIM": 2},
+            "MANIFEST_INVALID",
+            "rank-3 tensor for a",
+        ),
+        (
+            [("a", torch.zeros(1)), ("b", torch.zeros(1, device="meta"))],
+            {},
+            "MANIFEST_INVALID",
+            "multiple device types",
+        ),
+        ([("\ud800", torch.zeros(1))], {}, "MANIFEST_INVALID", "non-UTF-8"),
+        (
+            [("abc", torch.zeros(1)), ("def", torch.zeros(1))],
+            {"_DRAFT_REFIT_MAX_UTF8_BYTES": 5},
+            "MANIFEST_INVALID",
+            "UTF-8 metadata limit",
+        ),
+    ],
+)
+def test_materialize_draft_refit_export_rejects_invalid_exports(
+    monkeypatch, items, limits, expected_status, detail
+) -> None:
+    for name, value in limits.items():
+        monkeypatch.setattr(draft_utils, name, value)
+    exporter = items if callable(items) else lambda: iter(items)
+
+    export = draft_utils._materialize_draft_refit_export(exporter)
+
+    assert export.status == getattr(
+        draft_utils, f"_DRAFT_REFIT_STATUS_{expected_status}"
+    )
+    assert detail in export.detail
+    assert export.manifest == () and export.tensors == ()
+
+
+def test_materialize_draft_refit_export_accepts_valid_export() -> None:
+    tensors = [("a", torch.zeros(2)), ("b", torch.ones(1, 3, dtype=torch.bfloat16))]
+
+    export = draft_utils._materialize_draft_refit_export(lambda: iter(tensors))
+
+    assert export.status == draft_utils._DRAFT_REFIT_STATUS_OK
+    assert [spec.name for spec in export.manifest] == ["a", "b"]
+    assert export.manifest[1].shape == (1, 3)
+    assert export.manifest[1].dtype == torch.bfloat16
+    assert [name for name, _ in export.tensors] == ["a", "b"]
