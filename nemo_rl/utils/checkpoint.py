@@ -94,7 +94,7 @@ def _finalize_telemetry(
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     """Load common state from either legacy or current MCore checkpoints."""
-    # Keep the optional MCore dependency out of DTensor and Automodel imports.
+    # Keep the optional MCore dependency out of the Automodel imports.
     try:
         from megatron.core.dist_checkpointing import load_common_state_dict
     except ImportError as error:
@@ -165,7 +165,7 @@ class PretrainedCheckpointConfig(TypedDict):
 
     When set, the policy will restore its initial weights from this checkpoint
     instead of loading them from ``model_name``. Supported by the Megatron backend
-    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+    only; the Automodel backend continues to use HuggingFace weights via ``model_name``.
 
     Attributes:
         path: Filesystem path to the checkpoint to load.
@@ -327,7 +327,7 @@ class CheckpointManager:
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
-            # DTensor path
+            # Automodel path
             if optimizer_path.exists():
                 return weights_path, optimizer_path
 
@@ -355,7 +355,7 @@ class CheckpointManager:
                         return weights_path, optimizer_path
 
             warnings.warn(
-                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"Optimizer state not found at {optimizer_path} (Automodel path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
                 "Optimizer will be freshly initialized.",
                 stacklevel=2,

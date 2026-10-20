@@ -66,6 +66,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     compute_seq_logprob_errors,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -194,6 +195,7 @@ from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
     validate_offload_policy_before_refit,
 )
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -296,7 +298,7 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -1351,13 +1353,15 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
-    if generation_config["backend"] == "megatron":
-        async_grpo_config = grpo_config.async_grpo
-        recompute_kv_cache = bool(
-            async_grpo_config is not None
-            and async_grpo_config.recompute_kv_cache_after_weight_updates
-        )
+    # `kv_cache_management_mode="recompute"`; the async loop's flag must agree.
+    # Synchronous GRPO does not consume this flag.
+    async_grpo_config = grpo_config.async_grpo
+    if (
+        generation_config["backend"] == "megatron"
+        and async_grpo_config is not None
+        and async_grpo_config.enabled
+    ):
+        recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
         kv_cache_mode = generation_config["mcore_generation_config"][
             "kv_cache_management_mode"
         ]
@@ -1997,9 +2001,10 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info()
             if policy_generation is not None:
-                policy_generation.prepare_refit_info(state_dict_info)
+                initialize_refit_metadata(policy, policy_generation)
+            else:
+                policy.prepare_refit_info()
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2836,10 +2841,15 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
+        configured_buffer_size_bytes = (
+            None
+            if _refit_buffer_size_gb is None
+            else int(_refit_buffer_size_gb * 1024**3)
+        )
         if colocated_inference:
             # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
+            if configured_buffer_size_bytes is not None:
+                buffer_size_bytes = configured_buffer_size_bytes
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -2862,7 +2872,7 @@ def refit_policy_generation(
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM)
+            # update weights through collective transport
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )
@@ -4060,6 +4070,7 @@ def _grpo_train_impl(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "filtered_reward",
@@ -4072,6 +4083,7 @@ def _grpo_train_impl(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_draft_ratio_metrics(metrics)
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -4910,6 +4922,7 @@ def async_grpo_train(
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
@@ -5110,6 +5123,7 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -5817,6 +5831,7 @@ def async_grpo_train(
                                 policy,
                                 policy_generation,
                                 colocated_inference,
+                                _refit_buffer_size_gb=refit_buffer_size_gb,
                             )
                             POLICY_GENERATION_STALE = False
 
@@ -5977,6 +5992,7 @@ def async_grpo_train(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "global_valid_seqs",
@@ -5986,6 +6002,7 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                finalize_draft_ratio_metrics(metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics

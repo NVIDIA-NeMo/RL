@@ -26,7 +26,7 @@ single `ValueError` listing every violation. The current requirements are:
 
 * **Non-colocated only** — `policy.generation.colocated.enabled=false`. The colocated
   path uses IPC and is unaffected by this feature.
-* **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the DTensor
+* **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel
   training backend is not supported yet.).
 * **vLLM or Megatron generation backend** — `policy.generation.backend` must be
   `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
@@ -378,6 +378,15 @@ generation side maps those HF names onto whatever its own storage layout is.
   fused components, and quantize into persistent storage with fresh scales.
   Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
+
+Parameter-spec construction lives in two stateless collections in the existing
+backend files. `MegatronReshardParamSpecCollection` provides `_default_param_spec`
+and `_grouped_expert_spec` for source hooks. `VllmReshardParamSpecCollection`
+provides `_direct_param_spec`, `_default_staged_param_spec`, and the separate
+MXFP8, blockwise FP8, and TRTLLM grouped-expert factories. Workers retain parameter
+discovery, shared metadata and scale validation, factory selection, map construction,
+communicator lifecycle, and transport orchestration. The TRTLLM factory owns its
+destination-shard, mesh, expert-divisibility, and registered-name checks.
 
 **To extend to a new backend**, provide a destination map from canonical HF weights
 to that backend's local storage. Both backends implement this as

@@ -268,6 +268,10 @@ class GenerationConfig(TypedDict):
     _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # The trainer streams the drafter's full weight set (incl. embed/lm_head)
+    # on refit (Automodel draft co-training); drafter module sharing must be
+    # disabled and the draft manifest is validated exactly.
+    _draft_full_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
     # Populated from grpo.debug_payload_metrics; not meant to be set by the user.
     _debug_payload_metrics: NotRequired[bool]
@@ -438,6 +442,7 @@ class CollectiveSenderSpec:
     nccl_peer: str = "nemo"
     buffer_size_bytes: int | None = None
     num_buffers: int | None = None
+    use_legacy_packing: bool = False
 
 
 def agreed_media_columns(
@@ -590,8 +595,17 @@ class GenerationInterface(ABC):
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            Optionally, the parameter names the backend wants pre-quantized on
+            the trainer before streaming (e.g. vllm_cfg.refit_prequantize);
+            None when no trainer-side pre-quantization is requested. The vLLM
+            implementation also installs its FP8 configuration on the workers.
+        """
         raise NotImplementedError
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -699,41 +713,63 @@ class GenerationInterface(ABC):
             f"token_capture.enabled is not supported for {type(self).__name__}"
         )
 
-    # Optional hook; backends may override to invalidate any reusable caches
-    # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:
+        """Confirm stale KV state cannot be reused after a weight update.
+
+        Backends may implement this by invalidating active-request KV state directly or
+        by performing equivalent engine-side handling atomically with refit. Clearing
+        only unreferenced prefix-cache entries is insufficient while requests are active.
+
+        Returns:
+            True only when the backend guarantees the recompute contract; False when it
+            is unsupported or could not be completed.
+        """
         return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
-        """Pause in-flight generation while preserving request state.
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Arrange a safe generation pause around the upcoming weight refit.
 
         Backends with native in-flight refit support override this hook. The default
         implementation warns once per backend type and lets the refit continue with
-        the backend's existing in-flight behavior. On supported backends, in-flight
-        requests are frozen rather than aborted and resume from
-        :meth:`resume_generation_after_refit`; new requests queue until then.
+        the backend's existing in-flight behavior. Native pause implementations
+        freeze requests until :meth:`resume_generation_after_refit`. A backend
+        may instead acknowledge a lifecycle owned by its weight synchronizer,
+        which must pause and handle the requested cache clearing before transfer
+        and resume before returning. Such backends document their request handling
+        and timeout semantics; for example, SGLang may retract or abort requests.
 
         Args:
             clear_cache: Also clear the engine's reusable caches at pause time so
                 preserved requests recompute their KV after the weight update.
+            timeout_s: Maximum time to wait for engines to pause; None waits indefinitely.
 
         Returns:
-            True if every engine paused; False when the backend has no native pause
-            support. Backends with native support raise when pausing fails.
+            True if every engine paused or the weight synchronizer guarantees the
+            lifecycle above; False when neither is supported. Pause failures raise
+            from this hook or the synchronizer that owns the pause.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def resume_generation_after_refit(self) -> bool:
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
         """Resume generation paused by :meth:`pause_generation_for_refit`.
 
         The default implementation shares the once-per-backend warning emitted by
         :meth:`pause_generation_for_refit` and lets the refit continue for backends
         without native pause/resume support.
 
+        Args:
+            timeout_s: Maximum time to wait for engines to resume; None waits indefinitely.
+
         Returns:
-            True if every engine resumed; False when the backend has no native resume
-            support. Backends with native support raise when resuming fails.
+            True if every surviving engine resumed, including when the weight
+            synchronizer already performed the resume; False when neither path is
+            supported. With fleet health, confirmed dead engines may be excluded
+            if enough survivors remain. Other resume failures raise.
         """
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False

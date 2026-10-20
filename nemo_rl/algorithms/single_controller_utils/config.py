@@ -318,8 +318,9 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
     # the deadline knowing there is no second chance.
     #
-    # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # None disables the collective watchdog and controller's transfer deadline.
+    # Generation pause/resume still have a 360s timeout. Set this well above a healthy
+    # refit, because the cost of firing early is
     # aborting a run that was merely slow, while the cost of firing late is only that a
     # wedge lasts longer before it is broken.
     #
@@ -493,7 +494,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         default_factory=GenerationRouterConfig
     )
     # Recompute generation KV caches after each weight update.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -1217,13 +1218,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
-    # setup_data_plane unconditionally, so a DTensor critic dies in Ray with the
+    # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the
     # model already on GPU. ppo_math_1B.yaml ships automodel_cfg.enabled=true.
     value_megatron_cfg = master_config.value.get("megatron_cfg", {})  # type: ignore
     if not value_megatron_cfg.get("enabled"):
         raise ValueError(
             "PPO on the SingleController path requires a Megatron critic "
-            "(value.megatron_cfg.enabled=true). The DTensor value worker does not "
+            "(value.megatron_cfg.enabled=true). The Automodel value worker does not "
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
