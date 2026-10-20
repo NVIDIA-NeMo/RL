@@ -1273,8 +1273,8 @@ Depending on your data shape, you may want to change these values."""
         resolve against), so these rows are structurally off-chain and do not
         poison; if the *terminal* request itself ended this way, the
         missing-terminal-row check below still masks the rollout. A Gym that
-        predates the set names only the uncommitted-call reason, and the
-        fallback below keeps that rule on such a pin. Every other failure
+        exports no such set names only the uncommitted-call reason, and the
+        fallback below applies that rule on such a Gym. Every other failure
         reason (for example ``worker_capture_failed``,
         ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
         reason-less failure row poisons as ``capture_failed``) marks a call
@@ -1331,9 +1331,8 @@ Depending on your data shape, you may want to change these values."""
                 else:
                     selection_reason = selection.reason
         # Gym names the ledger reasons of a call that served no completion in
-        # one set (an engine refusal joined the uncommitted call in
-        # NVIDIA-NeMo/Gym#3980); a Gym without the set has only the
-        # uncommitted-call reason, so the fallback keeps today's rule there.
+        # one set; a Gym that exports no set has only the uncommitted-call
+        # reason, so the fallback applies that rule there.
         unserved_reasons = getattr(
             token_id_capture,
             "UNSERVED_CALL_FAILURE_REASONS",

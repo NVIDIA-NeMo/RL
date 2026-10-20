@@ -247,17 +247,24 @@ def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names(
     monkeypatch,
 ) -> None:
     """Gym names the ledger reasons of a call that served no completion in
-    ``UNSERVED_CALL_FAILURE_REASONS``; an engine refusal (the prompt no longer
-    fit the context window) joined the uncommitted call there. Neither call can
-    be a lineage parent, so neither row poisons the verified chain."""
+    ``UNSERVED_CALL_FAILURE_REASONS``: the uncommitted call and the engine
+    refusal (the prompt no longer fit the context window). Neither call can be
+    a lineage parent, so neither row poisons the verified chain. The rows are
+    built from Gym's own reason names where the pinned Gym exports them:
+    ``UNCOMMITTED_CALL_REASON`` is read from Gym, and
+    ``ENGINE_REFUSED_CALL_REASON`` is read from Gym when it exports the name
+    and spelled here otherwise. The set itself is installed here, because a
+    Gym without it gives the builder nothing to read."""
     import nemo_gym.token_id_capture as token_id_capture
 
+    uncommitted = token_id_capture.UNCOMMITTED_CALL_REASON
+    engine_refused = getattr(
+        token_id_capture, "ENGINE_REFUSED_CALL_REASON", "engine_refused_request"
+    )
     monkeypatch.setattr(
         token_id_capture,
         "UNSERVED_CALL_FAILURE_REASONS",
-        frozenset(
-            {"request_finished_without_staged_coordinates", "engine_refused_request"}
-        ),
+        frozenset({uncommitted, engine_refused}),
         raising=False,
     )
     env = _capture_env()
@@ -265,11 +272,8 @@ def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names(
         "rollout_id": "r0",
         "records": [_manifest_record("c1"), _manifest_record("c2", parent="c1")],
         "failures": [
-            {"model_call_id": "c3", "reason": "engine_refused_request"},
-            {
-                "model_call_id": "c4",
-                "reason": "request_finished_without_staged_coordinates",
-            },
+            {"model_call_id": "c3", "reason": engine_refused},
+            {"model_call_id": "c4", "reason": uncommitted},
         ],
     }
     receipt = env._assemble_receipt(
@@ -283,9 +287,9 @@ def test_receipt_assembly_ignores_every_unserved_call_reason_gym_names(
 def test_receipt_assembly_keeps_the_uncommitted_rule_on_a_gym_without_the_set(
     monkeypatch,
 ) -> None:
-    """A Gym that predates ``UNSERVED_CALL_FAILURE_REASONS`` names only the
+    """A Gym that exports no ``UNSERVED_CALL_FAILURE_REASONS`` names only the
     uncommitted-call reason: that row stays off-chain, and a refusal row such
-    a Gym could not have written poisons like any other failure."""
+    a Gym does not write poisons like any other failure."""
     import nemo_gym.token_id_capture as token_id_capture
 
     monkeypatch.delattr(
