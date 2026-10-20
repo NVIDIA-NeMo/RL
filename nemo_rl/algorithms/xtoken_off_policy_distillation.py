@@ -247,7 +247,7 @@ def setup(
         f"tokenizers for {len(teachers)} teachers."
     )
 
-    # Backend gate: DTensor only, for the student and every teacher. Unlike
+    # Backend gate: Automodel only, for the student and every teacher. Unlike
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.

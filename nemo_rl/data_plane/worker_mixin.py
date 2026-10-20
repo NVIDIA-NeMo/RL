@@ -345,7 +345,7 @@ class TQWorkerMixin:
         """NCCL group of TP×CP×PP siblings within this DP rank.
 
         ``None`` means "no siblings" (TP=CP=PP=1). Subclasses must
-        override using their parallelism state (DTensor ``device_mesh``,
+        override using their parallelism state (Automodel ``device_mesh``,
         Megatron ``parallel_state``). Returning ``None`` makes
         :meth:`_fetch` use independent fetch; returning a group makes
         it use leader-fetch + NCCL broadcast.
@@ -762,7 +762,7 @@ class TQWorkerMixin:
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
 
-        Subclasses MUST override: DTensor reads ``device_mesh``,
+        Subclasses MUST override: Automodel reads ``device_mesh``,
         Megatron reads ``parallel_state``. There's no honest default —
         a missing impl would silently make every rank a writeback
         leader and re-create the ``-601 ILLEGAL_CLIENT`` duplicate-write
