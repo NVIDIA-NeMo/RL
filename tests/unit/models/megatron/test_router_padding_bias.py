@@ -325,33 +325,57 @@ def test_delegated_packing_cannot_silently_drop_router_mask(monkeypatch):
             delegate_pack_to_model=True,
             pad_individual_seqs_to_multiple_of=4,
             create_packed_seq_padding_mask=True,
-            create_nonpacked_router_padding_mask=True,
         )
 
 
-def test_delegated_packing_allows_hybridep_mask_without_bias_updates(monkeypatch):
-    """HybridEP requests packed padding masks even with expert-bias updates off.
+@pytest.mark.parametrize("bias_updates", [False, True])
+def test_hybridep_self_packing_requests_mask_only_for_bias_updates(
+    monkeypatch, bias_updates
+):
+    """HybridEP with model-owned packing (e.g. Qwen3.5) and expert-bias updates off.
 
-    A self-packing model (e.g. Qwen3.5 with HybridEP, moe_router_bias_update_rate=0)
-    never received that mask, so the request alone must not reject the batch.
+    The iterator must not request a router padding mask the self-packing model
+    cannot carry; an expert-bias request is still rejected.
     """
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.megatron import data as module
 
+    monkeypatch.setattr(BatchedDataDict, "to", lambda self, device: self)
     monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
     monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
-    result = module.process_microbatch(
-        _packed_batch(),
+    batch = _packed_batch()
+    batch.micro_batch_indices = [[[0, 2]]]
+    batch.micro_batch_lengths = [[8]]
+    cfg = {
+        "megatron_cfg": {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "sequence_parallel": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+        },
+        "sequence_packing": {"enabled": True},
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 4,
+    }
+    iterator, *_ = module.get_microbatch_iterator(
+        batch,
+        cfg,
+        mbs=1,
+        straggler_timer=None,
         seq_length_key="input_lengths",
-        pack_sequences=True,
         delegate_pack_to_model=True,
-        pad_individual_seqs_to_multiple_of=4,
-        create_packed_seq_padding_mask=True,
-        create_nonpacked_router_padding_mask=False,
+        create_router_padding_mask=bias_updates,
     )
-
-    # The model still receives the unpacked rows it packs itself, with no mask.
-    assert result.padding_mask is None
-    assert result.input_ids_cp_sharded.shape == (2, 8)
+    if bias_updates:
+        with pytest.raises(NotImplementedError, match="real-token validity"):
+            next(iterator)
+    else:
+        processed = next(iterator)
+        # The model still receives unpacked rows to pack itself, with no mask.
+        assert processed.padding_mask is None
+        assert processed.input_ids_cp_sharded.shape == (2, 8)
 
 
 @pytest.mark.parametrize("chunkwise", [False, True])

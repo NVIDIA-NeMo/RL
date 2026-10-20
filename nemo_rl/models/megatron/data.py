@@ -452,8 +452,12 @@ def get_microbatch_iterator(
     elif cfg["sequence_packing"]["enabled"]:
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
-        # statistics with any dispatcher, not only HybridEP.
-        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        # statistics with any dispatcher, not only HybridEP. A self-packing model
+        # never receives a caller-built mask, so HybridEP alone requests none
+        # there; an expert-bias request still does and is rejected downstream.
+        create_packed_seq_padding_mask = (
+            uses_hybridep and not delegate_pack_to_model
+        ) or create_router_padding_mask
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
@@ -773,8 +777,6 @@ def process_microbatch(
 
     ``create_nonpacked_router_padding_mask`` opts supported MoE models into
     right-padding exclusion using input lengths, independent of the loss mask.
-    It is set whenever expert-bias updates need router padding masks, so it also
-    rejects model-owned packing, which cannot carry real-token validity.
     """
     prepacked = "cu_seqlens" in data_dict
     if (
@@ -922,10 +924,7 @@ def process_microbatch(
                         )
                 attention_mask = None
             elif delegate_pack_to_model:
-                # Only expert-bias updates need real-token validity here. HybridEP
-                # also requests packed padding masks, but a self-packing model
-                # never received one, so that request alone must not fail.
-                if create_nonpacked_router_padding_mask:
+                if create_packed_seq_padding_mask:
                     raise NotImplementedError(
                         "Router padding masks require real-token validity through "
                         "model-owned sequence packing, which is not supported."
