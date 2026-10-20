@@ -851,7 +851,7 @@ class MegatronPolicyWorkerImpl(
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
-        enable_batch_invariant_mode(config)
+        enable_batch_invariant_mode(config, generation_only=is_refit_destination)
         torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files

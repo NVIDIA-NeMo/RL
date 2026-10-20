@@ -447,9 +447,13 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
     return resolved
 
 
-def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+def enable_batch_invariant_mode(
+    config: PolicyConfig, *, generation_only: bool = False
+) -> None:
     """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
-    validate_zero_train_gen_kl(config, check_environment=True)
+    validate_zero_train_gen_kl(
+        config, check_environment=True, generation_only=generation_only
+    )
     if config["megatron_cfg"].get("batch_invariant_mode"):
         enable_batch_invariant_kernels(config)
 

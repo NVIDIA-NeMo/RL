@@ -602,6 +602,25 @@ def test_generation_config_never_runs_the_inference_training_forward():
     )
 
 
+@pytest.mark.parametrize("precision", ["mxfp8", "nvfp4"])
+def test_dedicated_generation_policy_passes_validation(precision):
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    config = _inference_training_forward_config(precision)
+    generation_policy = {
+        **config,
+        "megatron_cfg": merged_inference_megatron_cfg(config),
+    }
+
+    assert _validate(generation_policy, generation_only=True).violations == []
+    assert any(
+        "requires policy.megatron_cfg.moe_inference_training_forward=true" in v
+        for v in _validate(generation_policy).violations
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Package and platform gates
 # --------------------------------------------------------------------------- #
@@ -816,6 +835,10 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
     )
     monkeypatch.setattr(
         zgm, "_use_full_vocab_log_softmax", lambda: shimmed.append(True)
+    )
+    tuned: list[bool] = []
+    monkeypatch.setattr(
+        zgm, "_enable_mcore_deterministic_tuning", lambda: tuned.append(True)
     )
     tuned: list[bool] = []
     monkeypatch.setattr(

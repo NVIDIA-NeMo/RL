@@ -100,14 +100,21 @@ def validate_zero_train_gen_mismatch(
     *,
     check_packages: bool = True,
     check_platform: bool = True,
+    generation_only: bool = False,
 ) -> ZeroTrainGenValidation:
-    """Run all zero-KL gates; return violations and non-fatal warnings."""
+    """Run all zero-KL gates; return violations and non-fatal warnings.
+
+    ``generation_only`` is for a dedicated generation policy, whose
+    ``megatron_cfg`` is the merged inference config: the training-only
+    ``moe_inference_training_forward`` is cleared there, so the checks on the
+    training side's value are left to the driver, which sees the full config.
+    """
     out = ZeroTrainGenValidation()
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
     _validate_required_values(config, out)
-    _validate_backend(config, out)
+    _validate_backend(config, out, generation_only=generation_only)
     _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
@@ -427,13 +434,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
 
 
 def validate_zero_train_gen_kl(
-    config: PolicyConfig, *, check_environment: bool
+    config: PolicyConfig, *, check_environment: bool, generation_only: bool = False
 ) -> None:
     """Raise if the zero-KL / batch-invariant config is invalid.
 
     ``check_environment=False`` runs only the config checks, so the driver can
     call it before Ray allocates GPUs; workers also check the installed
-    packages and the GPU.
+    packages and the GPU. ``generation_only`` is as in
+    :func:`validate_zero_train_gen_mismatch`.
     """
     if "megatron_cfg" not in config:  # Automodel policies
         return
@@ -441,6 +449,7 @@ def validate_zero_train_gen_kl(
         config,
         check_packages=check_environment,
         check_platform=check_environment,
+        generation_only=generation_only,
     )
     result.emit_warnings()
     result.raise_if_invalid(
@@ -465,7 +474,9 @@ def _validate_required_values(
             )
 
 
-def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
+def _validate_backend(
+    config: PolicyConfig, out: ZeroTrainGenValidation, *, generation_only: bool = False
+) -> None:
     generation = config.get("generation")
     if generation is None or generation.get("backend") != "megatron":
         out.violations.append(
@@ -493,7 +504,8 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
         fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
     ) or inference_cfg.get("inference_moe_nvfp4_recipe") is not None
     if (
-        impl == "inference_optimized"
+        not generation_only
+        and impl == "inference_optimized"
         and backend == "flashinfer"
         and quantized_experts
         and not config["megatron_cfg"].get("moe_inference_training_forward")
