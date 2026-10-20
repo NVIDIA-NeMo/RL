@@ -164,7 +164,7 @@ def _make_master_config(
         # The megatron build path reads these before any generation factory runs.
         generation_config["mcore_generation_config"] = {
             "expose_http_server": False,
-            "kv_cache_management_mode": "persist",
+            "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
     return MasterConfig.model_construct(
@@ -1484,11 +1484,11 @@ class TestSetup:
                 colocated=False, backend="megatron", megatron_enabled=False
             )
         elif invalid_case == "megatron_recompute_mismatch":
-            # Flag says recompute; the engine mode (fixture default "persist") disagrees.
+            # The opt-out disagrees with the fixture's default recompute mode.
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
             )
-            mc.async_rl.recompute_kv_cache_after_weight_updates = True
+            mc.async_rl.recompute_kv_cache_after_weight_updates = False
         elif invalid_case == "megatron_fleet_health":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
