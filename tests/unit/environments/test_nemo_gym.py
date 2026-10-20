@@ -2325,10 +2325,10 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
 
 
-def test_spinup_refuses_an_empty_server_mapping_by_name():
+def test_refuse_empty_server_mappings_names_each_empty_entry():
     """An empty server entry, or an entry whose first server-type group is
     empty, would crash NeMo-Gym's launcher with a bare IndexError at one of
-    its two index levels."""
+    its two index levels; the guard refuses both and names them."""
     from omegaconf import DictConfig
 
     with pytest.raises(

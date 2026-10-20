@@ -364,17 +364,21 @@ def _refuse_empty_server_mappings(
     """
     from omegaconf import DictConfig, OmegaConf
 
+    entries: Mapping[Any, Any] = global_config_dict
     if isinstance(global_config_dict, DictConfig):
         # Reading a DictConfig value resolves interpolations such as
         # ``${oc.env:NEMO_RL_POLICY_API_KEY}``, which may name variables set
         # only in the server processes; the structure is all this guard needs.
-        global_config_dict = OmegaConf.to_container(global_config_dict, resolve=False)
+        container = OmegaConf.to_container(global_config_dict, resolve=False)
+        # A DictConfig always converts to a dict; the check narrows the type.
+        assert isinstance(container, Mapping)
+        entries = container
     empty_mappings: list[str] = []
-    for key, value in global_config_dict.items():
+    for key, value in entries.items():
         if key in reserved_keys or not isinstance(value, Mapping):
             continue
         if len(value) == 0:
-            empty_mappings.append(key)
+            empty_mappings.append(str(key))
             continue
         # The launcher indexes only the entry's first key.
         first_key, first_value = next(iter(value.items()))
