@@ -6,7 +6,7 @@
 # SWE and TB are unchanged. GDPval runs as in hiteshis's OpenHands arm (gdpval-oh-web-gopo-mercor-02, step 46):
 # - OpenHands v3 (CodeAct) runs inside a per-rollout OpenSandbox sandbox (image gdpval:aa-v2-amd64, 8 CPU /
 #   48 GiB / 60 GiB) and calls the policy through the rollout-prefixed Gym URL, so token capture (the ledger) sees
-#   every call; up to 200 turns and the SWE agents' wall-clock budget per rollout, 900 s per model call, the whole trajectory within
+#   every call; up to 200 turns and 3600 s per rollout (7200 s with sandbox, install and judge), 900 s per model call, the whole trajectory within
 #   policy.max_total_sequence_length (no compaction).
 # - The resources server seeds the task (prompt + reference files), collects /workspace deliverables and judges
 #   them against the task's rubric through the upstream gdpval server: reward = rubric points / max points in
@@ -25,9 +25,9 @@ defaults: ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml
 async_rl:
   rollout_failure:
     nemo_gym:
-      # GDPval agent budget + 1 h for sandbox create (ready <= 1200 s), harness install (<= 900 s) and the judge
-      # (<= 1200 s); SWE / TB / search rollouts end within their own budgets anyway.
-      rollout_timeout_s: ${add:${env.nemo_gym.gdpval_train.responses_api_agents.gdpval_sandboxed_agent.agent_timeout},3600}
+      # GDPval agent budget (3600 s) + 1 h for sandbox create (ready <= 1200 s), harness install (<= 900 s) and the
+      # judge (<= 1200 s); SWE / TB / search rollouts end within their own budgets anyway.
+      rollout_timeout_s: 7200
   stall_watchdog:
     # A GDPval group can take ~2 h; warn-only either way.
     stall_timeout_s: 10800.0
@@ -81,9 +81,11 @@ env:
           remote_openhands_archive_path: ${oc.env:GDPVAL_HARNESS_DIR}/runtime.tar.gz
           harness_install_timeout: 900
           agent_max_turns: 200
-          # Same wall-clock budget as the SWE agents (user, 2026-10-20: "make gdpval timeout same as swe"; hiteshis's
-          # 4800 s came with an inherited SWE overlay, their first GDPval config used 3600 s = SWE's).
-          agent_timeout: ${env.nemo_gym.swe_rebench_opencode_sandboxed_agent.responses_api_agents.opencode_sandboxed_agent.sandbox_timeout}
+          # 3600 s in collection and PPO alike (user, 2026-10-20: "make gdpval timeout same as swe", then "for ppo
+          # default to 3600s too and 7200"): the SWE collection budget. Not tied to the SWE agents' sandbox_timeout,
+          # whose PPO default is the launcher's 2700 s. hiteshis's 4800 s came with an inherited SWE overlay (their
+          # first GDPval config used 3600 s).
+          agent_timeout: 3600
           max_context: ${policy.max_total_sequence_length}
           max_output_tokens: ${policy.max_total_sequence_length}
           checkpoint: ${policy.model_name}
