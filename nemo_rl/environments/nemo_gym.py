@@ -462,10 +462,13 @@ class NemoGymConfig(TypedDict):
 
 
 # The env.nemo_gym keys the driver's rollout loop reads (see NemoGymConfig).
+NEMO_GYM_HEALTH_CHECK_INTERVAL_KEY = "health_check_interval_seconds"
+NEMO_GYM_MAX_INFRA_ATTEMPTS_KEY = "max_infra_attempts_per_rollout"
+NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY = "rollout_metrics_hook"
 DRIVER_ROLLOUT_KEYS = (
-    "health_check_interval_seconds",
-    "max_infra_attempts_per_rollout",
-    "rollout_metrics_hook",
+    NEMO_GYM_HEALTH_CHECK_INTERVAL_KEY,
+    NEMO_GYM_MAX_INFRA_ATTEMPTS_KEY,
+    NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY,
 )
 
 
@@ -1962,12 +1965,12 @@ def _build_gym_actor_config(
     # Read by the rollout loop on the driver (nemo_rl/experience/rollouts.py), never
     # by a Gym server: kept as top-level fields of the actor's configuration.
     health_check_interval_seconds = nemo_gym_dict.pop(
-        "health_check_interval_seconds", None
+        NEMO_GYM_HEALTH_CHECK_INTERVAL_KEY, None
     )
     max_infra_attempts_per_rollout = nemo_gym_dict.pop(
-        "max_infra_attempts_per_rollout", None
+        NEMO_GYM_MAX_INFRA_ATTEMPTS_KEY, None
     )
-    rollout_metrics_hook = nemo_gym_dict.pop("rollout_metrics_hook", None)
+    rollout_metrics_hook = nemo_gym_dict.pop(NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY, None)
     # Imported once here, on the driver, so a path that names no importable
     # callable is refused before any actor starts; each rollout process
     # resolves the callable again for itself. Deferred import: the module
@@ -1977,7 +1980,7 @@ def _build_gym_actor_config(
     )
 
     get_nemo_gym_rollout_metrics_hook(
-        {"nemo_gym": {"rollout_metrics_hook": rollout_metrics_hook}}
+        {"nemo_gym": {NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY: rollout_metrics_hook}}
     )
     port_range = {
         key: value

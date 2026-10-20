@@ -35,7 +35,12 @@ import logging
 from collections.abc import Callable, Mapping
 from typing import Any, Optional, cast
 
-from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym import (
+    NEMO_GYM_HEALTH_CHECK_INTERVAL_KEY,
+    NEMO_GYM_MAX_INFRA_ATTEMPTS_KEY,
+    NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY,
+    as_nemo_gym_shard_set,
+)
 from nemo_rl.experience.failures import GymTransportError
 from nemo_rl.experience.metric_utils import is_histogram_metric
 
@@ -55,7 +60,7 @@ def get_nemo_gym_health_check_interval(env_config: dict[str, Any]) -> Optional[f
     """
     nemo_gym_config = env_config.get("nemo_gym")
     value = (
-        nemo_gym_config.get("health_check_interval_seconds")
+        nemo_gym_config.get(NEMO_GYM_HEALTH_CHECK_INTERVAL_KEY)
         if isinstance(nemo_gym_config, dict)
         else None
     )
@@ -86,7 +91,7 @@ def get_nemo_gym_max_infra_attempts(env_config: dict[str, Any]) -> int:
     """
     nemo_gym_config = env_config.get("nemo_gym")
     value = (
-        nemo_gym_config.get("max_infra_attempts_per_rollout")
+        nemo_gym_config.get(NEMO_GYM_MAX_INFRA_ATTEMPTS_KEY)
         if isinstance(nemo_gym_config, dict)
         else None
     )
@@ -273,7 +278,7 @@ def get_nemo_gym_rollout_metrics_hook(
     """
     nemo_gym_config = env_config.get("nemo_gym")
     path = (
-        nemo_gym_config.get("rollout_metrics_hook")
+        nemo_gym_config.get(NEMO_GYM_ROLLOUT_METRICS_HOOK_KEY)
         if isinstance(nemo_gym_config, dict)
         else None
     )
