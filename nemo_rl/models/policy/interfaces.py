@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec, RefitPayloadMode
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
 
@@ -214,11 +214,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def prepare_refit_info(
-        self,
-        *,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
     def enable_refit_prequantize(
@@ -296,6 +292,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -305,8 +302,6 @@ class ColocatablePolicyInterface(PolicyInterface):
         gen_parallelism: dict[str, int],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: RefitPayloadMode,
     ) -> Any:
         """Prepare per-layer param metadata for nccl_reshard-based refit."""
         raise NotImplementedError

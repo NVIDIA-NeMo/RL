@@ -556,6 +556,28 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+##### Adaptive PPO clip
+
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+  truncated_importance_sampling_type: adaptive-ppo-clip
+  truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
+  truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
+  sequence_level_importance_ratios: false
+```
+
+The loss zeroes the weight of negative-advantage tokens with $w$ below `truncated_importance_sampling_ratio_min`, positive-advantage tokens with $w$ above `truncated_importance_sampling_ratio + k`, and every token with $w$ above `truncated_importance_sampling_adaptive_outer_bound`. `is_oob_ratio` reports the fraction of filtered tokens.
+
+The offset $k$ starts at 0. After each training step, the trainer compares the step's `approx_entropy` with `truncated_importance_sampling_adaptive_target_entropy`: entropy above the target lowers $k$ by `truncated_importance_sampling_adaptive_k_step`, and entropy below the target raises it by the same amount. $k$ is clamped between 0 and `truncated_importance_sampling_adaptive_k_max`. The legacy GRPO trainers and the single controller log `cur_adaptive_ppo_clip_k`, the $k$ each step trained with, and save the updated $k$ in checkpoints so a resumed run continues from the same bound. The legacy PPO trainer rejects this mode. Sequence-level importance ratios are not supported. See the [MAI-1 paper](https://microsoft.ai/pdf/mai-thinking-1.pdf) for more details.
+
 
 #### Single-forward sequence-logprob filtering
 
@@ -572,7 +594,7 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
 ```
 
-The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. DTensor, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
 
 The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
 
@@ -651,6 +673,7 @@ When top-p or top-k filtering is enabled, the following conventions apply:
 - **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
 - **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
 - **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+- **Invalid policy support** caused by disagreement on the top-k/top-p filtered set is excluded from actor ratios, actor-loss reduction, KL-in-reward, OPD advantages, and sequence-error checks. Excluded positions still count toward global token/sequence normalization. The shared `token_mask` stays unchanged so the unfiltered reference KL still uses valid response tokens. Diagnostic JSONL dumps represent nonfinite log probabilities as `null`; the training tensors retain their original values.
 
 Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
 
@@ -702,6 +725,14 @@ semantics.
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described
+below. Set it to `minimal` to skip optional diagnostic kernels; the loss
+and objective bookkeeping remain unchanged. Both modes report
+`token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.enable_torch_compile` can
+be enabled separately to compile the tensor-only actor objective (it is opt-in
+because backend and distributed-layout support should be validated first).
+
 ### Multiplicative Token Probability Error
 This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
 
@@ -747,7 +778,7 @@ This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi
 
 Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error, rather than the variance, as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
+This metric is always reported when `loss_fn.metrics_level` is `full`. In `minimal` mode, it is only reported when `use_importance_sampling_correction` is enabled. The per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
 
 ### Entropy
 This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
@@ -841,16 +872,16 @@ The headline metric is per-reward convergence, not just aggregate reward. NeMo-R
 
 ## LoRA Configuration
 
-GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
+GRPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA on the default Automodel backend:
 
 ```bash
-uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-The DTensor GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+The Automodel GRPO LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
 
-For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.

@@ -122,42 +122,42 @@ MXFP8 configurations should use `quantization_ignore_patterns` instead.
 (`precision: "fp8"` without `is_mx`) has no pattern-based replacement yet and
 must continue to use `quantization_ignored_layer_kws`.
 
-For MXFP8 rollout with Megatron training, trainer-side prequantization can
-reduce the refit payload:
+### Optional trainer-side MXFP8 refit
+
+By default, the rollout worker receives BF16 weights and quantizes them.
+To reduce the transfer size, enable trainer-side quantization:
 
 ```yaml
 policy:
-    generation:
-        vllm_cfg:
-            precision: fp8
-            is_mx: true
-            refit_prequantize: true
+  megatron_cfg:
+    enabled: true
+  generation:
+    backend: vllm
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      refit_prequantize: true
 ```
 
-`refit_prequantize` is an MXFP8 refit optimization. It requires
-`precision: fp8`, `is_mx: true`, and the Megatron policy backend. It moves
-eligible weight quantization to the trainer and transfers E4M3 values plus E8M0
-scales instead of BF16 weights. It is rejected for blockwise FP8, BF16, NVFP4,
-sparse-delta refit, and NCCL-Reshard refit. NVFP4 real-quant rollout uses its own
-packed-weight refit protocol.
+Use this option only with a Megatron policy and an MXFP8 vLLM rollout.
+The policy worker quantizes supported BF16 weights and sends E4M3 values with
+E8M0 scales. Other weights use their normal refit path.
 
-The default receiver-side path and the optional trainer-side path make a
-different runtime tradeoff:
+For each block of 32 supported weight values, the weight payload changes from
+64 BF16 bytes to 32 E4M3 bytes plus one scale byte. This count excludes
+transport metadata, padding, and weights that are not eligible for this option.
+It does not predict the end-to-end speedup.
 
-| Path | Wire payload per 32 values | Quantization runtime | Use when |
-|---|---:|---|---|
-| Receiver-side (default) | 64 bytes of BF16 | The rollout worker uses vLLM's installed quantizer | Runtime alignment is more important than refit transfer cost |
-| Trainer-side (`refit_prequantize: true`) | 32 bytes of E4M3 values + 1 E8M0 scale byte | The policy worker uses FlashInfer on Blackwell | Colocated refit transfer and receiver work are measurable bottlenecks |
+On Blackwell, the policy worker uses FlashInfer when it is available.
+Otherwise, it uses the PyTorch reference quantizer. Both paths
+store scales in `*_scale_from_checkpoint`. NeMo RL checks the value and scale
+shapes and normalizes zero scales before loading the weights.
 
-The transport payloads differ, but both paths produce the same explicit
-post-quantization loader representation: the E4M3 value tensor keeps the
-logical checkpoint shape, and the matching `*_scale_from_checkpoint` tensor
-stores E8M0 bytes with shape
-`(*weight.shape[:-1], weight.shape[-1] / 32)`. NeMo RL validates this contract
-and applies the same scale reshape and zero-scale handling on both paths. The
-GB200 test suite checks bitwise parity against the installed vLLM quantizer and
-runs functional GRPO refits for both paths across the separate policy and
-rollout worker environments with numerical error bounds.
+Do not use `refit_prequantize` with blockwise FP8, BF16, NVFP4, sparse-delta
+refit, NCCL Reshard, or the vLLM reload API. NVFP4 real-quant rollout uses a
+different packed-weight refit protocol. GB200 tests check quantized-value
+parity with the installed vLLM quantizer. Functional GRPO tests also check
+refit in separate policy and rollout worker environments.
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 

@@ -433,7 +433,7 @@ def convert_calibration_to_vllm_format(
     """Convert NeMo-RL calibration results to vLLM parameter format.
 
     Currently only used by megatron policy worker.
-    After FP8 KV cache is supported by DTensor path, this function can be reused.
+    After FP8 KV cache is supported by the Automodel path, this function can be reused.
 
     This function transforms the calibration output format (with layer_N keys)
     into the flat dictionary format that vLLM expects for parameter loading.

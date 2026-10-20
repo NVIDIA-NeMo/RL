@@ -57,6 +57,7 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
+    iteration_scope,
     managed_span,
     trace_context_kwargs,
     umbrella_span,
@@ -222,18 +223,22 @@ class SFTSingleControllerActor:
             with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
                 self._trainer.prepare_for_training()
                 while self._save_state.total_steps < self._max_steps:
-                    metrics = self._run_train_step()
-                    self._logger.log_metrics(metrics, self._save_state.total_steps)
-                    metric = self._checkpoint_metric(metrics)
-                    self._timeout.mark_iteration()
-                    save_by_timeout = self._timeout.check_save()
-                    if self._should_save(save_by_timeout=save_by_timeout):
-                        self._save_checkpoint(metric)
-                    if save_by_timeout:
-                        # check_save fires once and then latches, so continuing
-                        # would train unsaved until the walltime kill.
-                        print("Timeout has been reached, stopping training early")
-                        break
+                    # Read before _run_train_step increments it, so the whole
+                    # pass is tagged with the step that is running rather than
+                    # the one that just finished.
+                    with iteration_scope(self._save_state.total_steps + 1):
+                        metrics = self._run_train_step()
+                        self._logger.log_metrics(metrics, self._save_state.total_steps)
+                        metric = self._checkpoint_metric(metrics)
+                        self._timeout.mark_iteration()
+                        save_by_timeout = self._timeout.check_save()
+                        if self._should_save(save_by_timeout=save_by_timeout):
+                            self._save_checkpoint(metric)
+                        if save_by_timeout:
+                            # check_save fires once and then latches, so continuing
+                            # would train unsaved until the walltime kill.
+                            print("Timeout has been reached, stopping training early")
+                            break
                 return vars(self._save_state).copy()
         finally:
             for cleanup, name in (
@@ -254,18 +259,10 @@ class SFTSingleControllerActor:
             "batch_size": config.policy["train_global_batch_size"]
             // self._placement_plan.logical_world_size,
             "max_sequence_length": config.data["max_input_seq_length"],
-            "placement_fingerprint": self._placement_plan.placement_hash,
-            "packing_algorithm": config.policy["sequence_packing"]["algorithm"]
-            if config.data["energon"].packing_buffer_size is not None
-            else None,
-            # This caps sources per physical pack. Energon's similarly named
-            # max_samples_per_sequence instead controls sequential shard reads.
-            "max_sequences_per_bin": config.policy["sequence_packing"].get(
-                "max_sequences_per_bin"
-            ),
             "sequence_length_pad_multiple": config.policy[
                 "make_sequence_length_divisible_by"
             ],
+            "placement_fingerprint": self._placement_plan.placement_hash,
             "only_unmask_final": config.sft.only_unmask_final,
         }
         if self._loader_states is None:
@@ -465,8 +462,8 @@ def setup_sft_v2(
         raise ValueError("SFTv2 supports only the Megatron policy backend.")
     sequence_packing = master_config.policy["sequence_packing"]
     dynamic_batching = master_config.policy["dynamic_batching"]
-    energon_packing = master_config.data["energon"].packing_buffer_size is not None
-    if not energon_packing:
+    packing = master_config.data["energon"].task_encoder.packing
+    if packing is None:
         if sequence_packing["enabled"] or dynamic_batching["enabled"]:
             raise ValueError("SFTv2 without Energon packing requires fixed batching.")
     else:
@@ -476,9 +473,7 @@ def setup_sft_v2(
             raise ValueError(
                 "Energon packing requires sequence_packing enabled with fuse_loss."
             )
-        if sequence_packing.get("algorithm") not in {
-            algorithm.value for algorithm in PackingAlgorithm
-        }:
+        if packing.name not in {algorithm.value for algorithm in PackingAlgorithm}:
             raise ValueError("Energon SFT requires a supported packing algorithm.")
         if dynamic_batching["enabled"]:
             raise ValueError("Energon packing does not support dynamic batching.")
@@ -510,7 +505,7 @@ def setup_sft_v2(
     max_sequence_length = master_config.data["max_input_seq_length"]
     if max_sequence_length is None:
         raise ValueError("SFTv2 requires data.max_input_seq_length.")
-    if energon_packing:
+    if packing is not None:
         megatron_cfg = master_config.policy["megatron_cfg"]
         if (
             megatron_cfg.get("moe_token_dispatcher_type") == "flex"
@@ -519,6 +514,10 @@ def setup_sft_v2(
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
         pad_multiple = master_config.policy["make_sequence_length_divisible_by"]
+        if pad_multiple <= 0:
+            raise ValueError(
+                "Energon packing requires make_sequence_length_divisible_by to be positive."
+            )
         parallel_multiple = get_parallel_token_alignment(megatron_cfg)
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
@@ -530,7 +529,6 @@ def setup_sft_v2(
                 "Energon packing requires max_input_seq_length to be divisible by "
                 "make_sequence_length_divisible_by."
             )
-
         fp8_multiple = get_fp8_token_alignment(megatron_cfg) * parallel_multiple
         if fp8_multiple > parallel_multiple:
             if max_sequence_length % fp8_multiple != 0:

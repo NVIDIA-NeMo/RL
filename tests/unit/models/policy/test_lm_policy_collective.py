@@ -153,7 +153,7 @@ def test_policy_worker_offsets_its_rank_in_the_collective(monkeypatch):
     )
 
 
-def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
+def test_policy_forwards_final_checkpoint_marker_to_automodel(monkeypatch):
     calls = []
 
     class WorkerGroup:
@@ -168,7 +168,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
         "nemo_rl.models.policy.lm_policy.ray.get", lambda futures: futures
     )
     policy = Policy.__new__(Policy)
-    policy.cfg = {"dtensor_cfg": {"enabled": True}}
+    policy.cfg = {"automodel_cfg": {"enabled": True}}
     policy.worker_group = WorkerGroup()
 
     policy.save_checkpoint(
@@ -189,7 +189,7 @@ def test_policy_forwards_final_checkpoint_marker_to_dtensor_v2(monkeypatch):
     ]
 
 
-def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
+def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
     calls = []
 
     class WorkerGroup:
@@ -202,8 +202,8 @@ def test_policy_uses_megatron_save_path_when_dtensor_is_disabled(monkeypatch):
     )
     policy = Policy.__new__(Policy)
     policy.cfg = {
-        # Disabled DTensor settings must not select the Automodel save path.
-        "dtensor_cfg": {"enabled": False},
+        # Disabled Automodel settings must not select the Automodel save path.
+        "automodel_cfg": {"enabled": False},
         "megatron_cfg": {"enabled": True},
     }
     policy.worker_group = WorkerGroup()
@@ -301,6 +301,7 @@ def test_policy_forwards_packed_collective_options_to_workers():
                 "refit_timeout_s": None,
                 "buffer_size_bytes": 1024**3,
                 "num_buffers": 2,
+                "use_legacy_packing": False,
             },
         )
     ]

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -32,6 +33,7 @@ MXFP8_CASES = {
         "segment_size": 16,
         "async_engine": True,
         "tensor_parallel_size": 32,
+        "gpu_memory_utilization": 0.4,
         "moe_backend": "flashinfer_trtllm",
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
@@ -251,7 +253,6 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     assert vllm_cfg["is_mx"] is True
     if expected.get("refit_optimizations"):
         assert vllm_cfg["refit_prequantize"] is True
-        assert vllm_cfg["refit_cache_loader_routes"] is True
         assert config["policy"]["megatron_cfg"]["enabled"] is True
     assert "quantization_ignored_layer_kws" not in vllm_cfg
     assert vllm_cfg["quantization_ignore_patterns"] == expected["ignore_patterns"]
@@ -263,6 +264,8 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
     )
     if expected.get("tensor_parallel_size") is not None:
         assert vllm_cfg["tensor_parallel_size"] == expected["tensor_parallel_size"]
+    if expected.get("gpu_memory_utilization") is not None:
+        assert vllm_cfg["gpu_memory_utilization"] == expected["gpu_memory_utilization"]
     if expected["async_engine"] is not None:
         assert vllm_cfg["async_engine"] is expected["async_engine"]
     assert (
@@ -298,7 +301,6 @@ def test_sync_qwen3_mxfp8_rollout_recipes_enable_refit_optimizations(
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
 
     assert vllm_cfg["refit_prequantize"] is True
-    assert vllm_cfg["refit_cache_loader_routes"] is True
 
 
 @pytest.mark.parametrize(
@@ -316,7 +318,6 @@ def test_async_qwen3_mxfp8_rollout_recipes_skip_sync_refit_optimizations(
     vllm_cfg = config["policy"]["generation"]["vllm_cfg"]
 
     assert not vllm_cfg.get("refit_prequantize", False)
-    assert not vllm_cfg.get("refit_cache_loader_routes", False)
 
 
 def test_mxfp8_rollout_recipes_are_in_gb200_performance_suite() -> None:
@@ -374,6 +375,41 @@ def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
         assert "max_num_steps" not in grpo_config
         assert "val_batch_size" not in grpo_config
         assert "max_val_samples" not in grpo_config
+
+
+ASYNC_MXFP8_RECIPE_PATHS = sorted(
+    PERF_CONFIG_DIR.glob("*-async-1off-mxfp8-rollout.yaml")
+)
+
+
+def test_async_mxfp8_recipe_discovery_is_not_empty() -> None:
+    # An empty parametrize list collects as a silent SKIP, which would leave
+    # the nccl_reshard guard dead if the recipe directory or naming changes.
+    assert ASYNC_MXFP8_RECIPE_PATHS
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ASYNC_MXFP8_RECIPE_PATHS,
+    ids=lambda path: path.stem,
+)
+def test_async_mxfp8_recipes_use_nccl_reshard(config_path: Path) -> None:
+    config = _load_resolved_yaml(config_path)
+
+    assert config["policy"]["generation"]["refit_transport"] == "nccl_reshard"
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    ASYNC_MXFP8_RECIPE_PATHS,
+    ids=lambda path: path.stem,
+)
+def test_async_mxfp8_recipes_pass_nccl_reshard_validation(config_path: Path) -> None:
+    nccl_reshard_utils = pytest.importorskip("nemo_rl.weight_sync.nccl_reshard_utils")
+    config = _load_resolved_yaml(config_path)
+    master_config = SimpleNamespace(policy=config["policy"])
+
+    nccl_reshard_utils.check_nccl_reshard_refit_support(master_config)
 
 
 def test_deepseek_mxfp8_launchers_handle_unset_and_spaced_checkpoint_paths() -> None:

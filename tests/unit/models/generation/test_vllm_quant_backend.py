@@ -70,7 +70,6 @@ def _make_vllm_config(
         "quant_cfg": quant_cfg,
         "vllm_cfg": {
             "precision": "bfloat16",
-            "refit_cache_loader_routes": False,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "expert_parallel_size": 1,
@@ -177,9 +176,7 @@ def test_vllm_quant_refit(cluster, async_engine):
             )
 
         # Refit: transfer pre-folded weights + input_quantizer amax from Megatron to vLLM
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
         refit_policy_generation(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]
@@ -264,9 +261,7 @@ def test_vllm_kv_quant_refit(cluster, recipe, uses_constant_amax, monkeypatch):
                 "have non-positive amax"
             )
 
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
         refit_policy_generation(
             megatron_policy, vllm_policy, vllm_config["colocated"]["enabled"]

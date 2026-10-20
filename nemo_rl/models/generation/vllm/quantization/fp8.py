@@ -22,7 +22,7 @@ from unittest.mock import patch
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModel, DeepseekV3Config, PretrainedConfig
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -48,9 +48,6 @@ from nemo_rl.models.generation.vllm.quantization.utils import (
     resolve_module_from_param_name,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
-from nemo_rl.models.generation.vllm.worker_utils import (
-    refit_cache_loader_routes_enabled,
-)
 
 logger = init_logger(__name__)
 
@@ -271,6 +268,28 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
+def _get_fp8_parameter_names(config: PretrainedConfig) -> list[str]:
+    """Enumerate model parameters without loading pretrained weights."""
+    try:
+        with init_empty_weights():
+            model = AutoModel.from_config(config, trust_remote_code=True)
+    except KeyError as exc:
+        if config.model_type != "deepseek_v3" or exc.args != ("type",):
+            raise
+        # Moonlight's remote _init_rope still expects rope_scaling["type"].
+        # Fall back only for that incompatibility; working remote models keep
+        # their original parameter names, including unfused expert weights.
+        logger.warning(
+            "Remote DeepSeek V3 model construction failed with %r; using the "
+            "native model to enumerate FP8 parameter names.",
+            exc,
+        )
+        native_config = DeepseekV3Config.from_dict(config.to_dict())
+        with init_empty_weights():
+            model = AutoModel.from_config(native_config, trust_remote_code=False)
+    return [name for name, _ in model.named_parameters()]
+
+
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
@@ -395,9 +414,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
-        with init_empty_weights():
-            model = AutoModel.from_config(config, trust_remote_code=True)
-        param_names = [name for name, _ in model.named_parameters()]
+        param_names = _get_fp8_parameter_names(config)
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
@@ -424,13 +441,11 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             stacklevel=2,
         )
     if quantization_ignored_layer_kws:
-        with init_empty_weights():
-            model = AutoModel.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight").replace(
                 "model.backbone.", "backbone."
             )
-            for name, _ in model.named_parameters()
+            for name in _get_fp8_parameter_names(config)
         ]
         ignored_layers = [
             n
@@ -543,28 +558,29 @@ def get_module_from_param_name(model, name: str):
     return resolution.module
 
 
-_GROUPED_EXPERT_WEIGHT_SUFFIXES = (
-    "mlp.experts.gate_up_proj",
-    "mlp.experts.down_proj",
-)
-
-
-def _is_grouped_expert_weight(name: str) -> bool:
-    return name.endswith(_GROUPED_EXPERT_WEIGHT_SUFFIXES)
-
-
 def _grouped_expert_weight_name_from_scale(name: str) -> str | None:
     if not name.endswith(MXFP8_SCALE_SUFFIX):
         return None
     weight_name = name.removesuffix(MXFP8_SCALE_SUFFIX)
-    return weight_name if _is_grouped_expert_weight(weight_name) else None
+    return weight_name if is_grouped_moe_expert_weight_name(weight_name) else None
+
+
+def _require_qwen35_grouped_moe_layout(model_runner: Any, key: str) -> None:
+    model_config = getattr(model_runner.vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or []
+    if not any(arch.startswith("Qwen3_5MoeFor") for arch in architectures):
+        raise ValueError(
+            f"Prequantized grouped MoE refit for {key!r} requires the validated "
+            f"Qwen3.5-MoE gate-then-up layout; got {architectures}. "
+            "Set vllm_cfg.refit_prequantize=false for this model."
+        )
 
 
 def _is_fp8_weight(name, model):
     if name not in fp8_state.seen_params:
         fp8_state.seen_params.add(name)
         # Filter out bias params
-        if name.endswith("weight") or _is_grouped_expert_weight(name):
+        if name.endswith("weight") or is_grouped_moe_expert_weight_name(name):
             module = get_module_from_param_name(model, name)
             # We currently only quantize linear layers
             if (
@@ -621,15 +637,15 @@ def get_quantized_weight_iterator(
             if global_fp8_config.refit_prequantize and _is_fp8_weight(
                 grouped_weight_name, model
             ):
+                _require_qwen35_grouped_moe_layout(model_runner, k)
                 yield from _reroute_grouped_moe_expert_scale(k, v)
             else:
                 yield k, v
             continue
 
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix.
-        # vLLM's grouped loader cannot load receiver-quantized per-block scales,
-        # so BF16 blockwise inputs use per-expert checkpoint entries. Trainer-side
-        # prequantized MXFP8 inputs stay fused and route their scales above.
+        # Prequantized MXFP8 slabs stay fused; BF16 slabs are quantized into
+        # per-expert entries so vLLM can load their scales.
         if is_grouped_moe_expert_weight_name(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
@@ -646,14 +662,15 @@ def get_quantized_weight_iterator(
                         raise ValueError(
                             "MXFP8 E4M3 refit weights require refit_prequantize=true."
                         )
+                    _require_qwen35_grouped_moe_layout(model_runner, k)
                     yield k, v
                     continue
                 if global_fp8_config.is_mx:
-                    raise NotImplementedError(
-                        "MXFP8 refit does not support quantizing grouped MoE "
-                        "expert weights on the fly; enable refit_prequantize."
+                    yield from _expand_grouped_moe_expert_to_mxfp8(
+                        k, v, refit_with_reload_api=refit_with_reload_api
                     )
-                yield from _expand_grouped_moe_expert_to_fp8(k, v)
+                else:
+                    yield from _expand_grouped_moe_expert_to_fp8(k, v)
             else:
                 yield k, v
             continue
@@ -720,13 +737,7 @@ def load_weights(
         model_load_weights(quantized_weights)
         return
 
-    from nemo_rl.models.generation.vllm.vllm_backend import load_weights_maybe_cached
-
-    load_weights_maybe_cached(
-        model_runner.model,
-        list(quantized_weights),
-        cache_loader_routes=refit_cache_loader_routes_enabled(model_runner.vllm_config),
-    )
+    model_runner.model.load_weights(weights=quantized_weights)
 
 
 def cast_tensor_to_fp8_blockwise(
@@ -863,6 +874,24 @@ def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     return weight_fp8, scale_inv
 
 
+def _split_grouped_moe_shards(
+    key: str, weight: torch.Tensor
+) -> tuple[str, tuple[tuple[str, torch.Tensor], ...]]:
+    """Split one grouped expert slab into vLLM projection shards."""
+    base, proj = key.rsplit(".", 1)
+    if proj == "gate_up_proj":
+        intermediate = weight.shape[1] // 2
+        shards = (
+            ("gate_proj", weight[:, :intermediate, :]),
+            ("up_proj", weight[:, intermediate:, :]),
+        )
+    elif proj == "down_proj":
+        shards = (("down_proj", weight),)
+    else:
+        raise ValueError(f"Unsupported grouped MoE projection {proj!r} in {key!r}")
+    return base, shards
+
+
 def _expand_grouped_moe_expert_to_fp8(key, weight):
     """Expand a grouped Qwen3.5 MoE expert slab into per-expert FP8 weights.
 
@@ -888,15 +917,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
         A list of ``(name, tensor)`` pairs: for every expert, the FP8 weight and
         its ``_scale_inv`` for each unfused projection.
     """
-    base, proj = key.rsplit(".", 1)
-    if proj == "gate_up_proj":
-        intermediate = weight.shape[1] // 2
-        shards = (
-            ("gate_proj", weight[:, :intermediate, :]),
-            ("up_proj", weight[:, intermediate:, :]),
-        )
-    else:
-        shards = (("down_proj", weight),)
+    base, shards = _split_grouped_moe_shards(key, weight)
 
     entries = []
     # gate/up are dim-1 slices; feed the views directly — per-expert rows stay
@@ -951,6 +972,23 @@ def _reroute_grouped_moe_expert_scale(
         )
         for expert_id, expert_scale in enumerate(grouped_scale.unbind(0))
     ]
+
+
+def _expand_grouped_moe_expert_to_mxfp8(
+    key: str, weight: torch.Tensor, *, refit_with_reload_api: bool
+) -> list[tuple[str, torch.Tensor]]:
+    """Expand a grouped Qwen3.5 MoE slab into per-expert MXFP8 entries."""
+    base, shards = _split_grouped_moe_shards(key, weight)
+
+    entries = []
+    scale_suffix = "_scale" if refit_with_reload_api else "_scale_from_checkpoint"
+    for shard_name, grouped_moe_expert in shards:
+        for expert_id, expert_weight in enumerate(grouped_moe_expert):
+            value, scale = quantize_mxfp8_weight(expert_weight.contiguous())
+            name = f"{base}.{expert_id}.{shard_name}.weight"
+            entries.append((name, value))
+            entries.append((name + scale_suffix, scale))
+    return entries
 
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
@@ -1312,8 +1350,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
-        # vLLM 0.28 dropped the `layer` kwarg (0.25 forwarded it only to the
-        # FlashInfer TRTLLM experts); routing tables still come from the layer.
         self.moe_kernel = make_fp8_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
@@ -1321,23 +1357,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
-
-
-# Shared gather destinations keyed by (tag, shape, device). They persist across
-# refits so the batched shuffle allocates nothing after the first pass; their
-# contents are rewritten on every call, so a sleep-mode discard is harmless.
-mxfp8_shuffle_scratch_buffers: dict[
-    tuple[str, tuple[int, ...], torch.device], torch.Tensor
-] = {}
-
-
-def _mxfp8_scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
-    key = (tag, tuple(shape), device)
-    buf = mxfp8_shuffle_scratch_buffers.get(key)
-    if buf is None:
-        buf = torch.empty(shape, dtype=torch.uint8, device=device)
-        mxfp8_shuffle_scratch_buffers[key] = buf
-    return buf
 
 
 def _mxfp8_moe_row_permutations(
@@ -1391,7 +1410,7 @@ def _shuffle_mxfp8_moe_batched(
     the row gathers run as a single dim-1 index_select over the whole
     [E, M, K] tensor and the scale swizzle as one 3D block_scale_interleave,
     whose flat output equals the stacked per-expert 2D outputs. Gathers write
-    into shared scratch buffers; callers copy_ into the persistent
+    into temporary buffers; callers copy_ into the persistent
     destinations (w13/w2 weights may alias their own gather source).
     """
     from flashinfer import block_scale_interleave
@@ -1407,29 +1426,15 @@ def _shuffle_mxfp8_moe_batched(
 
     w13_u8 = w13_weight.view(torch.uint8)
     w2_u8 = w2_weight.view(torch.uint8)
-    w13_shuffled = torch.index_select(
-        w13_u8, 1, perm_w13, out=_mxfp8_scratch("w13", w13_u8.shape, w13_u8.device)
-    )
-    w2_shuffled = torch.index_select(
-        w2_u8, 1, perm_w2, out=_mxfp8_scratch("w2", w2_u8.shape, w2_u8.device)
-    )
+    w13_shuffled = torch.index_select(w13_u8, 1, perm_w13)
+    w2_shuffled = torch.index_select(w2_u8, 1, perm_w2)
 
     w13_sf_u8 = pad_flashinfer_scale_k(w13_scale.view(torch.uint8))
     w2_sf_u8 = pad_flashinfer_scale_k(w2_scale.view(torch.uint8))
     # Same constraint shuffle_matrix_sf_a asserts on the per-expert path.
     assert w13_sf_u8.shape[1] % 128 == 0 and w2_sf_u8.shape[1] % 128 == 0
-    w13_sf_gathered = torch.index_select(
-        w13_sf_u8,
-        1,
-        perm_w13,
-        out=_mxfp8_scratch("w13_sf", w13_sf_u8.shape, w13_sf_u8.device),
-    )
-    w2_sf_gathered = torch.index_select(
-        w2_sf_u8,
-        1,
-        perm_w2,
-        out=_mxfp8_scratch("w2_sf", w2_sf_u8.shape, w2_sf_u8.device),
-    )
+    w13_sf_gathered = torch.index_select(w13_sf_u8, 1, perm_w13)
+    w2_sf_gathered = torch.index_select(w2_sf_u8, 1, perm_w2)
     w13_scale_shuffled = (
         block_scale_interleave(w13_sf_gathered)
         .view(MXFP8_SCALE_DTYPE)
@@ -1456,7 +1461,7 @@ def _shuffle_mxfp8_moe_per_expert(
     is_gated: bool,
     epilogue_tile_m: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-expert reference shuffle, kept for NRL_MXFP8_SHUFFLE_VERIFY."""
+    """Per-expert reference shuffle for batched-shuffle parity tests."""
     from flashinfer import (
         reorder_rows_for_gated_act_gemm,
         shuffle_matrix_a,

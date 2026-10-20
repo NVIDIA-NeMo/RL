@@ -270,9 +270,9 @@ def test_deepseek_v4_context_entry_failure_preserves_original_error(
     monkeypatch.setattr(
         vllm.config,
         "set_current_vllm_config",
-        lambda _config: FailingContext()
-        if context_name == "config"
-        else contextlib.nullcontext(),
+        lambda _config: (
+            FailingContext() if context_name == "config" else contextlib.nullcontext()
+        ),
     )
     if context_name == "device":
         monkeypatch.setattr(

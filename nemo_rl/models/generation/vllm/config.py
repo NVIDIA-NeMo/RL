@@ -39,7 +39,6 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
-VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 
@@ -88,8 +87,6 @@ class VllmSpecificArgs(TypedDict):
     # the vLLM worker then skips its per-refit re-quantization. Requires the
     # Megatron policy backend.
     refit_prequantize: NotRequired[bool]
-    # Cache and replay stable vLLM weight-loader routes across refits.
-    refit_cache_loader_routes: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
@@ -109,6 +106,15 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
+    # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
+    # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
+    # model server. Needs expose_http_server; refused at setup without it.
+    # Absent or false: the routes accept unauthenticated requests.
+    http_server_api_key_required: NotRequired[bool]
+    # The generated key. Filled by VllmGeneration in the copy of the config the
+    # workers receive; never set in a YAML.
+    http_server_api_key: NotRequired[str]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Invalidate weight-dependent multimodal encoder outputs after a successful
@@ -269,10 +275,6 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "refit_with_reload_api; prequantized refit uses receiver scale names "
             "that are not accepted by vLLM's native reload path."
         )
-    for field in ("refit_cache_loader_routes",):
-        value = vllm_cfg.get(field)
-        if value is not None and not isinstance(value, bool):
-            raise ValueError(f"policy.generation.vllm_cfg.{field} must be a boolean.")
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:

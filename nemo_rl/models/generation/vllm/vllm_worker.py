@@ -64,7 +64,6 @@ from nemo_rl.models.generation.vllm.video_utils import (
     register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
-    configure_refit_runtime,
     find_tokenizer_required_architectures,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
@@ -439,7 +438,7 @@ class BaseVllmGenerationWorker:
         # Only bind single-GPU workers to their GPU's NUMA node.
         # For TP>1 workers, the parent process spans multiple NUMA nodes;
         # binding it would incorrectly constrain the EngineCore subprocess
-        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # (which inherits sched_setaffinity + numa_set_preferred via fork).
         # Individual TP workers get their own NUMA binding via collective_rpc
         # in post_init / post_init_async.
         # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
@@ -552,7 +551,6 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
-        configure_refit_runtime(self.cfg["vllm_cfg"], vllm_kwargs)
         # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
         # processor and re-applies them on the GPU in the vision tower's dtype. The
         # policy side normalizes on the CPU in fp32 through the same HF processor, so
