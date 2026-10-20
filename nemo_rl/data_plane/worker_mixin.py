@@ -38,7 +38,11 @@ import numpy as np
 import torch
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
-from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PackedTensor,
+    row_shapes_key,
+)
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
@@ -373,6 +377,111 @@ def _materialize_fetched(
     )
 
 
+def _expand_sparse_packed_rows(
+    value: PackedTensor,
+    present_positions: tuple[int, ...],
+    total_rows: int,
+) -> PackedTensor:
+    """Reinsert empty logical rows omitted by a sparse multimodal producer."""
+    if len(value) != len(present_positions):
+        raise ValueError(
+            "Sparse packed field row count does not match its tagged positions: "
+            f"value rows={len(value)}, positions={len(present_positions)}"
+        )
+    position_to_row = {
+        position: source_row for source_row, position in enumerate(present_positions)
+    }
+    rows = [
+        (
+            value.slice([position_to_row[position]])
+            if position in position_to_row
+            else PackedTensor.empty_rows_like(value, 1)
+        )
+        for position in range(total_rows)
+    ]
+    return PackedTensor.concat(rows)
+
+
+def _fetch_remote_materialized(
+    dp_client: "DataPlaneClient",
+    meta: "KVBatchMeta",
+    *,
+    layout: Layout,
+    pad_value_dict: dict[str, int | float] | None,
+    pad_to_seqlen: int,
+) -> BatchedDataDict[Any]:
+    """Fetch a TQ batch without letting sparse media erase dense media rows.
+
+    TransferQueue's direct-by-key metadata returns only fields produced for
+    *every* requested key. A DP shard that mixes image and text-only samples
+    therefore omits a packed media field for the whole shard. The per-row
+    geometry tags identify exactly which keys produced each packed field, so
+    fetch those keys separately and restore empty logical rows before model
+    microbatching.
+    """
+    requested_fields = list(meta.fields or [])
+    sparse_groups: dict[tuple[int, ...], list[str]] = {}
+    common_fields: list[str] = []
+    tags = meta.tags
+
+    for field in requested_fields:
+        if field not in PACKED_MULTIMODAL_FIELDS or tags is None:
+            common_fields.append(field)
+            continue
+        tag_key = row_shapes_key(field)
+        present_positions = tuple(
+            position for position, tag in enumerate(tags) if tag_key in tag
+        )
+        if len(present_positions) == len(meta.sample_ids):
+            common_fields.append(field)
+        elif present_positions:
+            sparse_groups.setdefault(present_positions, []).append(field)
+        # No tagged row produced this packed field. Do not request it: TQ would
+        # omit it anyway, and a text-only shard should not hand the model a
+        # meaningless all-empty modality key.
+
+    td = dp_client.get_samples(
+        sample_ids=meta.sample_ids,
+        partition_id=meta.partition_id,
+        select_fields=common_fields,
+    )
+    data = _materialize_fetched(
+        td,
+        local_batch=False,
+        layout=layout,
+        pad_value_dict=pad_value_dict,
+        pad_to_seqlen=pad_to_seqlen,
+        tags=tags,
+    )
+
+    for present_positions, fields in sparse_groups.items():
+        sparse_meta = meta.subset(present_positions)
+        sparse_td = dp_client.get_samples(
+            sample_ids=sparse_meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=fields,
+        )
+        sparse_data = _materialize_fetched(
+            sparse_td,
+            local_batch=False,
+            layout=layout,
+            pad_value_dict=pad_value_dict,
+            pad_to_seqlen=pad_to_seqlen,
+            tags=sparse_meta.tags,
+        )
+        for field in fields:
+            value = sparse_data.get(field)
+            if not isinstance(value, PackedTensor):
+                raise TypeError(
+                    f"Sparse packed field {field!r} materialized as "
+                    f"{type(value).__name__}, expected PackedTensor"
+                )
+            data[field] = _expand_sparse_packed_rows(
+                value, present_positions, len(meta.sample_ids)
+            )
+    return data
+
+
 class TQWorkerMixin:
     """Adds TransferQueue per-rank fetch/write-back to a policy worker.
 
@@ -558,20 +667,22 @@ class TQWorkerMixin:
                         meta,
                         select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                     )
-                else:
-                    td = dp_client.get_samples(
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    data = _materialize_fetched(
+                        td,
+                        local_batch=True,
+                        layout=wire_layout,
+                        pad_value_dict=pad_value_dict,
+                        pad_to_seqlen=pad_to_seqlen,
+                        tags=meta.tags,
                     )
-                data = _materialize_fetched(
-                    td,
-                    local_batch=local_batch,
-                    layout=wire_layout,
-                    pad_value_dict=pad_value_dict,
-                    pad_to_seqlen=pad_to_seqlen,
-                    tags=meta.tags,
-                )
+                else:
+                    data = _fetch_remote_materialized(
+                        dp_client,
+                        meta,
+                        layout=wire_layout,
+                        pad_value_dict=pad_value_dict,
+                        pad_to_seqlen=pad_to_seqlen,
+                    )
                 if ship_fragments:
                     fragments_by_row, _, _ = self._route_fragments_by_row(plans)
                     data[_ROUTE_BLOB], data[_ROUTE_INDEX] = _pack_route_fragments(
@@ -616,20 +727,22 @@ class TQWorkerMixin:
                 meta,
                 select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
             )
-        else:
-            td = dp_client.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            data = _materialize_fetched(
+                td,
+                local_batch=True,
+                layout=layout,
+                pad_value_dict=pad_value_dict,
+                pad_to_seqlen=pad_to_seqlen,
+                tags=meta.tags,
             )
-        data = _materialize_fetched(
-            td,
-            local_batch=local_batch,
-            layout=layout,
-            pad_value_dict=pad_value_dict,
-            pad_to_seqlen=pad_to_seqlen,
-            tags=meta.tags,
-        )
+        else:
+            data = _fetch_remote_materialized(
+                dp_client,
+                meta,
+                layout=layout,
+                pad_value_dict=pad_value_dict,
+                pad_to_seqlen=pad_to_seqlen,
+            )
         data = self._maybe_assemble_routed_experts(meta, data)
         attach_message_log_view(data)
         trace_tq_fetch_payload(
