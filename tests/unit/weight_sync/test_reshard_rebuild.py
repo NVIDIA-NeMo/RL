@@ -92,6 +92,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         "prepare_nccl_reshard_refit_info",
         "set_refit_membership",
         "nccl_reshard_refit",
+        "_refit_leaders_by_shard",
         "_refit_leader_workers",
     ):
         setattr(

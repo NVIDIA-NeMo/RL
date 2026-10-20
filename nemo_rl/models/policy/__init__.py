@@ -17,7 +17,12 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import (
+    DFlashDraftConfig,
+    DraftConfig,
+    DSparkDraftConfig,
+    Eagle3DraftConfig,
+)
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -38,8 +43,8 @@ def _patch_transformers_tokenizer_class_set():
 
     Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
     per process the first time any policy code is imported -- covers the driver
-    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
-    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron and Automodel
+    both import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
     import transformers
@@ -185,7 +190,7 @@ class MoEParallelizerOptions(TypedDict):
 
 
 class AutomodelCheckpointConfig(TypedDict, total=False):
-    """Automodel checkpoint settings used by DTensor v2."""
+    """Automodel checkpoint settings."""
 
     model_save_format: Literal["torch_save", "safetensors"] | None
     save_consolidated: Literal["false", "final", "every"]
@@ -382,6 +387,15 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # When True, offload_after_refit skips rerunning the full offload_before_refit
+    # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
+    # and only re-offloads the optimizer with a single allocator cleanup.
+    # When True, the reference-policy swap in use_reference_model stages the
+    # active weights in persistent pinned CPU buffers and keeps the reference
+    # state dict pinned from setup, so the three per-step full-model PCIe
+    # transfers run as non-blocking pinned copies instead of pageable ones.
+    # Costs 2x model-size pinned host RAM per worker. Default False keeps the
+    # current pageable-copy behavior.
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
@@ -598,6 +612,12 @@ class MegatronConfig(TypedDict):
     zero_train_gen_mismatch: NotRequired[bool]
 
 
+# Block drafters propose a whole anchored block per step and exist only on
+# the Automodel co-training path; eagle3 additionally runs on Megatron.
+BLOCK_DRAFT_ALGOS = ("dspark", "dflash")
+DRAFT_ALGOS = ("eagle3", *BLOCK_DRAFT_ALGOS)
+
+
 class TokenizerConfig(TypedDict):
     name: str
     # None selects NeMo-RL's passthrough prompt/response template.
@@ -698,7 +718,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[Eagle3DraftConfig]
+    draft: NotRequired[DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
