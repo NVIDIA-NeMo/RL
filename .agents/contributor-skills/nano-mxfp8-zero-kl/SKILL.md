@@ -107,7 +107,7 @@ run trains normally but the KL is nonzero.
 | `enable_chunked_prefill` | `false` | validated |
 | `tensor_model_parallel_size` | same as training (`1`) | validated |
 | `fp8_cfg` | **identical to the training block**, including `fp8: hybrid` | only `enabled` and `fp8_recipe` must match training (validated); `fp8` and `fp8_param` are **not validated** (this block replaces the training one wholesale, and the parent recipe has `e4m3`) |
-| `inference_grouped_gemm_backend` | `torch` | **not validated** (only `flashinfer` is rejected) |
+| `inference_grouped_gemm_backend` | `torch` | **not validated** (`flashinfer` is rejected unless training sets `moe_inference_training_forward`; that setup is in `nano-nvfp4-zero-kl`) |
 | `inference_moe_token_dispatcher_type` | `nvls` | **not validated** |
 | `moe_router_dtype` | `fp32` | **not validated** |
 | `enable_prefix_caching` | `false` | **not validated** |
