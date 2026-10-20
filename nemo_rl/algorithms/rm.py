@@ -159,7 +159,7 @@ def setup(
     ):
         raise ValueError(
             "Context parallelism (context_parallel_size > 1) is not supported for reward model "
-            "training on the DTensor backend. The log_sigmoid operator used in the RM loss does "
+            "training on the Automodel backend. The log_sigmoid operator used in the RM loss does "
             "not have a DTensor sharding strategy registered for CP meshes. "
             "Please set policy.automodel_cfg.context_parallel_size=1. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
