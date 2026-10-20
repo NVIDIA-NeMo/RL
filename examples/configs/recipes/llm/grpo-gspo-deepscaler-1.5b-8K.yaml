@@ -27,10 +27,10 @@ policy:
     kwargs:
       lr: 2.0e-06
   generation:
-    vllm_cfg:
-      enforce_eager: true
     vllm_kwargs:
+      # CUDA graphs (backend: eager) instead of enforce_eager (~2x faster generation), see #4569
       compilation_config:
+        backend: eager
         custom_ops: ["all", "-rotary_embedding"]
 data:
   train:

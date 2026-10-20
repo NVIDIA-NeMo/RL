@@ -16,11 +16,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence, get_args
 
 import torch
 
 SpeculatorType = Literal["eagle3", "dflash", "dspark"]
+SPECULATOR_TYPES: tuple[str, ...] = get_args(SpeculatorType)
 
 
 class SpeculatorRuntimeError(RuntimeError):
@@ -33,6 +34,40 @@ class RunnerFamily(str, Enum):
     ACCESSOR = "get_draft_model"
     DRAFTER = "drafter.model"
     SPECULATOR = "speculator.model"
+
+
+# vLLM's legacy GPUModelRunner keeps the speculative proposer as ``drafter``;
+# the v2 model runner (vllm/v1/worker/gpu/model_runner.py, the default since
+# vLLM 0.29) keeps it as ``speculator``. Both expose the draft nn.Module as
+# ``.model``. Checked in this order so a legacy runner is never shadowed.
+DRAFTER_OWNER_ATTRS: tuple[tuple[str, RunnerFamily], ...] = (
+    ("drafter", RunnerFamily.DRAFTER),
+    ("speculator", RunnerFamily.SPECULATOR),
+)
+
+
+def find_draft_model(model_runner: Any) -> tuple[RunnerFamily, Any | None] | None:
+    """Return the runner family and live draft model, or None if no capability.
+
+    ``get_draft_model`` wins when present. Otherwise the first owner attribute
+    with a non-None ``.model`` wins. When an owner attribute exists but every
+    model is None, the first existing family is returned with a None model.
+    """
+    accessor = getattr(model_runner, "get_draft_model", None)
+    if callable(accessor):
+        return RunnerFamily.ACCESSOR, accessor()
+    first_family: RunnerFamily | None = None
+    for owner_attr, family in DRAFTER_OWNER_ATTRS:
+        if not hasattr(model_runner, owner_attr):
+            continue
+        if first_family is None:
+            first_family = family
+        model = getattr(getattr(model_runner, owner_attr), "model", None)
+        if model is not None:
+            return family, model
+    if first_family is None:
+        return None
+    return first_family, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,7 +225,7 @@ class DraftRuntimeAdapter:
         pp_rank: int,
         pp_size: int,
     ) -> DraftRuntimeAdapter:
-        if speculator_type not in ("eagle3", "dflash", "dspark"):
+        if speculator_type not in SPECULATOR_TYPES:
             raise SpeculatorRuntimeError(
                 f"unsupported speculator_type={speculator_type!r} with "
                 f"vLLM={vllm_version}"
@@ -200,21 +235,13 @@ class DraftRuntimeAdapter:
                 f"invalid pipeline rank {pp_rank} for PP={pp_size}"
             )
 
-        accessor = getattr(model_runner, "get_draft_model", None)
-        if callable(accessor):
-            family = RunnerFamily.ACCESSOR
-            model = accessor()
-        elif hasattr(model_runner, "drafter"):
-            family = RunnerFamily.DRAFTER
-            model = getattr(getattr(model_runner, "drafter"), "model", None)
-        elif hasattr(model_runner, "speculator"):
-            family = RunnerFamily.SPECULATOR
-            model = getattr(getattr(model_runner, "speculator"), "model", None)
-        else:
+        found = find_draft_model(model_runner)
+        if found is None:
             raise SpeculatorRuntimeError(
                 f"speculator_type={speculator_type}, vLLM={vllm_version}: no "
                 "get_draft_model, drafter.model, or speculator.model capability"
             )
+        family, model = found
 
         if speculator_type in ("dflash", "dspark") and pp_size != 1:
             raise SpeculatorRuntimeError(

@@ -18,12 +18,38 @@ import pytest
 import torch
 
 from nemo_rl.models.generation.vllm.speculator_runtime import (
+    SPECULATOR_TYPES,
     DraftRuntimeAdapter,
     ModelUpdateCoverage,
     ModelUpdateManifest,
     RunnerFamily,
     SpeculatorRuntimeError,
+    find_draft_model,
 )
+
+
+def test_speculator_types_match_the_literal() -> None:
+    assert SPECULATOR_TYPES == ("eagle3", "dflash", "dspark")
+
+
+def test_find_draft_model_skips_owner_attributes_without_a_model() -> None:
+    draft_model = object()
+    runner = SimpleNamespace(
+        drafter=SimpleNamespace(model=None),
+        speculator=SimpleNamespace(model=draft_model),
+    )
+
+    assert find_draft_model(runner) == (RunnerFamily.SPECULATOR, draft_model)
+
+
+def test_find_draft_model_reports_first_family_when_no_model_is_loaded() -> None:
+    runner = SimpleNamespace(drafter=SimpleNamespace(model=None))
+
+    assert find_draft_model(runner) == (RunnerFamily.DRAFTER, None)
+
+
+def test_find_draft_model_returns_none_without_a_capability() -> None:
+    assert find_draft_model(SimpleNamespace()) is None
 
 
 @pytest.mark.parametrize("speculator_type", ["dflash", "dspark"])

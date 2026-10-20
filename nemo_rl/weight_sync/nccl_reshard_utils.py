@@ -704,7 +704,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         )
 
     # Only Megatron training currently provides the local Bridge source views;
-    # DTensor training is not supported by this transport yet.
+    # Automodel training is not supported by this transport yet.
     megatron_enabled = megatron_cfg.get("enabled", False)
     automodel_enabled = automodel_cfg.get("enabled", False)
     if not megatron_enabled:
@@ -1107,8 +1107,8 @@ def build_nccl_reshard_refit_info(
 
         # Propagate the grouped-expert projection tag (gate_proj/up_proj/
         # down_proj) so the train side stacks the matching per-expert tensors
-        # (_group_experts) and the gen backend maps the grouped HF param into
-        # its own fused layout (w13/w2).
+        # (MegatronReshardParamSpecCollection._grouped_expert_spec) and the gen
+        # backend maps the grouped HF param into its own fused layout (w13/w2).
         if "grouped_expert_proj" in meta:
             info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 
