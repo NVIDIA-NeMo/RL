@@ -680,6 +680,15 @@ ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.29.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    # ether0 imports rdkit, whose bundled cairo links these system libraries; the dry run
+    # below starts ether0, and so does every job that runs it. The base image lacks them.
+    # swe_agents' `playwright install --with-deps` pulls them in only when it finishes
+    # inside OpenHands' 2-minute `make build` timeout, so install them explicitly.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends libexpat1 libx11-6 libxext6 libxrender1
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
