@@ -1319,7 +1319,7 @@ def setup_single_controller(
     trajectory_logger_cfg = master_config.trajectory_logger
     if trajectory_logger_cfg.enabled and trajectory_logger_cfg.log_dir is None:
         trajectory_logger_cfg.log_dir = os.path.abspath(
-            os.path.join(master_config.logger["log_dir"], "trajectories")
+            os.path.join(master_config.logger.log_dir, "trajectories")
         )
 
     # Resolved once here so the student workers and the teacher worker group

@@ -74,8 +74,9 @@ def test_token_column_preserves_mask_cast_before_normalization() -> None:
 
 @pytest.mark.parametrize("with_prev_logprobs", [True, False])
 @pytest.mark.parametrize("with_ppo", [True, False])
+@pytest.mark.parametrize("with_group_id", [True, False])
 def test_trajectory_logger_preserves_rows_and_publishes_step(
-    tmp_path: Path, with_prev_logprobs: bool, with_ppo: bool
+    tmp_path: Path, with_prev_logprobs: bool, with_ppo: bool, with_group_id: bool
 ) -> None:
     meta = KVBatchMeta(
         partition_id="train",
@@ -86,6 +87,9 @@ def test_trajectory_logger_preserves_rows_and_publishes_step(
             {"prompt_idx": 7, "weight_version": 3},
         ],
     )
+    if with_group_id:
+        for tag, group_id in zip(meta.tags, ["first-epoch", "second-epoch"]):
+            tag["group_id"] = group_id
     fields = {
         "input_lengths": torch.tensor([2, 3]),
         "advantages": torch.tensor([[0.5, 1.0, 0.0], [1.5, 2.0, 2.5]]),
@@ -110,7 +114,7 @@ def test_trajectory_logger_preserves_rows_and_publishes_step(
     for _ in range(2):
         writer.record(meta, td, step=1, chunk_index=0)
 
-    step_dir = tmp_path / "step=00000001"
+    step_dir = tmp_path / "step-00000001"
     assert list(step_dir.glob("*.parquet")) == []
     writer.commit_step(1)
     files = list(step_dir.glob("*.parquet"))
@@ -124,6 +128,8 @@ def test_trajectory_logger_preserves_rows_and_publishes_step(
         "group_g1",
     ]
     assert [row["prompt_idx"] for row in rows] == [7] * 4
+    expected_groups = ["first-epoch", "second-epoch"] if with_group_id else [None, None]
+    assert [row["group_id"] for row in rows] == expected_groups * 2
     assert [row["input_ids"] for row in rows[:2]] == [[10, 11], [20, 21, 22]]
     assert [row["token_mask"] for row in rows[:2]] == [[1, 0], [1, 0, 1]]
     assert [row["advantages"] for row in rows[:2]] == [[0.5, 1.0], [1.5, 2.0, 2.5]]
@@ -139,3 +145,10 @@ def test_trajectory_logger_preserves_rows_and_publishes_step(
         [[-1.0, -1.5], [-2.0, -2.5, -3.0]] if with_prev_logprobs else [None, None]
     )
     assert [row["prev_logprobs"] for row in rows[:2]] == expected_prev
+
+    writer.record(meta, td, step=2, chunk_index=0)
+    writer.commit_step(2)
+    table = pq.read_table(tmp_path)
+    assert table.schema.field("step").type == pa.int64()
+    assert sorted(table.column("step").to_pylist()) == [1, 1, 1, 1, 2, 2]
+    assert table.column("group_id").to_pylist() == expected_groups * 3

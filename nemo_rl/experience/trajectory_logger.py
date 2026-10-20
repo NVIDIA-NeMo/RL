@@ -30,7 +30,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import MASK_SAMPLE, TRUNCATED
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, MASK_SAMPLE, TRUNCATED
 
 TRAJECTORY_SCHEMA_VERSION = "nemorl-trajectories/1"
 
@@ -53,6 +53,7 @@ ROW_SCHEMA = pa.schema(
         ("attempt_start", pa.timestamp("us", tz="UTC")),
         ("chunk_index", pa.int32()),
         ("sample_id", pa.string()),
+        ("group_id", pa.string()),
         ("prompt_idx", pa.int64()),
         ("weight_version", pa.int64()),
         ("reward", pa.float64()),
@@ -127,6 +128,7 @@ class TrajectoryLogger:
             "attempt_start": [self._attempt_start] * n,
             "chunk_index": [chunk_index] * n,
             "sample_id": meta.sample_ids,
+            "group_id": [tag.get(GROUP_ID_TAG) for tag in tags],
             "prompt_idx": [tag.get("prompt_idx") for tag in tags],
             "weight_version": [tag.get("weight_version") for tag in tags],
             "reward": _rollout_column(tensors["total_reward"], n),
@@ -148,7 +150,7 @@ class TrajectoryLogger:
         table = pa.table(columns, schema=ROW_SCHEMA)
 
         if self._active_step is None:
-            directory = self._root / f"step={step:08d}"
+            directory = self._root / f"step-{step:08d}"
             directory.mkdir(parents=True, exist_ok=True)
             self._pending_path = directory / f".part-{uuid4().hex}.parquet.tmp"
             self._writer = pq.ParquetWriter(

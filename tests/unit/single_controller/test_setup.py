@@ -324,6 +324,36 @@ def patched_factories():
         }
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("configured_dir", [None, "custom-trajectories"])
+def test_trajectory_logger_directory_resolution(
+    patched_factories: dict[str, Any],
+    tmp_path: Path,
+    enabled: bool,
+    configured_dir: str | None,
+) -> None:
+    mc = _make_master_config()
+    mc.logger = LoggerConfig(log_dir=str(tmp_path / "logs"))
+    mc.trajectory_logger.enabled = enabled
+    mc.trajectory_logger.log_dir = configured_dir
+
+    with patch(
+        "nemo_rl.experience.trajectory_logger_actor.create_trajectory_logger_actor"
+    ) as create_logger:
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    expected_dir = configured_dir
+    if enabled and configured_dir is None:
+        expected_dir = str(tmp_path / "logs" / "trajectories")
+    assert mc.trajectory_logger.log_dir == expected_dir
+    if enabled:
+        create_logger.assert_called_once_with(mc.data_plane, expected_dir)
+        assert actor_args.trajectory_logger_actor is create_logger.return_value
+    else:
+        create_logger.assert_not_called()
+        assert actor_args.trajectory_logger_actor is None
+
+
 def test_build_generation_passes_sglang_config():
     """SGLangGeneration receives the complete generation config by keyword."""
     master_config = _make_master_config(backend="sglang")
