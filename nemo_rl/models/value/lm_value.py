@@ -429,6 +429,7 @@ class Value(ValueInterface):
         *,
         is_final_checkpoint: bool,
         defer_finalize: bool = False,
+        timeout: Optional[float] = None,
     ) -> None:
         """Save a checkpoint of the value model.
 
@@ -438,7 +439,8 @@ class Value(ValueInterface):
         With Megatron ``checkpoint.async_save`` and ``defer_finalize``, this
         returns after D2H staging, like ``Policy.save_checkpoint``; the caller
         must call ``finalize_async_save()`` before renaming the checkpoint
-        directory. Otherwise the write is complete on return.
+        directory. Otherwise the write is complete on return. ``timeout`` (s)
+        bounds the wait (``ray.get`` raises ``GetTimeoutError``).
         """
         megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
 
@@ -458,7 +460,7 @@ class Value(ValueInterface):
                 tokenizer_path=tokenizer_path,
                 is_final_checkpoint=is_final_checkpoint,
             )
-        ray.get(futures)
+        ray.get(futures, timeout=timeout)
 
     def finalize_async_save(
         self, terminate: bool = False, timeout: Optional[float] = None

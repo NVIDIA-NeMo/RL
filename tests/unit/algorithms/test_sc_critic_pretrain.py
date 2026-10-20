@@ -713,8 +713,12 @@ class _SavingValue:
     def finish_training(self):
         self.events.append("finish")
 
-    def save_checkpoint(self, *, weights_path, optimizer_path, defer_finalize, **_):
+    def save_checkpoint(
+        self, *, weights_path, optimizer_path, defer_finalize, timeout, **_
+    ):
         Path(weights_path).mkdir(parents=True)
+        # Async saves are bounded; synchronous ones wait as before.
+        assert timeout == (cp.ASYNC_SAVE_TIMEOUT_S if defer_finalize else None)
         self.events.append(
             ("save", Path(weights_path).parts[-3], optimizer_path is not None, defer_finalize)
         )
@@ -800,7 +804,7 @@ def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
     # The write lands, step_1 is finalized and its rolling checkpoint promoted
     # before step_2's tmp folder is created and its rolling tmp cleared.
     assert events[:3] == [
-        ("finalize_async", False, None),
+        ("finalize_async", False, cp.ASYNC_SAVE_TIMEOUT_S),
         ("finalize", "tmp_step_1"),
         ("init", 2),
     ]
@@ -808,7 +812,10 @@ def test_async_critic_save_completes_at_the_next_save_or_exit(tmp_path):
 
     events.clear()
     saver.wait(terminate=True)
-    assert events == [("finalize_async", True, None), ("finalize", "tmp_step_2")]
+    assert events == [
+        ("finalize_async", True, cp.ASYNC_SAVE_TIMEOUT_S),
+        ("finalize", "tmp_step_2"),
+    ]
     assert cp.rolling_resume_step(tmp_path) == 2
     saver.close(timeout=1.0)  # nothing pending after a normal exit
     assert len(events) == 2

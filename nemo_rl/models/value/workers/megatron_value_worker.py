@@ -225,6 +225,40 @@ def _value_loss_prepare_fn(
     return {"logits": values}, data
 
 
+def _cpu_shm_async_save_strategy(ckpt_cfg: Any, model: list) -> Any:
+    """Bridge's torch_dist save strategy, staging async writes through CPU shared memory.
+
+    By default NVRx's persistent writer opens the trainer's CUDA tensors through
+    IPC handles; on NVL72 (MNNVL) nodes that import fails ("CUDA driver error:
+    out of memory" in rebuild_cuda_tensor) once the training ranks hold the
+    NVLink fabric resources, and the trainer then waits on the dead writer.
+    Megatron-Core's ``cpu_shm_mode`` makes the trainer copy the tensors to CPU
+    shared memory itself, so the writer never touches the GPU. Bridge builds this
+    same strategy without exposing the flag, and uses
+    ``checkpointing_context["save_strategy"]`` instead when it is set.
+    """
+    from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+        FullyParallelSaveStrategyWrapper,
+    )
+    from megatron.core.dist_checkpointing.strategies.torch import (
+        TorchDistSaveShardedStrategy,
+    )
+
+    strategy = TorchDistSaveShardedStrategy(
+        "torch_dist",
+        1,
+        thread_count=ckpt_cfg.storage_writers_per_rank,
+        cpu_shm_mode=True,
+    )
+    if ckpt_cfg.fully_parallel_save:
+        strategy = FullyParallelSaveStrategyWrapper(
+            strategy,
+            get_pg_collection(model).dp_cp,
+            ckpt_cfg.ckpt_assume_constant_structure,
+        )
+    return strategy
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
@@ -956,6 +990,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         so the caller may offload and keep training while the disk write runs in
         the background; the caller must call ``finalize_async_save()`` before
         renaming or promoting the checkpoint directory.
+
+        Async saves stage through CPU shared memory unless
+        ``megatron_cfg.checkpoint.async_ckpt_use_cpu_shm`` is false (see
+        ``_cpu_shm_async_save_strategy``).
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(
@@ -963,6 +1001,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             )
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
 
         try:
             maybe_finalize_async_save(
@@ -970,6 +1009,17 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
                 blocking=False,
             )
+            if (
+                ckpt_cfg.async_save
+                and ckpt_cfg.ckpt_format == "torch_dist"
+                and "save_strategy" not in self.checkpointing_context
+                and (self.cfg["megatron_cfg"].get("checkpoint") or {}).get(
+                    "async_ckpt_use_cpu_shm", True
+                )
+            ):
+                self.checkpointing_context["save_strategy"] = (
+                    _cpu_shm_async_save_strategy(ckpt_cfg, [self.model])
+                )
             self.mcore_state.cfg.checkpoint.save = weights_path
 
             optimizer_to_save = None

@@ -240,6 +240,10 @@ def critic_resume_paths(
 
 # Bound on landing a pending async save after an error (a full write takes ~1 min).
 CHECKPOINT_CLOSE_TIMEOUT_S = 600.0
+# Bound on each async save's scheduling and on waiting for its write: if a
+# writer process dies the trainer would otherwise wait on it until walltime;
+# failing lets the next chained job resume from the last complete checkpoint.
+ASYNC_SAVE_TIMEOUT_S = 1800.0
 
 
 class CriticCheckpointSaver:
@@ -265,6 +269,7 @@ class CriticCheckpointSaver:
         self.checkpointer = checkpointer
         self.rolling = rolling
         self.async_save = async_save
+        self._timeout = ASYNC_SAVE_TIMEOUT_S if async_save else None
         self._pending: Optional[tuple[str, int]] = None
 
     def save(
@@ -290,6 +295,7 @@ class CriticCheckpointSaver:
             tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
             is_final_checkpoint=is_last,
             defer_finalize=self.async_save,
+            timeout=self._timeout,
         )
         if self.rolling:
             _, resume_tmp = resume_state_dirs(self.checkpointer.checkpoint_dir)
@@ -300,6 +306,7 @@ class CriticCheckpointSaver:
                 tokenizer_path=str(resume_tmp / "value" / "tokenizer"),
                 is_final_checkpoint=is_last,
                 defer_finalize=self.async_save,
+                timeout=self._timeout,
             )
         self.value.finish_training()
         with open(os.path.join(checkpoint_path, FILE_LIST_NAME), "w") as f:
@@ -319,7 +326,10 @@ class CriticCheckpointSaver:
         pending, self._pending = self._pending, None
         started = time.perf_counter()
         if self.async_save and (pending is not None or terminate):
-            self.value.finalize_async_save(terminate=terminate, timeout=timeout)
+            self.value.finalize_async_save(
+                terminate=terminate,
+                timeout=self._timeout if timeout is None else timeout,
+            )
         if pending is None:
             return
         checkpoint_path, step = pending
