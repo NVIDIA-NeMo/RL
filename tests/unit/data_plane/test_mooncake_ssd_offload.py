@@ -560,23 +560,20 @@ def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
     assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()
 
 
-def test_sweep_keeps_files_once_the_existence_check_is_stale(
-    monkeypatch, tmp_path
-) -> None:
-    # A key cleared at the check may be re-put after it; it cannot be offloaded
-    # again within the 1 s lease, so unlinking is safe only shortly after.
-    cleared = _kv_file(tmp_path / "2@x", "2@x")
-    now = [0.0]
-    monkeypatch.setattr(
-        offload, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=None)
-    )
+def test_sweep_keeps_a_file_rewritten_after_it_was_listed(tmp_path) -> None:
+    # The key was absent at the check, then re-put and offloaded again before
+    # the unlink: the file changed since the listing, so it is the live copy.
+    rewritten = _kv_file(tmp_path / "2@x", "2@x")
+    replaced = _kv_file(tmp_path / "3@x", "3@x")
 
     def exists(keys):
-        now[0] += offload._SWEEP_UNLINK_WINDOW_S + 0.01  # a slow RPC
+        _kv_file(rewritten, "2@x", value=b"w" * 500)  # rewritten in place
+        tmp = _kv_file(tmp_path / "tmp", "3@x")
+        os.replace(tmp, replaced)  # replaced by rename (new inode)
         return [0] * len(keys)
 
     assert offload.sweep_cleared_files(str(tmp_path), exists) == 0
-    assert cleared.exists()
+    assert rewritten.exists() and replaced.exists()
 
 
 def test_sweep_keeps_everything_on_a_short_result_list(tmp_path) -> None:

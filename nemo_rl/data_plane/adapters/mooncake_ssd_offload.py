@@ -86,10 +86,6 @@ _watch_stop: threading.Event | None = None
 # a cleared key until the key is offloaded again or the owner exits. Each owner
 # sweeps those files itself (Mooncake 0.3.13 has no per-key disk delete).
 SWEEP_INTERVAL_S = 30.0
-# Unlink only this soon after the existence check: a key re-put after the
-# check stays in memory for at least its 1 s lease (master_args) before it can
-# be offloaded again, so no new file for it can appear within this window.
-_SWEEP_UNLINK_WINDOW_S = 0.5
 _SWEEP_BATCH = 1000
 # Files store the tenant-scoped key, ``<tenant>\0<key>``; TQ uses the default
 # tenant. Measured on 0.3.13 (job 1338878): b"\n\x0edefault\x0098@big...".
@@ -369,27 +365,25 @@ def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> 
     """Delete offload files under ``root`` whose key the master no longer has.
 
     ``exists`` is ``batch_is_exist``: 1 present, 0 absent, negative on error.
-    Only an explicit 0 deletes, and only within ``_SWEEP_UNLINK_WINDOW_S`` of
-    the check. Returns the number of files deleted.
+    A file is deleted only on an explicit 0 and only if it is unchanged since
+    it was listed (before the check): a key re-put and offloaded again after
+    the check rewrites its file, which is then kept. Returns the count deleted.
     """
     files = []
     for dirpath, _, names in os.walk(root):
         for name in names:
             path = os.path.join(dirpath, name)
             key = None if name.startswith(".lock") else _file_key(path)
-            if key is not None:
-                files.append((path, key))
+            if key is not None and (stamp := _stamp(path)) is not None:
+                files.append((path, key, stamp))
     removed = 0
     for start in range(0, len(files), _SWEEP_BATCH):
         batch = files[start : start + _SWEEP_BATCH]
-        checked = time.monotonic()
-        results = exists([key for _, key in batch])
+        results = exists([key for _, key, _ in batch])
         if len(results) != len(batch):
             continue
-        for (path, _), result in zip(batch, results):
-            if time.monotonic() - checked > _SWEEP_UNLINK_WINDOW_S:
-                break
-            if result != 0:
+        for (path, _, stamp), result in zip(batch, results):
+            if result != 0 or _stamp(path) != stamp:
                 continue
             try:
                 os.unlink(path)
@@ -397,6 +391,14 @@ def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> 
             except FileNotFoundError:
                 pass
     return removed
+
+
+def _stamp(path: str) -> tuple[int, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_ino, st.st_mtime_ns, st.st_size
 
 
 def _start_sweep(store: Any, root: str) -> None:
