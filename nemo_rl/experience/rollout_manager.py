@@ -44,6 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
+    _NG_ROLLOUT_ID_BODY_KEY,
     GYM_INFRA_FAILURE_KEY,
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
@@ -1273,6 +1274,18 @@ class AsyncNemoGymRolloutImpl:
         count the driver path reports from its stream merge. A row sent again
         because its stream ended without it is counted by the attempt counter
         (``RolloutStats.record_gym_row_redispatch``) alone.
+
+        A row that carries a gate rollout id (token capture) is never dispatched
+        again here, whatever the attempt budget: Gym's capture ledger is keyed
+        by that id, so a second session under it would add a second chain to
+        the first session's ledger, and the receipt built from that ledger
+        could deliver the first session's chain or be poisoned by its failure
+        rows. Under sibling recovery the stream drains, so the siblings that
+        land are sealed, and the marked rows end the attempt with
+        ``GymTransportError``; the recovery loop then mints a fresh attempt,
+        and with it a fresh gate rollout id, for every sibling that did not
+        seal (``RolloutRecoveryLedger.prepare_incomplete_retry``) and
+        dispatches those rows again.
         """
         if not inputs:
             raise ValueError("NeMo-Gym rollout dispatch requires at least one row")
@@ -1327,10 +1340,19 @@ class AsyncNemoGymRolloutImpl:
             # The markers of the attempt just finished; a re-dispatch counts
             # only when the previous attempt marked the row.
             attempt_markers: dict[int, str] = {}
+            # Rows with a gate rollout id are dispatched once per attempt of the
+            # recovery loop, which re-keys them (see the docstring).
+            captured = any(_NG_ROLLOUT_ID_BODY_KEY in row for row in inputs)
             max_row_attempts = (
                 1
-                if recovery_granularity is RecoveryGranularity.PROMPT_GROUP
+                if captured or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
+            )
+            # Under sibling recovery with gate ids the recovery loop dispatches a
+            # marked row again, so the stream drains and the siblings that land
+            # are sealed before the marked rows end the attempt.
+            drain_markers = (
+                captured and recovery_granularity is RecoveryGranularity.SIBLING
             )
             # Marked rows sent again across every later attempt, reported per rollout.
             infra_redispatches = 0
@@ -1369,8 +1391,11 @@ class AsyncNemoGymRolloutImpl:
                             on_completion=on_completion,
                             infra_failures=attempt_markers,
                             # Nothing re-dispatches a marked row after the last
-                            # attempt, so a marker ends it at once (see _stream_rows).
-                            stop_on_infra_failure=attempt == max_row_attempts,
+                            # attempt, so a marker ends it at once (see _stream_rows),
+                            # unless the recovery loop will.
+                            stop_on_infra_failure=(
+                                attempt == max_row_attempts and not drain_markers
+                            ),
                         )
                     except Exception as error:
                         last_error = error
