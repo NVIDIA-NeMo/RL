@@ -19,6 +19,7 @@ collector/adapter integration without starting an agent or a policy model.
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -27,6 +28,7 @@ from aiohttp.test_utils import TestServer
 from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import NemoGym
+from nemo_rl.experience.rollouts import _prepare_nemo_gym_rows
 
 pytest.importorskip("nemo_gym.episode_types")
 gym_config = pytest.importorskip("nemo_gym.global_config")
@@ -69,10 +71,13 @@ def _model_response(*, episode_protocol: bool) -> gym_openai.NeMoGymResponse:
     )
 
 
-@pytest.mark.parametrize("token_capture", [False, True])
+@pytest.mark.parametrize(
+    ("token_capture", "group_attempt"), [(False, 0), (False, 2), (True, 3)]
+)
 def test_real_collector_streams_episode_and_flat_http_results(
     monkeypatch: pytest.MonkeyPatch,
     token_capture: bool,
+    group_attempt: int,
 ) -> None:
     async def run() -> None:
         received_episode = []
@@ -169,28 +174,55 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     },
                 },
             }
-            rows = [
-                {
-                    **deepcopy(materialized_task),
-                    "_rowidx": index,
-                    "_ng_group_id": "episode-group",
-                    "_ng_group_attempt": 3,
-                    "_ng_rollout_index": index,
-                    "_ng_rollout_id": f"capture-episode-{index}",
-                    "_ng_attempt_index": index * 2,
-                }
-                for index in range(2)
-            ]
+            rows = [deepcopy(materialized_task) for _ in range(2)]
             rows.append(
                 {
-                    "_rowidx": 2,
-                    "_ng_rollout_id": "capture-flat",
                     "agent_ref": {"name": "legacy_agent"},
                     "responses_create_params": {
                         "input": [{"role": "user", "content": "Flat weather request"}]
                     },
                 }
             )
+            expected_task = deepcopy(materialized_task)
+            if token_capture:
+                for index, row in enumerate(rows[:2]):
+                    row.update(
+                        {
+                            "_rowidx": index,
+                            "_ng_group_id": "episode-group",
+                            "_ng_group_attempt": group_attempt,
+                            "_ng_rollout_index": index,
+                            "_ng_rollout_id": f"capture-episode-{index}",
+                            "_ng_attempt_index": index * 2,
+                        }
+                    )
+                rows[2].update({"_rowidx": 2, "_ng_rollout_id": "capture-flat"})
+                expected_episode_ids = [
+                    {"rollout_id": f"capture-episode-{index}", "attempt": index * 2}
+                    for index in range(2)
+                ]
+            else:
+                # Dataset rows have no rollout identity. Exercise the driver's
+                # real preparation step with complete materialized/flat groups.
+                rows.append(deepcopy(rows[2]))
+                if group_attempt:
+                    for row in rows:
+                        row["_ng_group_attempt"] = group_attempt
+                _prepare_nemo_gym_rows(
+                    rows,
+                    generation_config={"max_new_tokens": 64},
+                    sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+                    num_generations=2,
+                )
+                assert all("_ng_rollout_id" not in row for row in rows)
+                expected_task["task_input"]["responses_create_params"]["top_p"] = 0.9
+                expected_episode_ids = [
+                    {
+                        "rollout_id": f"{row['_ng_group_id']}-g{index}-t{group_attempt}",
+                        "attempt": 0,
+                    }
+                    for index, row in enumerate(rows[:2])
+                ]
 
             actor = NemoGym.__ray_metadata__.modified_class({})
             actor.rh = object()
@@ -236,24 +268,23 @@ def test_real_collector_streams_episode_and_flat_http_results(
             ]
 
         assert len(received_episode) == 2
-        assert len(received_flat) == 1
+        assert len(received_flat) == len(rows) - 2
         assert {body["episode_id"]["rollout_id"] for body in received_episode} == {
-            "capture-episode-0",
-            "capture-episode-1",
+            episode_id["rollout_id"] for episode_id in expected_episode_ids
         }
         for body in received_episode:
             assert set(body) == {"episode_id", "task"}
-            index = int(body["episode_id"]["rollout_id"].rsplit("-", 1)[1])
-            assert body["episode_id"]["attempt"] == index * 2
-            assert body["task"] == materialized_task
-        assert "episode_id" not in received_flat[0]
-        assert received_flat[0]["agent_ref"]["name"] == "legacy_agent"
+            assert body["episode_id"] in expected_episode_ids
+            assert body["task"] == expected_task
+        for body in received_flat:
+            assert "episode_id" not in body
+            assert body["agent_ref"]["name"] == "legacy_agent"
 
         by_index = {
             row_index: (agent_ref, result)
             for row_index, agent_ref, result, _ in streamed
         }
-        assert set(by_index) == {0, 1, 2}
+        assert set(by_index) == set(range(len(rows)))
         assert sum(timing is not None for _, _, _, timing in streamed) == 1
         for index in (0, 1):
             agent_ref, result = by_index[index]
@@ -262,10 +293,9 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 "name": "episode_agent",
             }
             assert result["full_result"]["reward"] == 0.75
-            assert result["full_result"]["_ng_episode_id"] == {
-                "rollout_id": f"capture-episode-{index}",
-                "attempt": index * 2,
-            }
+            assert (
+                result["full_result"]["_ng_episode_id"] == expected_episode_ids[index]
+            )
             assert result["full_result"]["_ng_task_id"] == materialized_task["task_id"]
             assert (
                 result["full_result"]["_ng_environment_server"] == "episode_environment"
@@ -277,9 +307,15 @@ def test_real_collector_streams_episode_and_flat_http_results(
                     "generation_logprobs"
                 ].tolist() == pytest.approx([-0.1, -0.2])
                 assert result["message_log"][1]["role"] == "assistant"
-        flat_ref, flat_result = by_index[2]
-        assert flat_ref["name"] == "legacy_agent"
-        assert flat_result["full_result"]["reward"] == 0.25
+        for index in range(2, len(rows)):
+            flat_ref, flat_result = by_index[index]
+            assert flat_ref["name"] == "legacy_agent"
+            assert flat_result["full_result"]["reward"] == 0.25
+            if not token_capture:
+                assert flat_result["message_log"][1]["token_ids"].tolist() == [21]
+                assert flat_result["message_log"][1][
+                    "generation_logprobs"
+                ].tolist() == pytest.approx([-0.4])
         if token_capture:
             expected_captures = [
                 ("capture-episode-0", 0.75),
@@ -308,9 +344,5 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 assert result["receipt"]["capture_poisoned"] is False
         else:
             actor._control.assert_not_awaited()
-            assert flat_result["message_log"][1]["token_ids"].tolist() == [21]
-            assert flat_result["message_log"][1][
-                "generation_logprobs"
-            ].tolist() == pytest.approx([-0.4])
 
     asyncio.run(run())

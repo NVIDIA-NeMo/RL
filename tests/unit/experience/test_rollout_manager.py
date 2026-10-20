@@ -30,6 +30,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,6 +47,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymTerminalEpisodeFailure,
@@ -74,6 +76,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -1496,6 +1499,48 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
     assert rows[1]["task_input"]["task_data"] == {"state": ["meeting-1"]}
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    [None, {}, {"taskset": ""}, {"taskset": []}],
+    ids=["flat-no-route", "missing-taskset", "empty-taskset", "list-taskset"],
+)
+def test_nemo_gym_bare_and_routed_rollouts_reject_malformed_rows_before_dispatch(
+    task_id: dict | None,
+) -> None:
+    if task_id is None:
+        rows = [{"agent_ref": {"name": "alpha"}, "_rowidx": 0}, {"_rowidx": 1}]
+        expected_error = (
+            "A NeMo-Gym row must contain task_id.taskset and task_input, "
+            "or a non-empty agent_ref.name or task_source"
+        )
+    else:
+        rows = [
+            {"task_id": identifier, "task_input": {}, "_rowidx": index}
+            for index, identifier in enumerate(
+                [{"taskset": "workplace:train"}, task_id]
+            )
+        ]
+        expected_error = (
+            "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
+        )
+    actor = Mock()
+    routed = NemoGymShardSet(
+        handles={"only": [actor]},
+        route_to_shard={"alpha": "only", "workplace_environment": "only"},
+        environment_server_routes={"workplace:train": "workplace_environment"},
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+
+    for environment in (actor, routed):
+        impl._task_to_env = {"nemo_gym": environment}
+        with pytest.raises(ValueError) as raised:
+            _run(impl._run_rollouts(rows, Timer(), "test"))
+
+        assert str(raised.value) == expected_error
+        assert actor.mock_calls == []
 
 
 # ---------------------------------------------------------------------------

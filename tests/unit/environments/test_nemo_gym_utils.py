@@ -447,7 +447,7 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     ):
         mock_cls.options.return_value.remote.return_value = actor
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
-        mock_ray.get.return_value = {}
+        mock_ray.get.side_effect = [None, [None, {}]]
 
         result = build_nemo_gym_actors(
             _env_configs(num_gpu_nodes=num_gpu_nodes),
@@ -480,26 +480,33 @@ def test_an_unsharded_job_gets_the_registry_runtime_env(
     # wrapper once dropped it without any type or test catching it.
     assert cfg["token_capture"] == token_capture
 
-    # Spinup is deferred from __init__, so the factory must await it. The
-    # tokenizer install has to follow it, not race it.
+    # Wait for spinup before submitting tokenizer installation and route
+    # retrieval together.
     actor._spinup.remote.assert_called_once_with()
     actor.set_tokenizer.remote.assert_called_once_with(_TOKENIZER)
     assert mock_ray.get.call_args_list == [
         call("spinup-ref"),
-        call(actor.set_tokenizer.remote.return_value),
-        call(actor.list_environment_server_routes.remote.return_value),
+        call(
+            [
+                actor.set_tokenizer.remote.return_value,
+                actor.list_environment_server_routes.remote.return_value,
+            ]
+        ),
     ]
 
 
-@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref"])
+@pytest.mark.parametrize("failed_ref", ["spinup-ref", "tokenizer-ref", "routes-ref"])
 def test_spinup_nemo_gym_actor_cleans_up_after_startup_failure(
     detected_uv_dirs, failed_ref
 ):
     actor = MagicMock()
     actor._spinup.remote.return_value = "spinup-ref"
     actor.set_tokenizer.remote.return_value = "tokenizer-ref"
+    actor.list_environment_server_routes.remote.return_value = "routes-ref"
 
     def get_or_fail(ref, **_kwargs):
+        if isinstance(ref, list):
+            return [get_or_fail(item, **_kwargs) for item in ref]
         if ref == failed_ref:
             raise RuntimeError("startup failed")
         return None
@@ -611,11 +618,11 @@ def _stub_gym_resolved_config(resolved):
     """Stand in for nemo_gym.global_config, which lives in the actor's venv."""
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
-    module.get_global_config_dict = lambda: resolved
+    module.get_global_config_dict = MagicMock(return_value=resolved)
     with patch.dict(
         sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
     ):
-        yield
+        yield module.get_global_config_dict
 
 
 def _spun_up_actor():
@@ -697,14 +704,24 @@ def test_list_entries_before_spinup_raises():
         actor.list_entries()
 
 
-def test_list_environment_server_routes_reads_the_resolved_gym_config():
-    resolved = DictConfig(
-        {"environment_server_routes": {"workplace:train": "workplace_environment"}}
-    )
-    with _stub_gym_resolved_config(resolved):
-        assert _spun_up_actor().list_environment_server_routes() == {
-            "workplace:train": "workplace_environment"
-        }
+@pytest.mark.parametrize(
+    "routes", [None, {}, {"workplace:train": "workplace_environment"}]
+)
+def test_list_environment_server_routes_caches_the_resolved_gym_config(routes):
+    resolved = DictConfig({"environment_server_routes": routes})
+    with _stub_gym_resolved_config(resolved) as get_config:
+        actor = _spun_up_actor()
+        first_routes = actor.list_environment_server_routes()
+        assert first_routes == (routes or {})
+
+        # Discovery callers must not mutate the map used by later rollouts.
+        first_routes["extra:train"] = "other_environment"
+        assert actor.list_environment_server_routes() == (routes or {})
+        get_config.assert_called_once_with()
+
+        actor.shutdown()
+        with pytest.raises(RuntimeError, match="call _spinup"):
+            actor.list_environment_server_routes()
 
 
 @pytest.mark.parametrize(
@@ -838,6 +855,8 @@ class _FakeGymCluster:
 
     def ray_get(self, reference, timeout=None):
         self.ray_get_calls.append((reference, timeout))
+        if isinstance(reference, list):
+            return [self.ray_get(item, timeout=timeout) for item in reference]
         if reference == "pg-ready":
             if self.pg_ready_error is not None:
                 raise self.pg_ready_error

@@ -26,6 +26,7 @@ from nemo_rl.environments.nemo_gym import (
 from nemo_rl.experience.failures import (
     FailureClass,
     GymTerminalEpisodeFailure,
+    GymTransportError,
     RolloutDataFailure,
     classify_rollout_failure,
 )
@@ -112,19 +113,6 @@ def test_materialized_task_preparation_preserves_payload_and_resolves_actual_age
     assert "responses_create_params" not in row
 
 
-def test_materialized_task_preparation_does_not_create_episode_identity():
-    row = _row()
-    del row["_ng_rollout_id"]
-    row["_ng_group_attempt"] = 2
-    original = deepcopy(row)
-    _prepare([row])
-    assert row == {
-        **original,
-        "_ng_environment_server": "weather_environment",
-        "agent_ref": {"type": "responses_api_agents", "name": "weather_agent"},
-    }
-
-
 def test_flat_row_preparation_and_result_are_opaque():
     row = {
         "agent_ref": {"name": "flat_row_agent"},
@@ -180,10 +168,15 @@ def test_episode_reply_identity_must_match_request(key):
 
 
 @pytest.mark.parametrize(
-    "terminal,error_type",
-    [(True, GymTerminalEpisodeFailure), (False, RuntimeError)],
+    "terminal,error_type,failure_class",
+    [
+        (True, GymTerminalEpisodeFailure, FailureClass.DATA),
+        (False, GymTransportError, FailureClass.INFRA),
+    ],
 )
-def test_handled_episode_failure_is_never_a_scored_result(terminal, error_type):
+def test_handled_episode_failure_is_never_a_scored_result(
+    terminal, error_type, failure_class
+):
     row = _row()
     _prepare([row])
     reply = _reply(row)
@@ -198,7 +191,7 @@ def test_handled_episode_failure_is_never_a_scored_result(terminal, error_type):
         error_type, match="verification failed.*stage=verification"
     ) as error:
         _normalize_nemo_gym_episode_result(row, reply)
-    assert classify_rollout_failure(error.value) is FailureClass.DATA
+    assert classify_rollout_failure(error.value) is failure_class
 
 
 @pytest.mark.parametrize("reward", [None, "1.0", True, float("nan"), float("inf")])
@@ -218,6 +211,7 @@ def test_episode_receipt_uses_fallback_identity_without_response(attempt, captur
     del row["_ng_rollout_id"]
     row["_ng_task_index"] = 17
     _prepare([row])
+    assert "_ng_rollout_id" not in row
     reply = _reply(row)
     reply["episode_id"] = {"rollout_id": "17-0", "attempt": attempt}
     del reply["result"]["response"]

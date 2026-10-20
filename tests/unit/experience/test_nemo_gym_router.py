@@ -161,6 +161,41 @@ def test_bare_actor_dispatches_materialized_rows_for_actor_side_route_resolution
     assert all("agent_ref" not in row for row in rows)
 
 
+@pytest.mark.parametrize(
+    "task_id",
+    [None, {}, {"taskset": ""}, {"taskset": []}],
+    ids=["flat-no-route", "missing-taskset", "empty-taskset", "list-taskset"],
+)
+def test_bare_and_routed_dispatch_reject_malformed_rows_consistently(
+    task_id: dict | None,
+) -> None:
+    if task_id is None:
+        rows = _rows(["alpha"], num_generations=2)
+        rows[1] = {"_rowidx": 1}
+        expected_error = (
+            "A NeMo-Gym row must contain task_id.taskset and task_input, "
+            "or a non-empty agent_ref.name or task_source"
+        )
+    else:
+        rows = _materialized_rows(["workplace:train"], num_generations=2)
+        rows[1]["task_id"] = task_id
+        expected_error = (
+            "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
+        )
+    actor = _FakeActor("only")
+    routed = _shard_set(
+        {"only": [actor]}, {"alpha": "only", "workplace_environment": "only"}
+    )
+    routed.environment_server_routes = {"workplace:train": "workplace_environment"}
+
+    for shard_set in (as_nemo_gym_shard_set(actor), routed):
+        with pytest.raises(ValueError) as raised:
+            _bucket_nemo_gym_rows_by_instance(rows, shard_set, num_generations=2)
+
+        assert str(raised.value) == expected_error
+        assert actor.calls == []
+
+
 def test_empty_batch_does_not_dispatch_to_a_bare_actor():
     assert (
         _bucket_nemo_gym_rows_by_instance(
