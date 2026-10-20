@@ -874,7 +874,7 @@ class TestDynamicSamplingValidation:
             warnings.simplefilter("error", UserWarning)
             validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize("sampler", ["windowed", "ready_first", "weight_fifo"])
+    @pytest.mark.parametrize("sampler", ["windowed", "ready_first"])
     def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
         validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
@@ -1335,3 +1335,8 @@ class TestInLossSeqFilterForPPO:
 
         with pytest.raises(ValueError, match="without use_kl_in_reward"):
             validate_single_controller_config(mc)
+
+
+def test_dynamic_sampling_rejects_weight_fifo():
+    with pytest.raises(ValueError, match="cannot be combined with.*weight_fifo"):
+        validate_single_controller_config(_dynamic_sampling_config(sampler="weight_fifo"))

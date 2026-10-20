@@ -1502,6 +1502,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
+        if async_config.sampler.name == "weight_fifo":
+            raise ValueError(
+                "grpo.use_dynamic_sampling cannot be combined with "
+                "async_rl.sampler.name='weight_fifo': replacements can carry a newer "
+                "weight version and leave the oldest bucket permanently short. "
+                "Use 'in_order', 'ready_first', or 'windowed'."
+            )
         grpo_cfg = cast(GRPOConfig, algo_cfg)
         if grpo_cfg.adv_estimator.name != "grpo":
             raise ValueError(
