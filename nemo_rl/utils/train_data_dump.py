@@ -100,6 +100,21 @@ class BaseDebugWriter:
     ) -> int:
         raise NotImplementedError
 
+    def finish_step(self, step: int, expected_rows: int | None = None) -> None:
+        """Publish a completed optimizer step and reset the per-step state.
+
+        Args:
+            step: The completed optimizer step.
+            expected_rows: Rows the shards reported writing, checked against the
+                rows published.
+        """
+        self._publish_step(step, expected_rows)
+        self.step = None
+        self.rows = 0
+
+    def _publish_step(self, step: int, expected_rows: int | None) -> None:
+        raise NotImplementedError
+
 
 class TrainDataDump(BaseDebugWriter):
     """Write chunks to a partial file, publishing only a completed optimizer step.
@@ -144,7 +159,7 @@ class TrainDataDump(BaseDebugWriter):
                 num_rows += 1
         return num_rows
 
-    def finish_step(self, step: int, expected_rows: int | None = None) -> None:
+    def _publish_step(self, step: int, expected_rows: int | None) -> None:
         """Merge every shard's part file and publish the step atomically.
 
         Called on the controller, which may not itself have written anything:
@@ -184,5 +199,3 @@ class TrainDataDump(BaseDebugWriter):
         os.replace(partial, self.log_dir / f"train_data_step{step + 1}.jsonl")
         for part in parts:
             part.unlink()
-        self.step = None
-        self.rows = 0
