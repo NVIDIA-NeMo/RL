@@ -31,6 +31,9 @@ async_rl:
 policy:
   train_global_batch_size: 16
   megatron_cfg:
+    # Retain backward logprob inputs in host memory for full-context rollouts.
+    # Native logprobs, gradients, and TMPE stay unchanged.
+    offload_logprob_logits_to_cpu: true
     # Keep policy scoring and checkpoint recomputation on the qualified BF16
     # kernels. This requires the source-pinned native TE/MCore runtime.
     stable_policy_forward: true
