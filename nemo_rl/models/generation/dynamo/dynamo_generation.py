@@ -40,6 +40,7 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -150,6 +151,20 @@ class DynamoGeneration(GenerationInterface):
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject SingleController settings the managed Dynamo backend cannot honor."""
+        # Both would otherwise fail only after the engines are up: R3 in the Megatron
+        # worker's setup, a VLM policy at its first multimodal prompt.
+        if router_replay_enabled(master_config.policy):
+            raise ValueError(
+                "policy.router_replay.enabled=true requires "
+                "policy.generation.backend='vllm'; managed Dynamo does not return "
+                "routed experts."
+            )
+        if master_config.policy.get("is_vlm"):
+            raise ValueError(
+                "policy.is_vlm=true is not supported with "
+                "policy.generation.backend='dynamo'; managed Dynamo serves text "
+                "prompts only."
+            )
         fleet_health = master_config.async_rl.generation_fleet_health
         if fleet_health.enabled:
             # The Dynamo frontend routes every request across its worker fleet, so

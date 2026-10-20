@@ -1684,6 +1684,16 @@ class TestSetup:
         ("misconfigure", "match"),
         [
             pytest.param(
+                lambda mc: mc.policy.update(router_replay={"enabled": True}),
+                "does not return routed experts",
+                id="router_replay",
+            ),
+            pytest.param(
+                lambda mc: mc.policy.update(is_vlm=True),
+                "serves text prompts only",
+                id="vlm",
+            ),
+            pytest.param(
                 lambda mc: setattr(
                     mc.async_rl.generation_fleet_health, "enabled", True
                 ),

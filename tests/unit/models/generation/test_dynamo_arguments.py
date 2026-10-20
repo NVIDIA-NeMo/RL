@@ -176,6 +176,31 @@ def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("override", "ignored"),
+    [
+        ({"bad_words": ["foo"]}, ["bad_words"]),
+        ({"ignore_eos": True}, ["ignore_eos"]),
+        ({"disaggregation": {"enabled": True}}, ["disaggregation"]),
+        # Inherited shared-YAML settings the exemplars carry stay quiet.
+        ({"disaggregation": {"enabled": False}}, []),
+        ({"ignore_eos": False}, []),
+        ({"refit_cfg": {"nixl": {}}, "mcore_generation_config": {"x": 1}}, []),
+        ({"real_quant_export_cpu_offload": True}, []),
+    ],
+)
+def test_config_warns_for_ignored_generation_keys(override, ignored) -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        DynamoConfig.model_validate(_config(**override))
+    expected = (
+        [f"policy.generation keys ignored by backend='dynamo': {ignored}"]
+        if ignored
+        else []
+    )
+    assert [str(warning.message) for warning in caught] == expected
+
+
 def test_config_rejects_a_required_http_server_api_key() -> None:
     """The managed Dynamo frontend checks no bearer token, so asking for one
     fails loudly instead of leaving the exposed server open; the exemplar's
