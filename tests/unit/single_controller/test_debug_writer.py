@@ -370,9 +370,7 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
 
 class _RecordingWriter(DebugWriter):
     def __init__(self, log_dir: str, *, shard_id: str, label: str = "unset") -> None:
-        super().__init__()
-        self.log_dir = log_dir
-        self.shard_id = shard_id
+        super().__init__(log_dir, shard_id=shard_id)
         self.label = label
 
     def _write_rows(self, step: int, rows: Any, replace: bool) -> int:
@@ -410,7 +408,7 @@ def test_make_debug_writer_builds_external_target_with_extra_kwargs(
     cfg = DebugWriterConfig(target=f"{__name__}._RecordingWriter", label="fake-label")
     writer = make_debug_writer(cfg, str(tmp_path), shard_id="2")
     assert isinstance(writer, _RecordingWriter)
-    assert writer.log_dir == str(tmp_path)
+    assert writer.log_dir == tmp_path
     assert writer.shard_id == "2"
     assert writer.label == "fake-label"
 
