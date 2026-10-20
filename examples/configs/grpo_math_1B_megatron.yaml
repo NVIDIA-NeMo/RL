@@ -81,7 +81,7 @@ policy:
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
   megatron_cfg:
     enabled: true
