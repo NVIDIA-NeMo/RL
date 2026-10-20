@@ -11,7 +11,9 @@ import numpy as np
 import torch
 import random
 import glob
-import os 
+import os
+import pathlib
+import base64
 
 random.seed(42)
    
@@ -532,16 +534,35 @@ class RewardBenchDataset:
         self.formatted_ds = Dataset.from_list(all_formatted_examples)
 
 
+def encode_non_text_input_data(turns, media_dir: pathlib.Path=None) -> None:
+    if isinstance(turns, str) or media_dir is None:
+        return  # text-only task
+    for turn in turns:
+        if isinstance(turn["content"], list):  # if a string then it is text-only
+            for item in turn["content"]:
+                if item["type"] == "text":
+                    continue
+                if "{b64}" in item[item["type"]]["url"]:
+                    media_file = media_dir / item["filename"]
+                    with media_file.open("rb") as reader:
+                        b64 = base64.b64encode(reader.read()).decode("utf-8")
+                    # Replace the placeholder '{b64}' in the URL with the base64 file encoding.
+                    item[item["type"]]["url"] = item[item["type"]]["url"].format(b64=b64)
+
+
 class HelpSteer3LocalDataset(torch.utils.data.Dataset):
     """Dataset for loading HelpSteer3 data from local JSONL files."""
-    def __init__(self, data_path: str, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
+    def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
         data = []
+        if media_path is not None:
+            media_path = pathlib.Path(media_path)
         with open(data_path, 'r', encoding='utf_8') as f:
             for line in f:
                 one = json.loads(line)
                 if one["args"]["num_responses"] == 2:
                     examples = []
                     preference = 0 if one["args"]["preference_ranking"] <= 3 else 1
+                    encode_non_text_input_data(one["args"]["context"], media_path)
 
                     example = {
                         #"prompt": format_genrm_prompt(one["args"]["context"], one["args"]["response1"], one["args"]["response2"]),

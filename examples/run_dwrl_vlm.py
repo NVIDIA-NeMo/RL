@@ -628,8 +628,8 @@ def setup_data(
     # Load dataset
     train_data_path = data_config["train"].get("data_path")
     val_data_path = data_config["validation"].get("data_path")
-    train_dataset = HelpSteer3LocalDataset(train_data_path, task_name="genrm_dwrl", shuffle_seed=seed, split='train', double_swap=False)
-    val_dataset = HelpSteer3LocalDataset(val_data_path, task_name="genrm_dwrl", shuffle_seed=seed, split='validation', double_swap=False) if val_data_path else None
+    train_dataset = HelpSteer3LocalDataset(train_data_path, media_path=data_config["train"].get("media_path"), task_name="genrm_dwrl", shuffle_seed=seed, split='train', double_swap=False)
+    val_dataset = HelpSteer3LocalDataset(val_data_path, media_path=data_config["validation"].get("media_path"), task_name="genrm_dwrl", shuffle_seed=seed, split='validation', double_swap=False) if val_data_path else None
 
     # Set up data processor
     task_data_processors: dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]] = (
@@ -837,7 +837,8 @@ def main() -> None:
     try:
         # Check if async mode is enabled
         if config.grpo.async_grpo.enabled:
-            return RuntimeError("async training is not yet supported for DWRL")
+            raise RuntimeError("async training is not yet supported for DWRL")
+
             # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
             if config.grpo.use_dynamic_sampling:
                 raise NotImplementedError(

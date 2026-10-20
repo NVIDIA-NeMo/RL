@@ -415,7 +415,8 @@ def main() -> None:
     try:
         # Check if async mode is enabled
         if config.grpo.async_grpo.enabled:
-            return RuntimeError("async training is not yet supported for DWRL")
+            raise RuntimeError("async training is not yet supported for DWRL")
+
             # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
             if config.grpo.use_dynamic_sampling:
                 raise NotImplementedError(
