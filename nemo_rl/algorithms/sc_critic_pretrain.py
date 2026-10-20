@@ -774,6 +774,31 @@ def _rank_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
 _BUCKETS = 4
 
 
+def heldout_slices(group: BankGroup) -> tuple[str, str]:
+    """``(agent, family)`` a held-out group's metrics are also broken down by.
+
+    ``agent`` is its ``agent_ref`` name without the ``_sandboxed_agent`` /
+    ``_agent`` suffix (one per SWE dataset, one for Terminal-Bench, ...);
+    ``family`` is ``tb``, ``search``, ``gdpval`` or ``swe``.
+    """
+    ref = (group.extra_env_info or {}).get("agent_ref")
+    name = str((ref.get("name") if isinstance(ref, dict) else ref) or "unknown")
+    for suffix in ("_sandboxed_agent", "_agent"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    low = name.lower()
+    if "terminal" in low or low.startswith("tb"):
+        family = "tb"
+    elif "browsecomp" in low or "search" in low:
+        family = "search"
+    elif "gdpval" in low:
+        family = "gdpval"
+    else:
+        family = "swe"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name), family
+
+
 @dataclass
 class HeldoutStats:
     """Legacy held-out critic metrics, accumulated over chunks of whole groups.
@@ -1144,30 +1169,49 @@ class _CriticPretrainer:
             self._cleanup(meta)
 
     def evaluate(self, groups: Sequence[BankGroup]) -> dict[str, float]:
-        """Forward-only held-out metrics, ``groups_per_step`` groups at a time."""
+        """Forward-only held-out metrics, ``groups_per_step`` groups at a time.
+
+        Besides the pooled ``critic/*`` metrics, the same metrics per agent and per
+        family (:func:`heldout_slices`) under ``by_agent/<agent>/...`` and
+        ``by_family/<family>/...``, from the same forward.
+        """
         stats = HeldoutStats()
+        sliced: dict[str, HeldoutStats] = {}
         for start in range(0, len(groups), self.groups_per_step):
             chunk = groups[start : start + self.groups_per_step]
+            slices = [heldout_slices(g) for g in chunk]
             meta, staged = self._put(chunk, id_prefix="h")
             try:
                 scored = self._score(meta, train=False)
                 real = staged.real_rows()
-                stats.add(
-                    values=scored["values"][real],
-                    returns=scored["returns"][real],
-                    token_mask=scored["token_mask"][real],
-                    sample_mask=scored["sample_mask"][real],
-                    rewards=scored["rewards"][real],
-                    canonical=staged.canonical_rows()[real],
-                    group_of_row=[
-                        g
-                        for g, pad in zip(staged.group_of_row, staged.is_pad)
-                        if not pad
-                    ],
-                )
+                fields = {
+                    "values": scored["values"][real],
+                    "returns": scored["returns"][real],
+                    "token_mask": scored["token_mask"][real],
+                    "sample_mask": scored["sample_mask"][real],
+                    "rewards": scored["rewards"][real],
+                    "canonical": staged.canonical_rows()[real],
+                }
+                group_of_row = [
+                    g for g, pad in zip(staged.group_of_row, staged.is_pad) if not pad
+                ]
+                stats.add(**fields, group_of_row=group_of_row)
+                for kind, i in (("agent", 0), ("family", 1)):
+                    for name in sorted({s[i] for s in slices}):
+                        keep = [slices[g][i] == name for g in group_of_row]
+                        if not any(keep):
+                            continue
+                        sel = torch.tensor(keep, dtype=torch.bool)
+                        sliced.setdefault(f"by_{kind}/{name}", HeldoutStats()).add(
+                            **{k: v[sel] for k, v in fields.items()},
+                            group_of_row=[g for g, k in zip(group_of_row, keep) if k],
+                        )
             finally:
                 self._cleanup(meta)
-        return stats.metrics()
+        out = stats.metrics()
+        for key, part in sliced.items():
+            out.update({f"{key}/{k}": v for k, v in part.metrics().items()})
+        return out
 
 
 def _bank_settings(banks: Sequence[Path], master_config: Any) -> int:
@@ -1614,6 +1658,20 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
                         f"q4={eval_metrics.get('critic/within_group_auc_q4', float('nan')):.4f}",
                         flush=True,
                     )
+                    families = sorted(
+                        {k.split("/")[1] for k in eval_metrics if k.startswith("by_family/")}
+                    )
+                    if len(families) > 1:
+                        print(
+                            "    by family: "
+                            + "; ".join(
+                                f"{f} ev={eval_metrics.get(f'by_family/{f}/critic/explained_var', float('nan')):.4f} "
+                                f"terminal_auc={eval_metrics.get(f'by_family/{f}/critic/terminal_auc', float('nan')):.4f} "
+                                f"q4={eval_metrics.get(f'by_family/{f}/critic/within_group_auc_q4', float('nan')):.4f}"
+                                for f in families
+                            ),
+                            flush=True,
+                        )
             if save_by_timeout:
                 print(
                     "⏰ Walltime budget reached; stopping after the save.", flush=True

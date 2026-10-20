@@ -620,6 +620,54 @@ def test_evaluate_applies_the_legacy_masks_and_scores_groups():
     assert plane.rows == {}
 
 
+class _RankValue(_Value):
+    """Predicts 0.9 for each group's first rollout and 0.1 for the rest."""
+
+    def get_values_from_meta(self, meta, privilege_prefixes=None):
+        self.calls.append("get_values")
+        for sid, n in zip(meta.sample_ids, meta.sequence_lengths):
+            self.plane.rows[sid]["values"] = torch.full((n,), 0.9 if sid.endswith("_g0") else 0.1)
+
+
+def _with_agent(group, name):
+    group.extra_env_info = {**group.extra_env_info, "agent_ref": {"type": "responses_api_agents", "name": name}}
+    return group
+
+
+def test_evaluate_breaks_held_out_metrics_down_by_agent_and_family():
+    rebench, tb = "swe_rebench_opencode_sandboxed_agent", "terminal_bench_2_1_opencode_sandboxed_agent"
+    assert cp.heldout_slices(_with_agent(_group("A", 1), rebench)) == ("swe_rebench_opencode", "swe")
+    assert cp.heldout_slices(_with_agent(_group("B", 1), tb)) == ("terminal_bench_2_1_opencode", "tb")
+    assert cp.heldout_slices(_with_agent(_group("S", 1), "browsecomp_sandboxed_agent"))[1] == "search"
+    assert cp.heldout_slices(_with_agent(_group("G", 1), "gdpval_train"))[1] == "gdpval"
+    assert cp.heldout_slices(_group("C", 1)) == ("unknown", "swe")
+
+    def groups():
+        return [
+            # length 10: 8 response tokens, so every progress quarter is populated
+            _with_agent(_group("A", 3, rewards=[1.0, 0.0, 0.0], length=10), rebench),
+            _with_agent(_group("B", 2, rewards=[0.0, 1.0], length=10), tb),
+            _with_agent(_group("C", 2, rewards=[1.0, 0.0], length=10), "scale_swe_opencode_sandboxed_agent"),
+        ]
+
+    plane = _Plane()
+    trainer = _trainer(plane, _RankValue(plane))  # 2 groups per chunk: slices span chunks
+    full = trainer.evaluate(groups())
+    alone = {
+        "swe": trainer.evaluate([g for g in groups() if g.group_id != "B"]),
+        "tb": trainer.evaluate([g for g in groups() if g.group_id == "B"]),
+    }
+    for family, m in alone.items():
+        for k in ("critic/terminal_auc", "critic/within_group_auc_q4", "critic/explained_var",
+                  "critic/n_mixed_groups", "num_heldout_samples"):
+            assert full[f"by_family/{family}/{k}"] == pytest.approx(m[k], nan_ok=True)
+    assert full["by_agent/swe_rebench_opencode/num_heldout_samples"] == 3.0
+    assert full["by_family/swe/critic/within_group_auc_q4"] == pytest.approx(1.0)
+    assert full["by_family/tb/critic/within_group_auc_q4"] == pytest.approx(0.0)
+    assert full["critic/within_group_auc_q4"] == pytest.approx(2 / 3)
+    assert plane.rows == {}
+
+
 class _Checkpointer:
     """CheckpointManager's checkpoint_dir + get_resume_paths, without the IO."""
 
