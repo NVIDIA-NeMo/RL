@@ -40,6 +40,7 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
     attach_captured_media_anchor_mask,
+    validate_requested_multimodal_fields,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
@@ -483,6 +484,9 @@ class TQWorkerMixin:
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
+            validate_requested_multimodal_fields(
+                data, requested_fields=meta.fields or [], tags=meta.tags
+            )
             trace_tq_fetch_payload(
                 stage=meta.task_name or "unknown",
                 keys=meta.sample_ids,
@@ -514,6 +518,9 @@ class TQWorkerMixin:
         )
         data = self._maybe_assemble_routed_experts(meta, data)
         attach_message_log_view(data)
+        validate_requested_multimodal_fields(
+            data, requested_fields=meta.fields or [], tags=meta.tags
+        )
         trace_tq_fetch_payload(
             stage=meta.task_name or "unknown",
             keys=meta.sample_ids,

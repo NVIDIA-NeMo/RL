@@ -198,6 +198,38 @@ def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:
     return sorted(WIRE_MULTIMODAL_FIELDS & set(meta.fields or ()))
 
 
+def validate_requested_multimodal_fields(
+    batch: Any,
+    *,
+    requested_fields: Sequence[str],
+    tags: Optional[Sequence[dict[str, Any]]],
+) -> None:
+    """Reject a model fetch that lost media declared by its row geometry.
+
+    Metric-only and value-model reads may deliberately omit media, so validate
+    only requested packed columns. Legacy rows without geometry tags retain
+    their existing behavior. This checks transport, never training masks.
+    """
+    if tags is None:
+        return
+    for field in PACKED_MULTIMODAL_FIELDS & set(requested_fields):
+        expected = [
+            len(tag.get(row_shapes_key(field), {}).get("shapes", [])) for tag in tags
+        ]
+        if not any(expected):
+            continue
+        value = batch.get(field)
+        if not isinstance(value, PackedTensor):
+            raise ValueError(
+                f"Requested media column {field!r} is missing although row geometry declares media"
+            )
+        actual = value.logical_segment_counts_by_row()
+        if actual != expected:
+            raise ValueError(
+                f"Requested media column {field!r} lost row segments: expected {expected}, got {actual}"
+            )
+
+
 def multimodal_row_tags(
     multimodal: dict, sample_count: int
 ) -> "Optional[list[dict[str, Any]]]":

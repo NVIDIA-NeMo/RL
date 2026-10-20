@@ -914,6 +914,84 @@ def _from_wire(td: TensorDict) -> TensorDict:
         return new_td
 
 
+def _restore_sparse_packed_columns(
+    data: TensorDict,
+    *,
+    sample_ids: list[str],
+    partition_id: str,
+    select_fields: list[str],
+) -> TensorDict:
+    """Recover media columns omitted by TQ's common-field KV projection.
+
+    ``kv_retrieve_meta`` exposes only fields written on every requested key.
+    A text-only rollout group omits its packed media columns, so fetching it
+    alongside a video group can silently discard the video's entire column.
+    Split only missing packed fields into smaller reads, retaining each
+    returned value exactly and inserting empty wire rows for keys without it.
+    Non-media columns and the ordinary dense-field read remain unchanged.
+    """
+    # Like _from_wire, avoid loading model/processor dependencies for clients
+    # which never use this adapter's read path.
+    from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+
+    missing = sorted((set(select_fields) & PACKED_MULTIMODAL_FIELDS) - set(data.keys()))
+    if not missing or len(sample_ids) < 2:
+        return data
+
+    recovered: dict[str, list[torch.Tensor | None]] = {}
+    for name in missing:
+        recovered[name] = []
+        for _ in sample_ids:
+            recovered[name].append(None)
+    midpoint = len(sample_ids) // 2
+    pending = [
+        (list(range(midpoint)), missing),
+        (list(range(midpoint, len(sample_ids))), missing),
+    ]
+    while pending:
+        indices, names = pending.pop()
+        part = tq.kv_batch_get(
+            keys=[sample_ids[index] for index in indices],
+            partition_id=partition_id,
+            select_fields=names,
+        )
+        absent = []
+        for name in names:
+            if name not in part.keys():
+                absent.append(name)
+                continue
+            value = part.get(name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"Packed media column {name!r} must contain tensor wire rows"
+                )
+            rows = list(value.unbind())
+            if len(rows) != len(indices):
+                raise ValueError(
+                    f"Packed media column {name!r} changed the requested row count"
+                )
+            for index, row in zip(indices, rows, strict=True):
+                recovered[name][index] = row
+        if absent and len(indices) > 1:
+            midpoint = len(indices) // 2
+            pending.extend(((indices[:midpoint], absent), (indices[midpoint:], absent)))
+
+    for name, rows in recovered.items():
+        template = next((row for row in rows if row is not None), None)
+        if template is None:
+            # This rank really is text-only for the field. Keep its existing
+            # absent-column representation rather than inventing a dtype.
+            continue
+        empty = template.new_empty((0,))
+        data.set(
+            name,
+            torch.nested.as_nested_tensor(
+                [empty if row is None else row for row in rows], layout=torch.jagged
+            ),
+        )
+    return data
+
+
 class TQDataPlaneClient(DataPlaneClient):
     """Adapter façade — maps NeMo-RL calls onto TransferQueue's public API."""
 
@@ -1296,6 +1374,12 @@ class TQDataPlaneClient(DataPlaneClient):
         self._mark_data_operation_started()
         td = tq.kv_batch_get(
             keys=list(sample_ids),
+            partition_id=partition_id,
+            select_fields=select_fields,
+        )
+        td = _restore_sparse_packed_columns(
+            td,
+            sample_ids=sample_ids,
             partition_id=partition_id,
             select_fields=select_fields,
         )
