@@ -2949,7 +2949,6 @@ def setup_reference_model_state(
             )
 
         reference_state_dict = {}
-
         if should_load_checkpoint or use_peft:
             reference_model = reference_model[0]
             reference_model.eval()
