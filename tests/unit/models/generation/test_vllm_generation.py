@@ -938,6 +938,85 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
+def _tokenize_test_handler(monkeypatch):
+    _install_fake_vllm_openai_modules(monkeypatch)
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"temperature": 1.0, "top_p": 1.0, "vllm_cfg": {}}
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    worker._http_engine_client = worker.llm
+    worker._capture_calls = {}
+    worker.token_capture = None
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
+    )
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    serving = sys.modules[
+        "vllm.entrypoints.serve.tokenize.serving"
+    ].ServingTokenization.instances[0]
+    handler = next(handler for path, handler in app.routes if path == "/tokenize")
+    return worker, serving, handler
+
+
+@pytest.mark.asyncio
+async def test_tokenize_media_validation_is_a_bad_request_without_capture(monkeypatch):
+    worker, serving, handler = _tokenize_test_handler(monkeypatch)
+    error_class = sys.modules["vllm.exceptions"].VLLMValidationError
+    error = error_class(
+        "At most 128 image(s) may be provided in one prompt.", parameter="image"
+    )
+    serving.create_tokenize = AsyncMock(side_effect=error)
+    response = await handler(MagicMock(), MagicMock())
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": {
+            "message": str(error),
+            "type": "invalid_request_error",
+            "param": "image",
+            "code": 400,
+        }
+    }
+    serving.create_tokenize.assert_awaited_once()
+    assert worker._capture_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_tokenize_unrelated_engine_error_still_propagates(monkeypatch):
+    worker, serving, handler = _tokenize_test_handler(monkeypatch)
+    serving.create_tokenize = AsyncMock(side_effect=ValueError("decoder failed"))
+    with pytest.raises(ValueError, match="decoder failed"):
+        await handler(MagicMock(), MagicMock())
+    assert worker._capture_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_tokenize_valid_measurement_retains_native_count_and_limit(monkeypatch):
+    worker, serving, handler = _tokenize_test_handler(monkeypatch)
+    response_class = sys.modules[
+        "vllm.entrypoints.serve.tokenize.protocol"
+    ].TokenizeResponse
+    native = response_class()
+    native.count = 4321
+    native.max_model_len = 262144
+    serving.create_tokenize = AsyncMock(return_value=native)
+    request_class = next(
+        cls
+        for cls in handler.__annotations__["request"].__args__
+        if cls.__name__ == "NeMoRLTokenizeChatRequest"
+    )
+    request = request_class()
+    request.ng_capture = {"mode": "candidate"}
+    response = await handler(request, MagicMock())
+    assert response.status_code == 200
+    assert json.loads(response.body) == {
+        "prompt_token_count": 4321,
+        "max_model_len": 262144,
+        "ng_context_measured": True,
+    }
+    assert worker._capture_calls == {}
+
+
 @pytest.mark.asyncio
 async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""

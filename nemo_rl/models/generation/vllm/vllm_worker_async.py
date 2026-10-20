@@ -1705,9 +1705,26 @@ class VllmAsyncGenerationWorkerImpl(
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
-            generator = await openai_serving_tokenization.create_tokenize(
-                request, raw_request
-            )
+            try:
+                generator = await openai_serving_tokenization.create_tokenize(
+                    request, raw_request
+                )
+            except VLLMValidationError as error:
+                # Measurement uses the same renderer as generation, so media
+                # and prompt validation can raise before capture admission.
+                # Preserve the bad-request contract instead of causing retries
+                # of an unchanged invalid prompt as a generic server error.
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(error),
+                            "type": "invalid_request_error",
+                            "param": error.parameter,
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
