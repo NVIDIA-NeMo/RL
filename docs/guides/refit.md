@@ -82,7 +82,7 @@ refit workload.
 TensorRT-LLM supports online block-FP8 refit for MoE rollouts. Policy
 training remains in BF16, and this setting does not change optimizer-state
 precision. During each refit, NeMo RL converts weights to E4M3 with 128x128
-blocks and FP32 scales. By default only the routed-expert weights are converted;
+blocks and FP32 scales. Only the routed-expert weights are converted;
 attention, routers, shared experts, embeddings, and the output head remain in
 BF16.
 
@@ -106,7 +106,9 @@ Setup also fails if no routed-expert weight is found, or if the model has dense
 MLP weights that would stay BF16. Supporting another model means extending the
 routed-expert name patterns in `quantization/fp8.py`.
 
-Verified: Qwen3.5 MoE, and Qwen3 MoE (Qwen3-30B-A3B, block-FP8 and MXFP8).
+Verified end to end: Qwen3.5 MoE with MXFP8 (the Qwen3.5-35B-A3B
+MXFP8 TRT-LLM nightlies). Unit-tested only: Qwen3 MoE (weight conversion and name mapping for
+block-FP8 and MXFP8); it has not been run end to end.
 
 NeMo RL initializes the TensorRT-LLM model with `load_format` set
 to `dummy`, then populates it from the first BF16 policy refit. By default
