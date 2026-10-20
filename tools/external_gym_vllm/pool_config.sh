@@ -125,6 +125,7 @@ register_external_vllm_pool() {
   local served_model_name="model"
   local vllm_port="8000"
   local startup_timeout="3600"
+  local launch_mode="ray"
   local -a shared_paths=()
 
   while (( $# > 0 )); do
@@ -141,6 +142,7 @@ register_external_vllm_pool() {
       --served-model-name) served_model_name="${2:?value required for $1}"; shift 2 ;;
       --vllm-port) vllm_port="${2:?value required for $1}"; shift 2 ;;
       --startup-timeout) startup_timeout="${2:?value required for $1}"; shift 2 ;;
+      --launch-mode) launch_mode="${2:?value required for $1}"; shift 2 ;;
       --shared-path) shared_paths+=("${2:?value required for $1}"); shift 2 ;;
       *)
         echo "ERROR: unknown register_external_vllm_pool option: $1" >&2
@@ -171,6 +173,22 @@ register_external_vllm_pool() {
     echo "ERROR: ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE=${gpus_per_node}" >&2
     return 2
   fi
+  # ray (default): each replica in a private Ray cluster through serve_vllm_on_ray.py, which needs nemo_rl and ray in
+  # the pool container. direct: the container's own `vllm serve` on one node (TP = GPUS_PER_NODE, vLLM's
+  # multiprocessing backend), for stock vLLM images without nemo_rl or ray.
+  case "${launch_mode}" in
+    ray) ;;
+    direct)
+      if (( tensor_parallel_size != gpus_per_node )); then
+        echo "ERROR: ${pool} --launch-mode direct runs one node per replica: TENSOR_PARALLEL_SIZE must equal GPUS_PER_NODE=${gpus_per_node}" >&2
+        return 2
+      fi
+      ;;
+    *)
+      echo "ERROR: ${pool} --launch-mode must be ray or direct (got '${launch_mode}')" >&2
+      return 2
+      ;;
+  esac
   if [[ -n "${group_id}" && ! "${group_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "ERROR: ${pool}_GROUP_ID may contain only letters, digits, '.', '_', and '-'" >&2
     return 2
@@ -208,6 +226,7 @@ register_external_vllm_pool() {
   _external_vllm_set "${pool}" SERVED_MODEL_NAME "${served_model_name}"
   _external_vllm_set "${pool}" VLLM_PORT "${vllm_port}"
   _external_vllm_set "${pool}" STARTUP_TIMEOUT "${startup_timeout}"
+  _external_vllm_set "${pool}" LAUNCH_MODE "${launch_mode}"
   if [[ -n "${group_id}" ]]; then
     _external_vllm_set "${pool}" GROUP_ID "${group_id}"
   fi

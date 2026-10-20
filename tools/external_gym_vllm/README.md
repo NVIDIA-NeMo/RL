@@ -100,6 +100,20 @@ launcher's pool definition. A pool's reasoning-parser setting must also agree
 with the consuming Gym server's `uses_reasoning_parser` setting; in particular,
 do not pass `--reasoning-parser` when Gym explicitly disables it.
 
+### Launch modes
+
+`--launch-mode` (field `POOL_LAUNCH_MODE`) selects how a replica starts:
+
+| Mode | Replica | Container needs |
+|---|---|---|
+| `ray` (default) | A private Ray cluster over the replica's nodes; `serve_vllm_on_ray.py` applies NeMo RL's vLLM patches, then runs `vllm serve` with `--distributed-executor-backend ray`. | `nemo_rl`, `ray` and `vllm` in `POOL_VLLM_PYTHON`; `ray` on `PATH`. |
+| `direct` | The container's own `python -m vllm.entrypoints.cli.main serve` on one node, vLLM's multiprocessing executor; no Ray, no NeMo RL patches. `TENSOR_PARALLEL_SIZE` must equal `GPUS_PER_NODE`. | `vllm` in `POOL_VLLM_PYTHON` (a stock vLLM image), plus `flock`. |
+
+`direct` serves models that need a newer vLLM than NeMo RL's image ships (for example a stock
+`vllm-openai` image) without rebuilding that image with `nemo_rl` and `ray`. Health checks, the
+backend registry, the load balancer, URL substitution and the stop-training-on-exit contract are
+the same in both modes.
+
 ## Global contract
 
 Required variables:

@@ -107,6 +107,7 @@ declare -A pool_log_dirs=()
 declare -A state_dirs=()
 declare -A lb_state_dirs=()
 declare -A pool_urls=()
+declare -A launch_modes=()
 
 total_external_nodes=0
 max_startup_timeout=0
@@ -152,6 +153,8 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_TENSOR_PARALLEL_SIZE=${tensor_parallel_sizes[${pool}]}"
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
+  launch_modes["${pool}"]=$(pool_value "${pool}" LAUNCH_MODE ray)
+  export "${pool}_LAUNCH_MODE=${launch_modes[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
@@ -194,6 +197,19 @@ for pool in "${pool_names[@]}"; do
   # Each private Ray cluster owns whole nodes. This makes its fixed Ray port safe
   # to reuse across replicas because no two replicas ever share a host.
   nodes_per_replica["${pool}"]=$((tensor_parallel_sizes[${pool}] / GPUS_PER_NODE))
+  case "${launch_modes[${pool}]}" in
+    ray) ;;
+    direct)
+      if (( nodes_per_replica[${pool}] != 1 )); then
+        echo "[FATAL] ${pool}_LAUNCH_MODE=direct serves one node per replica; TENSOR_PARALLEL_SIZE must equal GPUS_PER_NODE" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "[FATAL] ${pool}_LAUNCH_MODE must be ray or direct (got '${launch_modes[${pool}]}')" >&2
+      exit 1
+      ;;
+  esac
   node_counts["${pool}"]=$((replicas[${pool}] * nodes_per_replica[${pool}]))
   node_offsets["${pool}"]="${total_external_nodes}"
   total_external_nodes=$((total_external_nodes + node_counts[${pool}]))
@@ -351,6 +367,8 @@ pool_value() {
 
 MODEL=$(pool_value MODEL)
 VLLM_PYTHON=$(pool_value VLLM_PYTHON)
+LAUNCH_MODE=$(pool_value LAUNCH_MODE)
+[[ -n "${LAUNCH_MODE}" ]] || LAUNCH_MODE=ray
 VLLM_HTTP_PORT=$(pool_value VLLM_PORT)
 TENSOR_PARALLEL_SIZE=$(pool_value TENSOR_PARALLEL_SIZE)
 SERVED_MODEL_NAME=$(pool_value SERVED_MODEL_NAME)
@@ -380,7 +398,9 @@ cleanup_replica() {
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     registry_remove "${REPLICA_ID}" || true
   fi
-  ray stop 2>/dev/null || true
+  if [[ "${LAUNCH_MODE}" == "ray" ]]; then
+    ray stop 2>/dev/null || true
+  fi
 }
 trap cleanup_replica EXIT
 trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
@@ -397,21 +417,23 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
 
   echo "${HEAD_IP}" > "${HEAD_IP_FILE}"
-  echo "[${REPLICA_ID}] Starting private Ray head at ${HEAD_IP}:${RAY_PORT}"
-  ray start \
-    --head \
-    --node-ip-address="${HEAD_IP}" \
-    --port="${RAY_PORT}" \
-    --ray-client-server-port="${RAY_CLIENT_SERVER_PORT}" \
-    --min-worker-port="${MIN_WORKER_PORT}" \
-    --max-worker-port="${MAX_WORKER_PORT}" \
-    --node-manager-port="$((NODE_MANAGER_PORT + 1))" \
-    --object-manager-port="$((OBJECT_MANAGER_PORT + 1))" \
-    --runtime-env-agent-port="$((RUNTIME_ENV_AGENT_PORT + 1))" \
-    --dashboard-agent-grpc-port="$((DASHBOARD_AGENT_GRPC_PORT + 1))" \
-    --dashboard-agent-listen-port="$((DASHBOARD_AGENT_LISTEN_PORT + 1))" \
-    --metrics-export-port="$((METRICS_EXPORT_PORT + 1))" \
-    --disable-usage-stats
+  if [[ "${LAUNCH_MODE}" == "ray" ]]; then
+    echo "[${REPLICA_ID}] Starting private Ray head at ${HEAD_IP}:${RAY_PORT}"
+    ray start \
+      --head \
+      --node-ip-address="${HEAD_IP}" \
+      --port="${RAY_PORT}" \
+      --ray-client-server-port="${RAY_CLIENT_SERVER_PORT}" \
+      --min-worker-port="${MIN_WORKER_PORT}" \
+      --max-worker-port="${MAX_WORKER_PORT}" \
+      --node-manager-port="$((NODE_MANAGER_PORT + 1))" \
+      --object-manager-port="$((OBJECT_MANAGER_PORT + 1))" \
+      --runtime-env-agent-port="$((RUNTIME_ENV_AGENT_PORT + 1))" \
+      --dashboard-agent-grpc-port="$((DASHBOARD_AGENT_GRPC_PORT + 1))" \
+      --dashboard-agent-listen-port="$((DASHBOARD_AGENT_LISTEN_PORT + 1))" \
+      --metrics-export-port="$((METRICS_EXPORT_PORT + 1))" \
+      --disable-usage-stats
+  fi
 
   while IFS= read -r assignment; do
     [[ -n "${assignment}" ]] || continue
@@ -433,14 +455,24 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     [[ -n "${argument}" ]] && vllm_args+=("${argument}")
   done <<< "$(pool_value VLLM_ARGS)"
 
-  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} vLLM server at TP=${TENSOR_PARALLEL_SIZE}/DP=1"
-  "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve "${MODEL}" \
-    --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-    --distributed-executor-backend ray \
-    --port "${VLLM_HTTP_PORT}" \
-    --served-model-name "${SERVED_MODEL_NAME}" \
-    "${vllm_args[@]}" \
-    > "${LOG_FILE}" 2>&1 &
+  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} vLLM server at TP=${TENSOR_PARALLEL_SIZE}/DP=1 (${LAUNCH_MODE})"
+  if [[ "${LAUNCH_MODE}" == "direct" ]]; then
+    # The container's own vLLM on this one node (multiprocessing executor): no Ray, no NeMo RL patches.
+    "${VLLM_PYTHON}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
+      --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+      --port "${VLLM_HTTP_PORT}" \
+      --served-model-name "${SERVED_MODEL_NAME}" \
+      "${vllm_args[@]}" \
+      > "${LOG_FILE}" 2>&1 &
+  else
+    "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve "${MODEL}" \
+      --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
+      --distributed-executor-backend ray \
+      --port "${VLLM_HTTP_PORT}" \
+      --served-model-name "${SERVED_MODEL_NAME}" \
+      "${vllm_args[@]}" \
+      > "${LOG_FILE}" 2>&1 &
+  fi
   VLLM_PID=$!
 
   while ! "${VLLM_PYTHON}" -c \
