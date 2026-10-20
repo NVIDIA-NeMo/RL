@@ -15,6 +15,7 @@
 """Validated configuration for the managed Dynamo generation backend."""
 
 import warnings
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -156,9 +157,18 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
 
 
 class DynamoCfg(BaseModel, extra="forbid"):
-    """Driver-owned Dynamo service and worker-fleet configuration."""
+    """Driver-owned Dynamo service and worker-fleet configuration.
 
-    engine: Literal["vllm"]
+    ``engine`` selects what serves behind the frontend: Dynamo-managed ``vllm``
+    workers, or NeMo RL's own ``megatron`` inference engines (prefill/decode
+    only; each engine is a dedicated Megatron inference policy, and Megatron's
+    Dynamo adapter runs next to it). ``megatron_root`` is the Megatron-LM tree
+    that adapter imports; None resolves to the Megatron-LM nested in the
+    Megatron-Bridge submodule.
+    """
+
+    engine: Literal["vllm", "megatron"]
+    megatron_root: str | None = None
     startup_timeout_s: PositiveFloat
     request_timeout_s: PositiveFloat
     control_timeout_s: PositiveFloat
@@ -276,7 +286,10 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
         return self
 
 
-def _require_nonempty_vllm_config(value: Any) -> Any:
+def _vllm_config_or_none(value: Any) -> Any:
+    """Megatron engines carry no vLLM config; vLLM engines need a nonempty one."""
+    if value is None:
+        return None
     if not isinstance(value, dict) or not value:
         raise ValueError(
             "policy.generation.vllm_cfg must be a nonempty mapping when "
@@ -291,18 +304,48 @@ class DynamoConfig(BaseModel, extra="allow"):
     backend: Literal["dynamo"]
     dynamo_cfg: DynamoCfg
     vllm_cfg: Annotated[
-        DynamoVllmConfig, BeforeValidator(_require_nonempty_vllm_config)
-    ]
+        DynamoVllmConfig | None, BeforeValidator(_vllm_config_or_none)
+    ] = None
     vllm_kwargs: dict[str, Any]
     disaggregation: DisaggConfig = Field(default_factory=DisaggConfig)
 
     @property
-    def engine_world_size(self) -> int:
-        """Return the derived ranks in each single-node vLLM engine."""
+    def is_megatron_engine(self) -> bool:
+        return self.dynamo_cfg.engine == "megatron"
+
+    def engine_world_size(self, policy_config: Mapping[str, Any] | None = None) -> int:
+        """Ranks one engine spans, whichever engine serves behind the frontend.
+
+        vLLM engines are TP x PP of ``vllm_cfg``. Megatron engines are dedicated
+        inference policies, so their width is whatever layout those policies are
+        built with (``policy.megatron_cfg`` with the ``mcore_generation_config``
+        overrides applied), which needs ``policy_config``. This is the only place
+        that computes an engine width.
+        """
+        if self.is_megatron_engine:
+            if policy_config is None:
+                raise ValueError(
+                    "Megatron engines behind Dynamo need the policy config to size "
+                    "their engines; pass policy_config"
+                )
+            # Deferred: the Megatron config module pulls in the policy config
+            # types, which this module must stay importable without.
+            from nemo_rl.models.generation.megatron.config import (
+                merged_inference_megatron_cfg,
+            )
+
+            # The same merged layout the engine's workers are built with (its
+            # context_parallel_size is pinned to 1 by the merge).
+            layout = merged_inference_megatron_cfg(policy_config)  # type: ignore[arg-type]
+            return int(
+                layout["tensor_model_parallel_size"]
+                * layout.get("pipeline_model_parallel_size", 1)
+                * layout["context_parallel_size"]
+            )
+        assert self.vllm_cfg is not None, "validated: vLLM engines carry vllm_cfg"
         return self.vllm_cfg.tensor_parallel_size * self.vllm_cfg.pipeline_parallel_size
 
-    @property
-    def replica_width(self) -> int:
+    def replica_width(self, engine_world_size: int) -> int:
         """GPUs one rollout replica spans: one engine, or one P/D group.
 
         The Dynamo frontend routes across the whole fleet, so a replica only
@@ -310,22 +353,25 @@ class DynamoConfig(BaseModel, extra="allow"):
         """
         layout = self.disaggregation
         if not layout.enabled:
-            return self.engine_world_size
+            return engine_world_size
         return (
             layout.num_prefill_engines + layout.num_decode_engines
-        ) * self.engine_world_size
+        ) * engine_world_size
 
-    def worker_roles(self, inference_world_size: int) -> list[DynamoWorkerRole]:
+    def worker_roles(
+        self, inference_world_size: int, engine_world_size: int
+    ) -> list[DynamoWorkerRole]:
         """Return each engine's role, in launch order, for this many GPUs.
 
         Replicas are tiled prefill engines first, as TRT-LLM disaggregation
         lays them out. Launch order is also refit rank order.
         """
-        if inference_world_size % self.replica_width != 0:
+        replica_width = self.replica_width(engine_world_size)
+        if inference_world_size % replica_width != 0:
             raise ValueError(
                 f"Managed Dynamo has {inference_world_size} inference GPUs, which "
-                f"is not a multiple of one replica's {self.replica_width} GPUs "
-                "(policy.generation.disaggregation engines x TP x PP)."
+                f"is not a multiple of one replica's {replica_width} GPUs "
+                "(policy.generation.disaggregation engines x engine width)."
             )
         layout = self.disaggregation
         replica: list[DynamoWorkerRole] = ["aggregated"]
@@ -336,11 +382,18 @@ class DynamoConfig(BaseModel, extra="allow"):
                     layout.num_prefill_engines + layout.num_decode_engines
                 )
             ]
-        return replica * (inference_world_size // self.replica_width)
+        return replica * (inference_world_size // replica_width)
 
     @model_validator(mode="after")
     def _validate_backend_boundary(self) -> "DynamoConfig":
         extra = self.model_extra or {}
+        if self.is_megatron_engine:
+            self._validate_megatron_engines(extra)
+            return self
+        if self.vllm_cfg is None:
+            raise ValueError(
+                "policy.generation.vllm_cfg is required when dynamo_cfg.engine='vllm'"
+            )
         # Shared GRPO YAML inheritance supplies mcore_generation_config and
         # refit_cfg. Managed Dynamo uses vLLM arguments and the collective
         # synchronizer instead, so these two sections are intentionally ignored.
@@ -369,7 +422,8 @@ class DynamoConfig(BaseModel, extra="allow"):
                     f"policy.generation.{quantization_field} is not supported "
                     "when backend='dynamo'"
                 )
-        if (self.vllm_cfg.model_extra or {}).get("speculative_config"):
+        vllm_cfg = self.vllm_cfg
+        if (vllm_cfg.model_extra or {}).get("speculative_config"):
             raise ValueError(
                 "policy.generation.vllm_cfg.speculative_config is not read by the "
                 "Dynamo backend; set policy.generation.vllm_kwargs.speculative_config"
@@ -385,7 +439,7 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "when backend='dynamo'; managed engines always load NeMo RL's worker "
                 "extension, which every refit relies on"
             )
-        vllm_extra = self.vllm_cfg.model_extra or {}
+        vllm_extra = vllm_cfg.model_extra or {}
         if vllm_extra.get("reset_encoder_cache_after_weight_update"):
             raise ValueError(
                 "policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update "
@@ -411,6 +465,68 @@ class DynamoConfig(BaseModel, extra="allow"):
         if self.disaggregation.enabled:
             self._validate_disaggregation()
         return self
+
+    def _validate_megatron_engines(self, extra: dict[str, Any]) -> None:
+        """What a prefill/decode fleet of Megatron engines can and cannot carry."""
+        if not self.disaggregation.enabled:
+            raise ValueError(
+                "dynamo_cfg.engine='megatron' requires "
+                "policy.generation.disaggregation.enabled=true; aggregated Megatron "
+                "engines behind Dynamo are not supported (use backend='megatron')"
+            )
+        if self.vllm_cfg is not None:
+            raise ValueError(
+                "policy.generation.vllm_cfg must be null when "
+                "dynamo_cfg.engine='megatron'; the engines are Megatron inference "
+                "policies and read mcore_generation_config"
+            )
+        if self.vllm_kwargs:
+            raise ValueError(
+                "policy.generation.vllm_kwargs must be empty when "
+                "dynamo_cfg.engine='megatron'"
+            )
+        if extra.get("colocated", {}).get("enabled"):
+            raise ValueError(
+                "policy.generation.colocated.enabled must be false when "
+                "backend='dynamo'"
+            )
+        if extra.get("refit_transport") is not None:
+            raise ValueError(
+                "policy.generation.refit_transport must be null when "
+                "dynamo_cfg.engine='megatron'; the engines refit through the "
+                "collective transport"
+            )
+        for quantization_field in ("quant_cfg", "real_quant"):
+            if extra.get(quantization_field):
+                raise ValueError(
+                    f"policy.generation.{quantization_field} is not supported "
+                    "when backend='dynamo'"
+                )
+        mcore = extra.get("mcore_generation_config")
+        if not isinstance(mcore, dict):
+            raise ValueError(
+                "policy.generation.mcore_generation_config is required when "
+                "dynamo_cfg.engine='megatron'"
+            )
+        if not mcore.get("enable_prefix_caching"):
+            raise ValueError(
+                "mcore_generation_config.enable_prefix_caching must be true for "
+                "Megatron prefill/decode engines: decode admission reuses the "
+                "prefix-cache allocator"
+            )
+        if mcore.get("kv_cache_management_mode") != "persist":
+            raise ValueError(
+                "mcore_generation_config.kv_cache_management_mode must be "
+                "'persist' for Megatron prefill/decode engines; offload and "
+                "recompute invalidate the registered KV transfer buffers"
+            )
+        if mcore.get("expose_http_server"):
+            raise ValueError(
+                "mcore_generation_config.expose_http_server must be false when "
+                "dynamo_cfg.engine='megatron'; the Dynamo frontend is the HTTP "
+                "surface"
+            )
+        self._validate_disaggregation()
 
     def _validate_disaggregation(self) -> None:
         layout = self.disaggregation

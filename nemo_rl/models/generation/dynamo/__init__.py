@@ -18,11 +18,19 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoWorkerArgs,
 )
 from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
+from nemo_rl.models.generation.dynamo.engine_pool import (
+    DynamoEnginePool,
+    EngineRecord,
+    EngineRefitChannel,
+)
 
 __all__ = [
     "DynamoCfg",
     "DynamoConfig",
+    "DynamoEnginePool",
     "DynamoFrontendArgs",
     "DynamoGeneration",
     "DynamoWorkerArgs",
+    "EngineRecord",
+    "EngineRefitChannel",
 ]

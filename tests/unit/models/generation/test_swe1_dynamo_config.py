@@ -63,7 +63,7 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
         "gpus_per_node": 8,
         "num_nodes": 1,
     }
-    assert validated.engine_world_size == 4
+    assert validated.engine_world_size() == 4
     assert generation["vllm_cfg"]["expert_parallel_size"] == 4
     assert validated.dynamo_cfg.frontend_args.router_mode == "kv"
     assert validated.dynamo_cfg.control_timeout_s == 600

@@ -183,6 +183,25 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     assert calls.count("shutdown") == 1
 
 
+def test_megatron_engines_are_refused_until_their_fleet_is_wired(monkeypatch) -> None:
+    """The config accepts engine=megatron; the facade must say so, not trip over vLLM code."""
+    calls: list[str] = []
+    _patch_runtime(monkeypatch, calls=calls)
+    config = _config()
+    config["vllm_cfg"] = None
+    config["dynamo_cfg"]["engine"] = "megatron"
+    config["disaggregation"] = {"enabled": True}
+    config["refit_transport"] = None
+    config["mcore_generation_config"] = {
+        "enable_prefix_caching": True,
+        "kv_cache_management_mode": "persist",
+        "expose_http_server": False,
+    }
+    with pytest.raises(NotImplementedError, match="engine='megatron' is not served"):
+        DynamoGeneration(cluster=object(), config=config)
+    assert calls == [], "nothing was started"
+
+
 def test_blocking_generate_is_rejected_and_async_generation_uses_http(
     monkeypatch,
 ) -> None:
