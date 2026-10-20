@@ -41,7 +41,12 @@ def _build_message_log_batch() -> list[LLMMessageLogType]:
     return [
         [
             {"role": "user", "content": "Q1", "token_ids": torch.tensor([1, 2, 3])},
-            {"role": "assistant", "content": "A1", "token_ids": torch.tensor([4, 5])},
+            {
+                "role": "assistant",
+                "content": "A1",
+                "token_ids": torch.tensor([4, 5]),
+                "generation_logprobs": torch.zeros(2),
+            },
         ],
         [
             {"role": "user", "content": "Q2", "token_ids": torch.tensor([6, 7])},
@@ -49,6 +54,7 @@ def _build_message_log_batch() -> list[LLMMessageLogType]:
                 "role": "assistant",
                 "content": "A2",
                 "token_ids": torch.tensor([8, 9, 10, 11]),
+                "generation_logprobs": torch.zeros(4),
             },
         ],
     ]
@@ -59,7 +65,7 @@ def test_decompose_message_log_basic_shapes() -> None:
     assert out["turn_lengths"].tolist() == [[3, 2], [2, 4]]
     assert list(out["turn_roles"][0]) == ["user", "assistant"]
     assert list(out["turn_contents"][1]) == ["Q2", "A2"]
-    # First assistant turn's length per sample.
+    # Total assistant-turn length per sample.
     assert out["response_token_lengths"].tolist() == [2, 4]
 
 
@@ -71,8 +77,8 @@ def test_decompose_message_log_no_assistant_turn() -> None:
     assert out["response_token_lengths"].tolist() == [0]
 
 
-def test_decompose_message_log_picks_first_assistant() -> None:
-    """If multiple assistant turns exist, ``response_token_lengths`` takes the first."""
+def test_decompose_message_log_sums_assistant_turns() -> None:
+    """If multiple assistant turns exist, ``response_token_lengths`` is their total."""
     out = decompose_message_log(
         [
             [
@@ -81,17 +87,50 @@ def test_decompose_message_log_picks_first_assistant() -> None:
                     "role": "assistant",
                     "content": "A1",
                     "token_ids": torch.tensor([2, 3]),
+                    "generation_logprobs": torch.zeros(2),
                 },
                 {"role": "user", "content": "U2", "token_ids": torch.tensor([4])},
                 {
                     "role": "assistant",
                     "content": "A2",
                     "token_ids": torch.tensor([5, 6, 7, 8]),
+                    "generation_logprobs": torch.zeros(4),
                 },
             ]
         ]
     )
-    assert out["response_token_lengths"].tolist() == [2]
+    assert out["response_token_lengths"].tolist() == [6]
+
+
+@pytest.mark.parametrize("generated_lengths", [[], [0], [15], [0, 15], [15, 10]])
+def test_decompose_message_log_excludes_prompt_history(
+    generated_lengths: list[int],
+) -> None:
+    """History stays in turn metadata, but only generated turns count as responses."""
+    messages = [
+        {"role": "user", "content": "Q", "token_ids": torch.ones(5, dtype=torch.long)},
+        {
+            "role": "assistant",
+            "content": "history",
+            "token_ids": torch.ones(100, dtype=torch.long),
+        },
+        {"role": "user", "content": "Q2", "token_ids": torch.ones(5, dtype=torch.long)},
+    ]
+    messages.extend(
+        {
+            "role": "assistant",
+            "content": "generated",
+            "token_ids": torch.ones(length, dtype=torch.long),
+            "generation_logprobs": torch.zeros(length),
+        }
+        for length in generated_lengths
+    )
+    out = decompose_message_log([messages])
+    assert out["turn_lengths"].tolist() == [[5, 100, 5, *generated_lengths]]
+    assert out["response_token_lengths"].tolist() == [sum(generated_lengths)]
+    assert out["turn_roles"][0] == [m["role"] for m in messages]
+    assert out["turn_contents"][0] == [m["content"] for m in messages]
+    assert "generation_logprobs" not in messages[1]
 
 
 def test_decompose_message_log_jagged_turn_count() -> None:

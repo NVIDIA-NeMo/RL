@@ -14,11 +14,11 @@ variant.
 
 | Model | Task | Training backend | Training parallelism | Generation backend | Status |
 | --- | --- | --- | --- | --- | --- |
-| `google/gemma-4-E2B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM | Functionally Ready |
-| `google/gemma-4-E4B-it` | VLM GRPO | AutoModel (FSDP2) | CP1 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-12B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 | vLLM TP2 | Functionally Ready |
-| `google/gemma-4-26B-A4B-it` | Text-only DAPO | AutoModel (FSDP2) | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-31B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-E2B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM | Functionally Ready |
+| `google/gemma-4-E4B-it` | VLM GRPO | Automodel | CP1 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-12B-it` | Text-only DAPO | Automodel | CP1 | vLLM TP2 | Functionally Ready |
+| `google/gemma-4-26B-A4B-it` | Text-only DAPO | Automodel | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-31B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM TP4 | Functionally Ready |
 
 ## Reference Recipes
 
@@ -26,14 +26,14 @@ Recipe YAML files under `examples/configs/recipes/` are the source of truth.
 
 | Model | Layout | Nodes and GPUs | Recipe |
 | --- | --- | --- | --- |
-| E2B | FSDP2, CP1 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.yaml) |
-| E2B | FSDP2, CP2 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-fsdp2cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-fsdp2cp2-automodel.yaml) |
+| E2B | FSDP2, CP1 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel.yaml) |
+| E2B | FSDP2, CP2 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml) |
 | E4B | VLM FSDP2, CP1 | 1n8g | [`vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml) |
-| 12B | FSDP2, CP1 | 2n8g | [`dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml) |
-| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml) |
-| 26B-A4B | FSDP2, EP16, CP2 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml) |
-| 31B | FSDP2, CP1 | 4n8g | [`dapo-gemma4-31b-it-4n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-fsdp2-automodel.yaml) |
-| 31B | FSDP2, CP2 | 4n8g | [`dapo-gemma4-31b-it-4n8g-fsdp2cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-fsdp2cp2-automodel.yaml) |
+| 12B | FSDP2, CP1 | 2n8g | [`dapo-gemma4-12b-it-2n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-automodel.yaml) |
+| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml) |
+| 26B-A4B | FSDP2, EP16, CP2 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml) |
+| 31B | FSDP2, CP1 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel.yaml) |
+| 31B | FSDP2, CP2 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml) |
 
 ## Run a Recipe
 
@@ -42,7 +42,7 @@ For example, run the 12B configuration with:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml
+  --config examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-automodel.yaml
 ```
 
 See the [GRPO guide](../../grpo.md) for algorithm and launch details.

@@ -13,8 +13,6 @@ policy:
   generation:
     nvfp4_pertoken_rollout:
       enabled: true
-    vllm_kwargs:
-      moe_backend: flashinfer_trtllm
     vllm_cfg:
       env_vars:
         FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH: '1'

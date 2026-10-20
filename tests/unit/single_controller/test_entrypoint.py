@@ -167,6 +167,7 @@ def test_main_configures_generation_for_trained_mtp(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
@@ -185,6 +186,7 @@ def test_main_accepts_policy_without_draft_config(
         "tokenizer",
         has_refit_draft_weights=False,
         trains_mtp=True,
+        draft_full_refit=False,
     )
 
 

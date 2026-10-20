@@ -66,10 +66,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         data_config: Mapping[str, Any],
         batch_size: int,
         max_sequence_length: int,
-        placement_fingerprint: str,
-        packing_algorithm: str | None,
-        max_sequences_per_bin: int | None,
         sequence_length_pad_multiple: int,
+        placement_fingerprint: str,
         only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
     ) -> bool:
@@ -89,13 +87,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             processor=self._sft_processor,
             batch_size=batch_size,
             max_sequence_length=max_sequence_length,
+            sequence_length_pad_multiple=sequence_length_pad_multiple,
             split_role="train",
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         )
         if restored_state is not None:
