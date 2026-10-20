@@ -3238,7 +3238,7 @@ def test_mask_sample_flags_read_either_form_of_the_flag():
     assert flags.tolist() == [True, True, True, False, False, False]
 
 
-def _postprocess_rollouts(first_prompts, group_ids=None):
+def _postprocess_rollouts(first_prompts, group_ids=None, agent_name="agent"):
     """Postprocess one group whose first prompts are the given token lists.
 
     ``group_ids`` mirrors what ``_prepare_nemo_gym_rows`` stamps on each row;
@@ -3248,7 +3248,7 @@ def _postprocess_rollouts(first_prompts, group_ids=None):
         group_ids = [None] * len(first_prompts)
     rows = []
     for group_id in group_ids:
-        row = {"agent_ref": {"name": "agent"}}
+        row = {"agent_ref": {"name": agent_name}}
         if group_id is not None:
             row[rollouts_mod.NEMO_GYM_GROUP_ID_KEY] = group_id
         rows.append(row)
@@ -3290,13 +3290,16 @@ def _postprocess_rollouts(first_prompts, group_ids=None):
     )
 
 
-def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
+def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkeypatch):
     """Warn only when the rollouts of one logical prompt group do not share a prompt.
 
     The comparison is distinct first prompts against logical prompt groups
     (``_ng_group_id``), so a validation batch with one rollout per prompt stays
-    silent, and rows without the key form a single group.
+    silent, and rows without the key form a single group. The warning is
+    reported once per agent name in a process; the ``baseline_groups/*`` keys
+    carry the per-step signal.
     """
+    monkeypatch.setattr(rollouts_mod, "_DISTINCT_FIRST_PROMPT_WARNED", set())
 
     def warnings():
         return [r for r in caplog.records if "distinct first prompts" in r.getMessage()]
@@ -3320,28 +3323,40 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog):
     assert record.levelname == "WARNING"
     assert "form 1 logical prompt group(s) but have 2 distinct" in record.getMessage()
     assert "do not share a prompt prefix" in record.getMessage()
+    assert "agent(s) ['agent']" in record.getMessage()
+
+    # The same agent's next group still reports the count but warns no more.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        repeated = _postprocess_rollouts([[1, 5, 7], [1, 5, 9]])
+    assert repeated.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert not warnings()
 
     # Validation layout: one rollout per prompt, one group id per row. Distinct
     # prompts are expected there and must not warn.
     caplog.clear()
     with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
         validation = _postprocess_rollouts(
-            [[1, 5, 7], [1, 5, 9]], group_ids=["g0", "g1"]
+            [[1, 5, 7], [1, 5, 9]], group_ids=["g0", "g1"], agent_name="other"
         )
     assert validation.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
     assert validation.rollout_metrics["baseline_groups/logical_groups"] == 2
     assert not warnings()
 
-    # Two logical groups with only one of them split: still a failure.
+    # Two logical groups with only one of them split: still a failure, and a
+    # first report for this agent.
     caplog.clear()
     with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
         partial = _postprocess_rollouts(
-            [[1, 5, 10], [1, 5, 11], [1, 6]], group_ids=["a", "a", "b"]
+            [[1, 5, 10], [1, 5, 11], [1, 6]],
+            group_ids=["a", "a", "b"],
+            agent_name="other",
         )
     assert partial.rollout_metrics["baseline_groups/distinct_first_prompts"] == 3
     assert partial.rollout_metrics["baseline_groups/logical_groups"] == 2
     [record] = warnings()
     assert "3 NeMo-Gym rollouts form 2 logical prompt group(s)" in record.getMessage()
+    assert "agent(s) ['other']" in record.getMessage()
 
     # A one-rollout group is trivially distinct and must stay silent.
     caplog.clear()

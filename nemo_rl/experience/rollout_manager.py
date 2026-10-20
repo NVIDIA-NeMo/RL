@@ -76,6 +76,9 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.experience.rollouts import (
     _SHARED_GENRM_METRICS,
+    BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC,
+    BASELINE_GROUPS_LOGICAL_GROUPS_METRIC,
+    BASELINE_GROUPS_SAMPLES_METRIC,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -1402,7 +1405,7 @@ class AsyncNemoGymRolloutImpl:
                     sum("receipt" not in result for result in completed_results),
                 )
             )
-            # Match the legacy path's first-prompt diagnostic when tokens are
+            # Match the driver path's first-prompt diagnostic when tokens are
             # available. Receipt mode defers token reconstruction to the finalizer.
             # SingleController baselines use logical group ids, so distinct
             # rendered prompts here do not imply zero advantages.
@@ -1418,14 +1421,14 @@ class AsyncNemoGymRolloutImpl:
                     first_prompt_logs,
                     pad_value_dict={"token_ids": self._tokenizer.pad_token_id},
                 )
-                rollout_metrics["baseline_groups/distinct_first_prompts"] = int(
+                rollout_metrics[BASELINE_GROUPS_DISTINCT_FIRST_PROMPTS_METRIC] = int(
                     torch.unique(first_prompts["token_ids"], dim=0).shape[0]
                 )
                 # Each dispatched group is one logical prompt group here, so the
                 # key reads 1; emitted so dashboards see the same key set as the
-                # legacy path, where it counts the batch's prompt groups.
-                rollout_metrics["baseline_groups/logical_groups"] = 1
-                rollout_metrics["baseline_groups/samples"] = len(completed_results)
+                # driver path, where it counts the batch's prompt groups.
+                rollout_metrics[BASELINE_GROUPS_LOGICAL_GROUPS_METRIC] = 1
+                rollout_metrics[BASELINE_GROUPS_SAMPLES_METRIC] = len(completed_results)
 
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:
