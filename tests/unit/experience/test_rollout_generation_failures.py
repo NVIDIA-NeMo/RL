@@ -637,6 +637,36 @@ class TestAbandonedCaptureLedgers:
             asyncio.run(impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout"))
         assert retire.calls == [["r0", "r1"]]
 
+    def test_a_cancelled_dispatch_retires_the_rows_still_running(self):
+        """A staleness abort cancels the dispatch; CancelledError is not an Exception."""
+
+        class _HangAfterFirstRow(_FakeGymMethod):
+            async def _stream(self, num_inputs):
+                stream = super()._stream(num_inputs)
+                yield await anext(stream)
+                # Resumed only after row 0 has been recorded.
+                self.hanging.set()
+                async for item in stream:
+                    yield item
+
+        method = _HangAfterFirstRow(rows_to_yield=1, hang_after=True)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire)
+
+        async def _main():
+            method.hanging = asyncio.Event()
+            task = asyncio.ensure_future(
+                impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout")
+            )
+            await asyncio.wait_for(method.hanging.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
+
+        assert retire.calls == [["r1"]]
+
 
 class TestGymRolloutDeadline:
     """The gym path is where the silent wedge described in the resiliency report lives.

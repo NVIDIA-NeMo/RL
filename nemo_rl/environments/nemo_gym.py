@@ -696,6 +696,11 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        # Rollout IDs waiting to be retired, in arrival order.
+        # A dict keeps the order and drops duplicates.
+        self._retire_pending: Dict[str, None] = {}
+        self._retire_full = asyncio.Event()
+        self._retire_task: Optional[asyncio.Task[None]] = None
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -842,11 +847,6 @@ Depending on your data shape, you may want to change these values."""
         self._server_client = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
-        # Rollout IDs waiting to be retired, in arrival order.
-        # A dict keeps the order and drops duplicates.
-        self._retire_pending: Dict[str, None] = {}
-        self._retire_full = asyncio.Event()
-        self._retire_task: Optional[asyncio.Task[None]] = None
         if self._token_capture_enabled:
             assert token_capture is not None
             policy_overrides = (
