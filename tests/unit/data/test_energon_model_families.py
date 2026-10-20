@@ -114,10 +114,10 @@ def test_registry_rejects_unsupported_and_undeclared_components(
     )
     with pytest.raises(
         ValueError,
-        match="Cooker registry key 'qwen_only'.*model family 'nemotron'.*qwen",
+        match="Cooker 'qwen_only'.*model family 'nemotron'.*qwen",
     ):
         registry.resolve_for_model_family("qwen_only", model_family="nemotron")
-    with pytest.raises(TypeError, match="registry key 'undeclared'.*must declare"):
+    with pytest.raises(TypeError, match="Cooker 'undeclared'.*must declare"):
         registry.resolve_for_model_family("undeclared", model_family="qwen")
 
 
@@ -140,13 +140,13 @@ def test_loader_setup_rejects_an_unsupported_cooker(
     )
     monkeypatch.setattr(
         COOKER_REGISTRY,
-        "resolve_for_model_family",
-        registry.resolve_for_model_family,
+        "resolve_configured_for_model_family",
+        registry.resolve_configured_for_model_family,
     )
 
     with pytest.raises(
         ValueError,
-        match="Cooker registry key 'qwen_only'.*model family 'nemotron'.*qwen",
+        match="Cooker 'qwen_only'.*model family 'nemotron'.*qwen",
     ):
         _loader_config(
             {
