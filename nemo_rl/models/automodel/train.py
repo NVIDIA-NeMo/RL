@@ -282,6 +282,7 @@ def apply_top_k_top_p_filtering_for_local_logits(
             logits,
             top_k=sampling_params.top_k,
             top_p=sampling_params.top_p,
+            keep_ties=sampling_params.top_p_keep_ties,
         )
     return logits
 

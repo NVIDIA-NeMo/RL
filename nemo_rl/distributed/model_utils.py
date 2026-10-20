@@ -353,6 +353,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
         tp_group: torch.distributed.ProcessGroup,
         top_k: int | None,
         top_p: float,
+        top_p_keep_ties: bool,
         inference_only: bool = False,
     ) -> torch.Tensor:
         """Forward pass for sampling-based logprob computation.
@@ -363,6 +364,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
             tp_group: Tensor parallel process group
             top_k: Top-k filtering parameter (None or -1 to disable)
             top_p: Top-p filtering parameter (1.0 to disable)
+            top_p_keep_ties: Keep every token tied with the smallest top-p logit
             inference_only: If True, don't save tensors for backward
 
         Returns:
@@ -396,7 +398,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
 
         # Apply top-k and top-p filtering locally (returns keep_mask for gradient)
         logits, keep_mask = apply_top_k_top_p(
-            seq_parallel_logits, top_k=top_k, top_p=top_p
+            seq_parallel_logits, top_k=top_k, top_p=top_p, keep_ties=top_p_keep_ties
         )
 
         # Compute log softmax
@@ -434,7 +436,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
         """Backward pass for sampling-based logprob computation."""
         grad_output = grad_outputs[0]  # [B, S]
         softmax_output, target_local, keep_mask = ctx.saved_tensors
@@ -465,7 +467,7 @@ class DistributedLogprobWithSampling(torch.autograd.Function):
         grad_vocab_parallel = all_to_all_sq2vp(grad_logits_local, tp_group)
         grad_vocab_parallel = grad_vocab_parallel.view(B, S, V // world_size)
 
-        return grad_vocab_parallel, None, None, None, None, None
+        return grad_vocab_parallel, None, None, None, None, None, None
 
 
 class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
@@ -482,6 +484,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         tp_group: torch.distributed.ProcessGroup,
         top_k: int | None,
         top_p: float,
+        top_p_keep_ties: bool,
         chunk_size: int,
         inference_only: bool = False,
     ) -> torch.Tensor:
@@ -493,6 +496,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
             tp_group: Tensor parallel process group
             top_k: Top-k filtering parameter (None or -1 to disable)
             top_p: Top-p filtering parameter (1.0 to disable)
+            top_p_keep_ties: Keep every token tied with the smallest top-p logit
             chunk_size: Chunk size for memory efficiency (in sequence dimension)
             inference_only: If True, don't save tensors for backward
 
@@ -553,7 +557,10 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
             # Apply top-k and top-p filtering locally
             logits_chunk, _ = apply_top_k_top_p(
-                seq_parallel_logits_chunk, top_k=top_k, top_p=top_p
+                seq_parallel_logits_chunk,
+                top_k=top_k,
+                top_p=top_p,
+                keep_ties=top_p_keep_ties,
             )
 
             # Compute log softmax
@@ -587,6 +594,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
             ctx.tp_group = tp_group
             ctx.top_k = top_k
             ctx.top_p = top_p
+            ctx.top_p_keep_ties = top_p_keep_ties
             ctx.chunk_size = chunk_size
 
         return token_logprobs
@@ -595,7 +603,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
         """Backward pass with chunked rematerialization."""
         grad_output = grad_outputs[0]  # [B, S]
         (vocab_parallel_logits,) = ctx.saved_tensors
@@ -603,6 +611,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         tp_group = ctx.tp_group
         top_k = ctx.top_k
         top_p = ctx.top_p
+        top_p_keep_ties = ctx.top_p_keep_ties
         chunk_size = ctx.chunk_size
 
         world_size = torch.distributed.get_world_size(tp_group)
@@ -642,7 +651,10 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
 
             # Rematerialize filtering
             logits_chunk, keep_mask = apply_top_k_top_p(
-                seq_parallel_logits_chunk, top_k=top_k, top_p=top_p
+                seq_parallel_logits_chunk,
+                top_k=top_k,
+                top_p=top_p,
+                keep_ties=top_p_keep_ties,
             )
 
             # Rematerialize softmax
@@ -674,7 +686,7 @@ class ChunkedDistributedLogprobWithSampling(torch.autograd.Function):
         grad_vocab_parallel = torch.cat(all_grad_chunks, dim=0)
         grad_vocab_parallel = grad_vocab_parallel.view(B, S, V_local)
 
-        return grad_vocab_parallel, None, None, None, None, None, None
+        return grad_vocab_parallel, None, None, None, None, None, None, None
 
 
 class ChunkedDistributedGatherLogprob(torch.autograd.Function):
@@ -835,6 +847,7 @@ def _tp_target_logprobs(
                     tp_group,
                     sampling_params.top_k,
                     sampling_params.top_p,
+                    sampling_params.top_p_keep_ties,
                     chunk_size,
                     inference_only,
                 ).contiguous()
@@ -844,6 +857,7 @@ def _tp_target_logprobs(
                 tp_group,
                 sampling_params.top_k,
                 sampling_params.top_p,
+                sampling_params.top_p_keep_ties,
                 inference_only,
             ).contiguous()
         if chunk_size is not None:
@@ -878,6 +892,7 @@ def _tp_target_logprobs(
                 logits_chunk,
                 top_k=sampling_params.top_k,
                 top_p=sampling_params.top_p,
+                keep_ties=sampling_params.top_p_keep_ties,
             )
         log_probs = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
         out_chunks.append(
@@ -1006,6 +1021,7 @@ def from_parallel_logits_to_logprobs(
                 tp_group,
                 sampling_params.top_k,
                 sampling_params.top_p,
+                sampling_params.top_p_keep_ties,
                 chunk_size,
                 inference_only,
             ).contiguous()
@@ -1016,6 +1032,7 @@ def from_parallel_logits_to_logprobs(
                 tp_group,
                 sampling_params.top_k,
                 sampling_params.top_p,
+                sampling_params.top_p_keep_ties,
                 inference_only,
             ).contiguous()
     else:
@@ -1134,6 +1151,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 group,
                 sampling_params.top_k,
                 sampling_params.top_p,
+                sampling_params.top_p_keep_ties,
                 chunk_size,
                 inference_only,
             ).contiguous()
@@ -1144,6 +1162,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 group,
                 sampling_params.top_k,
                 sampling_params.top_p,
+                sampling_params.top_p_keep_ties,
                 inference_only,
             ).contiguous()
     else:
@@ -1690,6 +1709,11 @@ def get_next_token_logprobs_from_logits(
             next_token_logits_wo_last,
             top_k=sampling_params.top_k if sampling_params is not None else None,
             top_p=sampling_params.top_p if sampling_params is not None else 1.0,
+            keep_ties=(
+                sampling_params.top_p_keep_ties
+                if sampling_params is not None
+                else False
+            ),
         )
         # Compute logprobs
         next_token_logprobs = torch.nn.functional.log_softmax(
