@@ -325,7 +325,33 @@ def test_delegated_packing_cannot_silently_drop_router_mask(monkeypatch):
             delegate_pack_to_model=True,
             pad_individual_seqs_to_multiple_of=4,
             create_packed_seq_padding_mask=True,
+            create_nonpacked_router_padding_mask=True,
         )
+
+
+def test_delegated_packing_allows_hybridep_mask_without_bias_updates(monkeypatch):
+    """HybridEP requests packed padding masks even with expert-bias updates off.
+
+    A self-packing model (e.g. Qwen3.5 with HybridEP, moe_router_bias_update_rate=0)
+    never received that mask, so the request alone must not reject the batch.
+    """
+    from nemo_rl.models.megatron import data as module
+
+    monkeypatch.setattr(module, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_context_parallel_world_size", lambda: 1)
+    result = module.process_microbatch(
+        _packed_batch(),
+        seq_length_key="input_lengths",
+        pack_sequences=True,
+        delegate_pack_to_model=True,
+        pad_individual_seqs_to_multiple_of=4,
+        create_packed_seq_padding_mask=True,
+        create_nonpacked_router_padding_mask=False,
+    )
+
+    # The model still receives the unpacked rows it packs itself, with no mask.
+    assert result.padding_mask is None
+    assert result.input_ids_cp_sharded.shape == (2, 8)
 
 
 @pytest.mark.parametrize("chunkwise", [False, True])

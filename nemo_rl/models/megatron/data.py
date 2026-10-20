@@ -773,6 +773,8 @@ def process_microbatch(
 
     ``create_nonpacked_router_padding_mask`` opts supported MoE models into
     right-padding exclusion using input lengths, independent of the loss mask.
+    It is set whenever expert-bias updates need router padding masks, so it also
+    rejects model-owned packing, which cannot carry real-token validity.
     """
     prepacked = "cu_seqlens" in data_dict
     if (
@@ -920,7 +922,10 @@ def process_microbatch(
                         )
                 attention_mask = None
             elif delegate_pack_to_model:
-                if create_packed_seq_padding_mask:
+                # Only expert-bias updates need real-token validity here. HybridEP
+                # also requests packed padding masks, but a self-packing model
+                # never received one, so that request alone must not fail.
+                if create_nonpacked_router_padding_mask:
                     raise NotImplementedError(
                         "Router padding masks require real-token validity through "
                         "model-owned sequence packing, which is not supported."
