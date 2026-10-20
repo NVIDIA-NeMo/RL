@@ -1075,12 +1075,14 @@ def test_async_generation_setup_failure_aborts_then_flushes(
     traceback_log = MagicMock()
     monkeypatch.setattr("traceback.print_exc", traceback_log)
     flush = MagicMock(side_effect=lambda: events.append("flush"))
+    refit = MagicMock(side_effect=error)
     namespace = dict(
         POLICY_GENERATION_STALE=stale,
         policy=policy,
         policy_generation=rollout,
         capture=capture,
-        refit_policy_generation=MagicMock(side_effect=error),
+        refit_policy_generation=refit,
+        refit_buffer_size_gb=1.25,
         colocated_inference=False,
         weight_version=0,
         _flush_collector_telemetry=flush,
@@ -1091,6 +1093,16 @@ def test_async_generation_setup_failure_aborts_then_flushes(
             namespace,
         )
     assert raised.value is error
+    if stale:
+        refit.assert_called_once_with(
+            policy,
+            rollout,
+            False,
+            _refit_buffer_size_gb=1.25,
+            profile_weight_version=0,
+        )
+    else:
+        refit.assert_not_called()
     traceback_log.assert_called_once_with()
     flush.assert_called_once_with()
     assert events == (["abort_policy", "abort_rollout"] if enabled else []) + ["flush"]

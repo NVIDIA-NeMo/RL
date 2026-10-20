@@ -945,9 +945,17 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
 
 @pytest.mark.parametrize("require_capture", [False, True])
 @pytest.mark.parametrize(
-    ("vllm_cfg_overrides", "expected_nemotron_h_fp32_lm_head"),
+    (
+        "vllm_cfg_overrides",
+        "expected_nemotron_h_fp32_lm_head",
+        "expected_extra_env_vars",
+    ),
     [
-        ({"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True}, True),
+        (
+            {"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True},
+            True,
+            ["EXPLICIT_VAR", "USER_VAR"],
+        ),
         (
             {
                 "env_vars": {
@@ -956,6 +964,7 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
                 }
             },
             False,
+            ["EXPLICIT_VAR", "USER_VAR", VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR],
         ),
     ],
 )
@@ -963,6 +972,7 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
     monkeypatch,
     vllm_cfg_overrides,
     expected_nemotron_h_fp32_lm_head,
+    expected_extra_env_vars,
     require_capture: bool,
 ):
     from nemo_rl.models.generation.vllm import vllm_worker
@@ -1004,7 +1014,7 @@ def test_vllm_worker_threads_nemotron_h_fp32_lm_head_cfg_into_source_patches(
     assert patch_calls == [
         {
             "py": sys.executable,
-            "extra_env_vars": ["EXPLICIT_VAR"],
+            "extra_env_vars": expected_extra_env_vars,
             "nemotron_h_fp32_lm_head": expected_nemotron_h_fp32_lm_head,
             "require_moe_routed_experts_capture": require_capture,
         }
