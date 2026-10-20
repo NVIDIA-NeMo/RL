@@ -2707,6 +2707,53 @@ class TestValidateOptimizerConfig:
 class TestValidateChunkingConfig:
     """Tests for _validate_chunking_config function."""
 
+    @pytest.mark.parametrize(
+        ("change", "expected"),
+        [
+            ({"logprob_chunk_size": None}, "positive logprob_chunk_size"),
+            ({"logprob_chunk_size": 0}, "positive logprob_chunk_size"),
+            ({"logprob_chunk_size": -1}, "positive logprob_chunk_size"),
+            ({"megatron_cfg": {"use_fused_linear_logprobs": True}}, "fused linear"),
+            ({"sequence_packing": {"enabled": True}}, "sequence_packing.enabled=false"),
+            ({"generation": {"top_k": 5, "top_p": 1.0}}, "top-k/top-p"),
+            ({"generation": {"top_k": None, "top_p": 0.9}}, "top-k/top-p"),
+        ],
+    )
+    def test_cpu_logit_storage_rejects_unsupported_paths(self, change, expected):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = {
+            "logprob_chunk_size": 5,
+            "megatron_cfg": {
+                "defer_fp32_logits": True,
+                "offload_logprob_logits_to_cpu": True,
+            },
+            "sequence_packing": {"enabled": False},
+            "generation": {"top_k": None, "top_p": 1.0},
+        }
+        for key, value in change.items():
+            if isinstance(value, dict):
+                config[key].update(value)
+            else:
+                config[key] = value
+        with pytest.raises(ValueError, match=expected):
+            _validate_chunking_config(config)
+
+    def test_cpu_logit_storage_accepts_chunked_unfiltered_logprobs(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        _validate_chunking_config(
+            {
+                "logprob_chunk_size": 5,
+                "megatron_cfg": {
+                    "defer_fp32_logits": True,
+                    "offload_logprob_logits_to_cpu": True,
+                },
+                "sequence_packing": {"enabled": False},
+                "generation": {"top_k": None, "top_p": 1.0},
+            }
+        )
+
     def test_logprob_chunk_requires_defer_fp32_logits(self):
         """Test that logprob chunking requires defer_fp32_logits=True."""
         from nemo_rl.models.megatron.setup import _validate_chunking_config

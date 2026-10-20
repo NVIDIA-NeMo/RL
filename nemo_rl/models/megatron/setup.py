@@ -306,7 +306,10 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
         )
 
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
@@ -1868,6 +1871,28 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
 
 def _validate_chunking_config(config: PolicyConfig) -> None:
     """Validate chunking configuration."""
+    if config["megatron_cfg"].get("offload_logprob_logits_to_cpu"):
+        chunk_size = config.get("logprob_chunk_size")
+        if chunk_size is None or chunk_size <= 0:
+            raise ValueError(
+                "offload_logprob_logits_to_cpu requires a positive logprob_chunk_size"
+            )
+        if config["megatron_cfg"].get("use_fused_linear_logprobs"):
+            raise ValueError(
+                "offload_logprob_logits_to_cpu cannot be combined with fused linear logprobs"
+            )
+        packing = config.get("sequence_packing")
+        if packing is not None and packing["enabled"]:
+            raise ValueError(
+                "offload_logprob_logits_to_cpu currently requires sequence_packing.enabled=false"
+            )
+        generation = config.get("generation")
+        if generation is not None and need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=generation["top_k"], top_p=generation["top_p"])
+        ):
+            raise ValueError(
+                "offload_logprob_logits_to_cpu does not support top-k/top-p filtering"
+            )
     if (
         "logprob_chunk_size" in config
         and config["logprob_chunk_size"] is not None

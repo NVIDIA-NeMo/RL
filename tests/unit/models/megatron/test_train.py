@@ -36,6 +36,90 @@ from nemo_rl.algorithms.loss.interfaces import LossInputType
 pytestmark = pytest.mark.mcore
 
 
+def test_cpu_logit_storage_preserves_native_grpo_loss_metrics_and_gradients(tmp_path):
+    """Exercise the real resource flag through native preparation and backward."""
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+    from nemo_rl.models.megatron import train
+
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        torch.manual_seed(700)
+        seed = torch.randn(4, 9, 32)
+        originals = {
+            "input_ids": torch.arange(36).reshape(4, 9) % 32,
+            "input_lengths": torch.full((4,), 9, dtype=torch.long),
+            "token_mask": torch.tensor(
+                [[0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]] * 4
+            ),
+            "sample_mask": torch.tensor([1.0, 0.0, 1.0, 1.0]),
+            "advantages": torch.tensor([0.25, -0.08, 1.89, -2.72])[:, None]
+            .expand(4, 9)
+            .clone(),
+            "prev_logprobs": torch.full((4, 9), -4.0),
+            "generation_logprobs": torch.full((4, 9), -4.0),
+        }
+        results = []
+        for offload in (False, True):
+            data = BatchedDataDict(
+                {key: value.clone() for key, value in originals.items()}
+            )
+            values = seed.clone().requires_grad_(True)
+            processor = train.LossPostProcessor(
+                loss_fn=ClippedPGLossFn(
+                    ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
+                ),
+                cfg={
+                    "sequence_packing": {"enabled": False},
+                    "logprob_chunk_size": 3,
+                    "megatron_cfg": {"offload_logprob_logits_to_cpu": offload},
+                },
+                cp_normalize=False,
+            )
+            with (
+                patch.object(train, "get_tensor_model_parallel_rank", return_value=0),
+                patch.object(
+                    train,
+                    "get_tensor_model_parallel_group",
+                    return_value=torch.distributed.group.WORLD,
+                ),
+                patch.object(
+                    train,
+                    "get_context_parallel_group",
+                    return_value=torch.distributed.group.WORLD,
+                ),
+                patch.object(train, "get_context_parallel_world_size", return_value=1),
+            ):
+                loss, metrics = processor(
+                    data,
+                    global_valid_seqs=data["sample_mask"].sum(),
+                    global_valid_toks=(
+                        data["token_mask"][:, 1:] * data["sample_mask"][:, None]
+                    ).sum(),
+                )(values)
+            loss.backward()
+            assert torch.isfinite(values.grad).all() and values.grad.abs().sum() > 0
+            assert torch.count_nonzero(values.grad[1]) == 0
+            assert all(
+                torch.equal(value, data[key]) for key, value in originals.items()
+            )
+            results.append((loss.detach(), metrics, values.grad.clone()))
+        before, after = results
+        assert torch.equal(before[0], after[0])
+        assert torch.equal(before[2], after[2])
+        assert before[1].keys() == after[1].keys()
+        for key, value in before[1].items():
+            assert (
+                torch.equal(value, after[1][key])
+                if isinstance(value, torch.Tensor)
+                else value == after[1][key]
+            )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class TestModelForward:
     """Tests for model_forward function."""
 

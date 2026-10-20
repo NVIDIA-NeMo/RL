@@ -438,6 +438,10 @@ class MegatronConfig(TypedDict):
     # If True, defer the casting of logits to float32 until the backward pass.
     # If you are using logprob_chunk_size, you must set this to True.
     defer_fp32_logits: NotRequired[bool]
+    # Keep saved training logits on CPU and copy back one chunk during backward.
+    # Optional bool, normally false. Preserves dtype and math; requires positive
+    # logprob_chunk_size, unpacked LOGPROB loss, and no top-k/top-p filtering.
+    offload_logprob_logits_to_cpu: NotRequired[bool]
     # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion

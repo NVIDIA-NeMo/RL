@@ -246,6 +246,36 @@ def test_distributed_logprob_forward_and_backward(
     distributed_test_runner(test_fn, world_size=tp_size)
 
 
+def _run_logprob_cpu_storage(rank, world_size):
+    """Check actual CUDA-to-CPU saved tensors and unchanged distributed gradients."""
+    group = torch.distributed.group.WORLD
+    for dtype in (torch.float32, torch.bfloat16):
+        torch.manual_seed(42 + rank)
+        source = torch.randn(2, 17, 64, dtype=dtype, device="cuda")[..., ::2]
+        torch.manual_seed(43)
+        target = torch.randint(world_size * 32, (2, 17), device="cuda")
+        weights = torch.randn(2, 17, device="cuda")
+        weights[:, ::3] = 0
+        results = []
+        for offload in (False, True):
+            logits = source.detach().requires_grad_(True)
+            output = ChunkedDistributedLogprob.apply(
+                logits, target, rank * 32, (rank + 1) * 32, 5, group, False, offload
+            )
+            saved = output.grad_fn.saved_tensors[0]
+            assert saved.device.type == ("cpu" if offload else "cuda")
+            assert saved.dtype == logits.dtype
+            (output * weights).sum().backward()
+            results.append((output.detach().cpu(), logits.grad.cpu()))
+        assert torch.equal(results[0][0], results[1][0])
+        assert torch.equal(results[0][1], results[1][1])
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_chunked_logprob_cpu_storage(distributed_test_runner, world_size):
+    distributed_test_runner(_run_logprob_cpu_storage, world_size=world_size)
+
+
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_distributed_log_softmax(distributed_test_runner, tp_size):
     test_fn = functools.partial(_run_log_softmax, tp_size=tp_size)

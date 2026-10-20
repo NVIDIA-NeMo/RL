@@ -209,6 +209,7 @@ def prepare_loss_input(
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
     teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
+    offload_logits_to_cpu: Optional[bool] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -231,6 +232,8 @@ def prepare_loss_input(
             ``[V_local, H_teacher]`` teacher LM-head shards, keyed by the stable
             index rows are tagged with. The ``opd_full`` hidden-state path
             projects each row's teacher payload into teacher logits with them.
+        offload_logits_to_cpu: Store logits needed by chunked LOGPROB backward
+            on CPU, preserving dtype and all loss inputs.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -241,6 +244,8 @@ def prepare_loss_input(
     Returns:
         tuple(loss_input, maybe_updated_data)
     """
+    if offload_logits_to_cpu and loss_fn.input_type != LossInputType.LOGPROB:
+        raise ValueError("CPU logit storage requires a LOGPROB loss")
     if loss_fn.input_type == LossInputType.LOGIT:
         loss_input = {"logits": logits}
 
@@ -265,6 +270,7 @@ def prepare_loss_input(
                 sampling_params=sampling_params,
                 chunk_size=chunk_size,
                 cp_sharder=cp_sharder,
+                offload_logits_to_cpu=offload_logits_to_cpu,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now

@@ -51,7 +51,7 @@ from nemo_rl.algorithms.loss import (
     wrap_loss_fn_with_input_preparation,
 )
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.loss.utils import _pack_input_ids
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -653,6 +653,12 @@ class LossPostProcessor:
         self.prepare_fn = prepare_fn
         self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
+        megatron_cfg = cfg.get("megatron_cfg")
+        if megatron_cfg and megatron_cfg.get("offload_logprob_logits_to_cpu"):
+            if prepare_fn is not None or loss_fn.input_type != LossInputType.LOGPROB:
+                raise ValueError(
+                    "CPU logit storage requires the native LOGPROB preparation path"
+                )
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -682,6 +688,12 @@ class LossPostProcessor:
         """
         # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+        megatron_cfg = self.cfg.get("megatron_cfg")
+        offload_logits = (
+            megatron_cfg.get("offload_logprob_logits_to_cpu")
+            if megatron_cfg is not None
+            else None
+        )
         if self.prepare_fn is not None:
             prepare_loss_input_wrapped = self.prepare_fn
         else:
@@ -691,6 +703,7 @@ class LossPostProcessor:
                 d2t=self.d2t,
                 chunk_size=logprob_chunk_size,
                 teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
+                offload_logits_to_cpu=offload_logits,
             )
 
         # wrap loss function with loss input preparation
