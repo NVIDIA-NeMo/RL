@@ -18,11 +18,20 @@ import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import torch
+from hydra.utils import get_class
+from pydantic import BaseModel
 
 from nemo_rl.utils.json_utils import json_safe_nonfinite
+
+
+class DebugWriterConfig(BaseModel, extra="allow"):
+    # Key in DEBUG_WRITER_REGISTRY, or a dotted import path to a DebugWriter defined
+    # outside this repo. Extra keys are forwarded to the constructor after log_dir
+    # and shard_id.
+    target: str = "json"
 
 
 class DebugWriter(ABC):
@@ -191,3 +200,42 @@ class JsonDebugWriter(DebugWriter):
         os.replace(partial, self.log_dir / f"train_data_step{step + 1}.jsonl")
         for part in parts:
             part.unlink()
+
+
+DEBUG_WRITER_REGISTRY: dict[str, Callable[..., DebugWriter]] = {
+    "json": JsonDebugWriter,
+}
+
+
+def make_debug_writer(
+    cfg: DebugWriterConfig, log_dir: str, *, shard_id: str = "0"
+) -> DebugWriter:
+    """Build the debug writer that cfg selects for one shard.
+
+    A target found in DEBUG_WRITER_REGISTRY picks that writer; any other target
+    containing a dot is imported as a dotted path to a DebugWriter subclass.
+
+    Args:
+        cfg: Debug writer config naming the writer and any constructor keys.
+        log_dir: Base log directory handed to the writer.
+        shard_id: Identifier of the shard that owns the returned writer.
+
+    Returns:
+        The constructed writer.
+    """
+    if cfg.target in DEBUG_WRITER_REGISTRY:
+        writer_cls = DEBUG_WRITER_REGISTRY[cfg.target]
+    elif "." in cfg.target:
+        writer_cls = get_class(cfg.target)
+        if not issubclass(writer_cls, DebugWriter):
+            raise ValueError(
+                f"debug_writer target {cfg.target!r} resolved to {writer_cls!r}, "
+                "which is not a DebugWriter subclass."
+            )
+    else:
+        raise ValueError(
+            f"Unsupported debug_writer target {cfg.target!r}. Set target to one of "
+            f"{sorted(DEBUG_WRITER_REGISTRY)} or to an importable dotted path to a "
+            "DebugWriter subclass."
+        )
+    return writer_cls(log_dir, shard_id=shard_id, **(cfg.model_extra or {}))

@@ -7,7 +7,12 @@ from typing import Any
 import pytest
 import torch
 
-from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriter,
+    DebugWriterConfig,
+    JsonDebugWriter,
+    make_debug_writer,
+)
 
 
 def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
@@ -361,3 +366,73 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     row = json.loads(text, parse_constant=reject_nonfinite)
     assert row["prev_logprobs"] == [[0.0, None, None, None]]
     assert torch.isneginf(values[0, 1])
+
+
+class _RecordingWriter(DebugWriter):
+    def __init__(self, log_dir: str, *, shard_id: str, label: str = "unset") -> None:
+        super().__init__()
+        self.log_dir = log_dir
+        self.shard_id = shard_id
+        self.label = label
+
+    def _write_rows(self, step: int, rows: Any, replace: bool) -> int:
+        return sum(1 for _ in rows)
+
+    def _publish_step(self, step: int, expected_rows: int | None) -> None:
+        pass
+
+
+class _IncompleteWriter(DebugWriter):
+    def _write_rows(self, step: int, rows: Any, replace: bool) -> int:
+        return 0
+
+
+class _Unrelated:
+    pass
+
+
+_NOT_A_CLASS = 5
+
+
+@pytest.mark.parametrize("cfg", [DebugWriterConfig(), DebugWriterConfig(target="json")])
+def test_make_debug_writer_selects_json_writer_by_default_and_by_name(
+    tmp_path: Path, cfg: DebugWriterConfig
+) -> None:
+    writer = make_debug_writer(cfg, str(tmp_path), shard_id="3")
+    assert type(writer) is JsonDebugWriter
+    assert writer.log_dir == tmp_path
+    assert writer.shard_id == "3"
+
+
+def test_make_debug_writer_builds_external_target_with_extra_kwargs(
+    tmp_path: Path,
+) -> None:
+    cfg = DebugWriterConfig(target=f"{__name__}._RecordingWriter", label="fake-label")
+    writer = make_debug_writer(cfg, str(tmp_path), shard_id="2")
+    assert isinstance(writer, _RecordingWriter)
+    assert writer.log_dir == str(tmp_path)
+    assert writer.shard_id == "2"
+    assert writer.label == "fake-label"
+
+
+@pytest.mark.parametrize(
+    ("target", "error", "match"),
+    [
+        ("unregistered", ValueError, "Unsupported debug_writer target"),
+        ("no_such_module_for_debug_writer.Writer", ImportError, None),
+        (f"{__name__}._missing", ImportError, None),
+        (f"{__name__}._NOT_A_CLASS", ValueError, None),
+        (f"{__name__}._Unrelated", ValueError, "not a DebugWriter subclass"),
+    ],
+)
+def test_make_debug_writer_rejects_invalid_targets(
+    tmp_path: Path, target: str, error: type[Exception], match: str | None
+) -> None:
+    with pytest.raises(error, match=match):
+        make_debug_writer(DebugWriterConfig(target=target), str(tmp_path))
+
+
+def test_external_writer_missing_a_hook_fails_at_construction(tmp_path: Path) -> None:
+    cfg = DebugWriterConfig(target=f"{__name__}._IncompleteWriter")
+    with pytest.raises(TypeError, match="_publish_step"):
+        make_debug_writer(cfg, str(tmp_path))

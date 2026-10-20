@@ -127,7 +127,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     is_ppo_run,
 )
-from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.debug_writer import make_debug_writer
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
@@ -784,7 +784,7 @@ class SingleControllerActor:
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
         self._train_data_dump = (
-            JsonDebugWriter(self._logger.base_log_dir)
+            make_debug_writer(self._async_cfg.debug_writer, self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
             else None
         )
