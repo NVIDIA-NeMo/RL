@@ -65,6 +65,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
+from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -1286,6 +1287,7 @@ class AutomodelPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication.
 
@@ -1304,6 +1306,7 @@ class AutomodelPolicyWorkerImpl(
                 kv_scales=kv_scales,
                 buffer_size_bytes=buffer_size_bytes,
                 num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
             )
         if guard.fired:
             # The aborted collective returned cleanly, so this is the only signal there is.
@@ -1318,6 +1321,7 @@ class AutomodelPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
@@ -1344,6 +1348,7 @@ class AutomodelPolicyWorkerImpl(
             post_iter_func=automodel_post_iter_func,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
 
         # Manually move model to cpu for cpu offload case
@@ -1417,6 +1422,9 @@ class AutomodelPolicyWorkerImpl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        # Release recompute activations that MoE dispatch state keeps alive;
+        # otherwise they pin cached segments and empty_cache() cannot free them.
+        release_moe_dispatcher_state(self.model)
         gc.collect()
         torch.cuda.empty_cache()
 

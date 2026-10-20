@@ -442,6 +442,7 @@ class CollectiveSenderSpec:
     nccl_peer: str = "nemo"
     buffer_size_bytes: int | None = None
     num_buffers: int | None = None
+    use_legacy_packing: bool = False
 
 
 def agreed_media_columns(
