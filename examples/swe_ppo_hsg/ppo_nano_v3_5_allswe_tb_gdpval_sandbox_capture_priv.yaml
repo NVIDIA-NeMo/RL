@@ -138,7 +138,10 @@ env:
           judge_timeout: 1200
           judge_max_attempts: 1
           judge_retry_delay_s: 5.0
-          judge_concurrency: 4
+          # Verdicts in flight per judge server (each renders deliverables in a subprocess on this node, then makes
+          # one judge call). 2 train servers x 32 = 64 = one judge replica's vLLM max_num_seqs; the launcher scales it
+          # with the bundled judge pool (GDPVAL_JUDGE_CONCURRENCY).
+          judge_concurrency: 32
           judge_media_mode: images_and_text
           judge_url: ${oc.env:JUDGE_BASE_URL}
           judge_model: ${oc.env:JUDGE_MODEL_NAME}
