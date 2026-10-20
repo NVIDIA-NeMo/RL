@@ -382,18 +382,26 @@ class UnitSlabStore:
     def _commit(
         self, u: dict[str, Any], blob_id: str, deadline: float | None, errs: list
     ) -> bool:
-        """Awaited commit (design §4.1): the blob may be demoted only after it.
+        """Awaited commit (design §4.1): the blob is durable once it returns True.
 
-        On failure the blob is never published; the unit drops it on abort.
+        A blob the unit spilled to disk answers ``"pending"`` while its file is
+        written: ask again, inside the put deadline. On failure the blob is never
+        published; the unit drops it on abort.
         """
         ok = False
         try:
-            ok = self.ctl.call(
-                u["zmq"],
-                "commit",
-                timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
-                blob_id=blob_id,
-            )
+            backoff = PENDING_POLL_S
+            while True:
+                status = self.ctl.call(
+                    u["zmq"],
+                    "commit",
+                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                    blob_id=blob_id,
+                )
+                if status != "pending":
+                    break
+                backoff = busy_wait(deadline, backoff)
+            ok = status == "done"
             if not ok:
                 errs.append(TransferError(f"unit {u['unit_id']} lost the blob"))
         except (TransferError, LostBlobs, DataPlaneBusy) as e:
@@ -579,6 +587,9 @@ class UnitSlabStore:
             missing = [b for r in resolved.values() for b in r["missing"]]
             if missing:
                 raise LostBlobs(missing, "blob not on unit")
+            failed = [b for r in resolved.values() for b in r.get("failed", ())]
+            if failed:  # the unit still has the file, so the caller may retry
+                raise TransferFailed(failed, "disk read failed on the unit")
             pending = {b for r in resolved.values() for b in r.get("pending", ())}
             for u, blobs in by_unit.items():
                 blobs = [b for b in blobs if b not in pending]
