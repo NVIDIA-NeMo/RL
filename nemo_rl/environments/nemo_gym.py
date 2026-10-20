@@ -1968,6 +1968,17 @@ def _build_gym_actor_config(
         "max_infra_attempts_per_rollout", None
     )
     rollout_metrics_hook = nemo_gym_dict.pop("rollout_metrics_hook", None)
+    # Imported once here, on the driver, so a path that names no importable
+    # callable is refused before any actor starts; each rollout process
+    # resolves the callable again for itself. Deferred import: the module
+    # imports this one.
+    from nemo_rl.experience.nemo_gym_rollout_config import (
+        get_nemo_gym_rollout_metrics_hook,
+    )
+
+    get_nemo_gym_rollout_metrics_hook(
+        {"nemo_gym": {"rollout_metrics_hook": rollout_metrics_hook}}
+    )
     port_range = {
         key: value
         for key in ("port_range_low", "port_range_high")

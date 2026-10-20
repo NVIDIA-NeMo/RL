@@ -35,7 +35,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import nemo_rl.experience.rollouts as rollouts_mod
+import nemo_rl.experience.nemo_gym_rollout_config as rollout_config_mod
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
     PostWriteEnrichmentError,
@@ -1680,7 +1680,7 @@ def test_nemo_gym_run_rollouts_keeps_the_group_timing_across_a_redispatch():
 
 
 def _sum_rewards_hook(rows, full_results):
-    """Rollout-metrics hook the SC parity test names by its dotted path.
+    """Rollout-metrics hook the single-controller parity test names by its dotted path.
 
     Reports what it saw through its returned metrics, because the dotted-path
     import can hand the test a second module instance whose globals the test
@@ -1779,31 +1779,6 @@ def test_nemo_gym_sc_hook_resolution_survives_pickling():
     assert callable(restored._rollout_metrics_hook)
 
 
-def test_nemo_gym_sc_per_agent_metrics_cover_the_union_of_result_fields():
-    """A numeric field only some completions carry is still aggregated: the
-    per-agent keys are the union over the completions, not the first
-    completion's keys."""
-    impl = _nemo_gym_impl(False)
-    completions = [
-        Completion(
-            message_log=[{"role": "assistant", "token_ids": [1]}],
-            env_extras=extras,
-            truncated=False,
-            reward=reward,
-        )
-        for reward, extras in [
-            (0.0, {"reward": 0.0}),
-            (1.0, {"reward": 1.0, "speedup": 2.0}),
-            (1.0, {"reward": 1.0, "speedup": 4.0}),
-        ]
-    ]
-
-    metrics = impl._compute_rollout_metrics(completions, "agent")
-
-    assert metrics["agent/speedup/mean"] == pytest.approx(6.0 / 3)
-    assert metrics["agent/speedup/max"] == 4.0
-
-
 def _masked_flag(flag_form, value):
     if flag_form == "first_class":
         return {"mask_sample": value}
@@ -1883,7 +1858,7 @@ def test_nemo_gym_sc_rollout_metrics_hook_runs_after_the_built_in_metrics(
     returns survives the built-in writers with a collision warning."""
     from nemo_rl.experience.rollouts import Timer
 
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    monkeypatch.setattr(rollout_config_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
     seen = []
 
     def hook(rows, full_results):
@@ -1953,6 +1928,57 @@ def test_nemo_gym_sc_path_rejects_a_bad_metrics_hook_path_before_dispatch():
             )
         )
     assert env.dispatched == []
+
+
+def test_nemo_gym_sc_path_reports_driver_only_settings_once(capsys, monkeypatch):
+    """The two env.nemo_gym settings only the driver loop reads are reported
+    the first time an actor's configuration is read in this process, each
+    naming the single-controller setting that applies instead, and not again;
+    an unset setting is not reported."""
+    from nemo_rl.experience import rollout_manager as rollout_manager_mod
+    from nemo_rl.experience.rollouts import Timer
+
+    monkeypatch.setattr(
+        rollout_manager_mod, "_DRIVER_ONLY_ROLLOUT_SETTINGS_WARNED", set()
+    )
+
+    def run_group(rollout_settings):
+        env = _ScriptedGymEnv(
+            scripts=[
+                [
+                    (0, {"name": "agent"}, _streamed_gym_result(), None),
+                    (1, {"name": "agent"}, _streamed_gym_result(), None),
+                ]
+            ],
+            rollout_settings=rollout_settings,
+        )
+        impl = _run_rollouts_impl(env, max_attempts=1)
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+            )
+        )
+
+    run_group({"health_check_interval_seconds": None})
+    assert "driver rollout loop" not in capsys.readouterr().out
+
+    driver_settings = {
+        "health_check_interval_seconds": 60,
+        "max_infra_attempts_per_rollout": 3,
+    }
+    run_group(driver_settings)
+    run_group(driver_settings)
+    out = capsys.readouterr().out
+    assert out.count("is read only by the driver rollout loop") == 2
+    assert "env.nemo_gym.health_check_interval_seconds=60" in out
+    assert "async_rl.rollout_failure.nemo_gym.rollout_timeout_s" in out
+    assert "env.nemo_gym.max_infra_attempts_per_rollout=3" in out
+    assert "async_rl.rollout_failure.nemo_gym.max_row_attempts" in out
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

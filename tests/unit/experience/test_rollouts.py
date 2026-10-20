@@ -27,6 +27,7 @@ import torch
 from PIL import Image
 from transformers import AutoTokenizer
 
+import nemo_rl.experience.nemo_gym_rollout_config as rollout_config_mod
 import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
@@ -2347,11 +2348,10 @@ def test_postprocess_nemo_gym_group_returns_task_index(
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
 
 
-def test_per_agent_value_metrics_exclude_environment_masked_rollouts():
-    """An environment-masked rollout carries placeholder values, so it votes in
-    no per-agent value metric (the correctness ranking key included), while the
-    mask flag itself still averages over every rollout as the masked share."""
-    rows = [{"agent_ref": {"name": "agent"}} for _ in range(3)]
+def test_per_agent_value_metrics_follow_the_mask_gate():
+    """The group postprocess hands the mask gate to ``per_agent_result_metrics``,
+    whose rules the helper tests pin: with the gate on, an environment-masked
+    rollout votes in no per-agent value metric; with it off, every rollout votes."""
 
     def result(**extras):
         input_message = {"role": "user", "content": "", "token_ids": torch.tensor([1])}
@@ -2369,28 +2369,29 @@ def test_per_agent_value_metrics_exclude_environment_masked_rollouts():
             "full_result": {"reward": 0.0, **extras},
         }
 
-    results = [
-        result(correctness=1.0, speedup=4.0, mask_sample=False),
-        result(correctness=0.0, speedup=2.0, mask_sample=False),
-        # The masked rollout's values are placeholders, not measurements.
-        result(correctness=0.0, speedup=0.0, mask_sample=True),
-    ]
-    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
-        nemo_gym_rows=rows,
-        results=results,
-        timer=rollouts_mod.Timer(),
-        timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
-        )(),
-        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
-        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
-        log_full_result_tables=False,
-    )
-    metrics = rollout_result.rollout_metrics
-    assert metrics["agent/correctness/mean"] == pytest.approx(0.5)
-    assert metrics["agent/speedup/mean"] == pytest.approx(3.0)
-    assert metrics["agent/mask_sample/mean"] == pytest.approx(1 / 3)
+    def correctness_mean(mask_env_flagged_samples):
+        rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+            nemo_gym_rows=[{"agent_ref": {"name": "agent"}} for _ in range(3)],
+            results=[
+                result(correctness=1.0, mask_sample=False),
+                result(correctness=0.0, mask_sample=False),
+                # The masked rollout's values are placeholders, not measurements.
+                result(correctness=0.0, mask_sample=True),
+            ],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/rollout",
+            policy_generation=type(
+                "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
+            )(),
+            input_batch=BatchedDataDict({"loss_multiplier": torch.ones(3)}),
+            tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+            log_full_result_tables=False,
+            mask_env_flagged_samples=mask_env_flagged_samples,
+        )
+        return rollout_result.rollout_metrics["agent/correctness/mean"]
+
+    assert correctness_mean(True) == pytest.approx(0.5)
+    assert correctness_mean(False) == pytest.approx(1 / 3)
 
 
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
@@ -3816,7 +3817,7 @@ def test_run_async_nemo_gym_rollout_raises_when_infra_attempts_are_exhausted(
 
 
 def test_nemo_gym_max_infra_attempts_accessor():
-    attempts = rollouts_mod.get_nemo_gym_max_infra_attempts
+    attempts = rollout_config_mod.get_nemo_gym_max_infra_attempts
     assert attempts({}) == 1
     assert attempts({"nemo_gym": {"max_infra_attempts_per_rollout": None}}) == 1
     assert attempts({"nemo_gym": {"max_infra_attempts_per_rollout": 3}}) == 3
@@ -3858,7 +3859,7 @@ def test_gym_rollout_reads_the_dispatch_budget_from_the_actor_config(monkeypatch
 
 
 def test_nemo_gym_health_check_interval_accessor():
-    interval = rollouts_mod.get_nemo_gym_health_check_interval
+    interval = rollout_config_mod.get_nemo_gym_health_check_interval
     assert interval({}) is None
     assert interval({"nemo_gym": {"health_check_interval_seconds": None}}) is None
     assert interval({"nemo_gym": {"health_check_interval_seconds": 60}}) == 60.0
@@ -3965,7 +3966,7 @@ def test_gym_rollout_reads_both_reliability_knobs_from_the_actor_config(monkeypa
 
 
 def test_nemo_gym_rollout_metrics_hook_resolves_by_import_path():
-    get = rollouts_mod.get_nemo_gym_rollout_metrics_hook
+    get = rollout_config_mod.get_nemo_gym_rollout_metrics_hook
     assert get({}) is None
     assert get({"nemo_gym": {"rollout_metrics_hook": None}}) is None
     path = "nemo_rl.experience.metric_utils.calculate_single_metric"
@@ -3977,7 +3978,8 @@ def test_nemo_gym_rollout_metrics_hook_resolves_by_import_path():
             {
                 "nemo_gym": {
                     "rollout_metrics_hook": (
-                        "nemo_rl.experience.rollouts.DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT"
+                        "nemo_rl.experience.nemo_gym_rollout_config."
+                        "DEFAULT_MAX_INFRA_ATTEMPTS_PER_ROLLOUT"
                     )
                 }
             }
@@ -4024,7 +4026,7 @@ def test_nemo_gym_group_applies_the_rollout_metrics_hook(caplog, monkeypatch):
     """The configured hook sees the group's rows and aligned full results and
     its metrics are merged; a hook that raises is reported with its traceback
     and cannot fail the rollout."""
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    monkeypatch.setattr(rollout_config_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def results():
         return [
@@ -4068,7 +4070,7 @@ def test_nemo_gym_rollout_metrics_hook_runs_after_the_per_agent_means(
     """The hook runs after every built-in metric writer, so a key it returns
     survives instead of being reabsorbed by the per-agent means, and the
     collision is warned once."""
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    monkeypatch.setattr(rollout_config_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def hook(rows, full_results):
         return {"agent/reward/mean": 99.0}
@@ -4085,7 +4087,7 @@ def test_nemo_gym_rollout_metrics_hook_output_is_validated(caplog, monkeypatch):
     """A hook that returns no mapping is reported once like a raising hook and
     cannot fail the rollout; a value the step aggregation cannot average is
     dropped and reported once while the hook's other metrics survive."""
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    monkeypatch.setattr(rollout_config_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def forgot_the_return(rows, full_results):
         sum(r["reward"] for r in full_results)
@@ -4129,7 +4131,7 @@ def test_nemo_gym_rollout_metrics_hook_conditions_are_reported_once(
 ):
     """Each condition (a failure, a collision) is reported the first time only
     for a given hook, since it would otherwise repeat for every prompt group."""
-    monkeypatch.setattr(rollouts_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
+    monkeypatch.setattr(rollout_config_mod, "_ROLLOUT_METRICS_HOOK_WARNED", set())
 
     def broken(rows, full_results):
         raise KeyError("score")
@@ -4196,17 +4198,20 @@ def test_per_agent_result_metrics_report_only_the_share_when_every_rollout_is_ma
     assert "agent/reward/mean" not in metrics
 
 
-def test_nemo_gym_per_agent_metrics_cover_fields_present_on_some_rollouts_only():
+def test_per_agent_result_metrics_cover_fields_present_on_some_rollouts_only():
     """A numeric result field that only some rollouts of an agent carry is still
     aggregated: the per-agent keys are the union over the rollouts, not the
     first rollout's keys."""
-    metrics = _postprocess_hook_group(
-        [
-            _hook_group_result(1.0),
-            _hook_group_result(0.0, speedup=2.0),
-            _hook_group_result(1.0, speedup=4.0),
-        ]
-    ).rollout_metrics
+    results = [
+        {"reward": 1.0},
+        {"reward": 0.0, "speedup": 2.0},
+        {"reward": 1.0, "speedup": 4.0},
+    ]
+
+    metrics = rollouts_mod.per_agent_result_metrics(
+        "agent", results, exclude_masked=True
+    )
+
     assert metrics["agent/reward/mean"] == pytest.approx(2 / 3)
     # calculate_single_metric divides by the agent's rollout count, so a field two
     # of three rollouts carry averages over all three; max and the histogram
@@ -4276,7 +4281,9 @@ def test_gym_rollout_bounds_the_actor_config_read(monkeypatch):
             await asyncio.Event().wait()
 
     actor.rollout_config = _ParkedRolloutConfig()
-    monkeypatch.setattr(rollouts_mod, "NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        rollout_config_mod, "NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS", 0.01
+    )
     monkeypatch.setattr(
         rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
     )

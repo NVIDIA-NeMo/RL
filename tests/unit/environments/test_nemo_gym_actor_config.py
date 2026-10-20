@@ -20,7 +20,12 @@ configuration. A key left in the wrong place is silently ignored, so the split
 is pinned here.
 """
 
+import pytest
+
 import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+# A hook path that imports: the actor configuration is refused otherwise.
+_HOOK_PATH = "nemo_rl.experience.metric_utils.calculate_single_metric"
 
 
 def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
@@ -32,7 +37,7 @@ def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
         "port_range_high": 5499,
         "health_check_interval_seconds": 60,
         "max_infra_attempts_per_rollout": 3,
-        "rollout_metrics_hook": "package.module.function",
+        "rollout_metrics_hook": _HOOK_PATH,
         "thinking_tags": ["<think>", "</think>"],
     }
     cfg = nemo_gym_mod._build_gym_actor_config(
@@ -47,7 +52,7 @@ def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
     assert "port_range_low" not in cfg
     assert cfg["health_check_interval_seconds"] == 60
     assert cfg["max_infra_attempts_per_rollout"] == 3
-    assert cfg["rollout_metrics_hook"] == "package.module.function"
+    assert cfg["rollout_metrics_hook"] == _HOOK_PATH
     assert cfg["thinking_tags"] == ["<think>", "</think>"]
     gym_global = cfg["initial_global_config_dict"]
     assert gym_global["config_paths"] == ["a.yaml"]
@@ -61,6 +66,29 @@ def test_actor_fields_leave_the_gym_global_configuration(monkeypatch):
         assert key not in gym_global
     # The caller's mapping is left untouched.
     assert nemo_gym_dict["port_range_high"] == 5499
+
+
+@pytest.mark.parametrize(
+    ("hook_path", "error"),
+    [("no.such.module.function", ModuleNotFoundError), ("nodots", ValueError)],
+)
+def test_actor_config_refuses_a_hook_path_that_does_not_import(
+    monkeypatch, hook_path, error
+):
+    """The hook path is imported once while the actor configuration is built on
+    the driver, so a path that names no importable callable fails before any
+    actor starts instead of on the first prompt group."""
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: None)
+
+    with pytest.raises(error):
+        nemo_gym_mod._build_gym_actor_config(
+            {"rollout_metrics_hook": hook_path},
+            base_urls=["http://engine.example/v1"],
+            model_name="model",
+            enable_router_replay=False,
+            use_fastokens=False,
+        )
 
 
 def test_rollout_config_reports_every_driver_key(monkeypatch):

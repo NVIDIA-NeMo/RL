@@ -67,6 +67,12 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.nemo_gym_rollout_config import (
+    RolloutMetricsHook,
+    _nemo_gym_rollout_config,
+    apply_nemo_gym_rollout_metrics_hook,
+    get_nemo_gym_rollout_metrics_hook,
+)
 from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
@@ -79,7 +85,6 @@ from nemo_rl.experience.rollout_recovery import (
 from nemo_rl.experience.rollouts import (
     NEMO_GYM_INFRA_REDISPATCHES_METRIC,
     EffortLevelsConfig,
-    RolloutMetricsHook,
     _add_timing_payload,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -88,14 +93,11 @@ from nemo_rl.experience.rollouts import (
     _EffortShapingMetrics,
     _find_routed_experts_template,
     _nemo_gym_group_metrics,
-    _nemo_gym_rollout_config,
     _tensorize_by_key,
-    apply_nemo_gym_rollout_metrics_hook,
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
-    get_nemo_gym_rollout_metrics_hook,
     nemo_gym_retry_timing_label,
     nemo_gym_rollout_hit_max_tokens,
     per_agent_result_metrics,
@@ -951,6 +953,41 @@ class _HookUnresolved:
 _HOOK_UNRESOLVED = _HookUnresolved()
 
 
+# The env.nemo_gym settings only the driver rollout loop reads, each paired with
+# the single-controller setting that does the same job on this path.
+_DRIVER_ONLY_ROLLOUT_SETTINGS = {
+    "health_check_interval_seconds": "async_rl.rollout_failure.nemo_gym.rollout_timeout_s",
+    "max_infra_attempts_per_rollout": "async_rl.rollout_failure.nemo_gym.max_row_attempts",
+}
+
+# Driver-only settings already reported in this process; each is reported the
+# first time only, since the read happens once per rollout implementation.
+_DRIVER_ONLY_ROLLOUT_SETTINGS_WARNED: set[str] = set()
+
+
+def _warn_driver_only_rollout_settings_once(settings: Mapping[str, Any]) -> None:
+    """Report, once per process, each configured setting of ``settings`` this path ignores.
+
+    ``settings`` is the ``env.nemo_gym`` mapping a Gym actor hands back through
+    ``rollout_config``. ``health_check_interval_seconds`` and
+    ``max_infra_attempts_per_rollout`` are read by the driver rollout loop
+    (``run_async_nemo_gym_rollout``) and by nothing here: this path bounds a
+    prompt group with its rollout deadline and dispatches a row again under
+    its own attempt budget. A recipe that carries the two keys over from a
+    driver run gets this message instead of silence.
+    """
+    for key, replacement in _DRIVER_ONLY_ROLLOUT_SETTINGS.items():
+        if settings.get(key) is None or key in _DRIVER_ONLY_ROLLOUT_SETTINGS_WARNED:
+            continue
+        _DRIVER_ONLY_ROLLOUT_SETTINGS_WARNED.add(key)
+        print(
+            f"NeMo-Gym: env.nemo_gym.{key}={settings[key]!r} is read only by the "
+            f"driver rollout loop and has no effect on the single-controller path, "
+            f"which applies {replacement} instead (reported once)",
+            flush=True,
+        )
+
+
 class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
@@ -1337,9 +1374,9 @@ class AsyncNemoGymRolloutImpl:
         expected_indices = [row["_rowidx"] for row in inputs]
         if len(expected_indices) != len(set(expected_indices)):
             raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
-        # Resolved before any dispatch, as the driver path resolves it before
-        # preparing its rows, so a bad hook path fails at configuration time
-        # instead of after a generated prompt group.
+        # Resolved before this prompt group is dispatched; a path that does not
+        # import was refused when the actor configuration was built on the
+        # driver (_build_gym_actor_config), so this read cannot fail on it.
         hook = await self._resolve_rollout_metrics_hook()
 
         # Run generation and restore input order as results stream back.
@@ -1593,10 +1630,12 @@ class AsyncNemoGymRolloutImpl:
 
         Read from the Gym actor's ``rollout_config`` exactly like the driver
         path, so both paths apply the same configured hook; ``None`` (no hook)
-        is cached the same way.
+        is cached the same way. The same read reports, once per process, any
+        configured setting of that mapping only the driver path applies.
         """
         if self._rollout_metrics_hook is _HOOK_UNRESOLVED:
             env_config = await _nemo_gym_rollout_config(self._task_to_env["nemo_gym"])
+            _warn_driver_only_rollout_settings_once(env_config["nemo_gym"])
             self._rollout_metrics_hook = get_nemo_gym_rollout_metrics_hook(env_config)
         return self._rollout_metrics_hook
 
