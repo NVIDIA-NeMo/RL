@@ -786,6 +786,74 @@ and the step share of $\sum_i |A_i| L_i$ by group pass rate (`share_bucket_le_0.
 `share_bucket_0.25_0.75`, `share_bucket_ge_0.75`), which by construction equals the share before
 reweighting; `share_max_abs_diff` reports the largest difference and should be about 0.
 
+#### Agentic rollouts: per-turn scopes
+
+In a multi-turn agentic rollout the response length $L_i$ counts every turn. A correct answer
+reached in 8 tool calls has more tokens than one reached in 4, even when each turn is just as
+terse, so the default `scope: trajectory` pushes on the number of turns as well as on verbosity.
+Fewer turns often means fewer checks of the work: less reproducing, less re-running tests. The
+per-turn scopes reweight only the model's free text, measured per turn, and leave tool calls and
+the decision to end a turn at their unweighted credit:
+
+```yaml
+grpo:
+  adv_estimator:
+    positive_length_reweight:
+      enabled: true
+      scope: prose_per_turn        # "trajectory" (default) | "thinking_per_turn" | "prose_per_turn"
+      exclude_final_answer: false  # prose_per_turn only
+      turns_counted: with_spans    # "with_spans" | "all"
+```
+
+Every trained assistant token belongs to one class:
+
+- THINKING: from the start of the turn through the closing thinking tag, inclusive, so the
+  decision to stop thinking is reweighted too.
+- ACTION: each tool-call span (`<tool_call>` ... `</tool_call>`, inclusive) and the turn's final
+  end-of-turn token. In the last turn that token is the decision to end the episode.
+- CONTENT: every other token of the turn, i.e. free text before, between or after tool calls,
+  including the final answer.
+
+The measured set $M$ is the thinking tokens (`thinking_per_turn`) or the thinking and content
+tokens (`prose_per_turn`). For each row, $P_i$ is the number of measured trained tokens, $T_i$ the
+number of turns with at least one measured token (`with_spans`) or all trained turns (`all`), and
+$V_i = P_i / T_i$ the free text per turn. The weights are the same as above with $L$ replaced by
+$V$, over the positives with $P_i > 0$. The renormalization uses $\sum A_j P_j$, and only the
+measured tokens of positive rows are scaled. Every action token, every negative row and every
+excluded token keeps its exact advantage, and each group's share of the step is unchanged.
+
+- Turn invariance: a row with twice the turns and twice the text per row gets the same weight
+  as one with half of both.
+- Why `prose_per_turn` is recommended: the measured set and the reweighted set are the same
+  tokens. If only thinking were reweighted, the model could move reasoning from the thinking
+  block into visible text before the tool call and escape the reweighting; with prose, moving
+  text between the two changes nothing.
+- The remaining leak is the tool calls themselves. A tool whose arguments are free text (a
+  "think" or "notes" tool, a free-text schema field) should be counted as prose if one exists.
+- `exclude_final_answer: true` removes the last turn's content from both $M$ and the scaling, for
+  tasks where the answer's length is part of the job (reports, code delivered as text).
+- Turn padding: with $V = P/T$, adding a turn with little text lowers $V$ and raises the weight,
+  so the per-turn measure pushes toward more, terser turns rather than fewer. `with_spans`
+  counts only turns that contain measured text, so a turn that is just a tool call does not dilute
+  $V$; with `all` it does. Watch `net_turn_credit` and the turn counts below.
+
+The per-turn scopes run after the estimator, before message-level penalties and the
+advantage clip, so penalties keep precedence. They need the per-token
+`assistant_turn_id` / `thinking_mask` / `action_mask` columns. On the SingleController
+token-capture path the RolloutReassembler builds them from the sampled token ids. Every run of
+generated tokens is one turn, and the tags must be single tokens of the policy tokenizer, as
+they are for the Nemotron and Qwen chat formats; setup fails otherwise. A thinking turn with no
+closing tag is all thinking, matching the reasoning parser. The legacy GRPO trainers reject the
+per-turn scopes for now.
+
+Additional metrics for the per-turn scopes: `turns_mean_correct` / `turns_mean_incorrect`,
+`thinking_per_turn_mean_correct`, `content_per_turn_mean_correct`,
+`action_tokens_per_turn_mean_correct`, `thinking_share_of_prose_mean_correct` (whether text
+is moving between thinking and content), and
+`net_turn_credit` $= \sum_i A_i T_i / \sum_i |A_i| T_i$ over all trained turns, overall and per
+pass-rate bucket (`net_turn_credit_bucket_*`). It is the net push on the number of turns that
+GRPO itself applies, which the per-turn reweighting leaves unchanged.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 

@@ -40,7 +40,10 @@ import torch
 
 from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
+    PositiveLengthReweightConfig,
     PositiveLengthReweightStats,
+    per_turn_length_reweight_config,
+    reweight_positive_text_per_turn,
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
@@ -105,6 +108,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # grpo.adv_estimator.positive_length_reweight with a per-turn scope (None otherwise): applied
+    # after the estimator, before message penalties and the advantage clip.
+    per_turn_length_reweight: Optional[PositiveLengthReweightConfig] = None
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -151,6 +157,7 @@ class AdvantageStageConfig:
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
+            per_turn_length_reweight=per_turn_length_reweight_config(algo_cfg),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
             # logger is still a TypedDict, so this is the same value the
             # Logger exposes as base_log_dir.
@@ -177,6 +184,14 @@ class AdvantageStageConfig:
                 [
                     adv_cfg.invalid_tool_call_mask_field,
                     adv_cfg.malformed_thinking_mask_field,
+                ]
+            )
+        if self.per_turn_length_reweight is not None:
+            fields.extend(
+                [
+                    adv_cfg.assistant_turn_id_field,
+                    adv_cfg.thinking_mask_field,
+                    adv_cfg.action_mask_field,
                 ]
             )
         if self.policy_logprobs_required:
@@ -471,6 +486,27 @@ class AdvantageComputer:
             advantages = torch.zeros_like(mask)
             if cfg.is_ppo:
                 returns = torch.zeros_like(mask)
+
+        if cfg.per_turn_length_reweight is not None and has_valid_training_tokens:
+            # Per-turn scopes of positive_length_reweight: on the per-row estimator output,
+            # before message penalties overwrite flagged steps and before the clip.
+            advantages, positive_length_reweight_stats = (
+                reweight_positive_text_per_turn(
+                    advantages,
+                    prompt_ids=prompt_ids,
+                    rewards=rewards,
+                    mask=mask,
+                    assistant_turn_id=tensor_field(
+                        data, adv_cfg.assistant_turn_id_field
+                    ),
+                    thinking_mask=tensor_field(data, adv_cfg.thinking_mask_field),
+                    action_mask=tensor_field(data, adv_cfg.action_mask_field),
+                    # The rows the estimator treats as valid (token-capture placeholders and
+                    # mask_sample / overlong / seq-logprob-error rows carry sample mask 0).
+                    valid=final_sample_mask > 0,
+                    config=cfg.per_turn_length_reweight,
+                )
+            )
 
         if cfg.message_level_advantage_penalties_enabled:
             # Sequence-error filtering and the pre-existing sample mask remain

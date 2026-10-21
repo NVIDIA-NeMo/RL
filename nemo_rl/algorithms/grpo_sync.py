@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
+    _raise_if_per_turn_length_reweight,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _validation_early_stop_message,
@@ -540,6 +541,7 @@ def grpo_train_sync(
             "want TransferQueue."
         )
     _raise_if_message_level_advantage_penalties_enabled(master_config)
+    _raise_if_per_turn_length_reweight(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits

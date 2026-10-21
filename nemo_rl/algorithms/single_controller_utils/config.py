@@ -30,6 +30,7 @@ from pydantic import (
 )
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import per_turn_length_reweight_config
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
@@ -48,8 +49,11 @@ from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
+    ACTION_MASK,
+    ASSISTANT_TURN_ID,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
+    THINKING_MASK,
 )
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
@@ -1533,6 +1537,24 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "(env.should_use_nemo_gym=true) on SingleController."
         )
 
+    # positive_length_reweight per-turn scopes: the RolloutReassembler builds their
+    # assistant_turn_id / thinking_mask / action_mask columns from the captured tokens, so
+    # they need NeMo-Gym rollouts with token capture.
+    per_turn_reweight = per_turn_length_reweight_config(algo_cfg)
+    if per_turn_reweight is not None:
+        if not should_use_nemo_gym(master_config):
+            raise ValueError(
+                "grpo.adv_estimator.positive_length_reweight.scope="
+                f"{per_turn_reweight.scope!r} requires the NeMo-Gym rollout path "
+                "(env.should_use_nemo_gym=true) on SingleController."
+            )
+        if not master_config.token_capture.enabled:
+            raise NotImplementedError(
+                "grpo.adv_estimator.positive_length_reweight.scope="
+                f"{per_turn_reweight.scope!r} reads the per-turn token-class columns, which "
+                "only the token-capture path builds (token_capture.enabled=true)."
+            )
+
     opd_enabled = opd_module.is_opd_enabled(master_config)
     if opd_enabled and is_ppo_run(master_config):
         raise ValueError(
@@ -1637,6 +1659,10 @@ class AdvantageConfig:
     sample_mask_field: str = "sample_mask"
     invalid_tool_call_mask_field: str = INVALID_TOOL_CALL_MASK
     malformed_thinking_mask_field: str = MALFORMED_THINKING_MASK
+    # positive_length_reweight per-turn scopes (built by the RolloutReassembler).
+    assistant_turn_id_field: str = ASSISTANT_TURN_ID
+    thinking_mask_field: str = THINKING_MASK
+    action_mask_field: str = ACTION_MASK
     mask_sample_field: str = "mask_sample"
     truncated_field: str = "truncated"
     repeated_batch_fields: list[str] = field(default_factory=list)

@@ -37,6 +37,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import per_turn_length_reweight_config
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -2043,6 +2044,16 @@ def setup_single_controller(
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
+                ),
+                # Per-turn token-class columns for positive_length_reweight's per-turn scopes.
+                turn_text_tokenizer=(
+                    policy_config["tokenizer"]["name"]
+                    if per_turn_length_reweight_config(algo_cfg) is not None
+                    else None
+                ),
+                require_thinking_tags=(
+                    getattr(per_turn_length_reweight_config(algo_cfg), "scope", None)
+                    == "thinking_per_turn"
                 ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,

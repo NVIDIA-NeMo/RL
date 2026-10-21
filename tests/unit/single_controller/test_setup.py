@@ -766,6 +766,40 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    @pytest.mark.parametrize("scope", ["thinking_per_turn", "prose_per_turn"])
+    def test_per_turn_length_reweight_validates_with_token_capture(self, patched_factories, scope):
+        from nemo_rl.algorithms.advantage_estimator import PositiveLengthReweightConfig
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            validate_single_controller_config,
+        )
+
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.policy["generation"].setdefault("vllm_cfg", {}).update(async_engine=True, expose_http_server=True)  # NeMo-Gym requires both
+        mc.grpo.adv_estimator.positive_length_reweight = PositiveLengthReweightConfig(
+            enabled=True, scope=scope
+        )
+        validate_single_controller_config(mc)
+
+        # Without token capture the columns are never built: fail at setup, not mid-step.
+        mc.token_capture.enabled = False
+        with pytest.raises(NotImplementedError, match="token-capture"):
+            validate_single_controller_config(mc)
+
+    def test_per_turn_length_reweight_requires_nemo_gym(self, patched_factories):
+        from nemo_rl.algorithms.advantage_estimator import PositiveLengthReweightConfig
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            validate_single_controller_config,
+        )
+
+        mc = _make_master_config()
+        mc.token_capture.enabled = True
+        mc.grpo.adv_estimator.positive_length_reweight = PositiveLengthReweightConfig(
+            enabled=True, scope="prose_per_turn"
+        )
+        with pytest.raises(ValueError, match="NeMo-Gym"):
+            validate_single_controller_config(mc)
+
     def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
         mc = _make_master_config()
         mc.env["should_use_nemo_gym"] = True

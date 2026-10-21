@@ -57,6 +57,15 @@ META_IDX = "meta_idx"
 INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
 MALFORMED_THINKING_MASK = "malformed_thinking_mask"
 
+# Token-aligned per-turn token classes for the per-turn scopes of
+# grpo.adv_estimator.positive_length_reweight (experience/turn_text.turn_text_columns):
+# the 0-based assistant turn of each generated token (-1 elsewhere) and its THINKING / ACTION
+# class (CONTENT = in a turn and neither).
+ASSISTANT_TURN_ID = "assistant_turn_id"
+THINKING_MASK = "thinking_mask"
+ACTION_MASK = "action_mask"
+TURN_TEXT_FIELDS = (ASSISTANT_TURN_ID, THINKING_MASK, ACTION_MASK)
+
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
