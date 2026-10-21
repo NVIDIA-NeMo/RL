@@ -1059,11 +1059,7 @@ class TestProcessMicrobatch:
         from nemo_rl.models.megatron.data import process_microbatch
 
         input_ids = torch.arange(8).unsqueeze(0)
-        position_ids = torch.arange(8).unsqueeze(0)
-        mtp_loss_mask = torch.ones(1, 8)
-        cp_input_ids = torch.tensor([[4, 5, 2, 3]])
-        cp_position_ids = torch.tensor([[4, 5, 2, 3]])
-        cp_mtp_loss_mask = torch.ones(1, 4)
+        mtp_loss_mask = torch.arange(200, 208).unsqueeze(0)
 
         with (
             patch(
@@ -1074,14 +1070,6 @@ class TestProcessMicrobatch:
                 "nemo_rl.models.megatron.data.get_context_parallel_rank",
                 return_value=1,
             ),
-            patch(
-                "nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids",
-                return_value=(torch.ones(1, 1, 8, 8), None, position_ids),
-            ),
-            patch(
-                "nemo_rl.models.megatron.data._get_tokens_on_this_cp_rank",
-                side_effect=[cp_input_ids, cp_position_ids, cp_mtp_loss_mask],
-            ) as mock_shard,
         ):
             result = process_microbatch(
                 {"input_ids": input_ids, "mtp_loss_mask": mtp_loss_mask},
@@ -1089,14 +1077,11 @@ class TestProcessMicrobatch:
                 straggler_timer=MagicMock(),
             )
 
-        assert torch.equal(result.input_ids_cp_sharded, cp_input_ids)
-        assert torch.equal(result.position_ids, cp_position_ids)
-        assert torch.equal(result.mtp_loss_mask, cp_mtp_loss_mask)
+        # CP rank 1 of 2 owns load-balanced chunks 1 and 2 of 4.
+        assert result.input_ids_cp_sharded.tolist() == [[2, 3, 4, 5]]
+        assert result.position_ids.tolist() == [[2, 3, 4, 5]]
+        assert result.mtp_loss_mask.tolist() == [[202, 203, 204, 205]]
         assert result.attention_mask is None
-        assert mock_shard.call_count == 3
-        assert mock_shard.call_args_list[0].args[0] is input_ids
-        assert mock_shard.call_args_list[1].args[0] is position_ids
-        assert mock_shard.call_args_list[2].args[0] is mtp_loss_mask
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):

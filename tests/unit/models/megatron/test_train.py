@@ -333,6 +333,7 @@ class TestModelForward:
         from nemo_rl.models.megatron.train import model_forward
 
         mock_model = MagicMock(return_value=torch.randn(1, 6, 8))
+        mock_model.config = SimpleNamespace(sequence_parallel=False)
         mock_data_dict = MagicMock()
         mock_data_dict.get_multimodal_dict.return_value = {}
         padding_mask = torch.tensor(

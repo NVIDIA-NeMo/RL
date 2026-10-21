@@ -2220,6 +2220,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
         torch.testing.assert_close(idx, expected_idx)
 
 
+@pytest.mark.automodel
 class TestFullLogitsPostProcessorSeqPacking:
     def test_restores_one_dense_row_per_logical_sample(self):
         processor = FullLogitsPostProcessor(

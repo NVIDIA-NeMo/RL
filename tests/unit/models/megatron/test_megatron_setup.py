@@ -202,9 +202,11 @@ class TestValidateModelPaths:
         assert pretrained_path == f"{tmp_path}/meta-llama/Llama-3.2-1B"
         assert pt_checkpoint_exists is False
 
-    def test_megatron_fsdp_uses_local_hf_snapshot(self):
+    def test_megatron_fsdp_uses_local_hf_snapshot(self, monkeypatch):
         """Megatron-FSDP initializes from HF instead of a torch_dist cache."""
         from nemo_rl.models.megatron.setup import validate_model_paths
+
+        monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
 
         config = {
             "model_name": "meta-llama/Llama-3.1-8B",
