@@ -2132,6 +2132,11 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        # Set by the resolver only when the think-tag penalty is on.
+        thinking_tags = None
+        if master_config.reward_penalties.penalize_malformed_think_tag:
+            assert resolved_reward_penalty_config is not None
+            thinking_tags = resolved_reward_penalty_config["thinking_tags"]
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2152,10 +2157,7 @@ def setup_single_controller(
                     if master_config.reward_penalties.penalize_malformed_think_tag
                     else None
                 ),
-                # Set by the resolver only when the think-tag penalty is on.
-                thinking_tags=(resolved_reward_penalty_config or {}).get(
-                    "thinking_tags"
-                ),
+                thinking_tags=thinking_tags,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
