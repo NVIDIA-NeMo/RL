@@ -95,6 +95,47 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
     assert generation["stop_token_ids"] is None
 
 
+@pytest.mark.parametrize(
+    "gym_kwargs_location",
+    [{}, {"extra_body": {}}],
+    ids=["vllm_model", "extra_body"],
+)
+def test_dynamo_policy_template_kwargs_sit_under_gyms(
+    gym_kwargs_location: dict,
+) -> None:
+    """The policy's template kwargs are a baseline; the kwargs Gym sends win per key."""
+    # gym_kwargs_location is Gym's vllm_model config; its kwargs live on it or in extra_body.
+    kwargs_owner = gym_kwargs_location.get("extra_body", gym_kwargs_location)
+    kwargs_owner["chat_template_kwargs"] = {"enable_thinking": True}
+    config = SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "dynamo",
+                "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+                "stop_strings": None,
+                "stop_token_ids": None,
+            },
+            "tokenizer": {
+                "chat_template_kwargs": {"enable_thinking": False, "effort": "low"}
+            },
+        },
+        env={
+            "nemo_gym": {
+                "policy_model": {
+                    "responses_api_models": {"vllm_model": gym_kwargs_location}
+                }
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert gym_kwargs_location["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "effort": "low",
+    }
+
+
 def test_setup_nemo_gym_config_rejects_unsupported_backend() -> None:
     config = SimpleNamespace(policy={"generation": {"backend": "unsupported"}})
 

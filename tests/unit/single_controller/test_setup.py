@@ -21,6 +21,7 @@ import dataclasses
 import json
 import threading
 import warnings
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -382,6 +383,18 @@ def test_build_generation_constructs_dynamo_from_normalized_config():
     )
     assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
     generation.finish_generation.assert_called_once_with()
+
+
+def test_failed_dynamo_build_fails_the_waiting_gym_spinup():
+    """Gym waits on the frontend URL, so a failed build must fail it, not hang it."""
+    base_urls = Future()
+    build = MagicMock(side_effect=RuntimeError("engines failed to start"))
+
+    with pytest.raises(RuntimeError, match="engines failed to start"):
+        sc_setup_mod._build_then_publish_base_urls(build, base_urls)
+    # timeout=0: a future left pending raises TimeoutError here instead of hanging.
+    with pytest.raises(RuntimeError, match="engines failed to start"):
+        base_urls.result(timeout=0)
 
 
 def test_build_generation_rejects_deferred_dynamo_load():

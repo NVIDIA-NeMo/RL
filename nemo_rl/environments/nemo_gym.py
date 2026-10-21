@@ -1910,7 +1910,12 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         vllm_model["dynamo_frontend"] = True
         chat_template_kwargs = config.policy["tokenizer"].get("chat_template_kwargs")
         if chat_template_kwargs:
-            vllm_model.setdefault("chat_template_kwargs", dict(chat_template_kwargs))
+            # A baseline under the kwargs Gym sends (vllm_model's, else
+            # extra_body's), which win per key.
+            gym_kwargs = vllm_model.get("chat_template_kwargs") or (
+                (vllm_model.get("extra_body") or {}).get("chat_template_kwargs") or {}
+            )
+            vllm_model["chat_template_kwargs"] = {**chat_template_kwargs, **gym_kwargs}
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

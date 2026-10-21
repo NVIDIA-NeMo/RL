@@ -78,10 +78,12 @@ def derive_prefix_eos_count(
     counting EOS in ``template_prefix_token_ids``. Every EOS in the prefix
     closed one message, and a template closes the final assistant turn with one
     EOS even when the model was truncated before emitting it. The two counts
-    agree whenever the history up to the prefix's last assistant turn is the
-    history the prefix was generated from, which Gym's lineage admission
-    verifies before it supplies a prefix. If they ever disagree, the splice
-    fails rather than cutting at a wrong boundary.
+    agree when the history up to the prefix's last assistant turn is the
+    history the prefix was generated from (Gym's lineage admission checks this
+    for captured calls; without capture it is assumed, as on the native server)
+    and the model emitted no EOS text as ordinary tokens. A render with fewer
+    EOS than this count fails the splice; an extra EOS before the boundary cuts
+    early instead.
     """
     eos_token_ids = _eos_token_id_set(eos_token_id)
     count = sum(tid in eos_token_ids for tid in model_prefix_token_ids)

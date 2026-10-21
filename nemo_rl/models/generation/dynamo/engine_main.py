@@ -32,6 +32,8 @@ any of them.
 
 import inspect
 import os
+from collections.abc import AsyncIterator
+from typing import Any
 
 # As dynamo.vllm's own entry point: a fixed hash seed for engine subprocesses.
 if "PYTHONHASHSEED" not in os.environ:
@@ -39,6 +41,8 @@ if "PYTHONHASHSEED" not in os.environ:
 
 
 def _check_dynamo_seams() -> None:
+    # Deferred: dynamo.vllm imports vLLM, which must not load before main() holds
+    # restore standby.
     from dynamo.vllm import main as dynamo_main
     from dynamo.vllm import worker_factory
 
@@ -68,6 +72,8 @@ def _check_dynamo_seams() -> None:
 
 def _install_engine_host() -> None:
     """Rebind dynamo.vllm's handler, worker factory, and token-budget publisher."""
+    # Deferred: dynamo.vllm imports vLLM, which must not load before main() holds
+    # restore standby.
     from dynamo.common.token_budget import TokenBudget, publish_token_budget
     from dynamo.llm.exceptions import HttpError
     from dynamo.vllm import main as dynamo_main
@@ -88,7 +94,7 @@ def _install_engine_host() -> None:
     ):
         """Dynamo's decode handler with NeMo RL's per-request hooks."""
 
-        def __init__(self, *args, **kwargs) -> None:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             if self.model_max_len is None:
                 raise RuntimeError("NeMo RL's Dynamo engine host needs max_model_len")
@@ -98,7 +104,9 @@ def _install_engine_host() -> None:
                 sampling_profile=os.environ[SAMPLING_PROFILE_ENV],
             )
 
-        async def generate(self, request, context):
+        async def generate(
+            self, request: dict[str, Any], context: Any
+        ) -> AsyncIterator[dict[str, Any]]:
             try:
                 async for chunk in self._nemo_rl_generate(
                     request, context, super().generate
@@ -113,7 +121,11 @@ def _install_engine_host() -> None:
 
     class NemoRLWorkerFactory(worker_factory.WorkerFactory):
         def register_engine_routes(
-            self, runtime, generate_endpoint, handler, lora_enabled=False
+            self,
+            runtime: Any,
+            generate_endpoint: Any,
+            handler: Any,
+            lora_enabled: bool = False,
         ) -> None:
             super().register_engine_routes(
                 runtime, generate_endpoint, handler, lora_enabled=lora_enabled
@@ -127,7 +139,9 @@ def _install_engine_host() -> None:
                     handler.nrl_set_rollout_weight_version,
                 )
 
-    def publish_engine_owned_token_budget(runtime_config, max_model_len) -> None:
+    def publish_engine_owned_token_budget(
+        runtime_config: Any, max_model_len: int | None
+    ) -> None:
         if max_model_len is None:
             return
         publish_token_budget(
@@ -152,6 +166,7 @@ def main() -> None:
     maybe_run_restore_standby_mode()
     _install_engine_host()
 
+    # Deferred until standby is held, as above.
     from dynamo.vllm.main import main as dynamo_vllm_main
 
     dynamo_vllm_main()

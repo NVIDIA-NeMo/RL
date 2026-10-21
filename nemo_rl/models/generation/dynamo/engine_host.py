@@ -33,6 +33,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import ray
 
 from nemo_rl.models.generation.openai_server_utils import (
@@ -51,6 +52,9 @@ LOGGER = logging.getLogger(__name__)
 # dynamo_frontend). Dynamo forwards nvext.annotations to the engine verbatim.
 ROLLOUT_ANNOTATION = "nemo_gym:rollout"
 CAPTURE_ANNOTATION_PREFIX = "ng_capture:"
+# Without capture: the last echoed assistant turn's prompt + generation token
+# ids, which the native server reads from the messages instead.
+PREFIX_ANNOTATION_PREFIX = "ng_prefix:"
 
 # Engine routes, served at {system_url}/engine/<name>.
 SETUP_TOKEN_CAPTURE_ROUTE = "nrl_setup_token_capture"
@@ -84,6 +88,11 @@ def sampling_profile_env(generation_config: Mapping[str, Any]) -> str:
     return json.dumps({key: generation_config[key] for key in _SAMPLING_PROFILE_KEYS})
 
 
+def _as_f32(value: float | None) -> float | None:
+    """Dynamo's frontend carries sampling floats as f32."""
+    return None if value is None else float(np.float32(value))
+
+
 def _annotation_value(annotations: list[str], prefix: str) -> str | None:
     for annotation in annotations:
         if annotation.startswith(prefix):
@@ -95,9 +104,10 @@ class NemoRLEngineHostMixin(TokenCaptureHostMixin):
     """NeMo-Gym rollout handling for a ``dynamo.vllm`` decode handler.
 
     Requests without NeMo Gym's annotations pass through untouched. Rollout
-    requests get the native server's checks and output clamp; captured
-    requests additionally splice their staged prefix, stage the finished call
-    to TransferQueue from this process, and return only commit coordinates.
+    requests get the native server's checks, prefix splice and output clamp;
+    captured requests splice their staged prefix instead, stage the finished
+    call to TransferQueue from this process, and return only commit
+    coordinates.
     """
 
     _nrl_max_model_len: int
@@ -112,7 +122,9 @@ class NemoRLEngineHostMixin(TokenCaptureHostMixin):
         self._init_token_capture_host()
         self._nrl_max_model_len = max_model_len
         self._nrl_eos_token_id = eos_token_id
-        self._nrl_sampling_profile = json.loads(sampling_profile)
+        self._nrl_sampling_profile = {
+            key: _as_f32(value) for key, value in json.loads(sampling_profile).items()
+        }
         # Data-plane reads and writes block; the engine serves every stream from
         # one event loop, so they run here instead.
         self._nrl_executor = ThreadPoolExecutor(thread_name_prefix="nrl-capture")
@@ -157,14 +169,19 @@ class NemoRLEngineHostMixin(TokenCaptureHostMixin):
                 "chunk that carries the generated token ids.",
             )
         sampling_options: dict[str, Any] = request.get("sampling_options") or {}
+        # Compared at f32 on both sides: the frontend delivers 0.7 as 0.69999998.
         error = off_policy_sampling_error(
-            temperature=sampling_options.get("temperature"),
-            top_p=sampling_options.get("top_p"),
+            temperature=_as_f32(sampling_options.get("temperature")),
+            top_p=_as_f32(sampling_options.get("top_p")),
             top_k=sampling_options.get("top_k"),
             generation_config=self._nrl_sampling_profile,
         )
         if error is not None:
             raise EngineRequestError(400, error)
+        # As the native server does: Gym requests are not token-in, so Dynamo
+        # would otherwise fill an unset top_k from generation_config.json.
+        sampling_options["top_k"] = -1
+        request["sampling_options"] = sampling_options
 
     def _clamp_max_tokens(self, request: dict[str, Any], prompt_len: int) -> None:
         """Cap output so prompt + output fit max_model_len, as the native server does."""
@@ -201,12 +218,18 @@ class NemoRLEngineHostMixin(TokenCaptureHostMixin):
             admission = parse_capture_admission(json.loads(capture_context))
         token_ids = list(request["token_ids"])
         prefix_token_ids = None
-        if admission is not None and admission.mode == "token_in":
-            prefix_token_ids = await self._run_off_loop(
-                self._resolve_admission_prefix, admission
-            )
+        if admission is not None:
+            if admission.mode == "token_in":
+                prefix_token_ids = await self._run_off_loop(
+                    self._resolve_admission_prefix, admission
+                )
+        elif (
+            echoed := _annotation_value(annotations, PREFIX_ANNOTATION_PREFIX)
+        ) is not None:
+            prefix_token_ids = json.loads(echoed)
+        if prefix_token_ids is not None:
             # The frontend rendered the full conversation; replace the history
-            # with the exact tokens staged for it.
+            # with the exact tokens the model generated for it.
             token_ids = splice_prefix_tokens(
                 tokenizer=None,
                 model_prefix_token_ids=prefix_token_ids,

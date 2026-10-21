@@ -19,6 +19,7 @@ import asyncio
 import json
 from typing import Any
 
+import numpy as np
 import pytest
 
 pytest.importorskip("nemo_gym")
@@ -36,6 +37,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import StagedPrefix  # noqa: E402
 from nemo_rl.models.generation.dynamo.engine_host import (  # noqa: E402
     CAPTURE_ANNOTATION_PREFIX,
+    PREFIX_ANNOTATION_PREFIX,
     ROLLOUT_ANNOTATION,
     EngineRequestError,
     NemoRLEngineHostMixin,
@@ -43,7 +45,12 @@ from nemo_rl.models.generation.dynamo.engine_host import (  # noqa: E402
 
 _EOS = 2
 _MAX_MODEL_LEN = 16
-_SAMPLING = {"temperature": 1.0, "top_p": 1.0}
+_PROFILE = {"temperature": 0.7, "top_p": 0.95, "val_temperature": 0.6, "val_top_p": 1.0}
+# As Dynamo's frontend delivers the profile's sampling: in f32.
+_SAMPLING = {
+    "temperature": float(np.float32(0.7)),
+    "top_p": float(np.float32(0.95)),
+}
 
 
 class _MemorySink:
@@ -68,9 +75,7 @@ class _Host(NemoRLEngineHostMixin):
         self._init_nemo_rl_engine_host(
             max_model_len=_MAX_MODEL_LEN,
             eos_token_id=_EOS,
-            sampling_profile=json.dumps(
-                {**_SAMPLING, "val_temperature": 0.6, "val_top_p": 0.95}
-            ),
+            sampling_profile=json.dumps(_PROFILE),
         )
         self.token_capture = RolloutTokenCapture(
             sink=sink,
@@ -155,8 +160,9 @@ def _run(host: _Host, request: dict, generate: Any, context: _Context) -> list[d
             [5, 6, 8, _EOS],
             id="text-root",
         ),
-        # The frontend re-rendered the first turn's output as [9]; the engine runs
-        # the staged tokens [5, 6, EOS] and stages only the new suffix.
+        # The frontend re-rendered the first turn's output [6] as [9, 9], so the
+        # boundary sits at the EOS, not at the staged prefix's length. The engine
+        # runs the staged tokens [5, 6, EOS] and stages only the new suffix.
         pytest.param(
             {
                 "rollout_id": "r0",
@@ -167,7 +173,7 @@ def _run(host: _Host, request: dict, generate: Any, context: _Context) -> list[d
                 "staging_chain": ["r0/c1"],
                 "parent_chain_hash": "1" * 64,
             },
-            [5, 9, _EOS, 11, 12],
+            [5, 9, 9, _EOS, 11, 12],
             "stop",
             [5, 6, _EOS, 11, 12],
             [11, 12, 8, _EOS],
@@ -219,32 +225,50 @@ def test_captured_call_stages_from_the_engine_and_returns_only_coords(
 
 
 @pytest.mark.parametrize(
-    ("request_overrides", "annotated", "expected"),
+    ("request_overrides", "annotated", "expected", "engine_prompt"),
     [
-        pytest.param({}, False, "untouched", id="non-gym-passthrough"),
-        pytest.param({}, True, "clamped", id="rollout-clamped"),
+        pytest.param({}, False, "untouched", [5, 6], id="non-gym-passthrough"),
+        pytest.param({}, True, "clamped", [5, 6], id="rollout-clamped"),
+        # Without capture, the last echoed turn's tokens replace the frontend's
+        # re-render of it, as the native server's required_prefix_token_ids does.
+        pytest.param(
+            {
+                "token_ids": [5, 9, 9, _EOS, 11, 12],
+                "annotations": [
+                    ROLLOUT_ANNOTATION,
+                    f"{PREFIX_ANNOTATION_PREFIX}[5,6,{_EOS}]",
+                ],
+            },
+            True,
+            "clamped",
+            [5, 6, _EOS, 11, 12],
+            id="echoed-prefix-spliced",
+        ),
         pytest.param(
             {"token_ids": list(range(_MAX_MODEL_LEN))},
             True,
             "maximum context length",
+            None,
             id="overflow",
         ),
         pytest.param(
             {"sampling_options": {**_SAMPLING, "top_k": 5}},
             True,
             "Top k",
+            None,
             id="off-policy",
         ),
         pytest.param(
             {"stop_conditions": {"max_tokens": 100, "stop": ["\n"]}},
             True,
             "stop strings",
+            None,
             id="stop-strings",
         ),
     ],
 )
 def test_rollout_requests_get_native_checks_and_clamp(
-    request_overrides, annotated, expected
+    request_overrides, annotated, expected, engine_prompt
 ) -> None:
     host = _Host(_MemorySink())
     request = _request([5, 6], admission=None)
@@ -255,7 +279,7 @@ def test_rollout_requests_get_native_checks_and_clamp(
     seen: list[dict] = []
     generate, yielded = _generate(seen)
 
-    if expected not in ("untouched", "clamped"):
+    if engine_prompt is None:
         with pytest.raises(EngineRequestError, match=expected) as error:
             _run(host, request, generate, _Context())
         assert error.value.status_code == 400
@@ -263,8 +287,16 @@ def test_rollout_requests_get_native_checks_and_clamp(
         return
     chunks = _run(host, request, generate, _Context())
     assert chunks == yielded  # without capture, engine_data reaches the client
-    assert seen[0]["stop_conditions"]["max_tokens"] == (
-        100 if expected == "untouched" else _MAX_MODEL_LEN - 2
-    )
-    assert "output_options" not in seen[0]
+    [engine_request] = seen
+    assert engine_request["token_ids"] == engine_prompt
+    if expected == "untouched":
+        assert engine_request["stop_conditions"]["max_tokens"] == 100
+        assert engine_request["sampling_options"] == {"temperature": 0.0, "top_k": 1}
+    else:
+        assert engine_request["stop_conditions"]["max_tokens"] == (
+            _MAX_MODEL_LEN - len(engine_prompt)
+        )
+        # As the native server: Dynamo must not fill top_k from generation_config.json.
+        assert engine_request["sampling_options"]["top_k"] == -1
+    assert "output_options" not in engine_request
     assert chunks[-1]["engine_data"]["completion_token_ids"] == [8, _EOS]
