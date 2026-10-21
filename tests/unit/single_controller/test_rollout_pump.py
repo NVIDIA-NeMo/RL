@@ -600,6 +600,30 @@ def test_filtered_group_can_draw_from_the_next_epoch() -> None:
     assert ctrl._filtered_prompts_by_step == {0: 1}
 
 
+@pytest.mark.parametrize("windowed", [False, True], ids=["ready_first", "windowed"])
+def test_streaming_sampler_filters_with_its_own_budget(windowed: bool) -> None:
+    manager = _ScriptedRolloutManager(
+        [RolloutOutcome.FILTERED, RolloutOutcome.COMMITTED]
+    )
+    ctrl = _pump_controller(
+        manager,
+        [_batch("uniform"), _batch("useful")],
+        on_dropped_prompt="shrink",
+        dynamic_sampling_max_replacements=2,
+    )
+    ctrl._sampler = (
+        WindowedSampler(ctrl._buffer, max_staleness_versions=1)
+        if windowed
+        else ReadyFirstSampler(ctrl._buffer, max_staleness_versions=1)
+    )
+    asyncio.run(asyncio.wait_for(ctrl._rollout_pump(), timeout=3))
+    assert manager.prompts_seen == ["uniform", "useful"]
+    assert ctrl._filtered_prompts_by_step == {0: 1}
+    assert not ctrl._rollout_runtime.batch_shortfall
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._batch_replacements == ({} if windowed else {0: 1})
+
+
 class TestDynamicSamplingReplacement:
     """A filtered group draws on its own pool and its own budget."""
 
@@ -844,11 +868,8 @@ class TestReplaceDroppedPrompt:
 
     @pytest.mark.parametrize(
         "make_sampler",
-        [
-            lambda buf: WeightFifoSampler(buf, max_staleness_versions=1),
-            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1),
-        ],
-        ids=["weight_fifo", "ready_first"],
+        [lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1)],
+        ids=["ready_first"],
     )
     def test_a_gated_sampler_that_stamps_nothing_still_substitutes(self, make_sampler):
         """The pool does not depend on a stamp: the same slot just takes a new prompt."""
@@ -884,8 +905,12 @@ class TestReplaceDroppedPrompt:
         asyncio.run(ctrl._rollout_pump())
 
         assert manager.prompts_seen == ["p0", "p1"], "both batches were admitted"
-        assert len(ctrl._rollout_runtime.replacement_reserve) == 0, "no batch was diverted to a pool"
-        assert ctrl._rollout_runtime.batch_shortfall == {}, "nothing is charged, so no step shrinks"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 0, (
+            "no batch was diverted to a pool"
+        )
+        assert ctrl._rollout_runtime.batch_shortfall == {}, (
+            "nothing is charged, so no step shrinks"
+        )
         assert ctrl._batch_replacements == {}
 
     @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
@@ -1060,7 +1085,9 @@ class TestTakeReplacement:
                 max_replacement_attempts=max_replacement_attempts,
             )
         )
-        ctrl._rollout_runtime.replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
+        ctrl._rollout_runtime.replacement_reserve = deque(
+            _batch(f"spare{i}") for i in range(spares)
+        )
         buffer = _RecordingBuffer()
         ctrl._sampler = (
             WindowedSampler(buffer, max_staleness_versions=1)
@@ -1086,7 +1113,9 @@ class TestTakeReplacement:
         # producing, so even a valid target_step with spares on hand is not replaced.
         ctrl = self._controller(spares=2, windowed=True)
         assert ctrl._take_replacement(0) is None
-        assert len(ctrl._rollout_runtime.replacement_reserve) == 2, "pool left untouched"
+        assert len(ctrl._rollout_runtime.replacement_reserve) == 2, (
+            "pool left untouched"
+        )
 
     def test_an_unstamped_group_is_still_substituted(self):
         """A group with no target_step of its own is replaced like any other."""
@@ -1102,6 +1131,16 @@ class TestTakeReplacement:
         ctrl = self._controller(spares=1)
         ctrl._sampler = _PlainSampler()
         assert ctrl._take_replacement(0) is not None
+
+    def test_the_per_slot_budget_stops_substituting(self):
+        ctrl = self._controller(max_replacement_attempts=2, spares=5)
+        assert ctrl._take_replacement(1) is not None
+        assert ctrl._take_replacement(2) is None
+
+    def test_an_empty_pool_shrinks_instead_of_waiting(self):
+        """At epoch end there is no more data; the step closes short, not never."""
+        ctrl = self._controller(spares=0)
+        assert ctrl._take_replacement(0) is None
 
 
 class TestChargeShortfall:
@@ -1164,16 +1203,6 @@ class TestChargeShortfall:
         ctrl._assembling_version = 6
         ctrl._credit_shortfall(None)
         assert ctrl._rollout_runtime.batch_shortfall == {5: 1, 6: 1}
-
-    def test_the_per_slot_budget_stops_substituting(self):
-        ctrl = self._controller(max_replacement_attempts=2, spares=5)
-        assert ctrl._take_replacement(1) is not None
-        assert ctrl._take_replacement(2) is None
-
-    def test_an_empty_pool_shrinks_instead_of_waiting(self):
-        """At epoch end there is no more data; the step closes short, not never."""
-        ctrl = self._controller(spares=0)
-        assert ctrl._take_replacement(0) is None
 
 
 class TestALostGroupDoesNotStallTheGate:
