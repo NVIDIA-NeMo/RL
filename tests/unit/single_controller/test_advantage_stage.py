@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import math
 from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
@@ -64,6 +65,7 @@ def _config(**overrides) -> AdvantageStageConfig:
         policy_logprobs_required=False,
         reference_logprobs_required=False,
         teacher_logprobs_required=False,
+        opd_full_enabled=False,
         message_level_advantage_penalties_enabled=False,
         shardable=True,
         train_data_dump_dir=None,
@@ -588,6 +590,8 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
+    opd_full_enabled: bool = False,
+    seq_logprob_error_threshold: float | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -598,7 +602,7 @@ def _controller(
     algo = GRPOConfig(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
-        seq_logprob_error_threshold=None,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -616,6 +620,7 @@ def _controller(
         policy_logprobs_required=is_opd,
         reference_logprobs_required=False,
         teacher_logprobs_required=is_opd,
+        opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
         train_data_dump_dir=dump_dir,
@@ -698,6 +703,54 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
+
+
+@pytest.mark.parametrize("full_vocab", [False, True])
+@pytest.mark.parametrize("tokenless_sample", [False, True])
+def test_opd_normalization_gap_and_tokenless_rows_match_across_shards(
+    full_vocab: bool, tokenless_sample: bool
+) -> None:
+    results = []
+    total_rows = NUM_GROUPS * GROUP_SIZE
+    for num_actors in (0, 3):
+        rows = _rows()
+        for row in rows.values():
+            row["generation_logprobs"] = row["prev_logprobs"] + math.log(2.5)
+        if tokenless_sample:
+            rows["s0"]["token_mask"][1:] = 0
+        store = _RowStore(rows)
+        ctrl = _controller(
+            "opd",
+            num_actors,
+            store,
+            opd_full_enabled=full_vocab,
+            seq_logprob_error_threshold=2.0,
+        )
+        _, has_valid = asyncio.run(ctrl._advantage_stage(_pool_meta()))
+        masks = torch.stack(
+            [store.rows[f"s{i}"]["sample_mask"] for i in range(total_rows)]
+        )
+        advantages = torch.stack(
+            [store.rows[f"s{i}"]["advantages"] for i in range(total_rows)]
+        )
+        metrics = reduce_advantage_pump_metrics(
+            **ctrl._step_log_dict, sequence_lengths=[]
+        )
+        expected_rows = total_rows - int(tokenless_sample) if full_vocab else 0
+        assert has_valid == full_vocab
+        assert masks.sum() == expected_rows
+        assert ctrl._opd_stat_count == expected_rows * SEQ
+        if full_vocab:
+            assert metrics["max_seq_mult_prob_error"] == pytest.approx(2.5)
+            assert metrics["num_masked_seqs_by_logprob_error"] == 0
+        results.append(
+            (masks, advantages, metrics, ctrl._opd_stat_sum, ctrl._opd_gap_sum)
+        )
+    for local, sharded in zip(*results):
+        if isinstance(local, torch.Tensor):
+            torch.testing.assert_close(local, sharded)
+        else:
+            assert local == pytest.approx(sharded)
 
 
 @pytest.mark.parametrize("num_actors", [0, 3])
