@@ -292,6 +292,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         pass
 

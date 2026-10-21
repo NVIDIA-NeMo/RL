@@ -512,6 +512,12 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
+    if loss_fn.has_adaptive_loss_state():
+        raise ValueError(
+            "loss_fn.truncated_importance_sampling_type='adaptive-ppo-clip' needs "
+            "a trainer that advances its entropy controller; use GRPO or the "
+            "single controller instead of the legacy PPO trainer."
+        )
     value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
 
     # Validate force_on_policy_ratio
