@@ -740,6 +740,26 @@ class NixlStorageManager(KVStorageManager):
         # so owning a private context is correct on both.
         super().__init__(controller_info, cfg)
 
+    async def put_data(self, data, metadata, data_parser=None) -> None:
+        """Put, then release the blobs the written keys used to point at.
+
+        TQ replaces a key's meta without telling the backend, so an overwritten
+        key's old blob would leak. The old meta is read before the put, which
+        overwrites it in ``metadata``. Like TQ's other backends this is a plain
+        replace: a lost notify ACK or two writers on one key are not guarded.
+        """
+        old = [
+            m[f]
+            for m in metadata._custom_backend_meta or []
+            for f in data.keys()
+            if m.get(f)
+        ]
+        await super().put_data(data, metadata, data_parser)
+        if old:
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.storage_client.clear, [], old
+            )
+
     # TQ calls these from its client event loop (sync wrappers block on them);
     # the work is Ray RPCs plus file I/O, so run it off the loop.
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
