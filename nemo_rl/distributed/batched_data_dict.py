@@ -866,7 +866,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 for shard_indice in range(shard_size):
                     # use the max seqlen of all shards to calculate the total number of tokens in the mb
                     # this ensures each DP rank has the same batch size each iteration which is
-                    # required for FSDP2 and megatron policies.
+                    # required for Automodel and megatron policies.
                     max_seqlen_this_shard_indice = 0
                     chunk_start = chunk_idx * shard_size
                     chunk_end = (chunk_idx + 1) * shard_size
