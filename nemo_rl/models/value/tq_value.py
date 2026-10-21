@@ -25,7 +25,11 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_VALUE_TRAIN_FIELDS, VALUE_SEED_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_VALUE_TRAIN_FIELDS,
+    ROUTE_PASSTHROUGH_FLAG,
+    VALUE_SEED_FIELDS,
+)
 from nemo_rl.models.value.lm_value import Value
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.timer import Timer
@@ -80,6 +84,26 @@ class TQValue(TQDriverMixin, Value):
                 "setup_data_plane", cfg=dp_cfg
             )
         )
+
+    def _isolated_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        fields: list[str],
+        task_name: str,
+        include_multimodal: bool = True,
+    ) -> KVBatchMeta:
+        """Keep critic inputs while excluding the actor's deferred route replay."""
+        value_meta = super()._isolated_meta(
+            meta,
+            fields=fields,
+            task_name=task_name,
+            include_multimodal=include_multimodal,
+        )
+        # The critic has its own router. Deferred actor plans stay attached for
+        # provenance but must not trigger policy route assembly on value workers.
+        value_meta.extra_info.pop(ROUTE_PASSTHROUGH_FLAG, None)
+        return value_meta
 
     # ── lifecycle ──────────────────────────────────────────────────────
 

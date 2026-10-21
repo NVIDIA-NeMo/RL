@@ -32,6 +32,9 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_VALUE_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
+    ROUTE_PASSTHROUGH_FLAG,
+    ROUTE_PLAN_TAG,
+    ROUTED_EXPERTS_FIELD,
     VALUE_SEED_FIELDS,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -116,6 +119,49 @@ def _make_tq_value() -> tuple[TQValue, MagicMock]:
 
 
 class TestTQValueFanout:
+    @pytest.mark.parametrize("training", [False, True])
+    def test_critic_does_not_consume_the_policy_deferred_routes(
+        self, training: bool
+    ) -> None:
+        v, wg = _make_tq_value()
+        meta = _meta()
+        media_fields = ["pixel_values", "imgs_sizes", "num_frames"]
+        meta.fields = [*DP_VALUE_TRAIN_FIELDS, *media_fields, ROUTED_EXPERTS_FIELD]
+        meta.extra_info = {ROUTE_PASSTHROUGH_FLAG: True, "step": 7}
+        meta.tags = [
+            {ROUTE_PLAN_TAG: "actor-only-plan", "session_role": "parent"},
+            {ROUTE_PLAN_TAG: "actor-only-plan", "session_role": "child"},
+        ]
+        wg.get_all_worker_results.return_value = [
+            {"global_loss": 1.0, "grad_norm": 0.5, "all_mb_metrics": {}}
+        ]
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as shard,
+        ):
+            if training:
+                v.train_from_meta(meta, loss_fn="LF")
+            else:
+                v.get_values_from_meta(meta)
+
+        sent = shard.call_args.args[0]
+        assert not sent.extra_info.get(ROUTE_PASSTHROUGH_FLAG)
+        assert ROUTED_EXPERTS_FIELD not in sent.fields
+        assert set(media_fields).issubset(sent.fields)
+        assert sent.extra_info["step"] == 7
+        assert sent.tags == meta.tags
+        # The same original metadata still belongs to the policy's R3 path.
+        assert meta.extra_info[ROUTE_PASSTHROUGH_FLAG] is True
+        worker = _ValueStubWorker()
+        data = {"input_ids": torch.ones(2, 4, dtype=torch.long)}
+        # A critic must not decode these actor-only plans or request policy
+        # route dimensions before running its own forward/backward.
+        assert worker._maybe_assemble_routed_experts(sent, data) is data
+
     @pytest.mark.parametrize("training", [False, True])
     def test_critic_dispatch_preserves_recorded_media_columns(self, training):
         v, wg = _make_tq_value()
