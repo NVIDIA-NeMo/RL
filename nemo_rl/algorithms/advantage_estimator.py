@@ -90,11 +90,12 @@ class GAEConfig(BaseModel, extra="allow"):
     # sequence-logprob error, multi-trace pad rows). "kept_rows": only the rows
     # that train. Rows excluded from the loss stay excluded either way.
     normalize_over: Literal["all_rows", "kept_rows"] = "all_rows"
-    # Clamp the critic's values to [lo, hi] before GAE: the range a return can take, e.g. (0, 1) for rewards in
+    # Clamp the critic's values to [lo, hi] before GAE: the range a return can take. Default (0, 1): rewards in
     # [0, 1] with gamma 1 and no KL in the reward. Clamping onto that range never moves a value farther from the
     # realised return, so no token's advantage gets noisier. Policy advantages and bootstrapped returns use the
-    # clamped values; the value loss still trains the critic's raw outputs. None: off.
-    value_clamp: Optional[tuple[float, float]] = None
+    # clamped values; the value loss still trains the critic's raw outputs. A terminal reward outside the range
+    # warns once (and is counted in adv_raw/reward_outside_clamp_frac); null turns the clamp off.
+    value_clamp: Optional[tuple[float, float]] = (0.0, 1.0)
 
     @field_validator("value_clamp")
     @classmethod
@@ -416,6 +417,7 @@ class GeneralizedAdvantageEstimator:
         # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
         self.length_adaptive_alpha = estimator_config.length_adaptive_alpha
         self.value_clamp = estimator_config.value_clamp
+        self._warned_reward_outside_clamp = False
         if self.value_clamp is not None and loss_config.use_kl_in_reward and (
             loss_config.reference_policy_kl_penalty > 0
         ):
@@ -559,6 +561,22 @@ class GeneralizedAdvantageEstimator:
                 "adv_raw/value_clamped_high_frac": float(((values > hi) & valid).sum() / n_valid),
                 "adv_raw/value_clamped_low_frac": float(((values < lo) & valid).sum() / n_valid),
             }
+            # The clamp assumes every return lies in [lo, hi]; check the terminal rewards of the rows that train.
+            rows = valid.any(dim=-1)
+            terminal = rewards.reshape(-1).to(values.device, torch.float32)
+            outside = rows & ((terminal < lo - 1e-6) | (terminal > hi + 1e-6))
+            clamp_metrics["adv_raw/reward_outside_clamp_frac"] = float(
+                outside.sum() / rows.sum().clamp(min=1)
+            )
+            if bool(outside.any()) and not self._warned_reward_outside_clamp:
+                self._warned_reward_outside_clamp = True
+                bad = terminal[outside]
+                warnings.warn(
+                    f"ppo.adv_estimator.value_clamp={self.value_clamp}: {int(outside.sum())} terminal "
+                    f"reward(s) outside the clamp range (min {float(bad.min()):.4g}, max "
+                    f"{float(bad.max()):.4g}); the clamp can bias the baseline for them. Warned once; "
+                    "adv_raw/reward_outside_clamp_frac counts them every step."
+                )
             values = values.clamp(min=lo, max=hi)
 
         lam_value = self._resolve_lambda_value()

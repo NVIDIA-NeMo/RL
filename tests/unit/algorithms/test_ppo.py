@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -65,7 +66,7 @@ def test_gae_basic_computation():
     With gamma=1.0 and lambda=1.0, GAE reduces to Monte Carlo returns
     minus values, so advantages = cumulative_rewards_from_t - V(s_t).
     """
-    estimator_config = GAEConfig(gae_lambda=1.0, normalize_advantages=False)
+    estimator_config = GAEConfig(value_clamp=None, gae_lambda=1.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -95,7 +96,7 @@ def test_gae_gamma_lambda_zero():
     With lambda=0: A_t = delta_t = r_t + gamma * V(s_{t+1}) - V(s_t).
     Only immediate TD error, no bootstrapping.
     """
-    estimator_config = GAEConfig(gae_lambda=0.0, normalize_advantages=False)
+    estimator_config = GAEConfig(value_clamp=None, gae_lambda=0.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -122,7 +123,7 @@ def test_gae_gamma_lambda_zero():
 
 def test_gae_shape_and_masking():
     """Test that GAE correctly handles masked (padding) positions."""
-    estimator_config = GAEConfig(normalize_advantages=False)
+    estimator_config = GAEConfig(value_clamp=None, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -153,7 +154,7 @@ def test_gae_shape_and_masking():
 
 def test_gae_normalize_advantages():
     """Test that advantage normalization produces zero mean and unit variance."""
-    estimator_config = GAEConfig(normalize_advantages=True)
+    estimator_config = GAEConfig(value_clamp=None, normalize_advantages=True)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -180,7 +181,7 @@ def test_gae_normalize_advantages():
 
 def test_gae_kl_penalty_in_rewards():
     """Test KL penalty injection into token-level rewards (gated + applied)."""
-    estimator_config = GAEConfig(gae_lambda=1.0, normalize_advantages=False)
+    estimator_config = GAEConfig(value_clamp=None, gae_lambda=1.0, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.1, kl_type="k1", use_kl_in_reward=True)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -249,7 +250,7 @@ def test_gae_kl_penalty_in_rewards():
 
 def test_gae_vapo_decoupled_lambda():
     """Test VAPO decoupled GAE: separate lambda for value vs policy."""
-    base_config = GAEConfig(
+    base_config = GAEConfig(value_clamp=None,
         gae_lambda_value=1.0, gae_lambda_policy=0.5, normalize_advantages=False
     )
     loss_config = _make_loss_config(kl_penalty=0.0)
@@ -280,7 +281,7 @@ def test_gae_vapo_decoupled_lambda():
 
 def test_gae_equal_explicit_lambdas_compute_once():
     """Explicit equal policy and value lambdas reuse a single GAE pass."""
-    config = GAEConfig(
+    config = GAEConfig(value_clamp=None,
         gae_lambda_value=1.0,
         gae_lambda_policy=1.0,
         normalize_advantages=False,
@@ -306,7 +307,7 @@ def test_gae_equal_explicit_lambdas_compute_once():
 
 def test_gae_length_adaptive_lambda():
     """Test VAPO length-adaptive lambda: lambda_policy = 1 - 1/(alpha * length)."""
-    config = GAEConfig(length_adaptive_alpha=0.05, normalize_advantages=False)
+    config = GAEConfig(value_clamp=None, length_adaptive_alpha=0.05, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(config, loss_config)
 
@@ -334,7 +335,7 @@ def test_gae_carry_forward_interior_gap():
     corrupt the GAE accumulators: the advantages at the valid tokens must
     match the case where the gap is simply removed from the sequence.
     """
-    estimator_config = GAEConfig(gae_gamma=0.99, normalize_advantages=False)
+    estimator_config = GAEConfig(value_clamp=None, gae_gamma=0.99, normalize_advantages=False)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -387,15 +388,15 @@ def test_gae_value_clamp_bounds_the_baseline_to_the_return_range():
     )
 
     plain = GeneralizedAdvantageEstimator(
-        GAEConfig(gae_lambda=1.0, normalize_advantages=False), loss_config
+        GAEConfig(gae_lambda=1.0, normalize_advantages=False, value_clamp=None), loss_config
     )
     adv, _ = plain.compute_advantage(values=values, **kwargs)
     torch.testing.assert_close(adv, rewards[:, None] - values)
     assert "adv_raw/value_clamped_high_frac" not in plain.last_metrics
 
+    assert GAEConfig().value_clamp == (0.0, 1.0)  # on by default
     clamped = GeneralizedAdvantageEstimator(
-        GAEConfig(gae_lambda=1.0, normalize_advantages=False, value_clamp=(0.0, 1.0)),
-        loss_config,
+        GAEConfig(gae_lambda=1.0, normalize_advantages=False), loss_config
     )
     adv_c, ret_c = clamped.compute_advantage(values=values, **kwargs)
     torch.testing.assert_close(adv_c, rewards[:, None] - values.clamp(0.0, 1.0))
@@ -403,6 +404,17 @@ def test_gae_value_clamp_bounds_the_baseline_to_the_return_range():
     assert bool((adv_c.abs() <= adv.abs() + 1e-6).all())
     assert clamped.last_metrics["adv_raw/value_clamped_high_frac"] == pytest.approx(2 / 8)
     assert clamped.last_metrics["adv_raw/value_clamped_low_frac"] == pytest.approx(1 / 8)
+    assert clamped.last_metrics["adv_raw/reward_outside_clamp_frac"] == 0.0
+
+    # A terminal reward outside the clamp range warns once and is counted every step.
+    out_of_range = dict(kwargs, rewards=torch.tensor([1.5, 0.0]))
+    with pytest.warns(UserWarning, match="outside the clamp range"):
+        clamped.compute_advantage(values=values, **out_of_range)
+    assert clamped.last_metrics["adv_raw/reward_outside_clamp_frac"] == pytest.approx(0.5)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        clamped.compute_advantage(values=values, **out_of_range)
+    assert clamped.last_metrics["adv_raw/reward_outside_clamp_frac"] == pytest.approx(0.5)
 
     with pytest.raises(ValueError, match="lo < hi"):
         GAEConfig(value_clamp=(1.0, 0.0))

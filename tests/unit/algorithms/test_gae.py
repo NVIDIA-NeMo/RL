@@ -296,6 +296,7 @@ def test_gae_public_path_preserves_rewards_whitening_and_decoupling(
     decoupling: str,
 ) -> None:
     config = GAEConfig(
+        value_clamp=None,  # values up to 8 and rewards 3.0 / -0.5: pure GAE math
         gae_lambda=1.0,
         normalize_advantages=normalize,
         gae_lambda_value=1.0 if decoupling != "none" else None,
