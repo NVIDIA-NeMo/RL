@@ -138,6 +138,12 @@ class CriticPretrainConfig(BaseModel, extra="forbid"):
     # forward-equivalents a step costs). "auto": skip it when its predictions
     # cannot change the update (train_scoring_is_redundant); "always": keep it.
     train_scoring: Literal["auto", "always"] = "auto"
+    # Write each held-out evaluation's per-rollout value summary
+    # (value_summary_records) to <eval_dump_dir>/<split>_step<N>.jsonl; None: off.
+    eval_dump_dir: Optional[str] = None
+    # Score the held-out splits once with the loaded weights and exit: no training,
+    # no optimizer, no checkpoint writes. Pair with ppo.warm_start_value_checkpoint.
+    eval_only: bool = False
 
     @model_validator(mode="after")
     def validate_settings(self) -> "CriticPretrainConfig":
@@ -799,6 +805,64 @@ def heldout_slices(group: BankGroup) -> tuple[str, str]:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name), family
 
 
+def value_summary_records(
+    fields: dict[str, torch.Tensor], groups: Sequence[BankGroup]
+) -> list[dict[str, Any]]:
+    """One record per canonical rollout with a response, for offline baseline studies.
+
+    ``groups[i]`` is row i's group. ``v_first`` / ``v_last`` are the values at the
+    first / last response token; ``q_n`` / ``q_sum`` / ``q_sumsq`` are the response
+    token count, sum and sum of squares of the values per progress quarter
+    (HeldoutStats' quarters), so a per-quarter least-squares fit on the values is
+    exact without the per-token values.
+    """
+    tokens = fields["token_mask"].bool()
+    values = fields["values"].double()
+    rel = (torch.cumsum(tokens.long(), dim=1) - 1).double() / tokens.sum(
+        dim=1, keepdim=True
+    ).clamp(min=1).double()
+    records = []
+    for row in torch.nonzero(fields["canonical"] & tokens.any(dim=1)).reshape(-1).tolist():
+        v, t, r = values[row], tokens[row], rel[row]
+        where = torch.nonzero(t).reshape(-1)
+        q_n, q_sum, q_sumsq = [], [], []
+        for b in range(_BUCKETS):
+            lo, hi = b / _BUCKETS, (b + 1) / _BUCKETS
+            sel = t & (r >= lo) & (r < hi if b < _BUCKETS - 1 else r <= 1.0)
+            q_n.append(int(sel.sum()))
+            q_sum.append(float(v[sel].sum()))
+            q_sumsq.append(float((v[sel] * v[sel]).sum()))
+        group = groups[row]
+        records.append(
+            {
+                "group_id": group.group_id,
+                "family": heldout_slices(group)[1],
+                "reward": float(fields["rewards"][row]),
+                "sample_mask": float(fields["sample_mask"][row]),
+                "v_first": float(v[where[0]]),
+                "v_last": float(v[where[-1]]),
+                "q_n": q_n,
+                "q_sum": q_sum,
+                "q_sumsq": q_sumsq,
+            }
+        )
+    return records
+
+
+def write_value_summary(
+    dump_dir: str | os.PathLike, split: str, step: int, records: list[dict[str, Any]]
+) -> Path:
+    """Write ``records`` to ``<dump_dir>/<split>_step<step>.jsonl`` atomically."""
+    path = Path(dump_dir) / f"{split}_step{step}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    with open(tmp, "w") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 @dataclass
 class HeldoutStats:
     """Legacy held-out critic metrics, accumulated over chunks of whole groups.
@@ -1168,12 +1232,17 @@ class _CriticPretrainer:
         finally:
             self._cleanup(meta)
 
-    def evaluate(self, groups: Sequence[BankGroup]) -> dict[str, float]:
+    def evaluate(
+        self,
+        groups: Sequence[BankGroup],
+        dump: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, float]:
         """Forward-only held-out metrics, ``groups_per_step`` groups at a time.
 
         Besides the pooled ``critic/*`` metrics, the same metrics per agent and per
         family (:func:`heldout_slices`) under ``by_agent/<agent>/...`` and
-        ``by_family/<family>/...``, from the same forward.
+        ``by_family/<family>/...``, from the same forward. With ``dump``, also
+        appends each rollout's :func:`value_summary_records` record to it.
         """
         stats = HeldoutStats()
         sliced: dict[str, HeldoutStats] = {}
@@ -1196,6 +1265,10 @@ class _CriticPretrainer:
                     g for g, pad in zip(staged.group_of_row, staged.is_pad) if not pad
                 ]
                 stats.add(**fields, group_of_row=group_of_row)
+                if dump is not None:
+                    dump.extend(
+                        value_summary_records(fields, [chunk[g] for g in group_of_row])
+                    )
                 for kind, i in (("agent", 0), ("family", 1)):
                     for name in sorted({s[i] for s in slices}):
                         keep = [slices[g][i] == name for g in group_of_row]
@@ -1491,8 +1564,20 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         )
         optimizer_path = None
         print(f"🔥 Initializing the critic from {warm_start} (weights only)")
+        # An eval-only run labels its results with the step it scores.
+        if cfg.eval_only and last_checkpoint_path is None:
+            found = re.search(r"step_(\d+)", str(warm_start))
+            step = int(found.group(1)) if found else step
     else:
         weights_path, optimizer_path = None, None
+    if cfg.eval_only:
+        if weights_path is None:
+            raise ValueError(
+                "critic_pretrain.eval_only needs weights: set "
+                "ppo.warm_start_value_checkpoint=<run>/step_N"
+            )
+        optimizer_path = None
+        print(f"🔎 Eval only: scoring the held-out splits at step {step}", flush=True)
 
     dp_cfg = master_config.data_plane
     dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
@@ -1518,7 +1603,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
         name_prefix="lm_value",
         weights_path=weights_path,
         optimizer_path=optimizer_path,
-        init_optimizer=True,
+        init_optimizer=not cfg.eval_only,
         dp_cfg=dp_cfg,
     )
     value.finish_training()
@@ -1578,8 +1663,52 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             flush=True,
         )
 
+    def run_heldout_eval(at_step: int) -> None:
+        for prefix, paths, start, end in (
+            ("validation", heldout_eval, 0, gpp),
+            ("validation_response", response_eval, gpp - k, gpp),
+        ):
+            if not paths:
+                continue
+            eval_groups = [
+                slice_rollouts(load_bank_group(p), start, end)
+                if prefix == "validation_response"
+                else load_bank_group(p)
+                for p in paths
+            ]
+            dump = [] if cfg.eval_dump_dir else None
+            eval_metrics = trainer.evaluate(eval_groups, dump=dump)
+            logger.log_metrics(eval_metrics, at_step, prefix=prefix)
+            print(
+                f"  {prefix}: "
+                f"ev={eval_metrics.get('critic/explained_var', float('nan')):.4f} "
+                f"terminal_auc={eval_metrics.get('critic/terminal_auc', float('nan')):.4f} "
+                f"q1={eval_metrics.get('critic/within_group_auc_q1', float('nan')):.4f} "
+                f"q4={eval_metrics.get('critic/within_group_auc_q4', float('nan')):.4f}",
+                flush=True,
+            )
+            families = sorted(
+                {k.split("/")[1] for k in eval_metrics if k.startswith("by_family/")}
+            )
+            if len(families) > 1:
+                print(
+                    "    by family: "
+                    + "; ".join(
+                        f"{f} ev={eval_metrics.get(f'by_family/{f}/critic/explained_var', float('nan')):.4f} "
+                        f"terminal_auc={eval_metrics.get(f'by_family/{f}/critic/terminal_auc', float('nan')):.4f} "
+                        f"q4={eval_metrics.get(f'by_family/{f}/critic/within_group_auc_q4', float('nan')):.4f}"
+                        for f in families
+                    ),
+                    flush=True,
+                )
+            if dump is not None:
+                path = write_value_summary(cfg.eval_dump_dir, prefix, at_step, dump)
+                print(f"    {len(dump)} rollout value summaries -> {path}", flush=True)
+
     try:
-        while step < planned_steps:
+        if cfg.eval_only:
+            run_heldout_eval(step)
+        while not cfg.eval_only and step < planned_steps:
             started = time.perf_counter()
             groups = _load_step_groups(
                 plan.stream[step * gps : (step + 1) * gps], plan, k
@@ -1636,42 +1765,7 @@ def critic_pretrain(master_config: Any, tokenizer: Any) -> None:
             value.finish_training()
 
             if is_last or (cfg.eval_period > 0 and step % cfg.eval_period == 0):
-                for prefix, paths, start, end in (
-                    ("validation", heldout_eval, 0, gpp),
-                    ("validation_response", response_eval, gpp - k, gpp),
-                ):
-                    if not paths:
-                        continue
-                    eval_groups = [
-                        slice_rollouts(load_bank_group(p), start, end)
-                        if prefix == "validation_response"
-                        else load_bank_group(p)
-                        for p in paths
-                    ]
-                    eval_metrics = trainer.evaluate(eval_groups)
-                    logger.log_metrics(eval_metrics, step, prefix=prefix)
-                    print(
-                        f"  {prefix}: "
-                        f"ev={eval_metrics.get('critic/explained_var', float('nan')):.4f} "
-                        f"terminal_auc={eval_metrics.get('critic/terminal_auc', float('nan')):.4f} "
-                        f"q1={eval_metrics.get('critic/within_group_auc_q1', float('nan')):.4f} "
-                        f"q4={eval_metrics.get('critic/within_group_auc_q4', float('nan')):.4f}",
-                        flush=True,
-                    )
-                    families = sorted(
-                        {k.split("/")[1] for k in eval_metrics if k.startswith("by_family/")}
-                    )
-                    if len(families) > 1:
-                        print(
-                            "    by family: "
-                            + "; ".join(
-                                f"{f} ev={eval_metrics.get(f'by_family/{f}/critic/explained_var', float('nan')):.4f} "
-                                f"terminal_auc={eval_metrics.get(f'by_family/{f}/critic/terminal_auc', float('nan')):.4f} "
-                                f"q4={eval_metrics.get(f'by_family/{f}/critic/within_group_auc_q4', float('nan')):.4f}"
-                                for f in families
-                            ),
-                            flush=True,
-                        )
+                run_heldout_eval(step)
             if save_by_timeout:
                 print(
                     "⏰ Walltime budget reached; stopping after the save.", flush=True

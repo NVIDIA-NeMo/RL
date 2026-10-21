@@ -668,6 +668,44 @@ def test_evaluate_breaks_held_out_metrics_down_by_agent_and_family():
     assert plane.rows == {}
 
 
+class _RampValue(_Value):
+    """Predicts 0.1 x token position."""
+
+    def get_values_from_meta(self, meta, privilege_prefixes=None):
+        self.calls.append("get_values")
+        for sid, n in zip(meta.sample_ids, meta.sequence_lengths):
+            self.plane.rows[sid]["values"] = 0.1 * torch.arange(n, dtype=torch.float32)
+
+
+def test_evaluate_dumps_per_rollout_value_summaries(tmp_path):
+    plane = _Plane()
+    trainer = _trainer(plane, _RampValue(plane))  # 2 groups per chunk: the dump spans chunks
+    groups = [
+        _group("A", 2, rewards=[1.0, 0.0], subagent=(1,), length=10),
+        _group("B", 1, rewards=[0.0], env_masked=(0,), length=10),
+        _with_agent(_group("C", 1, length=10), "terminal_bench_2_1_opencode_sandboxed_agent"),
+    ]
+    dump = []
+    metrics = trainer.evaluate(groups, dump=dump)
+    # The dump does not change the metrics.
+    assert metrics == pytest.approx(trainer.evaluate(groups), nan_ok=True)
+    # One record per canonical rollout (the subagent row is not one), in group order.
+    assert [(r["group_id"], r["reward"], r["sample_mask"]) for r in dump] == [
+        ("A", 1.0, 1.0), ("A", 0.0, 1.0), ("B", 0.0, 0.0), ("C", 1.0, 1.0)
+    ]
+    assert [r["family"] for r in dump] == ["swe", "swe", "swe", "tb"]
+    # Response tokens are positions 2..9: two per progress quarter.
+    r = dump[0]
+    assert r["v_first"] == pytest.approx(0.2) and r["v_last"] == pytest.approx(0.9)
+    assert r["q_n"] == [2, 2, 2, 2]
+    assert r["q_sum"] == pytest.approx([0.5, 0.9, 1.3, 1.7])
+    assert r["q_sumsq"] == pytest.approx([0.13, 0.41, 0.85, 1.45])
+    path = cp.write_value_summary(tmp_path / "dumps", "validation", 140, dump)
+    assert path.name == "validation_step140.jsonl"
+    assert [json.loads(line) for line in path.read_text().splitlines()] == dump
+    assert plane.rows == {}
+
+
 class _Checkpointer:
     """CheckpointManager's checkpoint_dir + get_resume_paths, without the IO."""
 
