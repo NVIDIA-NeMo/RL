@@ -26,6 +26,11 @@ pytest.importorskip("nemo_gym")
 pytestmark = pytest.mark.nemo_gym
 
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
+from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
+    DYNAMO_CAPTURE_ANNOTATION_PREFIX,
+    DYNAMO_GYM_REQUEST_ANNOTATION,
+    DYNAMO_PREFIX_ANNOTATION_PREFIX,
+)
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     RolloutTokenCapture,
 )
@@ -300,3 +305,16 @@ def test_rollout_requests_get_native_checks_and_clamp(
         assert engine_request["sampling_options"]["top_k"] == -1
     assert "output_options" not in engine_request
     assert chunks[-1]["engine_data"]["completion_token_ids"] == [8, _EOS]
+
+
+def test_annotations_match_gyms_dynamo_dialect() -> None:
+    """The engine host recognizes exactly the annotations Gym's dialect sends."""
+    assert (
+        ROLLOUT_ANNOTATION,
+        CAPTURE_ANNOTATION_PREFIX,
+        PREFIX_ANNOTATION_PREFIX,
+    ) == (
+        DYNAMO_GYM_REQUEST_ANNOTATION,
+        DYNAMO_CAPTURE_ANNOTATION_PREFIX,
+        DYNAMO_PREFIX_ANNOTATION_PREFIX,
+    )
