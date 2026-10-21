@@ -150,7 +150,8 @@ class NixlStorageUnit:
         # and slab pages to socket k % sockets; a no-op on single-socket nodes.
         self.numa_node: int | None = None
         nixl_init_params = dict(nixl_init_params or {})
-        sockets = numa_utils.cpu_nodes() if numa_mode == "auto" else {}
+        auto = numa_mode == "auto" and os.environ.get("NRL_DISABLE_NUMA_BINDING") != "1"
+        sockets = numa_utils.cpu_nodes() if auto else {}
         if len(sockets) >= 2:
             node = sorted(sockets)[int(numa_index) % len(sockets)]
             numa_utils.bind_process(sockets[node])
@@ -457,13 +458,13 @@ class NixlStorageUnit:
         return {
             "unit_id": self.unit_id,
             "node_id": self.node_id,
-            "numa": self.numa_node,
             "nics": self._nics,
             "zmq": self._server.address,
             "agent_name": self.ep.name,
             "agent_md": self.ep.metadata(),
             "slab_base": self.slab_base,
             "slab_bytes": int(self.slab.nbytes),
+            "put_bytes": int(self.staging_base),
             "state": "ACTIVE",
         }
 
@@ -483,9 +484,8 @@ class NixlStorageUnit:
         try:
             off = self.alloc_.alloc(nbytes)
         except UnitFull:
-            # The client tries the next unit on UnitFull, retries on Busy. It asks
-            # for spill=False first, so a put spills only after every unit refused
-            # (best-effort: a unit may free or fragment space after it answered).
+            # Best-effort RAM-first: the client asks spill=False of every unit
+            # before it asks any unit to spill.
             if self.ssd_dir is None or not spill:
                 raise
             # Spill: the put goes to disk from birth, through the IO area. The

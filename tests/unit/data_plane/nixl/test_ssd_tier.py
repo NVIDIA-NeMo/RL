@@ -205,42 +205,41 @@ def test_alloc_without_spill_is_unitfull_and_leaves_the_io_area_alone(tmp_path):
 
 
 class _SpillCtl(_Ctl):
-    """Two units; ``full`` names the ones whose RAM refuses a no-spill alloc."""
+    """Records each alloc as ``(address, spill)``; ``full`` units refuse no-spill ones."""
 
     def __init__(self, full):
-        self.full = full
-        self.allocs = []
-        super().__init__({"alloc": self._alloc, "commit": lambda a: "done"})
+        super().__init__({"commit": lambda a: "done"})
+        self.full, self.allocs = full, []
 
     def call(self, address, op, *, timeout_s=None, **args):
-        if op == "alloc":
-            self.allocs.append((address, args["spill"]))
-        return super().call(address, op, timeout_s=timeout_s, **args)
-
-    def _alloc(self, address):
-        if address in self.full and not self.allocs[-1][1]:
-            return UnitFull("ram full")
+        if op != "alloc":
+            return super().call(address, op, timeout_s=timeout_s, **args)
+        self.allocs.append((address, args["spill"]))
+        if address in self.full and not args["spill"]:
+            raise UnitFull("ram full")
         return 64
 
 
-def test_a_put_tries_every_units_ram_before_any_unit_spills():
-    ctl = _SpillCtl(full={"tcp://u0"})
+@pytest.mark.parametrize(
+    ("full", "allocs", "unit"),
+    [
+        # u0's RAM is full but u1 has room: no unit spills.
+        ({"tcp://u0"}, [("tcp://u0", False), ("tcp://u1", False)], 1),
+        # Every unit's RAM is full: only then does the first unit spill.
+        (
+            {"tcp://u0", "tcp://u1"},
+            [("tcp://u0", False), ("tcp://u1", False), ("tcp://u0", True)],
+            0,
+        ),
+    ],
+    ids=["ram_on_next_unit", "spill_after_all_refused"],
+)
+def test_a_put_tries_every_units_ram_before_any_unit_spills(full, allocs, unit):
+    ctl = _SpillCtl(full)
     s = _store(ctl)
     s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert ctl.allocs == [("tcp://u0", False), ("tcp://u1", False)]
-    assert s._blob_unit["b"] == 1
-
-
-def test_a_put_spills_only_when_no_unit_has_ram_left():
-    ctl = _SpillCtl(full={"tcp://u0", "tcp://u1"})
-    s = _store(ctl)
-    s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert ctl.allocs == [
-        ("tcp://u0", False),
-        ("tcp://u1", False),
-        ("tcp://u0", True),
-    ]
-    assert s._blob_unit["b"] == 0
+    assert ctl.allocs == allocs
+    assert s._blob_unit["b"] == unit
 
 
 def test_commit_waits_when_too_many_io_jobs_are_running(tmp_path, monkeypatch):
@@ -494,18 +493,40 @@ def test_pending_reads_reask_at_once_after_progress_and_reset_the_backoff(monkey
     assert sleeps == [p0, 2 * p0, p0]
 
 
-def test_with_ssd_on_reads_are_pinned_and_find_other_clients_blobs_by_meta():
+def test_with_ssd_on_ram_blobs_read_by_hint_and_spilled_blobs_read_pinned():
     s = _store(
         _Ctl({"resolve": lambda a: {"pin_id": "p", "offsets": {"b": 0}, "missing": []}})
     )
-    s._read_hinted = lambda *a, **k: pytest.fail("hinted read with ssd on")
+    s._read_hinted = lambda *a, **k: {}  # the hinted path took the blob
     s._blob_unit = {}  # this client never wrote "b"
     s.directory = None  # asking the directory would raise
-    meta = {"u": 0, "so": 0, "z": 64, "g": "abc"}
+    scratch = (2000, memoryview(bytearray(64)))
+    s._gen = lambda unit_id: 1
     s.read(
-        {"b": [(0, 8, 1000)]}, {"b": meta}, scratch=(2000, memoryview(bytearray(64)))
+        {"b": [(0, 8, 1000)]},
+        {"b": {"u": 0, "so": 0, "z": 64, "g": 1}},
+        scratch=scratch,
     )
+    assert s.stats["slow_reads"] == 0
+    s._read_hinted = lambda *a, **k: pytest.fail("hinted read of a spilled blob")
+    s.read({"b": [(0, 8, 1000)]}, {"b": {"u": 0, "g": 1}}, scratch=scratch)
     assert s.stats["slow_reads"] == 1
+
+
+def test_a_put_that_spilled_carries_no_read_hint():
+    ctl = _Ctl({"alloc": lambda a: 600, "commit": lambda a: "done"})
+    s = _store(ctl)
+    s._units[0]["put_bytes"] = 512  # offset 600 is in the IO area
+    s._units[1]["put_bytes"] = 512
+    s._gen = lambda unit_id: 1
+    _, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert hint == {"u": 0, "g": 1}
+    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "done"})
+    s = _store(ctl)
+    s._units[0]["put_bytes"] = 512
+    s._gen = lambda unit_id: 1
+    _, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert hint == {"u": 0, "g": 1, "so": 64, "z": 8}
 
 
 # ------------------------------------------------------------------ config

@@ -104,8 +104,9 @@ class Graveyard:
     owns it, and its local ranges; callers keep the memory behind those
     ranges alive (the pool retires it, the adapter keeps zero-copy sources).
 
-    Past ``max_bytes`` of retained local ranges the process is POISONED:
-    every later transfer raises :class:`DataPlaneFatal` before touching NIXL.
+    Past ``max_bytes`` of retained memory (local ranges, plus every buffer the
+    pool retires whole) the process is POISONED: every later transfer raises
+    :class:`DataPlaneFatal` before touching NIXL.
     """
 
     def __init__(self, max_bytes: int = 4 << 30) -> None:
@@ -116,7 +117,18 @@ class Graveyard:
 
     def retain(self, agent: Any, h: Any, ldesc: Any, rdesc: Any, local) -> None:
         self.entries.append((agent, h, ldesc, rdesc, list(local)))
-        self.bytes += sum(int(n) for _, n in local)
+        self._charge(sum(int(n) for _, n in local))
+
+    def retain_buffer(self, nbytes: int) -> None:
+        """Charge a pool buffer retired whole because a failed transfer touches it.
+
+        Its transferred ranges were charged by :meth:`retain`, so they count
+        twice: the limit errs on the side of poisoning.
+        """
+        self._charge(int(nbytes))
+
+    def _charge(self, nbytes: int) -> None:
+        self.bytes += nbytes
         if self.bytes > self.max_bytes and self.poisoned is None:
             self.poisoned = (
                 f"{len(self.entries)} unfinished NIXL transfer(s) retain "

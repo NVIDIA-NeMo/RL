@@ -363,12 +363,9 @@ class UnitSlabStore:
                 if self.ssd and not self._commit(u, blob_id, deadline, errs):
                     continue
                 self._blob_unit[blob_id] = unit_id
-                hint = {
-                    "u": unit_id,
-                    "so": int(off),
-                    "z": int(nbytes),
-                    "g": self._gen(unit_id),
-                }
+                hint = {"u": unit_id, "g": self._gen(unit_id)}
+                if off < int(u.get("put_bytes", off + 1)):  # not a spilled blob
+                    hint |= {"so": int(off), "z": int(nbytes)}
                 return blob_id, hint
             if any(isinstance(e, DataPlaneBusy) for e in errs):
                 backoff = busy_wait(deadline, backoff)
@@ -437,14 +434,9 @@ class UnitSlabStore:
         fast: dict[int, list[str]] = {}
         for b, ranges in requests.items():
             m = metas.get(b) or {}
-            # SSD tier: blobs may move to disk, so every read is pinned.
-            if (
-                scratch is not None
-                and not self.ssd
-                and "so" in m
-                and "z" in m
-                and self._hint_live(m)
-            ):
+            # A hint exists only for blobs in the put area, which never move; a
+            # spilled blob has none and is read pinned.
+            if scratch is not None and "so" in m and "z" in m and self._hint_live(m):
                 fast.setdefault(int(m["u"]), []).append(b)
             else:
                 slow[b] = ranges

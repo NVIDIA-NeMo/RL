@@ -45,6 +45,8 @@ from typing import Any, Iterator
 
 import numpy as np
 
+from nemo_rl.data_plane.nixl import nixl_io
+
 
 log = logging.getLogger(__name__)
 
@@ -192,6 +194,7 @@ class BufferPool:
         with self._cv:
             self.retired.append(item)
             self.stats["retired_bytes"] += buf.nbytes
+        nixl_io.GRAVEYARD.retain_buffer(buf.nbytes)
         return True
 
     def _evict_for(self, incoming: int) -> None:
