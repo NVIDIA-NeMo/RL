@@ -29,7 +29,7 @@ from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 def _patch_transformers_tokenizer_class_set():
     """Undo the transformers block on deepseek_v3 tokenizers.
 
-    Root cause: transformers >=5.4 lists "deepseek_v3" in two internal
+    Legacy root cause: transformers 5.4 through 5.12 lists "deepseek_v3" in two internal
     registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
     TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
     they force the fast tokenizer backend and suppress trust_remote_code, so
@@ -39,7 +39,8 @@ def _patch_transformers_tokenizer_class_set():
 
     Removing both entries restores the trust_remote_code / auto_map path.
     discard/pop-with-default are no-ops when the entries are absent, so this is
-    safe on any transformers version in the currently-supported range.
+    safe on the supported legacy versions. Verified 5.18 uses its upstream
+    native/explicitly trusted remote paths without installing this fallback.
 
     Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
     per process the first time any policy code is imported -- covers the driver
@@ -50,15 +51,22 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
-    # load-bearing across the currently supported backend environments.
-    # TODO: remove this patch (and the assert below) once the deepseek_v3
-    # entries actually disappear upstream.
+    version = PkgVersion(transformers.__version__)
+    # 5.18 retains both registry entries to preserve the native tokenizer.json
+    # path, but its remote-code check now honors explicit trust_remote_code=True.
+    # Keep that upstream behavior intact: the legacy retry mutates global
+    # registries and is unnecessary for the verified 5.18 native/remote paths.
+    if PkgVersion("5.18.0") <= version < PkgVersion("5.19.0"):
+        return
+
+    # 5.12.1 still needs the fallback. Keep unverified intervening/future
+    # versions explicit rather than widening the compatibility bound blindly.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert version < PkgVersion("5.13.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
-        "Check if the upstream fix now applies and remove this patch if so."
+        "The deepseek_v3 tokenizer fallback supports <5.13; the upstream "
+        "native/remote paths were also verified on 5.18. Check the tokenizer "
+        "registry behavior before supporting another version."
     )
 
     from transformers import AutoTokenizer
@@ -146,8 +154,9 @@ class AutomodelBackendConfig(TypedDict):
     enable_hf_state_dict_adapter: NotRequired[bool]
     # Enable FSDP-specific optimizations
     enable_fsdp_optimizations: NotRequired[bool]
-    # Precision for the MoE gate computation (e.g., "float64", "float32")
-    gate_precision: NotRequired[str]
+    # Optional MoE gate dtype override (e.g., "float64", "float32"). None keeps
+    # the native model's gate precision, matching Automodel's BackendConfig.
+    gate_precision: NotRequired[str | None]
 
 
 class AutomodelFreezeConfig(TypedDict):

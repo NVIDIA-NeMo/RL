@@ -14,7 +14,9 @@
 
 import logging
 import multiprocessing
+import os
 import time
+from typing import TYPE_CHECKING
 
 import ray
 
@@ -30,6 +32,9 @@ from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
+if TYPE_CHECKING:
+    from sglang_router.launch_router import RouterArgs
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,13 +47,20 @@ def _validate_router_retry_options(router_cfg: SGLangRouterConfig) -> None:
                 raise ValueError(f"{key} must be a positive integer, got {value!r}")
 
 
-def run_router(args):
+def run_router(args: "RouterArgs", parent_pid: int) -> None:
+    """Terminate the router child if its owning Ray actor dies."""
+    # SGLang is optional in the driver environment; load it in the router child.
+    from sglang.srt.utils import kill_itself_when_parent_died
     from sglang_router.launch_router import launch_router
 
+    kill_itself_when_parent_died()
+    if os.getppid() != parent_pid:
+        # Close the race where the actor dies before the guard is installed.
+        return
     launch_router(args)
 
 
-@ray.remote(num_cpus=1, num_gpus=0)
+@ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class RouterActor:
     """Starts and owns the sglang router subprocess.
 
@@ -91,7 +103,9 @@ class RouterActor:
         return router_ip, router_port
 
     def start(self, router_args) -> None:
-        self._process = multiprocessing.Process(target=run_router, args=(router_args,))
+        self._process = multiprocessing.Process(
+            target=run_router, args=(router_args, os.getpid())
+        )
         self._process.daemon = True
         self._process.start()
 

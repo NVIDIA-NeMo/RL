@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,21 +98,26 @@ from nemo_rl.utils.timer import Timer
 
 
 def _refit_tensor_dtype(
-    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+    fqn: str,
+    tensor: torch.Tensor,
+    default_dtype: torch.dtype,
+    *,
+    keep_in_fp32: bool = False,
 ) -> torch.dtype:
-    """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
+    """Preserve integer buffers and model-declared FP32 parameters during refit.
 
     Integer/bool buffers (e.g. the reduced-vocab draft's d2t index map) must
     keep their dtype — token ids are not representable in bf16. FP32
     ``e_score_correction_bias`` tensors are inference-critical MoE router
-    state and must also stay FP32.
+    state and must also stay FP32. The model's FP32 module declarations apply
+    before HF name adaptation, which may remove an FP32 module's name.
     """
     if not tensor.is_floating_point():
         return tensor.dtype
     is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
         "e_score_correction_bias"
     )
-    if is_router_correction_bias and tensor.dtype == torch.float32:
+    if (keep_in_fp32 or is_router_correction_bias) and tensor.dtype == torch.float32:
         return tensor.dtype
     return default_dtype
 
@@ -124,14 +129,16 @@ def _module_params_generator(
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The default dtype for refit tensors. Source-FP32
-            ``e_score_correction_bias`` tensors retain FP32.
+        target_dtype: The default dtype for refit tensors. Model-declared FP32
+            parameters and source-FP32 router correction biases retain FP32.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
     module_map = dict(model.named_modules())
+    fp32_modules = set(getattr(model, "_keep_in_fp32_modules", None) or [])
+    fp32_modules.update(getattr(model, "_keep_in_fp32_modules_strict", None) or [])
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
@@ -140,7 +147,12 @@ def _module_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            refit_dtype = _refit_tensor_dtype(
+                adapted_fqn,
+                adapted_tensor,
+                target_dtype,
+                keep_in_fp32=bool(fp32_modules.intersection(name.split("."))),
+            )
             yield (
                 adapted_fqn,
                 adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
@@ -1156,6 +1168,10 @@ class AutomodelPolicyWorkerImpl(
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         state_dict_info = {}
+        fp32_modules = set(getattr(self.model, "_keep_in_fp32_modules", None) or [])
+        fp32_modules.update(
+            getattr(self.model, "_keep_in_fp32_modules_strict", None) or []
+        )
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
                 continue
@@ -1167,7 +1183,10 @@ class AutomodelPolicyWorkerImpl(
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 refit_dtype = _refit_tensor_dtype(
-                    adapted_fqn, adapted_tensor, self.dtype
+                    adapted_fqn,
+                    adapted_tensor,
+                    self.dtype,
+                    keep_in_fp32=bool(fp32_modules.intersection(name.split("."))),
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
 

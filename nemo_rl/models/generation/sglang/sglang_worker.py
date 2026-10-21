@@ -103,8 +103,12 @@ class SGLangGenerationWorker:
         self._launch_server_process(server_args_dict)
 
     def _launch_server_process(self, server_args_dict):
+        from sglang.srt.plugins import load_plugins
         from sglang.srt.server_args import ServerArgs
 
+        # Match SGLang Engine: plugins register local config classes and hooks
+        # before ServerArgs resolves/caches model metadata for spawned workers.
+        load_plugins()
         logger.info(
             f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
         )
@@ -513,8 +517,17 @@ class SGLangGenerationWorker:
         for key in [
             "dtype",
             "kv_cache_dtype",
+            "trust_remote_code",
+            "attention_backend",
+            "moe_runner_backend",
+            "enable_fp32_lm_head",
+            "swa_full_tokens_ratio",
+            "disable_flashinfer_autotune",
+            "disable_radix_cache",
+            "disable_overlap_schedule",
             "context_length",
             "max_running_requests",
+            "max_total_tokens",
             "chunked_prefill_size",
             "max_prefill_tokens",
             "schedule_policy",

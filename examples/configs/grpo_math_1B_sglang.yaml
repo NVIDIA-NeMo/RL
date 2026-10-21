@@ -11,7 +11,14 @@ policy:
       quantization:
         scheme: bf16
       model_path: ${policy.model_name}
+      trust_remote_code: true
       dtype: ${policy.precision}
+      # Optional Flint serving overrides (set only when required by the model):
+      # attention_backend: fa4
+      # moe_runner_backend: flashinfer_trtllm_routed
+      # enable_fp32_lm_head: true
+      # swa_full_tokens_ratio: 0.05
+      # disable_flashinfer_autotune: true
       context_length: 512
       allow_auto_truncate: true
       tp_size: 1

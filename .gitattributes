@@ -1,0 +1,3 @@
+
+# Unified patches contain significant single-space context lines.
+integrations/flint/patches/*.patch whitespace=-blank-at-eol

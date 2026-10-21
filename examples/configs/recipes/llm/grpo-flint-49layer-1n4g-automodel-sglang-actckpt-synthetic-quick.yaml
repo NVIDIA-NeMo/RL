@@ -1,0 +1,18 @@
+defaults: ./grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.yaml
+
+# Deterministic hash of each generated response; integration testing only.
+# Set FLINT_SYNTHETIC_SMOKE=1 to register the private reward environment.
+data:
+  default:
+    env_name: flint_smoke
+
+env:
+  flint_smoke: {}
+
+checkpointing:
+  checkpoint_dir: /flint-work/results/synthetic
+  metric_name: null
+  keep_top_k: 1
+
+logger:
+  log_dir: /flint-work/logs/synthetic
