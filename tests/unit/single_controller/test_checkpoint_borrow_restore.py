@@ -243,7 +243,8 @@ def _controller(
     controller._trainer_version = 0
     controller._train_steps = 0
     controller._current_epoch = 0
-    controller._sampler_stamps_target_steps = False
+    controller._batch_admitted = False
+    controller._assembling_version = 0
     controller._rollout_recovery_enabled = True
     controller._restored_replay_groups_to_regenerate = []
     controller._batch_shortfall = {}

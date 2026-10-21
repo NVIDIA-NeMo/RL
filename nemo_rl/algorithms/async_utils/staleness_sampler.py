@@ -26,6 +26,9 @@ loop in one object, injected into both pumps:
   - ``is_on_policy`` / ``required_buffer_capacity`` (derived facts): what the
     weight-sync and capacity-validation paths need *without* re-reading raw
     knobs, so those consumers can't drift out of sync with the sampler.
+  - ``DropAccountingSampler`` (optional): what losing a prompt group for good
+    costs under this policy, i.e. which step it is charged to and whether a
+    spare pool replaces it.
 
 ``PromptGroupSampler`` is the interface; ``WindowedSampler`` /
 ``ReadyFirstSampler`` / ``WeightFifoSampler`` / ``InOrderSampler`` are the
@@ -41,6 +44,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import importlib
+import warnings
 from typing import (
     Annotated,
     Callable,
@@ -182,6 +186,45 @@ class TransactionalAdmissionSampler(Protocol):
         ...
 
 
+@runtime_checkable
+class DropAccountingSampler(Protocol):
+    """Sampler that says what it costs to lose a prompt group for good.
+
+    A group is lost when its rollout is dropped (a failure, or dynamic sampling
+    filtering a zero-variance group) and no replacement is available. Optional: for a
+    sampler without these members the controller uses the gated defaults: the spare
+    pool is on, the last step cannot close short, and the group is charged to its own
+    ``target_step`` (or to the step being assembled if the sampler stamps none).
+
+    Declare the two flags as class attributes, not in ``__init__``. Setup validates the
+    sampler class before it is constructed, so flags that exist only on an instance are
+    invisible there and draw a warning even though the controller -- which checks the
+    instance -- would honour them.
+    """
+
+    uses_replacement_pool: ClassVar[bool]
+    """Whether a dropped group is replaced from a pool of spare prompts."""
+
+    closes_short_at_exhaustion: ClassVar[bool]
+    """Whether the last step may close on the groups that exist once the data runs out."""
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Return the step a permanently lost group is charged to.
+
+        Args:
+            target_step: The step stamped on the lost group, or ``None`` if the
+                policy does not stamp.
+            assembling_version: The step the train pump is assembling, or will
+                assemble next once the current one has finished selecting.
+
+        Returns:
+            The step whose size shrinks by one, or ``None`` if nothing is charged.
+        """
+        ...
+
+
 class BaseSampler(abc.ABC):
     """Shared machinery for the built-in policies.
 
@@ -193,11 +236,21 @@ class BaseSampler(abc.ABC):
     supports_buffer_checkpoint: ClassVar[bool] = False
     supports_training_claims: ClassVar[bool] = True
 
+    # Defaults for DropAccountingSampler, right for a gated sampler that does not stamp.
+    uses_replacement_pool: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
     def __init__(self, buffer: TQReplayBuffer) -> None:
         self._buffer = buffer
         # Pre-incremented before each admitted batch, so -1 lets the first
         # batch through a zero-staleness gate.
         self._dispatch_index: int = -1
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step, or the one being assembled if it has none."""
+        return assembling_version if target_step is None else target_step
 
     @property
     def dispatch_index(self) -> int:
@@ -370,6 +423,11 @@ class WindowedSampler(BaseSampler):
     # Ungated restored groups are ordinary in-window candidates.
     supports_buffer_checkpoint: ClassVar[bool] = True
 
+    # Rollout never stops producing, so a lost group is made up by later ones: no spare
+    # pool is needed, and only the tail of the data can leave a step short.
+    uses_replacement_pool: ClassVar[bool] = False
+    closes_short_at_exhaustion: ClassVar[bool] = True
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -394,6 +452,12 @@ class WindowedSampler(BaseSampler):
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return self.min_groups_for_streaming_train
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge nothing: a step takes any ready groups, so none of them is missing."""
+        return None
 
     def should_abort_inflight(
         self,
@@ -584,6 +648,12 @@ class WeightFifoSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    # A replacement is dispatched at whatever the weight version is once the original
+    # was given up on. Unless the trainer has not moved since, that is a newer version
+    # than the bucket the replacement is meant to fill, and select -- which waits on the
+    # oldest in-window bucket alone -- then waits on a bucket nothing can top up. A pool
+    # that only works when the timing happens to line up is not one worth having.
+    uses_replacement_pool: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -646,6 +716,9 @@ class InOrderSampler(_GatedSampler):
     # The controller checkpoints the exact dispatch cursor separately.
     supports_buffer_checkpoint: ClassVar[bool] = True
 
+    uses_replacement_pool: ClassVar[bool] = True
+    closes_short_at_exhaustion: ClassVar[bool] = False
+
     def __init__(
         self,
         buffer: TQReplayBuffer,
@@ -656,6 +729,12 @@ class InOrderSampler(_GatedSampler):
         super().__init__(buffer, gate_window=max_lookahead_versions)
         self.max_lookahead_versions = max_lookahead_versions
         self.warmup_lookahead_versions = warmup_lookahead_versions
+
+    def charge_step_for_lost_group(
+        self, *, target_step: Optional[int], assembling_version: int
+    ) -> Optional[int]:
+        """Charge the group's own step: each batch is trained as exactly one step."""
+        return target_step
 
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         # Sized for the peak window: otherwise the buffer, not the gate, bounds
@@ -884,6 +963,55 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
             f"boolean class attribute, got {capability!r}"
         )
     return capability
+
+
+_DROP_ACCOUNTING_MEMBERS = (
+    "uses_replacement_pool",
+    "closes_short_at_exhaustion",
+    "charge_step_for_lost_group",
+)
+
+
+def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
+    """Warn when a custom sampler gets the gated drop defaults by omission.
+
+    Imports the class but does not construct it, so it can run during setup. Built-in
+    samplers are skipped. ``DropAccountingSampler`` is all-or-nothing under
+    ``isinstance``, so a class with only some of the members is treated as having none.
+    That is easy to do by accident and changes behaviour silently, so name the members
+    that are missing.
+
+    Checks the class, while the controller checks the constructed instance. A sampler
+    that assigns the flags in ``__init__`` is therefore warned about here and then
+    honoured at runtime. The protocol asks for class attributes precisely so the two
+    agree; the warning says so rather than pretending the members do not exist.
+    """
+    if not isinstance(cfg, CustomSamplerConfig):
+        return
+    sampler_cls = _custom_sampler_class(cfg)
+    if isinstance(sampler_cls, DropAccountingSampler):
+        return
+    present = [m for m in _DROP_ACCOUNTING_MEMBERS if hasattr(sampler_cls, m)]
+    missing = [m for m in _DROP_ACCOUNTING_MEMBERS if m not in present]
+    detail = (
+        f"its class defines only {present} and is missing {missing}, and a partial "
+        "implementation is ignored"
+        if present
+        else "its class does not implement DropAccountingSampler"
+    )
+    warnings.warn(
+        f"{sampler_cls.__name__} is used with dynamic sampling but {detail}. "
+        "Dropped groups are handled with the gated defaults: a spare pool is used, "
+        "the last step cannot close short at data exhaustion, and a lost group is "
+        "charged to its own target_step (or the step being assembled if the sampler "
+        "stamps none). That is right for a gated sampler. A sampler that keeps "
+        "producing without a gate, like windowed, should implement "
+        "DropAccountingSampler with uses_replacement_pool = False and "
+        "closes_short_at_exhaustion = True. Declare the flags as class attributes: "
+        "this check runs before the sampler is constructed, so flags assigned in "
+        "__init__ are not visible here even though the controller would honour them.",
+        stacklevel=2,
+    )
 
 
 def create_sampler(

@@ -36,6 +36,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
+    ReadyFirstSampler,
     WeightFifoSampler,
     WindowedSampler,
     WindowedSamplerConfig,
@@ -104,6 +105,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._batch_admitted = False
+    ctrl._assembling_version = 0
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
@@ -304,7 +307,7 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     )
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
-    ctrl._sampler_stamps_target_steps = False
+    ctrl._batch_admitted = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
     with pytest.raises(RuntimeError, match="already contains 1 group"):
@@ -359,13 +362,18 @@ class _SkippingRolloutManager:
         # generated leaves that step permanently short. Without the credit the train
         # pump waits on it forever, turning a tolerated drop into a hung run.
         (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
-        # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
-        # a drop costs throughput and strands nothing. Crediting here would shrink an
-        # unrelated step.
-        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {}),
+        # The gated samplers stamp nothing, but their gate still waits on the trainer, so
+        # a step that never fills would hang the run. Both losses are charged to the
+        # step being assembled, which no train pump has moved past here.
+        (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), {0: 2}),
+        (lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1), {0: 2}),
+        # windowed never stops producing, so later groups make up for a lost one and
+        # there is nothing to charge.
+        (lambda buf: WindowedSampler(buf, max_staleness_versions=1), {}),
     ],
+    ids=["in_order", "weight_fifo", "ready_first", "windowed"],
 )
-def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
+def test_rollout_pump_charges_shortfall_as_the_sampler_decides(
     make_sampler,
     expected_shortfall: dict[int, int],
 ) -> None:
@@ -474,7 +482,6 @@ def _pump_controller(
     ctrl._trainer_version = trainer_version
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
-    ctrl._sampler_stamps_target_steps = False
     return ctrl
 
 
@@ -517,8 +524,13 @@ class TestReplaceDroppedPrompt:
         # Nothing committed, so the slot's permit must come back exactly once.
         assert ctrl._buffer_capacity._value == 4
 
-    def test_an_unstamped_sampler_never_diverts_a_batch_into_the_pool(self):
-        """No step can be stranded, so a pool would only cost prompts nothing draws on."""
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1)],
+        ids=["ready_first"],
+    )
+    def test_a_gated_sampler_that_stamps_nothing_still_substitutes(self, make_sampler):
+        """The pool does not depend on a stamp: the same slot just takes a new prompt."""
         buffer = _RecordingBuffer()
         manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
         ctrl = _pump_controller(
@@ -526,13 +538,34 @@ class TestReplaceDroppedPrompt:
             [_batch("p0"), _batch("p1")],
             buffer=buffer,
         )
-        ctrl._sampler = WeightFifoSampler(buffer, max_staleness_versions=1)
+        ctrl._sampler = make_sampler(buffer)
 
         asyncio.run(ctrl._rollout_pump())
 
-        assert manager.prompts_seen == ["p0", "p1"], "no substitution attempted"
-        assert len(ctrl._replacement_reserve) == 0, "no batch was spent on the pool"
+        assert manager.prompts_seen == ["p0", "p1"], "p1 stood in for p0"
+        assert len(ctrl._replacement_reserve) == 0
         assert ctrl._batch_shortfall == {}
+        assert ctrl._batch_replacements == {0: 1}, (
+            "an unstamped group counts toward the step being assembled"
+        )
+
+    def test_windowed_uses_no_spare_pool_and_loses_the_group_quietly(self):
+        """Its rollout keeps producing, so a lost group is made up by later ones."""
+        buffer = _RecordingBuffer()
+        manager = _ScriptedRolloutManager([RolloutOutcome.SKIPPED])
+        ctrl = _pump_controller(
+            manager,
+            [_batch("p0"), _batch("p1")],
+            buffer=buffer,
+        )
+        ctrl._sampler = WindowedSampler(buffer, max_staleness_versions=1)
+
+        asyncio.run(ctrl._rollout_pump())
+
+        assert manager.prompts_seen == ["p0", "p1"], "both batches were admitted"
+        assert len(ctrl._replacement_reserve) == 0, "no batch was diverted to a pool"
+        assert ctrl._batch_shortfall == {}, "nothing is charged, so no step shrinks"
+        assert ctrl._batch_replacements == {}
 
     @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
     def test_a_clean_run_loses_neither_a_prompt_nor_a_step_to_the_pool(
@@ -691,7 +724,7 @@ class TestTakeReplacement:
         on_dropped_prompt: str = "replace",
         max_replacement_attempts: int = 1,
         spares: int = 0,
-        stamps_target_steps: bool = True,
+        windowed: bool = False,
     ):
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         ctrl = object.__new__(controller_cls)
@@ -702,7 +735,12 @@ class TestTakeReplacement:
             )
         )
         ctrl._replacement_reserve = deque(_batch(f"spare{i}") for i in range(spares))
-        ctrl._sampler_stamps_target_steps = stamps_target_steps
+        buffer = _RecordingBuffer()
+        ctrl._sampler = (
+            WindowedSampler(buffer, max_staleness_versions=1)
+            if windowed
+            else InOrderSampler(buffer, max_lookahead_versions=1)
+        )
         return ctrl
 
     def test_a_spare_is_handed_out_and_leaves_the_pool(self):
@@ -715,12 +753,27 @@ class TestTakeReplacement:
         assert ctrl._take_replacement(0, 0) is None
         assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
 
-    def test_a_non_stamping_sampler_has_no_short_step_to_repair(self):
-        # The sampler's capability decides, not this call's target_step: a sampler
-        # that stamps no steps has nothing waiting on a replacement, so even a valid
-        # target_step with spares on hand still shrinks.
-        ctrl = self._controller(spares=2, stamps_target_steps=False)
+    def test_a_sampler_without_a_pool_never_substitutes(self):
+        # The sampler's capability decides, not this call's target_step: windowed keeps
+        # producing, so even a valid target_step with spares on hand is not replaced.
+        ctrl = self._controller(spares=2, windowed=True)
         assert ctrl._take_replacement(0, 0) is None
+        assert len(ctrl._replacement_reserve) == 2, "pool left untouched"
+
+    def test_an_unstamped_group_is_still_substituted(self):
+        """A group with no target_step of its own is replaced like any other."""
+        ctrl = self._controller(spares=1)
+        assert ctrl._take_replacement(None, 0) is not None
+
+    def test_a_custom_sampler_without_the_hooks_is_treated_as_gated(self):
+        """It predates DropAccountingSampler, so it must not lose the spare pool."""
+
+        class _PlainSampler:
+            pass
+
+        ctrl = self._controller(spares=1)
+        ctrl._sampler = _PlainSampler()
+        assert ctrl._take_replacement(None, 0) is not None
 
     def test_the_per_slot_budget_stops_substituting(self):
         ctrl = self._controller(max_replacement_attempts=2, spares=5)
@@ -731,6 +784,134 @@ class TestTakeReplacement:
         """At epoch end there is no more data; the step closes short, not never."""
         ctrl = self._controller(spares=0)
         assert ctrl._take_replacement(0, 0) is None
+
+
+class TestChargeShortfall:
+    """Which step a permanently lost group is charged to, per sampler."""
+
+    @staticmethod
+    def _controller(sampler: Any, *, assembling_version: int = 5):
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = sampler
+        ctrl._assembling_version = assembling_version
+        ctrl._batch_shortfall = {}
+        return ctrl
+
+    def test_a_stamped_group_is_charged_to_its_own_step(self):
+        sampler = InOrderSampler(_RecordingBuffer(), max_lookahead_versions=1)
+        ctrl = self._controller(sampler)
+        ctrl._credit_shortfall(3)
+        assert ctrl._batch_shortfall == {3: 1}
+
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [
+            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1),
+            lambda buf: WeightFifoSampler(buf, max_staleness_versions=1),
+        ],
+        ids=["ready_first", "weight_fifo"],
+    )
+    def test_an_unstamped_group_is_charged_to_the_step_being_assembled(
+        self, make_sampler
+    ):
+        ctrl = self._controller(make_sampler(_RecordingBuffer()), assembling_version=5)
+        ctrl._credit_shortfall(None)
+        ctrl._credit_shortfall(None)
+        assert ctrl._batch_shortfall == {5: 2}
+
+    def test_windowed_charges_nothing(self):
+        sampler = WindowedSampler(_RecordingBuffer(), max_staleness_versions=1)
+        ctrl = self._controller(sampler)
+        ctrl._credit_shortfall(None)
+        ctrl._credit_shortfall(3)
+        assert ctrl._batch_shortfall == {}
+
+    def test_a_custom_sampler_without_the_hooks_is_charged_like_a_gated_one(self):
+        class _PlainSampler:
+            pass
+
+        ctrl = self._controller(_PlainSampler(), assembling_version=2)
+        ctrl._credit_shortfall(None)
+        ctrl._credit_shortfall(7)
+        assert ctrl._batch_shortfall == {2: 1, 7: 1}
+
+    def test_a_loss_after_selection_closed_counts_toward_the_next_step(self):
+        """The train pump advances the version when it stops selecting for a step."""
+        ctrl = self._controller(
+            ReadyFirstSampler(_RecordingBuffer(), max_staleness_versions=1),
+            assembling_version=5,
+        )
+        ctrl._credit_shortfall(None)
+        ctrl._assembling_version = 6
+        ctrl._credit_shortfall(None)
+        assert ctrl._batch_shortfall == {5: 1, 6: 1}
+
+
+class TestALostGroupDoesNotStallTheGate:
+    """The hang a lost group used to cause under a gated sampler that stamps nothing.
+
+    With a zero staleness window the gate admits the next batch only once the trainer has
+    moved past the current one. A step that is waiting on a group nobody is generating
+    never ends, so the trainer never moves and the gate never opens.
+    """
+
+    @staticmethod
+    def _controller(sampler: Any) -> Any:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._sampler = sampler
+        ctrl._assembling_version = 0
+        ctrl._batch_shortfall = {}
+        ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+        ctrl._async_cfg = SimpleNamespace(
+            rollout_failure=SimpleNamespace(min_step_batch_fraction=0.5)
+        )
+        return ctrl
+
+    @pytest.mark.parametrize(
+        "make_sampler",
+        [
+            lambda buf: WeightFifoSampler(buf, max_staleness_versions=0),
+            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=0),
+        ],
+        ids=["weight_fifo", "ready_first"],
+    )
+    def test_the_charged_step_closes_short_and_opens_the_gate(self, make_sampler):
+        async def exercise() -> None:
+            trainer = {"version": 0}
+            ctrl = self._controller(make_sampler(_RecordingBuffer()))
+            admit = lambda: ctrl._sampler.admit(  # noqa: E731
+                trainer_version_fn=lambda: trainer["version"]
+            )
+
+            await admit()
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(admit(), timeout=0.05)
+
+            # One group of step 0 is given up on, so the step can only ever hold one.
+            ctrl._credit_shortfall(None)
+            assert ctrl._target_groups_for_step(0) == 1
+
+            # The train pump closes the step on what it has, and the version moves on.
+            trainer["version"] = 1
+            await asyncio.wait_for(admit(), timeout=1.0)
+
+        asyncio.run(exercise())
+
+    def test_windowed_never_gates_so_nothing_needs_charging(self):
+        async def exercise() -> None:
+            ctrl = self._controller(
+                WindowedSampler(_RecordingBuffer(), max_staleness_versions=0)
+            )
+            for _ in range(3):
+                await asyncio.wait_for(
+                    ctrl._sampler.admit(trainer_version_fn=lambda: 0), timeout=1.0
+                )
+            ctrl._credit_shortfall(None)
+            assert ctrl._target_groups_for_step(0) == 2, "the step keeps its size"
+
+        asyncio.run(exercise())
 
 
 class TestTargetGroupsForStep:
@@ -1445,7 +1626,6 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
         ctrl._current_epoch = 0
-        ctrl._sampler_stamps_target_steps = False
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]

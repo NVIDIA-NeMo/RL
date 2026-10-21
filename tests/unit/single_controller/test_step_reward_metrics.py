@@ -86,10 +86,34 @@ def test_kept_groups_alone_would_hide_the_signal():
     assert metrics["zero_variance_fraction"] == pytest.approx(0.75)
 
 
-def test_unstamped_groups_are_not_recorded():
+def test_unstamped_groups_are_not_recorded_without_a_provider():
     manager = _manager()
     manager.record_group_rewards(None, [1.0, 0.0], replacement_index=0)
     assert manager._step_rewards == {}
+
+
+def test_unstamped_groups_are_tallied_under_the_step_being_assembled():
+    manager = _manager()
+    manager.set_tally_step_provider(lambda: 4)
+    manager.record_group_rewards(None, [1.0, 0.0], replacement_index=0)
+    manager.record_group_rewards(3, [1.0, 1.0], replacement_index=0)
+
+    assert manager.pop_step_reward_metrics(3)["generated_prompt_groups"] == 1.0
+    metrics = manager.pop_step_reward_metrics(4)
+    assert metrics["generated_prompt_groups"] == 1.0
+    assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+
+
+def test_the_provider_is_read_when_the_group_is_recorded():
+    manager = _manager()
+    assembling = {"step": 2}
+    manager.set_tally_step_provider(lambda: assembling["step"])
+    manager.record_group_rewards(None, [1.0, 0.0], replacement_index=0)
+    assembling["step"] = 3
+    manager.record_group_rewards(None, [0.0, 0.0], replacement_index=0)
+
+    assert manager.pop_step_reward_metrics(2)["generated_prompt_groups"] == 1.0
+    assert manager.pop_step_reward_metrics(3)["generated_prompt_groups"] == 1.0
 
 
 def test_empty_reward_list_is_not_recorded():

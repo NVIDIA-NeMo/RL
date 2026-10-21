@@ -1688,6 +1688,11 @@ class AsyncNemoGymRolloutImpl:
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
+    # Set by the controller: finds the step a group without a target step is tallied
+    # under. A class attribute so a manager built without a controller tallies only the
+    # stamped groups.
+    _tally_step_provider: Optional[Callable[[], int]] = None
+
     def __init__(
         self,
         tokenizer: TokenizerType,
@@ -1926,6 +1931,14 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
+    def set_tally_step_provider(self, provider: Callable[[], int]) -> None:
+        """Set how a group with no target step finds the step it is tallied under.
+
+        Args:
+            provider: Zero-arg accessor for the step currently being assembled.
+        """
+        self._tally_step_provider = provider
+
     async def run_rollout(
         self,
         input_sample: DatumSpec,
@@ -1967,14 +1980,20 @@ class RolloutManager:
 
         Args:
             target_step: Step the group was stamped for. ``None`` (sampler does not
-                stamp steps) means there is nothing to report against, so skip.
+                stamp steps) means it is tallied under the step being assembled, or
+                skipped if no provider was set.
             rewards: One reward per row of the group.
             replacement_index: 0 for the originally scheduled prompt, N for its N-th
                 replacement.
         """
-        if target_step is None or not rewards:
+        if not rewards:
             return
-        tally = self._step_rewards.setdefault(target_step, StepRewardStats())
+        step = target_step
+        if step is None:
+            if self._tally_step_provider is None:
+                return
+            step = self._tally_step_provider()
+        tally = self._step_rewards.setdefault(step, StepRewardStats())
         total = float(sum(rewards))
         tally.groups += 1
         tally.zero_variance_groups += int(rewards_carry_no_signal(rewards))
@@ -2038,7 +2057,8 @@ class RolloutManager:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            target_step: Training step this rollout targets, stamped on the buffer slot;
+                ``None`` when the sampler stamps no step.
             inflight_registry: Optional controller-owned mapping from group ID to
                 its dispatch task and start weight version.
             lineage_group_id: Stable group minted by the rollout ledger before
@@ -2055,7 +2075,7 @@ class RolloutManager:
             ``max_consecutive_dropped_prompts``. A ``SKIPPED`` prompt committed nothing,
             so the caller owns both its backpressure permit and the checkpoint-atomic
             transition from its retained ledger record to either a replacement prompt
-            or the shortfall for the training step it was stamped for.
+            or the shortfall for the training step it is charged to.
 
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out and the fleet has not

@@ -125,8 +125,9 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     absorbed, one that does not stops the run.
 
     Once a prompt has been given up on, ``on_dropped_prompt`` decides what happens to
-    the training step it was stamped for: train the step on fewer groups, or substitute
-    a fresh prompt so the step keeps its configured batch size.
+    the training step it is charged to (the step it was stamped for, or the step being
+    assembled when the sampler stamps none): train the step on fewer groups, or
+    substitute a fresh prompt so the step keeps its configured batch size.
     """
 
     # ── shared: consumed by generate_and_push, above the impl split ──
@@ -181,10 +182,10 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # and should not be treated like losing 1 of 128. The floor is ceil(fraction * N),
     # so at the default a batch of 8 or fewer tolerates no drops at all.
     min_step_batch_fraction: Annotated[float, Field(gt=0.0, le=1.0)] = 0.9
-    # What becomes of the training step a given-up prompt was stamped for. Only stamped
-    # prompts are affected: with a sampler that does not stamp (WeightFifoSampler,
-    # whose admit returns None) a step fills from whatever is ready, so a drop costs
-    # throughput but strands nothing and there is nothing to substitute for.
+    # What becomes of the training step a given-up prompt is charged to: the step it was
+    # stamped for under in_order, the step being assembled under ready_first, and none
+    # under windowed (its rollout keeps producing, so later groups make up for it).
+    # weight_fifo cannot honour a drop at all, so a nonzero budget is rejected for it.
     #
     # "shrink" (the default, and the behaviour before this knob existed) closes the step
     # on fewer groups, bounded by min_step_batch_fraction above.
@@ -993,16 +994,11 @@ def _validate_failure_settings(
     ``on_dropped_prompt="replace"`` unable to ever produce a replacement. These are the
     combinations it cannot see, because each depends on a field outside that block.
 
-    Warnings rather than errors for most of them, deliberately: a strict "never train a
+    All of them are warnings rather than errors, deliberately: a strict "never train a
     short batch" run, one base YAML whose sampler is overridden per experiment, a
     deliberately deep spare pool are all coherent things to have typed, so rejecting
     them would forbid configurations somebody wants. What is not acceptable is finding
     out hours into a run, or not at all.
-
-    The exception, and the only hard error here, is a drop budget under a sampler that
-    stamps no target step. That one is not a knob cancelling itself out; it converts a
-    recoverable prompt failure into a stalled run, so there is no configuration it
-    could be the intent of.
     """
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1010,46 +1006,36 @@ def _validate_failure_settings(
         + failure_config.max_consecutive_dropped_prompts
     )
     floor = math.ceil(num_prompts_per_step * failure_config.min_step_batch_fraction)
-    # InOrderSampler is the only built-in that stamps a target step, and only a
-    # stamped step can be credited short, so for the others the floor is unreachable
-    # and the spare pool is never filled. A "custom" sampler may or may not stamp,
-    # which is why it is in neither set -- a warning nobody can act on is noise.
-    #
-    # Named by exclusion rather than by list so that a sampler added later is guarded
-    # by default instead of silently exempt: every built-in but InOrderSampler leaves
-    # _GatedSampler._stamp returning None, and ready_first (#3582) landed doing exactly
-    # that after this check was first written.
+    # A lost group shrinks a step under every built-in sampler but windowed, whose
+    # rollout keeps producing and only comes up short at the end of the data. A "custom"
+    # sampler is in neither group -- a warning nobody can act on is noise.
     sampler_name = async_config.sampler.name
-    sampler_stamps = sampler_name == "in_order"
-    sampler_never_stamps = sampler_name not in ("in_order", "custom")
+    sampler_shrinks_steps = sampler_name in ("in_order", "ready_first", "weight_fifo")
 
-    # A budget that permits drops is worse than inert under an unstamped sampler: the
-    # prompt is still given up on, but _credit_shortfall has no step to charge it to,
-    # so the step's target never falls and the train pump waits on a group nobody is
-    # generating. How that ends depends on the sampler. Under weight_fifo the wait never
-    # does: the same gate that stops the rollout pump running ahead also stops it
-    # reaching exhaustion, so the "rollout exhausted" error never fires and the run
-    # holds its GPUs until the wall clock kills it. Under windowed and ready_first the
-    # shortfall instead migrates from batch to batch until the last one, which has none
-    # left to borrow from, and the run dies there hours in. A zero budget is exempt: no
-    # drop is tolerated at all then, so nothing reaches the shortfall path and the
-    # warnings below are the right register.
-    if sampler_never_stamps and drop_budget:
+    # weight_fifo builds a step only from groups sharing one start_weight, so a lost
+    # group cannot be charged to a step: it is never substituted (a replacement would be
+    # dispatched later, usually under a newer weight, and land in another bucket) and
+    # shrinking the
+    # assembling step leaves the bucket it came from short. The step waits on a group
+    # nobody is generating and the run stalls with no error. A zero budget is exempt:
+    # no drop is tolerated then, so nothing reaches that path.
+    if sampler_name == "weight_fifo" and drop_budget:
         raise ValueError(
-            f"async_rl.sampler.name={sampler_name!r} stamps no target step, so the drop "
-            f"budget (max_skipped_prompts={failure_config.max_skipped_prompts}, "
+            "async_rl.sampler.name='weight_fifo' cannot honour the drop budget "
+            f"(max_skipped_prompts={failure_config.max_skipped_prompts}, "
             f"max_consecutive_dropped_prompts="
-            f"{failure_config.max_consecutive_dropped_prompts}) cannot be honoured: a "
-            "prompt that is given up on is never subtracted from the step waiting for "
-            "it, so that step waits on a group no one is generating -- ending the run "
-            "at its final step, or stalling it outright with no error at all. Set "
-            "async_rl.sampler.name='in_order' to get the tolerance these budgets "
-            "promise, or set both budgets to 0 to end the run on the first dropped "
-            "prompt instead."
+            f"{failure_config.max_consecutive_dropped_prompts}): it builds each step "
+            "only from groups generated under one weight version, so a lost group can "
+            "be neither reliably replaced (its replacement is dispatched later, and "
+            "lands in a newer weight's bucket unless the trainer has not moved since) "
+            "nor charged to a step, and the step waits on a group no one is "
+            "generating. Set async_rl.sampler.name to 'in_order' or "
+            "'ready_first', or set both budgets to 0 to end the run on the first "
+            "dropped prompt instead."
         )
 
     if (
-        sampler_stamps
+        sampler_shrinks_steps
         and drop_budget
         and floor >= num_prompts_per_step
         and failure_config.on_dropped_prompt == "shrink"
@@ -1067,13 +1053,22 @@ def _validate_failure_settings(
             stacklevel=2,
         )
 
-    if failure_config.on_dropped_prompt == "replace" and sampler_never_stamps:
+    if failure_config.on_dropped_prompt == "replace" and sampler_name in (
+        "windowed",
+        "weight_fifo",
+    ):
+        why = (
+            "its rollout never stops producing, so a dropped group is made up by later "
+            "ones"
+            if sampler_name == "windowed"
+            else "a replacement is dispatched later and, unless the trainer has not "
+            "moved since, lands in a newer weight version's bucket than the step it is "
+            "meant to fill"
+        )
         warnings.warn(
             f"async_rl.rollout_failure.on_dropped_prompt='replace' does nothing with "
-            f"the {sampler_name} sampler: it does not stamp a target step, so no step "
-            "is ever left short, the spare pool is never filled, and every drop "
-            "behaves as 'shrink'. replaced_prompt_groups will stay at 0 whether or "
-            "not anything failed.",
+            f"the {sampler_name} sampler: {why}, so no spare pool is filled. "
+            "replaced_prompt_groups will stay at 0 whether or not anything failed.",
             stacklevel=2,
         )
 
@@ -1195,7 +1190,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     # Dynamic sampling drops uniform groups, and each drop needs a replacement prompt.
-    # The default on_dropped_prompt="shrink" would silently shrink the step instead.
+    # The default on_dropped_prompt="shrink" would silently shrink the step instead. The
+    # windowed sampler is exempt: its rollout keeps producing, so later groups make up for
+    # a dropped one without a spare pool.
     if algo_cfg.use_dynamic_sampling:
         # Dynamic-sampling drops shorten the training step. PPO's critic shards that
         # step against value.train_global_batch_size, so the first short step fails a
@@ -1213,7 +1210,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
         rollout_failure = async_config.rollout_failure
-        if rollout_failure.on_dropped_prompt != "replace":
+        if async_config.sampler.name == "weight_fifo":
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling cannot be combined with "
+                "async_rl.sampler.name='weight_fifo'. weight_fifo builds each step "
+                "only from groups generated under the same weight version, and a "
+                "replacement for a filtered group is generated later, under a newer "
+                "version. The step can then never fill, and training hangs. "
+                "Set async_rl.sampler.name to 'in_order' or 'ready_first', or turn "
+                f"off {algo_prefix}.use_dynamic_sampling."
+            )
+        if (
+            async_config.sampler.name != "windowed"
+            and rollout_failure.on_dropped_prompt != "replace"
+        ):
             raise ValueError(
                 f"{algo_prefix}.use_dynamic_sampling requires "
                 'async_rl.rollout_failure.on_dropped_prompt="replace"; with '
@@ -1221,20 +1231,33 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "substituted, so each zero-variance group silently shrinks its "
                 "training step instead of being resampled."
             )
-        if async_config.sampler.name not in ("in_order", "custom"):
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling requires a sampler that stamps a "
-                "target step (async_rl.sampler.name must be 'in_order', or a 'custom' "
-                f"sampler that stamps one), but got '{async_config.sampler.name}': "
-                "without a stamped step a filtered group cannot be credited short or "
-                "replaced, so every filtered group silently shrinks the batch."
-            )
         if algo_cfg.num_generations_per_prompt < 2:
             raise ValueError(
                 f"{algo_prefix}.use_dynamic_sampling requires "
                 "num_generations_per_prompt >= 2: a single generation has no "
                 "within-group spread, so every group would be filtered "
                 f"(got {algo_cfg.num_generations_per_prompt})."
+            )
+        # windowed has no spare pool, so filtered groups are never replaced and the data
+        # runs out mid-step: the last step holds (total - filtered) mod P groups. Any
+        # floor above 1 rejects most such tails and fails the run after every full step
+        # has trained.
+        tail_floor = math.ceil(
+            algo_cfg.num_prompts_per_step * rollout_failure.min_step_batch_fraction
+        )
+        if async_config.sampler.name == "windowed" and tail_floor > 1:
+            warnings.warn(
+                f"{algo_prefix}.use_dynamic_sampling with the windowed sampler has no "
+                "spare pool, so when the data runs out the last step holds only the "
+                "groups left, usually fewer than num_prompts_per_step="
+                f"{algo_cfg.num_prompts_per_step}. "
+                f"async_rl.rollout_failure.min_step_batch_fraction="
+                f"{rollout_failure.min_step_batch_fraction} gives a floor of "
+                f"{tail_floor}, so a shorter last step fails the run after every full "
+                "step has trained. Lower min_step_batch_fraction to at most "
+                "1 / num_prompts_per_step to let the last step close short, or cap "
+                "the run with max_num_steps.",
+                stacklevel=2,
             )
 
     if not is_ppo_run(master_config):
