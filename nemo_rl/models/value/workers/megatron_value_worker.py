@@ -67,6 +67,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
+    clear_transient_model_caches,
     broadcast_tensor,
     get_aux_loss_track_names,
     get_moe_metrics,
@@ -1059,6 +1060,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_inference(self) -> None:
         """Offload model params to CPU after inference."""
+        clear_transient_model_caches(self.model)
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
@@ -1072,6 +1074,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         # releases the CUDA parameter storage, so refresh while it is resident,
         # as the policy worker does before finish_inference offload.
         self.model.eval()
+        clear_transient_model_caches(self.model)
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True
         )

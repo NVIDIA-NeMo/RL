@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
@@ -24,6 +25,35 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+
+def clear_transient_model_caches(model: torch.nn.Module) -> None:
+    """Release completed forward/backward caches before yielding colocated GPUs.
+
+    Call only after the phase's backward passes have finished. Dispatchers are
+    plain Python objects, so moving the enclosing module to CPU does not move
+    their routing tensors. In particular, recomputed routing probabilities can
+    retain the checkpoint autograd graph as well as the routing allocation.
+    Model parameters, gradient buffers and optimizer state are left unchanged.
+    """
+    # Older MCore versions cache rotary tensors across sequence lengths.
+    clear_rotary_cache = getattr(RotaryEmbedding.forward, "cache_clear", None)
+    if clear_rotary_cache is not None:
+        clear_rotary_cache()
+
+    for module in model.modules():
+        dispatcher = getattr(module, "token_dispatcher", None)
+        if dispatcher is None:
+            continue
+        for attr in (
+            "probs",  # AllToAll + AllGather
+            "routing_map",  # AllToAll
+            "reversed_local_input_permutation_mapping",  # AllToAll
+            "local_probs",  # AllGather
+            "local_map",  # AllGather
+        ):
+            if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                setattr(dispatcher, attr, None)
 
 
 def validate_cc_execution_padding(model: torch.nn.Module) -> None:

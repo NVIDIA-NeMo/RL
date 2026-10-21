@@ -1417,8 +1417,9 @@ def test_qwen3vl_type_fallback_still_delegates_packing():
     assert _model_self_packs_for_cp(Qwen3VLModel.__new__(Qwen3VLModel))
 
 
-class _FakeTrainableModel:
+class _FakeTrainableModel(torch.nn.Module):
     def __init__(self):
+        super().__init__()
         self.train_called = False
         self.eval_called = False
 
