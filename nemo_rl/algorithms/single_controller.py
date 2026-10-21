@@ -95,6 +95,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    _save_adaptive_loss_state,
+    _update_adaptive_loss_state,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
@@ -3574,6 +3576,7 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    _update_adaptive_loss_state(self._loss_fn, step_metrics)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -5195,6 +5198,7 @@ class SingleControllerActor:
             save_state.current_epoch = self._current_epoch
             save_state.consumed_samples = self._consumed_samples
             save_state.total_valid_tokens = self._total_valid_tokens
+            _save_adaptive_loss_state(save_state, self._loss_fn)
             save_state.sampler_name = self._async_cfg.sampler.name
             save_state.sampler_dispatch_index = self._sampler.dispatch_index
             dataloader_state = self._dataloader.state_dict()

@@ -2,7 +2,7 @@ defaults: grpo-qwen3-8b-4n8g-automodel.yaml
 # Qwen3-30B-A3B-Instruct-2507 GRPO math baseline (NO speculative decoding),
 # Automodel backend, 4 nodes x 8 GPUs. MoE sibling of the
 # Qwen3-8B baseline: EP=32 shards the 128 experts across all GPUs via
-# HybridEP dispatch + grouped-GEMM experts; dtensor TP stays 1.
+# HybridEP dispatch + grouped-GEMM experts; Automodel TP stays 1.
 grpo:
   val_period: 10
 checkpointing:

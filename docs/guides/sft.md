@@ -239,7 +239,7 @@ sft:
 
 policy:
   train_micro_batch_size: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false
