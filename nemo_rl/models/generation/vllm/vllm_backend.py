@@ -2171,31 +2171,33 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Done once ahead of refit; the cached mapping is reused by every
         ``nccl_reshard_refit`` call.
         """
+        self._validate_native_layerwise_refit("nccl_reshard")
+
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
 
-        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            restore_refit_info_placements(refit_info)
-        )
+        refit_info = restore_refit_info_placements(refit_info)
         state_dict_info = {
             param["name"]: (
                 tuple(param["global_shape"]),
                 _STR_TO_DTYPE[param["dtype"]],
             )
-            for layer_name in self.nccl_reshard_refit_info["layer_names"]
-            for param in self.nccl_reshard_refit_info["per_layer_params"][layer_name]
+            for layer_name in refit_info["layer_names"]
+            for param in refit_info["per_layer_params"][layer_name]
         }
         state_dict_info.update(
             {
                 name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
-                for name, meta in self.nccl_reshard_refit_info.get(
-                    "misc_meta", {}
-                ).items()
+                for name, meta in refit_info.get("misc_meta", {}).items()
             }
         )
         self._prepare_model_update_manifest(state_dict_info)
-        self._validate_native_layerwise_refit("nccl_reshard")
+        # The draft check needs this refit's manifest, so it runs before storing.
+        self._reject_native_refit_of_trtllm_moe_draft()
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+            refit_info
+        )
 
         if self._uses_unquantized_flashinfer_trtllm() and not self.pp_comm_groups:
             # The TRTLLM expert map needs the per-PP-stage communicator ranks,
