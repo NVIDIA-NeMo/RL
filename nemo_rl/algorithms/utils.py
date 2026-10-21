@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Optional
@@ -32,7 +33,11 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.models.policy import TokenizerConfig
-from nemo_rl.telemetry.vocabulary import RUN_WINDOW_WALL_CLOCK_CATEGORIES
+from nemo_rl.telemetry.vocabulary import (
+    EFFICIENCY_PCT_KEY,
+    EFFICIENCY_PCT_PER_STEP_KEY,
+    RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+)
 from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
@@ -1014,6 +1019,9 @@ def log_generation_metrics(
 
 
 WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    # Spelled out rather than INIT_TOTAL_CATEGORY: this list is the canonical
+    # declaration, and the telemetry suite parses it as string literals to keep
+    # the constants that restate it honest.
     "init/total",
     "idle/buffer_starvation",
     "idle/refit_bubble",
@@ -1130,13 +1138,44 @@ def print_efficiency_summary(
     loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
     loggable["efficiency/total_waste_s"] = wall_waste
     loggable["efficiency/productive_time_s"] = productive
-    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable[EFFICIENCY_PCT_KEY] = efficiency_pct
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
     # Carries the window of the ratio above to the OTel tee, which tags it. A
     # caller that supplies no per-step denominator gets a run-cumulative ratio,
     # and publishing that as per-step would state the opposite of what it is.
     # A float, not the string it represents, because everything in this dict is
     # also logged to WandB/TensorBoard as a scalar.
-    loggable["efficiency/efficiency_pct_is_per_step"] = float(pct_is_per_step)
+    loggable[EFFICIENCY_PCT_PER_STEP_KEY] = float(pct_is_per_step)
 
     return loggable
+
+
+_DRAFT_RATIO_NUM_RE = re.compile(r"^(draft_.*)_num(@\d+)?$")
+
+
+def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Turn summed ``draft_*_num``/``draft_*_den`` metric pairs back into ratios, in place.
+
+    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/runtime.py``)
+    emit per-microbatch accuracy/rate metrics as raw num/den pairs instead of
+    pre-divided ratios, because the training loop's default per-key metric
+    reduction sums every metric not on its small mean-reduction allowlist
+    across all microbatches and DP ranks -- summing a pre-divided
+    per-microbatch ratio would produce a meaningless value (e.g. a
+    "draft_full_acc@0" of 240 instead of a rate in [0, 1]). Call this AFTER
+    that per-key reduction has summed the raw num/den pairs into global
+    totals, so the ratio it computes is the correct token-weighted global
+    rate. Deliberately dependency-free (no nemo_automodel import) so the
+    driver process can call it unconditionally.
+    """
+    for key in list(metrics.keys()):
+        match = _DRAFT_RATIO_NUM_RE.match(key)
+        if match is None:
+            continue
+        base, suffix = match.group(1), match.group(2) or ""
+        den_key = f"{base}_den{suffix}"
+        if den_key not in metrics:
+            continue
+        num = metrics.pop(key)
+        den = metrics.pop(den_key)
+        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0

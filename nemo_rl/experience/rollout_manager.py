@@ -75,6 +75,7 @@ from nemo_rl.experience.rollout_recovery import (
     SiblingSealResult,
 )
 from nemo_rl.experience.rollouts import (
+    _SHARED_GENRM_METRICS,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -82,11 +83,13 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_group_metrics,
     _tensorize_by_key,
     apply_reward_penalties,
     attach_static_multimodal_payload,
     calculate_rewards,
     compute_reward_penalty_metrics,
+    nemo_gym_rollout_hit_max_tokens,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -1394,6 +1397,10 @@ class AsyncNemoGymRolloutImpl:
                     result.get("full_result") or {} for result in completed_results
                 ],
             )
+            # Receipt metrics come from their manifests, not token-bearing results.
+            receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
+            if not receipt_mode:
+                rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
@@ -1472,9 +1479,10 @@ class AsyncNemoGymRolloutImpl:
                     )
                 )
                 continue
-            truncated = (
-                sum(len(m["token_ids"]) for m in result["message_log"])
-                == self._max_seq_len
+            truncated = nemo_gym_rollout_hit_max_tokens(
+                result["full_result"],
+                total_tokens=sum(len(m["token_ids"]) for m in result["message_log"]),
+                max_total_tokens_per_sample=self._max_seq_len,
             )
             completions.append(
                 Completion(
@@ -1613,6 +1621,8 @@ class AsyncNemoGymRolloutImpl:
                 for c in completions
             ]
         for key in agent_extras[0].keys():
+            if key in _SHARED_GENRM_METRICS:
+                continue
             values = [
                 float(r[key])  # type: ignore
                 for r in agent_extras

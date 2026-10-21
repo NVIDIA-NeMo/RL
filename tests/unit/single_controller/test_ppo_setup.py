@@ -523,7 +523,7 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    def test_rejects_a_dtensor_critic(self):
+    def test_rejects_automodel_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""
         mc = _ppo_master_config(value=_value_config(megatron_enabled=False))
 

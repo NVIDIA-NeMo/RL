@@ -218,6 +218,7 @@ def test_disabled_opd_full_leaves_the_logprob_path_intact():
             "sequence_level_importance_ratios",
         ),
         ({"use_importance_sampling_correction": True}, "exact expectation"),
+        ({"score_centering_top_k": 128}, "score_centering_top_k"),
         (
             {"truncated_importance_sampling_type": "tis"},
             "truncated_importance_sampling_type",

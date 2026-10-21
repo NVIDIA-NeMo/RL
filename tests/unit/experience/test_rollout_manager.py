@@ -1087,6 +1087,34 @@ def test_receipt_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+@pytest.mark.parametrize(
+    ("response", "expected_truncated"),
+    [
+        pytest.param(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+            True,
+            id="length_incomplete",
+        ),
+        pytest.param(
+            {"status": "completed", "incomplete_details": None},
+            False,
+            id="completed",
+        ),
+    ],
+)
+def test_result_to_completion_truncated_on_length_incomplete_response(
+    response, expected_truncated
+):
+    result = _mask_gate_result()
+    result["full_result"]["response"] = response
+    completion = _nemo_gym_impl(True)._results_to_completions([result])[0][0]
+    # Two tokens, far below max_seq_len: only the length cut marks truncation.
+    assert completion.truncated is expected_truncated
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_streamed_receipt_callback_uses_current_completion_conversion(
     log_full_result_tables,
@@ -1172,6 +1200,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 0.0,
+                "reward_score_raw": 0.0,
+                "optional_score": 1.0,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1185,6 +1215,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 1.0,
+                "reward_score_raw": 1.0,
+                "optional_score": None,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1204,6 +1236,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
     assert metrics["agent/gen_tokens_per_sample/max"] == 3
     assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
+    assert metrics["agent/optional_score/mean"] == pytest.approx(0.5)
+    assert "agent/reward_score_raw/mean" not in metrics
 
 
 def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():

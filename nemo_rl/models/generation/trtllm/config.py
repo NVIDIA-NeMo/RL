@@ -84,6 +84,8 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
     model_name: NotRequired[str]
     max_model_len: int
     precision: str
+    # With precision="fp8", use MXFP8 (UE8M0 1x32 scales) instead of 128x128 block-FP8.
+    is_mx: NotRequired[bool]
     expose_http_server: NotRequired[bool]
     async_engine: NotRequired[bool]
     # Duplicated from grpo.async_grpo because the generation backend never sees
