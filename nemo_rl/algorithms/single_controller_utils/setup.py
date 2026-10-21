@@ -49,6 +49,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
     sampler_supports_training_claims,
+    sampler_supports_transactional_admission,
     warn_if_custom_sampler_lacks_drop_accounting,
 )
 from nemo_rl.algorithms.grpo import (
@@ -1189,6 +1190,11 @@ def setup_single_controller(
         )
     if algo_cfg.use_dynamic_sampling:
         warn_if_custom_sampler_lacks_drop_accounting(master_config.async_rl.sampler)
+        if not sampler_supports_transactional_admission(master_config.async_rl.sampler):
+            raise ValueError(
+                "Dynamic sampling requires TransactionalAdmissionSampler: the admission "
+                "wait must permit filtering-pool refill outside checkpoint mutations."
+            )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     snapshots_enabled = rollout_snapshots_enabled(master_config)

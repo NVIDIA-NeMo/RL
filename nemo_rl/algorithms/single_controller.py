@@ -2004,7 +2004,9 @@ class SingleControllerActor:
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
                         if filtered and not self._sampler_uses_replacement_pool():
-                            async with self._dispatch_reservation("prompt_reservations") as cut:
+                            async with self._dispatch_reservation(
+                                "prompt_reservations"
+                            ) as cut:
                                 self._discard_prompt_group(cut, lineage_group_id)
                                 self._charge_filtered_prompt(target_step)
                             self._buffer_capacity.release()
@@ -2033,10 +2035,8 @@ class SingleControllerActor:
 
                         if filtered:
                             filtered_replacements += 1
-                            drawn = (
-                                self._filtered_prompts_by_step.get(target_step, 0)
-                                if target_step is not None
-                                else 0
+                            drawn = self._filtered_prompts_by_step.get(
+                                self._accounting_step(target_step), 0
                             )
                             spent = (
                                 f"{drawn}/"
@@ -2134,12 +2134,17 @@ class SingleControllerActor:
             await lock.acquire()
 
         async def wait_for_admission() -> None:
+            if not isinstance(self._sampler, TransactionalAdmissionSampler):
+                raise RuntimeError(
+                    "dynamic sampling requires TransactionalAdmissionSampler"
+                )
             admission = asyncio.create_task(
                 self._sampler.wait_until_admissible(
                     trainer_version_fn=lambda: self._trainer_version
                 )
             )
             try:
+                await asyncio.sleep(0)
                 while not admission.done():
                     await maybe_refill()
                     await asyncio.sleep(0.1)
@@ -2488,7 +2493,9 @@ class SingleControllerActor:
             return self._rollout_runtime.filtered_reserve.popleft()
         if not self._dataloader_exhausted:
             raise RuntimeError("filtered replacement pool emptied before consumption")
-        self._rollout_runtime.steps_allowed_short.add(self._accounting_step(target_step))
+        self._rollout_runtime.steps_allowed_short.add(
+            self._accounting_step(target_step)
+        )
         return None
 
     @contextlib.asynccontextmanager
@@ -2643,10 +2650,11 @@ class SingleControllerActor:
     def _target_groups_for_step(self, step: int) -> int:
         """How many prompt groups this step should train on, after dropped prompts.
 
-        ``num_prompts_per_step`` is the target; groups stamped for this step that were
-        given up on are subtracted, because they are never arriving and a sampler that
-        matches batches to steps exactly cannot substitute another step's groups for
-        them. Without this the pump waits on a group no one is generating.
+        ``num_prompts_per_step`` is the target; groups charged to this step that were
+        given up on are subtracted, because they are never arriving. Which step a lost
+        group is charged to is the sampler's call (see ``DropAccountingSampler``): the
+        step it was stamped for, the step being assembled, or none. Without this the
+        pump waits on a group no one is generating.
 
         A data-exhausted step returns its remaining target even below the floor,
         allowing the train pump to drain its groups and abort accumulated gradients.
@@ -2921,8 +2929,12 @@ class SingleControllerActor:
                                     # min_step_batch_fraction.
                                     missing = target_groups - groups_dispatched
                                     if self._dynamic_sampling_enabled:
-                                        self._rollout_runtime.steps_allowed_short.add(version_during_step)
-                                    self._rollout_runtime.batch_shortfall[version_during_step] = (
+                                        self._rollout_runtime.steps_allowed_short.add(
+                                            version_during_step
+                                        )
+                                    self._rollout_runtime.batch_shortfall[
+                                        version_during_step
+                                    ] = (
                                         self._rollout_runtime.batch_shortfall.get(
                                             version_during_step, 0
                                         )

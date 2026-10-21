@@ -260,8 +260,12 @@ def test_unstamped_groups_are_not_recorded_without_a_provider():
 def test_unstamped_groups_are_tallied_under_the_step_being_assembled():
     manager = _manager()
     manager.set_tally_step_provider(lambda: 4)
-    manager.record_group_rewards(None, [1.0, 0.0], replacement_index=0, zero_variance=False)
-    manager.record_group_rewards(3, [1.0, 1.0], replacement_index=0, zero_variance=False)
+    manager.record_group_rewards(
+        None, [1.0, 0.0], replacement_index=0, zero_variance=False
+    )
+    manager.record_group_rewards(
+        3, [1.0, 1.0], replacement_index=0, zero_variance=False
+    )
 
     assert manager.drain_step_reward_metrics(3)["generated_prompt_groups"] == 1.0
     metrics = manager.drain_step_reward_metrics(4)
@@ -273,9 +277,13 @@ def test_the_provider_is_read_when_the_group_is_recorded():
     manager = _manager()
     assembling = {"step": 2}
     manager.set_tally_step_provider(lambda: assembling["step"])
-    manager.record_group_rewards(None, [1.0, 0.0], replacement_index=0, zero_variance=False)
+    manager.record_group_rewards(
+        None, [1.0, 0.0], replacement_index=0, zero_variance=False
+    )
     assembling["step"] = 3
-    manager.record_group_rewards(None, [0.0, 0.0], replacement_index=0, zero_variance=False)
+    manager.record_group_rewards(
+        None, [0.0, 0.0], replacement_index=0, zero_variance=False
+    )
 
     assert manager.drain_step_reward_metrics(2)["generated_prompt_groups"] == 1.0
     assert manager.drain_step_reward_metrics(3)["generated_prompt_groups"] == 1.0
