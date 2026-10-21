@@ -17,9 +17,15 @@ from typing import Literal, NotRequired, TypedDict, Union
 from nemo_rl.data.energon.config import EnergonLoaderConfig, EnergonSourceConfig
 
 
+class MegatronSFTDatasetConfig(TypedDict):
+    prompt_format: Literal["identity", "nemotron-nano-v2", "nemotron-h-aligned"]
+    override_pad_token: NotRequired[str | None]
+
+
 class ResponseDatasetConfig(TypedDict):
     dataset_name: NotRequired[str]
     data_path: NotRequired[str]
+    chat_key: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]
     subset: NotRequired[str | None]
@@ -33,12 +39,16 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    megatron_sft: NotRequired[MegatronSFTDatasetConfig]
     # TODO(rohitrango): Move model-specific media controls to ProcessorInterface.
     num_frames: NotRequired[int]
     video_sampling_style: NotRequired[Literal["nemotron_vl"]]
     video_target_num_patches: NotRequired[int | None]
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
+    # Zero-pad audio to a multiple of the feature hop length, matching vLLM
+    # models that do this before feature extraction (e.g. Qwen3-Omni).
+    pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
     max_samples: NotRequired[int | None]
 
@@ -59,6 +69,7 @@ class PreferenceDatasetConfig(TypedDict):
     video_target_num_patches: NotRequired[int | None]
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
+    pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
     split_validation_size: NotRequired[float | int]
     legacy_validation_split: NotRequired[bool]

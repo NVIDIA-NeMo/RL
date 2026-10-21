@@ -140,9 +140,6 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
         # asks the backend which one that is. A stand-in has to carry every hook the code
         # under test reads, or it tests a shape the product never has.
         get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
-        # Same reason: the policy is asked for refit metadata in the backend's payload
-        # representation, so the stand-in has to answer which one that is.
-        get_refit_payload_mode=lambda: "hf_export",
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -154,22 +151,22 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     refit_info_pushes = []
     generation.prepare_refit_info = lambda info: refit_info_pushes.append(info)
     generation.refit_info_pushes = refit_info_pushes
-    generation.rebuild_collective = (
-        lambda membership, ip, port: vllm_generation.VllmGeneration.rebuild_collective(
+    generation.rebuild_collective = lambda membership, ip, port: (
+        vllm_generation.VllmGeneration.rebuild_collective(
             generation, membership, ip, port
         )
     )
     policy_calls = []
-    refit_payload_modes = []
+    refit_info_requests = []
+
+    def prepare_refit_info() -> dict[str, object]:
+        state_dict_info = {"model.weight": object()}
+        refit_info_requests.append(state_dict_info)
+        return state_dict_info
+
     policy = SimpleNamespace(
-        # Keyword-only, exactly as Policy.prepare_refit_info has been since #3739. A
-        # stand-in that accepted a bare call is how the rebuild shipped without the
-        # argument: every test here passed while every collective-transport recovery on
-        # hardware died at this line with a TypeError before touching NCCL.
-        prepare_refit_info=lambda *, refit_payload_mode: (
-            refit_payload_modes.append(refit_payload_mode) or {"model.weight": object()}
-        ),
-        refit_payload_modes=refit_payload_modes,
+        prepare_refit_info=prepare_refit_info,
+        refit_info_requests=refit_info_requests,
         init_collective=lambda ip,
         port,
         world_size,
@@ -213,20 +210,37 @@ class TestRebuildDispatch:
         # survivors really were called.
         assert [w.idx for w in workers if w.calls] == [0, 1, 3]
 
-    def test_refit_info_is_regenerated_in_the_backend_s_payload_mode(self, monkeypatch):
-        """The rebuild asks the policy for refit metadata the way init_communicator does.
+    def test_rebuild_repeats_the_prequantization_handshake(self, monkeypatch):
+        monkeypatch.setattr("ray.get", lambda futures: futures)
+        sync, _, _ = _rebuildable(dead_shards=(2,))
+        initial_info = {"model.weight": {"dtype": "bfloat16"}}
+        updated_info = {"model.weight": {"dtype": "float8_e4m3fn"}}
+        pushed_info = []
+        enabled_names = []
+        sync._policy.cfg = {"megatron_cfg": {"enabled": True}}
+        sync._policy.prepare_refit_info = lambda: initial_info
+        sync._policy.enable_refit_prequantize = lambda names: (
+            enabled_names.extend(names) or updated_info
+        )
+        sync._generation.prepare_refit_info = lambda info: (
+            pushed_info.append(info)
+            or (["model.weight"] if len(pushed_info) == 1 else None)
+        )
 
-        Policy.prepare_refit_info takes a keyword-only refit_payload_mode (#3739) and the
-        backend decides which one; a rebuild that omits it does not degrade, it raises,
-        and it does so on the recovery path -- so a run that lost a shard died in the
-        rebuild that was meant to save it (PR #3929 validation, CW-DFW job 18689836).
-        """
+        sync.reconcile_communicator([2])
+
+        assert enabled_names == ["model.weight"]
+        assert pushed_info == [initial_info, updated_info]
+
+    def test_refit_info_is_regenerated_and_redistributed(self, monkeypatch):
+        """The rebuild refreshes metadata through the argument-free policy API."""
         monkeypatch.setattr("ray.get", lambda futures: futures)
         sync, _, _ = _rebuildable(dead_shards=(2,))
 
         assert sync.reconcile_communicator([2]) is True
 
-        assert sync._policy.refit_payload_modes == ["hf_export"]
+        assert len(sync._policy.refit_info_requests) == 1
+        assert sync._generation.refit_info_pushes == sync._policy.refit_info_requests
         assert len(sync._generation.refit_info_pushes) == 1, (
             "the metadata must reach every shard after the rebuild"
         )
@@ -441,10 +455,9 @@ class TestControllerCallSite:
         _condemn(monitor, 1)
         calls = []
         synchronizer = SimpleNamespace(
-            reconcile_communicator=lambda absent, force=False: calls.append(
-                list(absent)
+            reconcile_communicator=lambda absent, force=False: (
+                calls.append(list(absent)) or False
             )
-            or False
         )
         ctrl = self._controller(monitor, synchronizer)
 

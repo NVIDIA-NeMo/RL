@@ -2,3 +2,7 @@ defaults: vlm_grpo-nemotron-omni-30ba3b-clevr-2n8g-megatron-tp8ep8.v1.yaml
 data_plane:
   enabled: true
   backend: mooncake_cpu
+data:
+  # mooncake_cpu RDMA-pins a large segment on the driver, so forking DataLoader
+  # workers from it copies the pinned pages (~20s per validation); load in-process.
+  num_workers: 0

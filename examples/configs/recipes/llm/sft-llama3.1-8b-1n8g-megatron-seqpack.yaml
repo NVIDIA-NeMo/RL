@@ -13,7 +13,7 @@ policy:
   train_global_batch_size: 512
   train_micro_batch_size: 2
   max_total_sequence_length: 4096
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   sequence_packing:
     enabled: true

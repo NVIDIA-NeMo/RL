@@ -37,12 +37,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.automodel.convert import convert_dcp_to_hf
 from nemo_rl.models.megatron.community_import import (
     export_model_from_megatron,
     import_model_from_hf_name,
 )
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
 
 _CONVERTER_PATH = os.path.normpath(
     os.path.join(
@@ -86,8 +86,7 @@ def create_test_config() -> Dict[str, Any]:
             "max_total_sequence_length": 128,
             "precision": "bfloat16",
             "offload_optimizer_for_logprob": False,
-            "dtensor_cfg": {
-                "_v2": True,
+            "automodel_cfg": {
                 "enabled": True,
                 "checkpoint": {
                     "model_save_format": "torch_save",
@@ -473,7 +472,7 @@ def main():
 
         # Step 2: Create DCP checkpoint
         print("\n" + "=" * 60)
-        print("STEP 2: Creating DTensor DCP checkpoint")
+        print("STEP 2: Creating Automodel DCP checkpoint")
         print("=" * 60)
         dcp_checkpoint_path = create_dcp_checkpoint(
             model_name, create_test_config(), temp_dir
@@ -485,9 +484,9 @@ def main():
         print("=" * 60)
         megatron_checkpoint_path = create_megatron_checkpoint(model_name, temp_dir)
 
-        # Step 4: Convert DTensor DCP to HF
+        # Step 4: Convert Automodel DCP to HF
         print("\n" + "=" * 60)
-        print("STEP 4: Converting DTensor DCP to HF format")
+        print("STEP 4: Converting Automodel DCP to HF format")
         print("=" * 60)
         dcp_to_hf_path = convert_dcp_to_hf_checkpoint(
             dcp_checkpoint_path, model_name, temp_dir
@@ -539,7 +538,7 @@ def main():
         print("STEP 6: Loading converted models and comparing")
         print("=" * 60)
 
-        # Load DTensor DCP-converted model
+        # Load Automodel DCP-converted model
         dcp_converted_model = AutoModelForCausalLM.from_pretrained(
             dcp_to_hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
@@ -556,12 +555,12 @@ def main():
         print("STEP 7: Running assertions")
         print("=" * 60)
 
-        # Compare DTensor DCP-converted vs Original HF model
-        print("Comparing DTensor DCP-converted HF model with Original HF model...")
+        # Compare Automodel DCP-converted vs Original HF model
+        print("Comparing Automodel DCP-converted HF model with Original HF model...")
         assert_state_dicts_equal(
             dcp_converted_state_dict,
             original_state_dict,
-            "DTensor DCP-converted HF model",
+            "Automodel DCP-converted HF model",
             "Original HF model",
         )
 
@@ -574,9 +573,7 @@ def main():
             "Original HF model",
         )
 
-        print(
-            "✓ Dtensor V1 and Dtensor V2 DCP and Megatron roundtrip checkpoints are identical!"
-        )
+        print("✓ Automodel DCP and Megatron roundtrip checkpoints are identical!")
 
         # LoRA merged model: should have same keys as original but different values
         # (because the LoRA adapter perturbs the weights).
@@ -671,7 +668,7 @@ def main():
         megatron_keys = set(megatron_converted_state_dict.keys())
 
         assert dcp_keys == expected_keys, (
-            f"DTensor DCP converted model missing keys: {expected_keys - dcp_keys}"
+            f"Automodel DCP converted model missing keys: {expected_keys - dcp_keys}"
         )
         assert megatron_keys == expected_keys, (
             f"Megatron converted model missing keys: {expected_keys - megatron_keys}"
@@ -688,7 +685,7 @@ def main():
             megatron_output = megatron_converted_model(test_input)
 
         print(
-            "✓ DTensor DCP, Megatron, and LoRA merged models can perform forward passes"
+            "✓ Automodel DCP, Megatron, and LoRA merged models can perform forward passes"
         )
 
         print("\n" + "=" * 80)

@@ -5,7 +5,7 @@ loss_fn:
 policy:
   max_total_sequence_length: 24576
   logprob_batch_size: 2
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 2
   optimizer:
     kwargs:

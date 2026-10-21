@@ -183,9 +183,14 @@ def _valid_sample_record(
     valid_length: int,
     preview_limit: int = 16,
 ) -> dict[str, Any]:
-    sample = tensor[sample_idx, :valid_length]
+    if tensor.is_nested:
+        sample = tensor.unbind()[sample_idx][:valid_length]
+        full_shape = [tensor.size(0)]
+    else:
+        sample = tensor[sample_idx, :valid_length]
+        full_shape = list(tensor.shape)
     return {
-        "full_shape": list(tensor.shape),
+        "full_shape": full_shape,
         "valid_shape": list(sample.shape),
         "dtype": str(tensor.dtype),
         "valid_sha256": _tensor_sha256(sample),

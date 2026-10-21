@@ -13,7 +13,7 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   max_total_sequence_length: 8192
-  dtensor_cfg:
+  automodel_cfg:
     cpu_offload: true
     activation_checkpointing: true
     checkpoint:

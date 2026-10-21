@@ -106,6 +106,16 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
         ({"quant_cfg": "fp8"}, {}),
         ({"vllm_cfg": {"precision": "fp8", "kv_cache_dtype": "auto"}}, {}),
         (
+            {
+                "vllm_cfg": {
+                    "precision": "bfloat16",
+                    "kv_cache_dtype": "auto",
+                    "refit_prequantize": True,
+                }
+            },
+            {},
+        ),
+        (
             {"vllm_cfg": {"precision": "bfloat16", "kv_cache_dtype": "fp8_e4m3"}},
             {},
         ),

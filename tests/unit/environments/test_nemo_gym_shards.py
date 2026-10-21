@@ -692,6 +692,7 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
             "common_overrides": {"x": 1},
             "allowed_duplicate_entries": ["policy_model"],
             "effort_levels": {"low_weight": 0.0},
+            "external_service_readiness": {"services": []},
             "tokenizer_config": {"name": "policy"},
             "genrm_model": {"responses_api_models": {}},
             "safety_judge_model": {"responses_api_models": {}},
@@ -699,3 +700,27 @@ def test_find_gym_config_entries_ignores_scalars_and_known_keys():
     )
 
     assert entries == ["genrm_model", "safety_judge_model"]
+
+
+def test_external_service_readiness_reaches_every_shard():
+    """The readiness gate is a NeMo RL setting, not an overlay a shard must claim."""
+    readiness = {
+        "services": [
+            {
+                "name": "GENRM",
+                "url": "http://10.0.0.1:9213/health",
+                "expected_backends": 2,
+            }
+        ],
+        "timeout_seconds": 10,
+        "poll_interval_seconds": 1,
+        "request_timeout_seconds": 2,
+    }
+    config = _sharded_config(external_service_readiness=readiness)
+
+    plan = parse_shard_plan(config)
+
+    assert plan is not None
+    for shard in plan.shards:
+        merged = apply_shard_overlay(config, plan, shard)
+        assert merged["external_service_readiness"] == readiness

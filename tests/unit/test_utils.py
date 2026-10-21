@@ -40,6 +40,28 @@ class SimpleLossFn:
         return loss, metrics
 
 
+class UnitSequenceLossFn(SimpleLossFn):
+    """Give each valid sequence unit loss, with a graph for backward.
+
+    Keep this helper outside pytest modules so Ray workers can deserialize it
+    without importing pytest, which is only installed in the test driver.
+    """
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        num_valid_samples = data["sample_mask"].sum()
+        loss = logits.float().mean() * 0 + num_valid_samples / global_valid_seqs
+        return loss, {
+            "loss": loss.item(),
+            "num_valid_samples": num_valid_samples.item(),
+        }
+
+
 # Create a simple masked NLL loss function
 class SimpleNLLLossFn:
     loss_type = LossType.TOKEN_LEVEL

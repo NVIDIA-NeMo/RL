@@ -33,6 +33,7 @@ _SPAN_EMITTING_DIRS = (
     _REPO / "nemo_rl" / "distributed",
     _REPO / "nemo_rl" / "data_plane",
     _REPO / "nemo_rl" / "environments",
+    _REPO / "nemo_rl" / "utils",
     _REPO / "examples",
 )
 
@@ -310,6 +311,10 @@ def _emitted_span_names(
     if called == "evaluate_span":
         algorithm = _string_arg(node)
         return {f"rl.{algorithm}.evaluate"} if algorithm else set()
+    if called == "checkpoint_finalize_span":
+        # Fixed name: CheckpointManager is shared across algorithms, so there
+        # is no algorithm to interpolate.
+        return {"rl.checkpoint.finalize"}
     if called == "efficiency_span":
         category = _string_arg(node)
         return {f"rl.{category.replace('/', '.')}"} if category else set()
@@ -401,6 +406,7 @@ def test_every_registered_group_has_an_emitter():
         "startup_span": RLSpanGroup.SETUP,
         "setup_span": RLSpanGroup.SETUP,
         "evaluate_span": RLSpanGroup.U_EVALUATE,
+        "checkpoint_finalize_span": RLSpanGroup.CHECKPOINT,
         "efficiency_span": RLSpanGroup.EFFICIENCY,
         "traced_worker_init": RLSpanGroup.MODEL_INIT,
     }
@@ -450,19 +456,20 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
 
     dispatched: set[str] = set()
     unwired: dict[str, str] = {}
-    for source in _python_sources(_REPO / "nemo_rl"):
-        for node in ast.walk(ast.parse(source.read_text())):
-            if not isinstance(node, ast.Call):
-                continue
-            targets = _dispatch_targets(node, decorated, indirect)
-            if not targets:
-                continue
-            where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
-            for target, sends_carrier in targets:
-                if sends_carrier:
-                    dispatched.add(target)
-                else:
-                    unwired[target] = where
+    for directory in (_REPO / "nemo_rl", _REPO / "examples"):
+        for source in _python_sources(directory):
+            for node in ast.walk(ast.parse(source.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                targets = _dispatch_targets(node, decorated, indirect)
+                if not targets:
+                    continue
+                where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+                for target, sends_carrier in targets:
+                    if sends_carrier:
+                        dispatched.add(target)
+                    else:
+                        unwired[target] = where
 
     assert not unwired, (
         "methods decorated with @accepts_trace_context whose dispatch site does "

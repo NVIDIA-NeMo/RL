@@ -39,7 +39,7 @@ policy:
   logprob_batch_size: 1
   max_total_sequence_length: 32768
   logprob_chunk_size: 2048
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -101,6 +101,51 @@ env:
     - resources_servers/mcqa/configs/mcqa.yaml
     - resources_servers/instruction_following/configs/instruction_following.yaml
     - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+
+    # Use legacy agent orchestration.
+    math_with_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: math_with_judge_simple_agent
+    code_gen_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: code_gen_simple_agent
+    workplace_assistant_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+    mcqa_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: mcqa_simple_agent
+    instruction_following_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: instruction_following_simple_agent
+    structured_outputs_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: structured_outputs_simple_agent
+
     math_with_judge:
       resources_servers:
         math_with_judge:

@@ -160,6 +160,15 @@ env:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/verifiers_agent/configs/acereason-math.yaml
 
+    # Use legacy agent orchestration.
+    verifiers_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: verifiers_agent
+
 checkpointing:
   checkpoint_dir: "checkpoints/qa-distillation-nano3-megatron"
 

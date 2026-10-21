@@ -157,6 +157,20 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    # Drop inherited wrappers for environments omitted from this recipe.
+    math_with_judge_environment_server: null
+    code_gen_environment_server: null
+    workplace_assistant_environment_server: null
+    mcqa_environment_server: null
+    instruction_following_environment_server: null
+    structured_outputs_environment_server: null
+    swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_agent
     policy_model:
       responses_api_models:
         vllm_model:
@@ -172,6 +186,13 @@ env:
           model_server:
             type: responses_api_models
             name: policy_model
+    single_step_tool_use_with_argument_comparison_swe_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: single_step_tool_use_with_argument_comparison_swe
     use_absolute_ip: true
 logger:
   log_dir: results/nemotron-3-nano-swe-dynamo

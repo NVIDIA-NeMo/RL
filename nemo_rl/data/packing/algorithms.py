@@ -19,7 +19,7 @@ import math
 import random
 from abc import ABC, abstractmethod
 from bisect import bisect, bisect_right
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 
 class PackingAlgorithm(enum.Enum):
@@ -326,19 +326,36 @@ class GreedyKnapsackPacker(SequencePacker):
 
 
 class BalancedGreedyKnapsackPacker(SequencePacker):
-    """Spread descending sequences across the smallest estimated bin count.
+    """Place descending sequences into the least-full available bin."""
 
-    Time complexity is O(n log n) for sorting plus O(n * m) for placement,
-    where m is the number of bins.
-    """
+    def __init__(
+        self,
+        bin_capacity: int,
+        collect_metrics: bool = False,
+        min_bin_count: Optional[int] = None,
+        bin_count_multiple: Optional[int] = None,
+        max_sequences_per_bin: Optional[int] = None,
+        balanced_knapsack_delta: int = 0,
+    ) -> None:
+        super().__init__(
+            bin_capacity,
+            collect_metrics,
+            min_bin_count,
+            bin_count_multiple,
+            max_sequences_per_bin,
+        )
+        if balanced_knapsack_delta < 0:
+            raise ValueError("balanced_knapsack_delta must be nonnegative")
+        self.balanced_knapsack_delta = balanced_knapsack_delta
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
-        """Place each sequence into the least-full bin that can accept it."""
         self._validate_sequence_lengths(sequence_lengths)
         if not sequence_lengths:
             return []
         count = math.ceil(sum(sequence_lengths) / self.bin_capacity)
-        bins: List[List[int]] = [[] for _ in range(count)]
+        bins: List[List[int]] = [
+            [] for _ in range(count + self.balanced_knapsack_delta)
+        ]
         loads = [0] * len(bins)
         for index in sorted(
             range(len(sequence_lengths)),
@@ -746,6 +763,7 @@ def get_packer(
     min_bin_count: Optional[int] = None,
     bin_count_multiple: Optional[int] = None,
     max_sequences_per_bin: Optional[int] = None,
+    balanced_knapsack_delta: Optional[int] = None,
 ) -> SequencePacker:
     """Factory function to get a sequence packer based on the algorithm.
 
@@ -759,6 +777,8 @@ def get_packer(
         bin_count_multiple: The total number of bins must be a multiple of this value.
                            If None, no multiple constraint is enforced.
         max_sequences_per_bin: Optional cap on atomic items per bin.
+        balanced_knapsack_delta: Extra initial bins for balanced_greedy_knapsack.
+            None uses zero; other algorithms reject an explicit value.
 
     Returns:
         A SequencePacker instance for the specified algorithm.
@@ -793,10 +813,24 @@ def get_packer(
             f"Available algorithms: {available_algorithms}"
         )
 
+    if (
+        balanced_knapsack_delta is not None
+        and algorithm != PackingAlgorithm.BALANCED_GREEDY_KNAPSACK
+    ):
+        raise ValueError(
+            "balanced_knapsack_delta is only supported by balanced_greedy_knapsack"
+        )
+
+    kwargs: dict[str, Any] = {
+        "collect_metrics": collect_metrics,
+        "min_bin_count": min_bin_count,
+        "bin_count_multiple": bin_count_multiple,
+        "max_sequences_per_bin": max_sequences_per_bin,
+    }
+    if algorithm == PackingAlgorithm.BALANCED_GREEDY_KNAPSACK:
+        kwargs["balanced_knapsack_delta"] = balanced_knapsack_delta or 0
+
     return packers[algorithm](
         bin_capacity,
-        collect_metrics=collect_metrics,
-        min_bin_count=min_bin_count,
-        bin_count_multiple=bin_count_multiple,
-        max_sequences_per_bin=max_sequences_per_bin,
+        **kwargs,
     )

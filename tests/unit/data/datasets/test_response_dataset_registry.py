@@ -145,6 +145,22 @@ def test_load_response_dataset_uses_external_class(stub_module):
     assert dataset.processor_set is True
 
 
+def test_load_megatron_packed_passes_context_parallel_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(RESPONSE_REGISTRY, "megatron_sft_packed", _StubResponseDataset)
+    config = {"dataset_name": "megatron_sft_packed", "data_path": "packed.jsonl"}
+
+    dataset = load_response_dataset(config, context_parallel_size=8)
+
+    assert isinstance(dataset, _StubResponseDataset)
+    assert _StubResponseDataset.last_init_kwargs == {
+        **config,
+        "context_parallel_size": 8,
+    }
+    assert dataset.task_spec_config is config
+
+
 def test_load_response_dataset_unknown_bare_name_errors():
     config = {"dataset_name": "definitely_not_in_registry"}
     with pytest.raises(ValueError, match="Unsupported dataset_name"):

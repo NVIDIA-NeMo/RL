@@ -37,6 +37,7 @@ from nemo_rl.algorithms.loss.loss_input import (
 )
 from nemo_rl.algorithms.loss.wrapper import (
     DraftLossWrapper,
+    DraftRuntimeLossWrapper,
     SequencePackingFusionLossWrapper,
     SequencePackingLossWrapper,
     wrap_loss_fn_with_input_preparation,
@@ -64,5 +65,6 @@ __all__ = [
     "SequencePackingFusionLossWrapper",
     "SequencePackingLossWrapper",
     "DraftLossWrapper",
+    "DraftRuntimeLossWrapper",
     "wrap_loss_fn_with_input_preparation",
 ]

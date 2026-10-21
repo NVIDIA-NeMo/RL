@@ -36,6 +36,8 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+from nemo_rl.telemetry.instrumentation import accepts_trace_context, managed_span
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
 @ray.remote(
@@ -64,10 +66,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         data_config: Mapping[str, Any],
         batch_size: int,
         max_sequence_length: int,
-        placement_fingerprint: str,
-        packing_algorithm: str | None,
-        max_sequences_per_bin: int | None,
         sequence_length_pad_multiple: int,
+        placement_fingerprint: str,
         only_unmask_final: bool,
         restored_state: Optional[dict[str, Any]] = None,
     ) -> bool:
@@ -87,13 +87,11 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             processor=self._sft_processor,
             batch_size=batch_size,
             max_sequence_length=max_sequence_length,
+            sequence_length_pad_multiple=sequence_length_pad_multiple,
             split_role="train",
             logical_rank=logical_rank,
             logical_world_size=logical_world_size,
             placement_fingerprint=placement_fingerprint,
-            packing_algorithm=packing_algorithm,
-            max_sequences_per_bin=max_sequences_per_bin,
-            sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
         )
         if restored_state is not None:
@@ -103,6 +101,7 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         self._sft_logical_world_size = logical_world_size
         return True
 
+    @accepts_trace_context
     def load_next_sft_batch(
         self,
         *,
@@ -121,20 +120,21 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
 
         started = time.monotonic()
 
-        # restart when one epoch is exhausted
-        try:
-            batch = next(self._sft_loader_iterator)
-        except StopIteration:
-            self._sft_loader_iterator = iter(self._sft_loader)
-            batch = next(self._sft_loader_iterator)
+        with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.read_batch"):
+            # Restart when one epoch is exhausted.
+            try:
+                batch = next(self._sft_loader_iterator)
+            except StopIteration:
+                self._sft_loader_iterator = iter(self._sft_loader)
+                batch = next(self._sft_loader_iterator)
 
-        prepared = prepare_sft_batch(
-            batch,
-            tokenizer=self.tokenizer,
-            only_unmask_final=only_unmask_final,
-            make_sequence_length_divisible_by=make_sequence_length_divisible_by,
-        )
-        load_seconds = time.monotonic() - started
+        with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
+            prepared = prepare_sft_batch(
+                batch,
+                tokenizer=self.tokenizer,
+                only_unmask_final=only_unmask_final,
+                make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+            )
         batch_size = prepared.size
         source_ids = self._source_ids(prepared, batch_size=batch_size)
         partition_id = (
@@ -191,7 +191,8 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
             source_ids=source_ids,
             field_names=tuple(field_names),
             sequence_lengths=lengths,
-            load_seconds=load_seconds,
+            # The controller waits for the whole call, including publishing.
+            load_seconds=time.monotonic() - started,
             valid_tokens=valid_tokens,
         )
         self._sft_active_envelope = envelope

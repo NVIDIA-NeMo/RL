@@ -18,7 +18,7 @@ This page provides performance benchmarks for LLMs and VLMs using NeMo RL across
 - **G-**: Generation related
 - **T-GBS**: Training global batch size (`policy.train_global_batch_size`)
 - **G-GBS**: Number of rollout samples generated per step (`grpo.num_prompts_per_step * grpo.num_generations_per_prompt`)
-- **Training backend**: NeMo RL has two training backends: Megatron and PyTorch DTensor. This performance summary currently only shows numbers from the Megatron backend.
+- **Training backend**: NeMo RL has two training backends: Megatron and Automodel. This performance summary currently only shows numbers from the Megatron backend.
 
 ## Performance Metrics
 

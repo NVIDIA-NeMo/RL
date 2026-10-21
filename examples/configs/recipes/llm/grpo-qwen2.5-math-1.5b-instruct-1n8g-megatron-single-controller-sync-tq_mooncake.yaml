@@ -2,3 +2,15 @@ defaults: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.y
 
 data_plane:
   backend: mooncake_cpu
+  mooncake_cpu:
+    # Nightly coverage for Mooncake SSD offload, which runs in the storage
+    # units. This recipe keeps only ~8 MB in the data plane at a time, so
+    # small units (2 x 64 MiB) and a 0.02 offload threshold (~2.6 MB) make the master
+    # offload every step and read values back from SSD. The wrapper script
+    # overrides `path` with a fresh per-run dir and asserts files appear in
+    # it; the value here only has to be a valid absolute path.
+    storage_unit_segment_size: 67108864  # 64 MiB per unit
+    ssd_offload:
+      enabled: true
+      path: /tmp/nrl_mooncake_ssd_offload
+      offload_threshold: 0.02

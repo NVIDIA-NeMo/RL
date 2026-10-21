@@ -21,6 +21,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
 
@@ -325,6 +326,95 @@ def test_reward_shaping_missing_assistant_response():
         AssertionError, match="Assistant response not found during reward shaping"
     ):
         apply_reward_shaping(batch, config)
+
+
+@pytest.mark.parametrize("decomposed", [False, True])
+def test_reward_shaping_counts_all_assistant_turns(decomposed: bool) -> None:
+    """Both input paths count every generated assistant turn."""
+
+    def turn(role: str, n: int) -> dict:
+        message = {
+            "role": role,
+            "content": "",
+            "token_ids": torch.zeros(n, dtype=torch.long),
+        }
+        if role == "assistant":
+            message["generation_logprobs"] = torch.zeros(n)
+        return message
+
+    message_logs = [
+        # Single turn: 15 assistant tokens, within the expected length of 20.
+        [turn("user", 5), turn("assistant", 15)],
+        # Two turns: 15 + 10 = 25 assistant tokens, 5 over the expected length.
+        [
+            turn("user", 5),
+            turn("assistant", 15),
+            turn("environment", 3),
+            turn("assistant", 10),
+        ],
+    ]
+    batch = BatchedDataDict(
+        {"message_log": message_logs, "total_reward": torch.tensor([1.0, 1.0])}
+    )
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(message_logs)[
+                    "response_token_lengths"
+                ],
+                "total_reward": torch.tensor([1.0, 1.0]),
+            }
+        )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=10,
+        overlong_buffer_penalty=1.0,
+        max_response_length=30,
+    )
+    result = apply_reward_shaping(batch, config)
+
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]))
+
+
+@pytest.mark.parametrize("decomposed", [False, True])
+@pytest.mark.parametrize("history_length", [0, 100])
+def test_reward_shaping_excludes_prompt_history(
+    decomposed: bool, history_length: int
+) -> None:
+    """A long history or empty assistant placeholder must not penalize 15 new tokens."""
+    batch = create_mock_batch_with_responses(1, [15], [1.0])
+    batch["message_log"][0][1:1] = [
+        {
+            "role": "assistant",
+            "content": "prompt history",
+            "token_ids": torch.zeros(history_length, dtype=torch.long),
+        },
+        {
+            "role": "user",
+            "content": "follow-up",
+            "token_ids": torch.ones(5, dtype=torch.long),
+        },
+    ]
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(batch["message_log"])[
+                    "response_token_lengths"
+                ],
+                "total_reward": batch["total_reward"],
+            }
+        )
+    result = apply_reward_shaping(
+        batch,
+        RewardShapingConfig(
+            enabled=True,
+            max_response_length=30,
+            overlong_buffer_length=10,
+            overlong_buffer_penalty=1.0,
+        ),
+    )
+    torch.testing.assert_close(result["total_reward"], torch.tensor([1.0]))
 
 
 def test_reward_shaping_mismatched_lengths():

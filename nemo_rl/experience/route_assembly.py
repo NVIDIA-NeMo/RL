@@ -56,6 +56,16 @@ ROUTE_FAILURE_MODEL_SHAPE = "fragment_model_shape"
 ROUTE_FAILURE_ASSEMBLED_LENGTH = "assembled_length_mismatch"
 
 
+def boundary_route_rows(prev_len: int) -> int:
+    """Include the last token of the previous message.
+
+    Chosen experts are only recorded for input tokens.
+    Choice of the last generated token in the previous message was a placeholder.
+    Rewrite it with the correct value, known from the new prefill.
+    """
+    return 1 if prev_len > 0 else 0
+
+
 @dataclass(frozen=True)
 class RouteFragment:
     """One staged route payload plus the metadata its extras digest binds.
@@ -148,7 +158,7 @@ def execute_route_plan(
         mode = classify_route_span(
             carry_len=span.carry_len,
             generation_len=span.generation_len,
-            staged_route_len=span.staged_route_len,
+            staged_route_len=span.staged_route_len - span.boundary_rows,
         )
         if mode != "sentinel":
             fragment = fragments.get(span.staging_key)
@@ -167,6 +177,9 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_LENGTH
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
+            if span.boundary_rows:
+                routed[position - 1] = routes[0].to(torch.int16)
+                routes = routes[1:]
             if mode == "full":
                 routed[position : position + contribution] = routes.to(torch.int16)
             else:

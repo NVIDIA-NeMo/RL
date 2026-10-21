@@ -121,7 +121,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     policy_config = {
         "model_name": "/ckpt/student",
         "megatron_cfg": {"enabled": True},
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "router_replay": {"enabled": True},
@@ -184,7 +184,7 @@ def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatc
         "model_name": "/ckpt/student",
         "pretrained_checkpoint": {"format": "megatron_bridge", "path": "/ckpt/sft"},
         "megatron_cfg": {"enabled": True},
-        "dtensor_cfg": {"enabled": False},
+        "automodel_cfg": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
     }

@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Automodel checkpoint utilities for DTensor policy workers.
+"""Automodel checkpoint utilities for the policy workers.
 
 This module provides a wrapper class around the nemo_automodel Checkpointer
-for saving and loading model checkpoints in DTensor-based policy workers.
+for saving and loading model checkpoints in Automodel policy workers.
 """
 
 import logging
@@ -38,8 +38,6 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer
 
-from nemo_rl.utils.native_checkpoint import save_tokenizer_on_rank0
-
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +52,7 @@ def _resolve_lora_adapter_dir(restore_from: str) -> str:
         if os.path.isfile(os.path.join(candidate, "adapter_model.safetensors")):
             return candidate
     raise FileNotFoundError(
-        f"dtensor_cfg.lora_cfg.restore_from={restore_from!r}: no "
+        f"automodel_cfg.lora_cfg.restore_from={restore_from!r}: no "
         "adapter_model.safetensors found there or in its 'model' subdirectory. "
         "restore_from must point to a PEFT adapter checkpoint (a directory "
         "containing adapter_model.safetensors + adapter_config.json, e.g. a "
@@ -63,7 +61,7 @@ def _resolve_lora_adapter_dir(restore_from: str) -> str:
 
 
 def build_checkpoint_config(
-    dtensor_cfg: Mapping[str, Any],
+    automodel_cfg: Mapping[str, Any],
     *,
     model_repo_id: str,
     dequantize_base_checkpoint: bool,
@@ -71,14 +69,14 @@ def build_checkpoint_config(
     is_async: bool,
     skip_task_head_prefixes_for_base_model: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Build the Automodel checkpoint config for a DTensor v2 worker.
+    """Build the Automodel checkpoint config for a worker.
 
     Read NeMo-RL settings from the YAML-backed checkpoint block and forward
-    them to Automodel. This integration boundary is shared by the two DTensor
+    them to Automodel. This integration boundary is shared by the two Automodel
     v2 workers; defaults belong in the exemplar configs.
 
     Args:
-        dtensor_cfg: The worker's ``policy.dtensor_cfg`` / ``value.dtensor_cfg``
+        automodel_cfg: The worker's ``policy.automodel_cfg`` / ``value.automodel_cfg``
             mapping. Automodel checkpoint settings are read from its nested
             ``checkpoint`` block; all other keys are ignored.
         model_repo_id: Forwarded to Automodel's ``CheckpointingConfig.model_repo_id``.
@@ -97,12 +95,12 @@ def build_checkpoint_config(
         accepts, meant to be splatted into
         ``AutomodelCheckpointingConfig(enabled=True, checkpoint_dir="", **result)``.
     """
-    raw_checkpoint_config = dtensor_cfg["checkpoint"]
+    raw_checkpoint_config = automodel_cfg["checkpoint"]
     model_save_format = raw_checkpoint_config["model_save_format"]
     if model_save_format not in ("torch_save", "safetensors"):
         raise ValueError(
-            "dtensor_cfg.checkpoint.model_save_format must be 'torch_save' or "
-            "'safetensors' when using DTensor v2."
+            "automodel_cfg.checkpoint.model_save_format must be 'torch_save' or "
+            "'safetensors' when using Automodel."
         )
 
     checkpoint_config = {
@@ -191,7 +189,7 @@ except Exception as e:  # pragma: no cover - defensive: never break import
 
 
 class AutomodelCheckpointManager:
-    """Manages checkpointing for DTensor-based models using nemo_automodel's Checkpointer.
+    """Manages checkpointing for Automodel models using nemo_automodel's Checkpointer.
 
     This class provides a clean interface for saving and loading model checkpoints,
     wrapping the nemo_automodel Checkpointer with configuration management.
@@ -291,6 +289,40 @@ class AutomodelCheckpointManager:
         self.checkpointer.maybe_wait_for_staging()
         self.checkpointer.async_wait()
 
+    @staticmethod
+    def _save_tokenizer_on_rank0(tokenizer: Any, tokenizer_path: str) -> None:
+        """Save a tokenizer (or processor) to ``tokenizer_path`` from rank 0 only.
+
+        Unlike model/optimizer state, the tokenizer is *replicated* rather than
+        sharded: every rank holds an identical copy, and ``save_pretrained`` writes
+        to the same rank-independent filenames (``tokenizer_config.json``, ...).
+        Letting all ranks write means N-1 redundant writes racing on the same file.
+        ``save_pretrained`` is not atomic (it opens with ``O_TRUNC``, writes, and may
+        read files back), so concurrent writers can deadlock on the inode lock. On a
+        ``hard``-mounted NFS share this manifests as ranks stuck indefinitely in
+        uninterruptible disk sleep, hanging the whole job at checkpoint time.
+
+        This mirrors the rank-0 guard nemo_automodel applies to the same artifacts in
+        ``nemo_automodel.components.checkpoint.addons.ConsolidatedHFAddon.pre_save``.
+
+        Note this must NOT be applied to ``dcp.save``-based model/optimizer saves:
+        those are collective calls whose output is already rank-disjoint, so guarding
+        them would deadlock and drop every non-zero rank's shard.
+
+        Args:
+            tokenizer: The tokenizer or processor to save.
+            tokenizer_path: Directory to save the tokenizer into.
+        """
+        is_distributed = torch.distributed.is_initialized()
+        if not is_distributed or torch.distributed.get_rank() == 0:
+            print(f"Saving tokenizer (or processor) to {tokenizer_path}")
+            tokenizer.save_pretrained(tokenizer_path)
+        if is_distributed:
+            # Keep non-zero ranks from returning while rank 0 is still writing, so
+            # that the tokenizer directory is complete for any caller that reads it
+            # right after save_checkpoint() returns.
+            torch.distributed.barrier()
+
     def save_checkpoint(
         self,
         model: nn.Module,
@@ -356,7 +388,7 @@ class AutomodelCheckpointManager:
             # Rank-0 guarded: passing tokenizer_path bypasses save_model()'s
             # ConsolidatedHFAddon (we pass tokenizer=None above), which is where
             # nemo_automodel applies its own rank-0 guard, so we must apply it here.
-            save_tokenizer_on_rank0(tokenizer, tokenizer_path)
+            self._save_tokenizer_on_rank0(tokenizer, tokenizer_path)
 
         # Async DCP staging reads from the live model and optimizer state. Wait
         # for those copies before callers can update or offload the source tensors;
@@ -413,49 +445,64 @@ class AutomodelCheckpointManager:
             "Call init_checkpointer() first."
         )
 
-        model_dir = (
-            weights_path
-            if weights_path.endswith("/model")
-            else os.path.join(weights_path, "model")
-        )
-
+        # load model
+        model_dir = os.path.join(weights_path, "model")
         self.checkpointer.load_model(
             model=model,
             model_path=model_dir,
         )
 
+        # load optimizer
         if optimizer_path and optimizer is not None:
-            if getattr(optimizer, "master_weights", False):
-                # Check the on-disk dtype before DCP copies into current buffers:
-                # legacy FP32 masters must not be cast into BF16 int16 remainders.
-                metadata = dcp.FileSystemReader(
-                    os.path.join(optimizer_path, "optim")
-                ).read_metadata()
-                optimizer_state = OptimizerState(
-                    model,
-                    optimizer,
-                    is_peft=self.checkpointer.config.is_peft,
-                    has_expert_parallelism=self.moe_mesh is not None,
-                )
-                expected_state, _ = flatten_state_dict(optimizer_state.state_dict())
-                for key, value in expected_state.items():
-                    if not key.endswith(".master_param"):
-                        continue
-                    saved = metadata.state_dict_metadata.get(key)
-                    if saved is not None and saved.properties.dtype != value.dtype:
-                        raise ValueError(
-                            f"Cannot resume optimizer master weights: {key} has "
-                            f"checkpoint dtype {saved.properties.dtype}, but the "
-                            f"current optimizer expects {value.dtype}. "
-                            "Check policy.precision and policy.optimizer.kwargs "
-                            "(especially store_param_remainders and master_weight_dtype) "
-                            "against the configuration and code used to save the checkpoint, "
-                            "or start a fresh run without restoring optimizer state."
-                        )
-                del expected_state, optimizer_state
+            self.check_master_weight_dtypes(model, optimizer, optimizer_path)
             self.checkpointer.load_optimizer(
                 optimizer=optimizer,
                 model=model,
                 weights_path=optimizer_path,
                 scheduler=scheduler,
             )
+
+    def check_master_weight_dtypes(
+        self,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        optimizer_path: str,
+    ) -> None:
+        """Hard-error if a resumed optimizer's on-disk master dtype has drifted.
+
+        Must run before ``checkpointer.load_optimizer``: legacy FP32 masters
+        must not be silently cast into BF16 int16 remainders (or vice versa)
+        just because ``store_param_remainders``/``master_weight_dtype``
+        changed between save and resume.
+        """
+        if not getattr(optimizer, "master_weights", False):
+            return
+        assert self.checkpointer is not None, (
+            "Checkpointer must be initialized before loading checkpoint. "
+            "Call init_checkpointer() first."
+        )
+        # Check the on-disk dtype before DCP copies into current buffers.
+        metadata = dcp.FileSystemReader(
+            os.path.join(optimizer_path, "optim")
+        ).read_metadata()
+        optimizer_state = OptimizerState(
+            model,
+            optimizer,
+            is_peft=self.checkpointer.config.is_peft,
+            has_expert_parallelism=self.moe_mesh is not None,
+        )
+        expected_state, _ = flatten_state_dict(optimizer_state.state_dict())
+        for key, value in expected_state.items():
+            if not key.endswith(".master_param"):
+                continue
+            saved = metadata.state_dict_metadata.get(key)
+            if saved is not None and saved.properties.dtype != value.dtype:
+                raise ValueError(
+                    f"Cannot resume optimizer master weights: {key} has "
+                    f"checkpoint dtype {saved.properties.dtype}, but the "
+                    f"current optimizer expects {value.dtype}. "
+                    "Check policy.precision and policy.optimizer.kwargs "
+                    "(especially store_param_remainders and master_weight_dtype) "
+                    "against the configuration and code used to save the checkpoint, "
+                    "or start a fresh run without restoring optimizer state."
+                )

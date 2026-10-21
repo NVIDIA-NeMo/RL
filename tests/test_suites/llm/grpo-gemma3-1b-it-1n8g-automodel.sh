@@ -1,0 +1,45 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source $SCRIPT_DIR/common.env
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+STEPS_PER_RUN=400
+MAX_STEPS=400
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=180  # bumped from 120: cold venv rebuild takes ~100min + 400 steps × ~12s
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+# Run the experiment
+cd $PROJECT_ROOT
+uv run examples/run_grpo.py \
+    --config $CONFIG_PATH \
+    grpo.max_num_steps=$MAX_STEPS \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=True \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name=$EXP_NAME \
+    logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
+    checkpointing.enabled=True \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+# Convert tensorboard logs to json
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Only run metrics if the target step is reached
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Step time: median of the 50 steps before the last. Every run has a few
+    # 10-80 s generation stalls, and a mean over 5 steps fails whenever one
+    # lands in the window.
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'median(data["timing/train/total_step_time"], -51, -1) < 14'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
+fi

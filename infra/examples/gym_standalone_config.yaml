@@ -3,6 +3,16 @@
 config_paths:
 - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
 - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+
+# Use legacy agent orchestration.
+workplace_assistant_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: workplace_assistant_simple_agent
+
 policy_model:
   responses_api_models:
     vllm_model:

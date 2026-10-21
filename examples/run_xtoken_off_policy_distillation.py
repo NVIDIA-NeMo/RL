@@ -35,6 +35,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -64,8 +65,9 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
+    check_outdated_config(config)
 
+    config = MasterConfig(**config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
     # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
     # cross-tokenizer). The consistency check (a same-vocab teacher must
@@ -76,7 +78,7 @@ def main() -> None:
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}",

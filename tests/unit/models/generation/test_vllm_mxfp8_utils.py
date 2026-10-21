@@ -198,3 +198,17 @@ def test_pad_w13_intermediate_preserves_gate_halves(is_gated: bool) -> None:
     else:
         torch.testing.assert_close(padded[:, :2], tensor)
         assert torch.all(padded[:, 2:] == -1)
+
+
+def test_pad_w13_intermediate_reuses_matching_storage() -> None:
+    pad_w13_intermediate = _load_mxfp8_utils().pad_w13_intermediate
+    tensor = torch.arange(12).reshape(1, 4, 3)
+
+    assert pad_w13_intermediate(tensor, 2, is_gated=True) is tensor
+
+
+def test_pad_w13_intermediate_rejects_smaller_target() -> None:
+    pad_w13_intermediate = _load_mxfp8_utils().pad_w13_intermediate
+
+    with pytest.raises(ValueError, match="Cannot pad gated MXFP8 W13"):
+        pad_w13_intermediate(torch.ones(1, 4, 3), 1, is_gated=True)

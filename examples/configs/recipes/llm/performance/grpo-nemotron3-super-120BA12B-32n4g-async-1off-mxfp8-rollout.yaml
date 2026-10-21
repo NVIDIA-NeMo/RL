@@ -3,6 +3,7 @@ checkpointing:
   checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout
 policy:
   generation:
+    refit_transport: nccl_reshard
     vllm_cfg:
       precision: "fp8"
       is_mx: true

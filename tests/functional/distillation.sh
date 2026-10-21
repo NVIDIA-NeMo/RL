@@ -27,11 +27,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     teacher.model_name=Qwen/Qwen3-0.6B \
     cluster.gpus_per_node=2 \
     policy.train_global_batch_size=8 \
-    policy.dtensor_cfg.tensor_parallel_size=1 \
-    policy.dtensor_cfg.context_parallel_size=2 \
+    policy.automodel_cfg.tensor_parallel_size=1 \
+    policy.automodel_cfg.context_parallel_size=2 \
     policy.max_total_sequence_length=256 \
-    teacher.dtensor_cfg.tensor_parallel_size=2 \
-    teacher.dtensor_cfg.context_parallel_size=1 \
+    teacher.automodel_cfg.tensor_parallel_size=2 \
+    teacher.automodel_cfg.context_parallel_size=1 \
     distillation.max_num_steps=3 \
     distillation.num_prompts_per_step=16 \
     distillation.max_val_samples=2 \

@@ -192,7 +192,7 @@ topology, sending weights, and finalizing the backend. Each concrete policy
 worker supplies the iterator used by `send_weights_via_checkpoint_engine()`:
 
 - Megatron streams `_iter_params_with_optional_kv_scales()`.
-- DTensor/FSDP2 streams the same local DTensor conversion path used by IPC and
+- Automodel streams the same local DTensor conversion path used by IPC and
   NCCL refit.
 
 Some policy iterators materialize weights through distributed collectives. A
@@ -365,7 +365,7 @@ Current limitations:
 - Checkpoint-engine refit targets non-colocated policy-to-vLLM refit.
 - SGLang and Megatron generation do not implement checkpoint-engine refit;
   [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288) tracks
-  generation-side support. Megatron and DTensor policy backends are supported
+  generation-side support. Megatron and Automodel policy backends are supported
   when the generation backend is vLLM.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.
 - Sharded vLLM EP refit supports static expert ownership and canonical

@@ -122,7 +122,7 @@ This computes the policy gradient loss per token (under masking) instead of aggr
 
 ## Importance Sampling Correction and MoE Stability
 
-When training and generation backends differ (e.g., FSDP vs vLLM, BF16 vs FP8), the logprobs they produce can disagree. NeMo RL captures this disagreement as an IS correction weight:
+When training and generation backends differ (e.g., Automodel vs vLLM, BF16 vs FP8), the logprobs they produce can disagree. NeMo RL captures this disagreement as an IS correction weight:
 
 $$\rho_t = \exp(\texttt{prev\_logprobs}_t - \texttt{generation\_logprobs}_t)$$
 
@@ -131,7 +131,7 @@ For dense models $\rho_t$ stays close to 1.0. For **MoE models**, even tiny floa
 | Source | Cause | Solution |
 |--------|-------|----------|
 | **Router Shift** (algorithmic) | Multi mini-batch updates change the router too fast. | **Pure Online Training** — set `max_num_epochs: 1` (default in `grpo_math_1B.yaml`). |
-| **Backend Mismatch** (engineering) | FSDP and vLLM compute different logits; small differences flip expert selection. | **IS Correction + Filtering** — ICE-POP or seq-mask-tis (see below). |
+| **Backend Mismatch** (engineering) | Automodel and vLLM compute different logits; small differences flip expert selection. | **IS Correction + Filtering** — ICE-POP or seq-mask-tis (see below). |
 
 Pure Online training eliminates router shift by ensuring the policy is updated only once per rollout. This leaves backend mismatch as the remaining source of instability, which is handled by filtering.
 

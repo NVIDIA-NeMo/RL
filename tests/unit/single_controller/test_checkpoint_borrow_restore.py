@@ -227,6 +227,7 @@ def _controller(
     )
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
+        checkpointing={"load_replay_buffer": True},
         token_capture=SimpleNamespace(enabled=False),
     )
     controller._dataloader = loader
@@ -242,10 +243,13 @@ def _controller(
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
+    controller._restored_replay_groups_to_regenerate = []
     controller._batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
+    controller._finalizer_metrics_by_group = {}
+    controller._finalizer_rewards_by_group = {}
     controller._replacement_reserve = deque(replacement_reserve or [])
     controller._rollout_slot_waiters = 0
     controller._rollout_permitted_waiters = 0

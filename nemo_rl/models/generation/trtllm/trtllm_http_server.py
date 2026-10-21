@@ -13,24 +13,253 @@
 # limitations under the License.
 """OpenAI-compatible HTTP server wrapping ``tensorrt_llm.LLM``, serving /v1/chat/completions.
 
-Returns NeMoGym fields (prompt_token_ids, generation_token_ids, generation_log_probs).
-Supports Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splicing.
+Returns prompt and generated token ids alongside per-token logprobs, and supports
+Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splicing.
+
+Under PD disaggregation this endpoint is *leg-aware*. A replica's
+``OpenAIDisaggServer`` drives it twice per request:
+
+* ``context_only`` -- prefill only. Returns the handshake and the prompt token
+  ids, skipping all post-processing; see :func:`_context_leg_response`.
+* ``generation_only`` -- decodes and post-processes as usual, but takes the
+  prompt token ids the orchestrator relays from the context leg rather than
+  rebuilding them, so the sequence matches the KV that was transferred.
 """
 
+import asyncio
+import functools
 import logging
+import os
+import random
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
 
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _choice_declares_token_ids() -> bool:
+    """Whether the installed TRT-LLM's chat choice model declares ``token_ids``.
+
+    Cached because it is consulted once per generated response, and imported
+    lazily because this module is also used on the aggregated path where
+    tensorrt_llm need not be importable.
+    """
+    try:
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionResponseChoice
+    except ImportError:
+        return False
+    return "token_ids" in ChatCompletionResponseChoice.model_fields
+
+
+@functools.cache
+def _chat_completion_request_cls() -> type:
+    """``ChatCompletionRequest`` whose assistant ``tool_calls`` survive dumping.
+
+    The OpenAI message types declare ``tool_calls`` as an ``Iterable``, which
+    validates into a lazy ``ValidatorIterator``. For an assistant message that
+    carries both ``reasoning`` and ``reasoning_content`` -- what NeMo-Gym sends
+    -- the union resolves to TRT-LLM's ``ReasoningAssistantMessage`` and
+    ``model_dump`` then emits ``tool_calls: []``, so the prompt is rendered
+    without the conversation's earlier tool calls. Materializing the iterator
+    right after validation keeps them. Deferred so importing this module does
+    not require tensorrt_llm.
+    """
+    from pydantic import model_validator
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    class _ChatCompletionRequest(ChatCompletionRequest):
+        @model_validator(mode="after")
+        def _materialize_tool_calls(self) -> "_ChatCompletionRequest":
+            for message in self.messages:
+                tool_calls = message.get("tool_calls")
+                if tool_calls is not None and not isinstance(tool_calls, list):
+                    message["tool_calls"] = list(tool_calls)
+            return self
+
+    return _ChatCompletionRequest
+
+
+def normalize_chat_inputs(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """``messages`` and ``tools`` as TRT-LLM's ``ChatCompletionRequest`` dumps them.
+
+    Every path that renders the chat template goes through here, so the engine
+    answering Gym directly and the disagg route render the same prompt. Key
+    order matters: templates serialize each tool verbatim (``tool | tojson``),
+    and validation reorders a tool's keys to the model's declaration order,
+    ``{"type", "function"}`` -- what the disagg server hands its engines and
+    what vLLM renders -- while Gym sends ``{"function", "type"}``.
+    """
+    dump = _chat_completion_request_cls()(
+        # Required by the model but never rendered.
+        model="",
+        messages=messages,
+        tools=tools,
+    ).model_dump(mode="json", exclude_unset=True)
+    return dump["messages"], dump["tools"]
+
+
+async def build_spliced_prompt_ids(
+    messages: list[dict],
+    tools: "list[dict] | None",
+    tokenizer: Any,
+    model_config: Any,
+    template_kwargs: dict[str, Any],
+) -> list[int]:
+    """Render the chat template and splice in the on-policy prefix.
+
+    The single source of truth for turning a conversation into engine prompt
+    ids -- shared by the engine adapter's route and the disagg frontend's
+    tokenizer (phase-2 ``frontend_tokenize``) so both produce IDENTICAL ids;
+    a divergence between them would silently train on off-policy tokens.
+
+    Raises ``ValueError`` for unparseable or multimodal messages. The
+    tokenizer-heavy part runs in a thread: the HF fast tokenizer releases the
+    GIL, so a 30k-token render stops serializing the caller's event loop.
+    """
+    from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+
+    conversation, mm_coroutine, *_ = parse_chat_messages_coroutines(
+        messages, model_config
+    )
+    mm_data, mm_embeddings = await mm_coroutine
+    if mm_data is not None or mm_embeddings is not None:
+        raise ValueError(
+            "NeMo-RL's TRT-LLM HTTP adapter does not support multimodal chat inputs"
+        )
+
+    def _sync() -> list[int]:
+        # Full retokenization avoids accumulating generation token IDs twice.
+        prompt_token_ids = _build_prompt_token_ids(
+            conversation,
+            tokenizer,
+            tools=tools,
+            default_template_kwargs=template_kwargs,
+        )
+        # Empty required_prefix_ids on turn one returns the template unchanged.
+        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+            messages,
+            conversation,
+            tokenizer,
+            tools,
+            template_kwargs,
+        )
+        return replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=required_prefix_ids,
+            template_prefix_token_ids=template_prefix_ids,
+            template_token_ids=prompt_token_ids,
+        )
+
+    return await asyncio.to_thread(_sync)
+
+
+# Sampling rate for shadow-validating frontend-supplied prompt ids on the
+# context leg: the ctx adapter recomputes the ids from the messages it also
+# received and logs a mismatch. Cheap insurance while frontend_tokenize is
+# young; 0 disables.
+_TOKENIZE_SHADOW_RATE = float(
+    os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
+)
+
+
+def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:
+    """The engine's ``DisaggregatedParams`` plus the orchestrator's b64 request.
+
+    The body carries TRT-LLM's *wire* ``DisaggregatedParams``; the engine takes
+    the LLM-level one (opaque_state is bytes there, base64 on the wire), so it
+    is converted with TRT-LLM's own helper. The conversion copies only what the
+    engine consumes, which drops ``return_prompt_token_ids_b64`` -- an
+    orchestrator-to-context-worker instruction (``gen_tokids_ctxbytes``) that
+    must therefore be read off the wire model before converting.
+
+    Returns:
+        ``(None, False)`` without disaggregated params, else the LLM-level
+        params and whether the context leg should return
+        ``prompt_token_ids_b64`` instead of the int list.
+    """
+    if raw is None:
+        return None, False
+    from tensorrt_llm.serve.openai_protocol import (
+        DisaggregatedParams as WireDisaggregatedParams,
+    )
+    from tensorrt_llm.serve.openai_protocol import to_llm_disaggregated_params
+
+    wire = WireDisaggregatedParams(**raw)
+    return_b64 = bool(getattr(wire, "return_prompt_token_ids_b64", False))
+    return to_llm_disaggregated_params(wire), return_b64
+
+
+def _context_leg_response(
+    model_name: str,
+    prompt_token_ids: list[int],
+    gen: Any,
+    return_prompt_token_ids_b64: bool,
+) -> Any:
+    """Reply to a ``context_only`` request.
+
+    Prefill materialised KV and at most one token; the disagg server only reads
+    the handshake back off this response (plus the prompt token ids, so the
+    generation server need not re-tokenize). Nothing here is user-visible, so
+    the reasoning/tool/stop-token post-processing is skipped entirely.
+
+    ``return_prompt_token_ids_b64`` comes from :func:`_parse_disaggregated_params`.
+    """
+    from fastapi.responses import JSONResponse
+    from tensorrt_llm.serve.openai_protocol import to_disaggregated_params
+
+    ctx_out = getattr(gen, "disaggregated_params", None)
+    if ctx_out is None:
+        raise RuntimeError(
+            "context leg returned no disaggregated_params; the engine is most "
+            "likely missing cache_transceiver_config"
+        )
+
+    response: dict[str, Any] = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None},
+                "finish_reason": gen.finish_reason,
+                "disaggregated_params": to_disaggregated_params(ctx_out).model_dump(),
+            }
+        ],
+        "usage": {
+            "prompt_tokens": len(prompt_token_ids),
+            "completion_tokens": 0,
+            "total_tokens": len(prompt_token_ids),
+        },
+    }
+
+    # The orchestrator asks for the base64 int32 buffer when it wants to relay a
+    # string instead of materialising the int list on its event loop.
+    if return_prompt_token_ids_b64:
+        import base64
+
+        import numpy as np
+
+        response["prompt_token_ids_b64"] = base64.b64encode(
+            np.asarray(prompt_token_ids, dtype=np.int32).tobytes()
+        ).decode("ascii")
+    else:
+        response["prompt_token_ids"] = prompt_token_ids
+
+    return JSONResponse(content=response)
 
 
 def _build_reasoning_parser(name: str, chat_template_kwargs: dict[str, Any]) -> Any:
@@ -101,18 +330,15 @@ def create_app(
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
-    # Per-request template kwargs override these defaults.
-    _server_template_kwargs: dict[str, Any] = {
-        "enable_thinking": True,
-        **(default_chat_template_kwargs or {}),
-    }
+    # Per-request template kwargs override these defaults. Only what the config
+    # sets, like the vLLM server: an unset key falls back to the chat template's
+    # own default, and the disagg frontend's tokenizer renders the same way.
+    _server_template_kwargs: dict[str, Any] = dict(default_chat_template_kwargs or {})
 
     # Use the configured parser or infer one from the model config.
     _tool_parser_name = _resolve_tool_parser_name(tool_parser, model_name)
     _tool_parser_instance = _build_tool_parser(_tool_parser_name)
     _parse_tool_calls = _make_parse_tool_calls(_tool_parser_instance)
-
-    from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 
     model_config = getattr(llm, "_hf_model_config", None)
     if model_config is None:
@@ -152,10 +378,27 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        body: dict = await request.json()
-        messages: list[dict] = body.get("messages", [])
-        tools: list[dict] | None = body.get("tools")
+        body: dict = await _decode_request_body(request)
+        try:
+            messages, tools = normalize_chat_inputs(
+                body.get("messages", []), body.get("tools")
+            )
+        except ValueError as e:  # pydantic.ValidationError is a ValueError
+            return JSONResponse(status_code=400, content={"error": str(e)})
         logprobs_requested = body.get("logprobs", False)
+
+        # Conversation affinity for attention-DP routing; affects perf only.
+        # Needs NVIDIA-NeMo/Gym#3582 to send conversation_params.
+        _conv_id = (body.get("conversation_params") or {}).get("conversation_id")
+
+        # The disagg server drives this endpoint twice per request -- once
+        # context_only, once generation_only -- carrying the handshake between
+        # them. opaque_state is bytes in the engine but base64 on the wire, so
+        # convert with TRT-LLM's own helper rather than reproducing it.
+        disagg_params, return_prompt_token_ids_b64 = _parse_disaggregated_params(
+            body.get("disaggregated_params")
+        )
+        is_context_leg = getattr(disagg_params, "request_type", None) == "context_only"
 
         # The NeMo-RL generation config, not the request, is the source of truth
         # for sampling params.
@@ -176,47 +419,76 @@ def create_app(
             else None
         )
 
-        try:
-            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
-                messages, model_config
-            )
-            mm_data, mm_embeddings = await mm_coroutine
-        except ValueError as e:
-            return JSONResponse(status_code=400, content={"error": str(e)})
+        # b64 when gen_tokids_ctxbytes is set, an int array otherwise.
+        supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
+        if isinstance(supplied, str):
+            # Same int32 buffer encoding openai_server.py uses on this hop.
+            import base64
 
-        # This token-only adapter does not support multimodal inputs.
-        if mm_data is not None or mm_embeddings is not None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "NeMo-RL's TRT-LLM HTTP adapter does not support "
-                    "multimodal chat inputs"
-                },
-            )
+            import numpy as np
 
-        # Full retokenization avoids accumulating generation token IDs twice.
-        prompt_token_ids = _build_prompt_token_ids(
-            conversation,
-            tokenizer,
-            tools=tools,
-            default_template_kwargs=effective_template_kwargs,
-        )
+            supplied = np.frombuffer(
+                base64.b64decode(supplied), dtype=np.int32
+            ).tolist()
 
-        # Empty required_prefix_ids on turn one returns the template unchanged.
-        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
-            messages,
-            conversation,
-            tokenizer,
-            tools,
-            effective_template_kwargs,
-        )
-
-        adj_prompt = replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=required_prefix_ids,
-            template_prefix_token_ids=template_prefix_ids,
-            template_token_ids=prompt_token_ids,
-        )
+        if supplied:
+            adj_prompt = list(supplied)
+            # Shadow validation for frontend-tokenized ids (context leg only:
+            # the generation leg's ids legitimately extend past the messages).
+            if (
+                is_context_leg
+                and messages
+                and _TOKENIZE_SHADOW_RATE > 0
+                and random.random() < _TOKENIZE_SHADOW_RATE
+            ):
+                try:
+                    recomputed = await build_spliced_prompt_ids(
+                        messages,
+                        tools,
+                        tokenizer,
+                        model_config,
+                        effective_template_kwargs,
+                    )
+                    if recomputed != adj_prompt:
+                        diff = next(
+                            (
+                                i
+                                for i, (a, b) in enumerate(zip(adj_prompt, recomputed))
+                                if a != b
+                            ),
+                            min(len(adj_prompt), len(recomputed)),
+                        )
+                        lo, hi = max(0, diff - 8), diff + 8
+                        logger.error(
+                            "frontend-tokenize SHADOW MISMATCH: supplied %d ids, "
+                            "recomputed %d, first divergence at %d; "
+                            "supplied[%d:%d]=%s (%r) vs recomputed=%s (%r); "
+                            "template_kwargs=%r first_msg_role=%r",
+                            len(adj_prompt),
+                            len(recomputed),
+                            diff,
+                            lo,
+                            hi,
+                            adj_prompt[lo:hi],
+                            tokenizer.decode(adj_prompt[lo:hi]),
+                            recomputed[lo:hi],
+                            tokenizer.decode(recomputed[lo:hi]),
+                            effective_template_kwargs,
+                            (messages[0] or {}).get("role") if messages else None,
+                        )
+                except Exception as e:  # noqa: BLE001 - shadow must never fail serving
+                    logger.error("frontend-tokenize shadow recompute failed: %s", e)
+        else:
+            try:
+                adj_prompt = await build_spliced_prompt_ids(
+                    messages,
+                    tools,
+                    tokenizer,
+                    model_config,
+                    effective_template_kwargs,
+                )
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": str(e)})
 
         max_tokens_requested = (
             body.get("max_tokens") or body.get("max_completion_tokens") or max_seq_len
@@ -245,9 +517,16 @@ def create_app(
         )
 
         try:
+            _conv_params = None
+            if _conv_id:
+                from tensorrt_llm.conversation_params import ConversationParams
+
+                _conv_params = ConversationParams(conversation_id=str(_conv_id))
             output = await llm.generate_async(
                 {"prompt_token_ids": adj_prompt},
                 sampling_params=sampling,
+                disaggregated_params=disagg_params,
+                conversation_params=_conv_params,
             )
         except RequestError as e:
             err = str(e)
@@ -259,6 +538,16 @@ def create_app(
             raise
 
         gen = output.outputs[0]
+
+        if is_context_leg:
+            # Prefill produced KV and at most one token. Everything downstream
+            # -- reasoning parsing, tool parsing, stop-token trimming -- is for
+            # the completed generation, so skip it and hand the disagg server
+            # just what it needs to build the generation leg.
+            return _context_leg_response(
+                model_name, adj_prompt, gen, return_prompt_token_ids_b64
+            )
+
         gen_token_ids = list(gen.token_ids)
 
         gen_logprobs: list[float] = []
@@ -307,9 +596,6 @@ def create_app(
                 "content": content_text or None,
                 "reasoning_content": reasoning_content,
                 "tool_calls": parsed_tool_calls,
-                "prompt_token_ids": adj_prompt,
-                "generation_token_ids": gen_token_ids,
-                "generation_log_probs": gen_logprobs,
             }
             finish_reason = "tool_calls"
         else:
@@ -317,10 +603,24 @@ def create_app(
                 "role": "assistant",
                 "content": answer_text,
                 "reasoning_content": reasoning_content,
-                "prompt_token_ids": adj_prompt,
-                "generation_token_ids": gen_token_ids,
-                "generation_log_probs": gen_logprobs,
             }
+
+        # NeMo-Gym reads the rollout fields off the *message*
+        # (nemo_rl/environments/nemo_gym.py: a message without
+        # generation_token_ids is skipped outright, so a miss loses the whole
+        # turn's training data silently). Aggregated serving answers Gym
+        # directly, so attach them here.
+        #
+        # Not under disaggregation: there the reply is re-validated by the
+        # disagg server against ChatMessage, which is extra="forbid" and would
+        # 400 on these. They ride the declared fields instead
+        # (choices[].token_ids, prompt_token_ids, logprobs) and the disagg
+        # server's outbound adaptor re-attaches them to the message before Gym
+        # ever sees it -- see trtllm_disagg_server.attach_rollout_fields.
+        if disagg_params is None:
+            msg_dict["prompt_token_ids"] = adj_prompt
+            msg_dict["generation_token_ids"] = gen_token_ids
+            msg_dict["generation_log_probs"] = gen_logprobs
 
         response: dict[str, Any] = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -328,8 +628,15 @@ def create_app(
             "created": int(time.time()),
             "model": model_name,
             "choices": [
-                {"index": 0, "message": msg_dict, "finish_reason": finish_reason}
+                {
+                    "index": 0,
+                    "message": msg_dict,
+                    "finish_reason": finish_reason,
+                }
             ],
+            # Declared on ChatCompletionResponse precisely so a generation
+            # server need not re-tokenize the prompt.
+            "prompt_token_ids": adj_prompt,
             "usage": {
                 "prompt_tokens": len(adj_prompt),
                 "completion_tokens": len(gen_token_ids),
@@ -337,11 +644,37 @@ def create_app(
             },
         }
 
+        # Generated token ids get their own declared field only on a TRT-LLM
+        # build whose ChatCompletionResponseChoice carries one
+        # (CompletionResponseChoice already does). Emitting it unconditionally
+        # would 400 at the disagg server's extra="forbid" re-validation on every
+        # other build -- which is precisely where the token_id:N logprobs
+        # fallback below is supposed to take over, so the write has to be gated
+        # the same way the read is.
+        if _choice_declares_token_ids():
+            response["choices"][0]["token_ids"] = gen_token_ids
+
         if logprobs_requested and gen_logprobs:
+            # `token` carries the id rather than the decoded text when asked.
+            # On TRT-LLM builds whose ChatCompletionResponseChoice lacks
+            # token_ids (declared since f94eeb37), this declared string field is
+            # how the ids survive the disagg server's strict re-validation. Same
+            # encoding vLLM uses, which is what NeMo-Gym already parses.
+            # Under disaggregation the flag never survives the frontend's
+            # gym-field strip, yet ids are exactly what rides this channel
+            # (the disagg adaptor parses token_id:N back out) -- and decoding
+            # each generated token individually is per-token tokenizer work
+            # nobody reads. Force the id encoding on any disagg request.
+            as_ids = (
+                bool(body.get("return_tokens_as_token_ids"))
+                or disagg_params is not None
+            )
             response["choices"][0]["logprobs"] = {
                 "content": [
                     {
-                        "token": tokenizer.decode([tid]),
+                        "token": (
+                            f"token_id:{tid}" if as_ids else tokenizer.decode([tid])
+                        ),
                         "logprob": lp,
                         "bytes": None,
                         "top_logprobs": [],
@@ -378,6 +711,28 @@ def _resolve_tool_parser_name(configured_name: str | None, model_name: str) -> s
         f"Could not infer a tool parser from {model_name!r}; "
         "set trtllm_cfg.tool_parser explicitly."
     )
+
+
+# TRT-LLM's disagg orchestrator encodes the forwarded worker request with
+# msgspec msgpack and flags it with this header, deliberately leaving
+# Content-Type as application/json so FastAPI still routes the body
+# (tensorrt_llm/serve/openai_client.py: MSGPACK_HEADERS). A plain
+# ``await request.json()`` therefore dies on the first byte of every
+# orchestrator-forwarded request -- 0x8e is a msgpack fixmap header, not UTF-8.
+# Only the request leg is encoded this way: the client reads Content-Type off
+# the response solely to reject an unexpected event-stream, so responses stay
+# ordinary JSON.
+_MSGPACK_REQUEST_HEADER = "x-trtllm-msgpack"
+
+
+async def _decode_request_body(request: "Request") -> dict[str, Any]:
+    """Body as a dict, honoring the orchestrator's msgpack framing."""
+    if request.headers.get(_MSGPACK_REQUEST_HEADER) != "1":
+        return await request.json()
+
+    import msgspec
+
+    return msgspec.msgpack.decode(await request.body())
 
 
 def _build_tool_parser(name: str) -> Any:

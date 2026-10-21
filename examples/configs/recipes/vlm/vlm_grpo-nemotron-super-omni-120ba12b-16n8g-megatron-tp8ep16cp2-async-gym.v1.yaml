@@ -130,6 +130,25 @@ env:
     - resources_servers/mcqa/configs/mcqa.yaml
     - resources_servers/gui_coordinate/configs/gui_coordinate.yaml
     - resources_servers/string_match/configs/string_match.yaml
+    # Drop inherited wrappers for environments omitted from this recipe.
+    code_gen_environment_server: null
+    workplace_assistant_environment_server: null
+    instruction_following_environment_server: null
+    structured_outputs_environment_server: null
+    gui_coordinate_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: gui_coordinate_simple_agent
+    string_match_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: string_match_simple_agent
     policy_model:
       responses_api_models:
         vllm_model:

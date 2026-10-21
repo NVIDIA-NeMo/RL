@@ -1,6 +1,6 @@
 # NeMo-RL
 
-NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
+NeMo-RL is an RLHF training framework built on Ray and PyTorch (Automodel / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
 
 ## Skills
 
@@ -26,6 +26,10 @@ Never skip or reorder these steps. Do not wait for the user to name the right
 skill keyword — infer it from the artifact you read.
 
 ## Code Review
+
+For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR.
+See CONTRIBUTING.md for service integration prerequisites. The existing
+repository review guidance and local interactive commands below are unchanged.
 
 Use `/review-pr <pr-number>` for interactive local PR review.
 

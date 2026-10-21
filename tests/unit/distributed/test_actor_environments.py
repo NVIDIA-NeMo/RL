@@ -37,6 +37,7 @@ from nemo_rl.distributed.virtual_cluster import (
     git_root,
     uv_py_executable,
 )
+from nemo_rl.models.policy.utils import POLICY_WORKER_OVERRIDES
 
 MODULE_PATH = Path(git_root) / "nemo_rl" / "distributed" / "actor_environments.py"
 
@@ -83,6 +84,17 @@ def test_actor_module_exists(actor_fqn):
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             defined.update(a.asname or a.name.split(".")[-1] for a in node.names)
     assert class_name in defined, f"{actor_fqn}: {class_name} not defined in {path}"
+
+
+@pytest.mark.parametrize("default_cls", sorted(POLICY_WORKER_OVERRIDES))
+def test_policy_worker_override_names_registered_actors(default_cls):
+    """Both sides of each override must be registered actor FQNs.
+
+    resolve_policy_worker_cls falls back to the unquantized worker when the key
+    misses, so a stale key after a rename would silently drop quantization.
+    """
+    assert default_cls in ACTOR_ENVIRONMENTS
+    assert POLICY_WORKER_OVERRIDES[default_cls] in ACTOR_ENVIRONMENTS
 
 
 @pytest.mark.skipif(

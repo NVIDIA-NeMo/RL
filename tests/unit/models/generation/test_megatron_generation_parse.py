@@ -322,11 +322,14 @@ def test_http_server_port_reservation(monkeypatch):
             rank=0,
             cfg={
                 "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
                     "mcore_generation_config": {
                         "block_size_tokens": 64,
                         "enable_prefix_caching": False,
                         "parsers": [],
-                    }
+                    },
                 }
             },
             _reserved_http_server_port=reserved_port,
@@ -373,16 +376,34 @@ def test_http_server_port_reservation(monkeypatch):
 
 @pytest.mark.mcore
 @pytest.mark.parametrize(
-    ("gen_cfg_extra", "expected_num_replicas"),
+    ("gen_cfg_extra", "expected", "absent"),
     [
-        ({}, None),
-        ({"http_server_num_replicas": 8}, 8),
+        # Replica count reaches MCore, and stays absent when unconfigured.
+        pytest.param({}, {}, ["num_replicas"], id="num-replicas-unset"),
+        pytest.param(
+            {"http_server_num_replicas": 8},
+            {"num_replicas": 8},
+            [],
+            id="num-replicas-forwarded",
+        ),
     ],
 )
-def test_http_server_num_replicas_is_forwarded_only_when_set(
-    monkeypatch, gen_cfg_extra, expected_num_replicas
+def test_http_server_kwargs_follow_policy_config(
+    monkeypatch, gen_cfg_extra, expected, absent
 ):
-    """Replica count reaches MCore, and stays absent when unconfigured."""
+    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
+
+    assert {key: started[key] for key in expected} == expected
+    assert not set(absent) & set(started)
+
+
+def _start_stubbed_http_server(
+    monkeypatch,
+    *,
+    gen_cfg_extra: dict | None = None,
+    sampling_cfg: dict | None = None,
+) -> dict:
+    """Run ``_setup_openai_api_server`` against a stubbed MCore server; return its kwargs."""
     started = {}
     monkeypatch.setattr(
         mlm_text_gen_server,
@@ -412,12 +433,13 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
         rank=0,
         cfg={
             "generation": {
+                **(sampling_cfg or {"temperature": 1.0, "top_p": 1.0, "top_k": None}),
                 "mcore_generation_config": {
                     "block_size_tokens": 64,
                     "enable_prefix_caching": False,
                     "parsers": [],
-                    **gen_cfg_extra,
-                }
+                    **(gen_cfg_extra or {}),
+                },
             }
         },
         _reserved_http_server_port=None,
@@ -425,11 +447,7 @@ def test_http_server_num_replicas_is_forwarded_only_when_set(
     )
 
     MegatronGenerationMixin._setup_openai_api_server(worker)
-
-    if expected_num_replicas is None:
-        assert "num_replicas" not in started
-    else:
-        assert started["num_replicas"] == expected_num_replicas
+    return started
 
 
 @pytest.mark.mcore
@@ -457,3 +475,35 @@ def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
     future.result.assert_called_once_with()
     setup_server.assert_called_once_with()
     assert worker.base_url == "http://10.0.0.5:5555/v1"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("sampling", "expected"),
+    [
+        (
+            {"temperature": 1.0, "top_p": 1.0, "top_k": None},
+            {"default_temperature": 1.0, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.7, "top_p": None, "top_k": -1},
+            {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            {"default_temperature": 0.6, "default_top_p": 0.95, "default_top_k": 20},
+        ),
+    ],
+)
+def test_http_server_defaults_follow_generation_sampling(
+    monkeypatch, sampling, expected
+):
+    """Requests that omit sampling fields use the training sampling profile.
+
+    Without explicit server defaults, MCore falls back to hardcoded values or to
+    the model's generation_config.json, which can differ from the parameters the
+    policy recomputes log probabilities with.
+    """
+    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling)
+
+    assert {key: started[key] for key in expected} == expected

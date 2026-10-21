@@ -10,6 +10,7 @@ set -eou pipefail
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
+CKPT_DIR=$EXP_DIR/checkpoints
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
@@ -37,9 +38,22 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     logger.monitor_gpus=true \
-    checkpointing.enabled=false \
+    policy.megatron_cfg.checkpoint.async_save=true \
+    policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true \
+    value.megatron_cfg.checkpoint.async_save=true \
+    value.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true \
+    checkpointing.enabled=true \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    checkpointing.metric_name=null \
+    checkpointing.save_period=1 \
     $@ \
     2>&1 | tee $RUN_LOG
+
+# Each async save must write the current optimizer state, not the first save's.
+for model in policy value; do
+    uv run tests/check_checkpoint_freshness.py \
+        $CKPT_DIR/step_1/$model/weights $CKPT_DIR/step_2/$model/weights
+done
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 

@@ -141,17 +141,19 @@ def apply_reward_shaping(
         else:
             response_lengths = list(response_token_lengths)
     else:
+        # Count all generated assistant turns, excluding prompt history. Measure
+        # before loss-mask preparation backfills missing generation_logprobs.
         response_lengths = []
         for message_log in batch["message_log"]:
-            length = None
-            for message in message_log:
-                if message["role"] == "assistant":
-                    length = message["token_ids"].shape[0]
-                    break
-            assert length is not None, (
+            assistant_lengths = [
+                message["token_ids"].shape[0]
+                for message in message_log
+                if message["role"] == "assistant" and "generation_logprobs" in message
+            ]
+            assert assistant_lengths, (
                 "Assistant response not found during reward shaping"
             )
-            response_lengths.append(length)
+            response_lengths.append(sum(assistant_lengths))
 
     assert len(response_lengths) == len(rewards), (
         "The number of messages in the batch must match the number of rewards"

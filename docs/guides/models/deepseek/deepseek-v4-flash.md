@@ -24,7 +24,7 @@ AutoModel training backend and vLLM generation.
 - **Algorithm**: GRPO with `DAPOMath17K` for training and
   `DAPOMathAIME2024` for validation.
 - **Training backend**: AutoModel with BF16 training, activation checkpointing,
-  TileLang attention, and the DeepEP expert dispatcher.
+  TileLang attention, and the HybridEP expert dispatcher.
 - **Training parallelism**: TP1, CP8, and EP128 on 128 GPUs. CP and EP are
   model-owned parallel dimensions that coexist on the same device mesh; they
   are not multiplicative.

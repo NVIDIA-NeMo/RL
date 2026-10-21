@@ -4,6 +4,8 @@ NeMo-RL's telemetry is a standard OpenTelemetry OTLP exporter: enable it, point 
 
 Choosing an observability solution — retention, scale, auth, dashboards — is your decision, driven by your organisation's existing stack (e.g. Jaeger, Grafana Tempo, or an OpenTelemetry Collector that fans out to your backend of choice). For backend-specific guidance, see [lens: backends](https://github.com/NVIDIA-NeMo/Lens).
 
+What ships here is log *records* from NeMo-RL's Python processes. The log *files* a Slurm job leaves behind — raylet and GCS logs, the per-node wrapper logs, the driver log — are a separate path that these settings do not control: see [`LOKI_PUSH_URL`](../cluster.md) for shipping those to Loki with Grafana Alloy.
+
 ## Turn it on
 
 What you measure goes in your run config, so a run's telemetry settings stay recoverable from the file that describes the run:

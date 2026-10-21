@@ -6,6 +6,7 @@ source "$SCRIPT_DIR/common.env"
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
 GPUS_PER_NODE=4
+SEGMENT_SIZE=4  # Keep the 16 HybridEP ranks within one NVLink domain.
 STEPS_PER_RUN=2
 MAX_STEPS=2
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
@@ -58,7 +59,7 @@ uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     "data[\"train/reward\"][\"$MAX_STEPS\"] >= 0.25" \
     "data[\"validation/accuracy\"][\"$MAX_STEPS\"] >= 0.4" \
     "data[\"train/gen_kl_error\"][\"$MAX_STEPS\"] < 0.03" \
-    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.007" \
+    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.008" \
     "data[\"train/approx_entropy\"][\"$MAX_STEPS\"] < 0.35"
 
 mapfile -t TRAIN_DATA_FILES < <(

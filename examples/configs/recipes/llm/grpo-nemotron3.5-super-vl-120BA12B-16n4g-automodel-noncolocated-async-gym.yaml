@@ -1,0 +1,11 @@
+defaults: ../../../nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml
+# Release-test entry point for the Nemotron 3.5 Super VL NeMo Gym workplace_assistant
+# recipe (async GRPO, non-colocated vLLM, 8 training + 8 generation 4-GPU GB200 nodes).
+# The recipe itself lives next to the other NeMo Gym recipes; this file only exists so
+# tests/test_suites/llm/<same name>.sh can resolve it.
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3.5-super-vl-120BA12B-16n4g-automodel-noncolocated-async-gym
+logger:
+  log_dir: logs/grpo-nemotron3.5-super-vl-120BA12B-16n4g-automodel-noncolocated-async-gym
+  wandb:
+    name: grpo-nemotron3.5-super-vl-120BA12B-16n4g-automodel-noncolocated-async-gym

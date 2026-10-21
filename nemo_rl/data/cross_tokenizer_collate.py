@@ -66,7 +66,7 @@ class CrossTokenizerCollator:
             side (also the padded sequence length of the student tensor).
         ctx_length_teachers: Per-teacher tokenization length caps.
         make_seq_div_by_student: Round student sequence length up to a
-            multiple of this value (typically TP * CP * 2 for DTensor V2).
+            multiple of this value (typically TP * CP * 2 for Automodel).
         make_seq_div_by_teachers: Per-teacher sequence-length divisors.
     """
 
@@ -164,7 +164,7 @@ class CrossTokenizerCollator:
                 dim=-1
             ).long()
             out[f"teacher_{i}_token_mask"] = teacher_attention_mask.long()
-            # Alignment payload, dense-padded so DTensor V2 can shard on dim 0.
+            # Alignment payload, dense-padded so Automodel can shard on dim 0.
             # Keys are driven off AlignmentBatch fields so they can't drift
             # from `alignment_from_flat_batch(data, prefix=f"alignment_{i}_")`.
             for f in dataclass_fields(alignment):

@@ -30,7 +30,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     sft.max_num_steps=3 \
     sft.val_batches=1 \
     sft.val_period=3 \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.megatron_cfg.peft.enabled=true \
     policy.megatron_cfg.pipeline_model_parallel_size=1 \

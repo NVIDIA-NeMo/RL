@@ -1,0 +1,50 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+
+# ===== BEGIN CONFIG =====
+# Mirrors grpo-llama3.2-1b-instruct-1n8g-automodel.v3.sh (delegated base).
+NUM_NODES=1
+STEPS_PER_RUN=500
+MAX_STEPS=500
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=120
+# ===== END CONFIG =====
+
+source "$SCRIPT_DIR/common-tq.env"
+# Run base script under this wrapper's identity (own log/ckpt dirs, wandb name).
+# The matching TQ YAML inherits from <base>.yaml and turns on data_plane.
+export EXP_NAME="$TQ_EXP_NAME"
+
+# The YAML turns on data_plane.simple.ssd_offload; the path is overridden below
+# with a fresh per-run dir so a stale dir from another run cannot satisfy the
+# check. TQ deletes its files on close, so watch for the first .bin during the
+# run instead of checking after it.
+SSD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nrl_tq_ssd_XXXXXX")
+SSD_SEEN="$SSD_DIR.seen"
+( until [[ -n "$(find "$SSD_DIR" -name '*.bin' -print -quit 2>/dev/null)" ]]; do
+    sleep 5
+done; touch "$SSD_SEEN" ) &
+SSD_WATCH_PID=$!
+trap 'kill "$SSD_WATCH_PID" 2>/dev/null || true; rm -rf "$SSD_DIR" "$SSD_SEEN"' EXIT
+
+bash "$SCRIPT_DIR/$BASE_RECIPE.sh" \
+    data_plane.observability.verify_tensor_hash=True \
+    data_plane.simple.ssd_offload.path="$SSD_DIR" \
+    "$@"
+
+# The wire guard only counts, so assert it looked and agreed. rows_checked
+# is the load-bearing one: mismatches==0 also holds when nothing was compared,
+# and a guard that stops working stops comparing.
+# The delegated base runs in a subshell, so common.env's TEST_DRYRUN exit
+# does not reach here. Skip explicitly, or the dryrun check in
+# tests/unit/test_recipes_and_test_suites.py fails on a missing metrics.json.
+# `if` form, not `&& exit`: a false `[[ ]]` returns 1 and set -e would abort.
+if [[ -n "${TEST_DRYRUN:-}" ]]; then exit 0; fi
+if [[ ! -e "$SSD_SEEN" ]]; then
+    echo "[ERROR] ssd_offload was enabled but no .bin file ever appeared under $SSD_DIR" >&2
+    exit 1
+fi
+cd "$SCRIPT_DIR/../../.."
+uv run tests/check_metrics.py "$SCRIPT_DIR/$TQ_EXP_NAME/metrics.json" \
+    'max({**data.get("data_plane/cluster/step/hash/mismatches", {}), **data.get("data_plane/driver/step/hash/mismatches", {})}) == 0' \
+    'max({**data.get("data_plane/cluster/step/hash/rows_checked", {}), **data.get("data_plane/driver/step/hash/rows_checked", {})}) > 0'

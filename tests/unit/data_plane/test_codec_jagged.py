@@ -27,6 +27,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.codec import (
     materialize,
     pack_jagged_fields,
+    pad_batch,
     response_from_nested,
     to_nested_by_length,
 )
@@ -348,3 +349,36 @@ def test_materialize_skips_pad_to_seqlen_for_opd_full_fields() -> None:
     assert torch.equal(out[0, :2], payload[0, :2])
     assert torch.equal(out[0, 2:], torch.zeros(2, 3))
     assert torch.equal(out[1], payload[1])
+
+
+def test_pad_batch_matches_padded_materialize() -> None:
+    """Padding a jagged batch afterwards equals materializing it padded."""
+    lengths = torch.tensor([3, 5, 1], dtype=torch.long)
+    fields = {
+        "input_ids": torch.randint(1, 100, (3, 5)),
+        "generation_logprobs": torch.randn(3, 5),
+        "synthetic_3d_field": torch.randn(3, 5, 2),
+        OPD_FULL_LOGITS_FIELD: torch.randn(3, 5, 4),
+        "dense_2d": torch.randn(3, 5),
+        "input_lengths": lengths,
+    }
+    td = pack_jagged_fields(
+        fields,
+        lengths=lengths,
+        token_aligned_fields=frozenset(
+            {
+                "input_ids",
+                "generation_logprobs",
+                "synthetic_3d_field",
+                OPD_FULL_LOGITS_FIELD,
+            }
+        ),
+    )
+    pads = {"input_ids": 7}
+
+    expected = materialize(td, layout="padded", pad_value_dict=pads, pad_to_seqlen=8)
+    got = pad_batch(materialize(td, layout="jagged"), pads, 8)
+
+    assert set(got) == set(expected)
+    for key in expected:
+        assert torch.equal(got[key], expected[key]), key

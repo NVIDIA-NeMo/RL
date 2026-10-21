@@ -1,60 +1,81 @@
 # Evaluation
 
-We provide evaluation tools to assess model capabilities.
+Use [NeMo Gym](https://docs.nvidia.com/nemo/gym/) to evaluate models and agents with repeatable benchmarks or [your own tasks](https://docs.nvidia.com/nemo/gym/data). The same NeMo Gym environments can produce rollouts and rewards for RL training.
 
-## Convert Model Format (Optional)
+NeMo Gym packages datasets, [agent harnesses](https://docs.nvidia.com/nemo/gym/agent-server), tools, [verifiers](https://docs.nvidia.com/nemo/gym/build-verifiers), rollout collection, and metrics into reusable environments. It supports single-turn and multi-turn evaluations against hosted endpoints, self-hosted model servers, and local checkpoints.
 
-If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation:
+## Choose a Benchmark
 
-```sh
-# Example for a GRPO checkpoint at step 170
-uv run python examples/converters/convert_dcp_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --dcp-ckpt-path results/grpo/step_170/policy/weights/ \
-    --hf-ckpt-path results/grpo/hf
+List the currently available benchmarks, then inspect one to see its dataset, agent harness, and repeat count:
+
+```bash
+uv run --extra nemo_gym gym list benchmarks
+uv run --extra nemo_gym gym list benchmarks aime24
 ```
 
-If you have a model saved in Megatron format, you can use the following command to convert it to Hugging Face format prior to running evaluation. This script requires Megatron Core, so make sure you launch with the mcore extra:
+## Run a Benchmark
 
-```sh
-# Example for a GRPO checkpoint at step 170
-uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
-    --config results/grpo/step_170/config.yaml \
-    --megatron-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
-    --hf-ckpt-path results/grpo/hf
+The following example evaluates a model on AIME24.
+
+This example requires:
+
+- A Linux system with an NVIDIA GPU supported by vLLM.
+- A NeMo RL checkout with submodules, set up as in the [installation guide](installation.md). The commands below run through `uv run`: `--extra nemo_gym` provides the `gym` command and `--extra vllm` provides `vllm serve`.
+- Network access to download the public model and AIME dataset from Hugging Face.
+
+To evaluate a NeMo RL checkpoint that is not in Hugging Face format, convert it first:
+
+- [Automodel DCP checkpoints](../design-docs/checkpointing.md#converting-torch-distributed-checkpoints-to-hugging-face-format)
+- [Megatron checkpoints](../design-docs/checkpointing.md#converting-megatron-checkpoints-to-hugging-face-format)
+- [Megatron LoRA adapter checkpoints](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format)
+
+The example below uses a public Hugging Face model directly.
+
+Start a vLLM server with the model or converted checkpoint you want to evaluate. This example uses Qwen2.5-Math-1.5B-Instruct:
+
+```bash
+uv run --extra vllm vllm serve Qwen/Qwen2.5-Math-1.5B-Instruct \
+    --host 0.0.0.0 \
+    --port 10240
 ```
 
-> [!NOTE]
-> Adjust the paths according to your training output directory structure.
+From another terminal, prepare the benchmark data. This one-time step downloads and converts AIME24 into the format expected by NeMo Gym:
 
-For an in-depth explanation of checkpointing, refer to the [Checkpointing documentation](../design-docs/checkpointing.md).
-
-## Run Evaluation
-
-Run the evaluation script with the converted model:
-
-```sh
-uv run python examples/run_eval.py generation.model_name=$PWD/results/grpo/hf
+```bash
+uv run --extra nemo_gym gym eval prepare --benchmark aime24
 ```
 
-Run the evaluation script with custom settings:
+Run the benchmark against the vLLM endpoint:
 
-```sh
-# Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
-#          Pass@1 accuracy averaged over 16 samples for each problem
-uv run python examples/run_eval.py \
-    --config examples/configs/evals/math_eval.yaml \
-    generation.model_name=agentica-org/DeepScaleR-1.5B-Preview \
-    generation.temperature=0.6 \
-    generation.top_p=0.95 \
-    generation.vllm_cfg.max_model_len=32768 \
-    data.dataset_name=math500 \
-    eval.num_tests_per_prompt=16 \
-    cluster.gpus_per_node=8
+```bash
+uv run --extra nemo_gym gym eval run \
+    --benchmark aime24 \
+    --model-type vllm_model \
+    --model-url http://127.0.0.1:10240/v1 \
+    --model Qwen/Qwen2.5-Math-1.5B-Instruct \
+    --model-api-key dummy_key \
+    --output results/aime24.jsonl
 ```
 
-> [!NOTE]
-> Evaluation results may vary slightly due to various factors, such as sampling parameters, random seed, inference engine version, and inference engine settings.
+The command prints key metrics and writes:
 
-Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that can be overridden. For an in-depth explanation of evaluation, refer to the [Evaluation documentation](../guides/eval.md).
+- `results/aime24.jsonl`: rollout records and rewards.
+- `results/aime24_materialized_inputs.jsonl`: the rendered benchmark inputs.
+- `results/aime24_aggregate_metrics.json`: [aggregate evaluation metrics](https://docs.nvidia.com/nemo/gym/evaluation/aggregate-metrics).
+
+## Analyze and Compare
+
+- [Compare baseline and candidate evaluation runs](https://docs.nvidia.com/nemo/gym/reference/cli-commands#gym-eval-compare).
+- [Investigate task-level failures and score changes](https://docs.nvidia.com/nemo/gym/evaluation/diagnose-results).
+
+## Run a Quick Evaluation with NeMo RL
+
+For quick checks without NeMo Gym, use NeMo RL's [built-in evaluator](../../examples/run_eval.py) to evaluate a Hugging Face-format checkpoint against its supported benchmarks:
+
+```sh
+uv run python examples/run_eval.py generation.model_name=/path/to/hugging-face-checkpoint
+```
+
+- When you evaluate a checkpoint you trained, use the same prompt and chat template as in training: set `data.prompt_file`, `data.system_prompt_file`, and `tokenizer.chat_template` to your training values. The defaults in `examples/configs/evals/eval.yaml` use the model's native chat template with no prompt file, which suits public models.
+- Supported `data.dataset_name` values: `AIME2024`, `AIME2025`, `AIME2026`, `gpqa`, `gpqa_diamond`, `math`, `math500`, `mmlu`, `mmlu_{language}` (one of `AR-XY`, `BN-BD`, `DE-DE`, `ES-LA`, `FR-FR`, `HI-IN`, `ID-ID`, `IT-IT`, `JA-JP`, `KO-KR`, `PT-BR`, `ZH-CN`, `SW-KE`, `YO-NG`), `mmlu_pro`, `mmau`, and `daily-omni`. Ready-made configs are in `examples/configs/evals/`.
 

@@ -52,11 +52,23 @@ def _engine_already_imported() -> str | None:
 
 
 def rail_link_layers() -> dict[str, str]:
-    """Map each mlx5 rail to its port-1 link layer, read from sysfs."""
+    """Map each usable RDMA device to its port-1 link layer, read from sysfs.
+
+    Any device name, not just ``mlx5_*``: vendors name rails differently. Port 1
+    must be ACTIVE: it is the port mooncake's RDMA transport uses by default
+    (``MC_IB_PORT`` overrides it). Mooncake's own discovery also accepts a
+    device active only on a higher port, which this skips.
+    """
     layers: dict[str, str] = {}
-    for path in sorted(glob.glob("/sys/class/infiniband/mlx5_*/ports/1/link_layer")):
+    for state_path in sorted(glob.glob("/sys/class/infiniband/*/ports/1/state")):
+        state = Path(state_path)
+        port_dir = state.parent
         try:
-            layers[Path(path).parents[2].name] = Path(path).read_text().strip()
+            if "ACTIVE" not in state.read_text():
+                continue
+            layers[port_dir.parents[1].name] = (
+                (port_dir / "link_layer").read_text().strip()
+            )
         except OSError:
             continue
     return layers
