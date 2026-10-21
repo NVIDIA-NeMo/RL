@@ -1569,12 +1569,19 @@ class AsyncNemoGymRolloutImpl:
                 )
                 for c in completions
             ]
-        # truncated metrics
-        truncated = [c.truncated for c in completions]
-
         # Aggregate metrics across all samples.
         n = len(completions)
-        truncation_rate = sum(truncated) / n
+        # Receipt completions carry a placeholder truncated=False; the finalizer
+        # reports capture termination rates from the rebuilt rows instead.
+        termination_metrics: dict[str, float] = {}
+        if not receipt_mode:
+            truncation_rate = sum(c.truncated for c in completions) / n
+            termination_metrics = {
+                "natural_termination_rate": sum(not c.truncated for c in completions)
+                / n,
+                "truncation_rate": truncation_rate,
+                f"{agent_name}/truncation_rate": truncation_rate,
+            }
         rollout_metrics: dict[str, Any] = {
             **(
                 calculate_single_metric(total_reward, n, "total_reward")
@@ -1592,10 +1599,7 @@ class AsyncNemoGymRolloutImpl:
                 max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
             ),
             "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
-            # truncated metrics
-            "natural_termination_rate": sum(not t for t in truncated) / n,
-            "truncation_rate": truncation_rate,
-            f"{agent_name}/truncation_rate": truncation_rate,
+            **termination_metrics,
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent

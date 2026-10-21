@@ -285,6 +285,30 @@ def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
     assert aggregate_capture_reward_metrics({}, []) == {}
 
 
+def test_termination_rates_pool_truncated_valid_rows():
+    # Two groups with 1 and 3 valid rows; 2 of the 4 rows hit max_seq_len.
+    observations = [
+        FinalizedReward(f"sample-{i}", f"attempt-{i}", 1.0, context)
+        for i, context in enumerate(
+            [RewardLogContext("a", None)] * 3 + [RewardLogContext("b", None)]
+        )
+    ]
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/truncated_count": [1.0, 1.0],
+            "finalize/truncated_count/a": [1.0, 0.0],
+            "finalize/truncated_count/b": [1.0],
+        },
+        observations,
+    )
+    assert metrics["truncation_rate"] == 0.5
+    assert metrics["natural_termination_rate"] == 0.5
+    assert metrics["a/truncation_rate"] == pytest.approx(1 / 3)
+    assert metrics["b/truncation_rate"] == 1.0
+    # No finalizer counts (echo path): termination rates come from completions.
+    assert "truncation_rate" not in aggregate_capture_reward_metrics({}, observations)
+
+
 def _input(*messages):
     return {"responses_create_params": {"input": list(messages)}}
 

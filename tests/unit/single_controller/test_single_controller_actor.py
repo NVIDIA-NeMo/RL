@@ -4195,12 +4195,16 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     pending = {
         "group-0": {
             "finalize/penalty_count/empty_final_answer": 1.0,
+            "finalize/truncated_count": 1.0,
+            "finalize/truncated_count/agent": 1.0,
             "finalize/effort/low/100": 1.0,
             "finalize/effort/length_reward_sum": 0.9,
             "finalize/effort/reward_sum": 1.9,
         },
         "group-1": {
             "finalize/penalty_count/empty_final_answer": 0.0,
+            "finalize/truncated_count": 0.0,
+            "finalize/truncated_count/agent": 0.0,
             "finalize/effort/low/900": 1.0,
             "finalize/effort/low/1000": 1.0,
             "finalize/effort/low/1200": 1.0,
@@ -4248,6 +4252,11 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
     assert metrics["agent/reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
+    # Termination rates pool truncated valid rows, not per-group rates.
+    assert metrics["truncation_rate"] == 0.25
+    assert metrics["natural_termination_rate"] == 0.75
+    assert metrics["agent/truncation_rate"] == 0.25
+    assert not any(name.startswith("finalize/truncated_count") for name in metrics)
     assert ("agent/full_result" in metrics) is log_full_result_tables
     if log_full_result_tables:
         assert '"reward":0.0' in metrics["agent/full_result"].data[0][0]

@@ -1262,7 +1262,9 @@ def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():
 
     metrics = _nemo_gym_impl(True)._compute_rollout_metrics(completions, "agent")
 
-    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    # Receipt truncated flags are placeholders; the finalizer reports these rates.
+    for key in ("truncation_rate", "natural_termination_rate", "agent/truncation_rate"):
+        assert key not in metrics
     assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
     assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
     assert metrics["agent/gen_tokens_per_sample/histogram"] == [5, 4]
