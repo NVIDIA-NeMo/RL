@@ -91,6 +91,9 @@ class StubEp:
         if self.fail is not None:
             raise self.fail
 
+    def transfer_many(self, ops, *, timeout_s):
+        return [self.fail] * len(ops)
+
 
 class _Placement:
     def order(self, units, *, node_id, nbytes):

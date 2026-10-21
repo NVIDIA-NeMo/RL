@@ -249,14 +249,73 @@ class NixlEndpoint:
 
         ``local`` and ``remote`` are parallel lists of ``(addr, nbytes)``.
         """
-        if op not in ("WRITE", "READ"):
-            raise ValueError(op)
+        err = self.transfer_many(
+            [(op, local, remote, remote_agent)], timeout_s=timeout_s
+        )[0]
+        if err is not None:
+            raise err
+
+    def transfer_many(
+        self,
+        ops: Sequence[
+            tuple[str, Sequence[tuple[int, int]], Sequence[tuple[int, int]], str]
+        ],
+        *,
+        timeout_s: float = 120.0,
+    ) -> list[TransferError | None]:
+        """Post every ``(op, local, remote, remote_agent)``, then wait for all of them.
+
+        The transfers run at the same time, so N units cost about the slowest
+        one, not the sum. One ``timeout_s`` bounds the wait for the whole batch.
+        Returns one entry per op: ``None`` once it is DONE, else its
+        :class:`TransferError`. Ops are independent: a failure of one does not
+        stop the others. Invalid arguments raise ``ValueError`` before anything
+        is posted.
+
+        Every posted transfer ends DONE (handle released) or retained (see
+        :meth:`_retain`), on every exit, including an exception.
+        """
         GRAVEYARD.check()
-        if len(local) != len(remote) or not local:
-            raise ValueError("descriptor lists must be non-empty and equal length")
-        for (_, a), (_, b) in zip(local, remote):
-            if a != b:
-                raise ValueError("descriptor lengths differ")
+        for op, local, remote, _ in ops:
+            if op not in ("WRITE", "READ"):
+                raise ValueError(op)
+            if len(local) != len(remote) or not local:
+                raise ValueError("descriptor lists must be non-empty and equal length")
+            for (_, a), (_, b) in zip(local, remote):
+                if a != b:
+                    raise ValueError("descriptor lengths differ")
+        errs: list[TransferError | None] = [None] * len(ops)
+        live: dict[int, tuple[Any, Any, Any]] = {}  # op index -> (h, ldesc, rdesc)
+        try:
+            for i, (op, local, remote, remote_agent) in enumerate(ops):
+                errs[i] = self._post(i, op, local, remote, remote_agent, live)
+            deadline = time.monotonic() + timeout_s
+            while live:
+                for i in list(live):
+                    try:
+                        state = self.agent.check_xfer_state(live[i][0])
+                    except Exception as e:  # noqa: BLE001
+                        errs[i] = self._fail(
+                            i, ops[i], live, f"{type(e).__name__}: {e}", e
+                        )
+                        continue
+                    if state == "DONE":
+                        self._done(live.pop(i))
+                    elif state != "PROC":
+                        errs[i] = self._fail(i, ops[i], live, f"ended in state {state}")
+                if live and time.monotonic() > deadline:
+                    for i in list(live):
+                        errs[i] = self._fail(
+                            i, ops[i], live, f"timed out after {timeout_s}s"
+                        )
+        except BaseException:
+            for i in list(live):
+                self._retain(live.pop(i), ops[i][1])
+            raise
+        return errs
+
+    def _post(self, i, op, local, remote, remote_agent, live) -> TransferError | None:
+        """Post one transfer; ``live[i]`` is set while it is still running."""
         ldesc = self.agent.get_xfer_descs([(a, n, 0) for a, n in local], "DRAM")
         rdesc = self.agent.get_xfer_descs([(a, n, 0) for a, n in remote], "DRAM")
         # NIXL reports a broken peer by raising (NIXL_ERR_REMOTE_DISCONNECT,
@@ -266,42 +325,56 @@ class NixlEndpoint:
         try:
             h = self.agent.initialize_xfer(op, ldesc, rdesc, remote_agent)
         except Exception as e:  # noqa: BLE001 - NIXL binding errors have no common base
-            raise TransferError(
-                f"{op} to {remote_agent}: {type(e).__name__}: {e}"
-            ) from e
+            err = TransferError(f"{op} to {remote_agent}: {type(e).__name__}: {e}")
+            err.__cause__ = e
+            return err
         # From here on the transfer may be posted. Anything short of DONE leaves
         # it possibly still running, so its local ranges go on ``unfinished``
         # for good: a READ's are its destination, a WRITE's its source, whose
         # memory and registration must outlive it too (BufferPool and the
         # zero-copy put check them). A failed WRITE's destination is remote;
-        # the caller retires it on the unit. The handle is kept too, never
-        # released: POSIX hands the request object to its I/O callbacks and
-        # deleting it under a pending I/O is a use-after-free.
+        # the caller retires it on the unit.
+        live[i] = (h, ldesc, rdesc)
         try:
             state = self.agent.transfer(h)
-            deadline = time.monotonic() + timeout_s
-            while state == "PROC":
-                if time.monotonic() > deadline:
-                    raise TransferError(
-                        f"{op} to {remote_agent} timed out after {timeout_s}s",
-                        in_flight=True,
-                    )
-                state = self.agent.check_xfer_state(h)
-            if state != "DONE":
-                raise TransferError(
-                    f"{op} to {remote_agent} ended in state {state}", in_flight=True
-                )
         except Exception as e:  # noqa: BLE001
-            self.unfinished_handles.append((h, ldesc, rdesc))
-            self.unfinished.extend(local)
-            GRAVEYARD.retain(self.agent, h, ldesc, rdesc, local)
-            if isinstance(e, TransferError):
-                raise
-            raise TransferError(
-                f"{op} to {remote_agent}: {type(e).__name__}: {e}", in_flight=True
-            ) from e
+            return self._fail(
+                i,
+                (op, local, remote, remote_agent),
+                live,
+                f"{type(e).__name__}: {e}",
+                e,
+            )
+        if state == "DONE":
+            self._done(live.pop(i))
+        elif state != "PROC":
+            return self._fail(
+                i, (op, local, remote, remote_agent), live, f"ended in state {state}"
+            )
+        return None
+
+    def _fail(self, i, op_args, live, why, cause=None) -> TransferError:
+        """Retain transfer ``i`` (it may still run) and return its error."""
+        op, local, _, remote_agent = op_args
+        self._retain(live.pop(i), local)
+        err = TransferError(f"{op} to {remote_agent}: {why}", in_flight=True)
+        err.__cause__ = cause
+        return err
+
+    def _retain(self, xfer: tuple[Any, Any, Any], local) -> None:
+        """Keep a transfer that may still run, for good.
+
+        The handle is never released: POSIX hands the request object to its I/O
+        callbacks and deleting it under a pending I/O is a use-after-free.
+        """
+        h, ldesc, rdesc = xfer
+        self.unfinished_handles.append((h, ldesc, rdesc))
+        self.unfinished.extend(local)
+        GRAVEYARD.retain(self.agent, h, ldesc, rdesc, local)
+
+    def _done(self, xfer: tuple[Any, Any, Any]) -> None:
         try:
-            self.agent.release_xfer_handle(h)
+            self.agent.release_xfer_handle(xfer[0])
         except Exception:  # noqa: BLE001 - nothing is pending on a DONE handle
             pass
 

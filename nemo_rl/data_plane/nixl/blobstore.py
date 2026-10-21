@@ -434,6 +434,8 @@ class UnitSlabStore:
         fsz = blob_format.FOOTER_SIZE
         retry: dict[str, list[ReadRange]] = {}
         slot = 0
+        # One READ per unit, all posted before any is waited for.
+        reads: list[tuple[int, list[str], dict[str, int], tuple[Any, ...]]] = []
         for unit_id, blobs in fast.items():
             try:
                 uinfo = self._unit(unit_id)
@@ -453,15 +455,14 @@ class UnitSlabStore:
                 loc.append((sbase + slot * fsz, fsz))
                 rem.append((base + int(m["z"]) - fsz, fsz))
                 slot += 1
-            try:
-                self.ep.transfer(
-                    "READ",
-                    loc,
-                    rem,
-                    uinfo["agent_name"],
-                    timeout_s=remaining(deadline, self.timeout_s),
-                )
-            except TransferError as e:
+            reads.append(
+                (unit_id, blobs, slots, ("READ", loc, rem, uinfo["agent_name"]))
+            )
+        errs = self.ep.transfer_many(
+            [r[3] for r in reads], timeout_s=remaining(deadline, self.timeout_s)
+        )
+        for (unit_id, blobs, slots, _), e in zip(reads, errs):
+            if e is not None:
                 if e.in_flight:
                     # The READ may still land in these local ranges, so they
                     # cannot be refilled by the pinned path; fail the read.
@@ -541,6 +542,7 @@ class UnitSlabStore:
             if failed:  # the unit still has the file, so the caller may retry
                 raise TransferFailed(failed, "disk read failed on the unit")
             pending = {b for r in resolved.values() for b in r.get("pending", ())}
+            reads: list[tuple[int, list[str], tuple[Any, ...]]] = []
             for u, blobs in by_unit.items():
                 blobs = [b for b in blobs if b not in pending]
                 if not blobs:
@@ -553,15 +555,12 @@ class UnitSlabStore:
                     for off, n, laddr in requests[b]:
                         loc.append((laddr, n))
                         rem.append((base + off, n))
-                try:
-                    self.ep.transfer(
-                        "READ",
-                        loc,
-                        rem,
-                        uinfo["agent_name"],
-                        timeout_s=remaining(deadline, self.timeout_s),
-                    )
-                except TransferError as e:
+                reads.append((u, blobs, ("READ", loc, rem, uinfo["agent_name"])))
+            errs = self.ep.transfer_many(
+                [r[2] for r in reads], timeout_s=remaining(deadline, self.timeout_s)
+            )
+            for (u, blobs, _), e in zip(reads, errs):
+                if e is not None:
                     raise self._failed(u, blobs, e) from e
         finally:
             for u, r in resolved.items():
