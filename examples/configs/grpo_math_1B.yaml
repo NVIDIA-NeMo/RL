@@ -685,7 +685,6 @@ data_plane:
     lease_margin_s: 30.0
     op_timeout_s: null               # deadline of one put / get (all its waits); null: 2 x transfer_timeout_s
     graveyard_max_bytes: 4294967296  # memory unfinished transfers may retain before fatal
-    store: {kind: unit}              # unit | file (file: add root: <shared dir>)
     ssd: {enabled: false}            # SSD tier: {enabled, dir, staging_bytes, pickup_s}
     nixl: {backend_name: UCX, backend_init_params: {}}
   observability:                      # per-op data-plane timing/volume
