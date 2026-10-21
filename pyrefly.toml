@@ -298,6 +298,7 @@ project-includes = [
   "nemo_rl/models/megatron/draft/step_state.py",
   "nemo_rl/models/megatron/draft/training.py",
   "nemo_rl/models/megatron/draft/utils.py",
+  "nemo_rl/models/megatron/golden_values.py",
   "nemo_rl/models/megatron/hybridep.py",
   "nemo_rl/models/megatron/memory_saver.py",
   "nemo_rl/models/megatron/opd_full_capture.py",
