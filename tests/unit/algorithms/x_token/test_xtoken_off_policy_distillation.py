@@ -455,6 +455,8 @@ def test_teacher_aligner_config_explicit_values_serialize_and_stay_out_of_policy
     assert dumped["aligner"] == {
         "projection_matrix_path": "/tmp/projection.pt",
         "drop_first_assistant_chunk_kl": True,
+        "student_to_teacher_table_path": None,
+        "teacher_to_student_table_path": None,
     }
     assert "projection_matrix_path" not in dumped
     assert "aligner" not in teacher.policy_config()

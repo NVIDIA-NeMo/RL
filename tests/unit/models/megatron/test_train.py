@@ -32,6 +32,7 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 pytestmark = pytest.mark.mcore
 
@@ -326,6 +327,30 @@ class TestModelForward:
 
         mock_scatter.assert_not_called()
         assert result is padding_mask
+
+    def test_model_forward_passes_cp_local_router_padding_mask(self):
+        """Packed physical/masked tokens are excluded by GPT's MoE router."""
+        from nemo_rl.models.megatron.train import model_forward
+
+        mock_model = MagicMock(return_value=torch.randn(1, 6, 8))
+        mock_model.config = SimpleNamespace(sequence_parallel=False)
+        mock_data_dict = MagicMock()
+        mock_data_dict.get_multimodal_dict.return_value = {}
+        padding_mask = torch.tensor(
+            [[False, True, True, True, True, True]], dtype=torch.bool
+        )
+
+        model_forward(
+            model=mock_model,
+            data_dict=mock_data_dict,
+            input_ids_cp_sharded=torch.tensor([[1, 0, 4, 0, 0, 0]]),
+            position_ids=None,
+            attention_mask=None,
+            packed_seq_params=MagicMock(),
+            padding_mask=padding_mask,
+        )
+
+        assert mock_model.call_args.kwargs["padding_mask"] is padding_mask
 
     def test_model_forward_with_defer_fp32_logits(self):
         """Test model_forward passes fp32_output when defer_fp32_logits is True."""
@@ -1160,6 +1185,7 @@ class TestMegatronForwardBackward:
         cfg = {"sequence_packing": {"enabled": False}}
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
 
+        global_valid_chunks_by_idx = {0: torch.tensor(37)}
         megatron_forward_backward(
             model=mock_model,
             data_iterator=iter([]),
@@ -1167,6 +1193,7 @@ class TestMegatronForwardBackward:
             seq_length=128,
             mbs=2,
             post_processing_fn=post_processor,
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         )
 
         mock_get_fb.assert_called_once()
@@ -1177,6 +1204,10 @@ class TestMegatronForwardBackward:
         assert call_kwargs["num_microbatches"] == 4
         assert call_kwargs["seq_length"] == 128
         assert call_kwargs["micro_batch_size"] == 2
+        assert (
+            call_kwargs["forward_step_func"].keywords["global_valid_chunks_by_idx"]
+            is global_valid_chunks_by_idx
+        )
 
     @patch("nemo_rl.models.megatron.train.get_forward_backward_func")
     def test_megatron_forward_backward_forward_only(self, mock_get_fb):
@@ -1526,9 +1557,13 @@ class TestLossPostProcessor:
         self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
     ):
         """Test LossPostProcessor without sequence packing."""
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
         from nemo_rl.models.megatron.train import LossPostProcessor
 
-        mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
+        # Only CSD losses receive the global alignment-chunk counts.
+        mock_loss_fn = MagicMock(
+            spec=CSDLossFn, return_value=(torch.tensor(0.5), {"loss": 0.5})
+        )
         mock_loss_fn.input_type = LossInputType.LOGIT
         cfg = {"sequence_packing": {"enabled": False}}
 
@@ -1538,11 +1573,13 @@ class TestLossPostProcessor:
         mock_tp_grp.return_value = MagicMock()
         mock_cp_grp.return_value = MagicMock()
 
+        global_valid_chunks_by_idx = {0: torch.tensor(37)}
         wrapped_fn = processor(
             data_dict=MagicMock(),
             packed_seq_params=None,
             global_valid_seqs=torch.tensor(10),
             global_valid_toks=torch.tensor(100),
+            global_valid_chunks_by_idx=global_valid_chunks_by_idx,
         )
 
         # Call the wrapped function
@@ -1552,6 +1589,10 @@ class TestLossPostProcessor:
         assert torch.isclose(loss, torch.tensor(0.5))
         assert isinstance(metrics, dict)
         assert len(metrics) == 1 and metrics["loss"] == 0.5
+        assert (
+            mock_loss_fn.call_args.kwargs["global_valid_chunks_by_idx"]
+            is global_valid_chunks_by_idx
+        )
 
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
@@ -1593,6 +1634,51 @@ class TestLossPostProcessor:
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=2
+    )
+    def test_cp_partial_loss_keeps_only_the_schedule_compensation(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """A CP-partial loss is not divided by CP; Megatron's own scaling is undone."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
+        mock_loss_fn.input_type = LossInputType.LOGIT
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg={"sequence_packing": {"enabled": False}},
+            num_microbatches=4,
+            cp_normalize=False,
+        )
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        loss, _ = processor(data_dict=MagicMock())(torch.randn(2, 10, 100))
+
+        # Only num_microbatches / cp_size = 4 / 2, which cancels the schedule's
+        # cp_size / num_microbatches; summed over CP the partials give the loss.
+        assert torch.isclose(loss, torch.tensor(2.0))
+
+    def test_only_owner_local_csd_returns_a_cp_partial_loss(self):
+        from nemo_rl.algorithms.loss.csd import CSDLossConfig, CSDLossFn
+        from nemo_rl.models.megatron.train import (
+            loss_returns_context_parallel_partial,
+        )
+
+        assert loss_returns_context_parallel_partial(
+            CSDLossFn(CSDLossConfig(student_vocab_size=8, owner_local=True))
+        )
+        assert not loss_returns_context_parallel_partial(
+            CSDLossFn(CSDLossConfig(student_vocab_size=8))
+        )
+        assert not loss_returns_context_parallel_partial(MagicMock())
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
         "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
     )
     @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")
@@ -1619,6 +1705,52 @@ class TestLossPostProcessor:
 
         # Verify SequencePackingLossWrapper was called
         mock_wrapper.assert_called_once()
+
+    def test_csd_packing_selects_axis_aware_wrapper_even_when_fusion_enabled(
+        self,
+    ):
+        import nemo_rl.models.megatron.train as megatron_train
+        from nemo_rl.algorithms.loss.csd import CSDLossFn
+
+        packed_params = MagicMock(
+            cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
+            cu_seqlens_q_padded=torch.tensor([0, 4], dtype=torch.int32),
+        )
+        with (
+            patch.object(
+                megatron_train, "get_tensor_model_parallel_rank", return_value=0
+            ),
+            patch.object(
+                megatron_train,
+                "get_tensor_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                megatron_train,
+                "get_context_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                megatron_train, "CSDSequencePackingLossWrapper"
+            ) as mock_csd_wrapper,
+            patch.object(
+                megatron_train, "SequencePackingFusionLossWrapper"
+            ) as mock_fused_wrapper,
+            patch.object(
+                megatron_train, "SequencePackingLossWrapper"
+            ) as mock_generic_wrapper,
+        ):
+            processor = megatron_train.LossPostProcessor(
+                loss_fn=object.__new__(CSDLossFn),
+                cfg={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+                cp_normalize=False,
+            )
+
+            processor(data_dict=MagicMock(), packed_seq_params=packed_params)
+
+        mock_csd_wrapper.assert_called_once()
+        mock_fused_wrapper.assert_not_called()
+        mock_generic_wrapper.assert_not_called()
 
 
 def test_direct_model_loss_normalizes_target_aligned_tokens_and_schedule_scaling():
@@ -2209,6 +2341,548 @@ class TestTopkLogitsPostProcessor:
             expected[0, :seq1_len] = local[0, : seq1_len // cp_size].repeat(cp_size, 1)
             expected[1, :seq2_len] = local[0, seq1_len // cp_size :].repeat(cp_size, 1)
             torch.testing.assert_close(result[key], expected)
+
+
+class TestSparseTeacherLogitsPostProcessor:
+    """Tests for the CP-local sparse teacher row export."""
+
+    @staticmethod
+    def _sparse_outputs(local_seq_len: int, k: int, force_width: int = 2):
+        return (
+            torch.randn(1, local_seq_len, k),
+            torch.randint(0, 32, (1, local_seq_len, k)),
+            torch.randn(1, local_seq_len),
+            torch.randint(0, 32, (1, local_seq_len, 1)),
+            torch.randn(1, local_seq_len, force_width),
+            torch.randint(0, 32, (1, local_seq_len, force_width)),
+            torch.zeros(1, local_seq_len, force_width, dtype=torch.bool),
+        )
+
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk_logz_force")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+        return_value=1,
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("torch.distributed.get_rank")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_world_size")
+    def test_force_ids_follow_load_balanced_cp_rows_without_gather(
+        self,
+        mock_cp_world,
+        mock_cp_group,
+        mock_dist_rank,
+        mock_tp_group,
+        mock_tp_rank,
+        mock_sparse_topk,
+        mock_cp_allgather,
+    ):
+        """Forced-label rows use the logits' load-balanced CP row order."""
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        mock_cp_group.return_value = MagicMock()
+        tp_group = MagicMock()
+        mock_tp_group.return_value = tp_group
+        local_seq_len = 4
+        k = 3
+        for cp_size, cp_rank, full_seq_len, expected_positions in (
+            (2, 1, 8, [2, 3, 4, 5]),
+            (4, 2, 16, [4, 5, 10, 11]),
+        ):
+            mock_cp_world.return_value = cp_size
+            mock_dist_rank.return_value = cp_rank
+            full_force_ids = torch.arange(full_seq_len * 2).reshape(1, full_seq_len, 2)
+            mock_sparse_topk.return_value = self._sparse_outputs(local_seq_len, k)
+            processor = SparseTeacherLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": False},
+                    "logprob_chunk_size": 2,
+                },
+                k=k,
+                temperature=0.5,
+                real_vocab_size=30,
+                noise_filter_k=5,
+            )
+
+            wrapped = processor(
+                data_dict={"force_include_token_ids": full_force_ids},
+                cu_seqlens_padded=None,
+            )
+            loss, result = wrapped(torch.randn(1, local_seq_len, 16))
+
+            call = mock_sparse_topk.call_args
+            assert torch.equal(call.args[1], full_force_ids[:, expected_positions])
+            assert call.args[2] == k
+            assert call.args[3] is tp_group
+            assert call.kwargs == {
+                "vocab_start_index": 16,
+                "vocab_end_index": 32,
+                "real_vocab_size": 30,
+                "temperature": 0.5,
+                "noise_filter_k": 5,
+                "chunk_size": 2,
+            }
+            mock_cp_allgather.assert_not_called()
+            assert loss.item() == 0.0
+            assert set(result) == {
+                "sparse_topk_logits",
+                "sparse_topk_indices",
+                "sparse_log_z",
+                "sparse_natural_tail_indices",
+                "sparse_forced_logits",
+                "sparse_forced_indices",
+                "sparse_forced_in_topk",
+            }
+            assert result["sparse_topk_logits"].shape == (1, local_seq_len, k)
+
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk_logz_force")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+        return_value=0,
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_unset_logprob_chunk_size_uses_bounded_row_tiles(
+        self, _mock_cp_world, _mock_tp_group, _mock_tp_rank, mock_sparse_topk
+    ):
+        from nemo_rl.models.megatron import train as megatron_train
+
+        mock_sparse_topk.return_value = self._sparse_outputs(4, 2)
+        processor = megatron_train.SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        wrapped = processor(
+            data_dict={"force_include_token_ids": torch.full((1, 4, 2), -1)},
+            cu_seqlens_padded=None,
+        )
+        wrapped(torch.randn(1, 4, 8))
+
+        assert (
+            mock_sparse_topk.call_args.kwargs["chunk_size"]
+            == megatron_train.SPARSE_TEACHER_ROW_CHUNK_SIZE
+        )
+
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=2,
+    )
+    @patch("torch.distributed.get_rank", return_value=0)
+    def test_force_ids_not_divisible_by_twice_cp_raise(
+        self, _mock_rank, _mock_cp_world, _mock_cp_group
+    ):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(ValueError, match="multiple of 2\\*cp_size=4"):
+            processor(
+                data_dict={"force_include_token_ids": torch.full((1, 6, 2), -1)},
+                cu_seqlens_padded=None,
+            )
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_force_rows_must_match_logit_rows(self, _mock_cp_world):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        wrapped = processor(
+            data_dict={"force_include_token_ids": torch.full((1, 6, 2), -1)},
+            cu_seqlens_padded=None,
+        )
+        with pytest.raises(ValueError, match="force=6, logits=8"):
+            wrapped(torch.randn(1, 8, 8))
+
+    def test_packing_and_missing_force_ids_raise(self):
+        from nemo_rl.models.megatron.train import SparseTeacherLogitsPostProcessor
+
+        packed = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(NotImplementedError, match="sequence packing"):
+            packed(data_dict={}, cu_seqlens_padded=None)
+        unpacked = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with pytest.raises(KeyError, match="force_include_token_ids"):
+            unpacked(data_dict={}, cu_seqlens_padded=None)
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    @patch("nemo_rl.models.megatron.train.apply_temperature_scaling")
+    def test_forward_dispatch_keeps_logits_unscaled(
+        self, mock_temp_scaling, mock_model_forward
+    ):
+        """The exporter applies the CSD temperature itself, never the sampler's."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            SparseTeacherLogitsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(1, 4, 8)
+        data_dict = MagicMock()
+        processed_mb = ProcessedMicrobatch(
+            data_dict=data_dict,
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            original_seq_length=4,
+        )
+        post_processor = SparseTeacherLogitsPostProcessor(
+            cfg={"sequence_packing": {"enabled": False}},
+            k=2,
+            temperature=1.0,
+            real_vocab_size=8,
+            noise_filter_k=0,
+        )
+        with patch.object(
+            SparseTeacherLogitsPostProcessor, "__call__", return_value=MagicMock()
+        ) as mock_call:
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+                sampling_params=TrainingSamplingParams(temperature=2.0),
+            )
+
+        mock_temp_scaling.assert_not_called()
+        mock_call.assert_called_once_with(data_dict=data_dict, cu_seqlens_padded=None)
+
+
+class TestFullLogitsPostProcessor:
+    """Tests for CP-aware full-vocabulary teacher-logit export."""
+
+    def test_context_parallel_logits_are_relaid_to_contiguous_window(self):
+        import nemo_rl.models.megatron.train as megatron_train
+
+        cp_group = MagicMock()
+        contiguous_logits = torch.randn(1, 2, 8, dtype=torch.float32)
+        with (
+            patch.object(
+                megatron_train, "get_context_parallel_group", return_value=cp_group
+            ),
+            patch.object(
+                megatron_train, "get_context_parallel_world_size", return_value=2
+            ),
+            patch.object(
+                megatron_train,
+                "cp_load_balanced_to_contiguous",
+                return_value=contiguous_logits,
+            ) as mock_relayout,
+        ):
+            processor = megatron_train.FullLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": False},
+                    "megatron_cfg": {"context_parallel_size": 2},
+                }
+            )
+            wrapped_fn = processor(data_dict=MagicMock(), cu_seqlens_padded=None)
+
+            output_tensor = torch.randn(1, 2, 8, dtype=torch.bfloat16)
+            loss, result = wrapped_fn(output_tensor)
+
+        assert loss.item() == 0.0
+        assert result["full_logits"] is contiguous_logits
+        relayout_args = mock_relayout.call_args
+        assert torch.equal(relayout_args.args[0], output_tensor.float())
+        assert relayout_args.kwargs == {"cp_group": cp_group, "seq_dim": 1}
+
+    def test_packed_cp1_restores_dense_logical_rows(self):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 2]),
+            }
+        )
+        raw_cu = torch.tensor([0, 3, 5], dtype=torch.int32)
+        padded_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=raw_cu,
+            cu_seqlens_kv=raw_cu,
+            cu_seqlens_q_padded=padded_cu,
+            cu_seqlens_kv_padded=padded_cu,
+        )
+        output = torch.tensor(
+            [
+                [
+                    [1.0],
+                    [2.0],
+                    [3.0],
+                    [99.0],
+                    [10.0],
+                    [11.0],
+                    [98.0],
+                    [97.0],
+                ]
+            ],
+            dtype=torch.bfloat16,
+        )
+
+        with patch.object(
+            megatron_train, "get_context_parallel_world_size", return_value=1
+        ):
+            wrapped = megatron_train.FullLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "megatron_cfg": {"context_parallel_size": 1},
+                }
+            )(
+                data_dict=data,
+                cu_seqlens_padded=padded_cu,
+                packed_seq_params=packed_params,
+            )
+            loss, result = wrapped(output)
+
+        assert loss.item() == 0.0
+        restored = result["full_logits"]
+        assert restored.shape == (2, 6, 1)
+        assert restored[0, :, 0].tolist() == [1.0, 2.0, 3.0, 0.0, 0.0, 0.0]
+        assert restored[1, :, 0].tolist() == [10.0, 11.0, 0.0, 0.0, 0.0, 0.0]
+
+    def test_packed_cp1_streams_valid_prefixes_without_retaining_tensors(self):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 2]),
+            }
+        )
+        raw_cu = torch.tensor([0, 3, 5], dtype=torch.int32)
+        padded_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=raw_cu,
+            cu_seqlens_kv=raw_cu,
+            cu_seqlens_q_padded=padded_cu,
+            cu_seqlens_kv_padded=padded_cu,
+        )
+        output = torch.tensor(
+            [
+                [
+                    [1.0],
+                    [2.0],
+                    [3.0],
+                    [99.0],
+                    [10.0],
+                    [11.0],
+                    [98.0],
+                    [97.0],
+                ]
+            ],
+            dtype=torch.bfloat16,
+        )
+        storage = torch.full((5, 1), -1.0, dtype=torch.float32)
+        new_zeros_shapes = []
+        original_new_zeros = torch.Tensor.new_zeros
+
+        def record_new_zeros(tensor, size, *args, **kwargs):
+            new_zeros_shapes.append(tuple(size))
+            return original_new_zeros(tensor, size, *args, **kwargs)
+
+        with (
+            patch.object(
+                megatron_train, "get_context_parallel_world_size", return_value=1
+            ),
+            patch.object(torch.Tensor, "new_zeros", record_new_zeros),
+        ):
+            processor = megatron_train.FullLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "megatron_cfg": {"context_parallel_size": 1},
+                },
+                packed_output_storage=storage,
+            )
+            wrapped = processor(
+                data_dict=data,
+                cu_seqlens_padded=padded_cu,
+                packed_seq_params=packed_params,
+            )
+            _, result = wrapped(output)
+
+        metadata = result["full_logits"]
+        assert isinstance(metadata, megatron_train.StreamedFullLogitsMetadata)
+        assert metadata.batch_size == 2
+        assert metadata.logical_seq_len == 6
+        assert metadata.storage_token_offset == 0
+        assert metadata.stored_seq_lengths == (3, 2)
+        assert processor.packed_output_token_cursor == 5
+        assert storage[:, 0].tolist() == [1.0, 2.0, 3.0, 10.0, 11.0]
+        assert new_zeros_shapes == [()]
+        assert all(
+            not isinstance(getattr(metadata, field_name), torch.Tensor)
+            for field_name in metadata.__dataclass_fields__
+        )
+
+    def test_packed_cp2_uses_per_sequence_head_tail_boundaries(self):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
+
+        cp_group = MagicMock()
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 8, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 5]),
+            }
+        )
+        raw_cu = torch.tensor([0, 3, 8], dtype=torch.int32)
+        padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=raw_cu,
+            cu_seqlens_kv=raw_cu,
+            cu_seqlens_q_padded=padded_cu,
+            cu_seqlens_kv_padded=padded_cu,
+        )
+        local_output = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
+        gathered = [
+            torch.tensor([[[1.0], [2.0], [3.0], [99.0]]]),
+            torch.tensor(
+                [[[10.0], [11.0], [12.0], [13.0], [14.0], [98.0], [97.0], [96.0]]]
+            ),
+        ]
+
+        with (
+            patch.object(
+                megatron_train, "get_context_parallel_world_size", return_value=2
+            ),
+            patch.object(
+                megatron_train, "get_context_parallel_group", return_value=cp_group
+            ),
+            patch.object(torch.distributed, "get_rank", return_value=0),
+            patch.object(
+                megatron_train,
+                "allgather_cp_sharded_tensor",
+                side_effect=gathered,
+            ) as mock_allgather,
+        ):
+            wrapped = megatron_train.FullLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "megatron_cfg": {"context_parallel_size": 2},
+                }
+            )(
+                data_dict=data,
+                cu_seqlens_padded=padded_cu,
+                packed_seq_params=packed_params,
+            )
+            _, result = wrapped(local_output)
+
+        restored = result["full_logits"]
+        assert restored.shape == (2, 4, 1)
+        assert restored[0, :, 0].tolist() == [1.0, 2.0, 3.0, 0.0]
+        assert restored[1, :, 0].tolist() == [10.0, 11.0, 12.0, 13.0]
+        assert mock_allgather.call_count == 2
+        assert mock_allgather.call_args_list[0].args[0].shape == (1, 2, 1)
+        assert mock_allgather.call_args_list[1].args[0].shape == (1, 4, 1)
+
+    def test_packed_cp2_streams_zero_overlap_rows_and_keeps_collective_order(self):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        import nemo_rl.models.megatron.train as megatron_train
+
+        cp_group = MagicMock()
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(2, 8, dtype=torch.long),
+                "input_lengths": torch.tensor([3, 5]),
+            }
+        )
+        raw_cu = torch.tensor([0, 3, 8], dtype=torch.int32)
+        padded_cu = torch.tensor([0, 4, 12], dtype=torch.int32)
+        packed_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=raw_cu,
+            cu_seqlens_kv=raw_cu,
+            cu_seqlens_q_padded=padded_cu,
+            cu_seqlens_kv_padded=padded_cu,
+        )
+        local_output = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
+        gathered = [
+            torch.tensor([[[1.0], [2.0], [3.0], [99.0]]]),
+            torch.tensor(
+                [[[10.0], [11.0], [12.0], [13.0], [14.0], [98.0], [97.0], [96.0]]]
+            ),
+        ]
+        storage = torch.full((1, 1), -1.0, dtype=torch.float32)
+
+        with (
+            patch.object(
+                megatron_train, "get_context_parallel_world_size", return_value=2
+            ),
+            patch.object(
+                megatron_train, "get_context_parallel_group", return_value=cp_group
+            ),
+            patch.object(torch.distributed, "get_rank", return_value=1),
+            patch.object(
+                megatron_train,
+                "allgather_cp_sharded_tensor",
+                side_effect=gathered,
+            ) as mock_allgather,
+        ):
+            processor = megatron_train.FullLogitsPostProcessor(
+                cfg={
+                    "sequence_packing": {"enabled": True},
+                    "megatron_cfg": {"context_parallel_size": 2},
+                },
+                packed_output_storage=storage,
+            )
+            wrapped = processor(
+                data_dict=data,
+                cu_seqlens_padded=padded_cu,
+                packed_seq_params=packed_params,
+            )
+            _, result = wrapped(local_output)
+
+        metadata = result["full_logits"]
+        assert isinstance(metadata, megatron_train.StreamedFullLogitsMetadata)
+        assert metadata.stored_seq_lengths == (0, 1)
+        assert processor.packed_output_token_cursor == 1
+        assert storage[:, 0].tolist() == [14.0]
+        # Every CP rank participates once per logical sample, even when this
+        # rank stores no tokens for the first row.
+        assert mock_allgather.call_count == 2
 
 
 class TestAggregateTrainingStatistics:

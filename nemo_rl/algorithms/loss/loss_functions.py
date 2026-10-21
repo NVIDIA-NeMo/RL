@@ -1907,7 +1907,7 @@ class DistillationLossFn(LossFunction):
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": data["input_ids"].shape[0],
+            "num_valid_samples": data["sample_mask"].sum().item(),
         }
 
         return kl_loss, metrics
@@ -2042,7 +2042,7 @@ class MseValueLossFn(LossFunction):
             "values_max": values_max,
             "returns_sq_mean": returns_sq_mean,
             "residual_sq_mean": residual_sq_mean,
-            "num_valid_samples": int(values.shape[0]),
+            "num_valid_samples": sample_mask.sum().item(),
         }
 
         return loss, metrics

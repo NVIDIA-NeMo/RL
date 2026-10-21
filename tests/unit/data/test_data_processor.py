@@ -591,7 +591,8 @@ class TestKdDataProcessor:
     def test_output_keys_and_values(self):
         out = kd_data_processor(
             datum_dict={
-                "messages": [{"role": "assistant", "content": "the quick brown fox"}]
+                "messages": [{"role": "assistant", "content": "the quick brown fox"}],
+                "sample_id": "corpus#3",
             },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),  # must not be called
@@ -606,12 +607,14 @@ class TestKdDataProcessor:
         assert out["extra_env_info"] is None
         assert out["loss_multiplier"] == 1.0
         assert out["idx"] == 3
+        assert out["sample_id"] == "corpus#3"
 
     def test_task_name_forwarded_when_present(self):
         out = kd_data_processor(
             datum_dict={
                 "messages": [{"role": "assistant", "content": "hello"}],
                 "task_name": "code",
+                "sample_id": "corpus#0",
             },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
@@ -622,7 +625,10 @@ class TestKdDataProcessor:
 
     def test_task_name_absent_when_not_in_datum(self):
         out = kd_data_processor(
-            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "sample_id": "corpus#0",
+            },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -635,7 +641,10 @@ class TestKdDataProcessor:
         # processor's. If a future change emits any of these keys, the
         # CrossTokenizerCollator's contract is broken.
         out = kd_data_processor(
-            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "sample_id": "corpus#0",
+            },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -662,7 +671,10 @@ class TestKdDataProcessor:
 
         # Should not raise — the processor must not touch the tokenizer.
         _ = kd_data_processor(
-            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "sample_id": "corpus#0",
+            },
             task_data_spec=self._spec(),
             tokenizer=StrictTokenizer(),
             max_seq_length=128,
@@ -676,7 +688,10 @@ class TestKdDataProcessor:
         # max_seq_length.
         long_text = "a" * 10_000
         out = kd_data_processor(
-            datum_dict={"messages": [{"role": "assistant", "content": long_text}]},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": long_text}],
+                "sample_id": "corpus#0",
+            },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -685,3 +700,34 @@ class TestKdDataProcessor:
         assert out["message_log"][0]["content"] == long_text
         # length is a fake placeholder for the kd pipeline.
         assert out["length"] == 0
+
+    def test_preserves_identity_tools_and_deep_copies_nested_messages(self):
+        source = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [
+                        {"function": {"name": "weather", "arguments": {"city": "SF"}}}
+                    ],
+                }
+            ],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "sample_id": "corpus#9",
+        }
+        out = kd_data_processor(
+            datum_dict=source,
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=4,
+        )
+        assert out["sample_id"] == "corpus#9"
+        assert out["tools"] == source["tools"]
+        out["message_log"][0]["tool_calls"][0]["function"]["arguments"]["city"] = "NYC"
+        out["tools"][0]["function"]["name"] = "changed"
+        assert (
+            source["messages"][0]["tool_calls"][0]["function"]["arguments"]["city"]
+            == "SF"
+        )
+        assert source["tools"][0]["function"]["name"] == "weather"

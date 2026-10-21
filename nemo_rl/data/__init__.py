@@ -51,6 +51,16 @@ class ResponseDatasetConfig(TypedDict):
     pad_audio_to_hop_length: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
     max_samples: NotRequired[int | None]
+    # Arrow/raw-text dataset fields used by cross-tokenizer distillation.
+    data_files: NotRequired[str | list[str] | None]
+    text_key: NotRequired[str | None]
+    characters_per_sample: NotRequired[int | None]
+    # Native OpenAI-format chat adapter fields.
+    chat_key: NotRequired[str]
+    use_preserving_dataset: NotRequired[bool]
+    system_key: NotRequired[str | None]
+    system_prompt: NotRequired[str | None]
+    tool_key: NotRequired[str | None]
 
 
 class PreferenceDatasetConfig(TypedDict):

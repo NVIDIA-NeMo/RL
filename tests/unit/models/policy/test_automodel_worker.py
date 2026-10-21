@@ -1784,7 +1784,9 @@ class TestTwoGPUCluster:
                 ]
                 assert counts == [2, 1]
             monkeypatch.setattr(
-                policy, "_shard_for_train", lambda data, batch_size: sharded_data
+                policy,
+                "_shard_for_train",
+                lambda data, batch_size, **_: sharded_data,
             )
 
             policy.prepare_for_training()

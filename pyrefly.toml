@@ -25,6 +25,11 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/algorithms/loss/csd.py",
+  "nemo_rl/algorithms/loss/csd_packing.py",
+  "tools/csd/__init__.py",
+  "tools/csd/build_subtoks_table.py",
+  "tools/csd/validate_subtoks_tables.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness
@@ -88,6 +93,7 @@ project-includes = [
   "nemo_rl/data/cross_tokenizer/__init__.py",
   "nemo_rl/data/cross_tokenizer/native_chat.py",
   "nemo_rl/data/cross_tokenizer/cross_tokenizer_collate.py",
+  "nemo_rl/data/cross_tokenizer/csd_collate.py",
   "nemo_rl/data/collate_fn.py",
   "nemo_rl/data/dataloader.py",
   "nemo_rl/data/datasets/__init__.py",
@@ -153,6 +159,7 @@ project-includes = [
   "nemo_rl/data/multimodal_utils.py",
   "nemo_rl/data/megatron_sft_packed.py",
   "nemo_rl/data/packing/__init__.py",
+  "nemo_rl/data/packing/lockstep.py",
   "nemo_rl/data/processors.py",
   "nemo_rl/data_plane/__init__.py",
   "nemo_rl/data_plane/adapters/__init__.py",
@@ -226,6 +233,7 @@ project-includes = [
   "nemo_rl/models/automodel/convert.py",
   "nemo_rl/models/automodel/router_replay.py",
   "nemo_rl/models/automodel/utils.py",
+  "nemo_rl/models/automodel/nemotron_h_cp.py",
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
   "nemo_rl/models/generation/dynamo/__init__.py",

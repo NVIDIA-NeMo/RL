@@ -1,0 +1,269 @@
+# CSD cross-tokenizer distillation. Build both tokenizer tables first; see
+# the CSD section of docs/guides/cross-tokenizer-distillation.md.
+defaults: distillation_math.yaml
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 5000
+  max_num_epochs: 1
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  offload_student_after_step: false
+loss_fn:
+  temperature: 1.0
+  vocab_topk: 8192
+  reverse_kl: false
+  kl_loss_weight: 1.0          # used only when dynamic_loss_scaling is false
+  ce_loss_scale: 0.1           # used only when dynamic_loss_scaling is false
+  dynamic_loss_scaling: true   # rescale KD to CE's size each step; the weights above are ignored
+  common_indices_from_subtoks: true
+  kl_chunk_shift: true
+  csd_loss_fn: jsd
+  csd_last_pos_loss_fn: null
+  csd_jsd_beta: 0.5
+  csd_mismatch_loss_beta: 5.0
+  csd_noise_filter_topk: 0
+  csd_realized_only_mismatch: false
+  teacher_topk_ipc_k: 128             # 0 sends dense teacher logits
+  teacher_topk_ipc_support_mode: row_topk
+  teacher_topk_ipc_keep_realized: true
+  csd_selected_row_chunk_size: 128   # owner-local Megatron path: student/teacher rows per tile
+  csd_support_chunk_batch_size: 16   # owner-local Megatron path: alignment chunks per batch
+  kd_loss_mode: sum
+  sum_weights_metric: null
+  alpha: 1.0
+  normalize_teacher_by_vocab: false
+checkpointing:
+  enabled: false
+  checkpoint_dir: checkpoints/csd
+  metric_name: train:loss
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 600
+  checkpoint_must_save_by: null
+  save_optimizer: true
+policy:
+  model_name: meta-llama/Llama-3.2-1B
+  tokenizer:
+    name: meta-llama/Llama-3.2-1B
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  automodel_cfg:
+    enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    load_precision: float32
+    shard_before_load: false
+  max_grad_norm: 1.0
+  freeze_parameter_patterns: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+    fuse_loss: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-05
+      weight_decay: 0.001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.02
+      end_factor: 1.0
+      total_iters: 250
+  - name: torch.optim.lr_scheduler.CosineAnnealingLR
+    kwargs:
+      T_max: 4750
+      eta_min: 0.0
+  - milestones:
+    - 250
+teacher: null
+teachers:
+- model_name: microsoft/Phi-4-mini-instruct
+  aligner:
+    projection_matrix_path: null
+    drop_first_assistant_chunk_kl: false
+    student_to_teacher_table_path: cross_tokenizer_data/csd/phi4mini/student_to_teacher.pt
+    teacher_to_student_table_path: cross_tokenizer_data/csd/phi4mini/teacher_to_student.pt
+  weight: 1.0
+  tokenizer:
+    name: microsoft/Phi-4-mini-instruct
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
+  automodel_cfg:
+    enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    load_precision: bfloat16
+    shard_before_load: false
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+    fuse_loss: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-05
+      weight_decay: 0.001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1e-8
+      foreach: false
+      fused: false
+- model_name: meta-llama/Llama-3.2-3B
+  aligner:
+    projection_matrix_path: null
+    drop_first_assistant_chunk_kl: false
+    student_to_teacher_table_path: null
+    teacher_to_student_table_path: null
+  weight: 1.0
+  tokenizer:
+    name: meta-llama/Llama-3.2-3B
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: bfloat16
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
+  automodel_cfg:
+    enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    load_precision: bfloat16
+    shard_before_load: false
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: modified_first_fit_decreasing
+    microbatch_order: packer
+    sequence_length_round: 64
+    fuse_loss: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-05
+      weight_decay: 0.001
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1e-8
+      foreach: false
+      fused: false
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: arrow_text
+    processor: kd_data_processor
+    data_files: nvidia/Nemotron-Pretraining-Specialized-v1.1
+    subset: Nemotron-Pretraining-Formal-Logic
+    split: train
+    text_key: text
+    characters_per_sample: null
+  validation: null
+logger:
+  log_dir: logs/csd
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: csd
+    name: csd
+  swanlab:
+    project: csd
+    name: csd
+  tensorboard:
+    log_dir: tb_logs-csd
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
+algorithm: csd
+collator:
+  mode: text
+  include_thinking_in_loss: false
+  native_thinking_alignment: false
+  kd_alignment_regions: null
+  num_packed_rows: 1
