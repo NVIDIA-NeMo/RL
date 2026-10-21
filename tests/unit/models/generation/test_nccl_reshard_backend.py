@@ -945,10 +945,12 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
         "misc_meta": {},
     }
     ext.pp_comm_groups = {}
+    ext.model_update_group = object()
     ext._receive_and_load_misc_params = MagicMock()
     ext._maybe_process_fp8_kv_cache = MagicMock()
     finalize = MagicMock()
     lifecycle_calls = []
+    preflight_calls = []
 
     @contextlib.contextmanager
     def lifecycle(transport):
@@ -956,6 +958,11 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
         yield finalize
 
     ext._weight_update_lifecycle = lifecycle
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda group, src: preflight_calls.append((group, src)),
+    )
     monkeypatch.setattr(torch.cuda, "Stream", lambda: object())
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
@@ -967,6 +974,7 @@ def test_nccl_reshard_refit_runs_transport_lifecycle(monkeypatch):
 
     assert ext.nccl_reshard_refit() is True
     assert lifecycle_calls == ["nccl_reshard"]
+    assert preflight_calls == [(ext.model_update_group, 0)]
     finalize.assert_called_once_with()
 
 
