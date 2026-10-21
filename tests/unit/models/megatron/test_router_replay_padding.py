@@ -111,3 +111,46 @@ def test_assignments_align_dense_batch_padding_before_tp_split(monkeypatch, tp_r
         source[:, 0], local_padding, _config()
     )
     assert torch.equal(assignment, expected)
+
+
+@pytest.mark.parametrize("consumer", ["actor", "critic"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"moe_expert_capacity_factor": 1.0},
+        {"moe_expert_rank_capacity_factor": 1.0},
+        {"moe_token_dropping": True},
+        {"moe_router_load_balancing_type": "seq_aux_loss", "moe_aux_loss_coeff": 0.1},
+        {"moe_router_bias_update_rate": 0.1},
+    ],
+)
+def test_actor_and_critic_check_their_own_nested_routers(consumer, overrides):
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    # Construct only the native router's module shell: the capability check
+    # needs its resolved config, not distributed groups or expert parameters.
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.config = _config(**overrides)
+    router.routing_type = "none"
+    router.enable_expert_bias, router.frozen_expert_bias = True, False
+    nested = torch.nn.Sequential(torch.nn.Sequential(router))
+    worker = SimpleNamespace(model=[nested])
+    check = (
+        MegatronPolicyWorkerImpl.validate_cc_execution_padding
+        if consumer == "actor"
+        else MegatronValueWorkerImpl.validate_cc_execution_padding
+    )
+    if overrides:
+        with pytest.raises(ValueError, match="dropless per-token"):
+            check(worker)
+    else:
+        check(worker)

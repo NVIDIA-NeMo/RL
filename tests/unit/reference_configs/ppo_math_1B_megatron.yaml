@@ -63,6 +63,7 @@ ppo:
   # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
   malformed_thinking_advantage: null
   seq_logprob_error_threshold: null
+  debug_payload_metrics: false
 
 loss_fn:
   disable_ppo_ratio: false

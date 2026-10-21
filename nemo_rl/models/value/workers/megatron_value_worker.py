@@ -20,12 +20,12 @@ from typing import Any, Iterator, Optional, TypeVar
 
 import ray
 import torch
+from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+    NemotronOmniModel,
+)
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
-)
-from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
-    NemotronOmniModel,
 )
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
@@ -70,6 +70,7 @@ from nemo_rl.models.megatron.common import (
     broadcast_tensor,
     get_aux_loss_track_names,
     get_moe_metrics,
+    validate_cc_execution_padding,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -519,6 +520,13 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
+    def validate_cc_execution_padding(self) -> None:
+        """Validate the critic's own nested routers before padded-row forwards."""
+        unwrapped = unwrap_model(self.model)
+        chunks = unwrapped if isinstance(unwrapped, list) else [unwrapped]
+        for chunk in chunks:
+            validate_cc_execution_padding(chunk)
+
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
             self.model.enable_forward_pre_hook()
@@ -702,9 +710,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             # Step LR scheduler once per train() call, not per global batch.
             # Megatron's OptimizerParamScheduler.step takes an `increment` in
             # samples: NeMo init scales lr_warmup_steps by gbs internally, so
-            # passing increment=gbs cancels that scaling and one tick == one
-            # train() call regardless of batch size.
-            self.scheduler.step(increment=gbs)
+            # The scheduler was initialized with the configured logical GBS.
+            # Captured contexts may override execution GBS; extra context or
+            # padding rows must not accelerate the learning-rate schedule.
+            self.scheduler.step(increment=self.cfg["train_global_batch_size"])
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)

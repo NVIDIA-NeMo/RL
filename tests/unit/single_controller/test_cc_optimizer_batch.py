@@ -23,14 +23,21 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
+    ReadyFirstSampler,
+)
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
     TMPEOutlierDumpRef,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from tests.unit.single_controller.test_logical_advantage import _batch, _controller
+from tests.unit.single_controller.test_logical_advantage import (
+    _batch,
+    _controller,
+    _ppo_controller,
+)
 from tests.unit.single_controller.test_single_controller_actor import (
     _FullStepSampler,
     _NoOpTrainer,
@@ -260,6 +267,73 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
     assert ctrl._train_steps == 1
     assert ctrl._consumed_samples == 2  # Existing counter is dataset prompts.
     ctrl._sync_weights.assert_awaited_once()
+    assert not ctrl._dp_client.list_sample_ids("train")
+
+
+@pytest.mark.parametrize(
+    "warmup,native_ready_first", [(False, False), (True, False), (False, True)]
+)
+def test_captured_ppo_uses_one_physical_batch_per_actor_and_critic_epoch(
+    monkeypatch, warmup, native_ready_first
+):
+    batch = _batch([("a", [(1.0, 3), (3.0, 1)])], padding=True)
+    meta, data = batch
+    data["values"] = torch.zeros_like(data["token_mask"])
+    ctrl, _ = _setup(monkeypatch, batches=[batch])
+    stage = _ppo_controller(meta, data)
+    ctrl._is_ppo = True
+    ctrl._algo_cfg = stage._algo_cfg
+    ctrl._algo_cfg.num_prompts_per_step = ctrl._algo_cfg.max_num_steps = 1
+    ctrl._algo_cfg.policy_training_start_step = int(warmup)
+    ctrl._ppo_epochs, ctrl._critic_ppo_epochs = 2, 3
+    ctrl._advantage_estimator = stage._advantage_estimator
+    ctrl._master_config.grpo, ctrl._master_config.ppo = None, ctrl._algo_cfg
+    ctrl._value = MagicMock()
+    ctrl._value_loss_fn = MagicMock()
+    ctrl._value.train_from_meta.return_value = {
+        "grad_norm": torch.tensor([1.0]),
+        "loss": torch.tensor([0.25]),
+        "all_mb_metrics": {},
+    }
+
+    async def exercise():
+        if native_ready_first:
+            ctrl._trainer_version = 1
+            for i, tag in enumerate(meta.tags):
+                tag["weight_version"] = i % 2
+            buffer = TQReplayBuffer(
+                ctrl._dp_client,
+                partition_id="train",
+                pad_value_dict={"token_ids": 0, "input_ids": 0},
+                include_message_violation_fields=False,
+            )
+            buffer.set_data_plane_checkpoint_barrier(
+                ctrl._data_plane_checkpoint_barrier
+            )
+            buffer.reserve(weight_version=0, target_step=1, group_id="a")
+            async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+                await buffer.commit_finalized(cut, "a", meta, 0, 1)
+            ctrl._buffer = buffer
+            ctrl._sampler = ReadyFirstSampler(buffer, max_staleness_versions=2)
+        await asyncio.wait_for(ctrl._train_pump(), timeout=3)
+
+    asyncio.run(exercise())
+
+    ctrl._value.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "validate_cc_execution_padding"
+    )
+    assert ctrl._value.train_from_meta.call_count == 3
+    for call in ctrl._value.train_from_meta.call_args_list:
+        assert call.kwargs == {"gbs": 5}
+    assert ctrl._trainer.begin_train_step.call_count == (0 if warmup else 2)
+    assert ctrl._trainer.finish_train_step.call_count == (0 if warmup else 2)
+    for call in ctrl._trainer.begin_train_step.call_args_list:
+        # The split actor consumes all rows without an execution GBS override;
+        # its configured GBS keeps the scheduler on the logical PPO epoch.
+        assert call.args == (None,) and not call.kwargs
+    assert ctrl._master_config.policy["train_global_batch_size"] == 2
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1
     assert not ctrl._dp_client.list_sample_ids("train")
 
 

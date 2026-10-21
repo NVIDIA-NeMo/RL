@@ -24,11 +24,14 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.data_plane import KVBatchMeta
@@ -347,9 +350,7 @@ def test_post_admission_role_counts_exclude_an_owner_with_an_invalid_child():
 
     assert valid
     assert data["sample_mask"].tolist() == [1, 1, 0, 0, 1]
-    assert role_counts == [
-        {"trace": 3, "parent": 2, "child": 1, "untagged": 0}
-    ]
+    assert role_counts == [{"trace": 3, "parent": 2, "child": 1, "untagged": 0}]
 
 
 def test_post_admission_role_counts_include_an_entirely_untagged_chunk():
@@ -365,9 +366,7 @@ def test_post_admission_role_counts_include_an_entirely_untagged_chunk():
     )
 
     assert valid
-    assert role_counts == [
-        {"trace": 3, "parent": 0, "child": 0, "untagged": 3}
-    ]
+    assert role_counts == [{"trace": 3, "parent": 0, "child": 0, "untagged": 3}]
 
 
 def test_all_invalid_owners_take_existing_no_training_path():
@@ -494,3 +493,76 @@ def test_unsupported_cc_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="CC"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def _ppo_controller(meta, data, *, gae_lambda=1.0, normalize=False):
+    ctrl = _controller(meta, data)
+    config = PPOConfig(
+        num_generations_per_prompt=ctrl._algo_cfg.num_generations_per_prompt,
+        adv_estimator=GAEConfig(
+            gae_lambda=gae_lambda, gae_gamma=1.0, normalize_advantages=normalize
+        ),
+    )
+    ctrl._is_ppo = True
+    ctrl._algo_cfg = config
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        config.adv_estimator, ctrl._master_config.loss_fn
+    )
+    return ctrl
+
+
+@pytest.mark.parametrize("gae_lambda", [0.5, 1.0])
+def test_ppo_context_rows_use_their_own_values_and_shared_task_outcome(gae_lambda):
+    meta, data = _batch([("a", [(1.0, 3), (3.0, 1)])], padding=True)
+    # Parent, child, and a continuation of that same child have distinct
+    # contexts. Their scalar reward agrees but their critic estimates differ.
+    for tag, session in zip(meta.tags, ["main", "child", "child", "main2", None]):
+        tag["session_id"] = session
+    data["values"] = torch.tensor(
+        [[0, 0.1, 0.2], [0, 0.3, 0.4], [0, 0.5, 0.6], [0, 0.7, 0.8], [999, 999, 999]]
+    )
+    ctrl = _ppo_controller(meta, data, gae_lambda=gae_lambda)
+    result, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid and {"advantages", "returns"}.issubset(result.fields)
+    reward = data["total_reward"][:4]
+    values = data["values"][:4]
+    expected_last = reward - values[:, 2]
+    expected_first = values[:, 2] - values[:, 1] + gae_lambda * expected_last
+    torch.testing.assert_close(data["advantages"][:4, 1], expected_first)
+    torch.testing.assert_close(data["advantages"][:4, 2], expected_last)
+    torch.testing.assert_close(data["returns"][:4, 1], expected_first + values[:, 1])
+    torch.testing.assert_close(data["returns"][:4, 2], reward)
+    assert data["advantages"][:, 0].count_nonzero() == 0
+    assert data["advantages"][-1].count_nonzero() == 0
+    assert ctrl._step_log_dict["rewards"][0].tolist() == [1, 3]
+
+
+def test_ppo_padding_is_excluded_from_gae_whitening_and_task_metrics():
+    outputs = []
+    for padding in [False, True]:
+        meta, data = _batch([("a", [(1.0, 2), (3.0, 1)])], padding=padding)
+        data["values"] = torch.arange(meta.size * 3).reshape(-1, 3).float() / 10
+        if padding:
+            data["values"][-1] = 1e6
+        ctrl = _ppo_controller(meta, data, normalize=True)
+        asyncio.run(ctrl._advantage_stage(meta))
+        outputs.append(data["advantages"][:3].clone())
+        assert ctrl._step_log_dict["rewards"][0].tolist() == [1, 3]
+    torch.testing.assert_close(outputs[0], outputs[1])
+
+
+@pytest.mark.parametrize("all_invalid", [False, True])
+def test_ppo_admission_rejects_all_contexts_of_an_invalid_owner(all_invalid):
+    meta, data = _batch([("a", [(1.0, 2), (3.0, 1)])], padding=True)
+    data["values"] = torch.zeros_like(data["token_mask"])
+    data["mask_sample"][1] = True
+    if all_invalid:
+        data["mask_sample"][2] = True
+    ctrl = _ppo_controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid is not all_invalid
+    assert data["sample_mask"].tolist() == [0, 0, int(not all_invalid), 0]
+    assert data["advantages"][:2].count_nonzero() == 0
+    assert data["returns"][:2].count_nonzero() == 0
+    assert data["advantages"][-1].count_nonzero() == 0
+    assert len(ctrl._dp_client.puts) == 1

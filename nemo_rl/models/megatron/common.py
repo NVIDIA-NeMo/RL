@@ -22,7 +22,38 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+
+def validate_cc_execution_padding(model: torch.nn.Module) -> None:
+    """Reject routers whose real-token outputs depend on masked dummy rows.
+
+    Inspect nested routers as VLMs may keep their language configuration on a
+    child module. Actor and critic must independently satisfy this condition.
+    """
+    for module in model.modules():
+        if not isinstance(module, Router):
+            continue
+        config = module.config
+        if (
+            not isinstance(module, TopKRouter)
+            or module.routing_type in ("sinkhorn", "quantile_balancing")
+            or config.moe_expert_capacity_factor is not None
+            or config.moe_expert_rank_capacity_factor is not None
+            or config.moe_pad_experts_for_cuda_graph_inference
+            or config.moe_token_dropping
+            or get_aux_loss_track_names(config)
+            or (
+                module.enable_expert_bias
+                and not module.frozen_expert_bias
+                and config.moe_router_bias_update_rate != 0
+            )
+        ):
+            raise ValueError(
+                "CC execution padding requires dropless per-token MoE routing "
+                "without auxiliary losses or router-bias updates"
+            )
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:

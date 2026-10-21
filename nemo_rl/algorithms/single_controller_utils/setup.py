@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import warnings
@@ -83,7 +84,6 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.single_controller_utils.tmpe_outlier_dump import (
     tmpe_outlier_dump_config_from_env,
 )
-from nemo_rl.experience.original_call_evidence import original_call_evidence_config
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS, uses_image_placeholder
@@ -116,6 +116,7 @@ from nemo_rl.environments.session_traces import (
     validate_session_resume_config,
 )
 from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
+from nemo_rl.experience.original_call_evidence import original_call_evidence_config
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -2214,6 +2215,31 @@ def setup_single_controller(
             # until every finalizer's process-local TQ client has attached and
             # registered its checkpoint participant.
             ray.get([actor.__ray_ready__.remote() for actor in finalizer_actors])
+    execution_row_multiple = 1
+    if token_capture_cfg.context_compaction:
+        execution_row_multiple = cc_execution_row_multiple(
+            trainer.cfg,
+            dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+            logprobs_required=(
+                not (
+                    master_config.loss_fn.force_on_policy_ratio
+                    and algo_cfg.seq_logprob_error_threshold is None
+                )
+                or (
+                    master_config.loss_fn.reference_policy_kl_penalty > 0
+                    and not algo_cfg.skip_reference_policy_logprobs_calculation
+                )
+            ),
+        )
+        if value is not None:
+            execution_row_multiple = math.lcm(
+                execution_row_multiple,
+                cc_execution_row_multiple(
+                    value.cfg,
+                    dp_size=value.sharding_annotations.get_axis_size("data_parallel"),
+                    logprobs_required=True,
+                ),
+            )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2239,24 +2265,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         context_compaction=token_capture_cfg.context_compaction,
-        execution_row_multiple=(
-            cc_execution_row_multiple(
-                trainer.cfg,
-                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                logprobs_required=(
-                    not (
-                        master_config.loss_fn.force_on_policy_ratio
-                        and algo_cfg.seq_logprob_error_threshold is None
-                    )
-                    or (
-                        master_config.loss_fn.reference_policy_kl_penalty > 0
-                        and not algo_cfg.skip_reference_policy_logprobs_calculation
-                    )
-                ),
-            )
-            if token_capture_cfg.context_compaction
-            else 1
-        ),
+        execution_row_multiple=execution_row_multiple,
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 

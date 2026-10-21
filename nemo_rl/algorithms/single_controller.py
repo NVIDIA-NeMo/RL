@@ -73,7 +73,10 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GeneralizedAdvantageEstimator,
+    GRPOAdvantageEstimator,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -102,13 +105,14 @@ from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
 )
-from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.ppo import PPOConfig, _compute_critic_metrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
     is_ppo_run,
     validate_cc_objective,
+    validate_cc_ppo_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     build_logical_owner_batch,
@@ -3029,6 +3033,13 @@ class SingleControllerActor:
                                         "validate_cc_execution_padding"
                                     ),
                                 )
+                                if self._is_ppo:
+                                    await asyncio.to_thread(
+                                        ray.get,
+                                        self._value.worker_group.run_all_workers_single_data(
+                                            "validate_cc_execution_padding"
+                                        ),
+                                    )
 
                         for group_id in selected_group_ids:
                             for name, value in self._finalizer_metrics_by_group.pop(
@@ -3244,6 +3255,10 @@ class SingleControllerActor:
                                     ),
                                 ):
                                     if not step_open:
+                                        # The split actor API already consumes every
+                                        # physical row and normalizes by valid tokens.
+                                        # Its GBS is the logical scheduler increment;
+                                        # changing it with segment count changes LR.
                                         await asyncio.to_thread(
                                             self._trainer.begin_train_step,
                                             self._loss_fn,
@@ -5397,11 +5412,19 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
         for _ in range(num_epochs):
-            result = await asyncio.to_thread(
-                self._value.train_from_meta,
-                meta,
-                self._value_loss_fn,  # pyrefly: ignore
-            )
+            if has_logical_owners(meta):
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta,
+                    meta,
+                    self._value_loss_fn,  # pyrefly: ignore
+                    gbs=meta.size,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta,
+                    meta,
+                    self._value_loss_fn,  # pyrefly: ignore
+                )
         await asyncio.to_thread(self._value.finish_training)
         assert result is not None
         return result
@@ -5439,16 +5462,22 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            if (
-                self._is_ppo
-                or not isinstance(self._algo_cfg, GRPOConfig)
+            if self._is_ppo:
+                if not isinstance(self._algo_cfg, PPOConfig) or not isinstance(
+                    self._advantage_estimator, GeneralizedAdvantageEstimator
+                ):
+                    raise ValueError("CC PPO logical owners require token-level GAE")
+                validate_cc_ppo_objective(self._algo_cfg, self._master_config.loss_fn)
+            elif (
+                not isinstance(self._algo_cfg, GRPOConfig)
                 or self._algo_cfg.adv_estimator.name != "grpo"
                 or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
             ):
                 raise ValueError(
                     "CC logical owners require the standard GRPO estimator"
                 )
-            validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
+            else:
+                validate_cc_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True
         adv_cfg = self._advantage_cfg
@@ -5650,7 +5679,7 @@ class SingleControllerActor:
         # Value-model estimators (GAE) hand back the regression target alongside
         # the advantages; the group-relative ones return a bare tensor.
         returns: Optional[torch.Tensor] = None
-        if has_valid_training_tokens and owner_batch is not None:
+        if has_valid_training_tokens and owner_batch is not None and not self._is_ppo:
             rows = owner_batch.representative_rows
             owner_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=owner_batch.group_ids,
@@ -5667,6 +5696,9 @@ class SingleControllerActor:
                 owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
             )
         elif has_valid_training_tokens:
+            # PPO retains row-specific values and GAE targets for each actual
+            # context. Logical owners govern admission and task-level metrics,
+            # never a scalar advantage broadcast to parent/child tokens.
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,

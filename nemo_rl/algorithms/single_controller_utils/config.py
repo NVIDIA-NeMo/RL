@@ -884,8 +884,34 @@ def validate_cc_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
         )
 
 
+def validate_cc_ppo_objective(ppo: PPOConfig, loss: ClippedPGLossConfig) -> None:
+    """Validate per-captured-context GAE with the shared terminal task reward.
+
+    Each row keeps its own critic values and token mask. GAE terminates at the
+    end of that recorded context; it does not bootstrap across compactions or
+    between parent and child sessions. Admission still requires a complete
+    logical episode, including every captured context.
+    """
+    if (
+        ppo.adv_estimator.name != "gae"
+        or not loss.token_level_loss
+        or loss.sequence_level_importance_ratios
+        or loss.truncated_importance_sampling_type == "seq-mask-tis"
+        or loss.positive_example_nll_weight != 0
+        or ppo.use_dynamic_sampling
+        or ppo.reward_shaping.enabled
+        or ppo.reward_scaling.enabled
+        or ppo.invalid_tool_call_advantage is not None
+        or ppo.malformed_thinking_advantage is not None
+    ):
+        raise ValueError(
+            "CC PPO requires token-level GAE with shared task rewards and no "
+            "message-level advantage overrides"
+        )
+
+
 def cc_execution_row_multiple(
-    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+    policy: PolicyConfig | ValueConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
     """Common row divisibility for the initial fixed-batch Megatron consumers.
 
@@ -895,7 +921,7 @@ def cc_execution_row_multiple(
     """
     if (
         not policy["megatron_cfg"]["enabled"]
-        or policy["sequence_packing"]["enabled"]
+        or ("sequence_packing" in policy and policy["sequence_packing"]["enabled"])
         or policy["dynamic_batching"]["enabled"]
         or policy["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
         is not None
@@ -905,7 +931,13 @@ def cc_execution_row_multiple(
         )
     sizes = [policy["train_micro_batch_size"]]
     if logprobs_required:
-        sizes.append(policy["logprob_batch_size"])
+        # The value worker uses train MBS for inference when this optional
+        # ValueConfig field is absent. Match that consumer's actual shape.
+        sizes.append(
+            policy["logprob_batch_size"]
+            if "logprob_batch_size" in policy
+            else policy["train_micro_batch_size"]
+        )
     if any(type(size) is not int or size < 1 for size in [dp_size, *sizes]):
         raise ValueError(
             "CC consumer DP and microbatch sizes must be positive integers"
@@ -1307,12 +1339,17 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     sampler_name = async_config.sampler.name
-    if sampler_name != "in_order":
+    if sampler_name == "ready_first":
+        if algo_cfg.policy_training_start_step > 0:
+            raise ValueError(
+                "PPO ready_first requires policy_training_start_step=0; "
+                "critic-only warmup is supported with sampler.name='in_order'"
+            )
+    elif sampler_name != "in_order":
         raise ValueError(
-            "PPO on the SingleController path only supports "
+            "PPO on the SingleController path requires "
             f"async_rl.sampler.name='in_order', but got '{sampler_name}'. "
-            "Other samplers are not supported yet (in particular during critic "
-            "warmup) (#2625)."
+            "The ready_first sampler is also supported without critic-only warmup."
         )
 
     rl_step_samples = (
@@ -1422,15 +1459,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "siblings have no durable receipts to recover"
         )
     if token_capture_config.context_compaction:
-        if master_config.grpo is None:
-            raise ValueError("context compaction requires GRPO")
         if not token_capture_config.enabled:
             raise ValueError(
                 "token_capture.context_compaction requires token_capture.enabled=true"
             )
         if (
-            master_config.grpo.invalid_tool_call_advantage is not None
-            or master_config.grpo.malformed_thinking_advantage is not None
+            algo_cfg.invalid_tool_call_advantage is not None
+            or algo_cfg.malformed_thinking_advantage is not None
         ):
             raise ValueError(
                 "context compaction does not support message-level advantage overrides"
@@ -1441,7 +1476,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         if async_config.rollout_failure.min_step_batch_fraction != 1:
             raise ValueError("context compaction requires min_step_batch_fraction=1")
-        validate_cc_objective(master_config.grpo, master_config.loss_fn)
+        if is_ppo_run(master_config):
+            assert master_config.ppo is not None
+            validate_cc_ppo_objective(master_config.ppo, master_config.loss_fn)
+            assert master_config.value is not None
+            cc_execution_row_multiple(
+                master_config.value, dp_size=1, logprobs_required=True
+            )
+        else:
+            assert master_config.grpo is not None
+            validate_cc_objective(master_config.grpo, master_config.loss_fn)
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "CC does not support reward penalties or on-policy distillation"

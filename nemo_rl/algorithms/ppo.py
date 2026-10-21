@@ -212,6 +212,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # Nullable sequence-level multiplicative probability-error threshold.
     # None logs metrics without masking; values above the threshold are excluded.
     seq_logprob_error_threshold: float | None = None
+    # Emit per-context probability mismatch diagnostics without altering admission.
+    debug_payload_metrics: bool = False
     # Advantage value assigned to invalid-tool-call tokens; None disables it.
     invalid_tool_call_advantage: float | None = None
     # Advantage value assigned to malformed-thinking tokens; None disables it.

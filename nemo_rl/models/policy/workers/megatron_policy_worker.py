@@ -46,7 +46,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
     FileSystemWriterAsync,
@@ -83,6 +82,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.common import (
     get_aux_loss_track_names,
     get_moe_metrics,
+    validate_cc_execution_padding,
 )
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -498,28 +498,7 @@ class MegatronPolicyWorkerImpl(
         VLM config, after checkpoint settings and provider overrides resolve.
         """
         for chunk in _unwrapped_chunks(self.model):
-            for module in chunk.modules():
-                if not isinstance(module, Router):
-                    continue
-                config = module.config
-                if (
-                    not isinstance(module, TopKRouter)
-                    or module.routing_type in ("sinkhorn", "quantile_balancing")
-                    or config.moe_expert_capacity_factor is not None
-                    or config.moe_expert_rank_capacity_factor is not None
-                    or config.moe_pad_experts_for_cuda_graph_inference
-                    or config.moe_token_dropping
-                    or get_aux_loss_track_names(config)
-                    or (
-                        module.enable_expert_bias
-                        and not module.frozen_expert_bias
-                        and config.moe_router_bias_update_rate != 0
-                    )
-                ):
-                    raise ValueError(
-                        "CC execution padding requires dropless per-token MoE routing "
-                        "without auxiliary losses or router-bias updates"
-                    )
+            validate_cc_execution_padding(chunk)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -1348,8 +1327,7 @@ class MegatronPolicyWorkerImpl(
                 if not eval_mode:
                     optimizer_update_count += 1
                     all_optimizer_updates_successful = (
-                        all_optimizer_updates_successful
-                        and bool(update_successful)
+                        all_optimizer_updates_successful and bool(update_successful)
                     )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks

@@ -50,7 +50,10 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
+    TokenCaptureConfig,
     algo_config,
+    cc_execution_row_multiple,
+    validate_cc_ppo_objective,
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -218,6 +221,70 @@ class TestAlgorithmBlockValidator:
             MasterConfig(**resolved)
 
 
+def _captured_ppo_config() -> MasterConfig:
+    mc = _ppo_master_config(megatron_enabled=True)
+    mc.token_capture = TokenCaptureConfig(enabled=True, context_compaction=True)
+    mc.async_rl.rollout_failure.min_step_batch_fraction = 1
+    for consumer in [mc.policy, mc.value]:
+        consumer.update(
+            sequence_packing={"enabled": False},
+            dynamic_batching={"enabled": False},
+            train_micro_batch_size=1,
+            logprob_batch_size=1,
+        )
+    return mc
+
+
+def test_captured_context_ppo_passes_startup_validation():
+    validate_single_controller_config(_captured_ppo_config())
+
+
+@pytest.mark.parametrize("warmup", [0, 1])
+def test_captured_ppo_ready_first_requires_an_updating_policy(warmup):
+    mc = _captured_ppo_config()
+    mc.async_rl.sampler = ReadyFirstSamplerConfig(max_staleness_versions=2)
+    mc.async_rl.max_buffered_rollouts = 12
+    mc.loss_fn.use_importance_sampling_correction = True
+    mc.ppo.policy_training_start_step = warmup
+    if warmup:
+        with pytest.raises(ValueError, match="ready_first requires"):
+            validate_single_controller_config(mc)
+    else:
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "ppo,loss",
+    [
+        ({"adv_estimator": {"name": "raw_reward"}}, {}),
+        ({"invalid_tool_call_advantage": -1}, {}),
+        ({"reward_scaling": {"enabled": True}}, {}),
+        ({}, {"token_level_loss": False}),
+        ({}, {"sequence_level_importance_ratios": True}),
+    ],
+)
+def test_captured_ppo_refuses_an_incompatible_objective(ppo, loss):
+    with pytest.raises(ValueError, match="CC PPO"):
+        validate_cc_ppo_objective(PPOConfig(**ppo), ClippedPGLossConfig(**loss))
+
+
+@pytest.mark.parametrize("consumer", ["policy", "value"])
+def test_captured_ppo_validates_both_fixed_batch_consumers(consumer):
+    mc = _captured_ppo_config()
+    getattr(mc, consumer)["sequence_packing"]["enabled"] = True
+    with pytest.raises(ValueError, match="fixed-batch"):
+        validate_single_controller_config(mc)
+
+
+def test_critic_execution_divisibility_matches_its_inference_and_train_batches():
+    mc = _captured_ppo_config()
+    mc.value["train_micro_batch_size"] = 4
+    mc.value["logprob_batch_size"] = 6
+    assert cc_execution_row_multiple(mc.value, dp_size=2, logprobs_required=True) == 24
+    del mc.value["logprob_batch_size"]
+    assert cc_execution_row_multiple(mc.value, dp_size=2, logprobs_required=True) == 8
+
+
 class TestIsPPORun:
     @pytest.mark.parametrize(
         ("make_config", "expected"),
@@ -308,7 +375,7 @@ class TestPPOValidation:
 
     @pytest.mark.parametrize(
         "sampler_config",
-        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        [WindowedSamplerConfig(), WeightFifoSamplerConfig()],
         ids=lambda cfg: cfg.name,
     )
     def test_rejects_samplers_that_drop_rollouts_by_weight_version(
@@ -595,6 +662,41 @@ def patched_ppo_factories():
 
 
 class TestSetupBuildsTheCritic:
+    def test_capture_padding_aligns_actor_and_critic_meshes(
+        self, patched_ppo_factories, tmp_path
+    ):
+        mc = _captured_ppo_config()
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        mc.logger["log_dir"] = str(tmp_path)
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.policy["generation"].update(
+            model_name="test-model", stop_strings=None, stop_token_ids=None, top_k=None
+        )
+        mc.policy["logprob_batch_size"] = 2
+        mc.value["logprob_batch_size"] = 3
+        for role in ["policy", "value"]:
+            handle = patched_ppo_factories[role]
+            handle.cfg = getattr(mc, role)
+            handle.sharding_annotations.get_axis_size.return_value = 2
+        with (
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[],
+            ),
+            patch.object(sc_setup_mod, "_spinup_gym", return_value=(MagicMock(), 0.0)),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(
+                sc_setup_mod, "setup_response_data", return_value=(list(range(8)), None)
+            ),
+        ):
+            actor_args, _ = setup_single_controller(
+                mc, tokenizer=MagicMock(pad_token_id=0)
+            )
+        assert actor_args.rollout_manager._execution_row_multiple == 12
+
     def test_actor_args_carry_the_critic_and_its_loss(self, patched_ppo_factories):
         mc = _ppo_master_config()
 

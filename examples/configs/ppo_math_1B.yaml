@@ -66,6 +66,7 @@ ppo:
     target_max: 1.0
   # Log train/generation probability mismatch. Set a threshold to mask
   # high-error sequences; null keeps metrics-only behavior.
+  debug_payload_metrics: false  # optional per-context diagnostics; never changes masks
   seq_logprob_error_threshold: null
 
 loss_fn:
