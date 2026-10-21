@@ -75,6 +75,55 @@ def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
             normalize_vllm_refit_config(_config(transport))
 
 
+def test_native_mxfp8_linear_backend_rejected_on_non_native_refit_transports():
+    """Native MXFP8 linear kernels need the IPC/collective layerwise reload."""
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    def _config(transport, vllm_kwargs, is_mx=True):
+        return cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"precision": "fp8", "is_mx": is_mx},
+                "vllm_kwargs": vllm_kwargs,
+                "refit_transport": transport,
+            },
+        )
+
+    for vllm_kwargs in (
+        {"linear_backend": "flashinfer_trtllm"},
+        {"kernel_config": {"linear_backend": "flashinfer_cutedsl"}},
+    ):
+        assert normalize_vllm_refit_config(_config(None, vllm_kwargs)) is None
+        for transport in (
+            "nccl_reshard",
+            "nixl",
+            "vllm_s3_sparse",
+            "vllm_zmq_sparse",
+            "my_pkg.engine:Engine",
+        ):
+            with pytest.raises(ValueError, match="native MXFP8 linear kernels"):
+                normalize_vllm_refit_config(_config(transport, vllm_kwargs))
+
+    # Non-native backends and non-MX precision keep the existing transports.
+    assert (
+        normalize_vllm_refit_config(
+            _config("nccl_reshard", {"linear_backend": "flashinfer_cutlass"})
+        )
+        is None
+    )
+    assert (
+        normalize_vllm_refit_config(
+            _config("nccl_reshard", {"linear_backend": "flashinfer_trtllm"}, False)
+        )
+        is None
+    )
+
+
 def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration

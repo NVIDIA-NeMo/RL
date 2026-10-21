@@ -401,8 +401,17 @@ def test_unquantized_weight_update_uses_layerwise_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("transport", ["ipc", "collective"])
-def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transport):
+@pytest.mark.parametrize(
+    ("transport", "native_linear"),
+    [
+        ("ipc", True),
+        ("collective", True),
+        ("nccl_reshard", False),
+    ],
+)
+def test_mixed_mxfp8_native_refit_processes_each_module_once(
+    monkeypatch, transport, native_linear
+):
     """Mixed refits reload BF16 experts and rebuild each MXFP8 layout once."""
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptMxFp8FusedMoE,
@@ -438,8 +447,8 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
     ext.device = torch.device("cpu")
     ext._mtp_drafter_refit_enabled = lambda: False
     ext._maybe_process_mtp_drafter_after_loading = lambda: call_order.append("mtp")
-    ext._maybe_process_fp8_kv_cache = MagicMock()
-    ext._get_mxfp8_linear_reload_roots = lambda: (mxfp8_qkv,)
+    linear_roots = (mxfp8_qkv,) if native_linear else ()
+    ext._get_mxfp8_linear_reload_roots = lambda: linear_roots
 
     monkeypatch.setattr(
         vllm_backend,
@@ -501,20 +510,34 @@ def test_mixed_mxfp8_native_refit_processes_each_module_once(monkeypatch, transp
         call_order.append("transfer")
         finalize()
 
-    assert call_order == [
-        "config_enter",
-        ("initialize", first_bf16_moe),
-        ("initialize", last_bf16_moe),
-        ("initialize", mxfp8_qkv),
-        "transfer",
-        ("finalize", model, model_config),
-        ("process_mxfp8", mxfp8_qkv),
-        ("process_mxfp8", mxfp8_moe),
-        ("hpc", model),
-        "mtp",
-        "config_exit",
-    ]
-    ext._maybe_process_fp8_kv_cache.assert_not_called()
+    if native_linear:
+        expected_order = [
+            "config_enter",
+            ("initialize", first_bf16_moe),
+            ("initialize", last_bf16_moe),
+            ("initialize", mxfp8_qkv),
+            "transfer",
+            ("finalize", model, model_config),
+            ("process_mxfp8", mxfp8_qkv),
+            ("process_mxfp8", mxfp8_moe),
+            ("hpc", model),
+            "mtp",
+            "config_exit",
+        ]
+    else:
+        expected_order = [
+            "config_enter",
+            ("initialize", first_bf16_moe),
+            ("initialize", last_bf16_moe),
+            "transfer",
+            ("finalize", model, model_config),
+            ("process_mxfp8", mxfp8_moe),
+            ("process_mxfp8", mxfp8_qkv),
+            ("hpc", model),
+            "mtp",
+            "config_exit",
+        ]
+    assert call_order == expected_order
 
 
 @pytest.mark.vllm
@@ -984,6 +1007,27 @@ def test_weight_update_errors_are_fatal_only_for_native_trtllm_refit(
 
 
 @pytest.mark.vllm
+def test_weight_update_errors_are_fatal_for_native_mxfp8_linear_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    _patch_native_mxfp8_kernel(monkeypatch, kernel_type)
+    linear = torch.nn.Linear(1, 1)
+    linear.quant_method = SimpleNamespace(kernel=kernel_type())
+    model = torch.nn.Module()
+    model.add_module("linear", linear)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=SimpleNamespace(quant_config=object())
+    )
+
+    assert ext._weight_update_errors_are_fatal() is True
+
+
+@pytest.mark.vllm
 def test_unquantized_reload_rejects_cotrained_mtp_during_prepare():
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -1246,9 +1290,9 @@ def test_sparse_delta_refit_rejected_for_native_mxfp8_linear(
     )
     ext.model_runner = SimpleNamespace(model=model)
 
-    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
+    with pytest.raises(RuntimeError, match="native MXFP8 linear kernels"):
         ext.prepare_sparse_delta_refit_info({})
-    with pytest.raises(RuntimeError, match="sparse-delta refit does not support"):
+    with pytest.raises(RuntimeError, match="native MXFP8 linear kernels"):
         ext.update_weights_from_decoded_sparse_payload(b"")
 
 
@@ -2000,7 +2044,6 @@ def test_checkpoint_engine_lifecycle_processes_weights_once(monkeypatch):
         process_weights,
     )
     ext._maybe_process_mtp_drafter_after_loading = MagicMock()
-    ext._maybe_process_fp8_kv_cache = MagicMock()
 
     with ext._weight_update_lifecycle("checkpoint_engine") as finalize:
         finalize()
@@ -2009,13 +2052,11 @@ def test_checkpoint_engine_lifecycle_processes_weights_once(monkeypatch):
         ext.model_runner.model, ext.model_config, ext.device
     )
     ext._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    ext._maybe_process_fp8_kv_cache.assert_not_called()
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_native_linear_refit_finalizes_once_without_kv_cache(
-    monkeypatch,
-):
+def test_checkpoint_engine_lifecycle_rejects_native_mxfp8_linear(monkeypatch):
+    """The lifecycle re-checks native MXFP8 so an MRO-bypassed validator cannot skip it."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
@@ -2032,9 +2073,9 @@ def test_checkpoint_engine_native_linear_refit_finalizes_once_without_kv_cache(
     extension.model_config = object()
     extension.device = torch.device("cpu")
     extension._maybe_process_mtp_drafter_after_loading = MagicMock()
-    extension._maybe_process_fp8_kv_cache = MagicMock()
     initialize = MagicMock()
     finalize = MagicMock()
+    process_weights = MagicMock()
 
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.reload.initialize_layerwise_reload",
@@ -2045,19 +2086,23 @@ def test_checkpoint_engine_native_linear_refit_finalizes_once_without_kv_cache(
     )
     monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
-        MagicMock(),
+        process_weights,
     )
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _config: contextlib.nullcontext()
     )
 
-    with extension._weight_update_lifecycle("checkpoint_engine") as finish:
-        finish()
+    with pytest.raises(
+        RuntimeError,
+        match="checkpoint-engine refit does not support native MXFP8 linear kernels",
+    ):
+        with extension._weight_update_lifecycle("checkpoint_engine") as finish:
+            finish()
 
-    initialize.assert_called_once_with(linear)
-    finalize.assert_called_once_with(linear, extension.model_config)
-    extension._maybe_process_mtp_drafter_after_loading.assert_called_once_with()
-    extension._maybe_process_fp8_kv_cache.assert_not_called()
+    initialize.assert_not_called()
+    finalize.assert_not_called()
+    process_weights.assert_not_called()
+    extension._maybe_process_mtp_drafter_after_loading.assert_not_called()
 
 
 @pytest.mark.vllm

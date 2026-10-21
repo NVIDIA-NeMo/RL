@@ -166,7 +166,7 @@ def test_checkpoint_engine_rejects_native_mxfp8_linear_refit(monkeypatch):
     )
     worker.model_runner = SimpleNamespace(model=model)
 
-    with pytest.raises(RuntimeError, match="checkpoint-engine"):
+    with pytest.raises(RuntimeError, match="native MXFP8 linear kernels"):
         asyncio.run(worker._update_weights_from_checkpoint_engine_async())
 
 

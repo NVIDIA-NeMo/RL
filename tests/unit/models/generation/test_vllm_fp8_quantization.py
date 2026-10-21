@@ -3395,17 +3395,32 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
         record_metadata_for_reloading,
     )
 
+    pad_rows = 126
+    pad_byte = 0x5A
+
+    def runtime_layout(weight_bytes, scale_bytes):
+        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+            return weight_bytes.t().contiguous(), scale_bytes.flatten()
+        weight_pad = torch.full(
+            (pad_rows, weight_bytes.shape[1]), pad_byte, dtype=torch.uint8
+        )
+        scale_pad = torch.full(
+            (pad_rows, scale_bytes.shape[1]), pad_byte, dtype=torch.uint8
+        )
+        return (
+            torch.cat([weight_bytes, weight_pad]),
+            torch.cat([scale_bytes, scale_pad]).flatten(),
+        )
+
     class Kernel:
         def process_weights_after_loading(self, layer):
-            weight = layer.weight.detach().clone() + 10
-            scale = layer.weight_scale.detach().clone() + 20
-            if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
-                weight = weight.t().contiguous()
-                scale = scale.flatten()
-            else:
-                weight = torch.nn.functional.pad(weight, (0, 0, 0, 126))
-                scale = torch.nn.functional.pad(scale, (0, 0, 0, 126)).flatten()
-            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+            weight, scale = runtime_layout(
+                layer.weight.detach().view(torch.uint8),
+                layer.weight_scale.detach(),
+            )
+            layer.weight = torch.nn.Parameter(
+                weight.view(torch.float8_e4m3fn), requires_grad=False
+            )
             layer.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
 
     Kernel.__name__ = kernel_name
@@ -3433,8 +3448,15 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
 
     layer = torch.nn.Module()
     layer.quant_method = Method()
-    layer.weight = torch.nn.Parameter(torch.ones(2, 32), requires_grad=False)
-    layer.weight_scale = torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)
+    generator = torch.Generator().manual_seed(0)
+
+    def random_bytes(shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator)
+
+    layer.weight = torch.nn.Parameter(
+        random_bytes((2, 32)).view(torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(random_bytes((2, 1)), requires_grad=False)
     layer.weight.weight_loader = weight_loader
     layer.weight_scale.weight_loader = weight_loader
     record_metadata_for_reloading(layer)
@@ -3452,36 +3474,77 @@ def test_mxfp8_native_linear_kernel_refit_preserves_runtime_storage(
     assert tuple(runtime_weight.shape) == runtime_weight_shape
     assert tuple(runtime_scale.shape) == runtime_scale_shape
 
-    for value in (2, 3):
+    for _ in range(2):
+        loaded_weight = random_bytes((2, 32))
+        loaded_scale = random_bytes((2, 1))
+        expected_weight, expected_scale = runtime_layout(loaded_weight, loaded_scale)
         initialize_layerwise_reload(layer)
         with set_current_vllm_config(vllm_config), torch.device("cpu"):
             layer.weight.weight_loader(
-                layer.weight, torch.full((2, 32), value, dtype=torch.float32)
+                layer.weight, loaded_weight.view(torch.float8_e4m3fn)
             )
-            layer.weight_scale.weight_loader(
-                layer.weight_scale, torch.full((2, 1), value, dtype=torch.float32)
-            )
+            layer.weight_scale.weight_loader(layer.weight_scale, loaded_scale)
             finalize_layerwise_reload(layer, model_config=None)
 
         assert layer.weight is runtime_weight
         assert layer.weight_scale is runtime_scale
         assert layer.weight.data_ptr() == runtime_weight_ptr
         assert layer.weight_scale.data_ptr() == runtime_scale_ptr
-        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
-            assert torch.equal(layer.weight, torch.full_like(layer.weight, value + 10))
-            assert torch.equal(
-                layer.weight_scale, torch.full_like(layer.weight_scale, value + 20)
-            )
-        else:
-            assert torch.equal(
-                layer.weight[:2], torch.full_like(layer.weight[:2], value + 10)
-            )
-            assert torch.equal(
-                layer.weight_scale[:2],
-                torch.full_like(layer.weight_scale[:2], value + 20),
-            )
+        # Byte views compare every element, including the TRTLLM pad rows
+        # and NaN encodings in float8_e4m3fn.
+        assert torch.equal(layer.weight.detach().view(torch.uint8), expected_weight)
+        assert torch.equal(layer.weight_scale.detach(), expected_scale)
 
     assert layer.quant_method.kernel.__class__.__name__ == kernel_name
+
+
+def test_mxfp8_cutedsl_refit_requires_vllm_config_context(fp8_module, monkeypatch):
+    from vllm.config import get_current_vllm_config_or_none
+
+    class FlashInferCutedslMxfp8LinearKernel:
+        def __init__(self, config):
+            self.config = config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutedslMxfp8LinearKernel",
+        FlashInferCutedslMxfp8LinearKernel,
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros(2, 32, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.zeros(2, 1, dtype=torch.uint8), requires_grad=False
+    )
+    kernel = FlashInferCutedslMxfp8LinearKernel(config=object())
+    method = types.SimpleNamespace(kernel=kernel)
+
+    assert get_current_vllm_config_or_none() is None
+    with pytest.raises(RuntimeError, match="requires set_current_vllm_config"):
+        fp8_module.process_weights_after_loading_mxfp8_linear(method, layer)
+    assert method.kernel is kernel
+    assert not hasattr(layer, "weight_scale_from_checkpoint")
+
+
+def test_mxfp8_linear_kernel_names_resolve_on_installed_vllm(fp8_module):
+    """Kernel detection matches class names, so a vLLM rename must fail here."""
+    import inspect
+
+    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8LinearMethod,
+    )
+
+    for kernel_name in (
+        "FlashInferCutedslMxfp8LinearKernel",
+        "FlashInferTrtllmMxfp8LinearKernel",
+        "FlashInferCutlassMxfp8LinearKernel",
+    ):
+        kernel_type = getattr(flashinfer, kernel_name)
+        assert isinstance(kernel_type, type)
+        kernel = kernel_type.__new__(kernel_type)
+        assert fp8_module._is_flashinfer_mxfp8_linear_kernel(kernel, kernel_name)
+    assert "self.kernel" in inspect.getsource(ModelOptMxFp8LinearMethod)
 
 
 def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monkeypatch):
@@ -3592,6 +3655,95 @@ def test_load_weights_uses_scale_name_for_mxfp8_linear_backend(
         "model.layers.0.mlp.up_proj.weight",
         f"model.layers.0.mlp.up_proj.{expected_scale_name}",
     ]
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "expected_scale_suffix"),
+    [
+        ("FlashInferTrtllmMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutedslMxfp8LinearKernel", "weight_scale"),
+        ("FlashInferCutlassMxfp8LinearKernel", "weight_scale_from_checkpoint"),
+    ],
+)
+def test_load_weights_fused_qkv_shards_in_separate_batches(
+    fp8_module, monkeypatch, kernel_name, expected_scale_suffix
+):
+    """q/k/v shards resolve to the fused qkv_proj and keep per-shard scales."""
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    kernel_type = type(kernel_name, (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer." + kernel_name,
+        kernel_type,
+        raising=False,
+    )
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = torch.nn.Linear(32, 6, bias=False)
+            self.qkv_proj.quant_method = types.SimpleNamespace(kernel=kernel_type())
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attn()
+
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
+        def __init__(self):
+            super().__init__()
+            self.config = types.SimpleNamespace(model_type="llama")
+            self.model = Decoder()
+
+    model = Model()
+    loaded = []
+    model.load_weights = lambda weights: loaded.append(list(weights))
+    model_runner = types.SimpleNamespace(model=model)
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda weight: (
+            weight.to(torch.float8_e4m3fn),
+            weight[:, :1].to(torch.uint8).unsqueeze(-1),
+        ),
+    )
+
+    # The sender reuses one buffer, so each batch overwrites the previous shard.
+    sender_buffer = torch.empty(2, 32)
+    shards = ("q_proj", "k_proj", "v_proj")
+    for index, shard in enumerate(shards):
+        sender_buffer.fill_(index + 1)
+        fp8.load_weights(
+            [(f"model.layers.0.self_attn.{shard}.weight", sender_buffer)],
+            model_runner,
+        )
+
+    assert len(loaded) == len(shards)
+    for index, (shard, batch) in enumerate(zip(shards, loaded)):
+        prefix = f"model.layers.0.self_attn.{shard}"
+        assert [name for name, _ in batch] == [
+            f"{prefix}.weight",
+            f"{prefix}.{expected_scale_suffix}",
+        ]
+        _, batch_scale = batch[1]
+        assert torch.equal(
+            batch_scale.flatten(), torch.full((2,), index + 1, dtype=torch.uint8)
+        )
 
 
 @pytest.mark.parametrize(

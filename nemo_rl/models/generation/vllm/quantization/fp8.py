@@ -629,7 +629,12 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 
 
 def _is_flashinfer_mxfp8_linear_kernel(kernel: object, kernel_name: str) -> bool:
-    from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    if kernel is None:
+        return False
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    except ImportError:
+        return False
 
     kernel_type = getattr(flashinfer, kernel_name, None)
     return isinstance(kernel_type, type) and isinstance(kernel, kernel_type)
@@ -638,6 +643,8 @@ def _is_flashinfer_mxfp8_linear_kernel(kernel: object, kernel_name: str) -> bool
 def uses_native_mxfp8_linear_refit(module: torch.nn.Module) -> bool:
     quant_method = getattr(module, "quant_method", None)
     kernel = getattr(quant_method, "kernel", None)
+    if kernel is None:
+        return False
     return any(
         _is_flashinfer_mxfp8_linear_kernel(kernel, kernel_name)
         for kernel_name in _NATIVE_MXFP8_LINEAR_REFIT_KERNELS
@@ -1154,18 +1161,22 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
+        # Under linear_backend=auto only CuTe-DSL is demoted to CUTLASS. A TRTLLM
+        # kernel that vLLM selects keeps the native refit path below.
         if _is_flashinfer_mxfp8_linear_kernel(
             kernel, "FlashInferCutedslMxfp8LinearKernel"
         ):
             from vllm.config import get_current_vllm_config_or_none
 
             vllm_config = get_current_vllm_config_or_none()
-            linear_backend = (
-                vllm_config.kernel_config.linear_backend
-                if vllm_config is not None
-                else "auto"
-            )
-            if linear_backend == "auto":
+            if vllm_config is None:
+                # Defaulting to "auto" here would silently demote an explicit
+                # flashinfer_cutedsl selection to CUTLASS.
+                raise RuntimeError(
+                    "process_weights_after_loading_mxfp8_linear requires "
+                    "set_current_vllm_config to resolve kernel_config.linear_backend"
+                )
+            if vllm_config.kernel_config.linear_backend == "auto":
                 from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
                     FlashInferCutlassMxfp8LinearKernel,
                 )
