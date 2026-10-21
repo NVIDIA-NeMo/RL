@@ -6,7 +6,7 @@
 # SWE and TB are unchanged. GDPval runs as in hiteshis's OpenHands arm (gdpval-oh-web-gopo-mercor-02, step 46):
 # - OpenHands v3 (CodeAct) runs inside a per-rollout OpenSandbox sandbox (image gdpval:aa-v2-amd64, 8 CPU /
 #   48 GiB / 60 GiB) and calls the policy through the rollout-prefixed Gym URL, so token capture (the ledger) sees
-#   every call; up to 200 turns and 3600 s per rollout (7200 s with sandbox, install and judge), 900 s per model call, the whole trajectory within
+#   every call; up to 400 turns and 3600 s per rollout (7200 s with sandbox, install and judge), 900 s per model call, the whole trajectory within
 #   policy.max_total_sequence_length (no compaction).
 # - The resources server seeds the task (prompt + reference files), collects /workspace deliverables and judges
 #   them against the task's rubric through the upstream gdpval server: reward = rubric points / max points in
@@ -80,7 +80,9 @@ env:
           remote_openhands_install_script_path: ${oc.env:GDPVAL_HARNESS_DIR}/install.sh
           remote_openhands_archive_path: ${oc.env:GDPVAL_HARNESS_DIR}/runtime.tar.gz
           harness_install_timeout: 900
-          agent_max_turns: 200
+          # 400, as the SWE / TB OpenCode agents' steps and search's max_steps (user, 2026-10-21; hiteshis used 200,
+          # which the full32 collection hit in 3 of ~21k rollouts).
+          agent_max_turns: 400
           # 3600 s in collection and PPO alike (user, 2026-10-20: "make gdpval timeout same as swe", then "for ppo
           # default to 3600s too and 7200"): the SWE collection budget. Not tied to the SWE agents' sandbox_timeout,
           # whose PPO default is the launcher's 2700 s. hiteshis's 4800 s came with an inherited SWE overlay (their
