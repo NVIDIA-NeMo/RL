@@ -3454,6 +3454,7 @@ def _make_dspark_refit_extension(
             load_weights=MagicMock(),
         )
     ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(),
         vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method=method)),
         speculator=SimpleNamespace(model=drafter_model) if has_speculator else None,
     )
@@ -3559,6 +3560,35 @@ def test_dspark_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
     del info[dropped_key]
     with pytest.raises(RuntimeError, match="missing draft keys"):
         ext.prepare_refit_info(info)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("method", ["dspark", "dflash"])
+def test_owner_accepts_stream_without_target_shared_draft_keys(monkeypatch, method):
+    # vLLM aliases the target's embed_tokens/lm_head into a drafter whose
+    # checkpoint has none, so the Megatron stream leaves them out.
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, drafter_model = _make_dspark_refit_extension(vllm_backend, method=method)
+    target_model = torch.nn.Module()
+    target_model.embed_tokens = torch.nn.Embedding(4, 4)
+    target_model.lm_head = torch.nn.Linear(4, 4, bias=False)
+    ext.model_runner.model = target_model
+    shared = {
+        "model.embed_tokens.weight": target_model.embed_tokens.weight,
+        "lm_head.weight": target_model.lm_head.weight,
+    }
+    names = [name for name, _ in drafter_model.named_parameters()]
+    drafter_model.named_parameters = lambda: [(n, shared.get(n)) for n in names]
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    info = _complete_dspark_draft_info()
+    del info["draft.embed_tokens.weight"]
+    del info["draft.lm_head.weight"]
+    ext.prepare_refit_info(info)
+    assert ext.state_dict_info is info
 
 
 @pytest.mark.vllm
