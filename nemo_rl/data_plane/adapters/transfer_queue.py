@@ -310,7 +310,7 @@ def _tq_shape_drift_error(
 ) -> RuntimeError:
     """Build the error shared by the monkey-patch shape guards below.
 
-    All three guards fire for the same reason — the pinned ``transfer_queue``
+    Every guard fires for the same reason — the pinned ``transfer_queue``
     revision no longer has the internals a patch depends on — so they share
     this message shape rather than each hand-rolling it.
     """
@@ -506,6 +506,75 @@ def _patch_scalar_field_schema() -> None:
 # without ever running __init__, so import is the earliest point that covers
 # every user of this module.
 _patch_scalar_field_schema()
+
+
+_UNCOUNTED = object()
+
+
+class _PhysicalCoreCountCache:
+    """``psutil`` as ``transfer_queue.utils.common`` sees it, counting physical cores once.
+
+    Everything but ``cpu_count(logical=False)`` passes straight through.
+    """
+
+    def __init__(self, psutil_module: Any) -> None:
+        self._psutil = psutil_module
+        self._physical_cores: Any = _UNCOUNTED
+
+    def cpu_count(self, logical: bool = True) -> int | None:
+        if logical:
+            return self._psutil.cpu_count(logical=True)
+        if self._physical_cores is _UNCOUNTED:
+            self._physical_cores = self._psutil.cpu_count(logical=False)
+        return self._physical_cores
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._psutil, name)
+
+
+def _patch_physical_core_count() -> None:
+    """Count the host's physical cores once per process, not on every TQ put/get.
+
+    Upstream ``limit_pytorch_auto_parallel_threads`` wraps every client
+    ``async_put`` / ``async_get_data`` and calls
+    ``psutil.cpu_count(logical=False)`` each time. On Linux that globs
+    ``/sys/devices/system/cpu`` and opens a topology file per CPU, and every
+    one of those accesses releases the GIL. In a process whose GIL is held by
+    a busy thread, such as a vLLM worker's engine loop, each access waits to
+    get it back: the count took 0.2–8 s per call there instead of ~1.5 ms,
+    and was most of the time of every TQ write the worker made.
+
+    The physical core count cannot change while a process runs, so the module's
+    ``psutil`` is swapped for a proxy that counts once. TQ's own controller and
+    storage-unit actors never import this module and keep counting per call.
+
+    Raises if TQ no longer calls ``psutil`` from that module: the call may have
+    moved (and still be per call) or been fixed upstream, and either way this
+    patch no longer does anything.
+    """
+    try:
+        from transfer_queue.utils import common as _common
+    except ImportError:
+        return
+    if getattr(_common, "_nrl_core_count_cached", False):
+        return
+    if not hasattr(_common, "psutil") or not hasattr(
+        _common, "limit_pytorch_auto_parallel_threads"
+    ):
+        raise _tq_shape_drift_error(
+            "utils.common no longer counts cores through psutil in "
+            "limit_pytorch_auto_parallel_threads",
+            "the per-call core count this patch caches has moved or gone",
+            "patch (it may simply be unnecessary — check whether upstream "
+            "caches the count)",
+        )
+    # pyrefly: ignore[bad-assignment]  the proxy stands in for the module on purpose
+    _common.psutil = _PhysicalCoreCountCache(_common.psutil)
+    _common._nrl_core_count_cached = True
+
+
+# At import for the same reason as _patch_scalar_field_schema.
+_patch_physical_core_count()
 
 
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
