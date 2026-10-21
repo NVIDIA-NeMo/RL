@@ -919,7 +919,9 @@ def setup(
         if generation_config["backend"] != "vllm":
             raise ValueError("Score centering requires vLLM generation")
         if should_use_nemo_gym(master_config):
-            raise ValueError("Score centering requires direct vLLM rollouts")
+            master_config.env["nemo_gym"]["score_centering_top_k"] = (
+                loss_config.score_centering_top_k
+            )
         support_replay = need_top_k_or_top_p_filtering(
             TrainingSamplingParams(
                 top_k=generation_config["top_k"], top_p=generation_config["top_p"]

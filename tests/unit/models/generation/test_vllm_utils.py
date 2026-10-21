@@ -663,6 +663,43 @@ def test_attach_token_information_to_chat_response_choices():
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
 
 
+def test_attach_score_centering_to_chat_response_choice():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101],
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201],
+                logprobs=[
+                    {
+                        201: SimpleNamespace(logprob=-0.2),
+                        202: SimpleNamespace(logprob=-1.7),
+                    }
+                ],
+                sampling_mask=SimpleNamespace(token_ids=[[201, 202]]),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())],
+        model_dump=lambda: {"choices": [{"message": {"role": "assistant"}}]},
+    )
+
+    attach_token_information_to_chat_response_choices(
+        response,
+        final_res,
+        score_centering_top_k=3,
+        score_centering_support_replay=True,
+    )
+    message = model_dump_chat_response_with_dynamic_message_fields(response)["choices"][
+        0
+    ]["message"]
+    assert message["score_centering_ids"] == [[201, 202]]
+    torch.testing.assert_close(
+        torch.tensor(message["score_centering_logprobs"]), torch.tensor([[-0.2, -1.7]])
+    )
+
+
 @pytest.mark.parametrize(
     ("token_ids", "logprobs", "error_match"),
     [

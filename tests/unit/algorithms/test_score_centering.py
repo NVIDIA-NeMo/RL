@@ -26,6 +26,7 @@ from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedP
 from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
@@ -241,6 +242,48 @@ def test_score_centering_fields_survive_message_flattening():
     torch.testing.assert_close(
         flat["score_centering_logprobs"][0, 2:],
         torch.tensor([[-0.4, -1.1], [-0.5, -1.0]]),
+    )
+
+
+def test_score_centering_gym_rollout_fields_survive_flattening():
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return ["" for _ in batch]
+
+    class _Gym:
+        cfg = {"score_centering_top_k": 3}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _Gym(),
+            {},
+            {
+                "responses_create_params": {"input": []},
+                "response": {
+                    "output": [
+                        {
+                            "type": "message",
+                            "prompt_token_ids": [1],
+                            "generation_token_ids": [2],
+                            "generation_log_probs": [-0.2],
+                            "score_centering_ids": [[2, 3]],
+                            "score_centering_logprobs": [[-0.2, -1.7]],
+                        }
+                    ]
+                },
+            },
+            _Tokenizer(),
+        )
+    )
+    message_logs = [result["message_log"]]
+    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    flat, _ = batched_message_log_to_flat_message(message_logs)
+    torch.testing.assert_close(
+        flat["score_centering_ids"][0, 1], torch.tensor([2, 3, 0])
+    )
+    torch.testing.assert_close(
+        flat["score_centering_logprobs"][0, 1],
+        torch.tensor([-0.2, -1.7, float("-inf")]),
     )
 
 

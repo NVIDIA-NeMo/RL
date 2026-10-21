@@ -1036,6 +1036,13 @@ class VllmAsyncGenerationWorkerImpl(
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
+                if self.logprobs and self.return_tokens_as_token_ids:
+                    score_centering_top_k = worker_self.cfg.get(
+                        "score_centering_top_k", 0
+                    )
+                    if score_centering_top_k:
+                        # Gym requests only the sampled token; training also needs its head.
+                        self.top_logprobs = score_centering_top_k
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
@@ -1334,14 +1341,17 @@ class VllmAsyncGenerationWorkerImpl(
                         cancelled = True
                         raise
 
-                # Capture stages the raw arrays below and strips OpenAI logprobs
-                # after the terminal PUT. Skip only their object construction;
-                # changing request.logprobs would also change engine sampling.
+                # Capture and score centering use the raw arrays below. Skip
+                # OpenAI logprob objects; changing request.logprobs would also
+                # change engine sampling.
                 bypass_logprobs = bool(
                     not request.stream
                     and request.logprobs
                     and return_as_token_id
-                    and id(request) in worker_self._capture_calls
+                    and (
+                        id(request) in worker_self._capture_calls
+                        or worker_self.cfg.get("score_centering_top_k", 0)
+                    )
                 )
                 with self._bypass_chat_logprobs(enabled=bypass_logprobs):
                     response = await super().chat_completion_full_generator(
@@ -1370,6 +1380,12 @@ class VllmAsyncGenerationWorkerImpl(
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
+                        score_centering_top_k=worker_self.cfg.get(
+                            "score_centering_top_k", 0
+                        ),
+                        score_centering_support_replay=worker_self.cfg.get(
+                            "score_centering_support_replay", False
+                        ),
                     )
 
                 if worker_self._return_routed_experts_enabled():
@@ -1473,13 +1489,6 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training
             # stability. Validation rollouts are the one exception: they are stamped with
@@ -1513,6 +1522,14 @@ class VllmAsyncGenerationWorkerImpl(
                 f"params (val_temperature={generation_config['val_temperature']}, "
                 f"val_top_p={generation_config['val_top_p']})"
             )
+            expected_top_k = generation_config[
+                "top_k" if is_train_sampling else "val_top_k"
+            ]
+            expected_top_k = expected_top_k if expected_top_k is not None else -1
+            assert request.top_k in (None, -1, expected_top_k), (
+                f"Top k sampling parameter must be unset or {expected_top_k}. Got `{request.top_k}`"
+            )
+            request.top_k = expected_top_k
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(

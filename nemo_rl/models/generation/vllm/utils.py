@@ -582,6 +582,8 @@ def attach_routed_experts_to_chat_response_choices(
 def attach_token_information_to_chat_response_choices(
     response: Any,
     final_request_output: Any,
+    score_centering_top_k: int = 0,
+    score_centering_support_replay: bool = False,
 ) -> Any:
     """Attach engine-native token information to OpenAI chat response choices."""
     prompt_token_ids = getattr(final_request_output, "prompt_token_ids", None)
@@ -671,6 +673,34 @@ def attach_token_information_to_chat_response_choices(
         choice.message.generation_token_ids = generation_token_ids
         choice.message.generation_log_probs = generation_log_probs
 
+        if score_centering_top_k and generation_token_ids:
+            from nemo_rl.models.generation.vllm.vllm_worker import (
+                BaseVllmGenerationWorker,
+            )
+
+            sampling_mask = None
+            if score_centering_support_replay:
+                if generation_details.sampling_mask is None:
+                    raise RuntimeError(
+                        "vLLM did not return the score-centering sampling mask"
+                    )
+                sampling_mask = generation_details.sampling_mask.token_ids
+            ids, logprobs = BaseVllmGenerationWorker._score_centering_head(
+                generation_logprob_details,
+                len(generation_token_ids),
+                score_centering_top_k,
+                device=torch.device("cpu"),
+                sampling_mask=sampling_mask,
+                sampled_tokens=generation_token_ids,
+            )
+            valid = torch.isfinite(logprobs)
+            choice.message.score_centering_ids = [
+                row[mask].tolist() for row, mask in zip(ids, valid)
+            ]
+            choice.message.score_centering_logprobs = [
+                row[mask].tolist() for row, mask in zip(logprobs, valid)
+            ]
+
     return response
 
 
@@ -688,6 +718,8 @@ def model_dump_chat_response_with_dynamic_message_fields(
             "prompt_token_ids",
             "generation_token_ids",
             "generation_log_probs",
+            "score_centering_ids",
+            "score_centering_logprobs",
         ):
             field_value = getattr(message, field_name, None)
             if field_value is not None:
