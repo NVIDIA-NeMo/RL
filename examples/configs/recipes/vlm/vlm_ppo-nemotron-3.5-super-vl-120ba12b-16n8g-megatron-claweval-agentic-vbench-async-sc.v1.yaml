@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Paired with the mixed GRPO recipe: use the same MODEL_PATH, TRAIN_PATH,
+# VAL_PATH, generation settings and Gym parent/child prompt environment.
+# Start both algorithms from the same base weights in separate result roots.
+defaults: ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc.v1.yaml
+
+grpo: null
+ppo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_rollout_turns: 1
+  max_num_epochs: 1000000
+  max_num_steps: 1000000
+  seed: 42
+  ppo_epochs: 1
+  critic_ppo_epochs: 1
+  policy_training_start_step: 0
+  warm_start_value_checkpoint: null
+  async_ppo: null
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  skip_reference_policy_logprobs_calculation: true
+  use_dynamic_sampling: false
+  seq_logprob_error_threshold: null
+  debug_payload_metrics: true
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  reward_shaping:
+    enabled: false
+  reward_scaling:
+    enabled: false
+  # Standard token GAE on each captured context; shared terminal task reward.
+  # No bootstrap across parent/child conversations or compaction boundaries.
+  adv_estimator:
+    name: gae
+    gae_lambda: 1.0
+    gae_gamma: 1.0
+    normalize_advantages: true
+    gae_lambda_value: null
+    gae_lambda_policy: null
+    length_adaptive_alpha: 0.0
+
+policy:
+  hf_config_overrides: {}
+  offload_optimizer_for_logprob: true
+
+# A separate model/optimizer with a scalar value head. Interpolations copy the
+# actor's model/backend settings, not its learned parameters or optimizer state.
+value:
+  model_name: ${policy.model_name}
+  tokenizer: ${policy.tokenizer}
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: ${policy.train_micro_batch_size}
+  logprob_batch_size: ${policy.logprob_batch_size}
+  precision: ${policy.precision}
+  reward_model_cfg:
+    enabled: false
+    reward_model_type: regression
+  dtensor_cfg: ${policy.dtensor_cfg}
+  megatron_cfg: ${policy.megatron_cfg}
+  hf_config_overrides: ${policy.hf_config_overrides}
+  dynamic_batching: ${policy.dynamic_batching}
+  sequence_packing: ${policy.sequence_packing}
+  make_sequence_length_divisible_by: ${policy.make_sequence_length_divisible_by}
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  max_grad_norm: ${policy.max_grad_norm}
+  optimizer: ${policy.optimizer}
+  scheduler: ${policy.scheduler}
+
+value_loss_fn:
+  scale: 1.0
+  cliprange: null
+
+async_rl:
+  # The actor/critic train on the same complete selected prompt-group batch.
+  min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
+  rollout_failure:
+    max_skipped_prompts: 0
+    max_consecutive_dropped_prompts: 0
+
+checkpointing:
+  checkpoint_dir: results/ppo-super-claweval-agentic-vbench
+
+logger:
+  log_dir: logs/ppo-super-claweval-agentic-vbench

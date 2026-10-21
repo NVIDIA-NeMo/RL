@@ -1340,7 +1340,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     sampler_name = async_config.sampler.name
     if sampler_name == "ready_first":
-        if algo_cfg.policy_training_start_step > 0:
+        ppo_config = master_config.ppo
+        assert ppo_config is not None
+        if ppo_config.policy_training_start_step > 0:
             raise ValueError(
                 "PPO ready_first requires policy_training_start_step=0; "
                 "critic-only warmup is supported with sampler.name='in_order'"
