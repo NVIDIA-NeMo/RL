@@ -3423,7 +3423,12 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
 
 def _patch_pp_group(monkeypatch, vllm_backend, *, is_last_rank=True):
     # vllm_backend binds get_pp_group at import; draft_utils resolves it per call.
-    group = SimpleNamespace(is_last_rank=is_last_rank)
+    # A non-last rank is stage 0 of a two-stage pipeline.
+    group = SimpleNamespace(
+        is_last_rank=is_last_rank,
+        rank_in_group=0,
+        world_size=1 if is_last_rank else 2,
+    )
     monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", lambda: group)
     monkeypatch.setattr(vllm_backend, "get_pp_group", lambda: group)
 
@@ -3603,15 +3608,22 @@ def test_dspark_owner_rejects_unexpected_draft_keys(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_dspark_non_owner_skips_draft_payloads(monkeypatch):
+def test_eagle3_non_owner_skips_draft_payloads(monkeypatch):
+    # DFlash/DSpark run only at PP=1, so eagle3 is the speculator with
+    # non-owning stages.
     from nemo_rl.models.generation.vllm import vllm_backend
 
-    ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
+    ext, _ = _make_dspark_refit_extension(
+        vllm_backend, has_speculator=False, method="eagle3"
+    )
     _patch_pp_group(monkeypatch, vllm_backend, is_last_rank=False)
     # Non-owning ranks neither validate the draft manifest nor require a
     # drafter for draft payloads.
-    ext.prepare_refit_info(_complete_dspark_draft_info())
-    ext._load_draft_weights([("embed_tokens.weight", torch.zeros(1))])
+    ext.prepare_refit_info(_complete_eagle3_draft_info())
+    assert not ext._load_draft_weights(
+        [("draft.embed_tokens.weight", torch.zeros(1))],
+        runtime_adapter=ext._draft_runtime_adapter,
+    )
 
 
 @pytest.mark.vllm
@@ -3837,8 +3849,8 @@ def test_eagle3_megatron_partial_manifest_without_drafter_hard_fails_at_prepare(
     monkeypatch,
 ):
     """An owning rank with a non-empty (even partial) draft manifest but no
-    drafter model must hard-fail in prepare_refit_info, not defer to
-    _load_draft_weights's warn-and-skip path."""
+    drafter model must hard-fail in prepare_refit_info, when it resolves the
+    draft runtime, not defer to _load_draft_weights's warn-and-skip path."""
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(
@@ -3852,7 +3864,7 @@ def test_eagle3_megatron_partial_manifest_without_drafter_hard_fails_at_prepare(
         "draft.fc.weight": ((4, 4), torch.bfloat16),
         "draft.midlayer.self_attn.q_proj.weight": ((4, 4), torch.bfloat16),
     }
-    with pytest.raises(RuntimeError, match="Draft refit validation requires"):
+    with pytest.raises(RuntimeError, match="owner draft model is unavailable"):
         ext.prepare_refit_info(info)
 
 
