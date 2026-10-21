@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
+from ray._common.utils import load_class
 
 from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
@@ -993,7 +994,7 @@ def test_actor_registry_honors_system_flag(use_system_executable):
         assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
 
 
-def test_init_ray_drops_mpi_launcher_env_in_trtllm_workers_only():
+def test_init_ray_worker_setup_drops_srun_env_in_trtllm_workers_only():
     """TRT-LLM's MPI_Init breaks under srun's launcher env; other workers keep it."""
     from nemo_rl.distributed.virtual_cluster import init_ray
 
@@ -1004,9 +1005,13 @@ def test_init_ray_drops_mpi_launcher_env_in_trtllm_workers_only():
         mock_cluster_resources.return_value = {"nrl_tag_0": 1}
         with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
             init_ray()
-        hook = mock_ray_init.call_args_list[0][1]["runtime_env"][
+        hook_path = mock_ray_init.call_args_list[0][1]["runtime_env"][
             "worker_process_setup_hook"
         ]
+    # A module path, as Ray loads it in each worker: a callable would break a
+    # nested ray.init (vLLM's EngineCore at TP>1).
+    assert isinstance(hook_path, str)
+    hook = load_class(hook_path)
 
     launcher = {
         "SLURM_JOBID": "14",

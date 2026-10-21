@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib.util
 import logging
 import os
 import random
@@ -44,6 +43,10 @@ RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
 RAY_CLUSTER_EXTERNAL = "attached_external"
 RAY_CLUSTER_REUSED_LOCAL = "reused_local"
 RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
 
 class ClusterConfig(BaseModel, extra="allow"):
@@ -437,22 +440,6 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         safe_set_span_attributes(span, {RAY_CLUSTER_SOURCE_ATTR: outcome})
 
 
-def _drop_mpi_launcher_env() -> None:
-    """Ray ``worker_process_setup_hook``: TRT-LLM workers only.
-
-    ``import tensorrt_llm`` runs ``MPI_Init``, which the srun launcher env
-    breaks: ``PMIX_*`` makes slurm cancel the whole Ray step when the worker
-    exits, and ``SLURM_*`` makes a TP>1 engine fail to spawn its MPI workers.
-    ``env_vars`` cannot unset a variable, so drop them in-process. TRT-LLM
-    workers set up no telemetry, so nothing is lost.
-    """
-    if importlib.util.find_spec("tensorrt_llm") is None:
-        return
-    for key in list(os.environ):
-        if key.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
-            os.environ.pop(key, None)
-
-
 def _init_ray(log_dir: Optional[str] = None) -> str:
     """Initialise Ray.
 
@@ -483,7 +470,11 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
-        "worker_process_setup_hook": _drop_mpi_launcher_env,
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
