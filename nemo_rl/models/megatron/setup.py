@@ -3194,6 +3194,11 @@ def make_policy_like_config(config: ValueConfig) -> dict:
     """
     megatron_cfg = dict(config["megatron_cfg"])
 
+    # The critic has a scalar value head, not vocabulary logits. Actor-only
+    # logprob offload/fusion controls cannot apply to value forward or MSE loss.
+    megatron_cfg["offload_logprob_logits_to_cpu"] = False
+    megatron_cfg["use_fused_linear_logprobs"] = False
+
     # Ensure required fields have defaults
     megatron_cfg.setdefault("empty_unused_memory_level", 1)
     megatron_cfg.setdefault("freeze_moe_router", False)

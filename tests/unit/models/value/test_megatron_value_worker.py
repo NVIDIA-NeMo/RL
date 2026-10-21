@@ -52,6 +52,39 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.mcore
 
 
+@pytest.mark.parametrize("fused_logprobs", [False, True])
+def test_value_adapter_excludes_actor_vocabulary_logprob_controls(
+    fused_logprobs: bool,
+) -> None:
+    """A scalar critic must not require an actor logprob-chunk configuration."""
+    from nemo_rl.models.megatron.setup import (
+        _validate_chunking_config,
+        make_policy_like_config,
+    )
+
+    value_config = {
+        "model_name": "synthetic-value-model",
+        "tokenizer": {"name": "synthetic-value-model"},
+        "train_global_batch_size": 32,
+        "train_micro_batch_size": 1,
+        "precision": "bfloat16",
+        "megatron_cfg": {
+            "offload_logprob_logits_to_cpu": True,
+            "use_fused_linear_logprobs": fused_logprobs,
+        },
+        "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 8,
+        "max_total_sequence_length": 512,
+    }
+    adapted = make_policy_like_config(value_config)
+    assert "logprob_chunk_size" not in adapted
+    _validate_chunking_config(adapted)
+    assert adapted["megatron_cfg"]["offload_logprob_logits_to_cpu"] is False
+    assert adapted["megatron_cfg"]["use_fused_linear_logprobs"] is False
+    assert value_config["megatron_cfg"]["offload_logprob_logits_to_cpu"] is True
+    assert value_config["megatron_cfg"]["use_fused_linear_logprobs"] is fused_logprobs
+
+
 def test_get_values_suspends_activation_offload() -> None:
     """Value inference must preserve the activation-offload training warmup."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
