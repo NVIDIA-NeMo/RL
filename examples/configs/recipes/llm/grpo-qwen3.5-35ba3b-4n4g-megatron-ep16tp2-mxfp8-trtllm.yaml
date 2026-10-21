@@ -21,7 +21,6 @@ policy:
       gpu_memory_utilization: 0.5
       precision: fp8
       is_mx: true
-      enforce_eager: false
       quantization_ignore_patterns:
       - language_model.model.layers.*.linear_attn.*
       - visual.*

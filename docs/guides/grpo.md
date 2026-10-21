@@ -556,6 +556,28 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+##### Adaptive PPO clip
+
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+  truncated_importance_sampling_type: adaptive-ppo-clip
+  truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
+  truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
+  sequence_level_importance_ratios: false
+```
+
+The loss zeroes the weight of negative-advantage tokens with $w$ below `truncated_importance_sampling_ratio_min`, positive-advantage tokens with $w$ above `truncated_importance_sampling_ratio + k`, and every token with $w$ above `truncated_importance_sampling_adaptive_outer_bound`. `is_oob_ratio` reports the fraction of filtered tokens.
+
+The offset $k$ starts at 0. After each training step, the trainer compares the step's `approx_entropy` with `truncated_importance_sampling_adaptive_target_entropy`: entropy above the target lowers $k$ by `truncated_importance_sampling_adaptive_k_step`, and entropy below the target raises it by the same amount. $k$ is clamped between 0 and `truncated_importance_sampling_adaptive_k_max`. The legacy GRPO trainers and the single controller log `cur_adaptive_ppo_clip_k`, the $k$ each step trained with, and save the updated $k$ in checkpoints so a resumed run continues from the same bound. The legacy PPO trainer rejects this mode. Sequence-level importance ratios are not supported. See the [MAI-1 paper](https://microsoft.ai/pdf/mai-thinking-1.pdf) for more details.
+
 
 #### Single-forward sequence-logprob filtering
 

@@ -41,6 +41,10 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     RewardPenaltyConfig,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -970,6 +974,18 @@ def _validate_opd_full_config(
             "reconstructed from its hidden states would not, silently optimizing a "
             "mismatched objective. Use teacher_payload='logits', where both sides "
             "come from the same scaled tensor."
+        )
+
+    if generation_config is not None and need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+        )
+    ):
+        warnings.warn(
+            "on_policy_distillation.full does not apply top-k/top-p filtering "
+            "to policy logprobs or the full-vocabulary KL. "
+            "policy.generation.top_k/top_p are still applied during rollout.",
+            stacklevel=2,
         )
 
     if full_cfg.teacher_payload == "logits":
