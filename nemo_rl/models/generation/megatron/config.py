@@ -122,6 +122,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
+    # Hybrid (Mamba) models: fraction of buffer_size_gb for Mamba states. Unless
+    # max_requests is set it caps concurrent requests per rank (default 0.1, more
+    # with speculative decoding).
+    mamba_memory_ratio: NotRequired[float | None]
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
     # GPU budget for cached Mamba states; null disables it (MCore default).

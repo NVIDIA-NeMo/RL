@@ -52,6 +52,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     _apply_inference_cuda_graph_scope,
     _apply_optional_inference_config_kwargs,
     _resolve_coordinator_policy,
+    _resolve_mamba_memory_ratio,
 )
 
 PAD = 0
@@ -68,6 +69,21 @@ def test_inference_cuda_graph_scope_is_applied_when_configured():
     assert (
         engine_model.config.inference_cuda_graph_scope is InferenceCudaGraphScope.block
     )
+
+
+@pytest.mark.mcore
+def test_mamba_memory_ratio_default_and_override():
+    assert _resolve_mamba_memory_ratio({}, False, 0) is None
+    assert _resolve_mamba_memory_ratio({"mamba_memory_ratio": 0.3}, False, 0) is None
+    assert _resolve_mamba_memory_ratio({}, True, 0) == pytest.approx(0.1)
+    assert _resolve_mamba_memory_ratio({}, True, 2) == pytest.approx(0.3)
+    assert _resolve_mamba_memory_ratio(
+        {"mamba_memory_ratio": None}, True, 1
+    ) == pytest.approx(0.2)
+    assert _resolve_mamba_memory_ratio({"mamba_memory_ratio": "0.25"}, True, 0) == 0.25
+    for bad in (0, 1, 1.5, -0.1):
+        with pytest.raises(ValueError, match="mamba_memory_ratio"):
+            _resolve_mamba_memory_ratio({"mamba_memory_ratio": bad}, True, 0)
 
 
 @pytest.mark.mcore
