@@ -344,7 +344,13 @@ def _store_with(ep_transfer_error: TransferError):
         raise ep_transfer_error
 
     st = object.__new__(UnitSlabStore)
-    st.ep = SimpleNamespace(transfer=transfer, has_remote=lambda n: True)
+
+    def transfer_many(ops, **k):
+        return [ep_transfer_error] * len(ops)
+
+    st.ep = SimpleNamespace(
+        transfer=transfer, transfer_many=transfer_many, has_remote=lambda n: True
+    )
     st.ctl = SimpleNamespace(
         call=lambda addr, op, **kw: 0,
         notify=lambda addr, op, **kw: notes.append((op, kw)),
@@ -426,3 +432,212 @@ def test_unit_abort_of_unposted_write_frees_at_once():
     abort(unit, "b", in_flight=False)
     assert alloc.used_bytes == 0
     assert unit.retired_bytes == 0
+
+
+# ------------------------------------------------------------------ transfer_many
+class _Boom(BaseException):
+    """Stands in for KeyboardInterrupt: not an Exception."""
+
+
+class _ScriptAgent:
+    """Handles are numbered in post order; ``polls[h]`` lists the states
+    ``check_xfer_state(h)`` returns in turn (then PROC forever)."""
+
+    def __init__(self, polls, init_fails=(), poll_raises=(), init_boom=None):
+        self.polls = [list(p) for p in polls]
+        self.init_fails, self.poll_raises, self.init_boom = (
+            set(init_fails),
+            set(poll_raises),
+            init_boom,
+        )
+        self.calls = 0
+        self.handles = 0
+        self.events: list[str] = []
+        self.released: list[int] = []
+
+    def get_xfer_descs(self, descs, mem):
+        return descs
+
+    def initialize_xfer(self, op, ldesc, rdesc, remote_agent):
+        i, self.calls = self.calls, self.calls + 1
+        if i == self.init_boom:
+            raise _Boom()
+        if i in self.init_fails:
+            raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
+        self.events.append("post")
+        self.handles += 1
+        return self.handles - 1
+
+    def transfer(self, h):
+        return "PROC"
+
+    def check_xfer_state(self, h):
+        self.events.append("check")
+        if h in self.poll_raises:
+            raise RuntimeError("poll failed")
+        return self.polls[h].pop(0) if self.polls[h] else "PROC"
+
+    def release_xfer_handle(self, h):
+        self.released.append(h)
+
+
+def _ops(n):
+    return [("READ", [(1000 * (i + 1), 8)], [(0, 8)], f"peer{i}") for i in range(n)]
+
+
+@pytest.fixture
+def graveyard(monkeypatch):
+    from nemo_rl.data_plane.nixl import nixl_io
+
+    g = nixl_io.Graveyard(max_bytes=1 << 30)
+    monkeypatch.setattr(nixl_io, "GRAVEYARD", g)
+    return g
+
+
+def test_transfer_many_posts_every_op_before_it_waits(graveyard):
+    agent = _ScriptAgent([["PROC", "DONE"], ["DONE"]])
+    ep = _endpoint(agent)
+    assert ep.transfer_many(_ops(2), timeout_s=5) == [None, None]
+    assert agent.events[:2] == ["post", "post"]
+    assert sorted(agent.released) == [0, 1]
+    assert ep.unfinished == [] and graveyard.bytes == 0
+
+
+def test_transfer_many_timeout_retains_each_unfinished_op_once(graveyard):
+    agent = _ScriptAgent([["DONE"], [], []])
+    ep = _endpoint(agent)
+    errs = ep.transfer_many(_ops(3), timeout_s=0.01)
+    assert errs[0] is None and all(e.in_flight for e in errs[1:])
+    assert ep.unfinished == [(2000, 8), (3000, 8)]
+    assert len(ep.unfinished_handles) == 2 and graveyard.bytes == 16
+    assert agent.released == [0]
+
+
+def test_a_failed_post_does_not_stop_the_other_ops(graveyard):
+    agent = _ScriptAgent([["DONE"]], init_fails={0})
+    ep = _endpoint(agent)
+    errs = ep.transfer_many(_ops(2), timeout_s=5)
+    assert errs[0].in_flight is False and errs[1] is None
+    assert ep.unfinished == [] and graveyard.bytes == 0  # nothing was posted for op 0
+
+
+def test_a_poll_error_retains_only_that_transfer(graveyard):
+    agent = _ScriptAgent([[], ["DONE"]], poll_raises={0})
+    ep = _endpoint(agent)
+    errs = ep.transfer_many(_ops(2), timeout_s=5)
+    assert errs[0].in_flight is True and errs[1] is None
+    assert ep.unfinished == [(1000, 8)]
+
+
+def test_an_exception_while_waiting_retains_every_posted_transfer(graveyard):
+    agent = _ScriptAgent([[], []])
+    ep = _endpoint(agent)
+
+    def boom(h):  # the first poll dies with a non-Exception
+        raise _Boom()
+
+    agent.check_xfer_state = boom
+    with pytest.raises(_Boom):
+        ep.transfer_many(_ops(2), timeout_s=5)
+    assert ep.unfinished == [(1000, 8), (2000, 8)]
+    assert len(ep.unfinished_handles) == 2 and graveyard.bytes == 16
+
+
+def test_an_exception_while_posting_retains_the_ops_already_posted(graveyard):
+    agent = _ScriptAgent([[]], init_boom=1)
+    ep = _endpoint(agent)
+    with pytest.raises(_Boom):
+        ep.transfer_many(_ops(2), timeout_s=5)
+    assert ep.unfinished == [(1000, 8)] and len(ep.unfinished_handles) == 1
+
+
+def test_invalid_ops_raise_before_anything_is_posted(graveyard):
+    agent = _ScriptAgent([[]])
+    ep = _endpoint(agent)
+    bad = [*_ops(1), ("READ", [(1000, 8)], [(0, 16)], "peer")]
+    with pytest.raises(ValueError):
+        ep.transfer_many(bad)
+    assert agent.calls == 0
+
+
+def test_a_hinted_read_posts_every_unit_in_one_batch():
+    from nemo_rl.data_plane.nixl import blob_format
+    from tests.unit.data_plane._nixl_helpers import StubCtl, StubEp, stub_store
+
+    batches = []
+
+    class Ep(StubEp):
+        def transfer_many(self, ops, *, timeout_s):
+            batches.append([o[3] for o in ops])
+            return self.results
+
+    ep = Ep()
+    ep.results = [None, None]
+    s = stub_store(StubCtl({}), ep=ep)
+    s.stats = {"fast_reads": 0, "slow_reads": 0, "tag_mismatch": 0}
+    reqs = {"a": [(0, 8, 1000)], "b": [(0, 8, 2000)]}
+    metas = {"a": {"so": 0, "z": 64}, "b": {"so": 0, "z": 64}}
+    scratch = (5000, memoryview(bytearray(2 * blob_format.FOOTER_SIZE)))
+    s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
+    assert batches == [["unit-0-abc", "unit-1-abc"]]
+    # A unit whose READ never posted falls back to the pinned path alone ...
+    ep.results = [TransferError("no peer"), None]
+    retry = s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
+    assert "a" in retry
+    # ... one whose READ may still land fails the read.
+    ep.results = [None, TransferError("late", in_flight=True)]
+    with pytest.raises(Exception, match="late"):
+        s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
+
+
+def test_pool_registration_waits_are_counted_by_the_timed_lock():
+    from nemo_rl.data_plane.adapters.tq_nixl import TimedLock
+
+    lock = TimedLock()
+    pool = BufferPool(_FakeEp(), lock, base_bytes=1024, base_count=1)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with lock:
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    held.wait()
+    threading.Timer(0.05, release.set).start()
+    with pool.acquire(4096):  # oversize: registered under the lock
+        pass
+    t.join()
+    assert lock.waits >= 1 and lock.wait_ms_max >= 20
+
+
+def test_timed_lock_counts_contention_but_not_reentry():
+    from nemo_rl.data_plane.adapters.tq_nixl import TimedLock
+
+    lock = TimedLock()
+    with lock:
+        with lock:
+            pass
+    assert lock.snapshot() == (0, 0.0, 0.0)
+
+
+def test_client_logs_op_time_and_lock_waits_every_30_seconds(capsys):
+    from nemo_rl.data_plane.adapters.tq_nixl import NixlKVClient, TimedLock
+
+    c = object.__new__(NixlKVClient)
+    c._lock, c._op_mu, c._who = TimedLock(), threading.Lock(), "pid=1"
+    c._ops, c._op_ms, c._stats_last = 0, 0.0, None
+    c._stats_at = time.monotonic() - 31
+
+    def fail(keys, values):
+        raise RuntimeError("put failed")
+
+    c._put = fail
+    with pytest.raises(RuntimeError):
+        c.put(["k"], [1])  # a failed put still counts
+    out = capsys.readouterr().out
+    assert "[nvdp-client] pid=1 stats" in out and "'ops': 1" in out
+    with pytest.raises(RuntimeError):
+        c.put(["k"], [1])
+    assert capsys.readouterr().out == ""  # not due again yet
