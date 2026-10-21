@@ -27,8 +27,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-BASELINE_SHA256 = "dbe9b8eb7585cd01c28feaf3172ef886b76d90bcd95f4593f7bae08051a55593"
-CANDIDATE_SHA256 = "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c"
+BASELINE_SHA256 = "dbe9b8eb7585cd01c28feaf3172ef886b76d90bcd95f4593f7bae08051a55593"  # pragma: allowlist secret - SHA256 integrity checksum
+CANDIDATE_SHA256 = "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c"  # pragma: allowlist secret - SHA256 integrity checksum
 RELATIVE_SOURCE = Path("nemo_automodel/components/models/flint/layers.py")
 TARGET = Path("/opt/flint/Automodel") / RELATIVE_SOURCE
 

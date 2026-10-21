@@ -27,9 +27,7 @@ import sys
 from pathlib import Path
 
 BASE_LAUNCHER = Path("/flint-work/tools/launch_grpo.py")
-BASE_LAUNCHER_SHA256 = (
-    "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
-)
+BASE_LAUNCHER_SHA256 = "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"  # pragma: allowlist secret - SHA256 integrity checksum
 SGLANG_DIAGNOSTIC_EXECUTABLE = "/flint-run/tools/python-sglang-diagnostic.sh"
 
 

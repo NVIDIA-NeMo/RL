@@ -38,17 +38,13 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
-SOURCE_CONFIG_SHA256 = (
-    "5fa9d05d3ef34c7b9306f7c839f9c232b122db5c85c783e79694556131830669"
-)
-VALIDATED_SETUP_SHA256 = (
-    "b9d81b8a75ee4e67cb7bef737798274593ae57dc695536350d6452a965c5beef"
-)
+SOURCE_CONFIG_SHA256 = "5fa9d05d3ef34c7b9306f7c839f9c232b122db5c85c783e79694556131830669"  # pragma: allowlist secret - SHA256 integrity checksum
+VALIDATED_SETUP_SHA256 = "b9d81b8a75ee4e67cb7bef737798274593ae57dc695536350d6452a965c5beef"  # pragma: allowlist secret - SHA256 integrity checksum
 RUNTIME_PINS = {
-    "/opt/flint/Automodel/nemo_automodel/components/models/flint/layers.py": "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c",
-    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang/srt/mem_cache/kv_cache_configurator.py": "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d",
-    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang/srt/mem_cache/swa_memory_pool.py": "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45",
-    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang_router/router_args.py": "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8",
+    "/opt/flint/Automodel/nemo_automodel/components/models/flint/layers.py": "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c",  # pragma: allowlist secret - SHA256 integrity checksum
+    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang/srt/mem_cache/kv_cache_configurator.py": "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d",  # pragma: allowlist secret - SHA256 integrity checksum
+    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang/srt/mem_cache/swa_memory_pool.py": "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45",  # pragma: allowlist secret - SHA256 integrity checksum
+    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang_router/router_args.py": "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8",  # pragma: allowlist secret - SHA256 integrity checksum
 }
 DATASETS = {
     "train": (

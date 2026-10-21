@@ -19,12 +19,12 @@ from pathlib import Path
 SITE_PACKAGES = Path("/opt/flint/envs/sglang/lib/python3.13/site-packages")
 PINS = {
     "sglang/srt/mem_cache/kv_cache_configurator.py": (
-        "0a3810ce07fe9d73f2c091c595c81a6b9db130cbe3230439a79cfc7eac195c78",
-        "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d",
+        "0a3810ce07fe9d73f2c091c595c81a6b9db130cbe3230439a79cfc7eac195c78",  # pragma: allowlist secret - SHA256 integrity checksum
+        "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d",  # pragma: allowlist secret - SHA256 integrity checksum
     ),
     "sglang/srt/mem_cache/swa_memory_pool.py": (
-        "d0d8c9ad1a7652978195bfea112611cd281012c6ff9c12dfd05f445c13534724",
-        "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45",
+        "d0d8c9ad1a7652978195bfea112611cd281012c6ff9c12dfd05f445c13534724",  # pragma: allowlist secret - SHA256 integrity checksum
+        "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45",  # pragma: allowlist secret - SHA256 integrity checksum
     ),
 }
 

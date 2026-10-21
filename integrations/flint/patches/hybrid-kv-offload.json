@@ -5,15 +5,15 @@
       "relative_path": "sglang/srt/mem_cache/kv_cache_configurator.py",
       "old": "            device=self.device,\n            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),\n            token_to_kv_pool_class=swa_pool_class,",
       "new": "            device=self.device,\n            enable_memory_saver=self.server_args.enable_memory_saver,\n            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),\n            token_to_kv_pool_class=swa_pool_class,",
-      "baseline_sha256": "0a3810ce07fe9d73f2c091c595c81a6b9db130cbe3230439a79cfc7eac195c78",
-      "candidate_sha256": "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d"
+      "baseline_sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "baseline_sha256": "0a3810ce07fe9d73f2c091c595c81a6b9db130cbe3230439a79cfc7eac195c78",
+      "candidate_sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "candidate_sha256": "c67d197b06f407964b5b209f140535bb08665d2fe9c502c89e3f2b68fc1ad28d"
     },
     {
       "relative_path": "sglang/srt/mem_cache/swa_memory_pool.py",
       "old": "        kwargs[\"enable_memory_saver\"] = False",
       "new": "        kwargs.setdefault(\"enable_memory_saver\", False)",
-      "baseline_sha256": "d0d8c9ad1a7652978195bfea112611cd281012c6ff9c12dfd05f445c13534724",
-      "candidate_sha256": "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45"
+      "baseline_sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "baseline_sha256": "d0d8c9ad1a7652978195bfea112611cd281012c6ff9c12dfd05f445c13534724",
+      "candidate_sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "candidate_sha256": "75a2f5d385c1c1ec886f0f553e19178b8bed498ce688fa99c88651231a8e8f45"
     }
   ]
 }
