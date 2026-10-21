@@ -10,6 +10,26 @@ in `research/logra`; NeMo RL and AutoModel core code are unchanged.
 | Sliding puzzle | Native multi-turn GRPO | RowAdam; AdamW on other weights | Native vLLM |
 | OSWorld | Token REINFORCE | SGD + finite-difference KL scaling | Native vLLM HTTP |
 
+<table width="680">
+  <tr>
+    <td colspan="2" align="center">
+      <img src="assets/grpo-7b-comparison.png" alt="Math GRPO memory and evaluation" width="640">
+    </td>
+  </tr>
+  <tr>
+    <th width="50%" align="center">Sliding-puzzle training memory</th>
+    <th width="50%" align="center">OSWorld evaluation</th>
+  </tr>
+  <tr>
+    <td align="center" valign="top">
+      <img src="assets/sliding-puzzle-memory.png" alt="Sliding-puzzle memory" width="217" height="169">
+    </td>
+    <td align="center" valign="top">
+      <img src="assets/cua-evaluation-gain.png" alt="OSWorld evaluation before and after 100 updates" width="300" height="169">
+    </td>
+  </tr>
+</table>
+
 ## 1. Environment
 
 Follow the repository's [Docker](../../docs/docker.md) and
@@ -63,8 +83,6 @@ LoGRA uses rank 256, refreshed Rademacher projections (seed 42) and RowAdam
 moment. Other weights use native AdamW. Both modes use reference-policy KL
 penalty 0.01; predicted-KL step control is disabled.
 
-![Math GRPO memory and evaluation](assets/grpo-7b-comparison.png)
-
 Two seeds × 100 updates; mean ± sample SD:
 
 | Metric | Dense AdamW | LoGRA |
@@ -104,8 +122,6 @@ uv run --locked analysis/plot_puzzle_memory.py /output/puzzle/memory.csv \
   --steps 20 --output /output/puzzle/sliding-puzzle-memory
 ```
 
-![Sliding-puzzle memory](assets/sliding-puzzle-memory.png)
-
 Two seeds × 20 updates on four GB200 GPUs (2 training + 2 rollout):
 
 | Method | Mean update peak / training GPU, GiB | Across-seed SD, MiB |
@@ -121,11 +137,9 @@ not measure convergence; its two-training-GPU layout differs from the math run.
 
 ## 4. OSWorld computer use
 
-The driver reuses **NeMo Gym's OSWorld client/runner** in desktop CPU actors,
-rather than NeMo RL's generic Gym service orchestration. AgentENV hosts the
-desktops; OSWorld supplies task verifiers. NeMo RL provides policy training,
-vLLM serving and weight synchronization. See [CUA setup](docs/cua-setup.md) for
-external model/data assets, runtime dependencies and sandbox credentials.
+Train a desktop-use policy on ScaleCUA with LoGRA. NeMo RL handles training
+and vLLM inference; NeMo Gym's OSWorld runner connects to AgentENV desktops.
+See [CUA setup](docs/cua-setup.md) for dependencies, assets and credentials.
 
 ```bash
 # From research/logra, on 4 nodes × 4 GB200 GPUs.
@@ -137,36 +151,15 @@ uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
   osworld.setup_cache=/writable/osworld_setup_cache
 ```
 
-Use a fresh output directory. Resume with `training.resume=/path/to/step_100`;
-retain the same parallelism and CUA/OSWorld settings. Evaluations run every 50
-updates and at the end; [external evaluation](docs/external-evaluation.md) is
-also supported. `cua_osworld.yaml` is an older, different desktop mixture.
+The recipe uses a Nemotron Omni SFT model, 815 ScaleCUA examples, token
+REINFORCE and rank-256 LoGRA with SGD and predicted-KL scaling. Use a fresh
+output directory; evaluations run every 50 updates.
 
-| Setting | ScaleCUA recipe |
-|---|---|
-| Model | Nemotron Omni RFC0040 iter881 SFT |
-| Resources | 8 training GPUs, EP8; 8 rollout GPUs, four TP2 engines |
-| Data / desktop | 815 ScaleCUA rows, 813 task IDs; `osworld-v2` |
-| Collection | 128 episodes/update, 256 in flight; generation overlaps training |
-| Context / sampling | 32K context; 8,192 tokens/turn; temperature/top-p 1.0/1.0 |
-| Objective | Token REINFORCE; prompt EMA baseline; importance weights clipped to [0.5, 2] |
-| Compression | Rank-256 refreshed Rademacher; SGD; other weights frozen |
-| Step scaling | Relative proposal norm 6e-5; FD-KL budget 5e-4 → 5e-5 over 600 updates; α cap 3 |
-| Checkpoints | Every 100 updates and at the end; optimizer, baseline and pending tasks included |
-
-![First 100 ScaleCUA updates](assets/cua-first100-training.png)
-![Original-stack evaluation](assets/cua-first100-evaluation.png)
-
-In the selected first 100 updates, mean training reward rises from **62.93%**
-(updates 1–50) to **64.25%** (51–100); median update time is **4.81 min**.
-One original-stack evaluation gives **48.93% → 52.11%** on 361 tasks
-(paired gain SE: 2.41 points), using `osworld-v2`, 49,152-token context and
-sampling temperature/top-p 0.5/0.9. It includes partial credit and does not
-establish significance or long-horizon stability; inline evaluation differs.
-
-Training/evaluation share 297 source task UUIDs and one identical instruction.
-Removing that instruction gives **49.06% → 51.98%** on 360 tasks; this is still
-not source-disjoint. Failed episodes remain in task means.
+After 100 updates, the mean verifier score improves from **48.93% to 52.11%**
+on 361 OSWorld tasks (**+3.18 percentage points**). This is one evaluation per
+checkpoint and includes partial credit. Training and evaluation share source
+task IDs and one identical instruction; excluding that instruction gives
+**49.06% → 51.98%**. See [evaluation details](docs/external-evaluation.md).
 
 ## 5. Scope and code
 
