@@ -1,24 +1,22 @@
 # =============================================================================
-# GRPO arm of the GRPO vs PPO ablation on SWE + Terminal-Bench + search + GDPval (user, 2026-10-20: "i want to do
-# ablation of grpo vs ppo"). Everything is the PPO arm's recipe
-# (ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml): same environments, harnesses, masking, policy
-# loss (clip 0.2 / 0.28, dual-clip 3, TIS 5, no KL), token capture with subagent segment rows, sequence lengths and
-# async settings. Only the algorithm differs:
+# GRPO arm of the GRPO vs PPO ablation on SWE + Terminal-Bench + search + GDPval. Everything is the PPO arm's
+# recipe (ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml): same environments, harnesses, masking,
+# policy loss (clip 0.2 / 0.28, dual-clip 3, TIS 5, no KL), token capture with subagent segment rows, sequence lengths
+# and async settings. Only the algorithm differs:
 # - `grpo` replaces `ppo`: no critic. Advantage = (reward - leave-one-out group mean) / group std, one value per
 #   rollout, given to all of its rows (the canonical row and its subagent segment rows);
 # - no critic blocks either (`value`, `value_loss_fn`: the SC refuses them without `ppo`).
 # Launch with v2.sh ALGO=grpo (it swaps the ppo.* overrides for grpo.* and drops the critic ones).
 # Masked rows (env mask rules, overlong filtering) take no gradient but keep their reward (usually 0) in the group's
-# baseline and std (masked_sample_rewards_in_baseline: true; user, 2026-10-21: "those should be in baseline"), so a
-# timed-out or truncated rollout reads as a failure for its siblings -- as in the PPO arm, whose stage-B critic is
-# trained on masked and truncated rollouts with their rewards.
+# baseline and std (masked_sample_rewards_in_baseline: true), so a timed-out or truncated rollout reads as a failure
+# for its siblings -- as in the PPO arm, whose stage-B critic is trained on masked and truncated rollouts with their
+# rewards.
 # =============================================================================
 defaults: ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml
 ppo: null
 value: null
 value_loss_fn: null
 grpo:
-  # 64 x 16 (user, 2026-10-21; was 128 x 16): at lag 1, 2,048 rollouts in flight, as the PPO arm's 512 x 1 at lag 3.
   num_prompts_per_step: 64
   num_generations_per_prompt: 16
   max_rollout_turns: 1

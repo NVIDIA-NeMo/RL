@@ -1,25 +1,24 @@
 # =============================================================================
-# ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml + GDPval (Gym gdpval_sandboxed_agent + gdpval_disaggregated,
-# ported from hiteshis's gdpval_ohv2_localjudge), for collecting and training on the six-set SWE mix,
-# Terminal-Bench and GDPval together. Rows carry their agent in `agent_ref`; GDPval rows use gdpval_train.
+# ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml + GDPval (Gym gdpval_sandboxed_agent + gdpval_disaggregated),
+# for collecting and training on the six-set SWE mix, Terminal-Bench and GDPval together. Rows carry their agent in
+# `agent_ref`; GDPval rows use gdpval_train.
 #
-# SWE and TB are unchanged. GDPval runs as in hiteshis's OpenHands arm (gdpval-oh-web-gopo-mercor-02, step 46):
+# SWE and TB are unchanged. GDPval:
 # - OpenHands v3 (CodeAct) runs inside a per-rollout OpenSandbox sandbox (image gdpval:aa-v2-amd64, 8 CPU /
-#   48 GiB / 60 GiB) and calls the policy through the rollout-prefixed Gym URL, so token capture (the ledger) sees
-#   every call; up to 400 turns and 3600 s per rollout (7200 s with sandbox, install and judge), 900 s per model call, the whole trajectory within
-#   policy.max_total_sequence_length (no compaction).
+#   48 GiB / 60 GiB) and calls the policy through the rollout-prefixed Gym URL, so token capture sees every call;
+#   up to 400 turns, 3600 s per agent run (7200 s per rollout with sandbox, install and judge), 900 s per model
+#   call, the whole trajectory within policy.max_total_sequence_length (no compaction).
 # - The resources server seeds the task (prompt + reference files), collects /workspace deliverables and judges
-#   them against the task's rubric through the upstream gdpval server: reward = rubric points / max points in
-#   [0, 1], no pass threshold. Judge: a local Qwen3.8-Flash-Next (launchers/gdpval/serve_judge_qwen38_flash_next
-#   .sbatch); the endpoint file (JUDGE_ENDPOINT_FILE) is re-read per verdict.
+#   them against the task's rubric: reward = rubric points / max points in [0, 1], no pass threshold. The judge
+#   (Qwen3.8-Flash-Next) is reached at JUDGE_BASE_URL.
 # - Masked: no verdict (judge/infrastructure failure, agent timeout: evaluation_completed false), an unfinished
 #   harness (agent_finished false) and, from the judge server, context / iteration-limit rollouts
-#   (mask_policy_failures) so the policy is not graded on length. A rule whose field a rollout lacks never
-#   matches, so the SWE / TB and GDPval rule sets do not interact.
-# - Web tools (Exa) are off until we have our own key set (the keys are visible inside the sandbox).
-# Paths and the endpoint come from the job environment (launcher v2.sh, NRL_CONFIG *gdpval*): GDPVAL_TRAIN_DATA,
-# GDPVAL_JUDGE_DATASET, GDPVAL_SANDBOX_IMAGE, GDPVAL_HARNESS_DIR, GDPVAL_ARTIFACT_ROOT, JUDGE_ENDPOINT_FILE,
-# JUDGE_BASE_URL / JUDGE_MODEL_NAME / JUDGE_API_KEY.
+#   (mask_policy_failures). A rule whose field a rollout lacks never matches, so the SWE / TB and GDPval rule sets
+#   do not interact.
+# - Web tools (Exa) are off: their keys would be visible inside the sandbox.
+# Paths and the judge come from the job environment (launcher v2.sh, NRL_CONFIG *gdpval*): GDPVAL_TRAIN_DATA,
+# GDPVAL_JUDGE_DATASET, GDPVAL_SANDBOX_IMAGE, GDPVAL_HARNESS_DIR, GDPVAL_ARTIFACT_ROOT, JUDGE_BASE_URL /
+# JUDGE_MODEL_NAME / JUDGE_API_KEY.
 # =============================================================================
 defaults: ppo_nano_v3_5_allswe_tb_sandbox_capture_priv.yaml
 async_rl:
@@ -80,18 +79,14 @@ env:
           remote_openhands_install_script_path: ${oc.env:GDPVAL_HARNESS_DIR}/install.sh
           remote_openhands_archive_path: ${oc.env:GDPVAL_HARNESS_DIR}/runtime.tar.gz
           harness_install_timeout: 900
-          # 400, as the SWE / TB OpenCode agents' steps and search's max_steps (user, 2026-10-21; hiteshis used 200,
-          # which the full32 collection hit in 3 of ~21k rollouts).
+          # As the OpenCode agents' steps and search's max_steps.
           agent_max_turns: 400
-          # 3600 s in collection and PPO alike (user, 2026-10-20: "make gdpval timeout same as swe", then "for ppo
-          # default to 3600s too and 7200"): the SWE collection budget. Not tied to the SWE agents' sandbox_timeout,
-          # whose PPO default is the launcher's 2700 s. hiteshis's 4800 s came with an inherited SWE overlay (their
-          # first GDPval config used 3600 s).
+          # The SWE agents' budget, set here rather than tied to their sandbox_timeout (a launcher setting).
           agent_timeout: 3600
           max_context: ${policy.max_total_sequence_length}
           max_output_tokens: ${policy.max_total_sequence_length}
           checkpoint: ${policy.model_name}
-          # 900 s (was 1800 in the base): 600 s cut 32k-token calls at 35-55 tok/s; 900 s removed most timeouts.
+          # Long enough for a 32k-token call at 35-55 tok/s.
           model_read_timeout_s: 900
           model_read_retries: 1
           web_tools_enabled: false
@@ -132,7 +127,7 @@ env:
             ready_timeout_s: 1200
             resources:
               cpu: 8
-              # 48 GiB: at 32 GiB ~0.5% of sandboxes were OOM-killed (hiteshis, 2026-10-05).
+              # 32 GiB OOM-kills ~0.5% of sandboxes.
               memory_mib: 49152
               disk_gib: 60
             metadata:

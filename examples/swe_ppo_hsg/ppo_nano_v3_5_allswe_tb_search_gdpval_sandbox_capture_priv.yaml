@@ -1,7 +1,7 @@
 # =============================================================================
-# The six-set SWE mix + Terminal-Bench + BrowseComp search + GDPval in one recipe (user, 2026-10-20: "run ppo on
-# gdpval+swe+tb+search"; the PPO arm of the GRPO vs PPO ablation, whose GRPO arm is
-# grpo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml). Rows carry their agent in `agent_ref`.
+# The six-set SWE mix + Terminal-Bench + BrowseComp search + GDPval in one recipe: the PPO arm of the GRPO vs PPO
+# ablation, whose GRPO arm is grpo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml. Rows carry their
+# agent in `agent_ref`.
 #
 # Both environment overlays, unchanged:
 # - ppo_nano_v3_5_allswe_tb_search_sandbox_capture_priv.yaml: browsecomp_sandboxed_agent on policy_model_search,
