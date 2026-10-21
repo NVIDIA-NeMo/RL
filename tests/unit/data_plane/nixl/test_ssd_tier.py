@@ -194,6 +194,55 @@ def test_a_put_that_fits_nowhere_is_unitfull_and_a_full_io_area_is_busy(tmp_path
     assert u.stats()["busy_replies"] == 1
 
 
+def test_alloc_without_spill_is_unitfull_and_leaves_the_io_area_alone(tmp_path):
+    u = _unit(tmp_path)
+    _fill(u)
+    with pytest.raises(UnitFull):
+        u.alloc("x", BLOB, 1, spill=False)
+    assert u.staging_.used_bytes == 0 and "x" not in u.blobs
+    u.alloc("y", BLOB, 1)  # the default still spills
+    assert u.stats()["spills"] == 0 and u.blobs["y"].staged_off is not None
+
+
+class _SpillCtl(_Ctl):
+    """Two units; ``full`` names the ones whose RAM refuses a no-spill alloc."""
+
+    def __init__(self, full):
+        self.full = full
+        self.allocs = []
+        super().__init__({"alloc": self._alloc, "commit": lambda a: "done"})
+
+    def call(self, address, op, *, timeout_s=None, **args):
+        if op == "alloc":
+            self.allocs.append((address, args["spill"]))
+        return super().call(address, op, timeout_s=timeout_s, **args)
+
+    def _alloc(self, address):
+        if address in self.full and not self.allocs[-1][1]:
+            return UnitFull("ram full")
+        return 64
+
+
+def test_a_put_tries_every_units_ram_before_any_unit_spills():
+    ctl = _SpillCtl(full={"tcp://u0"})
+    s = _store(ctl)
+    s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert ctl.allocs == [("tcp://u0", False), ("tcp://u1", False)]
+    assert s._blob_unit["b"] == 1
+
+
+def test_a_put_spills_only_when_no_unit_has_ram_left():
+    ctl = _SpillCtl(full={"tcp://u0", "tcp://u1"})
+    s = _store(ctl)
+    s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert ctl.allocs == [
+        ("tcp://u0", False),
+        ("tcp://u1", False),
+        ("tcp://u0", True),
+    ]
+    assert s._blob_unit["b"] == 0
+
+
 def test_commit_waits_when_too_many_io_jobs_are_running(tmp_path, monkeypatch):
     u = _unit(tmp_path)
     u._max_io_jobs = 1

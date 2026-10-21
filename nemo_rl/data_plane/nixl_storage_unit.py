@@ -473,7 +473,9 @@ class NixlStorageUnit:
 
     # ------------------------------------------------------------------ allocation
     @_locked
-    def alloc(self, blob_id: str, nbytes: int, n_entries: int) -> int:
+    def alloc(
+        self, blob_id: str, nbytes: int, n_entries: int, spill: bool = True
+    ) -> int:
         now = time.monotonic()
         self._reclaim(now)
         if blob_id in self.blobs:
@@ -481,8 +483,10 @@ class NixlStorageUnit:
         try:
             off = self.alloc_.alloc(nbytes)
         except UnitFull:
-            # The client spills to the next unit on UnitFull, retries on Busy.
-            if self.ssd_dir is None:
+            # The client tries the next unit on UnitFull, retries on Busy. It asks
+            # for spill=False first, so a put spills only after every unit refused
+            # (best-effort: a unit may free or fragment space after it answered).
+            if self.ssd_dir is None or not spill:
                 raise
             # Spill: the put goes to disk from birth, through the IO area. The
             # client cannot tell: it just WRITEs at the offset it is given.
