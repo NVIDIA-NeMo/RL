@@ -68,7 +68,6 @@ from nemo_rl.data_plane.nixl.blobstore import (
     LostBlobs,
     TransferFailed,
     UnitSlabStore,
-    make_store,
 )
 from nemo_rl.data_plane.nixl.bufpool import BufferPool, PoolExhausted, PoolTimeout
 from nemo_rl.data_plane.nixl.directory import BlobDirectory
@@ -143,8 +142,6 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     ssd = _as_dict(cfg.get("ssd") or {})
     if not ssd.get("enabled", False):
         return None
-    if _as_dict(cfg.get("store") or {}).get("kind", "unit") != "unit":
-        raise ValueError("NixlStore ssd.enabled needs store.kind='unit'")
     slab = int(cfg.get("unit_slab_bytes", 1 << 30))
     staging = int(ssd.get("staging_bytes", slab // 4))
     pickup_s = float(ssd.get("pickup_s", 10.0))
@@ -217,17 +214,12 @@ class NixlKVClient(StorageKVClient):
             cfg.get("directory_name", "BlobDirectory"), namespace=self.namespace
         )
         nixl_cfg = _as_dict(cfg.get("nixl") or {})
-        store_cfg = _as_dict(cfg.get("store") or {})
-        kind = store_cfg.get("kind", "unit")
         init_params = dict(nixl_cfg.get("backend_init_params") or {})
         self.ep = NixlEndpoint(
             f"client-{os.getpid()}-{uuid.uuid4().hex[:6]}",
             backend=nixl_cfg.get("backend_name", "UCX"),
             init_params=init_params,
             prog_thread=False,
-            extra_backends=(
-                [store_cfg.get("file_backend", "POSIX")] if kind == "file" else ()
-            ),
             require_rdma=bool(nixl_cfg.get("require_rdma", True)),
         )
         # Serialises every NIXL agent call (the agent is not thread-safe). Copies
@@ -262,34 +254,22 @@ class NixlKVClient(StorageKVClient):
             bool(cfg.get("debug_check_finite", False))
             or os.environ.get("NVDP_CHECK_FINITE") == "1"
         )
-        if kind == "unit":
-            ssd = ssd_config(cfg)
-            # A blob is one region of one unit's put area (the slab minus SSD
-            # staging); a put bigger than max_blob_bytes is split at key
-            # boundaries into several blobs, so it fits a unit with room to spare.
-            area = int(cfg.get("unit_slab_bytes", 1 << 30))
-            area -= ssd["staging_bytes"] if ssd else 0
-            self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
-            self.store = make_store(
-                "unit",
-                self.ep,
-                directory,
-                namespace=self.namespace,
-                placement=Spread(start=os.getpid()),
-                node_id=ray.get_runtime_context().get_node_id(),
-                timeout_s=self.timeout_s,
-                ssd=ssd is not None,
-            )
-        else:
-            self.store = make_store(
-                kind,
-                self.ep,
-                directory,
-                root=store_cfg["root"],
-                timeout_s=self.timeout_s,
-                backend=store_cfg.get("file_backend", "POSIX"),
-                max_open=int(store_cfg.get("max_open_files", 256)),
-            )
+        ssd = ssd_config(cfg)
+        # A blob is one region of one unit's put area (the slab minus SSD
+        # staging); a put bigger than max_blob_bytes is split at key
+        # boundaries into several blobs, so it fits a unit with room to spare.
+        area = int(cfg.get("unit_slab_bytes", 1 << 30))
+        area -= ssd["staging_bytes"] if ssd else 0
+        self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
+        self.store = UnitSlabStore(
+            self.ep,
+            directory,
+            namespace=self.namespace,
+            placement=Spread(start=os.getpid()),
+            node_id=ray.get_runtime_context().get_node_id(),
+            timeout_s=self.timeout_s,
+            ssd=ssd is not None,
+        )
 
     # ------------------------------------------------------------------ put
     def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
@@ -299,15 +279,7 @@ class NixlKVClient(StorageKVClient):
             _check_finite("put", keys, list(values))
         deadline = time.monotonic() + self.op_timeout_s
         with self._errors(keys):
-            if isinstance(self.store, UnitSlabStore):
-                return self._put_split(keys, list(values), deadline)
-            # file store: one contiguous blob
-            p = blob_format.plan(keys, values)
-            with self._acquire(p.nbytes, deadline) as (base, buf):
-                blob_format.write(p, memoryview(buf)[: p.nbytes])
-                with self._lock:
-                    blob_id, extra = self.store.put(base, p, deadline)
-        return [{"b": blob_id, **e.meta(), **extra} for e in p.entries]
+            return self._put_split(keys, list(values), deadline)
 
     def _put_split(
         self, keys: list[str], values: list[Any], deadline: float
@@ -625,8 +597,6 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
     namespace = cfg.get("namespace", DEFAULT_NAMESPACE)
     dir_name = cfg.get("directory_name", "BlobDirectory")
     nixl_cfg = _as_dict(cfg.get("nixl") or {})
-    store_cfg = _as_dict(cfg.get("store") or {})
-    kind = store_cfg.get("kind", "unit")
 
     # A fresh TQ controller means a fresh data plane: stale named actors from a
     # previous system in the same namespace would otherwise block creation.
@@ -635,44 +605,35 @@ def initialize_nixl_storage(conf: Any) -> dict[str, Any]:
     directory = BlobDirectory.options(name=dir_name, namespace=namespace).remote()
     handles: dict[str, Any] = {"BlobDirectory": directory}
 
-    if kind == "file":
-        # Actor-less store: one file per blob under store.root (Lustre / NVMe).
-        root = store_cfg.get("root")
-        if not root:
-            raise ValueError(
-                "backend.NixlStore.store.root is required for store.kind='file'"
-            )
-        os.makedirs(root, exist_ok=True)
-    else:
-        units = []
-        per_node: dict[str, int] = {}
-        for i, node_id in enumerate(unit_node_ids(cfg)):
-            numa_index = per_node.get(
-                node_id, 0
-            )  # k-th unit on this node -> socket k % sockets
-            per_node[node_id] = numa_index + 1
-            unit = NixlStorageUnit.options(
-                name=_unit_name(i),
-                namespace=namespace,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=node_id, soft=False
-                ),
-            ).remote(
-                i,
-                int(cfg.get("unit_slab_bytes", 1 << 30)),
-                read_pin_s=read_pin_s,
-                nixl_backend=nixl_cfg.get("backend_name", "UCX"),
-                nixl_init_params=nixl_cfg.get("backend_init_params") or {},
-                require_rdma=bool(nixl_cfg.get("require_rdma", True)),
-                numa_mode=str(cfg.get("numa", "auto")),
-                numa_index=numa_index,
-                directory=directory,
-                **ssd,
-            )
-            units.append(unit)
-            handles[_unit_name(i)] = unit
-        infos = ray.get([u.info.remote() for u in units])
-        ray.get([directory.register_unit.remote(info) for info in infos])
+    units = []
+    per_node: dict[str, int] = {}
+    for i, node_id in enumerate(unit_node_ids(cfg)):
+        numa_index = per_node.get(
+            node_id, 0
+        )  # k-th unit on this node -> socket k % sockets
+        per_node[node_id] = numa_index + 1
+        unit = NixlStorageUnit.options(
+            name=_unit_name(i),
+            namespace=namespace,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False
+            ),
+        ).remote(
+            i,
+            int(cfg.get("unit_slab_bytes", 1 << 30)),
+            read_pin_s=read_pin_s,
+            nixl_backend=nixl_cfg.get("backend_name", "UCX"),
+            nixl_init_params=nixl_cfg.get("backend_init_params") or {},
+            require_rdma=bool(nixl_cfg.get("require_rdma", True)),
+            numa_mode=str(cfg.get("numa", "auto")),
+            numa_index=numa_index,
+            directory=directory,
+            **ssd,
+        )
+        units.append(unit)
+        handles[_unit_name(i)] = unit
+    infos = ray.get([u.info.remote() for u in units])
+    ray.get([directory.register_unit.remote(info) for info in infos])
 
     conf.backend.NixlStore.directory_name = dir_name
     conf.backend.NixlStore.namespace = namespace
