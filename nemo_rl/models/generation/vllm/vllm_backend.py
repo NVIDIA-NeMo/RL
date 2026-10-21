@@ -40,12 +40,12 @@ from nemo_rl.models.generation.vllm.draft_utils import (
 )
 from nemo_rl.models.generation.vllm.speculator_runtime import (
     DRAFTER_OWNER_ATTRS,
-    SPECULATOR_TYPES,
     DraftRuntimeAdapter,
     ModelUpdateCoverage,
     ModelUpdateManifest,
     SpeculatorRuntimeError,
     find_draft_model,
+    is_speculator_type,
 )
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
@@ -1046,7 +1046,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
         speculator_type = getattr(spec_config, "method", None)
         self._draft_runtime_adapter = None
-        if speculator_type in SPECULATOR_TYPES:
+        if is_speculator_type(speculator_type):
             self._draft_runtime_adapter = DraftRuntimeAdapter.resolve(
                 self.model_runner,
                 speculator_type=speculator_type,

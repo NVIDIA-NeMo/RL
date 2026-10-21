@@ -16,12 +16,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable, Literal, Mapping, Sequence, get_args
+from typing import Any, Iterable, Literal, Mapping, Sequence, TypeGuard, get_args
 
 import torch
 
 SpeculatorType = Literal["eagle3", "dflash", "dspark"]
 SPECULATOR_TYPES: tuple[str, ...] = get_args(SpeculatorType)
+
+
+def is_speculator_type(value: object) -> TypeGuard[SpeculatorType]:
+    return value in SPECULATOR_TYPES
 
 
 class SpeculatorRuntimeError(RuntimeError):
@@ -225,7 +229,7 @@ class DraftRuntimeAdapter:
         pp_rank: int,
         pp_size: int,
     ) -> DraftRuntimeAdapter:
-        if speculator_type not in SPECULATOR_TYPES:
+        if not is_speculator_type(speculator_type):
             raise SpeculatorRuntimeError(
                 f"unsupported speculator_type={speculator_type!r} with "
                 f"vLLM={vllm_version}"
