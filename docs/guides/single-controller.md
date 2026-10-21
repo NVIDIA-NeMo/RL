@@ -131,6 +131,15 @@ correction; use `in_order` for critic-only warmup. PPO still consumes the full
 logical batch in each chunk: set `async_rl.min_groups_for_streaming_train` to
 `ppo.num_prompts_per_step`.
 
+The [mixed ClawEval and AgenticVBench Super PPO recipe](../../examples/configs/recipes/vlm/vlm_ppo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc.v1.yaml)
+inherits the matching GRPO recipe. For a comparison, supply the same base
+`MODEL_PATH`, `TRAIN_PATH`, `VAL_PATH`, Gym parent/child prompts and rollout
+budgets to both, and use separate fresh checkpoint and log directories. The
+critic learns jointly from verifier outcomes; this recipe uses one actor pass,
+one critic pass and no critic-only warmup. Equal seeds do not guarantee identical
+online batches with completion-order sampling. Account for the critic's
+additional memory and full checkpoint storage before launching.
+
 ## Checkpointing and Replay Recovery
 
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
