@@ -3776,7 +3776,11 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            ("finalize/penalty_count/", "finalize/effort/")
+                            (
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                                "finalize/truncated_count",
+                            )
                         )
                     }
                 )

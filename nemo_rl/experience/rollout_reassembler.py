@@ -913,6 +913,19 @@ class RolloutReassembler:
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
             )
+        # Valid rows hitting max_seq_len (the TRUNCATED predicate below), pooled
+        # into termination rates like the penalty counts; receipt-side rates
+        # only saw a placeholder truncated=False. Forest rows are not one per
+        # rollout, so Forest groups report no termination rates yet.
+        if logical is None:
+            metrics["finalize/truncated_count"] = 0.0
+            for row, context in zip(rows, log_contexts):
+                if row.valid:
+                    truncated = float(len(row.token_ids) == self._max_seq_len)
+                    metrics["finalize/truncated_count"] += truncated
+                    if context is not None:
+                        key = f"finalize/truncated_count/{context.agent_name}"
+                        metrics[key] = metrics.get(key, 0.0) + truncated
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.

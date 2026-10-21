@@ -552,6 +552,16 @@ def aggregate_capture_reward_metrics(
         result.update(
             calculate_single_metric(values, len(values), f"{agent_name}/reward")
         )
+    if "finalize/truncated_count" in metrics:
+        truncated = sum(metrics["finalize/truncated_count"])
+        result["truncation_rate"] = truncated / count
+        result["natural_termination_rate"] = (count - truncated) / count
+        for agent_name, values in agent_rewards.items():
+            key = f"finalize/truncated_count/{agent_name}"
+            if key in metrics:
+                result[f"{agent_name}/truncation_rate"] = sum(metrics[key]) / len(
+                    values
+                )
     for bucket in ("low", "high"):
         lengths = [
             int(name.rsplit("/", 1)[1])

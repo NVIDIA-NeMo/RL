@@ -65,6 +65,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQTokenSource,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
+from nemo_rl.experience.reward_penalties import RewardLogContext  # noqa: E402
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler  # noqa: E402
 from nemo_rl.experience.route_assembly import RouteLayout  # noqa: E402
 from nemo_rl.experience.route_plan import decode_route_plan  # noqa: E402
@@ -249,6 +250,7 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         fallback_weight_version=9,
         prompt_idx=17,
         loss_multiplier=0.25,
+        reward_log_contexts=[RewardLogContext("agent", None)] * 2,
     )
     assert not finalized.dropped
     assert finalized.meta is not None
@@ -257,6 +259,9 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
     # Group staleness comes from the valid rollout's calls (wv 4), not the fallback.
     assert (finalized.group_min_wv, finalized.group_max_wv) == (4, 4)
     assert finalized.metrics["finalize/invalid_row_rate"] == 0.5
+    # Only the valid row counts toward truncation; it fills max_seq_len.
+    assert finalized.metrics["finalize/truncated_count"] == 1.0
+    assert finalized.metrics["finalize/truncated_count/agent"] == 1.0
     # Text-only rollouts never carry media.
     assert finalized.metrics["finalize/media_row_rate"] == 0.0
     assert finalized.metrics["finalize/terminal_selection_heuristic_count"] == 1.0

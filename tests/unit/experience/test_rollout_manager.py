@@ -1273,7 +1273,9 @@ def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics(
     impl._forest_training = forest_training
     metrics = impl._compute_rollout_metrics(completions, "agent")
 
-    assert metrics["agent/truncation_rate"] == pytest.approx(0.5)
+    # Receipt truncated flags are placeholders; the finalizer reports these rates.
+    for key in ("truncation_rate", "natural_termination_rate", "agent/truncation_rate"):
+        assert key not in metrics
     assert metrics["agent/total_tokens_per_sample/histogram"] == [9, 4]
     assert metrics["agent/total_tokens_per_sample/mean"] == pytest.approx(6.5)
     # Receipts cannot distinguish generated tokens from inputs; no proxy escapes.
