@@ -1393,6 +1393,10 @@ def process_microbatch(
                 position_ids = _get_tokens_on_this_cp_rank(
                     position_ids, cp_rank, cp_size, seq_dim=1
                 )
+                if padding_mask is not None:
+                    padding_mask = _get_tokens_on_this_cp_rank(
+                        padding_mask, cp_rank, cp_size, seq_dim=1
+                    )
                 attention_mask = None
             else:
                 input_ids_cp_sharded = input_ids

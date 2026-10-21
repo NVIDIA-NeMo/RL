@@ -1083,6 +1083,36 @@ class TestProcessMicrobatch:
         assert result.mtp_loss_mask.tolist() == [[202, 203, 204, 205]]
         assert result.attention_mask is None
 
+    def test_process_microbatch_no_packing_context_parallel_shards_router_padding_mask(
+        self,
+    ):
+        """Unpacked CP shards the router padding mask like input_ids."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.arange(8).unsqueeze(0)
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=0,
+            ),
+        ):
+            result = process_microbatch(
+                {"input_ids": input_ids, "input_lengths": torch.tensor([6])},
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+                create_nonpacked_router_padding_mask=True,
+            )
+
+        # CP rank 0 of 2 owns load-balanced chunks 0 and 3 of 4; tokens 6-7 pad.
+        assert result.input_ids_cp_sharded.tolist() == [[0, 1, 6, 7]]
+        assert result.padding_mask.shape == result.input_ids_cp_sharded.shape
+        assert result.padding_mask.tolist() == [[False, False, True, True]]
+
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):
         """mtp_loss_mask defaults to None when not provided."""
