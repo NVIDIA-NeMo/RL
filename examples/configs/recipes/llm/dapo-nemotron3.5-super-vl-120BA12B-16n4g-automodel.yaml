@@ -1,7 +1,7 @@
 defaults: ../../grpo_math_1B.yaml
 # Nemotron 3.5 Super VL (NemotronH_Omni_Reasoning_V3: "Nemotron Super" hybrid
 # Mamba+Attention MoE backbone, 512 routed / 22 active experts, + RADIO vision
-# tower) DAPO-512 on the automodel (DTensor v2) backend, text-only math task.
+# tower) DAPO-512 on the Automodel backend, text-only math task.
 # Same task/algorithm settings as dapo-nanov3.5-30BA3B-4n8g-automodel.yaml;
 # Sized for 16 x 4-GPU GB200 nodes (train EP4, vLLM TP4/EP4); see the model
 # guide for why EP must stay within a node.
@@ -13,7 +13,7 @@ defaults: ../../grpo_math_1B.yaml
 #     and loads the checkpoint's RADIO weights for the (unused) vision tower.
 #
 # Notes:
-#   - The tokenizer path (no processor) is used, so the DTensor worker runs the
+#   - The tokenizer path (no processor) is used, so the Automodel worker runs the
 #     model text-only (is_vlm=false) and vLLM never receives images. The vision
 #     tower is still constructed on both sides; skip_mm_profiling keeps vLLM from
 #     reserving encoder-cache memory for images that never arrive.
