@@ -79,6 +79,10 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -858,8 +862,8 @@ class VllmAsyncGenerationWorkerImpl(
     @staticmethod
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
-    ) -> None:
-        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
+    ) -> RoutedExpertsStagingPayload | None:
+        """Align routes and retain their tensor for the following staging write."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
             return
@@ -868,10 +872,10 @@ class VllmAsyncGenerationWorkerImpl(
         routed = message.get("routed_experts")
         if routed is None:
             return
+        route_payload = None
         try:
             from nemo_rl.utils.routed_experts_codec import (
                 decode_routed_experts,
-                encode_routed_experts,
             )
 
             if isinstance(routed, str):
@@ -893,7 +897,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             start = prev_len - boundary_route_rows(prev_len)
-            message["routed_experts"] = encode_routed_experts(experts[start:])
+            route_payload = RoutedExpertsStagingPayload(experts[start:])
+            message["routed_experts"] = route_payload.encoded
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -901,6 +906,7 @@ class VllmAsyncGenerationWorkerImpl(
             message.pop("routed_experts", None)
         choice["message"] = message
         payload["choices"] = [choice]
+        return route_payload
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
@@ -928,21 +934,28 @@ class VllmAsyncGenerationWorkerImpl(
             # digest-covered extras; the pixels themselves are attachments.
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
+        route_payload = None
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            route_payload = self._delta_align_routed_experts(
                 payload,
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
+        attachments = state.media.tensors if state.media is not None else None
+        if route_payload is not None:
+            attachments = {
+                **(attachments or {}),
+                ROUTED_EXPERTS_STAGING_ATTACHMENT: route_payload,
+            }
         coords = self.token_capture.complete_call_from_response(
             call,
             payload,
-            attachments=state.media.tensors if state.media is not None else None,
+            attachments=attachments,
         )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
