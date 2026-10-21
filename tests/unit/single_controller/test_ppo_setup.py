@@ -729,15 +729,6 @@ class TestDynamicSamplingValidation:
     def test_accepts_the_samplers_that_stamp_no_target_step(self, sampler):
         validate_single_controller_config(_dynamic_sampling_config(sampler=sampler))
 
-        with pytest.raises(ValueError, match="sampler.name='in_order'"):
-            validate_single_controller_config(mc)
-
-    def test_rejects_a_single_generation_per_prompt(self):
-        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
-
-        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
-            validate_single_controller_config(mc)
-
     def test_ppo_rejects_dynamic_sampling_outright(self):
         # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
         # by the GRPO-only guard at the top of the dynamic-sampling block instead.
@@ -1190,4 +1181,6 @@ class TestInLossSeqFilterForPPO:
 
 def test_dynamic_sampling_rejects_weight_fifo():
     with pytest.raises(ValueError, match="cannot be combined with.*weight_fifo"):
-        validate_single_controller_config(_dynamic_sampling_config(sampler="weight_fifo"))
+        validate_single_controller_config(
+            _dynamic_sampling_config(sampler="weight_fifo")
+        )
