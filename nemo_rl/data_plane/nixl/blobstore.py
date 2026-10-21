@@ -301,9 +301,14 @@ class UnitSlabStore:
         refreshed = False
         while True:
             errs: list[Exception] = []
-            for cand in self.placement.order(
+            order = self.placement.order(
                 list(self._units.values()), node_id=self.node_id, nbytes=nbytes
-            ):
+            )
+            # With the SSD tier on, every unit's RAM is tried before any unit spills.
+            tries = [(c, True) for c in order]
+            if self.ssd:
+                tries = [(c, False) for c in order] + tries
+            for cand, spill in tries:
                 unit_id = int(cand["unit_id"])
                 try:
                     off = self.ctl.call(
@@ -313,6 +318,7 @@ class UnitSlabStore:
                         blob_id=blob_id,
                         nbytes=int(nbytes),
                         n_entries=int(n_entries),
+                        spill=spill,
                     )
                 except TransferError as e:
                     # No reply in time: the unit may still allocate. Nothing
