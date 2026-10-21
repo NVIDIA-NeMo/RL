@@ -1,5 +1,6 @@
 # Inherit the native GRPO loss, reward verifier, data loader and rollout engine.
 defaults: ../../../examples/configs/grpo_math_1B.yaml
+task: math # math dataset loader or sliding_puzzle procedural environment
 logra:
   enabled: true
   rank: 256

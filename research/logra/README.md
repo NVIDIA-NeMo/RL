@@ -2,15 +2,16 @@
 
 LoGRA replaces persistent dense gradients of selected weights with low-rank
 sketches. The selected model weights still change; there is no persistent adapter
-branch. This research project adds two entrypoints without changing NeMo RL or
+branch. This research project provides three examples without changing NeMo RL or
 AutoModel core code:
 
 | Example | Training loop | Sketch optimizer | Rollout engine |
 |---|---|---|---|
-| `run_grpo.py` | Native synchronous GRPO | RowAdam; native AdamW on other weights | Native vLLM |
+| `run_grpo.py` (math) | Native synchronous GRPO | RowAdam; native AdamW on other weights | Native vLLM |
+| `run_grpo.py` (sliding puzzle) | Native multi-turn GRPO | RowAdam; native AdamW on other weights | Native vLLM |
 | `run_cua.py` | Token REINFORCE on OSWorld desktops | SGD with finite-difference KL scaling | Native vLLM HTTP |
 
-Both examples use native **full-weight** policy synchronization. They do not
+All examples use native **full-weight** policy synchronization. They do not
 implement compressed trainer-to-rollout transfers.
 
 ## 1. Environment
@@ -93,7 +94,69 @@ whole-node or time-averaged measurement. Both methods start at 42.97%; two seeds
 on a 256-question subset do not establish superiority or equivalence. The full
 curves include Dense seed 43's drop at the final evaluation.
 
-## 3. Computer use: ScaleCUA and OSWorld
+## 3. Multi-turn GRPO: sliding puzzle
+
+This public example reuses NeMo RL's sliding-puzzle prompt generator, game
+logic, reward and GRPO loop. The model reads a text board and emits an action;
+the environment returns the updated board. Solving the puzzle earns reward 1.
+No desktop sandbox, external reward service or private dataset is required.
+
+The recipe uses Qwen2.5-7B-Instruct and boards of size 2×2 or 3×3, generated
+by the upstream example (1 or 3 shuffle moves). Each update has 8 boards × 4
+trajectories, at most 8 rollout turns, 96 generated tokens per turn and a
+2,048-token total context limit. It uses two training GPUs and two rollout GPUs,
+FP32 parameter storage, BF16 computation, activation checkpointing, no sequence
+packing or FSDP CPU parameter offload. Native optimizer offload during refit
+remains enabled in both. LoGRA uses rank-256 refreshed Rademacher sketches
+(projection seed 42) and RowAdam; the Dense control uses native AdamW. Both use
+the same LR schedule and reference-policy KL penalty. There is no predicted-KL
+controller here.
+
+From `research/logra`, with four allocated GPUs:
+
+```bash
+# Two-update integration smoke; pass logra.enabled=false for Dense.
+bash tests/functional/sliding_puzzle_logra.sh
+
+# Paired 20-update memory profiles, with fresh directories for each run.
+for seed in 42 43; do
+  uv run --locked run_grpo.py --config configs/grpo_logra_sliding_puzzle.yaml \
+    logra.enabled=false grpo.seed=$seed logger.log_dir=/output/puzzle/dense-s$seed
+  uv run --locked run_grpo.py --config configs/grpo_logra_sliding_puzzle.yaml \
+    logra.enabled=true grpo.seed=$seed logger.log_dir=/output/puzzle/logra-s$seed
+done
+
+uv run --locked analysis/export_events.py /output/puzzle --output /output/puzzle/memory.csv
+uv run --locked analysis/plot_puzzle_memory.py /output/puzzle/memory.csv \
+  --steps 20 --output /output/puzzle/sliding-puzzle-memory
+```
+
+![Sliding-puzzle training-memory comparison](assets/sliding-puzzle-memory.png)
+
+Measured on one node with four NVIDIA GB200 GPUs (two training, two rollout),
+using training seeds 42 and 43 with 20 updates each. The measured order was
+Dense → LoGRA for seed 42 and LoGRA → Dense for seed 43.
+
+| Method | Mean per-GPU update peak, GiB | Across-seed SD, MiB |
+|---|---:|---:|
+| Dense AdamW | 71.09 | 0.28 |
+| LoGRA | 29.73 | 0.03 |
+
+LoGRA reduces mean update peak by **58.19%**.
+The seed variation is small, so the plotted bands and error bars are nearly
+invisible. [Vector figure](assets/sliding-puzzle-memory.pdf).
+
+This is a short memory profile, not a task-performance or convergence benchmark.
+The metric is peak PyTorch allocated memory during each policy-training update,
+averaged across training GPUs; rollout memory is excluded. All 20 updates are
+included, and error bars represent sample standard deviation across the two
+seed means; curve bands show the across-seed standard deviation at each update.
+Boards are generated procedurally; the two methods' response lengths can differ.
+GPU type and training-GPU count must match within a comparison. This profile
+uses two training GPUs; the math run above uses four, so their absolute per-GPU
+memory figures are not directly comparable.
+
+## 4. Computer use: ScaleCUA and OSWorld
 
 CUA needs model weights, task manifests, setup assets, a writable cache, and an
 authorized sandbox endpoint. See [setup instructions](docs/cua-setup.md) for their
@@ -162,10 +225,10 @@ this subset is still not source-disjoint. Failed evaluation episodes remain in
 reported task means. The first-100-update figures are an explicitly selected
 window, not a claim about the whole longer trajectory.
 
-## 4. Code map and supported scope
+## 5. Code map and supported scope
 
 ```text
-run_grpo.py       Native GRPO setup and loop
+run_grpo.py       Native GRPO setup and loop; math or sliding-puzzle data
 run_cua.py        Desktop rollout → training batch → update → refit/checkpoint
 logra/
   actor_environments.py, policy.py   Register/select research workers
@@ -192,7 +255,7 @@ on realized KL. Resume requires matching parallelism and CUA/OSWorld settings.
 Pending task tickets are restored, but unfinished desktops are rerun rather than
 resumed bit for bit. Old `logra.osworld` checkpoint class names remain importable.
 
-## 5. Tests and analysis
+## 6. Tests and analysis
 
 ```bash
 uv run --locked --group test pytest tests/unit
@@ -203,6 +266,7 @@ uv run --locked --group test python -m torch.distributed.run \
 uv run --locked --group test python -m torch.distributed.run \
   --standalone --nproc-per-node=4 tests/functional/cua_equivalence.py
 bash tests/functional/grpo_logra.sh
+bash tests/functional/sliding_puzzle_logra.sh
 # Opt-in: real desktop/model prerequisites and full allocation are required.
 LOGRA_RUN_CUA_TEST=1 bash tests/functional/cua_logra.sh
 ```

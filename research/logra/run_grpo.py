@@ -15,7 +15,7 @@
 """Native synchronous GRPO with a research-local LoGRA worker."""
 
 import argparse
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from logra.actor_environments import register_actor_environments
 from logra.config import LoGRAConfig
@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 from pydantic import Field
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
@@ -39,6 +39,7 @@ from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 class ResearchConfig(MasterConfig):
     logra: LoGRAConfig = Field(default_factory=LoGRAConfig)
+    task: Literal["math", "sliding_puzzle"] = "math"
 
 
 def main():
@@ -59,11 +60,32 @@ def main():
     config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     register_actor_environments()
     init_ray()
+    set_seed(config.grpo.seed)
     tokenizer = get_tokenizer(config.policy["tokenizer"])
     config.policy["generation"] = configure_generation_config(
         config.policy["generation"], tokenizer
     )
-    datasets = setup_response_data(tokenizer, config.data, config.env)
+    if config.task == "sliding_puzzle":
+        # The optional game example owns its prompt generator and environment.
+        from examples.run_grpo_sliding_puzzle import setup_puzzle_data
+
+        val_length = config.grpo.max_val_samples
+        if val_length is None:
+            raise ValueError("Sliding puzzle requires an explicit grpo.max_val_samples")
+        datasets = setup_puzzle_data(
+            tokenizer=tokenizer,
+            env_cfg=config.env,
+            task_name="sliding_puzzle_game",
+            length=(
+                config.grpo.num_prompts_per_step
+                * config.grpo.num_generations_per_prompt
+                * config.grpo.max_num_steps
+            ),
+            val_length=val_length,
+            add_system_prompt=config.data["add_system_prompt"],
+        )
+    else:
+        datasets = setup_response_data(tokenizer, config.data, config.env)
     if len(datasets) != 4:
         raise ValueError("GRPO requires training and validation reward environments")
     dataset, val_dataset, task_to_env, val_task_to_env = datasets
@@ -84,8 +106,9 @@ def main():
     ) = setup(
         config,
         tokenizer,
-        dataset,
-        val_dataset,
+        # Native setup accepts IterableDataset in its own sliding-puzzle example.
+        dataset,  # pyrefly: ignore [bad-argument-type]
+        val_dataset,  # pyrefly: ignore [bad-argument-type]
         policy_factory=make_policy_factory(config.logra),
     )
     try:
