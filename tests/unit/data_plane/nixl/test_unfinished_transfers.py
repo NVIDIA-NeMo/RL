@@ -147,6 +147,21 @@ def test_pool_never_reuses_a_buffer_a_failed_read_may_still_fill(nbytes):
     assert pool.stats["retired_bytes"] == stuck.nbytes
 
 
+def test_a_retired_buffer_counts_whole_against_the_graveyard_limit(monkeypatch):
+    from nemo_rl.data_plane.nixl import nixl_io
+
+    g = nixl_io.Graveyard(max_bytes=2000)
+    monkeypatch.setattr(nixl_io, "GRAVEYARD", g)
+    ep = _FakeEp()
+    pool = BufferPool(ep, threading.Lock(), base_bytes=1024, base_count=2)
+    with pool.acquire(512) as (addr, _):
+        ep.unfinished.append((addr, 8))  # a tiny READ timed out; the buffer is 1024 B
+    assert g.bytes == 1024 and g.poisoned is None
+    with pool.acquire(512) as (addr, _):
+        ep.unfinished.append((addr, 8))
+    assert g.bytes == 2048 and g.poisoned is not None  # over the limit: POISONED
+
+
 def test_pool_reuses_buffers_after_a_clean_op():
     ep = _FakeEp()
     pool = BufferPool(ep, threading.Lock(), base_bytes=1024, base_count=1)
