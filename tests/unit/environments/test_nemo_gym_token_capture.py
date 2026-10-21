@@ -623,36 +623,28 @@ def _retired_batches(env) -> list[list[str]]:
     ]
 
 
-def test_receipt_postprocess_queues_its_rollout_for_retirement() -> None:
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"rollout_id": "r0", "records": [_manifest_record("c1")], "failures": []},
+        RuntimeError("control plane down"),
+    ],
+    ids=["fetched", "fetch_failed"],
+)
+def test_receipt_postprocess_leaves_retirement_to_the_dispatcher(manifest) -> None:
+    """The controller may still re-dispatch the row under this ID if receiving the result fails."""
     env = _capture_env()
-    env._control = AsyncMock(
-        return_value={
-            "rollout_id": "r0",
-            "records": [_manifest_record("c1")],
-            "failures": [],
-        }
+    if isinstance(manifest, Exception):
+        env._control = AsyncMock(side_effect=manifest)
+    else:
+        env._control = AsyncMock(return_value=manifest)
+
+    asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, {"reward": 1.0})
     )
 
-    async def _scenario() -> None:
-        await env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, {"reward": 1.0})
-        # Queued without a request of its own; the flush loop sends it later.
-        assert list(env._retire_pending) == ["r0"]
-        assert env._control.await_count == 1
-        env._retire_task.cancel()
-
-    asyncio.run(_scenario())
-
-
-def test_receipt_postprocess_retires_even_when_the_manifest_fetch_fails() -> None:
-    env = _capture_env()
-    env._control = AsyncMock(side_effect=RuntimeError("control plane down"))
-
-    async def _scenario() -> None:
-        await env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, {"reward": 1.0})
-        assert list(env._retire_pending) == ["r0"]
-        env._retire_task.cancel()
-
-    asyncio.run(_scenario())
+    assert env._retire_pending == {}
+    assert env._retire_task is None
 
 
 def test_retire_is_a_no_op_without_token_capture() -> None:

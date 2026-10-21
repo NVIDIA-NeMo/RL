@@ -1324,10 +1324,6 @@ Depending on your data shape, you may want to change these values."""
         except (RuntimeError, OSError) as error:
             # An unfetchable manifest finalizes as a placeholder row.
             print(f"manifest({rollout_id}) fetch failed: {error}", flush=True)
-        # The manifest is never read again.
-        # A restore retries every unsealed attempt under a fresh rollout ID.
-        # This actor's model server is the one that recorded the ledger.
-        await self.retire_rollout_ledgers([rollout_id])
         return {
             "message_log": [],
             "input_message_log": [],
