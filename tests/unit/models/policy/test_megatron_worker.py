@@ -1829,7 +1829,16 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.my_pp_stage = 0
     worker.pp_comm_group = object()
+    worker.model_update_group = object()
+    worker.cfg = {}
+    worker.draft_model = None
     worker._broadcast_misc_params_packed = MagicMock()
+    preflight_calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_preflight_producer",
+        lambda group, src, error: preflight_calls.append((group, src, error)),
+    )
     source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
     wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
     if source_dtype != torch.uint8:
@@ -1938,7 +1947,9 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         assert len(materialized_sources) == 1
         assert completed == []
         worker._broadcast_misc_params_packed.assert_not_called()
+        assert preflight_calls == [(worker.model_update_group, 0, None)]
         failure_stage = None
+        preflight_calls.clear()
         materialized_sources.clear()
         transferred.clear()
         source.add_(10)
@@ -1960,6 +1971,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
+    assert preflight_calls == [(worker.model_update_group, 0, None)] * 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")

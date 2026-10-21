@@ -2049,26 +2049,22 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             hold_refit_for_fault_injection,
         )
 
-        guard = RefitAbortWatchdog(self.model_update_group, refit_timeout_s)
-        try:
-            with guard:
-                hold_refit_for_fault_injection()
+        aborted = (
+            f"refit receive exceeded {refit_timeout_s}s and was aborted; "
+            "this engine now holds partial weights and must not serve until refit"
+        )
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
+            try:
                 result = self._update_weights_from_collective(refit_with_reload_api)
-        except SpeculatorRuntimeError as error:
-            # An aborted broadcast leaves survivors with missing keys; the
-            # abort, not the coverage gap, is the recoverable root cause.
-            if guard.fired:
-                raise RefitAborted(
-                    f"refit receive exceeded {refit_timeout_s}s and was aborted; "
-                    "this engine now holds partial weights and must not serve "
-                    "until refit"
-                ) from error
-            raise
+            except SpeculatorRuntimeError as error:
+                # An aborted broadcast leaves survivors with missing keys; the
+                # abort, not the coverage gap, is the recoverable root cause.
+                if guard.fired:
+                    raise RefitAborted(aborted) from error
+                raise
         if guard.fired:
-            raise RefitAborted(
-                f"refit receive exceeded {refit_timeout_s}s and was aborted; "
-                "this engine now holds partial weights and must not serve until refit"
-            )
+            raise RefitAborted(aborted)
         return result
 
     def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
@@ -2550,32 +2546,30 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             *(self.pp_comm_groups or {}).values(),
             self.model_update_group,
         ]
-        guard = RefitAbortWatchdog(groups, refit_timeout_s)
-        try:
-            with guard:
-                hold_refit_for_fault_injection()
+        aborted = (
+            f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
+            "aborted; this engine now holds partial weights and must not serve "
+            "until refit"
+        )
+        with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
+            hold_refit_for_fault_injection()
+            try:
                 with self._weight_update_lifecycle("nccl_reshard") as finalize:
                     result = self._nccl_reshard_refit_impl(finalize)
-        except Exception as error:
-            if guard.fired:
-                raise RefitAborted(
-                    f"refit nccl_reshard receive exceeded {refit_timeout_s}s and "
-                    "was aborted; this engine now holds partial weights and must "
-                    "not serve until refit"
-                ) from error
-            if self._weight_update_error_must_raise(error):
-                raise
-            logger.exception(
-                "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",
-                error,
-            )
-            return False
+            except Exception as error:
+                if guard.fired:
+                    raise RefitAborted(aborted) from error
+                if self._weight_update_error_must_raise(error):
+                    raise
+                logger.exception(
+                    "Error in VllmInternalWorkerExtension.nccl_reshard_refit: %s",
+                    error,
+                )
+                result = False
+        # Checked after the guard exits, so an abort that lands while a nonfatal
+        # error is logged still reports as RefitAborted.
         if guard.fired:
-            raise RefitAborted(
-                f"refit nccl_reshard receive exceeded {refit_timeout_s}s and was "
-                "aborted; this engine now holds partial weights and must not serve "
-                "until refit"
-            )
+            raise RefitAborted(aborted)
         return result
 
     def _nccl_reshard_refit_impl(self, finalize: WeightUpdateFinalizer) -> bool:
