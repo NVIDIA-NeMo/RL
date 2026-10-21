@@ -1886,6 +1886,7 @@ def test_prepare_refit_info_reports_only_fp8_weights(monkeypatch, enabled):
     monkeypatch.setattr(fp8, "global_fp8_config", None)
     monkeypatch.setattr(fp8, "is_fp8_model", is_fp8_model)
     monkeypatch.setattr(fp8, "_is_fp8_weight", is_fp8_weight)
+    _patch_pp_group(monkeypatch, vllm_backend)
 
     result = ext.prepare_refit_info(state_dict_info, serialized_config)
 
@@ -3420,6 +3421,13 @@ def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypat
     process_weights.assert_not_called()
 
 
+def _patch_pp_group(monkeypatch, vllm_backend, *, is_last_rank=True):
+    # vllm_backend binds get_pp_group at import; draft_utils resolves it per call.
+    group = SimpleNamespace(is_last_rank=is_last_rank)
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", lambda: group)
+    monkeypatch.setattr(vllm_backend, "get_pp_group", lambda: group)
+
+
 def _make_dspark_refit_extension(
     vllm_backend, *, has_speculator=True, drafter_param_names=None, method="dspark"
 ):
@@ -3428,7 +3436,7 @@ def _make_dspark_refit_extension(
     The default fake drafter mimics the pinned vLLM Qwen3DSparkForCausalLM
     layout: fused qkv/gate_up parameters, a mask_embedding placeholder, and an
     owned lm_head. Ownership is controlled via
-    vllm.distributed.parallel_state.get_pp_group in tests.
+    _patch_pp_group in tests.
     """
     if drafter_param_names is None:
         drafter_param_names = [
@@ -3532,10 +3540,7 @@ def test_dspark_owner_accepts_complete_draft_manifest(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_dspark_draft_info()
     # Keys the drafter's loader intentionally skips are tolerated as extras.
     info["draft.confidence_head.proj.weight"] = ((4,), torch.bfloat16)
@@ -3552,10 +3557,7 @@ def test_dspark_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_dspark_draft_info()
     del info[dropped_key]
     with pytest.raises(RuntimeError, match="missing draft keys"):
@@ -3580,10 +3582,7 @@ def test_owner_accepts_stream_without_target_shared_draft_keys(monkeypatch, meth
     }
     names = [name for name, _ in drafter_model.named_parameters()]
     drafter_model.named_parameters = lambda: [(n, shared.get(n)) for n in names]
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_dspark_draft_info()
     del info["draft.embed_tokens.weight"]
     del info["draft.lm_head.weight"]
@@ -3596,10 +3595,7 @@ def test_dspark_owner_rejects_unexpected_draft_keys(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_dspark_draft_info()
     info["draft.renamed_bogus.weight"] = ((4, 4), torch.bfloat16)
     with pytest.raises(RuntimeError, match="unexpected draft keys"):
@@ -3611,10 +3607,7 @@ def test_dspark_non_owner_skips_draft_payloads(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=False),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend, is_last_rank=False)
     # Non-owning ranks neither validate the draft manifest nor require a
     # drafter for draft payloads.
     ext.prepare_refit_info(_complete_dspark_draft_info())
@@ -3626,10 +3619,7 @@ def test_dspark_owner_without_speculator_raises(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend, has_speculator=False)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     with pytest.raises(RuntimeError, match="no drafter"):
         ext._load_draft_weights([("embed_tokens.weight", torch.zeros(1))])
 
@@ -3641,10 +3631,7 @@ def test_dspark_static_drafter_manifest_without_draft_keys_passes(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     ext, _ = _make_dspark_refit_extension(vllm_backend)
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = {"model.weight": ((4, 4), torch.bfloat16)}
     ext.prepare_refit_info(info)
     assert ext.state_dict_info is info
@@ -3733,10 +3720,7 @@ def test_dflash_owner_accepts_dspark_shaped_manifest_without_markov(monkeypatch)
     ext, _ = _make_dspark_refit_extension(
         vllm_backend, drafter_param_names=param_names, method="dflash"
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_dspark_draft_info()
     del info["draft.markov_head.markov_w1.weight"]
     del info["draft.markov_head.markov_w2.weight"]
@@ -3758,10 +3742,7 @@ def test_dflash_owner_rejects_markov_keys(monkeypatch):
         ],
         method="dflash",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = {
         "draft.embed_tokens.weight": ((4, 4), torch.bfloat16),
         "draft.fc.weight": ((4, 4), torch.bfloat16),
@@ -3781,10 +3762,7 @@ def test_eagle3_owner_accepts_complete_draft_manifest(monkeypatch):
         drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
         method="eagle3",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_eagle3_draft_info()
     # t2d is training-only and tolerated as an extra.
     info["draft.t2d"] = ((4,), torch.bool)
@@ -3805,10 +3783,7 @@ def test_eagle3_owner_rejects_missing_draft_keys(monkeypatch, dropped_key):
         drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
         method="eagle3",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_eagle3_draft_info()
     del info[dropped_key]
     with pytest.raises(RuntimeError, match="missing draft keys"):
@@ -3825,10 +3800,7 @@ def test_eagle3_owner_rejects_dspark_only_extras(monkeypatch):
         drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
         method="eagle3",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = _complete_eagle3_draft_info()
     info["draft.mask_embedding"] = ((4,), torch.bfloat16)
     with pytest.raises(RuntimeError, match="unexpected draft keys"):
@@ -3847,10 +3819,7 @@ def test_eagle3_megatron_partial_manifest_accepted(monkeypatch):
         drafter_param_names=_EAGLE3_DRAFTER_PARAM_NAMES,
         method="eagle3",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = {
         "model.weight": ((4, 4), torch.bfloat16),
         "draft.fc.weight": ((4, 4), torch.bfloat16),
@@ -3877,10 +3846,7 @@ def test_eagle3_megatron_partial_manifest_without_drafter_hard_fails_at_prepare(
         has_speculator=False,
         method="eagle3",
     )
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state.get_pp_group",
-        lambda: SimpleNamespace(is_last_rank=True),
-    )
+    _patch_pp_group(monkeypatch, vllm_backend)
     info = {
         "model.weight": ((4, 4), torch.bfloat16),
         "draft.fc.weight": ((4, 4), torch.bfloat16),
