@@ -227,16 +227,33 @@ class CaptureRewardSettings:
     enabled_penalties: tuple[str, ...]
     unwanted_tokens: tuple[int, ...]
     effort: EffortRewardSettings | None
+    # Malformed-think-tag rules, None while that penalty is off. IDs are the
+    # configured ones (None = inferred from the tokenizer, which is fixed per run).
+    think_tag_ids: tuple[int | None, int | None] | None
+    thinking_tags: tuple[str, ...] | None
 
     @classmethod
     def from_configs(
-        cls, penalties: RewardPenaltyConfig, effort: EffortLevelsConfig | None
+        cls,
+        penalties: RewardPenaltyConfig,
+        effort: EffortLevelsConfig | None,
+        thinking_tags: Sequence[str] | None,
     ) -> CaptureRewardSettings:
         unwanted: tuple[int, ...] = ()
         if penalties.penalize_unwanted_tokens:
             assert penalties.token_ids is not None
             assert penalties.token_ids.unwanted is not None
             unwanted = tuple(sorted(set(penalties.token_ids.unwanted)))
+        think_tag_ids = None
+        if penalties.penalize_malformed_think_tag:
+            if not thinking_tags:
+                raise ValueError(
+                    "penalize_malformed_think_tag requires resolved thinking_tags"
+                )
+            ids = penalties.token_ids
+            think_tag_ids = (
+                (ids.think_open, ids.think_close) if ids is not None else (None, None)
+            )
         return cls(
             tuple(spec.flag for spec in CAPTURE_PENALTIES if spec.enabled(penalties)),
             unwanted,
@@ -245,13 +262,28 @@ class CaptureRewardSettings:
             )
             if effort is not None and effort_shaping_enabled(effort)
             else None,
+            think_tag_ids,
+            tuple(thinking_tags)
+            if penalties.penalize_malformed_think_tag and thinking_tags
+            else None,
         )
 
     def to_state(self) -> dict[str, Any]:
-        """Serialize version 1 using the existing config field names."""
+        """Serialize version 1 using the existing config field names.
+
+        Think-tag rules appear only with the think-tag penalty, which version-1
+        sidecars could not record before (capture rejected it), so no migration.
+        """
         penalties: dict[str, Any] = {flag: True for flag in self.enabled_penalties}
+        token_ids: dict[str, Any] = {}
         if self.unwanted_tokens:
-            penalties["token_ids"] = {"unwanted": list(self.unwanted_tokens)}
+            token_ids["unwanted"] = list(self.unwanted_tokens)
+        if self.think_tag_ids is not None:
+            token_ids["think_open"], token_ids["think_close"] = self.think_tag_ids
+        if token_ids:
+            penalties["token_ids"] = token_ids
+        if self.thinking_tags is not None:
+            penalties["thinking_tags"] = list(self.thinking_tags)
         return {
             "version": 1,
             "penalties": penalties,
@@ -287,7 +319,10 @@ class CaptureRewardSettings:
             if value["effort"] is not None
             else None
         )
-        return cls.from_configs(penalties, effort)
+        # An extra field on RewardPenaltyConfig; absent unless the think-tag
+        # penalty was on, where from_configs rejects its absence.
+        thinking_tags = value["penalties"].get("thinking_tags")
+        return cls.from_configs(penalties, effort, thinking_tags)
 
     def require_compatible(self, current: CaptureRewardSettings) -> None:
         """Reject changed reward rules with actionable field names."""
@@ -299,6 +334,10 @@ class CaptureRewardSettings:
                 differences.append(f"penalties.{spec.flag}")
         if self.unwanted_tokens != current.unwanted_tokens:
             differences.append("penalties.token_ids.unwanted")
+        if self.think_tag_ids != current.think_tag_ids:
+            differences.append("penalties.token_ids.think_open/think_close")
+        if self.thinking_tags != current.thinking_tags:
+            differences.append("thinking_tags")
         if self.effort != current.effort:
             if self.effort is None or current.effort is None:
                 differences.append("effort.enabled")

@@ -1259,7 +1259,7 @@ def test_checkpoint_validates_reward_settings_and_observations():
     )
 
     settings = CaptureRewardSettings.from_configs(
-        RewardPenaltyConfig(penalize_empty_final_answer=True), None
+        RewardPenaltyConfig(penalize_empty_final_answer=True), None, None
     )
     observation = FinalizedReward(
         "sample", "attempt", 0.0, RewardLogContext("agent", '{"answer":"empty"}')
