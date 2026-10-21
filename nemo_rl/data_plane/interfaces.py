@@ -97,6 +97,36 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
 
 
+class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
+    """Mooncake SSD offload: segment owners spill DRAM to node-local SSD.
+
+    Once memory use across all segments passes ``offload_threshold`` (a share
+    of their total), Mooncake moves objects to the SSD of the process owning
+    them, under its own subdirectory of ``path`` (node-local, absolute).
+    Offload runs in every segment owner: the storage units when they are on,
+    otherwise every client with a segment (see
+    ``nemo_rl.data_plane.adapters.mooncake_ssd_offload``).
+    Size ``path`` for about (segment owners on the node) x (peak data
+    offloaded at once): owners delete the files of cleared keys every 30 s.
+    Operation, cleanup and the full-disk data-loss risk are described under
+    "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "MooncakeSsdOffloadConfig":
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.mooncake_cpu.ssd_offload.enabled=true requires "
+                "data_plane.mooncake_cpu.ssd_offload.path to be an absolute "
+                f"node-local SSD directory, got {self.path!r}."
+            )
+        return self
+
+
 class MooncakeCpuConfig(BaseModel, extra="allow"):
     """Sizing and RDMA knobs for ``backend="mooncake_cpu"``. Ignored otherwise.
 
@@ -147,6 +177,20 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     # Clusters whose nodes host units: "all" or a list of names (train,
     # inference, teacher:<name>).
     storage_unit_placement: list[str] | Literal["all"] = "all"
+    ssd_offload: MooncakeSsdOffloadConfig = Field(
+        default_factory=MooncakeSsdOffloadConfig
+    )
+
+    def owned_segment_size(self, segment_size: int | None) -> int:
+        """Bytes of Mooncake memory a process owns.
+
+        ``segment_size`` is what the process asked for (a storage unit's size,
+        or 0 for a client that owns nothing); ``None`` takes the controller's
+        default, which is 0 for every client once storage units are on.
+        """
+        if segment_size is not None:
+            return segment_size
+        return 0 if self.storage_unit_segment_size else self.global_segment_size
 
 
 class DataPlaneConfig(TypedDict):
