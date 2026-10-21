@@ -405,15 +405,10 @@ def setup(
             "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
         )
 
-    if value_config["megatron_cfg"]["enabled"]:
-        # Context parallelism for the Megatron value model requires sequence packing,
-        # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
-        if value_config["megatron_cfg"]["context_parallel_size"] > 1:
-            assert value_config["sequence_packing"]["enabled"], (
-                "Context parallelism (CP>1) for the Megatron PPO value model requires "
-                "value.sequence_packing.enabled=true."
-            )
-    else:
+    # Megatron validates CP against the actual provider during value-worker setup.
+    # Canonical Omni critics support dense CP inputs, while other providers still
+    # require packing. The driver cannot distinguish them before model setup.
+    if not value_config["megatron_cfg"]["enabled"]:
         # DTensor PPO value model currently doesn't support sequence packing and CP.
         assert value_config["dtensor_cfg"]["enabled"], (
             "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "

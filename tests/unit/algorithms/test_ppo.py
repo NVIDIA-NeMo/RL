@@ -2198,6 +2198,23 @@ def test_megatron_train_iters_matches_ppo_training_limit(
     assert config.value["megatron_cfg"]["train_iters"] == expected_value_train_iters
 
 
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("sequence_packing", [False, True])
+def test_ppo_setup_delegates_megatron_value_cp_validation_to_worker(
+    monkeypatch: pytest.MonkeyPatch, cp_size: int, sequence_packing: bool
+) -> None:
+    """The actual provider determines whether the critic needs packed CP inputs."""
+    config = _make_noncolocated_setup_config()
+    config.value["megatron_cfg"]["context_parallel_size"] = cp_size
+    config.value["sequence_packing"]["enabled"] = sequence_packing
+
+    *_, value_factory, _, _ = _run_noncolocated_setup(monkeypatch, config)
+
+    worker_config = value_factory.call_args.kwargs["config"]
+    assert worker_config["megatron_cfg"]["context_parallel_size"] == cp_size
+    assert worker_config["sequence_packing"]["enabled"] is sequence_packing
+
+
 def test_ppo_setup_rejects_a_warm_start_that_does_not_resolve(monkeypatch, tmp_path):
     """A fresh run's warm-start checkpoint must resolve, or the critic would silently start cold."""
     config = _make_noncolocated_setup_config()
