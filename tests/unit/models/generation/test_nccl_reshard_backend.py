@@ -817,6 +817,9 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(
     )
     ext.device = torch.device("cpu")
     ext.pp_comm_groups = None
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(speculative_config=None)
+    )
     ext._uses_unquantized_flashinfer_trtllm = lambda: True
     ext._validate_native_layerwise_refit = MagicMock()
     expected_map = HFToLocalParamMap()
@@ -825,6 +828,11 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(
     monkeypatch.setattr(
         "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
         lambda value: value,
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
     )
 
     class _FakeGroup:
