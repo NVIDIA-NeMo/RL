@@ -2139,8 +2139,17 @@ def _staged_routes(record: StagedCallRecord) -> list[int]:
     return decode_routed_experts(record.extras["routed_experts"]).flatten().tolist()
 
 
+def _route_pieces(routes: torch.Tensor) -> list[torch.Tensor]:
+    """Split routes into one piece per row, as vLLM appends them while decoding."""
+    return [routes[row : row + 1] for row in range(routes.shape[0])]
+
+
 class _EngineRoutes:
-    """vLLM's active per-request routes, as a generation cut reads them."""
+    """vLLM's active per-request route pieces, as a generation cut reads them.
+
+    ``by_request`` holds each request's routes so far; tests only ever extend
+    them, as vLLM only appends.
+    """
 
     def __init__(self) -> None:
         self.by_request: dict[str, torch.Tensor] = {}
@@ -2149,11 +2158,12 @@ class _EngineRoutes:
 
     def __call__(
         self, engine_request_id: str, *, timeout_s: float | None
-    ) -> torch.Tensor | None:
+    ) -> list[torch.Tensor] | None:
         self.reads.append(engine_request_id)
         if self.error is not None:
             raise self.error
-        return self.by_request.get(engine_request_id)
+        routes = self.by_request.get(engine_request_id)
+        return None if routes is None else _route_pieces(routes)
 
 
 def _router_replay_worker(
@@ -2365,7 +2375,7 @@ def test_router_replay_cut_reads_routes_once_after_freezing_its_tokens() -> None
         # has moved on: vLLM routed two more tokens than the cut froze.
         assert not state.lock.locked()
         assert state.frozen_cut == ("checkpoint-1", 2)
-        return _routes(1, 2, 3, 4, 5)
+        return _route_pieces(_routes(1, 2, 3, 4, 5))
 
     worker._snapshot_engine_routed_experts = read_while_decoding
 
@@ -2442,17 +2452,46 @@ def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_
     assert cut("checkpoint-2") == {"c1": "durable_prefix", "c2": "durable_prefix"}
 
 
-def test_vllm_route_chunks_with_mismatched_shapes_are_a_route_error() -> None:
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._http_engine_client = SimpleNamespace(
-        snapshot_routed_experts=lambda request_id, *, timeout_s: [
-            torch.zeros((2, 4, 2), dtype=torch.int16),
-            torch.zeros((1, 3, 2), dtype=torch.int16),
-        ]
-    )
+def test_router_replay_joins_only_the_route_pieces_vllm_added_since_the_last_cut() -> (
+    None
+):
+    worker, request, _ = _router_replay_call(_MemorySink())
+    state = worker._capture_calls[id(request)]
+    pieces = _route_pieces(_routes(1, 2, 3))
 
-    with pytest.raises(ValueError, match="must share shape"):
-        worker._snapshot_engine_routed_experts("request", timeout_s=1.0)
+    assert state.absorb_engine_route_pieces(pieces).flatten().tolist() == [1, 2, 3]
+    # Pieces already joined are not converted again: a changed old piece is
+    # ignored, and only the appended one is read.
+    pieces[0] = _routes(99)
+    pieces.append(_routes(4))
+    assert state.absorb_engine_route_pieces(pieces).flatten().tolist() == [1, 2, 3, 4]
+    assert state.engine_route_piece_count == 4
+
+
+@pytest.mark.parametrize(
+    ("pieces", "match"),
+    [
+        ([torch.zeros((2, 4, 2)), torch.zeros((1, 3, 2))], "dimension"),
+        ([torch.zeros(3)], r"\[rows, layers, topk\]"),
+        ([], "has not routed any token"),
+    ],
+    ids=["mismatched", "not_3d", "empty"],
+)
+def test_vllm_route_pieces_that_do_not_fit_are_a_route_error(pieces, match) -> None:
+    worker, request, _ = _router_replay_call(_MemorySink())
+    state = worker._capture_calls[id(request)]
+
+    with pytest.raises(ValueError, match=match):
+        state.absorb_engine_route_pieces(pieces)
+
+
+def test_vllm_route_list_that_shrank_is_a_route_error() -> None:
+    worker, request, _ = _router_replay_call(_MemorySink())
+    state = worker._capture_calls[id(request)]
+    state.absorb_engine_route_pieces(_route_pieces(_routes(1, 2, 3)))
+
+    with pytest.raises(ValueError, match="shrank"):
+        state.absorb_engine_route_pieces(_route_pieces(_routes(1, 2)))
 
 
 def test_router_replay_short_engine_routes_fail_the_cut_instead_of_padding() -> None:

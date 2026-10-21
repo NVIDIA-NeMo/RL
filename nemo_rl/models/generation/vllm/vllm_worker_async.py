@@ -1364,24 +1364,12 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _snapshot_engine_routed_experts(
         self, engine_request_id: str, *, timeout_s: float | None
-    ) -> torch.Tensor | None:
-        """Return an active request's full-sequence routes from vLLM."""
+    ) -> list[Any] | None:
+        """Return an active request's route pieces from vLLM, in order."""
         assert self._http_engine_client is not None  # setup_token_capture checks
-        chunks = self._http_engine_client.snapshot_routed_experts(
+        return self._http_engine_client.snapshot_routed_experts(
             engine_request_id, timeout_s=timeout_s
         )
-        if chunks is None:
-            return None
-        if not chunks:
-            raise ValueError("vLLM has not routed any token of the request yet")
-        tensors = [torch.as_tensor(chunk) for chunk in chunks]
-        model_shape = tuple(tensors[0].shape[1:])
-        if any(
-            tensor.dim() != 3 or tuple(tensor.shape[1:]) != model_shape
-            for tensor in tensors
-        ):
-            raise ValueError("vLLM route chunks must share shape [*, layers, topk]")
-        return torch.cat(tensors, dim=0)
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any

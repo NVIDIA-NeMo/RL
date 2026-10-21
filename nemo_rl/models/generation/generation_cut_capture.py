@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+import numpy as np
 import torch
 
 from nemo_rl.experience.route_assembly import (
@@ -100,6 +101,10 @@ class _RequestCaptureState:
     engine_request_id: str | None = None
     # Full-sequence routes from the request's final output.
     terminal_routed_experts: torch.Tensor | None = None
+    # The engine's route pieces joined so far, and how many pieces they cover:
+    # a cut converts only the pieces vLLM appended since. Cut-path only.
+    engine_routes: torch.Tensor | None = None
+    engine_route_piece_count: int = 0
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
     # generation-prefix row carries its tensor digests across recovery.
@@ -181,6 +186,42 @@ class _RequestCaptureState:
             self.generated_token_ids[:frozen],
             self.generated_logprobs[:frozen],
         )
+
+    def absorb_engine_route_pieces(self, pieces: list[Any]) -> torch.Tensor:
+        """Join the engine's route pieces, converting only the new ones.
+
+        ``pieces`` is the request's whole route list as vLLM holds it. vLLM
+        only appends to it, so the pieces already joined are skipped and the
+        new ones are joined in one call. Returns the request's full-sequence
+        routes.
+
+        Raises:
+            ValueError: the list shrank, or a piece is not
+                ``[rows, layers, topk]`` with this request's model dimensions.
+        """
+        if len(pieces) < self.engine_route_piece_count:
+            raise ValueError(
+                "vLLM's route list shrank: "
+                f"{len(pieces)} pieces, {self.engine_route_piece_count} already joined"
+            )
+        new = pieces[self.engine_route_piece_count :]
+        if new:
+            # One concatenate instead of one conversion per piece; it raises
+            # ValueError if the pieces' dimensions disagree.
+            joined = torch.from_numpy(np.concatenate([np.asarray(p) for p in new]))
+            if joined.dim() != 3 or joined.shape[1] < 1 or joined.shape[2] < 1:
+                raise ValueError("vLLM route pieces must be [rows, layers, topk]")
+            if self.engine_routes is not None:
+                if tuple(joined.shape[1:]) != tuple(self.engine_routes.shape[1:]):
+                    raise ValueError("vLLM route pieces changed model dimensions")
+                joined = torch.cat(
+                    (self.engine_routes, joined.to(self.engine_routes.dtype))
+                )
+            self.engine_routes = joined
+            self.engine_route_piece_count = len(pieces)
+        if self.engine_routes is None:
+            raise ValueError("vLLM has not routed any token of the request yet")
+        return self.engine_routes
 
     def frozen_cut_routed_experts(
         self, engine_routed_experts: Any | None
@@ -402,8 +443,8 @@ class GenerationCutCaptureMixin:
 
     def _snapshot_engine_routed_experts(
         self, engine_request_id: str, *, timeout_s: float | None
-    ) -> Any | None:
-        """Return an active request's full-sequence routes from the engine.
+    ) -> list[Any] | None:
+        """Return an active request's route pieces from the engine, in order.
 
         ``None`` once the request has left the engine. Backends that serve
         router replay override this.
@@ -477,10 +518,10 @@ class GenerationCutCaptureMixin:
             raise RuntimeError("generation-cut continuation has no staged chunks")
         return chunks
 
-    def _generation_cut_route_extras(
+    def _generation_cut_routes(
         self, chunks: list[Any], snapshots: list[Any]
-    ) -> tuple[dict[str, Any] | None, torch.Tensor | None]:
-        """Verify and join the route fragments carried by cut chunks.
+    ) -> torch.Tensor | None:
+        """Verify each cut chunk's route fragment against its digest and join them.
 
         The first chunk stores a normal full, delta-aligned route tensor whose
         last row is the unused final-position placeholder. Every later chunk
@@ -493,7 +534,7 @@ class GenerationCutCaptureMixin:
                 raise RuntimeError(
                     "generation-cut checkpoint has no router-replay payload"
                 )
-            return None, None
+            return None
         if any(fragment is None for fragment in fragments):
             raise RuntimeError("generation-cut route fragments are incomplete")
 
@@ -534,7 +575,7 @@ class GenerationCutCaptureMixin:
             raise RuntimeError(
                 "rebuilt generation-cut routes do not match cumulative token delta"
             )
-        return {"routed_experts": encode_routed_experts(routes)}, routes
+        return routes
 
     def _rebuild_generation_cut_snapshot(
         self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
@@ -600,14 +641,11 @@ class GenerationCutCaptureMixin:
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
         weight_version = weight_versions[0]
-        route_extras, routed_experts = self._generation_cut_route_extras(
-            chunks, snapshots
-        )
-        extras = (
-            call_extras
-            if route_extras is None
-            else {**(call_extras or {}), **route_extras}
-        )
+        # Routes are checked per chunk here and stay out of the prefix digest.
+        # With them popped, a text call's first-chunk extras read back as {};
+        # the cut digested no extras at all, so match it.
+        routed_experts = self._generation_cut_routes(chunks, snapshots)
+        extras = call_extras or None
         extras_digest = compute_extras_digest(extras)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
@@ -924,9 +962,13 @@ class GenerationCutCaptureMixin:
         if engine_request_id is None:
             raise ValueError("no vLLM output has named the request yet")
         timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
-        return self._snapshot_engine_routed_experts(
+        pieces = self._snapshot_engine_routed_experts(
             engine_request_id, timeout_s=timeout_s
         )
+        if pieces is None:
+            return None
+        # The cut owns the call's lifecycle lock, so only it touches the cache.
+        return state.absorb_engine_route_pieces(pieces)
 
     def _checkpoint_active_generation_cut(
         self,
@@ -1081,40 +1123,48 @@ class GenerationCutCaptureMixin:
 
             staged_key = None
             try:
-                cumulative_extras = self._generation_cut_record_payload(state)
-                if cumulative_routed_experts is not None:
-                    cumulative_extras = {
-                        **(cumulative_extras or {}),
-                        "routed_experts": encode_routed_experts(
-                            cumulative_routed_experts
-                        ),
-                    }
+                # The advertised prefix digest covers tokens and call extras,
+                # not routes: each chunk's own digest covers its routes, and a
+                # restore checks every chunk's routes against it. Hashing the
+                # whole prefix's routes on every cut would cost far more than
+                # the tokens.
+                call_extras = self._generation_cut_record_payload(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
-                    extras=cumulative_extras,
+                    extras=call_extras,
                 )
                 if chunk_token_ids:
-                    chunk_record = (
-                        cumulative_record
-                        if not state.generation_cut_staging_keys
-                        else capture.build_generation_chunk_record(
+                    chunk_route_extras = (
+                        None
+                        if chunk_routed_experts is None
+                        else {
+                            "routed_experts": encode_routed_experts(
+                                chunk_routed_experts
+                            )
+                        }
+                    )
+                    if state.generation_cut_staging_keys:
+                        chunk_record = capture.build_generation_chunk_record(
                             state.call,
                             generated_token_ids=chunk_token_ids,
                             generated_logprobs=chunk_logprobs,
-                            extras=(
-                                None
-                                if chunk_routed_experts is None
-                                else {
-                                    "routed_experts": encode_routed_experts(
-                                        chunk_routed_experts
-                                    )
-                                }
-                            ),
+                            extras=chunk_route_extras,
                         )
-                    )
+                    elif chunk_route_extras is None:
+                        chunk_record = cumulative_record
+                    else:
+                        # The first chunk is the whole prefix so far, with its
+                        # routes beside the call's extras.
+                        chunk_record = capture.build_prefix_record(
+                            state.call,
+                            prompt_token_ids=state.prompt_token_ids,
+                            generated_token_ids=generated_token_ids,
+                            generated_logprobs=generated_logprobs,
+                            extras={**(call_extras or {}), **chunk_route_extras},
+                        )
                     result = sink.stage_generation_prefix(
                         chunk_record,
                         checkpoint_id=checkpoint_id,
