@@ -21,20 +21,18 @@ from gdpo.generation import AutomodelGeneration
 from gdpo.setup import validate_gdpo_config
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import (
-    MasterConfig,
-    grpo_train,
-    setup,
-    shutdown_environments,
-)
+from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
 )
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, init_ray
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import setup_span, startup_span
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -82,65 +80,78 @@ def main() -> None:
     pprint.pprint(config)
 
     validate_gdpo_config(config.policy, config.loss_fn, config.grpo)
-    data_plane_cfg = config.data_plane or {}
-    if data_plane_cfg.get("enabled", False):
+    if config.data_plane is not None and config.data_plane["enabled"]:
         raise ValueError("GDPO does not support data_plane.enabled=true")
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    init_ray()
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    generation_cfg = config.policy["generation"]
-    assert generation_cfg is not None
-    config.policy["generation"] = configure_generation_config(generation_cfg, tokenizer)
-    dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-        tokenizer, config.data, config.env
-    )
-
-    (
-        policy,
-        policy_generation,
-        _nemo_gym,
-        _cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-        _teacher_worker_groups,
-        _alias_to_group_alias,
-    ) = setup(
-        config,
-        tokenizer,
-        dataset,
-        val_dataset,
-        policy_factory=_make_policy,
-        generation_factory=_make_generation,
-        generation_logprobs_available=False,
-    )
-    assert policy_generation is not None
-
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    init_telemetry_driver(config, algorithm="grpo")
     try:
-        with checkpointer:
-            grpo_train(
-                policy,
-                policy_generation,
-                dataloader,
-                val_dataloader,
-                tokenizer,
-                loss_fn,
-                task_to_env,
-                val_task_to_env,
-                logger,
-                checkpointer,
-                grpo_state,
-                master_config,
-            )
+        with startup_span():
+            init_ray()
+            with setup_span("tokenizer"):
+                tokenizer = get_tokenizer(config.policy["tokenizer"])
+                assert config.policy["generation"] is not None, (
+                    "A generation config is required for GDPO"
+                )
+                config.policy["generation"] = configure_generation_config(
+                    config.policy["generation"], tokenizer
+                )
+            with setup_span("data"):
+                dataset, val_dataset, task_to_env, val_task_to_env = (
+                    setup_response_data(tokenizer, config.data, config.env)
+                )
+            with setup_span("workers"):
+                (
+                    policy,
+                    policy_generation,
+                    _nemo_gym,
+                    _cluster,
+                    dataloader,
+                    val_dataloader,
+                    loss_fn,
+                    logger,
+                    checkpointer,
+                    grpo_state,
+                    master_config,
+                    _teacher_worker_groups,
+                    _alias_to_group_alias,
+                ) = setup(
+                    config,
+                    tokenizer,
+                    dataset,
+                    val_dataset,
+                    policy_factory=_make_policy,
+                    generation_factory=_make_generation,
+                    generation_logprobs_available=False,
+                )
+        assert policy_generation is not None
+
+        # grpo_train tears down its own environments once it starts.
+        trainer_owns_environment_shutdown = False
+        try:
+            with checkpointer:
+                trainer_owns_environment_shutdown = True
+                grpo_train(
+                    policy,
+                    policy_generation,
+                    dataloader,
+                    val_dataloader,
+                    tokenizer,
+                    loss_fn,
+                    task_to_env,
+                    val_task_to_env,
+                    logger,
+                    checkpointer,
+                    grpo_state,
+                    master_config,
+                )
+        finally:
+            if not trainer_owns_environment_shutdown:
+                shutdown_environments(task_to_env, val_task_to_env)
+            policy_generation.shutdown()
+            policy.shutdown()
     finally:
-        shutdown_environments(task_to_env, val_task_to_env)
-        policy_generation.shutdown()
-        policy.shutdown()
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

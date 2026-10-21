@@ -193,8 +193,8 @@ class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
         if seed is None:
             raise ValueError("GDPO generation requires an explicit rollout seed.")
 
-        batch_stop_strings = data.get("stop_strings", [])
-        if any(batch_stop_strings):
+        batch_stop_strings = data.get("stop_strings")
+        if batch_stop_strings is not None and any(batch_stop_strings):
             raise ValueError(
                 "Per-sample stop_strings are not supported by GDPO generation. "
                 "Use stop_token_ids instead."
@@ -202,9 +202,8 @@ class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
 
         generation_cfg = self.cfg["generation"]
         assert generation_cfg is not None
-        is_right_padded, error_msg = verify_right_padding(
-            data, pad_value=self.tokenizer.pad_token_id
-        )
+        pad_id = generation_cfg["_pad_token_id"]
+        is_right_padded, error_msg = verify_right_padding(data, pad_value=pad_id)
         if not is_right_padded:
             warnings.warn(
                 f"Input to the Automodel generation worker is not properly "
@@ -212,7 +211,6 @@ class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
             )
 
         device = torch.cuda.current_device()
-        pad_id = generation_cfg.get("_pad_token_id", self.tokenizer.pad_token_id)
         input_lengths = data["input_lengths"].to(device)
         generation_lengths = context_capped_generation_lengths(
             input_lengths,

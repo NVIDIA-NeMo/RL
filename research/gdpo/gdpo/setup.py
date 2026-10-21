@@ -20,13 +20,21 @@ quietly produce a wrong likelihood -- which is the failure mode that matters,
 because a subtly wrong ELBO still trains and still logs a plausible reward.
 """
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 from gdpo.config import DenoiseConfig, MaskedDiffusionConfig
 
+if TYPE_CHECKING:
+    # Type-only: importing the GRPO module would pull the full trainer into
+    # every Ray worker that resolves the diffusion config.
+    from nemo_rl.algorithms.grpo import GRPOConfig
+    from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+    from nemo_rl.models.generation.interfaces import GenerationConfig
+    from nemo_rl.models.policy import PolicyConfig
+
 
 def masked_diffusion_config_from_policy(
-    policy_cfg: Any,
+    policy_cfg: "PolicyConfig",
 ) -> Optional[MaskedDiffusionConfig]:
     """Resolves the dLLM config from a policy config, or None if not in use.
 
@@ -54,15 +62,17 @@ def masked_diffusion_config_from_policy(
     return cfg if cfg.enabled else None
 
 
-def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -> None:
+def validate_gdpo_config(
+    policy_cfg: "PolicyConfig",
+    loss_cfg: "ClippedPGLossConfig",
+    grpo_cfg: "GRPOConfig",
+) -> None:
     """Rejects dLLM configurations that would train against a wrong likelihood.
 
     Args:
         policy_cfg: The policy config section.
-        loss_cfg: The ``loss_fn`` config section (a ``ClippedPGLossConfig`` or
-            the equivalent mapping).
-        grpo_cfg: The ``grpo`` config section, when available. Only used to
-            reject async rollouts.
+        loss_cfg: The ``loss_fn`` config section.
+        grpo_cfg: The ``grpo`` config section.
 
     Raises:
         ValueError: If the dLLM policy is combined with a feature that assumes
@@ -73,8 +83,7 @@ def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
         return
 
     def _enabled(section: str) -> bool:
-        block = policy_cfg.get(section)
-        return bool(block) and bool(block.get("enabled"))
+        return section in policy_cfg and policy_cfg[section]["enabled"]
 
     # Each of these shards, reorders, or reuses tokens in a way that assumes a
     # causal, per-token factorization. None of them are meaningful for a
@@ -96,8 +105,10 @@ def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
                 f"masked positions, which {name} assumes away. Disable it."
             )
 
-    automodel_cfg = policy_cfg.get("automodel_cfg")
-    if automodel_cfg and automodel_cfg.get("context_parallel_size", 1) > 1:
+    if (
+        _enabled("automodel_cfg")
+        and policy_cfg["automodel_cfg"]["context_parallel_size"] > 1
+    ):
         raise ValueError(
             "policy.automodel_cfg.context_parallel_size > 1 is not supported with "
             "policy.masked_diffusion.enabled=true: context parallelism shards the sequence, "
@@ -108,36 +119,26 @@ def validate_gdpo_config(policy_cfg: Any, loss_cfg: Any, grpo_cfg: Any = None) -
     # nemo_rl.models.generation.interfaces.should_use_async_rollouts returns
     # False for it. Asking for async_grpo would therefore run plain synchronous
     # rollouts and silently ignore every async setting.
-    if grpo_cfg is not None:
-        async_cfg = getattr(grpo_cfg, "async_grpo", None)
-        if async_cfg is None and hasattr(grpo_cfg, "get"):
-            async_cfg = grpo_cfg.get("async_grpo")
-        enabled = getattr(async_cfg, "enabled", None)
-        if enabled is None and hasattr(async_cfg, "get"):
-            enabled = async_cfg.get("enabled")
-        if enabled:
-            raise ValueError(
-                "grpo.async_grpo.enabled is not supported with "
-                "policy.masked_diffusion.enabled=true: Automodel generation has no "
-                "async engine, so rollouts would silently run synchronously. "
-                "Set grpo.async_grpo.enabled=false."
-            )
-        seq_error_threshold = getattr(grpo_cfg, "seq_logprob_error_threshold", None)
-        if seq_error_threshold is None and hasattr(grpo_cfg, "get"):
-            seq_error_threshold = grpo_cfg.get("seq_logprob_error_threshold")
-        if seq_error_threshold is not None:
-            raise ValueError(
-                "grpo.seq_logprob_error_threshold is not supported with "
-                "policy.masked_diffusion.enabled=true: denoising does not expose generation-time "
-                "log probabilities to compare with policy ELBOs. Set it to null."
-            )
+    if grpo_cfg.async_grpo is not None and grpo_cfg.async_grpo.enabled:
+        raise ValueError(
+            "grpo.async_grpo.enabled is not supported with "
+            "policy.masked_diffusion.enabled=true: Automodel generation has no "
+            "async engine, so rollouts would silently run synchronously. "
+            "Set grpo.async_grpo.enabled=false."
+        )
+    if grpo_cfg.seq_logprob_error_threshold is not None:
+        raise ValueError(
+            "grpo.seq_logprob_error_threshold is not supported with "
+            "policy.masked_diffusion.enabled=true: denoising does not expose generation-time "
+            "log probabilities to compare with policy ELBOs. Set it to null."
+        )
 
     diffusion_cfg = masked_diffusion_config_from_policy(policy_cfg)
-    _validate_generation(policy_cfg.get("generation"), diffusion_cfg)
+    _validate_generation(policy_cfg.get("generation"))
     _validate_loss(loss_cfg, diffusion_cfg)
 
 
-def denoise_config_from_generation(generation_cfg: Any) -> DenoiseConfig:
+def denoise_config_from_generation(generation_cfg: "GenerationConfig") -> DenoiseConfig:
     """Validate and return the generation-side denoising configuration."""
     raw = generation_cfg.get("denoise_cfg")
     if raw is None:
@@ -145,12 +146,12 @@ def denoise_config_from_generation(generation_cfg: Any) -> DenoiseConfig:
     return raw if isinstance(raw, DenoiseConfig) else DenoiseConfig.model_validate(raw)
 
 
-def _validate_generation(generation_cfg: Any, diffusion_cfg: Any) -> None:
+def _validate_generation(generation_cfg: Optional["GenerationConfig"]) -> None:
     """Rejects rollout settings the denoising sampler cannot honor."""
     if generation_cfg is None:
         return
 
-    backend = generation_cfg.get("backend")
+    backend = generation_cfg["backend"]
     if backend != "automodel":
         raise ValueError(
             f"policy.generation.backend is '{backend}', but policy.masked_diffusion.enabled "
@@ -160,14 +161,14 @@ def _validate_generation(generation_cfg: Any, diffusion_cfg: Any) -> None:
             "Set policy.generation.backend='automodel'."
         )
 
-    if not generation_cfg.get("colocated", {}).get("enabled", True):
+    if not generation_cfg["colocated"]["enabled"]:
         raise ValueError(
             "policy.generation.colocated.enabled must be true with "
             "policy.generation.backend='automodel': rollouts run in the training "
             "workers, so there is no separate inference cluster to place."
         )
 
-    if generation_cfg.get("stop_strings"):
+    if generation_cfg["stop_strings"]:
         raise ValueError(
             "policy.generation.stop_strings is not supported with "
             "policy.generation.backend='automodel': iterative denoising stops on token "
@@ -176,8 +177,8 @@ def _validate_generation(generation_cfg: Any, diffusion_cfg: Any) -> None:
         )
 
     denoise_cfg = denoise_config_from_generation(generation_cfg)
-    max_new_tokens = generation_cfg.get("max_new_tokens")
-    if max_new_tokens is not None and max_new_tokens % denoise_cfg.block_length != 0:
+    max_new_tokens = generation_cfg["max_new_tokens"]
+    if max_new_tokens % denoise_cfg.block_length != 0:
         raise ValueError(
             f"policy.generation.max_new_tokens ({max_new_tokens}) must be a "
             f"multiple of policy.generation.denoise_cfg.block_length "
@@ -186,28 +187,22 @@ def _validate_generation(generation_cfg: Any, diffusion_cfg: Any) -> None:
         )
 
 
-def _validate_loss(loss_cfg: Any, diffusion_cfg: Any) -> None:
+def _validate_loss(
+    loss_cfg: "ClippedPGLossConfig", diffusion_cfg: MaskedDiffusionConfig
+) -> None:
     """Rejects loss settings the ELBO cannot be substituted into."""
-
-    def _get(key: str, default: Any) -> Any:
-        if hasattr(loss_cfg, key):
-            return getattr(loss_cfg, key)
-        if hasattr(loss_cfg, "get"):
-            return loss_cfg.get(key, default)
-        return default
-
     # The ELBO is a *sequence* likelihood: only its masked sum is meaningful, so
     # only a sequence-level ratio is well defined. A token-level ratio would
     # treat each position's ELBO contribution as its own likelihood, which it is
     # not -- positions not masked at a given quadrature point contribute zero.
-    if not _get("sequence_level_importance_ratios", False):
+    if not loss_cfg.sequence_level_importance_ratios:
         raise ValueError(
             "policy.masked_diffusion.enabled=true requires "
             "loss_fn.sequence_level_importance_ratios=true: the ELBO is a "
             "sequence-level likelihood, so per-token importance ratios are not "
             "well defined for it."
         )
-    if _get("token_level_loss", True):
+    if loss_cfg.token_level_loss:
         raise ValueError(
             "policy.masked_diffusion.enabled=true requires loss_fn.token_level_loss=false, "
             "to match the sequence-level ratio (the GSPO-style objective GDPO "
@@ -216,19 +211,19 @@ def _validate_loss(loss_cfg: Any, diffusion_cfg: Any) -> None:
     # The correction divides by the generation-time token logprobs, which
     # iterative denoising does not produce. They are zero-filled, so leaving
     # this on would silently apply exp(prev - 0) as an importance weight.
-    if _get("use_importance_sampling_correction", False):
+    if loss_cfg.use_importance_sampling_correction:
         raise ValueError(
             "loss_fn.use_importance_sampling_correction=true is not supported "
             "with policy.masked_diffusion.enabled=true: denoising rollouts produce no "
             "per-token sampling log probabilities to correct against."
         )
-    if _get("reference_policy_kl_penalty", 0.0) != 0:
+    if loss_cfg.reference_policy_kl_penalty != 0:
         raise ValueError(
             "loss_fn.reference_policy_kl_penalty must be 0 with "
             "policy.masked_diffusion.enabled=true: the existing KL estimator expects token "
             "log probabilities, not per-position ELBO contributions."
         )
-    if _get("use_kl_in_reward", False):
+    if loss_cfg.use_kl_in_reward:
         raise ValueError(
             "loss_fn.use_kl_in_reward is not supported with "
             "policy.masked_diffusion.enabled=true: reward KL requires token log probabilities, "
@@ -238,7 +233,7 @@ def _validate_loss(loss_cfg: Any, diffusion_cfg: Any) -> None:
     # loss decides whether to drop a column off every other per-token tensor to
     # match. Disagreement is an off-by-one at every position that still runs, so
     # require them to be stated consistently rather than inferring one silently.
-    position_aligned = _get("position_aligned_logprobs", False)
+    position_aligned = loss_cfg.position_aligned_logprobs
     if position_aligned == diffusion_cfg.shift_targets:
         raise ValueError(
             f"loss_fn.position_aligned_logprobs={position_aligned} is "

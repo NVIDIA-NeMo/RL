@@ -26,12 +26,28 @@ from gdpo import (
 )
 from pydantic import ValidationError
 
+from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+
 VALID_LOSS = {
     "sequence_level_importance_ratios": True,
     "token_level_loss": False,
     "use_importance_sampling_correction": False,
+    "reference_policy_kl_penalty": 0.0,
     "position_aligned_logprobs": True,
 }
+
+
+def make_loss(**overrides):
+    return ClippedPGLossConfig(**{**VALID_LOSS, **overrides})
+
+
+def validate(policy, loss=None, grpo=None):
+    validate_gdpo_config(
+        policy,
+        make_loss() if loss is None else loss,
+        GRPOConfig() if grpo is None else grpo,
+    )
 
 
 def make_policy(dllm=True, **overrides):
@@ -81,13 +97,13 @@ def test_already_validated_config_passes_through():
 
 
 def test_valid_config_passes_validation():
-    validate_gdpo_config(make_policy(), VALID_LOSS)
+    validate(make_policy())
 
 
 def test_non_dllm_policy_is_not_constrained():
     """None of the dLLM restrictions apply to an ordinary autoregressive run."""
     policy = make_policy(dllm=False, sequence_packing={"enabled": True})
-    validate_gdpo_config(policy, {"token_level_loss": True})
+    validate(policy, make_loss(token_level_loss=True))
 
 
 @pytest.mark.parametrize(
@@ -96,30 +112,30 @@ def test_non_dllm_policy_is_not_constrained():
 def test_causal_only_features_are_rejected(section):
     policy = make_policy(**{section: {"enabled": True}})
     with pytest.raises(ValueError, match=f"policy.{section} is not supported"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_context_parallelism_is_rejected():
     policy = make_policy(automodel_cfg={"enabled": True, "context_parallel_size": 2})
     with pytest.raises(ValueError, match="context_parallel_size"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_context_parallel_size_one_is_allowed():
     policy = make_policy(automodel_cfg={"enabled": True, "context_parallel_size": 1})
-    validate_gdpo_config(policy, VALID_LOSS)
+    validate(policy)
 
 
 def test_token_level_ratios_are_rejected():
-    loss = dict(VALID_LOSS, sequence_level_importance_ratios=False)
+    loss = make_loss(sequence_level_importance_ratios=False)
     with pytest.raises(ValueError, match="sequence_level_importance_ratios=true"):
-        validate_gdpo_config(make_policy(), loss)
+        validate(make_policy(), loss)
 
 
 def test_token_level_loss_is_rejected():
-    loss = dict(VALID_LOSS, token_level_loss=True)
+    loss = make_loss(token_level_loss=True)
     with pytest.raises(ValueError, match="token_level_loss=false"):
-        validate_gdpo_config(make_policy(), loss)
+        validate(make_policy(), loss)
 
 
 @pytest.mark.parametrize(
@@ -135,28 +151,16 @@ def test_token_level_loss_is_rejected():
     ],
 )
 def test_token_logprob_dependent_loss_options_are_rejected(setting, value, error):
-    loss = dict(VALID_LOSS, **{setting: value})
+    loss = make_loss(**{setting: value})
     with pytest.raises(ValueError, match=error):
-        validate_gdpo_config(make_policy(), loss)
-
-
-def test_loss_config_may_be_an_object_not_a_mapping():
-    """loss_fn arrives as a ClippedPGLossConfig BaseModel in the real pipeline."""
-
-    class LossObj:
-        sequence_level_importance_ratios = True
-        token_level_loss = False
-        use_importance_sampling_correction = False
-        position_aligned_logprobs = True
-
-    validate_gdpo_config(make_policy(), LossObj())
+        validate(make_policy(), loss)
 
 
 def test_loss_must_not_shift_when_policy_is_position_aligned():
     """The default loss shift is an off-by-one against dLLM logprobs."""
-    loss = dict(VALID_LOSS, position_aligned_logprobs=False)
+    loss = make_loss(position_aligned_logprobs=False)
     with pytest.raises(ValueError, match="position_aligned_logprobs"):
-        validate_gdpo_config(make_policy(), loss)
+        validate(make_policy(), loss)
 
 
 def test_loss_must_shift_when_policy_emits_next_token_logprobs():
@@ -164,19 +168,20 @@ def test_loss_must_shift_when_policy_emits_next_token_logprobs():
     policy = make_policy()
     policy["masked_diffusion"]["shift_targets"] = True
     with pytest.raises(ValueError, match="position_aligned_logprobs"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_consistent_shifting_pair_is_allowed():
     policy = make_policy()
     policy["masked_diffusion"]["shift_targets"] = True
-    validate_gdpo_config(policy, dict(VALID_LOSS, position_aligned_logprobs=False))
+    validate(policy, make_loss(position_aligned_logprobs=False))
 
 
 VALID_GENERATION = {
     "backend": "automodel",
     "colocated": {"enabled": True},
     "max_new_tokens": 128,
+    "stop_strings": None,
     "denoise_cfg": {"type": "block", "block_length": 32},
 }
 
@@ -188,93 +193,69 @@ def make_generation(**overrides):
 
 
 def test_a_dllm_generation_block_passes_validation():
-    validate_gdpo_config(make_policy(generation=make_generation()), VALID_LOSS)
+    validate(make_policy(generation=make_generation()))
 
 
 def test_an_absent_generation_block_is_not_validated():
     """Logprob-only entrypoints (SFT, evaluation) configure no rollouts."""
     policy = make_policy()
     policy["generation"] = None
-    validate_gdpo_config(policy, VALID_LOSS)
+    validate(policy)
 
 
 @pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm", "megatron"])
 def test_autoregressive_backends_are_rejected(backend):
     policy = make_policy(generation=make_generation(backend=backend))
     with pytest.raises(ValueError, match="have no KV cache"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_non_colocated_generation_is_rejected():
     policy = make_policy(generation=make_generation())
     policy["generation"]["colocated"]["enabled"] = False
     with pytest.raises(ValueError, match="colocated.enabled must be true"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_max_new_tokens_must_be_a_multiple_of_the_block_length():
     policy = make_policy(generation=make_generation(max_new_tokens=100))
     with pytest.raises(ValueError, match="multiple of policy.generation.denoise_cfg"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_stop_strings_are_rejected():
     policy = make_policy(generation=make_generation(stop_strings=["</answer>"]))
     with pytest.raises(ValueError, match="stop_strings is not supported"):
-        validate_gdpo_config(policy, VALID_LOSS)
+        validate(policy)
 
 
 def test_a_matching_custom_block_length_is_accepted():
     policy = make_policy(generation=make_generation(max_new_tokens=96))
     policy["generation"]["denoise_cfg"]["block_length"] = 48
-    validate_gdpo_config(policy, VALID_LOSS)
+    validate(policy)
 
 
 def test_generation_is_not_validated_when_dllm_is_disabled():
     """A non-dLLM policy keeps whatever generation backend it configured."""
     policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
-    validate_gdpo_config(policy, VALID_LOSS)
-
-
-class _Async:
-    def __init__(self, enabled):
-        self.enabled = enabled
-
-
-class _Grpo:
-    def __init__(self, enabled, seq_logprob_error_threshold=None):
-        self.async_grpo = _Async(enabled)
-        self.seq_logprob_error_threshold = seq_logprob_error_threshold
+    validate(policy)
 
 
 def test_async_grpo_is_rejected_for_dllm():
     """Async rollouts would silently fall back to synchronous ones."""
     policy = make_policy(generation=make_generation())
     with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
-        validate_gdpo_config(policy, VALID_LOSS, _Grpo(True))
+        validate(policy, grpo=GRPOConfig(async_grpo={"enabled": True}))
 
 
 def test_sync_grpo_is_accepted_for_dllm():
-    validate_gdpo_config(
-        make_policy(generation=make_generation()), VALID_LOSS, _Grpo(False)
-    )
+    validate(make_policy(generation=make_generation()), grpo=GRPOConfig())
 
 
 def test_seq_logprob_error_threshold_is_rejected_for_dllm():
     policy = make_policy(generation=make_generation())
     with pytest.raises(ValueError, match="seq_logprob_error_threshold"):
-        validate_gdpo_config(policy, VALID_LOSS, _Grpo(False, 1.05))
-
-
-def test_async_grpo_as_a_plain_mapping_is_also_rejected():
-    policy = make_policy(generation=make_generation())
-    with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
-        validate_gdpo_config(policy, VALID_LOSS, {"async_grpo": {"enabled": True}})
-
-
-def test_an_omitted_grpo_config_skips_the_async_check():
-    """Callers without a grpo section (SFT, eval) must still validate."""
-    validate_gdpo_config(make_policy(generation=make_generation()), VALID_LOSS)
+        validate(policy, grpo=GRPOConfig(seq_logprob_error_threshold=1.05))
 
 
 @pytest.mark.parametrize(
@@ -297,4 +278,4 @@ def test_invalid_diffusion_config_values_are_rejected(model, field, value):
 
 def test_async_grpo_is_ignored_when_dllm_is_disabled():
     policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
-    validate_gdpo_config(policy, VALID_LOSS, _Grpo(True))
+    validate(policy, grpo=GRPOConfig(async_grpo={"enabled": True}))
