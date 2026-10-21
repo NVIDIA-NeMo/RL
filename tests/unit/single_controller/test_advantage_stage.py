@@ -43,6 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -53,7 +54,6 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 def _config(**overrides) -> AdvantageStageConfig:
@@ -626,7 +626,7 @@ def _controller(
     ctrl._advantage_computer = AdvantageComputer(
         store, config=config, advantage_estimator=estimator
     )
-    ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
+    ctrl._train_data_dump = JsonDebugWriter(dump_dir) if dump_dir is not None else None
     ctrl._timer = Timer()
     ctrl._train_data_dump_rows = 0
     ctrl._train_steps = 0

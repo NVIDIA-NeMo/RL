@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -48,6 +48,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.debug_writer import (
+    DebugWriterConfig,
+    make_debug_writer,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -61,7 +65,6 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -101,6 +104,8 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # Which writer the dump uses; ignored while train_data_dump_dir is None.
+    debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -155,6 +160,7 @@ class AdvantageStageConfig:
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
+            debug_writer=master_config.async_rl.debug_writer,
         )
 
     def input_fields(self) -> list[str]:
@@ -315,7 +321,9 @@ class AdvantageComputer:
         # One writer per shard: the pool runs these concurrently, so they must
         # not share a file. The controller merges them on publish.
         self._train_data_dump = (
-            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+            make_debug_writer(
+                config.debug_writer, config.train_data_dump_dir, shard_id=shard_id
+            )
             if config.train_data_dump_dir is not None
             else None
         )
