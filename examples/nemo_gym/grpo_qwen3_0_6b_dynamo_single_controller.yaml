@@ -1,7 +1,8 @@
 # GRPO on the NeMo-Gym workplace-assistant environment via the SingleController path,
 # using managed Dynamo generation.
-# Gym rollouts go through Dynamo's token wrapper, which renders each prompt with the
-# policy tokenizer and forwards it to the Dynamo frontend as token input.
+# Gym's policy model talks to the Dynamo frontend directly; NeMo RL's engine host in
+# each dynamo.vllm process applies the rollout checks and, with token capture, stages
+# each call's tokens to TransferQueue from the engine.
 # Smoke-test scale; Qwen3-0.6B on one node with 2 GPUs (1 training + 1 Dynamo engine).
 # The CI-run variant, tests/functional/grpo_dynamo_gym_single_controller.sh, loads this
 # file and overrides only test scale, data paths, and logging; it mirrors the Megatron
@@ -67,13 +68,15 @@ policy:
         tokenizer_cache: false
         tokenizer_cache_bytes: 52428800
         router_mode: kv
+        # Token capture keys sessions by rollout; keep each on the engine caching it.
+        session_affinity_ttl_secs: 600
         extra_cli_args: []
     vllm_cfg:
       tensor_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.6
       enforce_eager: true
-      # NeMo-Gym reaches Dynamo through the token wrapper this starts.
+      # Publishes the Dynamo frontend URL to NeMo-Gym.
       expose_http_server: true
       # Read by the rollout telemetry pump, which this smoke does not enable.
       enable_vllm_metrics_logger: false

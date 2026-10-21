@@ -247,6 +247,24 @@ class DynamoRefitChannel:
             for worker in self._validated_workers()
         ]
 
+    def post_to_every_engine(self, route: str, payload: dict[str, Any]) -> None:
+        """POST one engine route to every engine and wait until all of them succeed.
+
+        Uses the immutable endpoints, like :meth:`resume`, so a client copy
+        reaches the same fleet.
+        """
+        ray.get(
+            [
+                _post_worker_route.remote(
+                    system_url=worker.system_url,
+                    route=route,
+                    payload=payload,
+                    timeout_s=self._init_timeout_s,
+                )
+                for worker in self._workers
+            ]
+        )
+
     def full_fleet_membership(self, train_world_size: int) -> RefitMembership:
         """Every engine, each a DP shard of TP x PP ranks after the trainers."""
         return desired_membership(

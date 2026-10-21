@@ -54,10 +54,13 @@ A Dynamo upgrade must update and reverify these coupled locations:
   posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
   with the request body as keyword arguments
   (`test_every_engine_rpc_the_driver_sends_binds_to_the_extension`)
-- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
-  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
-  reverify them against real Dynamo output because unit tests validate only the
-  expected local response shape
+- `nemo_rl/models/generation/dynamo/engine_main.py`: the `dynamo.vllm` names it
+  rebinds (`worker_factory.DecodeWorkerHandler`, `main.WorkerFactory`,
+  `main.publish_vllm_token_budget`), the `generate(request, context)` signature,
+  and the request and final-chunk layout `engine_host.py` reads
+  (`token_ids`, `stop_conditions`, `annotations`, `engine_data`). The module
+  fails at startup if a name moves; reverify the layouts against real Dynamo
+  output, because unit tests use a stand-in for Dynamo's handler
 - `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
   `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
   jail removes `nvext.engine_data`; remove this setting only after an upgraded
@@ -176,7 +179,7 @@ own communicators and raise instead of hanging.
 The fixed port layout is:
 
 - `1313-1399`: driver-local etcd and NATS control plane
-- `3000-3999`: frontend and token-wrapper HTTP endpoints
+- `3000-3999`: frontend HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
 
@@ -228,24 +231,44 @@ requests recompute their KV on the new weights; set it to false to keep both.
 
 NeMo-Gym rollouts work too: start from
 [`examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml`](../../examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml).
-Gym reaches Dynamo through the token wrapper that `vllm_cfg.expose_http_server`
-starts. The wrapper renders each prompt with the policy tokenizer and forwards it
-to the frontend as token input. Like NeMo RL's vLLM server, it also does three things:
+Gym's policy model talks to the Dynamo frontend directly, at the URL
+`vllm_cfg.expose_http_server` publishes, and NeMo RL sets Gym's Dynamo dialect
+for it (`vllm_model.dynamo_frontend`): token data travels in `nvext`, and the
+frontend renders each prompt with `policy.tokenizer.chat_template_kwargs`.
 
-- caps a request's output tokens so the prompt and output fit `max_model_len`, and
-  answers an overflowing prompt with the 400 Gym treats as a context-length refusal;
+Each engine runs `dynamo.vllm` through NeMo RL's entry module
+(`nemo_rl/models/generation/dynamo/engine_main.py`), which installs NeMo RL's
+engine host in the process that owns vLLM's AsyncLLM. Like NeMo RL's vLLM
+server, it handles every Gym request:
+
+- caps the request's output tokens so the prompt and output fit `max_model_len`,
+  and answers an overflowing prompt with the 400 Gym treats as a context-length
+  refusal;
 - rejects requests whose sampling matches neither the train nor the validation
-  profile;
-- aborts the engine request when Gym drops the call.
+  profile.
+
+The frontend aborts the engine request when Gym drops the call.
+
+With `token_capture.enabled`, the engine host also does exact-token capture with
+the native backend's own code (`TokenCaptureHostMixin`). Gym's `dynamo_worker`
+capture handler sends each call's admission as an `nvext` annotation. The engine
+then splices the staged prefix of a multi-turn call into the frontend's render,
+stages the finished call's tokens and logprobs to TransferQueue from its own
+process, and returns only the commit coordinates. The splice boundary is the
+staged prefix's EOS count, which matches the render because Gym admits a prefix
+only for an unedited history. Set `dynamo_cfg.frontend_args.session_affinity_ttl_secs`
+so each rollout stays on the engine caching its prefix: the KV router matches
+the frontend's render, not the spliced prompt.
 
 Current limits on this path:
 
 - Text policies only, and no MoE router replay: `policy.is_vlm` and
   `policy.router_replay.enabled` must be false.
-- NeMo-Gym runs without token capture: `token_capture.enabled` must stay false, so
-  rollout snapshots and non-default `rollout_recovery` policies are unavailable.
+- Token capture is text-only, and Gym requests may not carry `stop` strings: the
+  frontend matches them itself and drops the final chunk that carries the
+  engine's token data.
 - `async_rl.generation_router.enabled` must stay false, because the Dynamo
-  frontend routes the whole fleet behind the wrapper's one URL.
+  frontend routes the whole fleet behind one URL.
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.

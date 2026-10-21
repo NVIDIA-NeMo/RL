@@ -446,9 +446,11 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
+    if generation_backend == "dynamo":
+        return "dynamo_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'dynamo'; got {generation_backend!r}"
     )
 
 
@@ -1871,7 +1873,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
 
     # Enable the backend's OpenAI-compatible server.
     if generation_config["backend"] in ("vllm", "dynamo"):
-        # Dynamo uses these flags to expose its token wrapper to Gym.
+        # Dynamo uses expose_http_server to publish its frontend URL to Gym.
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -1894,6 +1896,21 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    if generation_config["backend"] == "dynamo":
+        # Gym's policy model talks to the Dynamo frontend directly. The frontend
+        # renders the chat template, so it needs the policy's template kwargs on
+        # each request, and token data travels in nvext (Gym's Dynamo dialect).
+        vllm_model = (
+            config.env.setdefault("nemo_gym", {})
+            .setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        vllm_model["dynamo_frontend"] = True
+        chat_template_kwargs = config.policy["tokenizer"].get("chat_template_kwargs")
+        if chat_template_kwargs:
+            vllm_model.setdefault("chat_template_kwargs", dict(chat_template_kwargs))
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

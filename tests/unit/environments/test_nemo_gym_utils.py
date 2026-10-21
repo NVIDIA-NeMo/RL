@@ -53,11 +53,33 @@ def test_setup_nemo_gym_config_enables_http_server(backend: str) -> None:
         "stop_strings": ["stop"],
         "stop_token_ids": [1],
     }
-    config = SimpleNamespace(policy={"generation": generation})
+    template_kwargs = {"enable_thinking": False}
+    config = SimpleNamespace(
+        policy={
+            "generation": generation,
+            "tokenizer": {"chat_template_kwargs": template_kwargs},
+        },
+        env={},
+    )
 
     setup_nemo_gym_config(config, tokenizer=None)
 
     is_vllm_like = backend in ("vllm", "dynamo")
+    # Gym's policy model calls Dynamo's frontend directly: nvext token transport,
+    # and the frontend renders with the policy's template kwargs.
+    dynamo_dialect = {
+        "nemo_gym": {
+            "policy_model": {
+                "responses_api_models": {
+                    "vllm_model": {
+                        "dynamo_frontend": True,
+                        "chat_template_kwargs": template_kwargs,
+                    }
+                }
+            }
+        }
+    }
+    assert config.env == (dynamo_dialect if backend == "dynamo" else {})
     assert generation["vllm_cfg"] == {
         "async_engine": is_vllm_like,
         "expose_http_server": is_vllm_like,

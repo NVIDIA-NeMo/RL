@@ -363,7 +363,7 @@ def test_build_generation_passes_sglang_config():
 
 
 def test_build_generation_constructs_dynamo_from_normalized_config():
-    """DynamoGeneration receives the validated config and the token wrapper's tokenizer."""
+    """DynamoGeneration receives the validated config."""
     master_config = _make_master_config(backend="dynamo")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
     inference_cluster = MagicMock(name="inference_cluster")
@@ -379,8 +379,6 @@ def test_build_generation_constructs_dynamo_from_normalized_config():
     mock_dynamo.assert_called_once_with(
         cluster=inference_cluster,
         config=master_config.policy["generation"],
-        tokenizer=tokenizer,
-        tokenizer_config=master_config.policy["tokenizer"],
     )
     assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
     generation.finish_generation.assert_called_once_with()
@@ -2242,17 +2240,15 @@ class TestSetup:
         assert train_iters_at_build == [8]
         fake_policy.shutdown.assert_not_called()
 
-    def test_nemo_gym_on_dynamo_spins_up_on_the_token_wrapper_url(
-        self, patched_factories
-    ):
-        """Gym waits for managed Dynamo's token wrapper, which checks no bearer token."""
+    def test_nemo_gym_on_dynamo_spins_up_on_the_frontend_url(self, patched_factories):
+        """Gym waits for managed Dynamo's frontend, which checks no bearer token."""
         mc = _make_master_config(backend="dynamo")
         mc.policy["generation"]["model_name"] = "test-model"
         mc.policy["generation"]["stop_strings"] = None
         mc.policy["generation"]["stop_token_ids"] = None
         mc.policy["generation"]["top_k"] = None
         fake_gen = patched_factories["fake_gen"]
-        fake_gen.dp_openai_server_base_urls = ["http://wrapper:5000/v1"]
+        fake_gen.dp_openai_server_base_urls = ["http://frontend:3000/v1"]
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
             None,
@@ -2272,10 +2268,8 @@ class TestSetup:
             validate.return_value.model_dump.return_value = mc.policy["generation"]
             actor_args, _ = setup_single_controller(mc, tokenizer)
 
-        _, build_kwargs = patched_factories["_build_generation"].call_args
-        assert build_kwargs["tokenizer"] is tokenizer
         _, spinup_kwargs = mock_spinup.call_args
-        assert spinup_kwargs["base_urls"] == ["http://wrapper:5000/v1"]
+        assert spinup_kwargs["base_urls"] == ["http://frontend:3000/v1"]
         assert spinup_kwargs["policy_api_key"] is None
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
 

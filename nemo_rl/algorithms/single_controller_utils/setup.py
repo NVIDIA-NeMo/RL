@@ -603,8 +603,7 @@ def _build_generation(
         defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
         reserved_http_server_ports: OpenAI server ports pre-published to NeMo-Gym,
             keyed by the distributed rank that adopts each one (Megatron only).
-        tokenizer: Tokenizer for the dedicated Megatron inference policy, or for
-            managed Dynamo's NeMo-Gym token wrapper (Megatron and Dynamo only).
+        tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
         processor: Optional AutoProcessor for VLM paths (Megatron only).
 
     Returns:
@@ -665,13 +664,10 @@ def _build_generation(
             "defer_model_load is only supported for the vllm backend"
         )
         # setup_single_controller validated and normalized this config through
-        # DynamoConfig before allocating clusters. The tokenizer renders NeMo-Gym
-        # prompts in the token wrapper that expose_http_server starts.
+        # DynamoConfig before allocating clusters.
         gen = DynamoGeneration(
             cluster=inference_cluster,
             config=cast(dict[str, Any], generation_config),
-            tokenizer=tokenizer,
-            tokenizer_config=cast(dict[str, Any], master_config.policy["tokenizer"]),
         )
 
     else:
@@ -831,8 +827,8 @@ def _build_then_publish_base_urls(
 ) -> tuple[Any, float]:
     """Build a generation backend, then hand its OpenAI base URLs to a waiting task.
 
-    Managed Dynamo starts its engines and NeMo-Gym token wrapper in one build, so its
-    URL exists only afterwards; the Gym spinup waits on ``base_urls`` instead.
+    Managed Dynamo starts its engines and frontend in one build, so its URL exists
+    only afterwards; the Gym spinup waits on ``base_urls`` instead.
     """
     try:
         generation, build_time = build()
@@ -1356,9 +1352,9 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] not in ("vllm", "megatron", "dynamo"):
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports vllm, megatron or dynamo; got "
                 f"{generation_config['backend']!r}"
             )
         if (
@@ -1722,7 +1718,7 @@ def setup_single_controller(
     megatron_port_holders: list[Any] = []
     reserved_http_server_ports = None
     weight_synchronizer: Optional[WeightSynchronizer] = None
-    # Set when NeMo-Gym waits on managed Dynamo's token wrapper URL.
+    # Set when NeMo-Gym waits on managed Dynamo's frontend URL.
     dynamo_gym_base_urls: Optional[Future[list[str]]] = None
     if megatron_backend:
         generation_config["model_name"] = master_config.policy["model_name"]
@@ -1879,7 +1875,7 @@ def setup_single_controller(
             )
             gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
         elif generation_config["backend"] == "dynamo":
-            # Managed Dynamo cannot defer its load: the token wrapper's URL exists once
+            # Managed Dynamo cannot defer its load: the frontend's URL exists once
             # the managed runtime is up. The generation task publishes it and the Gym
             # task waits on it, so the trainer still builds alongside both.
             dynamo_gym_base_urls = Future()
@@ -1894,7 +1890,7 @@ def setup_single_controller(
             gym_base_urls = generation.dp_openai_server_base_urls
         if dynamo_gym_base_urls is not None:
             # No router: the Dynamo frontend routes the whole fleet behind one URL
-            # (validate_settings rejects generation_router), and the token wrapper
+            # (validate_settings rejects generation_router), and the frontend
             # checks no bearer token.
             build_tasks["nemo_gym"] = partial(
                 _spinup_gym_once_published,

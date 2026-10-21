@@ -15,7 +15,8 @@
 
 # Two-GPU SingleController + NeMo-Gym run with managed Dynamo generation.
 # Mirrors grpo_megatron_generation_gym_single_controller.sh with the generation
-# backend swapped to managed Dynamo, whose token wrapper serves Gym's requests.
+# backend swapped to managed Dynamo; Gym's requests go straight to its frontend.
+# Pass ++token_capture.enabled=true to stage captured calls from the engines.
 
 set -euo pipefail
 
@@ -83,9 +84,9 @@ uv run --no-sync coverage run -a \
   "$@" \
   2>&1 | tee "${RUN_LOG}"
 
-# Gym reached Dynamo through the token wrapper, and every weight sync froze Dynamo in
-# place (pause) and restored it afterwards (resume).
-grep -F "[Dynamo] Forwarding rollout chat requests through token wrapper" "${RUN_LOG}"
+# Gym reached the Dynamo frontend, and every weight sync froze Dynamo in place (pause)
+# and restored it afterwards (resume).
+grep -F "[Dynamo] Forwarding rollouts to" "${RUN_LOG}"
 sync_count=$(grep -Fc "_sync_weights: sync done" "${RUN_LOG}" || true)
 pause_count=$(grep -Fc "[RL] Engine paused (mode=keep, clear_cache=True)" "${RUN_LOG}" || true)
 resume_count=$(grep -Fc "[RL] Engine resumed" "${RUN_LOG}" || true)
@@ -96,13 +97,19 @@ fi
 
 metrics_json=${EXP_DIR}/metrics.json
 uv run --no-sync tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${metrics_json}"
+EXTRA_CHECKS=()
+if [[ "$*" == *token_capture.enabled=true* ]]; then
+  # Nonzero only when a finalizer actor ran, i.e. capture really was on.
+  EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+fi
 # The worker starts from dummy weights, so these hold only if every refit landed.
 uv run --no-sync tests/check_metrics.py "${metrics_json}" \
   'max(data["train/token_mult_prob_error"]) < 1.05' \
   'median(data["train/gen_kl_error"]) < 1.3' \
-  'max(data["train/reward"]) > 0'
+  'max(data["train/reward"]) > 0' \
+  "${EXTRA_CHECKS[@]}"
 
-if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[V]LLM::EngineCore|[n]emorl_dynamo_etcd_|[n]emorl_dynamo_nats_"; then
+if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[d]ynamo.engine_main|[V]LLM::EngineCore|[n]emorl_dynamo_etcd_|[n]emorl_dynamo_nats_"; then
   echo "Managed Dynamo processes remain after SingleController shutdown" >&2
   exit 1
 fi

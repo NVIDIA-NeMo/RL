@@ -56,8 +56,12 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
     # The actor launches dynamo.vllm and dynamo.frontend with its own interpreter,
     # and those vLLM workers load NeMo RL's worker extension, so the venv needs
-    # nemo_rl, vLLM and ai-dynamo together.
-    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": ["dynamo"],
+    # nemo_rl, vLLM and ai-dynamo together. nemo_gym too: token capture
+    # (token_capture.enabled) runs inside each dynamo.vllm engine process.
+    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": [
+        "dynamo",
+        "nemo_gym",
+    ],
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],

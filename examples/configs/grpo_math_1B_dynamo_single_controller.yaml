@@ -36,6 +36,11 @@ policy:
         tokenizer_cache: false
         tokenizer_cache_bytes: 52428800
         router_mode: kv
+        # Keep each session on one engine for this many idle seconds; null disables
+        # it. Token capture sends its rollout id as the session, so set this when
+        # token_capture.enabled: the engine splices each turn's staged prefix after
+        # routing, which the KV router's prefix matching cannot see.
+        session_affinity_ttl_secs: null
         extra_cli_args: []
     vllm_cfg:
       async_engine: true

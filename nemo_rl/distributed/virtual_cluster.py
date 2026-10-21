@@ -157,7 +157,7 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
 #   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
-#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [3000, 4000) Dynamo frontend HTTP endpoints
 #     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
 #   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
