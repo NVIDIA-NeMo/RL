@@ -11,32 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BlobStore: where a blob's bytes live. The client never knows.
+"""UnitSlabStore: where a blob's bytes live. The client never knows.
 
 The client lays values out as raw bytes in a registered local buffer, then
 hands the store ``(local_addr, plan)``; on read it hands the store byte
 ranges and registered destination addresses. Everything about placement,
-pins, refcounts and the medium is the store's business, so the same client
-serves:
-
-- :class:`UnitSlabStore` — pinned-DRAM slabs on CPU StorageUnit actors, one-sided
-  RDMA over UCX. The hot path.
-- :class:`FileStore` — one file per blob on a shared filesystem (Lustre, NVMe),
-  written and read with NIXL's POSIX backend in loopback. No storage actors;
-  the BlobDirectory only keeps refcounts.
-
-Both return the same location meta, so TransferQueue and NeMo-RL cannot
-tell them apart, and a blob can be moved between stores by copying bytes
-and rewriting its meta (that is what tiering and checkpoint shards are).
+pins, refcounts and the medium is the store's business: pinned-DRAM slabs on
+CPU StorageUnit actors, one-sided RDMA over UCX, with an optional SSD tier on
+each unit.
 """
 
 from __future__ import annotations
 
-import os
 import time
 import uuid
-from collections import OrderedDict
-from typing import Any, Protocol
+from typing import Any
 
 import ray
 
@@ -54,12 +43,9 @@ from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
 from nemo_rl.data_plane.nixl.placement import Placement
 
 __all__ = [
-    "BlobStore",
-    "FileStore",
     "LostBlobs",
     "TransferFailed",
     "UnitSlabStore",
-    "make_store",
 ]
 
 # Client backoff while units answer Busy (design §5.3): doubling, capped.
@@ -100,39 +86,6 @@ def busy_wait(deadline: float | None, backoff: float) -> float:
 
 # (off_in_blob, nbytes, local_addr)
 ReadRange = tuple[int, int, int]
-
-
-class BlobStore(Protocol):
-    def put(
-        self,
-        local_addr: int,
-        p: blob_format.BlobPlan,
-        deadline: float | None = None,
-    ) -> tuple[str, dict[str, Any]]:
-        """Store the blob at ``local_addr``; return ``(blob_id, extra_meta)``."""
-        ...
-
-    def read(
-        self,
-        requests: dict[str, list[ReadRange]],
-        metas: dict[str, dict[str, Any]],
-        scratch: tuple[int, memoryview] | None = None,
-        deadline: float | None = None,
-    ) -> None:
-        """Fill every local range from its blob.
-
-        Raises :class:`LostBlobs` for confirmed loss, :class:`TransferFailed`
-        for a retryable failure, :class:`DataPlaneTimeout` past ``deadline``.
-        """
-        ...
-
-    def release(
-        self, counts: dict[str, int], hints: dict[str, int] | None = None
-    ) -> None:
-        """Drop ``counts[blob]`` live entries per blob; free the blob at zero."""
-        ...
-
-    def close(self) -> None: ...
 
 
 # ============================================================================ unit slabs
@@ -262,7 +215,6 @@ class UnitSlabStore:
         loc.update(self._where(rest))
         return loc
 
-    # -- BlobStore
     def put(
         self,
         local_addr: int,
@@ -643,166 +595,3 @@ class UnitSlabStore:
 
     def close(self) -> None:
         self.ctl.close()
-
-
-# ============================================================================ files (Lustre / NVMe)
-class FileStore:
-    """One file per blob under ``root``; NIXL POSIX loopback for WRITE/READ.
-
-    No storage actors. The BlobDirectory keeps per-blob refcounts so the last
-    ``release`` deletes the file. Registered fds are cached per process with
-    an LRU cap so reads of hot blobs skip the open+register cost.
-
-    A blob whose WRITE or READ failed short of DONE moves to ``retained``:
-    the transfer may still use its fd, so the fd stays open and registered
-    and the file stays in place until the process exits (never evicted,
-    released or closed).
-    """
-
-    def __init__(
-        self,
-        ep: NixlEndpoint,
-        directory: Any,
-        *,
-        root: str,
-        timeout_s: float,
-        backend: str = "POSIX",
-        max_open: int = 256,
-    ) -> None:
-        self.ep = ep
-        self.directory = directory
-        self.root = root
-        self.timeout_s = timeout_s
-        self.backend = backend
-        self.max_open = max_open
-        os.makedirs(root, exist_ok=True)
-        self._open: OrderedDict[str, tuple[int, int]] = (
-            OrderedDict()
-        )  # blob → (fd, nbytes)
-        self.retained: dict[str, tuple[int, int]] = {}  # blob → (fd, nbytes)
-
-    def path(self, blob_id: str) -> str:
-        return os.path.join(self.root, f"{blob_id}.blob")
-
-    def _fd(self, blob_id: str, nbytes: int, *, create: bool) -> int:
-        item = self._open.get(blob_id)
-        if item is not None:
-            self._open.move_to_end(blob_id)
-            return item[0]
-        flags = os.O_RDWR | (os.O_CREAT if create else 0)
-        try:
-            fd = os.open(self.path(blob_id), flags, 0o644)
-        except FileNotFoundError:
-            raise LostBlobs([blob_id], "file missing")
-        if create:
-            os.ftruncate(fd, nbytes)
-        self.ep.register_file(fd, nbytes, backend=self.backend)
-        self._open[blob_id] = (fd, nbytes)
-        while len(self._open) > self.max_open:
-            old, (ofd, _) = self._open.popitem(last=False)
-            self._close_fd(ofd)
-        return fd
-
-    def _close_fd(self, fd: int) -> None:
-        try:
-            self.ep.deregister_file(fd)
-        finally:
-            os.close(fd)
-
-    def _retain(self, blob_id: str) -> None:
-        item = self._open.pop(blob_id, None)
-        if item is not None:
-            self.retained[blob_id] = item
-
-    def _forget(self, blob_id: str) -> None:
-        item = self._open.pop(blob_id, None)
-        if item is not None:
-            self._close_fd(item[0])
-
-    # -- BlobStore
-    def put(
-        self,
-        local_addr: int,
-        p: blob_format.BlobPlan,
-        deadline: float | None = None,
-    ) -> tuple[str, dict[str, Any]]:
-        blob_id = uuid.uuid4().hex
-        left = remaining(deadline, self.timeout_s)
-        fd = self._fd(blob_id, p.nbytes, create=True)
-        try:
-            self.ep.transfer(
-                "WRITE",
-                [(local_addr, p.nbytes)],
-                [(0, p.nbytes)],
-                self.ep.name,
-                timeout_s=left,
-                remote_mem="FILE",
-                remote_dev=fd,
-            )
-        except TransferError as e:
-            if e.in_flight:
-                self._retain(blob_id)  # the WRITE may still land in the file
-            else:
-                self._forget(blob_id)
-                try:
-                    os.remove(self.path(blob_id))
-                except FileNotFoundError:
-                    pass
-            raise TransferFailed([blob_id], str(e), in_flight=e.in_flight) from e
-        ray.get(self.directory.put_blobs.remote([(blob_id, -1, len(p.entries))]))
-        return blob_id, {
-            "z": p.nbytes
-        }  # blob size: needed to register the file for reads
-
-    def read(
-        self,
-        requests: dict[str, list[ReadRange]],
-        metas: dict[str, dict[str, Any]],
-        scratch: tuple[int, memoryview] | None = None,
-        deadline: float | None = None,
-    ) -> None:
-        """A missing file is :class:`LostBlobs`; a failed READ is retryable."""
-        for b, ranges in requests.items():
-            nbytes = int(metas[b]["z"])
-            fd = self._fd(b, nbytes, create=False)
-            loc = [(laddr, n) for _, n, laddr in ranges]
-            rem = [(off, n) for off, n, _ in ranges]
-            try:
-                self.ep.transfer(
-                    "READ",
-                    loc,
-                    rem,
-                    self.ep.name,
-                    timeout_s=remaining(deadline, self.timeout_s),
-                    remote_mem="FILE",
-                    remote_dev=fd,
-                )
-            except TransferError as e:
-                if e.in_flight:
-                    self._retain(b)  # the READ may still use the fd
-                raise TransferFailed([b], str(e), in_flight=e.in_flight) from e
-
-    def release(
-        self, counts: dict[str, int], hints: dict[str, int] | None = None
-    ) -> None:
-        gone = ray.get(self.directory.release.remote(list(counts.items())))
-        for b in gone:
-            if b in self.retained:
-                continue  # a failed transfer may still use the file
-            self._forget(b)
-            try:
-                os.remove(self.path(b))
-            except FileNotFoundError:
-                pass
-
-    def close(self) -> None:
-        for b in list(self._open):
-            self._forget(b)
-
-
-def make_store(kind: str, ep: NixlEndpoint, directory: Any, **kw: Any) -> BlobStore:
-    if kind == "unit":
-        return UnitSlabStore(ep, directory, **kw)
-    if kind == "file":
-        return FileStore(ep, directory, **kw)
-    raise ValueError(f"unknown store kind {kind!r}; choose 'unit' or 'file'")

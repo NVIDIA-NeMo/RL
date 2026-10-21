@@ -104,7 +104,7 @@ def test_save_on_3_restore_on_2(ray_cluster, tmp_path_factory):
     meta = json.loads((ckpt / "metadata.json").read_text())
     assert meta["storage_saved"] is True
     manifest = json.loads((ckpt / "nixl_store" / "manifest.json").read_text())
-    assert manifest["store"] == "unit" and len(manifest["shards"]) == 3
+    assert len(manifest["shards"]) == 3
     n_blobs = sum(len(s["blobs"]) for s in manifest["shards"])
     assert n_blobs >= 2
     _teardown(tq, conf)
@@ -133,28 +133,6 @@ def test_save_on_3_restore_on_2(ray_cluster, tmp_path_factory):
         time.sleep(0.2)
     assert after == 0
     _teardown(tq, conf)
-
-
-def test_restore_refuses_other_store_kind(ray_cluster):
-    ckpt = REPO / ".nvdp_store" / f"ckpt-{uuid.uuid4().hex[:8]}"
-    tq, conf = _system(1)
-    tq.kv_batch_put(["a", "b"], "train", fields=_batch(1)[:2])
-    tq.save_checkpoint(str(ckpt))
-    _teardown(tq, conf)
-
-    import transfer_queue as tq2
-
-    import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
-
-    conf = make_tq_conf(num_units=1, namespace=NS)
-    conf.backend.NixlStore.store = {
-        "kind": "file",
-        "root": str(REPO / ".nvdp_store" / f"fs-{uuid.uuid4().hex[:6]}"),
-    }
-    tq2.init(conf)
-    with pytest.raises(Exception, match="store="):
-        tq2.load_checkpoint(str(ckpt))
-    _teardown(tq2, conf)
 
 
 def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypatch):

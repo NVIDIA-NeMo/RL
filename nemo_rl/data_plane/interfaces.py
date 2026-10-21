@@ -212,9 +212,6 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     each node of the selected virtual clusters instead. With ``numa="auto"`` the
     k-th unit on a multi-socket node is pinned (CPUs + slab memory) to socket
     ``k % sockets``; single-socket nodes are unaffected.
-
-    ``store.kind="file"`` is an actor-less alternative (one file per blob under
-    ``store.root`` on a shared filesystem, NIXL POSIX loopback).
     """
 
     num_storage_units: int = 2
@@ -242,7 +239,6 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     # Unfinished NIXL transfers may retain this much memory before the
     # process refuses further transfers (DataPlaneFatal).
     graveyard_max_bytes: int = 4294967296
-    store: dict[str, Any] = Field(default_factory=lambda: {"kind": "unit"})
     # SSD tier: {enabled, dir, staging_bytes, pickup_s}; puts the put area cannot take go to disk;
     # see tq_nixl.ssd_config. Checkpointing the store with it on is not supported.
     ssd: dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
