@@ -103,6 +103,12 @@ from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.single_controller_utils.batch_mix import (
+    UNKNOWN_AGENT,
+    BatchMixHistory,
+    agent_name_from_env_info,
+    batch_mix_metrics,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
@@ -594,6 +600,10 @@ class SingleControllerActor:
         self._finalizer_waiters = 0
         self._finalizer_unknown_outcomes = 0
         self._finalizer_metrics_by_group: dict[str, dict[str, float]] = {}
+        # Gym agent of each committed group, popped by the step that trains it
+        # (batch_mix/* metrics and chart).
+        self._agent_by_group: dict[str, str] = {}
+        self._batch_mix_history = BatchMixHistory()
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         if teacher_worker_groups:
             self._teacher_coordinator: Optional[
@@ -2082,6 +2092,8 @@ class SingleControllerActor:
         rollout_metrics = self._rollout_manager.pop_capture_rollout_metrics(
             request.group_id
         )
+        # Set when the privileged critic's prompt lookup already read the agent.
+        agent_name: Optional[str] = None
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2187,9 +2199,11 @@ class SingleControllerActor:
                             # buffer's commit; finalizer rows commit without a
                             # PromptGroupRecord, so look the prompt up here.
                             prompt = await self._dataset_prompt(int(request.prompt_idx))
+                            env_info = dict(prompt.get("extra_env_info") or {})
+                            agent_name = agent_name_from_env_info(env_info)
                             meta = await self._privilege_store.enrich_from_env_info(
                                 meta,
-                                dict(prompt.get("extra_env_info") or {}),
+                                env_info,
                                 int(request.prompt_idx),
                             )
                         await self._buffer.commit_finalized(
@@ -2235,6 +2249,11 @@ class SingleControllerActor:
             }
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
+        self._agent_by_group[request.group_id] = (
+            agent_name
+            if agent_name is not None
+            else await self._prompt_agent_name(request.prompt_idx)
+        )
         return finalized
 
     async def _cleanup_consumed_metas_unlocked(
@@ -3086,6 +3105,7 @@ class SingleControllerActor:
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
+            step_agent_names: list[str] = []
             # One chunk per step on the PPO path, so these are the step's own
             # model updates -- the last epoch's, when there is more than one.
             policy_result: Optional[dict[str, Any]] = None
@@ -3279,6 +3299,9 @@ class SingleControllerActor:
                                 step_finalizer_metrics.setdefault(name, []).append(
                                     float(value)
                                 )
+                            step_agent_names.append(
+                                self._agent_by_group.pop(group_id, UNKNOWN_AGENT)
+                            )
 
                         selected_rollout_metrics.extend(
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
@@ -3710,6 +3733,7 @@ class SingleControllerActor:
                         per_group_rollout_metrics, aggregate_rollout_metrics
                     )
                 )
+                step_metrics.update(batch_mix_metrics(step_agent_names))
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -3969,6 +3993,17 @@ class SingleControllerActor:
             self._logger.log_metrics(
                 step_metrics, step=self._train_steps, prefix="train"
             )
+            try:
+                self._batch_mix_history.add(self._train_steps, step_agent_names)
+                batch_mix_figure = self._batch_mix_history.figure()
+                if batch_mix_figure is not None:
+                    self._logger.log_plotly(
+                        batch_mix_figure,
+                        step=self._train_steps,
+                        name="train/batch_mix/chart",
+                    )
+            except Exception as error:  # metrics must never fail a step
+                log.warning("Skipping batch_mix chart: %s", error)
             # Must precede the step_finished=True log below. That log commits
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no
@@ -5805,6 +5840,17 @@ class SingleControllerActor:
                     for name, column in columns.items()
                 },
             )
+
+    async def _prompt_agent_name(self, prompt_idx: Optional[int]) -> str:
+        """The Gym agent a dataset prompt routes to, for batch_mix; never raises."""
+        if prompt_idx is None:
+            return UNKNOWN_AGENT
+        try:
+            prompt = await self._dataset_prompt(int(prompt_idx))
+        except Exception as error:  # metrics must never fail a group
+            log.warning("batch_mix: no agent for prompt %s: %s", prompt_idx, error)
+            return UNKNOWN_AGENT
+        return agent_name_from_env_info(prompt.get("extra_env_info"))
 
     async def _bank_prompt_info(
         self, prompt_idx: Optional[int]

@@ -28,6 +28,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.batch_mix import BatchMixHistory
 from nemo_rl.algorithms.single_controller_utils.config import SegmentRowsConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
@@ -103,6 +104,8 @@ def _controller(actor: object) -> Any:
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
     ctrl._finalizer_metrics_by_group = {}
+    ctrl._agent_by_group = {}
+    ctrl._batch_mix_history = BatchMixHistory()
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
@@ -161,6 +164,32 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         staging_keys=["group_g0/call"],
     )
     assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+    # No dataset to read the agent from in this fixture: tagged unknown, not raised.
+    assert ctrl._agent_by_group["group"] == "unknown"
+
+
+def test_finalization_tags_the_group_with_its_prompts_agent() -> None:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl._privilege_store = None
+    ctrl._dataset_prompt = AsyncMock(
+        return_value={
+            "extra_env_info": {
+                "agent_ref": {"type": "responses_api_agents", "name": "gdpval_train"}
+            }
+        }
+    )
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    ctrl._dataset_prompt.assert_awaited_once_with(17)
+    assert ctrl._agent_by_group == {"group": "gdpval_train"}
 
 
 def _privileged(ctrl: Any, env_info: dict[str, Any]) -> Any:
@@ -215,7 +244,9 @@ def test_privileged_critic_stamps_finalized_rows_before_commit() -> None:
 
     asyncio.run(ctrl._finalize_with_actor(_request()))
 
+    # One lookup serves the privilege prefix and the batch_mix agent tag.
     ctrl._dataset_prompt.assert_awaited_once_with(17)
+    assert ctrl._agent_by_group["group"] == "unknown"
     committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
     # Every row, segment rows included, references the instance's prefix.
     assert [tag[spc.PRIVILEGE_KEY_TAG] for tag in committed_meta.tags] == [

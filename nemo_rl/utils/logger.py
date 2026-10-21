@@ -155,6 +155,14 @@ class LoggerInterface(ABC):
         """
         return None
 
+    def log_plotly(self, figure: Any, step: int, name: str) -> None:
+        """Log an interactive plotly figure. Backends that cannot render one skip it.
+
+        Concrete for the same reason as :meth:`log_table`: only wandb renders
+        plotly figures natively.
+        """
+        return None
+
     @abstractmethod
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a matplotlib figure."""
@@ -622,6 +630,21 @@ class WandbLogger(LoggerInterface):
         with self._log_lock:
             self._buffer_step_metrics_locked(
                 {name: wandb.Table(columns=columns, data=rows)},
+                step=step,
+                step_finished=False,
+            )
+
+    def log_plotly(self, figure: Any, step: int, name: str) -> None:
+        """Log an interactive plotly figure to wandb.
+
+        Args:
+            figure: plotly ``Figure``
+            step: Global step value
+            name: Panel name
+        """
+        with self._log_lock:
+            self._buffer_step_metrics_locked(
+                {name: wandb.Plotly(figure)},
                 step=step,
                 step_finished=False,
             )
@@ -1506,6 +1529,17 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_table(columns, rows, step, name)
+
+    def log_plotly(self, figure: Any, step: int, name: str) -> None:
+        """Log a plotly figure to every backend that renders one (wandb).
+
+        Args:
+            figure: plotly ``Figure``
+            step: Global step value
+            name: Name of the plot
+        """
+        for logger in self.loggers:
+            logger.log_plotly(figure, step, name)
 
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a matplotlib figure to all backends.
