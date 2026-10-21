@@ -204,6 +204,40 @@ def _copy_into(dst: np.ndarray, src: memoryview, parallel_min: int) -> None:
         memoryview(dst)[:] = src
 
 
+class TimedLock:
+    """The client's lock, which also records how long callers wait for it.
+
+    The numbers decide whether concurrent callers in one process contend enough
+    to justify a finer-grained lock: ``wait_ms_sum`` / ``wait_ms_max`` over
+    contended acquisitions, ``waits`` those longer than 1 ms. Counters change
+    only while the lock is held, so they need no lock of their own. Re-entrant
+    acquisition by the holder never waits.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.waits = 0
+        self.wait_ms_sum = 0.0
+        self.wait_ms_max = 0.0
+
+    def __enter__(self) -> TimedLock:
+        if not self._lock.acquire(blocking=False):
+            t0 = time.monotonic()
+            self._lock.acquire()
+            ms = (time.monotonic() - t0) * 1000.0
+            self.wait_ms_sum += ms
+            self.wait_ms_max = max(self.wait_ms_max, ms)
+            self.waits += ms > 1.0
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._lock.release()
+
+    def snapshot(self) -> tuple[int, float, float]:
+        """``(waits, wait_ms_sum, wait_ms_max)``; plain reads, so it never waits itself."""
+        return self.waits, self.wait_ms_sum, self.wait_ms_max
+
+
 @StorageClientFactory.register("NixlStoreClient")
 class NixlKVClient(StorageKVClient):
     def __init__(self, config: dict[str, Any]):
@@ -222,10 +256,21 @@ class NixlKVClient(StorageKVClient):
             prog_thread=False,
             require_rdma=bool(nixl_cfg.get("require_rdma", True)),
         )
-        # Serialises every NIXL agent call (the agent is not thread-safe). Copies
+        # Serialises every NIXL agent call (the agent is not thread-safe) and
+        # counts the time callers wait for it (see TimedLock). Copies
         # into and out of pool buffers happen outside it, so concurrent TQ
         # threads overlap their memory traffic with each other's transfers.
-        self._lock = threading.RLock()
+        self._lock = TimedLock()
+        # Time spent in put / get, with TimedLock's counters: one line per
+        # process every 30 s while they change, to judge lock contention.
+        self._op_mu = threading.Lock()
+        self._ops, self._op_ms = 0, 0.0
+        self._stats_at, self._stats_last = time.monotonic(), None
+        try:
+            ctx = ray.get_runtime_context()
+            self._who = f"pid={os.getpid()} node={ctx.get_node_id()[:8]} actor={ctx.get_actor_name() or '-'}"
+        except Exception:  # noqa: BLE001 - a label only
+            self._who = f"pid={os.getpid()}"
         self.pool = BufferPool(
             self.ep,
             self._lock,
@@ -273,6 +318,13 @@ class NixlKVClient(StorageKVClient):
 
     # ------------------------------------------------------------------ put
     def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
+        t0 = time.monotonic()
+        try:
+            return self._put(keys, values)
+        finally:
+            self._op_done(t0)
+
+    def _put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         if not keys:
             return []
         if self._check:
@@ -428,6 +480,13 @@ class NixlKVClient(StorageKVClient):
     def get(
         self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None
     ) -> list[Any]:
+        t0 = time.monotonic()
+        try:
+            return self._get(keys, custom_backend_meta)
+        finally:
+            self._op_done(t0)
+
+    def _get(self, keys: list[str], custom_backend_meta) -> list[Any]:
         if not keys:
             return []
         metas = list(custom_backend_meta or [])
@@ -505,8 +564,38 @@ class NixlKVClient(StorageKVClient):
         with self._lock:
             self.store.release(counts, hints)
 
+    def _op_done(self, t0: float) -> None:
+        now = time.monotonic()
+        with self._op_mu:
+            self._ops += 1
+            self._op_ms += (now - t0) * 1000.0
+            due = now - self._stats_at >= 30.0
+            if due:
+                self._stats_at = now
+        if due:
+            self._log_stats()
+
+    def _log_stats(self) -> None:
+        waits, wait_sum, wait_max = self._lock.snapshot()
+        with self._op_mu:
+            st = (
+                self._ops,
+                round(self._op_ms, 1),
+                waits,
+                round(wait_sum, 1),
+                round(wait_max, 1),
+            )
+        if st != self._stats_last:
+            self._stats_last = st
+            print(
+                f"[nvdp-client] {self._who} stats "
+                f"{dict(zip(('ops', 'op_ms_sum', 'lock_waits', 'lock_wait_ms_sum', 'lock_wait_ms_max'), st))}",
+                flush=True,
+            )
+
     # ------------------------------------------------------------------ lifecycle
     def close(self) -> None:
+        self._log_stats()
         self.pool.close()
         with self._lock:
             self.store.close()
