@@ -949,6 +949,7 @@ class _BatchPrefixSink(_MemorySink):
         super().__init__()
         self.batches: list[list[int]] = []
         self.fail_after_write = False
+        self.fail_multi_row = False
         self.before_write = lambda: None
 
     def stage_generation_prefix_batch(
@@ -962,7 +963,7 @@ class _BatchPrefixSink(_MemorySink):
             chunk_sequences=chunk_sequences,
             attachments=attachments,
         )
-        if self.fail_after_write:
+        if self.fail_after_write or (self.fail_multi_row and len(records) > 1):
             # Like TQTokenSink after a failed put: discard the batch, then raise.
             self.clear(keys)
             raise RuntimeError("injected batch transport failure after writes")
@@ -1029,14 +1030,15 @@ def test_worker_batch_token_limit_handles_ragged_and_oversized_rows():
     assert sink.batches == [[2, 3], [9], [2]]  # First chunks include the prompt.
 
 
-def test_worker_batch_failure_rolls_back_every_unsealed_row():
+def test_worker_failed_puts_fail_their_calls_and_roll_back():
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
     sink.fail_after_write = True
 
-    with pytest.raises(RuntimeError):
-        worker._checkpoint_generation_cut(inventory)
+    receipt = worker._checkpoint_generation_cut(inventory)
 
-    assert not worker._generation_cut_receipts
+    # The batch put fails, then each row's own put fails too.
+    assert sink.batches == [[3, 4, 5], [3], [4], [5]]
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"] * 3
     assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
     for request, length in zip(requests, [2, 3, 4], strict=True):
         state = worker._capture_calls[id(request)]
@@ -1048,15 +1050,32 @@ def test_worker_batch_failure_rolls_back_every_unsealed_row():
         state.lifecycle_lock.release()
 
     sink.fail_after_write = False
+    retried = worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="retry-cut",
+            server_name="policy",
+            active_prefixes=inventory.active_prefixes,
+        )
+    )
+    assert [ack.prefix_token_count for ack in retried.prefixes] == [2, 3, 4]
+
+
+def test_worker_failed_batch_put_is_retried_row_by_row():
+    worker, sink, _, inventory = _batch_worker_fixture([2, 3, 4])
+    sink.fail_multi_row = True
+
     receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert sink.batches == [[3, 4, 5], [3], [4], [5]]
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_prefix"] * 3
     assert [ack.prefix_token_count for ack in receipt.prefixes] == [2, 3, 4]
+    # The failed batch was discarded before each row was written again.
+    assert len(sink.cleared_generation_prefix_keys) == 3
 
 
-def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
+def test_worker_batch_ack_failure_fails_only_its_call(monkeypatch):
     from nemo_gym._checkpoint import generation_cut
 
-    # The middle row's ack fails, so the last row is written but never receives
-    # its key: only the batch-level clear can discard it.
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
     original = generation_cut.GenerationCutPrefixAck
 
@@ -1065,8 +1084,43 @@ def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
             raise ValueError("injected acknowledgement failure")
         return original(**kwargs)
 
+    # The rejected call is still acknowledged, as a failure.
+    reject_second.failure = original.failure
     monkeypatch.setattr(generation_cut, "GenerationCutPrefixAck", reject_second)
-    with pytest.raises(ValueError, match="injected acknowledgement failure"):
+    receipt = worker._checkpoint_generation_cut(inventory)
+
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+        "durable_prefix",
+    ]
+    states = [worker._capture_calls[id(request)] for request in requests]
+    assert states[1].frozen_cut is None
+    assert states[1].staged_token_count == 0
+    assert not states[1].generation_cut_staging_keys
+    assert [state.staged_token_count for state in (states[0], states[2])] == [2, 4]
+    # Only the rejected call's row is cleared; the others stay advertised.
+    assert sink.cleared_generation_prefix_keys == [sink.generation_prefix_keys[1]]
+
+
+def test_worker_batch_interruption_clears_rows_no_call_received(monkeypatch):
+    from nemo_gym._checkpoint import generation_cut
+
+    class _Interrupted(BaseException):
+        pass
+
+    # The middle ack is interrupted, so the last row is written but never
+    # reaches its call: only the batch's own cleanup can discard it.
+    worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4])
+    original = generation_cut.GenerationCutPrefixAck
+
+    def interrupt_second(**kwargs):
+        if kwargs["model_call_id"] == "c1":
+            raise _Interrupted
+        return original(**kwargs)
+
+    monkeypatch.setattr(generation_cut, "GenerationCutPrefixAck", interrupt_second)
+    with pytest.raises(_Interrupted):
         worker._checkpoint_generation_cut(inventory)
 
     for request in requests:
@@ -1078,7 +1132,7 @@ def test_worker_batch_validates_every_ack_before_sealing(monkeypatch):
     assert set(sink.generation_prefix_keys) <= set(sink.cleared_generation_prefix_keys)
 
 
-def test_worker_batch_retains_earlier_success_on_later_batch_failure():
+def test_worker_later_batch_failure_keeps_earlier_cuts():
     worker, sink, requests, inventory = _batch_worker_fixture([2] * 3, batch_size=2)
 
     def fail_second():
@@ -1086,9 +1140,13 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
             sink.fail_after_write = True
 
     sink.before_write = fail_second
-    with pytest.raises(RuntimeError):
-        worker._checkpoint_generation_cut(inventory)
+    receipt = worker._checkpoint_generation_cut(inventory)
 
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_prefix",
+        "durable_failure",
+    ]
     earlier_keys = set(sink.generation_prefix_keys[:2])
     assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
     sink.fail_after_write = False
@@ -1097,26 +1155,34 @@ def test_worker_batch_retains_earlier_success_on_later_batch_failure():
         state = worker._capture_calls[id(request)]
         with state.lock:
             state.observe([99], [-0.2])
-    receipt = worker._checkpoint_generation_cut(inventory)
-    assert [ack.prefix_token_count for ack in receipt.prefixes] == [3, 3, 3]
-    assert [len(ack.staging_keys) for ack in receipt.prefixes] == [2, 2, 1]
+    retried = worker._checkpoint_generation_cut(
+        GenerationCutInventory.build(
+            checkpoint_id="retry-cut",
+            server_name="policy",
+            active_prefixes=inventory.active_prefixes,
+        )
+    )
+    assert [ack.prefix_token_count for ack in retried.prefixes] == [3, 3, 3]
+    assert [len(ack.staging_keys) for ack in retried.prefixes] == [2, 2, 1]
     assert earlier_keys.isdisjoint(sink.cleared_generation_prefix_keys)
 
 
-def test_worker_batch_preparation_failure_releases_pending_calls():
+def test_worker_batch_call_without_output_limit_fails_alone():
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3])
     worker._capture_calls[id(requests[1])].effective_output_limit = None
 
-    with pytest.raises(RuntimeError, match="effective output limit"):
-        worker._checkpoint_generation_cut(inventory)
+    receipt = worker._checkpoint_generation_cut(inventory)
 
-    assert not sink.batches
-    for request in requests:
-        state = worker._capture_calls[id(request)]
-        assert state.frozen_cut is None
-        assert state.staged_token_count == 0
-        assert state.lifecycle_lock.acquire(blocking=False)
-        state.lifecycle_lock.release()
+    assert [ack.disposition for ack in receipt.prefixes] == [
+        "durable_prefix",
+        "durable_failure",
+    ]
+    assert sink.batches == [[3]]
+    state = worker._capture_calls[id(requests[1])]
+    assert state.frozen_cut is None
+    assert state.staged_token_count == 0
+    assert state.lifecycle_lock.acquire(blocking=False)
+    state.lifecycle_lock.release()
 
 
 def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
@@ -2058,8 +2124,21 @@ def test_generation_cut_rolls_back_tokens_after_staging_failure():
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 11, 12]
 
 
+class _FailingCallPrefixSink(_MemorySink):
+    """Fails every prefix row of one call, as a corrupt row would."""
+
+    def __init__(self, model_call_id: str) -> None:
+        super().__init__()
+        self._model_call_id = model_call_id
+
+    def _stage_prefix_row(self, record, **kwargs) -> str:
+        if record.model_call_id == self._model_call_id:
+            raise RuntimeError("injected generation-prefix staging failure")
+        return super()._stage_prefix_row(record, **kwargs)
+
+
 def test_one_failed_call_does_not_fail_the_rest_of_the_cut():
-    sink = _FailOncePrefixSink()
+    sink = _FailingCallPrefixSink("failing")
     worker = _worker_with_capture(sink)
     inventory, (failing, healthy) = _active_call_inventory(
         worker, ("failing", [11, 12]), ("healthy", [13, 14])
@@ -2162,6 +2241,22 @@ def test_usable_restored_prefix_is_resumed():
     assert resolved.snapshot.digest == cut_record.digest
     _drain_cleanup(worker)
     assert sink.cleared_generation_prefix_keys == []
+
+
+def test_restored_prefix_uses_the_chunks_its_reader_fetched():
+    """The worker's batched reader fetches a restore's chunks; resolving the
+    prefix must use them instead of reading TQ again."""
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(sink, records={cut_key: cut_record})
+    admission = worker._capture_admission(request)
+    chunks = worker._fetch_generation_cut_rows([cut_key])
+    worker._staging_source = _MemoryPrefixSource({}, records={})
+
+    served, resolved = worker._resolve_usable_generation_cut(admission, [], chunks)
+
+    assert served is admission
+    assert resolved.snapshot.digest == cut_record.digest
 
 
 @pytest.mark.parametrize(

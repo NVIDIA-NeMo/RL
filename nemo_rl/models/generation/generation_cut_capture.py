@@ -1169,6 +1169,12 @@ class GenerationCutCaptureMixin:
         Past ``deadline`` no further TQ write starts: rows frozen for the next
         batch roll back and, with every call not yet reached, are acknowledged
         as failures. ``max_rows=1`` writes each call in its own put.
+
+        Gym acknowledges cuts per call, so a call that cannot be cut (a failed
+        freeze, write, acknowledgement or seal) is acknowledged as a failure
+        and regenerates after a restore; the other calls keep their cuts. A
+        failed batch put is retried one row per put, so one bad row fails only
+        its own call.
         """
         from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
 
@@ -1197,6 +1203,48 @@ class GenerationCutCaptureMixin:
             pending.clear()
             pending_tokens = 0
 
+        def fail(prefix: Any) -> None:
+            LOGGER.exception(
+                "cannot cut model call %s; it regenerates after a restore",
+                prefix.model_call_id,
+            )
+            acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
+
+        def stage(batch: list[tuple[Any, Any, int, Any]]) -> list[str | None]:
+            """Write a batch; if its put fails, write each row alone."""
+            try:
+                return sink.stage_generation_prefix_batch(
+                    [record for _, record, _, _ in batch],
+                    checkpoint_id=inventory.checkpoint_id,
+                    chunk_sequences=[sequence for _, _, sequence, _ in batch],
+                )
+            except Exception:
+                # The sink has already discarded the batch's keys.
+                if len(batch) == 1:
+                    fail(batch[0][3])
+                    return [None]
+                LOGGER.warning(
+                    "generation-prefix batch of %d rows failed; writing each alone",
+                    len(batch),
+                    exc_info=True,
+                )
+            keys: list[str | None] = []
+            for _, record, sequence, prefix in batch:
+                if past_deadline():
+                    uncut.append(prefix)
+                    keys.append(None)
+                    continue
+                try:
+                    keys += sink.stage_generation_prefix_batch(
+                        [record],
+                        checkpoint_id=inventory.checkpoint_id,
+                        chunk_sequences=[sequence],
+                    )
+                except Exception:
+                    fail(prefix)
+                    keys.append(None)
+            return keys
+
         def flush() -> None:
             nonlocal pending_tokens
             if not pending:
@@ -1204,44 +1252,50 @@ class GenerationCutCaptureMixin:
             if past_deadline():
                 release_pending()
                 return
-            keys: list[str] = []
-            sealed_keys: set[str] = set()
+            batch = list(pending)
+            pending.clear()
+            pending_tokens = 0
+            keys: list[str | None] = []
+            handed = 0
             try:
-                # On a raise the sink has already discarded the batch's keys.
-                keys = sink.stage_generation_prefix_batch(
-                    [record for _, record, _, _ in pending],
-                    checkpoint_id=inventory.checkpoint_id,
-                    chunk_sequences=[sequence for _, _, sequence, _ in pending],
-                )
-                batch_acks = [
-                    transaction.send(key)
-                    for (transaction, _, _, _), key in zip(pending, keys, strict=True)
-                ]
-                for (transaction, _, _, _), key in zip(pending, keys, strict=True):
+                keys = stage(batch)
+                ready = []
+                for (transaction, _, _, prefix), key in zip(batch, keys, strict=True):
+                    handed += 1
+                    if key is None:
+                        # Closing rolls the frozen cut back.
+                        transaction.close()
+                        continue
+                    try:
+                        # A failure here rolls the call back and clears its row.
+                        ready.append((transaction, prefix, transaction.send(key)))
+                    except Exception:
+                        fail(prefix)
+                # Every acknowledgement in the batch is built before any call
+                # seals its frozen cut into its live request state.
+                for transaction, prefix, acknowledgement in ready:
                     try:
                         transaction.send(None)
                     except StopIteration:
-                        sealed_keys.add(key)
+                        acknowledgements.append(acknowledgement)
+                    except Exception:
+                        fail(prefix)
                     else:
-                        raise RuntimeError("generation-cut transaction did not seal")
-                acknowledgements.extend(batch_acks)
-            except BaseException:
-                # Written rows may be advertised only once their transaction
-                # seals; clear the rest.
-                rejected = [key for key in keys if key not in sealed_keys]
-                if rejected:
-                    try:
-                        sink.clear(rejected)
-                    except Exception:  # noqa: BLE001 — preserve the batch failure
-                        LOGGER.exception(
-                            "Failed to clear rejected generation-prefix batch"
-                        )
-                raise
+                        transaction.close()
+                        acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
             finally:
-                for transaction, _, _, _ in pending:
+                # Only an interruption leaves written rows that no transaction
+                # received; nothing may advertise them.
+                orphaned = [key for key in keys[handed:] if key is not None]
+                if orphaned:
+                    try:
+                        sink.clear(orphaned)
+                    except Exception:  # noqa: BLE001 — preserve the interruption
+                        LOGGER.exception(
+                            "Failed to clear interrupted generation-prefix batch"
+                        )
+                for transaction, _, _, _ in batch:
                     transaction.close()
-                pending.clear()
-                pending_tokens = 0
 
         try:
             for index, prefix in enumerate(inventory.active_prefixes):
@@ -1253,34 +1307,43 @@ class GenerationCutCaptureMixin:
                     state = self._capture_calls_by_model_call_id.get(
                         prefix.model_call_id
                     )
-                if state is None:
-                    acknowledgements.append(
-                        self._completed_generation_cut_ack(
-                            prefix, inventory.checkpoint_id
-                        )
-                    )
-                    continue
-                transaction = self._generation_cut_transaction(
-                    prefix, state, inventory.checkpoint_id, deadline=deadline
-                )
                 try:
-                    try:
-                        record, sequence = next(transaction)
-                    except StopIteration as finished:
-                        acknowledgement = finished.value
-                        if acknowledgement is None:
-                            acknowledgement = self._completed_generation_cut_ack(
+                    if state is None:
+                        acknowledgements.append(
+                            self._completed_generation_cut_ack(
                                 prefix, inventory.checkpoint_id
                             )
-                        acknowledgements.append(acknowledgement)
+                        )
                         continue
-                    tokens = len(record.token_ids_delta)
-                    if pending and pending_tokens + tokens > max_tokens:
-                        flush()
-                    pending.append((transaction, record, sequence, prefix))
-                except BaseException:
-                    transaction.close()
-                    raise
+                    transaction = self._generation_cut_transaction(
+                        prefix, state, inventory.checkpoint_id, deadline=deadline
+                    )
+                    record, sequence = next(transaction)
+                except StopIteration as finished:
+                    acknowledgement = finished.value
+                    if acknowledgement is None:
+                        acknowledgement = self._completed_generation_cut_ack(
+                            prefix, inventory.checkpoint_id
+                        )
+                    acknowledgements.append(acknowledgement)
+                    continue
+                except Exception:
+                    fail(prefix)
+                    if state is not None:
+                        # The transaction rolls back only failures from its
+                        # route snapshot on; release a cut it froze earlier.
+                        with state.lock:
+                            frozen = state.frozen_cut
+                            if (
+                                frozen is not None
+                                and frozen[0] == inventory.checkpoint_id
+                            ):
+                                state.rollback_frozen_cut(inventory.checkpoint_id)
+                    continue
+                tokens = len(record.token_ids_delta)
+                if pending and pending_tokens + tokens > max_tokens:
+                    flush()
+                pending.append((transaction, record, sequence, prefix))
                 pending_tokens += tokens
                 if len(pending) >= max_rows or pending_tokens >= max_tokens:
                     # An oversized single row is written alone, never split.
