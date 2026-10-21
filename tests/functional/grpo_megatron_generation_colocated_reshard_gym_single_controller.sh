@@ -74,6 +74,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++policy.generation.mcore_generation_config.transformer_impl=inference_optimized \
     ++policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
     policy.generation.mcore_generation_config.refit_backend=nccl \
+    policy.generation.mcore_generation_config.kv_cache_management_mode=recompute \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
     policy.generation.colocated.enabled=true \

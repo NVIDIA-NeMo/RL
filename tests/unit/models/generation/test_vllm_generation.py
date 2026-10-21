@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import ray
@@ -40,6 +40,7 @@ from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
@@ -250,6 +251,55 @@ basic_automodel_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_skips_missing_metadata():
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.worker_group = MagicMock()
+
+    assert generation.prepare_refit_info(None) is None
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_uses_live_leaders_and_unions_prequant_names():
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": False}}
+
+    first_worker = MagicMock()
+    first_worker.prepare_refit_info.remote.return_value = "first"
+    second_worker = MagicMock()
+    second_worker.prepare_refit_info.remote.return_value = "second"
+    generation._refit_leader_workers = MagicMock(
+        return_value=[first_worker, second_worker]
+    )
+    state_dict_info = {"model.layers.0.weight": object()}
+
+    with (
+        patch(
+            "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+            return_value=[
+                ["model.layers.1.weight", "model.layers.0.weight"],
+                ["model.layers.2.weight", "model.layers.1.weight"],
+            ],
+        ) as ray_get,
+    ):
+        result = generation.prepare_refit_info(state_dict_info)
+
+    assert result == [
+        "model.layers.0.weight",
+        "model.layers.1.weight",
+        "model.layers.2.weight",
+    ]
+    generation._refit_leader_workers.assert_called_once_with()
+    first_worker.prepare_refit_info.remote.assert_called_once_with(
+        state_dict_info=state_dict_info
+    )
+    second_worker.prepare_refit_info.remote.assert_called_once_with(
+        state_dict_info=state_dict_info
+    )
+    ray_get.assert_called_once_with(["first", "second"])
 
 
 @pytest.mark.parametrize("async_engine", [False, True])
@@ -614,30 +664,73 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     assert worker.llm is None
 
 
+@pytest.mark.parametrize("timeout_s", [None, 0.25])
 def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
+    timeout_s: float | None,
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock()
-    generation.worker_group.workers = [object(), object()]
-    futures = [object(), object()]
-    generation.worker_group.run_all_workers_single_data.return_value = futures
-    ray_get = MagicMock(side_effect=[[True, True], [True, True]])
+    leaders = [MagicMock(), MagicMock()]
+    generation.worker_group = MagicMock(workers=leaders)
+    pause_futures = [object(), object()]
+    resume_futures = [object(), object()]
+    for worker, pause_future, resume_future in zip(
+        leaders, pause_futures, resume_futures
+    ):
+        worker.pause_generation_async.remote.return_value = pause_future
+        worker.resume_generation_async.remote.return_value = resume_future
+    generation._refit_membership = None
+    generation.dp_size = 2
+    generation.fleet_monitor = None
+    ray_get = MagicMock(side_effect=[[True, True], True, True])
     monkeypatch.setattr(ray, "get", ray_get)
+    ray_wait = MagicMock(return_value=(resume_futures, []))
+    monkeypatch.setattr(ray, "wait", ray_wait)
 
-    assert generation.pause_generation_for_refit(clear_cache=True)
-    assert generation.resume_generation_after_refit()
+    assert generation.pause_generation_for_refit(clear_cache=True, timeout_s=timeout_s)
+    assert generation.resume_generation_after_refit(timeout_s=timeout_s)
 
-    generation.worker_group.run_all_workers_single_data.assert_any_call(
-        "pause_generation_async",
-        clear_cache=True,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
-    generation.worker_group.run_all_workers_single_data.assert_any_call(
-        "resume_generation_async",
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-    )
+    for worker in leaders:
+        worker.pause_generation_async.remote.assert_called_once_with(clear_cache=True)
+        worker.resume_generation_async.remote.assert_called_once_with()
+    assert ray_get.call_args_list == [
+        call(pause_futures, timeout=timeout_s),
+        call(resume_futures[0]),
+        call(resume_futures[1]),
+    ]
+    ray_wait.assert_called_once_with(resume_futures, num_returns=2, timeout=timeout_s)
+
+
+@pytest.mark.parametrize("operation", ["pause", "resume"])
+def test_vllm_generation_refit_pause_and_resume_raise_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker = MagicMock()
+    generation.worker_group = MagicMock(workers=[worker])
+    generation._refit_membership = None
+    generation.dp_size = 1
+    ray_get = MagicMock(side_effect=ray.exceptions.GetTimeoutError("timed out"))
+    monkeypatch.setattr(ray, "get", ray_get)
+    resume_future = worker.resume_generation_async.remote.return_value
+    ray_wait = MagicMock(return_value=([], [resume_future]))
+    monkeypatch.setattr(ray, "wait", ray_wait)
+
+    with pytest.raises(RefitAborted, match=rf"{operation} did not return within 0.25s"):
+        if operation == "pause":
+            generation.pause_generation_for_refit(clear_cache=True, timeout_s=0.25)
+        else:
+            generation.resume_generation_after_refit(timeout_s=0.25)
+
+    future = getattr(worker, f"{operation}_generation_async").remote.return_value
+    if operation == "pause":
+        ray_get.assert_called_once_with([future], timeout=0.25)
+    else:
+        ray_wait.assert_called_once_with([future], num_returns=1, timeout=0.25)
+        ray_get.assert_not_called()
 
 
 def test_vllm_generation_rejects_partial_refit_pause_and_resume(
@@ -645,16 +738,15 @@ def test_vllm_generation_rejects_partial_refit_pause_and_resume(
 ) -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {"vllm_cfg": {"async_engine": True}}
-    generation.worker_group = MagicMock()
-    generation.worker_group.workers = [object(), object()]
-    generation.worker_group.run_all_workers_single_data.return_value = [
-        object(),
-        object(),
-    ]
+    leaders = [MagicMock(), MagicMock()]
+    generation.worker_group = MagicMock(workers=leaders)
+    generation._refit_membership = None
+    generation.dp_size = 2
+    monkeypatch.setattr(ray, "wait", MagicMock(return_value=([], [])))
     monkeypatch.setattr(
         ray,
         "get",
-        MagicMock(side_effect=[[True, False], [False, True]]),
+        MagicMock(side_effect=[[True, False], False, True]),
     )
 
     with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
@@ -2457,7 +2549,7 @@ async def test_vllm_policy_generation_async(
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         async_policy.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -2558,7 +2650,7 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
     automodel_config = basic_automodel_test_config
     lm_policy = Policy(cluster, automodel_config, tokenizer)
 
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -2883,7 +2975,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 
     # Prepare refit info
     print("Preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -2972,7 +3064,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     # Test
@@ -3631,7 +3723,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         vllm_policy = VllmGeneration(cluster, vllm_config)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         # Prepare input data (batch size 2)
@@ -3744,7 +3836,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
     lm_policy = Policy(cluster, train_config, tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -3818,7 +3910,7 @@ def test_vllm_generation_with_stop(cluster, test_input_data, tokenizer, is_eval)
         lm_policy = Policy(cluster, automodel_config, tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+        state_dict_info = lm_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")
@@ -3957,7 +4049,7 @@ async def test_vllm_refit_non_colocated_update_weights(
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
-    state_dict_info = lm_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = lm_policy.prepare_refit_info()
     vllm_generation.prepare_refit_info(state_dict_info)
 
     print("refitting vllm policy...")
@@ -4080,9 +4172,7 @@ def test_vllm_generation_with_megatron_training(
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -4244,9 +4334,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
         megatron_policy = Policy(moe_cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM policy with Megatron weights...")
@@ -4372,7 +4460,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
     print("preparing refit info...")
-    state_dict_info = megatron_policy.prepare_refit_info(refit_payload_mode="hf_export")
+    state_dict_info = megatron_policy.prepare_refit_info()
     vllm_policy.prepare_refit_info(state_dict_info)
 
     print("Refitting vLLM policy with Megatron...")
@@ -4488,9 +4576,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_policy.prepare_refit_info(state_dict_info)
 
         print("Refitting vLLM with Megatron PP=2 weights...")
@@ -4556,9 +4642,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
         vllm_generation = VllmGeneration(cluster, vllm_config)
 
         # prepare refit info
-        state_dict_info = megatron_policy.prepare_refit_info(
-            refit_payload_mode="hf_export"
-        )
+        state_dict_info = megatron_policy.prepare_refit_info()
         vllm_generation.prepare_refit_info(state_dict_info)
 
         print("refitting vllm policy...")

@@ -26,6 +26,7 @@ from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import ray
 import torch
 from pydantic import BaseModel, model_validator
@@ -119,6 +120,24 @@ _REWARD_PENALTY_METRICS = {
         "malformed_think_tag_rate",
     ),
 }
+
+_SHARED_GENRM_METRICS = (
+    "reward_score_raw",  # Selected score source before length/style shaping.
+    "reward_rubric_aggregate_valid",  # Valid rubric parses, including the tiebreaker; null on failure.
+    "reward_overall_score_raw",  # GenRM overall score before shaping.
+    "reward_overall_score",  # Overall score after length/style shaping.
+    "reward_length_adjustment",  # Difference between adjusted and raw scores.
+    "genrm_parse_failure_rate_per_group",
+    "genrm_rubric_parse_failure_rate_per_group",
+    "genrm_input_tokens_per_comparison_mean",
+    "genrm_input_tokens_per_comparison_p50",
+    "genrm_input_tokens_per_comparison_p95",
+    "genrm_output_tokens_per_comparison_mean",
+    "genrm_output_tokens_per_comparison_p50",
+    "genrm_output_tokens_per_comparison_p95",
+    "genrm_output_tokens_total_per_group",
+    "genrm_max_output_tokens_hit_rate_per_group",
+)
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -3000,6 +3019,123 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+def _single_group_reward_diagnostics(results: list[dict]) -> dict[str, float]:
+    """Summarize reward variation within one prompt's generations."""
+    metrics: dict[str, float] = {}
+    total_rewards = [float(result["full_result"]["reward"]) for result in results]
+    if total_rewards:
+        metrics["zero_advantage_group_pct"] = (
+            100.0 if len(set(total_rewards)) == 1 else 0.0
+        )
+        if len(total_rewards) > 1:
+            metrics["total_reward/std_in_group"] = statistics.stdev(total_rewards)
+
+    # Require every response to have a numeric raw score; parse failures must
+    # not be silently counted as zeros or ties.
+    for key in ("reward_score_raw", "reward_overall_score_raw"):
+        values = [result["full_result"].get(key) for result in results]
+        if not values or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            continue
+        numeric_values = [float(value) for value in values]
+        pair_count = len(numeric_values) * (len(numeric_values) - 1) // 2
+        tie_count = sum(
+            left == right
+            for index, left in enumerate(numeric_values)
+            for right in numeric_values[index + 1 :]
+        )
+        metrics[f"{key}/all_equal_in_group_pct"] = (
+            100.0 if len(set(numeric_values)) == 1 else 0.0
+        )
+        if pair_count:
+            metrics[f"{key}/pairwise_tie_pct"] = 100.0 * tie_count / pair_count
+            metrics[f"{key}/std_in_group"] = statistics.stdev(numeric_values)
+    return metrics
+
+
+def _group_reward_diagnostics(
+    results: list[dict], group_size: int | None = None
+) -> dict[str, float]:
+    """Compute diagnostics over the actual prompt groups in ``results``."""
+    if group_size is None or group_size == len(results):
+        return _single_group_reward_diagnostics(results)
+    if group_size <= 0 or len(results) % group_size:
+        raise ValueError("group_size must evenly divide results")
+
+    per_group = [
+        _single_group_reward_diagnostics(results[start : start + group_size])
+        for start in range(0, len(results), group_size)
+    ]
+    metrics: dict[str, float] = {}
+    for key in set().union(*(group.keys() for group in per_group)):
+        values = [group[key] for group in per_group if key in group]
+        if key.endswith("/std_in_group"):
+            metrics[f"{key}/mean"] = sum(values) / len(values)
+            metrics[f"{key}/p05"] = float(np.percentile(values, 5))
+            metrics[f"{key}/p95"] = float(np.percentile(values, 95))
+        else:
+            metrics[key] = sum(values) / len(values)
+    return metrics
+
+
+def _nemo_gym_group_metrics(
+    results: list[dict], group_size: int | None = None
+) -> dict[str, Any]:
+    """Compute metrics shared by both NeMo-Gym rollout implementations.
+
+    Used by the batched NeMo-Gym rollout path (``run_async_nemo_gym_rollout``)
+    and the single-controller path (``AsyncNemoGymRolloutImpl``). ``group_size``
+    identifies prompt-group boundaries; when omitted, all results are treated as
+    one group.
+    """
+    if not results:
+        return {}
+
+    metrics: dict[str, Any] = _group_reward_diagnostics(results, group_size)
+    valid_token_counts = [
+        result
+        for result in results
+        if result.get("token_extraction_valid") is True
+        and all(
+            isinstance(result.get(key), int)
+            and not isinstance(result.get(key), bool)
+            and result[key] >= 0
+            for key in ("reasoning_token_count", "response_token_count")
+        )
+    ]
+    # Fraction of samples where either the reasoning-token count or response-token
+    # count could not be extracted as a non-negative integer.
+    metrics["reasoning_response_token_extraction_failure_rate"] = 1 - len(
+        valid_token_counts
+    ) / len(results)
+    for key, values in (
+        (
+            "reasoning_tokens_per_sample",
+            [result["reasoning_token_count"] for result in valid_token_counts],
+        ),
+        (
+            "response_tokens_per_sample",
+            [result["response_token_count"] for result in valid_token_counts],
+        ),
+    ):
+        if values:
+            metrics.update(calculate_single_metric(values, len(values), key))
+            metrics[f"{key}/p05"] = pct(values, 5)
+            metrics[f"{key}/p95"] = pct(values, 95)
+
+    for key in _SHARED_GENRM_METRICS:
+        values = [
+            float(result["full_result"][key])
+            for result in results
+            if isinstance(result["full_result"].get(key), (bool, int, float))
+        ]
+        if values:
+            metrics.update(calculate_single_metric(values, len(values), key))
+    return metrics
+
+
 # Responses ``incomplete_details.reason`` values that mean the final model call
 # ran out of tokens. NeMo-Gym normalizes every length stop to
 # ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
@@ -3131,7 +3267,7 @@ def _postprocess_single_nemo_gym_group(
             max_total_tokens_per_sample = policy_generation.cfg[
                 "max_total_sequence_length"
             ]
-        all_sample_metrics = [
+        all_sample_metrics: list[dict[str, Any]] = [
             {
                 "total_reward": r["full_result"]["reward"],
                 "assistant_tokens": sum(
@@ -3158,6 +3294,8 @@ def _postprocess_single_nemo_gym_group(
             }
             for r in results
         ]
+    # Report diagnostics for the final rewards after all training-time adjustments.
+    group_metrics = _nemo_gym_group_metrics(results, group_size)
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
@@ -3165,8 +3303,8 @@ def _postprocess_single_nemo_gym_group(
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
-
         rollout_metrics = {
+            **group_metrics,
             **calculate_single_metric(
                 turn_counts,
                 batch_size,
@@ -3208,7 +3346,6 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
-
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
@@ -3230,8 +3367,10 @@ def _postprocess_single_nemo_gym_group(
                 agent_truncations
             ) / len(agent_truncations)
 
-            keys = agent_results[0].keys()
+            keys = set().union(*(result.keys() for result in agent_results))
             for key in keys:
+                if key in _SHARED_GENRM_METRICS:
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results

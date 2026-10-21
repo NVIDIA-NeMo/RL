@@ -172,6 +172,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 
@@ -196,7 +197,7 @@ policy:
   make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
   scheduler: null
 
   offload_optimizer_for_logprob: False

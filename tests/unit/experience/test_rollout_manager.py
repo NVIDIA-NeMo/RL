@@ -1200,6 +1200,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 0.0,
+                "reward_score_raw": 0.0,
+                "optional_score": 1.0,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1213,6 +1215,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
             ],
             env_extras={
                 "reward": 1.0,
+                "reward_score_raw": 1.0,
+                "optional_score": None,
                 "total_tokens_per_sample": 1000,
                 "gen_tokens_per_sample": 1000,
             },
@@ -1232,6 +1236,8 @@ def test_nemo_gym_rollout_metrics_include_per_agent_live_metrics():
     assert metrics["agent/gen_tokens_per_sample/mean"] == pytest.approx(2.0)
     assert metrics["agent/gen_tokens_per_sample/max"] == 3
     assert metrics["agent/gen_tokens_per_sample/histogram"] == [1, 3]
+    assert metrics["agent/optional_score/mean"] == pytest.approx(0.5)
+    assert "agent/reward_score_raw/mean" not in metrics
 
 
 def test_nemo_gym_receipt_rollout_metrics_include_per_agent_live_metrics():

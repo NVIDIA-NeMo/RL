@@ -100,7 +100,7 @@ def _validate_pair_safe_packing(
     if not raw_megatron_config["enabled"]:
         raise ValueError(
             "MPO with sequence packing requires the Megatron backend; the fused "
-            "packed-loss path is not implemented for DTensor."
+            "packed-loss path is not implemented for Automodel."
         )
     megatron_config = cast(MegatronConfig, raw_megatron_config)
 

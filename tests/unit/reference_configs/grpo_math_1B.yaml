@@ -73,7 +73,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after weight updates.
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -104,11 +104,19 @@ loss_fn:
   use_importance_sampling_correction: false
   # "tis"          – clamp IS weights to [min, max], where min defaults to 0
   # "icepop"       – zero out tokens with IS weight outside [min, max]
+  # "adaptive-ppo-clip" – advantage-aware token filtering with an entropy-adaptive upper bound
   # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
-  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / seq-mask-tis.
+  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / adaptive-ppo-clip / seq-mask-tis.
   truncated_importance_sampling_ratio_min: null
+  # adaptive-ppo-clip only; ignored otherwise. The A > 0 upper bound is truncated_importance_sampling_ratio + k.
+  # After each step, k rises by k_step if approx_entropy is below the target and falls by k_step if above,
+  # clamped to [0, k_max]. Tokens with IS weight above outer_bound are dropped.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
@@ -255,6 +263,9 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -346,14 +357,20 @@ policy:
     env_vars: null
 
   draft:
-    speculator_type: eagle3
     enabled: false
     model_name: null
     loss_weight: 0.1
+    # Drafter family: "eagle3" (Megatron backend, or Automodel with the
+    # speculators-style TTT trainer), "dspark" / "dflash" (Automodel backend).
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
     token_chunk_size: 4096
     optimizer: null
+    learning_rate: 1.0e-04
+    ttt_steps: 3
+    ttt_step_loss_decay: 1.0
+    train_embed_and_head: true
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
@@ -454,7 +471,7 @@ policy:
       prefix_cache_ttl_seconds: 300.0  # MCore default coordinator cache-entry lifetime.
       prefix_caching_routing_alpha: 1.0  # MCore default load penalty for prefix-affinity routing.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload", "recompute".
+      kv_cache_management_mode: "recompute"  # Must agree with recompute_kv_cache_after_weight_updates. Options: "persist", "offload", "recompute".
       async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
       materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
       num_speculative_tokens: 0
@@ -468,6 +485,8 @@ policy:
       http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
@@ -613,6 +632,12 @@ data_plane:
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
     num_storage_units: null          # null = 2 per selected node
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+    # Spill Mooncake memory to node-local SSD.
+    # Each segment owner (storage unit, or client) writes under its own subdir of path.
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      offload_threshold: 0.5         # offload above this share of segment memory
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
                                      # 8 clients/node is ~8 GiB off the training

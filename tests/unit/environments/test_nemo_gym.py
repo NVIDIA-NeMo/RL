@@ -46,6 +46,7 @@ from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
     NemoGym,
     NemoGymConfig,
+    _count_structured_response_tokens,
     _wait_for_external_services,
     build_reward_component_columns,
     extract_external_service_readiness,
@@ -84,6 +85,39 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+class _WhitespaceTokenizer:
+    def __init__(self):
+        self.encoded = []
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        self.encoded.append(text)
+        return text.split()
+
+
+def test_count_structured_response_tokens_strips_text():
+    tokenizer = _WhitespaceTokenizer()
+    assert _count_structured_response_tokens(
+        tokenizer, reasoning_text="  think carefully  ", answer_text="  final answer\n"
+    ) == (2, 2)
+    assert tokenizer.encoded == ["think carefully", "final answer"]
+
+
+def test_count_structured_response_tokens_allows_one_empty_component():
+    assert _count_structured_response_tokens(
+        _WhitespaceTokenizer(), reasoning_text="", answer_text="answer only"
+    ) == (0, 2)
+
+
+def test_count_structured_response_tokens_rejects_missing_text():
+    assert (
+        _count_structured_response_tokens(
+            _WhitespaceTokenizer(), reasoning_text="", answer_text=""
+        )
+        is None
+    )
 
 
 def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
@@ -1484,10 +1518,34 @@ def test_run_rollouts_takes_a_trace_carrier_without_disturbing_the_body():
         asyncio.run(stream.__anext__())
 
 
-def test_nemo_gym_postprocess_uses_batch_decode():
+@pytest.mark.parametrize(
+    ("token_fields", "expected_count"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param(
+            {
+                "reasoning_text": "think carefully",
+                "answer_text": "final answer",
+            },
+            2,
+            id="genrm",
+        ),
+        pytest.param({"reasoning_text": None}, None, id="aegis-without-reasoning"),
+        pytest.param(
+            {"reasoning_text": "safety reasoning"},
+            None,
+            id="aegis-with-reasoning",
+        ),
+    ],
+)
+def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     class _Tokenizer:
         def __init__(self):
             self.batch_decode_calls = []
+
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return text.split()
 
         def batch_decode(self, batch):
             self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
@@ -1498,11 +1556,15 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         "response": {
             "output": [
                 {
+                    "type": "reasoning",
+                    "summary": [{"text": "think carefully"}],
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
                 },
                 {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "final answer"}],
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
@@ -1511,6 +1573,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         },
         "responses_create_params": {"input": []},
     }
+    nemo_gym_result.update(token_fields)
 
     class _MockSelf:
         cfg = {}
@@ -1529,6 +1592,14 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert result["message_log"][1]["token_ids"].tolist() == [3]
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["reasoning_token_count"] == expected_count
+    assert result["response_token_count"] == expected_count
+    assert result["token_extraction_valid"] is (expected_count is not None)
+    for key, value in token_fields.items():
+        if expected_count is None:
+            assert result["full_result"][key] == value
+        else:
+            assert key not in result["full_result"]
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
@@ -2248,6 +2319,9 @@ def test_nemo_gym_sanity(
     def _standardize_single_result(d: dict):
         d = deepcopy(d)
         d.pop("full_result", None)
+        d.pop("reasoning_token_count", None)
+        d.pop("response_token_count", None)
+        d.pop("token_extraction_valid", None)
 
         # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
         d["message_log"] = d["message_log"][:2]

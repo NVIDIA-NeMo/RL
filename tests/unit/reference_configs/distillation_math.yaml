@@ -88,7 +88,7 @@ policy: &POLICY_BASE
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
-            # when using Dtensor, we need to set foreach
+            # when using Automodel, we need to set foreach
             # and fused to False
             foreach: False
             fused: False
@@ -133,6 +133,9 @@ policy: &POLICY_BASE
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
         gradient_accumulation_fusion: false
         use_fused_weighted_squared_relu: false
 

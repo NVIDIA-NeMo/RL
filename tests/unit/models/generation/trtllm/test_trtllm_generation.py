@@ -210,8 +210,8 @@ async def test_generate_async_dispatches_round_robin_and_returns_leader_index():
             }
         )
 
-    generation.worker_group.run_single_worker_single_data.side_effect = (
-        lambda **_: worker_result()
+    generation.worker_group.run_single_worker_single_data.side_effect = lambda **_: (
+        worker_result()
     )
     data = BatchedDataDict(
         {
@@ -323,6 +323,35 @@ def test_generation_lifecycle_routes_by_colocation(
         finish_method
     ] * 2
     assert [c.kwargs["worker_idx"] for c in run_one.call_args_list] == [0, 1]
+
+
+def test_prepare_refit_info_skips_missing_metadata_and_dispatches_present_metadata(
+    monkeypatch,
+):
+    generation = _bare_generation()
+    generation._engine_owner_indices = [3, 7]
+    run_one = generation.worker_group.run_single_worker_single_data
+    ray_get = MagicMock()
+    monkeypatch.setattr(trtllm_generation.ray, "get", ray_get)
+
+    assert generation.prepare_refit_info(None) is None
+    run_one.assert_not_called()
+    ray_get.assert_not_called()
+
+    state_dict_info = {"weight": {"shape": [2, 2]}}
+    futures = [SimpleNamespace(), SimpleNamespace()]
+    run_one.side_effect = futures
+
+    assert generation.prepare_refit_info(state_dict_info) is None
+    assert [call.kwargs for call in run_one.call_args_list] == [
+        {
+            "method_name": "prepare_refit_info_async",
+            "worker_idx": worker_idx,
+            "state_dict_info": state_dict_info,
+        }
+        for worker_idx in [3, 7]
+    ]
+    ray_get.assert_called_once_with(futures)
 
 
 @pytest.mark.parametrize(

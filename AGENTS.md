@@ -1,6 +1,6 @@
 # NeMo-RL
 
-NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
+NeMo-RL is an RLHF training framework built on Ray and PyTorch (Automodel / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
 
 ## Skills
 

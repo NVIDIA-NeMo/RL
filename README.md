@@ -11,6 +11,7 @@
 
 ## 📣 News
 
+* [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
 * [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
 * [08/26/2026] Qwen3.8-Flash-Next RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/qwen3-8-flash-next-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/qwen3-8-flash-next-support/docs/guides/models/qwen/qwen3-8-flash-next.md).
@@ -39,9 +40,9 @@
 <summary>Previous News</summary>
 
 * [02/04/2026] LoRA Support
-    * LoRA SFT is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
-    * LoRA GRPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
-    * LoRA DPO is supported on both [DTensor](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
+    * LoRA SFT is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1556) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1629) backends.
+    * LoRA GRPO is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1797) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/1889) backends.
+    * LoRA DPO is supported on both [Automodel](https://github.com/NVIDIA-NeMo/RL/pull/1826) and [Megatron Core](https://github.com/NVIDIA-NeMo/RL/pull/2125) backends.
     * Nano v3 LoRA recipes:
         * [sft-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml)
@@ -92,7 +93,7 @@ Please refer to our [design documents](https://github.com/NVIDIA-NeMo/RL/tree/ma
 ### Training Backends
 NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
 
-- **DTensor** - PyTorch's next-generation distributed training with improved memory efficiency (PyTorch-native TP, SP, PP, CP, and FSDP2).
+- [**Automodel**](https://github.com/NVIDIA-NeMo/Automodel) - Accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, CP, EP, and FSDP2).
 - [**Megatron**](https://github.com/NVIDIA-NeMo/Megatron-Bridge) - NVIDIA's high-performance training framework for scaling to large models with 6D parallelisms.
 
 The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](docs/design-docs/training-backends.md).
@@ -127,11 +128,11 @@ For detailed information on backend selection, configuration, and examples, see 
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
 - ✅ **Learning Algorithms** - GRPO/GSPO/DAPO, SFT(with LoRA), DPO, and On-policy distillation.
 - ✅ **Multi-Turn RL** - Multi-turn generation and training for RL with tool use, games, etc.
-- ✅ **Advanced Parallelism with DTensor** - PyTorch FSDP2, TP, CP, and SP for efficient training (through NeMo AutoModel).
+- ✅ **Advanced Parallelism with Automodel** - PyTorch FSDP2, TP, CP, SP, and EP for efficient training (through NeMo AutoModel).
 - ✅ **Larger Model Support with Longer Sequences** - Performant parallelisms with Megatron Core (TP/PP/CP/SP/EP/FSDP) (through NeMo Megatron Bridge). 
-- ✅ **Sequence Packing** - Sequence packing in both DTensor and Megatron Core for huge training performance gains.
+- ✅ **Sequence Packing** - Sequence packing in both Automodel and Megatron Core for huge training performance gains.
 - ✅ **Fast Generation** - vLLM backend for optimized inference.
-- ✅ **Hugging Face Integration** - OOB support in the DTensor path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
+- ✅ **Hugging Face Integration** - OOB support in the Automodel path, CKPT conversion available for Megatron path through Megatron Bridge middleware.
 - ✅ **End-to-End FP8 Low-Precision Training** - Support for Megatron Core FP8 training and FP8 vLLM generation.
 - ✅ **Vision Language Models (VLM)** - Support SFT and GRPO on VLMs.
 - ✅ **Megatron Inference** - Megatron Inference for fast Day-0 support for new Megatron models (avoid weight conversion).
@@ -201,7 +202,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ### Bare-Metal Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
+Use this quick start to get going with either the Automodel or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -211,7 +212,7 @@ For more examples and setup details, continue to the [Prerequisites](#prerequisi
 <table style="border-collapse:collapse; width:100%; table-layout:fixed;">
   <thead>
     <tr>
-      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Native PyTorch (DTensor)</th>
+      <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Automodel</th>
       <th style="border:1px solid #d0d7de; padding:8px; text-align:left; width:50%; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">Megatron Core</th>
     </tr>
   </thead>
@@ -227,7 +228,7 @@ uv venv</code></pre>
     </tr>
     <tr>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
-        <strong>Run GRPO (DTensor)</strong>
+        <strong>Run GRPO (Automodel)</strong>
         <pre style="white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere;"><code class="language-sh">uv run python examples/run_grpo.py</code></pre>
       </td>
       <td style="border:1px solid #d0d7de; padding:8px; vertical-align:top; word-break:break-word; overflow-wrap:anywhere; white-space:normal;">
@@ -350,7 +351,7 @@ uv run python examples/run_grpo.py \
   logger.num_val_samples_to_print=10
 ```
 
-The default configuration uses the DTensor training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
+The default configuration uses the Automodel training backend. We also provide a config `examples/configs/grpo_math_1B_megatron.yaml` which is set up to use the Megatron backend out of the box.
 
 To train using this config on a single GPU:
 
@@ -430,7 +431,7 @@ NeMo RL supports two distillation recipes:
 | Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
 |---|---|---|---|---|---|---|
 | MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
-| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | Automodel |
 
 ## On-policy Distillation
 
@@ -492,7 +493,7 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 ```
 
 > [!NOTE]
-> X-token distillation runs on the DTensor backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
+> X-token distillation runs on the Automodel backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
 
 ### X-Token Off-Policy Distillation Single Node
 
@@ -500,14 +501,14 @@ To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as 
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+  teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
 By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path (per teacher) is the only required override. You can customize other parameters with command-line overrides. For example:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+  teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
   policy.model_name="meta-llama/Llama-3.2-1B" \
   teachers.0.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
@@ -519,7 +520,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
+COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.aligner.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
