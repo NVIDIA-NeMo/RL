@@ -23,6 +23,7 @@ import torch
 import torch.distributed as dist
 
 from nemo_rl.models.megatron.draft import utils as draft_utils
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
 
 class _FalseyExporter:
@@ -420,7 +421,8 @@ def _draft_refit_worker(*, draft_model: object | None) -> Any:
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.cfg = {"draft": {"enabled": True}}
+    # Policy.__init__ hands workers the validated model, not the raw mapping.
+    worker.cfg = {"draft": Eagle3DraftConfig(enabled=True, model_name=None)}
     worker.model = object()
     worker.megatron_bridge = _EmptyBridge()
     worker.refit_conversion_tasks = []

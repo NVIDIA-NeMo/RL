@@ -133,6 +133,7 @@ from nemo_rl.models.megatron.train import (
     strip_context_parallel_local_loss_metric,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -3643,8 +3644,8 @@ class MegatronPolicyWorkerImpl(
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield this CP/TP lane's draft weights from its last PP stage."""
         draft_model = self.draft_model
-        draft_enabled = draft_model is not None or bool(
-            self.cfg.get("draft", {}).get("enabled", False)
+        draft_enabled = draft_model is not None or draft_refit_enabled(
+            self.cfg.get("draft")
         )
         if not draft_enabled:
             return
