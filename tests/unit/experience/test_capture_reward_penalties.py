@@ -417,7 +417,7 @@ def test_metric_pooling_mixes_low_and_high_effort_groups():
 
 
 def test_reward_settings_ignore_extras_and_inactive_options():
-    baseline = CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None)
+    baseline = CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
     config = RewardPenaltyConfig.model_validate(
         {
             "experiment_note": "retry",
@@ -427,7 +427,7 @@ def test_reward_settings_ignore_extras_and_inactive_options():
     inactive_effort = EffortLevelsConfig(
         low_weight=0, low_string="changed", low_ub=123, note="unused"
     )
-    assert CaptureRewardSettings.from_configs(config, inactive_effort) == baseline
+    assert CaptureRewardSettings.from_configs(config, inactive_effort, None) == baseline
     assert (
         CaptureRewardSettings.from_state({"version": 1, "penalties": {}, "effort": {}})
         == baseline
@@ -441,6 +441,7 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
             penalize_unwanted_tokens=True, token_ids={"unwanted": [42, 7, 42]}
         ),
         EffortLevelsConfig(low_weight=1, low_string="budget"),
+        None,
     )
     restored = CaptureRewardSettings.from_state(
         {
@@ -479,14 +480,21 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
         ),
         ({"effort": None}, "effort.enabled"),
         (
-            {"penalties": {"penalize_malformed_think_tag": True}},
+            {
+                "penalties": {
+                    "penalize_malformed_think_tag": True,
+                    "thinking_tags": ["<think>", "</think>"],
+                }
+            },
             "penalize_malformed_think_tag",
         ),
     ],
 )
 def test_reward_settings_reject_semantic_changes_with_field_names(change, expected):
     settings = CaptureRewardSettings.from_configs(
-        RewardPenaltyConfig(), EffortLevelsConfig(low_weight=1, low_string="budget")
+        RewardPenaltyConfig(),
+        EffortLevelsConfig(low_weight=1, low_string="budget"),
+        None,
     )
     changed = CaptureRewardSettings.from_state({**settings.to_state(), **change})
     with pytest.raises(ValueError, match=expected):
@@ -503,6 +511,12 @@ def test_reward_settings_reject_semantic_changes_with_field_names(change, expect
         {"version": 2, "penalties": {}, "effort": None},
         {"version": True, "penalties": {}, "effort": None},
         {"version": 1, "penalties": {"penalize_unwanted_tokens": True}, "effort": None},
+        # The think-tag penalty without its resolved tags.
+        {
+            "version": 1,
+            "penalties": {"penalize_malformed_think_tag": True},
+            "effort": None,
+        },
         {
             "version": 1,
             "penalties": {},
@@ -513,6 +527,37 @@ def test_reward_settings_reject_semantic_changes_with_field_names(change, expect
 def test_reward_settings_reject_invalid_records(state):
     with pytest.raises(ValueError):
         CaptureRewardSettings.from_state(state)
+
+
+def _think_settings(open_id, close_id, tags=("<think>", "</think>")):
+    return CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(
+            penalize_malformed_think_tag=True,
+            token_ids={"think_open": open_id, "think_close": close_id},
+        ),
+        None,
+        tags,
+    )
+
+
+def test_reward_settings_persist_think_tag_rules():
+    saved = CaptureRewardSettings.from_state(_think_settings(1, 2).to_state())
+    assert saved == _think_settings(1, 2)
+    saved.require_compatible(_think_settings(1, 2))
+    with pytest.raises(ValueError, match="think_open/think_close"):
+        saved.require_compatible(_think_settings(3, 4))
+    with pytest.raises(ValueError, match="thinking_tags"):
+        saved.require_compatible(_think_settings(1, 2, ("<t>", "</t>")))
+    # Inferred IDs (none configured) differ from configured ones.
+    with pytest.raises(ValueError, match="think_open/think_close"):
+        saved.require_compatible(_think_settings(None, None))
+    # Rules are only part of the identity while the penalty is on.
+    off = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(token_ids={"think_open": 3, "think_close": 4}),
+        None,
+        ("<t>", "</t>"),
+    )
+    assert off == CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
 
 
 def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():

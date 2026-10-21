@@ -201,7 +201,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -4725,6 +4725,7 @@ class SingleControllerActor:
         return CaptureRewardSettings.from_configs(
             self._master_config.reward_penalties,
             get_effort_config(self._master_config.env),
+            get_nemo_gym_thinking_tags(self._master_config.env),
         )
 
     async def _capture_rollout_checkpoint_cut(
