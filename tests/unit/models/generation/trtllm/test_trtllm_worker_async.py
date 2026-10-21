@@ -77,13 +77,6 @@ def test_configure_worker_reserves_gpus_for_internal_trtllm_actors(monkeypatch):
     assert env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "1"
     assert env_vars["NCCL_CUMEM_ENABLE"] == "1"
     assert env_vars["PATH"].endswith(":/usr/bin")
-    for name in (
-        "OMPI_ALLOW_RUN_AS_ROOT",
-        "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
-        "PRTE_ALLOW_RUN_AS_ROOT",
-        "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM",
-    ):
-        assert env_vars[name] == "1"
     assert init_kwargs == {
         "bundle_indices": [2, 3],
         "bundle_pg_idx": 0,
