@@ -159,6 +159,7 @@ project-includes = [
   "nemo_rl/data_plane/adapters/local.py",
   "nemo_rl/data_plane/adapters/mooncake_ssd_offload.py",
   "nemo_rl/data_plane/adapters/noop.py",
+  "nemo_rl/data_plane/adapters/tq_kv_meta_patch.py",
   "nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py",
   "nemo_rl/data_plane/adapters/transfer_queue.py",
   "nemo_rl/data_plane/adapters/transfer_queue_env.py",

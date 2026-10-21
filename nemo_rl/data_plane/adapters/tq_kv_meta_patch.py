@@ -24,6 +24,8 @@ import inspect
 import logging
 from typing import Any
 
+import ray
+import transfer_queue.interface as interface
 from transfer_queue.metadata import BatchMeta
 
 logger = logging.getLogger(__name__)
@@ -94,8 +96,6 @@ def assert_stock_source(cls: type) -> None:
 
 
 def make_patched_controller(actor_class: Any) -> Any:
-    import ray
-
     base = actor_class.__ray_metadata__.modified_class
     assert_stock_source(base)
 
@@ -108,8 +108,6 @@ def make_patched_controller(actor_class: Any) -> Any:
 
 def configure_controller_patch() -> None:
     """Make ``tq.init`` start the patched controller; call before it."""
-    import transfer_queue.interface as interface
-
     actor_class = interface.TransferQueueController
     if not getattr(actor_class.__ray_metadata__.modified_class, "_nrl_kv_meta_patched", False):
         interface.TransferQueueController = make_patched_controller(actor_class)
