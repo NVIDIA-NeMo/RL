@@ -259,16 +259,19 @@ class BackendPool:
 
 
 class LoadBalancer:
-    def __init__(self, pool: BackendPool, port: int) -> None:
+    def __init__(self, pool: BackendPool, port: int, backend_connections: int = 150) -> None:
         self.pool = pool
         self.port = port
+        self.backend_connections = backend_connections
         self._proxy_session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
         # limit=5000: enough for 26 backends × ~50 concurrent reqs, but capped
         # to prevent unbounded memory growth that caused OOM at 31GB with limit=0.
+        # limit_per_host caps the requests one backend sees; set it to at least
+        # the backend's --max-num-seqs or the LB queues what vLLM could batch.
         self._proxy_session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=5000, limit_per_host=150),
+            connector=aiohttp.TCPConnector(limit=5000, limit_per_host=self.backend_connections),
             timeout=aiohttp.ClientTimeout(total=1800),
         )
         await self.pool.start()
@@ -565,16 +568,25 @@ def main() -> None:
         default=5.0,
         help="Seconds between health checks / registry refresh",
     )
+    parser.add_argument(
+        "--backend-connections",
+        type=int,
+        default=150,
+        help="Max concurrent proxied requests per backend",
+    )
     args = parser.parse_args()
+    if args.backend_connections <= 0:
+        parser.error("--backend-connections must be positive")
 
     pool = BackendPool(args.registry_dir, args.group_id, args.health_interval)
-    lb = LoadBalancer(pool, args.port)
+    lb = LoadBalancer(pool, args.port, args.backend_connections)
     app = lb.make_app()
 
     log.info(
-        "Starting external vLLM load balancer on port %d (group=%s)",
+        "Starting external vLLM load balancer on port %d (group=%s, %d connections per backend)",
         args.port,
         args.group_id,
+        args.backend_connections,
     )
     log.info("Registry: %s", pool.registry_file)
 

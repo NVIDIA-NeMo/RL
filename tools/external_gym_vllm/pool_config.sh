@@ -120,6 +120,7 @@ register_external_vllm_pool() {
   local replicas=""
   local tensor_parallel_size=""
   local lb_port=""
+  local lb_backend_connections="150"
   local url_placeholder=""
   local group_id=""
   local served_model_name="model"
@@ -137,6 +138,7 @@ register_external_vllm_pool() {
       --replicas) replicas="${2:?value required for $1}"; shift 2 ;;
       --tensor-parallel-size) tensor_parallel_size="${2:?value required for $1}"; shift 2 ;;
       --lb-port) lb_port="${2:?value required for $1}"; shift 2 ;;
+      --lb-backend-connections) lb_backend_connections="${2:?value required for $1}"; shift 2 ;;
       --url-placeholder) url_placeholder="${2:?value required for $1}"; shift 2 ;;
       --group-id) group_id="${2:?value required for $1}"; shift 2 ;;
       --served-model-name) served_model_name="${2:?value required for $1}"; shift 2 ;;
@@ -166,6 +168,8 @@ register_external_vllm_pool() {
   _external_vllm_require_positive_integer \
     "${pool}_TENSOR_PARALLEL_SIZE" "${tensor_parallel_size}" || return
   _external_vllm_require_port "${pool}_LB_PORT" "${lb_port}" || return
+  _external_vllm_require_positive_integer \
+    "${pool}_LB_BACKEND_CONNECTIONS" "${lb_backend_connections}" || return
   _external_vllm_require_port "${pool}_VLLM_PORT" "${vllm_port}" || return
   _external_vllm_require_positive_integer \
     "${pool}_STARTUP_TIMEOUT" "${startup_timeout}" || return
@@ -222,6 +226,7 @@ register_external_vllm_pool() {
   _external_vllm_set "${pool}" REPLICAS "${replicas}"
   _external_vllm_set "${pool}" TENSOR_PARALLEL_SIZE "${tensor_parallel_size}"
   _external_vllm_set "${pool}" LB_PORT "${lb_port}"
+  _external_vllm_set "${pool}" LB_BACKEND_CONNECTIONS "${lb_backend_connections}"
   _external_vllm_set "${pool}" URL_PLACEHOLDER "${url_placeholder}"
   _external_vllm_set "${pool}" SERVED_MODEL_NAME "${served_model_name}"
   _external_vllm_set "${pool}" VLLM_PORT "${vllm_port}"

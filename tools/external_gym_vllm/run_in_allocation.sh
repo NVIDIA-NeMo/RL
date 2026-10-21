@@ -108,6 +108,7 @@ declare -A state_dirs=()
 declare -A lb_state_dirs=()
 declare -A pool_urls=()
 declare -A launch_modes=()
+declare -A lb_backend_connections=()
 
 total_external_nodes=0
 max_startup_timeout=0
@@ -135,6 +136,7 @@ for pool in "${pool_names[@]}"; do
   served_model_names["${pool}"]=$(pool_value "${pool}" SERVED_MODEL_NAME model)
   backend_ports["${pool}"]=$(pool_value "${pool}" VLLM_PORT 8000)
   lb_ports["${pool}"]=$(require_pool_value "${pool}" LB_PORT)
+  lb_backend_connections["${pool}"]=$(pool_value "${pool}" LB_BACKEND_CONNECTIONS 150)
   startup_timeouts["${pool}"]=$(pool_value "${pool}" STARTUP_TIMEOUT 3600)
   placeholders["${pool}"]=$(require_pool_value "${pool}" URL_PLACEHOLDER)
   group_ids["${pool}"]=$(pool_value "${pool}" GROUP_ID "inline-${pool,,}-${SLURM_JOB_ID}")
@@ -158,9 +160,10 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
-  for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE VLLM_PORT LB_PORT STARTUP_TIMEOUT; do
+  for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE VLLM_PORT LB_PORT LB_BACKEND_CONNECTIONS STARTUP_TIMEOUT; do
     case "${numeric_suffix}" in
       REPLICAS) numeric_value="${replicas[${pool}]}" ;;
+      LB_BACKEND_CONNECTIONS) numeric_value="${lb_backend_connections[${pool}]}" ;;
       TENSOR_PARALLEL_SIZE) numeric_value="${tensor_parallel_sizes[${pool}]}" ;;
       VLLM_PORT) numeric_value="${backend_ports[${pool}]}" ;;
       LB_PORT) numeric_value="${lb_ports[${pool}]}" ;;
@@ -599,7 +602,7 @@ for pool in "${pool_names[@]}"; do
     --ntasks=1 \
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
+    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}' '${lb_backend_connections[${pool}]}'" &
   lb_step_pids+=("$!")
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 done

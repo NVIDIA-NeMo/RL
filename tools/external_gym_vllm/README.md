@@ -74,6 +74,7 @@ The generated fields are:
 | `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
+| `POOL_LB_BACKEND_CONNECTIONS` | no | `150` | Requests the load balancer keeps in flight per replica (`--lb-backend-connections`); excess requests wait in the LB. Set it to at least the replicas' `--max-num-seqs`. |
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
 | `POOL_DISPLAY_NAME` | no | pool name | Human-readable log label. |

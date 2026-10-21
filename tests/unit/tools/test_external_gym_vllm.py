@@ -315,6 +315,22 @@ def test_load_balancer_accepts_payloads_larger_than_aiohttp_default():
 
 
 @pytest.mark.asyncio
+async def test_load_balancer_caps_requests_per_backend():
+    pool = BackendPool("/tmp", "test")
+    default_lb = LoadBalancer(pool, 9213)
+    load_balancer = LoadBalancer(pool, 9213, backend_connections=256)
+    with patch.object(pool, "start", AsyncMock()), patch.object(pool, "stop", AsyncMock()):
+        await default_lb.start()
+        await load_balancer.start()
+        try:
+            assert default_lb._proxy_session.connector.limit_per_host == 150
+            assert load_balancer._proxy_session.connector.limit_per_host == 256
+        finally:
+            await default_lb.stop()
+            await load_balancer.stop()
+
+
+@pytest.mark.asyncio
 async def test_proxy_returns_503_when_no_backend_is_available():
     load_balancer = LoadBalancer(BackendPool("/tmp", "test"), 9213)
     request = MagicMock(spec=web.Request)
@@ -383,10 +399,12 @@ def test_load_balancer_watchdog_forwards_term_to_child(tmp_path):
     fake_python = tmp_path / "fake-python"
     child_started = tmp_path / "child-started"
     child_stopped = tmp_path / "child-stopped"
+    child_args = tmp_path / "child-args"
     fake_python.write_text(
         textwrap.dedent(
             f"""\
             #!/bin/bash
+            echo "$@" > {child_args}
             touch {child_started}
             trap 'touch {child_stopped}; exit 0' TERM INT
             while true; do sleep 0.1; done
@@ -395,7 +413,7 @@ def test_load_balancer_watchdog_forwards_term_to_child(tmp_path):
     )
     fake_python.chmod(0o755)
     process = subprocess.Popen(
-        ["bash", str(watchdog), "9213", str(tmp_path), "test"],
+        ["bash", str(watchdog), "9213", str(tmp_path), "test", "256"],
         env={"PATH": os.environ["PATH"], "PYTHON": str(fake_python)},
         start_new_session=True,
     )
@@ -405,6 +423,7 @@ def test_load_balancer_watchdog_forwards_term_to_child(tmp_path):
         while not child_started.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert child_started.exists()
+        assert "--backend-connections 256" in child_args.read_text()
 
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=5) == 0
@@ -639,6 +658,7 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
           --replicas 2 \\
           --tensor-parallel-size 4 \\
           --lb-port 9215 \\
+          --lb-backend-connections 256 \\
           --url-placeholder __SAFETY_BASE_URL__ \\
           --group-id safety-pool
         external_vllm_pool_env SAFETY NCCL_MNNVL_ENABLE=0
@@ -650,6 +670,7 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
         printf 'env=%s\n' "$SAFETY_ENV_VARS"
         printf 'args=%s\n' "$(tr '\n' ',' <<< "$SAFETY_VLLM_ARGS")"
         printf 'group=%s\n' "$SAFETY_GROUP_ID"
+        printf 'lb_connections=%s\n' "$SAFETY_LB_BACKEND_CONNECTIONS"
         printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
         """
     )
@@ -666,6 +687,7 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
         "env=NCCL_MNNVL_ENABLE=0",
         "args=--dtype,bfloat16,--attention-backend,FLASH_ATTN,",
         "group=safety-pool",
+        "lb_connections=256",
         "nodes=2",
     ]
 
@@ -680,6 +702,11 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
             "TEST_TENSOR_PARALLEL_SIZE must be a positive integer",
         ),
         ("--lb-port", "99999999", "TEST_LB_PORT must be at most 65535"),
+        (
+            "--lb-backend-connections",
+            "0",
+            "TEST_LB_BACKEND_CONNECTIONS must be a positive integer",
+        ),
         ("--vllm-port", "0", "TEST_VLLM_PORT must be a positive integer"),
         (
             "--startup-timeout",
