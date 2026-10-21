@@ -1285,9 +1285,9 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     generation_config = master_config.policy["generation"]
     if (
         generation_config["backend"] == "vllm"
-        and cast(VllmConfig, generation_config)
-        .get("vllm_cfg", {})
-        .get("discard_weights_on_sleep")
+        and cast(VllmConfig, generation_config)["vllm_cfg"].get(
+            "discard_weights_on_sleep"
+        )
         is True
     ):
         raise NotImplementedError(

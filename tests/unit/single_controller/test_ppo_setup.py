@@ -124,6 +124,7 @@ def _make_master_config(
             "megatron_cfg": {"enabled": megatron_enabled},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },
