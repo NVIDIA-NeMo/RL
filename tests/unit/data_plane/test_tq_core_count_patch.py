@@ -18,15 +18,16 @@ get and calls ``psutil.cpu_count(logical=False)`` each time. That globs
 ``/sys`` and opens a file per CPU, releasing the GIL on every access, so in a
 GIL-saturated process (a vLLM worker) the count dominated each TQ write.
 
-The tests drive TQ's own context manager, so they fail if a TQ revision
-stops looking the count up through the module's ``psutil`` — the case where
-the patch would silently stop doing anything.
+These tests are the patch's drift guard: they drive TQ's own context manager,
+so they fail if a TQ pin stops looking the count up through the module's
+``psutil`` — the case where the patch would silently stop doing anything.
 """
 
 from __future__ import annotations
 
 import subprocess
 import sys
+import types
 
 import psutil
 import pytest
@@ -40,24 +41,24 @@ tq_common = pytest.importorskip(
 )
 
 
-class _CountingPsutil:
+class _CountingPsutil(types.SimpleNamespace):
     """Stands in for ``psutil``: records each count and reports fixed core counts."""
 
-    def __init__(self, physical: int, logical: int) -> None:
-        self.physical = physical
-        self.logical = logical
-        self.calls: list[bool] = []
+    def __init__(self, *, physical_cores: int, logical_cores: int) -> None:
+        calls: list[bool] = []
 
-    def cpu_count(self, logical: bool = True) -> int:
-        self.calls.append(logical)
-        return self.logical if logical else self.physical
+        def cpu_count(logical: bool = True) -> int:
+            calls.append(logical)
+            return logical_cores if logical else physical_cores
+
+        super().__init__(cpu_count=cpu_count, calls=calls, Process=psutil.Process)
 
 
 def test_tq_counts_physical_cores_once_across_puts_and_gets(monkeypatch) -> None:
     """Every put and get enters this context; only the first may count."""
-    counting = _CountingPsutil(physical=4, logical=8)
+    counting = _CountingPsutil(physical_cores=4, logical_cores=8)
     monkeypatch.setattr(
-        tq_common, "psutil", tq_adapter._PhysicalCoreCountCache(counting)
+        tq_common, "psutil", tq_adapter._with_cached_cpu_count(counting)
     )
 
     for _ in range(3):
@@ -69,48 +70,25 @@ def test_tq_counts_physical_cores_once_across_puts_and_gets(monkeypatch) -> None
     assert counting.calls == [False]
 
 
-def test_logical_counts_and_other_psutil_calls_pass_through() -> None:
-    counting = _CountingPsutil(physical=4, logical=8)
-    cache = tq_adapter._PhysicalCoreCountCache(counting)
+def test_other_psutil_attributes_pass_through() -> None:
+    """A later TQ that uses more of ``psutil`` in this module must keep working."""
+    cached = tq_adapter._with_cached_cpu_count(psutil)
 
-    assert cache.cpu_count() == 8
-    assert cache.cpu_count(logical=True) == 8
-    assert counting.calls == [True, True]
-    # TQ reaches psutil for more than the core count elsewhere; the proxy must
-    # keep every other attribute.
-    assert tq_adapter._PhysicalCoreCountCache(psutil).Process is psutil.Process
+    assert cached.Process is psutil.Process
+    assert cached.virtual_memory is psutil.virtual_memory
+    assert cached.cpu_count(logical=True) == psutil.cpu_count(logical=True)
 
 
-def test_an_unknown_physical_count_is_also_counted_once() -> None:
-    """psutil returns None when it cannot tell; that answer is cached too."""
-    counting = _CountingPsutil(physical=None, logical=8)  # type: ignore[arg-type]
-    cache = tq_adapter._PhysicalCoreCountCache(counting)
-
-    assert cache.cpu_count(logical=False) is None
-    assert cache.cpu_count(logical=False) is None
-    assert counting.calls == [False]
-
-
-def test_installed_proxy_reports_the_real_physical_count() -> None:
-    assert isinstance(tq_common.psutil, tq_adapter._PhysicalCoreCountCache)
+def test_installed_namespace_reports_the_real_physical_count() -> None:
+    assert tq_common._nrl_core_count_cached
     assert tq_common.psutil.cpu_count(logical=False) == psutil.cpu_count(logical=False)
 
 
 def test_patch_is_idempotent() -> None:
-    """A second call must not wrap the proxy in another proxy."""
+    """A second call must not cache the cached namespace again."""
     first = tq_common.psutil
     tq_adapter._patch_physical_core_count()
     assert tq_common.psutil is first
-
-
-def test_missing_psutil_reference_raises_drift_error(monkeypatch) -> None:
-    """If TQ stops counting through this module, say so instead of patching
-    nothing."""
-    monkeypatch.setattr(tq_common, "_nrl_core_count_cached", False)
-    monkeypatch.delattr(tq_common, "psutil")
-
-    with pytest.raises(RuntimeError, match="pin in pyproject.toml has moved"):
-        tq_adapter._patch_physical_core_count()
 
 
 def test_patch_is_installed_by_import_alone() -> None:

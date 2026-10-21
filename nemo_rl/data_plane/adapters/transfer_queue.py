@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import ctypes
+import functools
 import glob
 import importlib
 import ipaddress
@@ -35,6 +36,7 @@ import resource
 import socket
 import threading
 import time
+import types
 import warnings
 import weakref
 from collections.abc import Callable
@@ -42,6 +44,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, cast
 
+import psutil
 import torch
 
 # Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
@@ -310,7 +313,7 @@ def _tq_shape_drift_error(
 ) -> RuntimeError:
     """Build the error shared by the monkey-patch shape guards below.
 
-    Every guard fires for the same reason — the pinned ``transfer_queue``
+    All three guards fire for the same reason — the pinned ``transfer_queue``
     revision no longer has the internals a patch depends on — so they share
     this message shape rather than each hand-rolling it.
     """
@@ -508,28 +511,18 @@ def _patch_scalar_field_schema() -> None:
 _patch_scalar_field_schema()
 
 
-_UNCOUNTED = object()
+def _with_cached_cpu_count(psutil_module: Any) -> types.SimpleNamespace:
+    """``psutil_module`` with ``cpu_count`` cached per argument.
 
-
-class _PhysicalCoreCountCache:
-    """``psutil`` as ``transfer_queue.utils.common`` sees it, counting physical cores once.
-
-    Everything but ``cpu_count(logical=False)`` passes straight through.
+    Every other attribute is the module's own, so TQ code that uses more of
+    ``psutil`` keeps working.
     """
-
-    def __init__(self, psutil_module: Any) -> None:
-        self._psutil = psutil_module
-        self._physical_cores: Any = _UNCOUNTED
-
-    def cpu_count(self, logical: bool = True) -> int | None:
-        if logical:
-            return self._psutil.cpu_count(logical=True)
-        if self._physical_cores is _UNCOUNTED:
-            self._physical_cores = self._psutil.cpu_count(logical=False)
-        return self._physical_cores
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._psutil, name)
+    return types.SimpleNamespace(
+        **{
+            **vars(psutil_module),
+            "cpu_count": functools.lru_cache(maxsize=None)(psutil_module.cpu_count),
+        }
+    )
 
 
 def _patch_physical_core_count() -> None:
@@ -545,12 +538,12 @@ def _patch_physical_core_count() -> None:
     and was most of the time of every TQ write the worker made.
 
     The physical core count cannot change while a process runs, so the module's
-    ``psutil`` is swapped for a proxy that counts once. TQ's own controller and
-    storage-unit actors never import this module and keep counting per call.
+    ``psutil`` is swapped for one whose ``cpu_count`` is cached. TQ's own
+    controller and storage-unit actors never import this module and keep
+    counting per call.
 
-    Raises if TQ no longer calls ``psutil`` from that module: the call may have
-    moved (and still be per call) or been fixed upstream, and either way this
-    patch no longer does anything.
+    ``tests/unit/data_plane/test_tq_core_count_patch.py`` drives TQ's context
+    manager, so a TQ pin that stops counting through this module fails there.
     """
     try:
         from transfer_queue.utils import common as _common
@@ -558,18 +551,8 @@ def _patch_physical_core_count() -> None:
         return
     if getattr(_common, "_nrl_core_count_cached", False):
         return
-    if not hasattr(_common, "psutil") or not hasattr(
-        _common, "limit_pytorch_auto_parallel_threads"
-    ):
-        raise _tq_shape_drift_error(
-            "utils.common no longer counts cores through psutil in "
-            "limit_pytorch_auto_parallel_threads",
-            "the per-call core count this patch caches has moved or gone",
-            "patch (it may simply be unnecessary — check whether upstream "
-            "caches the count)",
-        )
-    # pyrefly: ignore[bad-assignment]  the proxy stands in for the module on purpose
-    _common.psutil = _PhysicalCoreCountCache(_common.psutil)
+    # pyrefly: ignore[bad-assignment]  the namespace stands in for the module on purpose
+    _common.psutil = _with_cached_cpu_count(psutil)
     _common._nrl_core_count_cached = True
 
 
