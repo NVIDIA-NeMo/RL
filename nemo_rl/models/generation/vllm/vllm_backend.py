@@ -1470,6 +1470,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self, transport: WeightUpdateTransport | None = None
     ) -> None:
         """Reject unsupported features on the native layerwise reload path."""
+        if transport == "nccl_reshard" and self._uses_deepseek_v4_fp8_refit():
+            raise RuntimeError(
+                "nccl-reshard refit does not support DeepSeek V4 FP8 because it "
+                "bypasses the model's prepare/finalize refit hooks. Use IPC or "
+                "collective refit."
+            )
         uses_unquantized_trtllm = self._uses_unquantized_flashinfer_trtllm()
         uses_native_mxfp8_linear = bool(self._get_mxfp8_linear_reload_roots())
         if not (uses_unquantized_trtllm or uses_native_mxfp8_linear):

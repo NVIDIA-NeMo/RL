@@ -519,7 +519,7 @@ _NATIVE_MXFP8_LINEAR_BACKENDS = ("flashinfer_cutedsl", "flashinfer_trtllm")
 def _requested_linear_backend(config: VllmConfig) -> str | None:
     vllm_kwargs = config.get("vllm_kwargs") or {}
     kernel_config = vllm_kwargs.get("kernel_config") or {}
-    if isinstance(kernel_config, dict) and kernel_config.get("linear_backend"):
+    if isinstance(kernel_config, Mapping) and kernel_config.get("linear_backend"):
         return kernel_config["linear_backend"]
     return vllm_kwargs.get("linear_backend")
 

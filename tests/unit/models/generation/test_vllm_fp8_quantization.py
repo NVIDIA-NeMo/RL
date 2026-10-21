@@ -3723,7 +3723,8 @@ def test_load_weights_fused_qkv_shards_in_separate_batches(
         ),
     )
 
-    # The sender reuses one buffer, so each batch overwrites the previous shard.
+    # The sender reuses one buffer. Batches are checked after all loads, so a
+    # loaded tensor that aliases the buffer would show the last shard's value.
     sender_buffer = torch.empty(2, 32)
     shards = ("q_proj", "k_proj", "v_proj")
     for index, shard in enumerate(shards):
@@ -3740,7 +3741,9 @@ def test_load_weights_fused_qkv_shards_in_separate_batches(
             f"{prefix}.weight",
             f"{prefix}.{expected_scale_suffix}",
         ]
+        _, batch_weight = batch[0]
         _, batch_scale = batch[1]
+        assert torch.equal(batch_weight.float(), torch.full((2, 32), float(index + 1)))
         assert torch.equal(
             batch_scale.flatten(), torch.full((2,), index + 1, dtype=torch.uint8)
         )
