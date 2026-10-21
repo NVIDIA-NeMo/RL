@@ -21,3 +21,6 @@ quantize:
           type: dynamic
           scale_bits: e4m3
         num_bits: e2m1
+    # MTP remains in native dtype for real-quant rollout.
+    - quantizer_name: '*mtp*'
+      enable: false
