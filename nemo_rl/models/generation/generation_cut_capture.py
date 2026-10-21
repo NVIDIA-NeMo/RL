@@ -39,6 +39,25 @@ LOGGER = logging.getLogger(__name__)
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 
+# Bound work in one engine-loop callback independently of TQ batch sizing.
+_ROUTE_SNAPSHOT_GROUP_MAX_CALLS = 64
+
+
+@dataclass(frozen=True)
+class _RouteSnapshotRequest:
+    """A cut transaction paused after freezing, before reading engine routes."""
+
+    engine_request_id: str
+    token_positions: int
+
+
+@dataclass(frozen=True)
+class _EngineRouteSnapshot:
+    """One call's local route result or error; never sent over the wire."""
+
+    routes: Any | None = None
+    error: Exception | None = None
+
 
 def _final_route_placeholder(
     layers: int, topk: int, dtype: torch.dtype
@@ -415,6 +434,31 @@ class GenerationCutCaptureMixin:
         """
         del engine_request_id, timeout_s
         raise NotImplementedError("this backend cannot read routes for a cut")
+
+    def _snapshot_engine_routed_experts_many(
+        self, engine_request_ids: list[str], *, deadline: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Adapt hosts with only a single-call reader to the grouped cut path."""
+        snapshots = {}
+        for request_id in engine_request_ids:
+            try:
+                timeout_s = (
+                    None if deadline is None else max(deadline - time.monotonic(), 0.0)
+                )
+                if timeout_s is not None and timeout_s <= 0:
+                    raise TimeoutError("generation route snapshot deadline passed")
+                snapshots[request_id] = _EngineRouteSnapshot(
+                    routes=self._snapshot_engine_routed_experts(
+                        request_id, timeout_s=timeout_s
+                    )
+                )
+            except (TimeoutError, TypeError, ValueError) as error:
+                snapshots[request_id] = _EngineRouteSnapshot(error=error)
+        return snapshots
+
+    def _materialize_engine_routed_experts(self, routes: Any | None) -> Any | None:
+        """Normalize one grouped result; single-call hosts already return tensors."""
+        return routes
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -908,17 +952,8 @@ class GenerationCutCaptureMixin:
         # Evidence for this completion aged out; restart it from its prior boundary.
         return GenerationCutPrefixAck.failure(prefix)
 
-    def _frozen_cut_engine_routed_experts(
-        self, state: _RequestCaptureState, *, deadline: float | None
-    ) -> Any | None:
-        """Read the engine's routes for a frozen cut that needs them.
-
-        Runs after the freeze, without ``state.lock``, so decoding continues.
-
-        Raises:
-            TimeoutError: the engine did not answer before ``deadline``.
-            ValueError: the engine cannot name the request's routes.
-        """
+    def _frozen_cut_engine_request_id(self, state: _RequestCaptureState) -> str | None:
+        """Select a frozen call's live lookup without holding its token lock."""
         with state.lock:
             needs_engine_routes = (
                 state.capture_routed_experts
@@ -931,6 +966,15 @@ class GenerationCutCaptureMixin:
             return None
         if engine_request_id is None:
             raise ValueError("no vLLM output has named the request yet")
+        return engine_request_id
+
+    def _frozen_cut_engine_routed_experts(
+        self, state: _RequestCaptureState, *, deadline: float | None
+    ) -> Any | None:
+        """Read routes for a frozen call without blocking token observation."""
+        engine_request_id = self._frozen_cut_engine_request_id(state)
+        if engine_request_id is None:
+            return None
         timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
         return self._snapshot_engine_routed_experts(
             engine_request_id, timeout_s=timeout_s
@@ -943,10 +987,13 @@ class GenerationCutCaptureMixin:
         checkpoint_id: str,
         *,
         deadline: float | None = None,
+        batch_route_lookup: bool = False,
     ) -> Generator[Any, Any, Any]:
         """Keep a live call frozen until transport and acknowledgement validate.
 
-        The generator yields ``(record, sequence)``, receives the staged key,
+        With grouped lookups it first yields a ``_RouteSnapshotRequest`` and
+        receives an ``_EngineRouteSnapshot``. It then yields ``(record, sequence)``,
+        receives the staged key,
         then yields its validated acknowledgement; the caller resumes it once
         more to seal. A call with nothing to stage returns its acknowledgement
         (or ``None`` if abort won the race) without yielding. Closing before the
@@ -1057,9 +1104,26 @@ class GenerationCutCaptureMixin:
                     disposition="durable_failure",
                 )
             try:
-                engine_routed_experts = self._frozen_cut_engine_routed_experts(
-                    state, deadline=deadline
-                )
+                if batch_route_lookup:
+                    request_id = self._frozen_cut_engine_request_id(state)
+                    engine_routed_experts = None
+                    if request_id is not None:
+                        token_positions = len(chunk_token_ids)
+                        if not state.generation_cut_staging_keys:
+                            token_positions += len(state.prompt_token_ids)
+                        snapshot = yield _RouteSnapshotRequest(
+                            engine_request_id=request_id,
+                            token_positions=token_positions,
+                        )
+                        if snapshot.error is not None:
+                            raise snapshot.error
+                        engine_routed_experts = self._materialize_engine_routed_experts(
+                            snapshot.routes
+                        )
+                else:
+                    engine_routed_experts = self._frozen_cut_engine_routed_experts(
+                        state, deadline=deadline
+                    )
                 with state.lock:
                     (
                         chunk_routed_experts,
@@ -1080,6 +1144,14 @@ class GenerationCutCaptureMixin:
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
+            except BaseException:
+                # Closing a transaction waiting for routes must release its
+                # frozen buffer, just like closing one waiting for its TQ PUT.
+                with state.lock:
+                    frozen = state.frozen_cut
+                    if frozen is not None and frozen[0] == checkpoint_id:
+                        state.rollback_frozen_cut(checkpoint_id)
+                raise
 
             staged_key = None
             try:
@@ -1190,6 +1262,11 @@ class GenerationCutCaptureMixin:
         acknowledgements: list[Any] = []
         pending: list[tuple[Generator[Any, Any, Any], Any, int, Any]] = []
         pending_tokens = 0
+        route_pending: list[
+            tuple[Generator[Any, Any, Any], Any, _RouteSnapshotRequest]
+        ] = []
+        route_pending_tokens = 0
+        route_group_limit = min(max_rows, _ROUTE_SNAPSHOT_GROUP_MAX_CALLS)
         uncut: list[Any] = []
 
         def past_deadline() -> bool:
@@ -1202,6 +1279,14 @@ class GenerationCutCaptureMixin:
                 uncut.append(prefix)
             pending.clear()
             pending_tokens = 0
+
+        def release_route_pending() -> None:
+            nonlocal route_pending_tokens
+            for transaction, prefix, _ in route_pending:
+                transaction.close()
+                uncut.append(prefix)
+            route_pending.clear()
+            route_pending_tokens = 0
 
         def fail(prefix: Any) -> None:
             LOGGER.exception(
@@ -1297,9 +1382,89 @@ class GenerationCutCaptureMixin:
                 for transaction, _, _, _ in batch:
                     transaction.close()
 
+        def queue_record(
+            transaction: Generator[Any, Any, Any],
+            prefix: Any,
+            record: Any,
+            sequence: int,
+        ) -> None:
+            nonlocal pending_tokens
+            tokens = len(record.token_ids_delta)
+            if pending and pending_tokens + tokens > max_tokens:
+                flush()
+            pending.append((transaction, record, sequence, prefix))
+            # Pyrefly 0.24.2 rejects augmented assignment to this nonlocal.
+            pending_tokens = pending_tokens + tokens
+            if len(pending) >= max_rows or pending_tokens >= max_tokens:
+                # An oversized single row is written alone, never split.
+                flush()
+
+        def resolve_route_pending() -> None:
+            """Read a frozen group's routes, then feed the existing TQ batches."""
+            nonlocal route_pending_tokens
+            if not route_pending:
+                return
+            if past_deadline():
+                release_route_pending()
+                return
+            group = list(route_pending)
+            route_pending.clear()
+            route_pending_tokens = 0
+            handed = 0
+            try:
+                request_ids = list(
+                    dict.fromkeys(request.engine_request_id for _, _, request in group)
+                )
+                try:
+                    snapshots = self._snapshot_engine_routed_experts_many(
+                        request_ids, deadline=deadline
+                    )
+                except Exception as error:
+                    # A failed owner handoff affects this bounded group. Never
+                    # retry each call with a fresh control timeout.
+                    LOGGER.exception("generation route snapshot group failed")
+                    for transaction, prefix, _ in group:
+                        # Do not inject one shared exception into every generator:
+                        # re-raising it grows its traceback and logs it N times.
+                        handed += 1
+                        transaction.close()
+                        LOGGER.warning(
+                            "cannot cut model call %s: group route snapshot failed (%s); "
+                            "it regenerates after a restore",
+                            prefix.model_call_id,
+                            type(error).__name__,
+                        )
+                        acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
+                    return
+                for transaction, prefix, request in group:
+                    handed += 1
+                    transferred = False
+                    try:
+                        if past_deadline():
+                            uncut.append(prefix)
+                            continue
+                        record, sequence = transaction.send(
+                            snapshots[request.engine_request_id]
+                        )
+                        queue_record(transaction, prefix, record, sequence)
+                        transferred = True
+                    except StopIteration as finished:
+                        acknowledgements.append(finished.value)
+                    except Exception:
+                        fail(prefix)
+                    finally:
+                        if not transferred:
+                            transaction.close()
+            finally:
+                # flush() owns transferred transactions. The remaining frozen
+                # calls still belong to this group, including on interruption.
+                for transaction, _, _ in group[handed:]:
+                    transaction.close()
+
         try:
             for index, prefix in enumerate(inventory.active_prefixes):
                 if past_deadline():
+                    release_route_pending()
                     release_pending()
                     uncut.extend(inventory.active_prefixes[index:])
                     break
@@ -1316,9 +1481,13 @@ class GenerationCutCaptureMixin:
                         )
                         continue
                     transaction = self._generation_cut_transaction(
-                        prefix, state, inventory.checkpoint_id, deadline=deadline
+                        prefix,
+                        state,
+                        inventory.checkpoint_id,
+                        deadline=deadline,
+                        batch_route_lookup=True,
                     )
-                    record, sequence = next(transaction)
+                    prepared = next(transaction)
                 except StopIteration as finished:
                     acknowledgement = finished.value
                     if acknowledgement is None:
@@ -1340,16 +1509,38 @@ class GenerationCutCaptureMixin:
                             ):
                                 state.rollback_frozen_cut(inventory.checkpoint_id)
                     continue
-                tokens = len(record.token_ids_delta)
-                if pending and pending_tokens + tokens > max_tokens:
-                    flush()
-                pending.append((transaction, record, sequence, prefix))
-                pending_tokens += tokens
-                if len(pending) >= max_rows or pending_tokens >= max_tokens:
-                    # An oversized single row is written alone, never split.
-                    flush()
+                if isinstance(prepared, _RouteSnapshotRequest):
+                    # This call is already frozen, so close it too if resolving
+                    # the preceding group is interrupted before we own it.
+                    try:
+                        if (
+                            route_pending
+                            and route_pending_tokens + prepared.token_positions
+                            > max_tokens
+                        ):
+                            resolve_route_pending()
+                    except BaseException:
+                        transaction.close()
+                        raise
+                    route_pending.append((transaction, prefix, prepared))
+                    route_pending_tokens += prepared.token_positions
+                    if (
+                        len(route_pending) >= route_group_limit
+                        or route_pending_tokens >= max_tokens
+                    ):
+                        resolve_route_pending()
+                else:
+                    try:
+                        record, sequence = prepared
+                        queue_record(transaction, prefix, record, sequence)
+                    except BaseException:
+                        transaction.close()
+                        raise
+            resolve_route_pending()
             flush()
         finally:
+            for transaction, _, _ in route_pending:
+                transaction.close()
             for transaction, _, _, _ in pending:
                 transaction.close()
         if uncut:

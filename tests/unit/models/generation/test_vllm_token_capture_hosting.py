@@ -76,6 +76,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
+    GenerationCutCaptureMixin,
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
     _ResolvedGenerationCut,
@@ -2570,6 +2571,14 @@ def _router_replay_worker(
     worker._return_routed_experts_enabled = lambda: True
     worker.routed_experts_dtype = torch.int16
     worker._rollout_weight_version = weight_version
+    # These fixtures inject a single-call engine reader. Test the mixin's
+    # adapter here; grouped owner-loop handoffs have their own regressions.
+    worker._snapshot_engine_routed_experts_many = lambda request_ids, *, deadline: (
+        GenerationCutCaptureMixin._snapshot_engine_routed_experts_many(
+            worker, request_ids, deadline=deadline
+        )
+    )
+    worker._materialize_engine_routed_experts = lambda routes: routes
     return worker
 
 

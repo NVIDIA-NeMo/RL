@@ -62,6 +62,7 @@ from nemo_rl.experience.route_assembly import (
 )
 from nemo_rl.models.generation.generation_cut_capture import (
     GenerationCutCaptureMixin,
+    _EngineRouteSnapshot,
     _prefix_routes_sha256,
     _CompletedCaptureState,
     _remaining_generation_limits_after_prefix,
@@ -686,6 +687,37 @@ class _AsyncLLMHTTPClient:
         if chunks is None:
             raise ValueError("vLLM's request state has no routed_experts_chunks")
         return list(chunks)
+
+    def snapshot_routed_experts_many(
+        self, request_ids: list[str], *, timeout_s: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Shallow-copy a frozen group's route lists in one owner-loop handoff.
+
+        No tensor assembly or encoding runs on the owner loop. Lookup errors
+        stay per request; the timeout applies to the whole callback.
+        """
+        if not request_ids:
+            return {}
+        if timeout_s is not None and timeout_s <= 0:
+            raise TimeoutError("generation route snapshot deadline passed")
+
+        async def snapshot() -> dict[str, _EngineRouteSnapshot]:
+            results = {}
+            for request_id in request_ids:
+                try:
+                    results[request_id] = _EngineRouteSnapshot(
+                        routes=self._routed_expert_chunks_on_owner(request_id)
+                    )
+                except (TypeError, ValueError) as error:
+                    results[request_id] = _EngineRouteSnapshot(error=error)
+            return results
+
+        future = asyncio.run_coroutine_threadsafe(snapshot(), self._engine_loop)
+        try:
+            return future.result(timeout=timeout_s)
+        except TimeoutError:
+            future.cancel()
+            raise
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -1383,11 +1415,18 @@ class VllmAsyncGenerationWorkerImpl(
         chunks = self._http_engine_client.snapshot_routed_experts(
             engine_request_id, timeout_s=timeout_s
         )
-        if chunks is None:
+        return self._materialize_engine_routed_experts(chunks)
+
+    def _materialize_engine_routed_experts(
+        self,
+        routes: Any | None,
+    ) -> torch.Tensor | None:
+        """Materialize route references on the cut thread, never the engine loop."""
+        if routes is None:
             return None
-        if not chunks:
+        if not routes:
             raise ValueError("vLLM has not routed any token of the request yet")
-        tensors = [torch.as_tensor(chunk) for chunk in chunks]
+        tensors = [torch.as_tensor(chunk) for chunk in routes]
         model_shape = tuple(tensors[0].shape[1:])
         if any(
             tensor.dim() != 3 or tuple(tensor.shape[1:]) != model_shape
@@ -1395,6 +1434,16 @@ class VllmAsyncGenerationWorkerImpl(
         ):
             raise ValueError("vLLM route chunks must share shape [*, layers, topk]")
         return torch.cat(tensors, dim=0)
+
+    def _snapshot_engine_routed_experts_many(
+        self, engine_request_ids: list[str], *, deadline: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Read a bounded frozen group using one engine-owner round trip."""
+        assert self._http_engine_client is not None  # setup_token_capture checks
+        timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        return self._http_engine_client.snapshot_routed_experts_many(
+            engine_request_ids, timeout_s=timeout_s
+        )
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
