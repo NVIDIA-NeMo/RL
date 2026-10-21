@@ -1,0 +1,104 @@
+# Nemotron Nano v3 30B-A3B (hybrid Mamba + squared-ReLU MoE) zero train/generation KL
+# with MXFP8 routed experts; attention, the shared experts and the Mamba mixers stay BF16.
+# The Nano MXFP8-rollouts recipe moved onto the Qwen3-30B-A3B zero-KL layout: one training
+# node (TP1, EP4) and one non-colocated Megatron generation node on the torch MXFP8
+# grouped GEMM, against TE's MXFP8 grouped GEMM in training.
+#
+# Needs Megatron-LM PR #7562 (batch-invariant squared ReLU and Mamba train/generation
+# parity) and PR #8195 (fp64 batch-invariant expert combine).
+defaults: grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts.yaml
+grpo:
+  max_num_steps: 5
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8
+policy:
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 32
+  logprob_batch_size: 4
+  make_sequence_length_divisible_by: 64
+  # Packing / dynamic batching make a token's numerics depend on its neighbours.
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    moe_permute_fusion: false
+    moe_token_dispatcher_type: alltoall
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+      # Megatron-Core asserts it for hybrid models in batch-invariant mode. The SSM
+      # Triton ops read it at import, after env_vars is applied in both training and
+      # generation workers.
+      MAMBA_DETERMINISTIC: '1'
+      # With MAMBA_DETERMINISTIC, the SSM Triton ops otherwise skip autotuning and fall back
+      # to their cheapest config.
+      TRITON_CACHE_AUTOTUNING: '1'
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: false
+    moe_router_dtype: fp32
+    defer_fp32_logits: true
+    activation_checkpointing: true
+    cuda_graph_impl: none
+    # The batch-invariant generation squared ReLU reproduces the fused training op's
+    # rounding; the unfused op rounds differently.
+    use_fused_weighted_squared_relu: true
+    te_precision_config_file: examples/te_precision/nanov3_routed_experts_mxfp8.yaml
+    fp8_cfg:
+      enabled: true
+      fp8: hybrid
+      fp8_recipe: mxfp8
+      # Trainer-side MXFP8 primary weights for the MXFP8 modules; refit still sends BF16.
+      fp8_param: true
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+    mcore_generation_config:
+      tensor_model_parallel_size: 1
+      expert_model_parallel_size: 4
+      sequence_parallel: false
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      enable_chunked_prefill: true
+      # Batch-invariant SSM chunked prefill needs max_tokens > the Mamba chunk size (128),
+      # and MCore needs max_tokens >= max_requests. 32 prompts of ~100 tokens overflow a
+      # 256-token step, so most steps split a prompt.
+      max_tokens: 256
+      max_requests: 32
+      enable_prefix_caching: false
+      inference_grouped_gemm_backend: torch
+      inference_moe_token_dispatcher_type: nvls
+      num_cuda_graphs: -1
+      moe_pad_experts_for_cuda_graph_inference: false
+      # Replaces megatron_cfg.fp8_cfg wholesale, so it must repeat the training block.
+      fp8_cfg:
+        enabled: true
+        fp8: hybrid
+        fp8_recipe: mxfp8
+        fp8_param: true
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
+  # The parent's 2-node segments do not divide the 1-node training and generation clusters.
+  segment_size: null
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8
+  wandb:
+    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8

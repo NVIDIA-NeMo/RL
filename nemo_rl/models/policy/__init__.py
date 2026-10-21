@@ -478,6 +478,21 @@ class MegatronConfig(TypedDict):
     # rows for the local expert count (Nano-30B: >=256 rows at 16 local experts,
     # >=1024 at 64); smaller capacities fail CUDA-graph capture.
     inference_flashinfer_mxfp8_token_capacity: NotRequired[int | None]
+    # Routed experts as NVFP4 weights x per-token NVFP4 activations on FlashInfer
+    # (MCore inference_moe_nvfp4_recipe). Only 'per_token'; None keeps BF16 experts.
+    # Requires inference_grouped_gemm_backend='flashinfer' and BF16 (no fp8_cfg).
+    inference_moe_nvfp4_recipe: NotRequired[Literal["per_token"] | None]
+    # Training forward of each MoE layer runs generation's FlashInfer MXFP8 or
+    # per-token NVFP4 expert kernel; the backward comes from the TE recompute pass
+    # (straight-through estimator). Requires transformer_impl='inference_optimized',
+    # inference_grouped_gemm_backend='flashinfer', batch_invariant_mode, and
+    # activation_checkpointing with recompute_granularity='selective' and 'moe' in
+    # recompute_modules. Generation never sets it.
+    moe_inference_training_forward: NotRequired[bool]
+    # Token bound per rank for the NVLS symmetric heap of that training forward.
+    # Unset: max(train_micro_batch_size, logprob_batch_size) * padded
+    # max_total_sequence_length, or the packing / dynamic batching mb_tokens if larger.
+    moe_inference_training_max_tokens_per_rank: NotRequired[int | None]
     # InferenceTopKRouter requires moe_router_num_groups=None
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
@@ -593,8 +608,8 @@ class MegatronConfig(TypedDict):
     num_layers_at_start_in_bf16: NotRequired[int]
     num_layers_at_end_in_bf16: NotRequired[int]
     # Path to a per-module Transformer Engine precision recipe loaded into
-    # Megatron quant_recipe.
-    te_precision_config_file: NotRequired[str]
+    # Megatron quant_recipe. null clears one inherited from a parent recipe.
+    te_precision_config_file: NotRequired[str | None]
     # Passed through to the Megatron model's freeze() method.
     # Supported keys are model-specific, such as freeze_vision_model,
     # freeze_vision_projection, and freeze_language_model.

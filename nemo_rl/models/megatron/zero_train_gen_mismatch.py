@@ -14,8 +14,9 @@
 
 """Zero train/generation KL (batch-invariant Megatron): validate the recipe, then enable.
 
-The recipe sets every required value; this module only checks them. Only BF16
-(no FP8) is supported.
+The recipe sets every required value; this module only checks them. Supported
+precisions are BF16 and MXFP8 (the same on train and generation), and FlashInfer
+MXFP8 or per-token NVFP4 experts with moe_inference_training_forward.
 """
 
 from __future__ import annotations
@@ -60,14 +61,20 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
-    "enable_chunked_prefill": False,
-}
+_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {}
 
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
     "CUBLASLT_WORKSPACE_SIZE": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+}
+
+# Hybrid Mamba models: the SSM Triton ops read both at import. Without
+# TRITON_CACHE_AUTOTUNING, MAMBA_DETERMINISTIC replaces autotuning with the cheapest
+# config.
+_HYBRID_MAMBA_ENV_VARS = {
+    "MAMBA_DETERMINISTIC": "1",
+    "TRITON_CACHE_AUTOTUNING": "1",
 }
 
 
@@ -94,14 +101,21 @@ def validate_zero_train_gen_mismatch(
     *,
     check_packages: bool = True,
     check_platform: bool = True,
+    generation_only: bool = False,
 ) -> ZeroTrainGenValidation:
-    """Run all zero-KL gates; return violations and non-fatal warnings."""
+    """Run all zero-KL gates; return violations and non-fatal warnings.
+
+    ``generation_only`` is for a dedicated generation policy, whose
+    ``megatron_cfg`` is the merged inference config: the training-only
+    ``moe_inference_training_forward`` is cleared there, so the checks on the
+    training side's value are left to the driver, which sees the full config.
+    """
     out = ZeroTrainGenValidation()
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return out
 
     _validate_required_values(config, out)
-    _validate_backend(config, out)
+    _validate_backend(config, out, generation_only=generation_only)
     _validate_platform(out, check_device=check_platform)
     if check_packages:
         _validate_packages(out)
@@ -309,6 +323,27 @@ def _use_fused_log_softmax_at_tp1() -> None:
             setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
 
 
+def _enable_mcore_deterministic_tuning() -> None:
+    """Pin Megatron-Core's Triton kernel configs when MAMBA_DETERMINISTIC=1 is set.
+
+    Megatron-Core with ``megatron.core.tuning`` (NVIDIA/Megatron-LM#6076) no longer
+    reads MAMBA_DETERMINISTIC. Its SSM kernels, and the hybrid batch-invariant check
+    in TransformerConfig, follow ``set_deterministic_mode``, and ``install`` pins
+    every in-scope autotuner without timing, so training and generation pick the
+    same config per shape. Megatron's own training sets these from
+    --deterministic-mode, which NeMo-RL does not go through. Older Megatron-Core
+    reads the variable itself.
+    """
+    if not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"):
+        return
+    try:
+        from megatron.core import tuning
+    except ImportError:
+        return
+    tuning.set_deterministic_mode(True)
+    tuning.install(deterministic=True)
+
+
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     """Pin TE FA support and call MCore ``enable_batch_invariant_mode``."""
     megatron_cfg = config["megatron_cfg"]
@@ -327,6 +362,7 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
+    _enable_mcore_deterministic_tuning()
     _use_fused_log_softmax_at_tp1()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
@@ -339,13 +375,14 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
 
 
 def validate_zero_train_gen_kl(
-    config: PolicyConfig, *, check_environment: bool
+    config: PolicyConfig, *, check_environment: bool, generation_only: bool = False
 ) -> None:
     """Raise if the zero-KL / batch-invariant config is invalid.
 
     ``check_environment=False`` runs only the config checks, so the driver can
     call it before Ray allocates GPUs; workers also check the installed
-    packages and the GPU.
+    packages and the GPU. ``generation_only`` is as in
+    :func:`validate_zero_train_gen_mismatch`.
     """
     if "megatron_cfg" not in config:  # Automodel policies
         return
@@ -353,6 +390,7 @@ def validate_zero_train_gen_kl(
         config,
         check_packages=check_environment,
         check_platform=check_environment,
+        generation_only=generation_only,
     )
     result.emit_warnings()
     result.raise_if_invalid(
@@ -388,7 +426,9 @@ def _validate_required_values(
             )
 
 
-def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
+def _validate_backend(
+    config: PolicyConfig, out: ZeroTrainGenValidation, *, generation_only: bool = False
+) -> None:
     generation = config.get("generation")
     if generation is None or generation.get("backend") != "megatron":
         out.violations.append(
@@ -408,6 +448,93 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
     if impl != "inference_optimized":
         out.violations.append(
             f"generation transformer_impl must be 'inference_optimized' (got {impl!r})."
+        )
+
+    fp8_cfg = inference_cfg.get("fp8_cfg") or {}
+    backend = _grouped_gemm_backend(inference_cfg)
+    quantized_experts = (
+        fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    ) or inference_cfg.get("inference_moe_nvfp4_recipe") is not None
+    if (
+        not generation_only
+        and impl == "inference_optimized"
+        and backend == "flashinfer"
+        and quantized_experts
+        and not config["megatron_cfg"].get("moe_inference_training_forward")
+    ):
+        out.violations.append(
+            "zero_train_gen_mismatch with inference_grouped_gemm_backend='flashinfer' "
+            "and MXFP8 or NVFP4 experts requires "
+            "policy.megatron_cfg.moe_inference_training_forward=true: the FlashInfer "
+            "kernel is batch-invariant but not bitwise identical to TE training. "
+            "Otherwise use 'torch' or 'vllm' with MXFP8."
+        )
+    if config["megatron_cfg"].get("moe_inference_training_forward"):
+        _validate_inference_training_forward(config, inference_cfg, out)
+
+
+def _grouped_gemm_backend(cfg: dict[str, Any]) -> Any:
+    backend = cfg.get("inference_grouped_gemm_backend")
+    return getattr(backend, "value", backend)
+
+
+def _validate_inference_training_forward(
+    config: PolicyConfig, inference_cfg: dict[str, Any], out: ZeroTrainGenValidation
+) -> None:
+    """The training MoE forward runs generation's FlashInfer kernel; TE recompute backs it."""
+    megatron_cfg = config["megatron_cfg"]
+    prefix = "moe_inference_training_forward=true requires"
+    if megatron_cfg.get("transformer_impl") != "inference_optimized":
+        out.violations.append(
+            f"{prefix} policy.megatron_cfg.transformer_impl='inference_optimized' "
+            f"(got {megatron_cfg.get('transformer_impl')!r})."
+        )
+    for label, cfg in (
+        ("policy.megatron_cfg", megatron_cfg),
+        ("policy.generation.mcore_generation_config", inference_cfg),
+    ):
+        if _grouped_gemm_backend(cfg) != "flashinfer":
+            out.violations.append(
+                f"{prefix} {label}.inference_grouped_gemm_backend='flashinfer' "
+                f"(got {_grouped_gemm_backend(cfg)!r})."
+            )
+    fp8_cfg = megatron_cfg.get("fp8_cfg") or {}
+    mxfp8 = fp8_cfg.get("enabled") and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    if not mxfp8 and megatron_cfg.get("inference_moe_nvfp4_recipe") is None:
+        out.violations.append(
+            f"{prefix} MXFP8 experts (policy.megatron_cfg.fp8_cfg with "
+            "fp8_recipe='mxfp8') or policy.megatron_cfg.inference_moe_nvfp4_recipe: "
+            "the FlashInfer BF16 kernel is not batch invariant."
+        )
+    recompute_modules = megatron_cfg.get("recompute_modules") or []
+    if not (
+        megatron_cfg.get("activation_checkpointing")
+        and megatron_cfg.get("recompute_granularity") == "selective"
+        and "moe" in recompute_modules
+    ):
+        out.violations.append(
+            f"{prefix} activation_checkpointing=true, "
+            "recompute_granularity='selective' and 'moe' in recompute_modules: the "
+            "backward comes from the TE recompute pass."
+        )
+    if megatron_cfg.get("cuda_graph_impl") == "local":
+        out.violations.append(
+            f"{prefix} a training cuda_graph_impl other than 'local', which disables "
+            "MoE-layer recompute."
+        )
+    mismatched = [
+        key
+        for key in (
+            "inference_moe_nvfp4_recipe",
+            "inference_moe_token_dispatcher_type",
+            "expert_model_parallel_size",
+        )
+        if megatron_cfg.get(key) != inference_cfg.get(key)
+    ]
+    if mismatched:
+        out.violations.append(
+            f"{prefix} the same training and generation values for: "
+            f"{', '.join(mismatched)}."
         )
 
 
@@ -497,15 +624,39 @@ def _validate_packages(out: ZeroTrainGenValidation) -> None:
 def validate_zero_train_gen_model_provider(
     config: PolicyConfig, model_cfg: Any
 ) -> None:
-    """Reject unsupported architectures using the resolved Bridge provider."""
+    """Reject unsupported architectures using the resolved Bridge provider.
+
+    Hybrid Mamba models are supported with MAMBA_DETERMINISTIC=1 and
+    TRITON_CACHE_AUTOTUNING=1, from policy.megatron_cfg.env_vars or the launch
+    environment.
+    """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
+
+    if getattr(model_cfg, "is_hybrid_model", False) or "M" in (
+        getattr(model_cfg, "hybrid_layer_pattern", None) or ""
+    ):
+        env_vars = config["megatron_cfg"].get("env_vars") or {}
+        wrong = {}
+        for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+            got = env_vars.get(key, os.environ.get(key))
+            if got != value:
+                wrong[key] = got
+        if wrong:
+            required = ", ".join(
+                f"{k}={v!r}" for k, v in _HYBRID_MAMBA_ENV_VARS.items()
+            )
+            got = ", ".join(f"{k}={v!r}" for k, v in wrong.items())
+            raise ValueError(
+                "zero_train_gen_mismatch on a hybrid Mamba model requires "
+                f"{required} together in policy.megatron_cfg.env_vars or the launch "
+                f"environment (got {got})."
+            )
 
     unsupported_fields = [
         field_name
         for field_name in (
             "multi_latent_attention",
-            "hybrid_layer_pattern",
             "experimental_attention_variant",
         )
         if getattr(model_cfg, field_name, None)
@@ -518,7 +669,7 @@ def validate_zero_train_gen_model_provider(
 
 
 def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> None:
-    """Only BF16 without FP8 is supported, on both the train and generation side."""
+    """BF16, or FP8 with the MXFP8 recipe; train and generation must agree."""
     if config.get("precision") != "bfloat16":
         out.violations.append(
             "zero_train_gen_mismatch requires policy.precision='bfloat16' "
@@ -529,8 +680,20 @@ def _validate_precision(config: PolicyConfig, out: ZeroTrainGenValidation) -> No
     generation = config.get("generation")
     if generation is not None and generation.get("backend") == "megatron":
         sides.append(("generation", merged_inference_megatron_cfg(config)))
+    kinds: dict[str, str] = {}
     for label, cfg in sides:
-        if cfg.get("fp8_cfg") and cfg["fp8_cfg"].get("enabled"):
+        fp8_cfg = cfg.get("fp8_cfg") or {}
+        if not fp8_cfg.get("enabled"):
+            kinds[label] = "bf16"
+            continue
+        kinds[label] = f"fp8:{fp8_cfg.get('fp8_recipe')}"
+        if fp8_cfg.get("fp8_recipe") != "mxfp8":
             out.violations.append(
-                f"zero_train_gen_mismatch does not support FP8 ({label}.fp8_cfg.enabled=true)."
+                "zero_train_gen_mismatch supports FP8 only with fp8_recipe='mxfp8' "
+                f"(got {label}.fp8_cfg.fp8_recipe={fp8_cfg.get('fp8_recipe')!r})."
             )
+    if len(set(kinds.values())) > 1:
+        out.violations.append(
+            "zero_train_gen_mismatch requires the same precision on the train and "
+            f"generation side (got {kinds})."
+        )

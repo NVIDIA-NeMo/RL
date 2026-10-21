@@ -439,9 +439,13 @@ def _resolve_optimizer_dtype_kwargs(optimizer_cfg: dict[str, Any]) -> dict[str, 
     return resolved
 
 
-def enable_batch_invariant_mode(config: PolicyConfig) -> None:
+def enable_batch_invariant_mode(
+    config: PolicyConfig, *, generation_only: bool = False
+) -> None:
     """Validate, then enable Megatron-Core batch-invariant kernels before CUDA init."""
-    validate_zero_train_gen_kl(config, check_environment=True)
+    validate_zero_train_gen_kl(
+        config, check_environment=True, generation_only=generation_only
+    )
     if config["megatron_cfg"].get("batch_invariant_mode"):
         enable_batch_invariant_kernels(config)
 
@@ -1329,6 +1333,35 @@ def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
         setattr(model_cfg, provider_attr, megatron_cfg[config_key])
 
 
+def moe_inference_training_max_tokens_per_rank(config: PolicyConfig) -> int:
+    """Tokens one rank feeds the largest moe_inference_training_forward pass.
+
+    The NVLS symmetric heap is allocated once and cannot grow, so it is sized for
+    the largest train or log-prob microbatch at the padded maximum sequence length.
+    """
+    configured = config["megatron_cfg"].get(
+        "moe_inference_training_max_tokens_per_rank"
+    )
+    if configured is not None:
+        return configured
+    divisor = config["make_sequence_length_divisible_by"]
+    padded_seq_len = -(-config["max_total_sequence_length"] // divisor) * divisor
+    micro_batch = max(
+        config["train_micro_batch_size"],
+        config.get("logprob_batch_size", config["train_micro_batch_size"]),
+    )
+    tokens = micro_batch * padded_seq_len
+    for batching_key in ("sequence_packing", "dynamic_batching"):
+        batching = config.get(batching_key) or {}
+        if batching.get("enabled"):
+            tokens = max(
+                tokens,
+                batching["train_mb_tokens"],
+                batching.get("logprob_mb_tokens", batching["train_mb_tokens"]),
+            )
+    return tokens
+
+
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Mixture of Experts configuration."""
     model_cfg.expert_tensor_parallel_size = config["megatron_cfg"][
@@ -1373,6 +1406,18 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         model_cfg.inference_flashinfer_mxfp8_token_capacity = config["megatron_cfg"][
             "inference_flashinfer_mxfp8_token_capacity"
         ]
+    if "inference_moe_nvfp4_recipe" in config["megatron_cfg"]:
+        model_cfg.inference_moe_nvfp4_recipe = config["megatron_cfg"][
+            "inference_moe_nvfp4_recipe"
+        ]
+    if "moe_inference_training_forward" in config["megatron_cfg"]:
+        model_cfg.moe_inference_training_forward = config["megatron_cfg"][
+            "moe_inference_training_forward"
+        ]
+        if model_cfg.moe_inference_training_forward:
+            model_cfg.moe_inference_training_max_tokens_per_rank = (
+                moe_inference_training_max_tokens_per_rank(config)
+            )
     if "moe_router_num_groups" in config["megatron_cfg"]:
         model_cfg.moe_router_num_groups = config["megatron_cfg"][
             "moe_router_num_groups"
@@ -1496,29 +1541,41 @@ def _quant_recipe_name(recipe: Any) -> str | None:
 
 
 def _validate_te_precision_config(
-    quant_recipe: Any, fp8_cfg: Mapping[str, Any] | None
+    quant_recipe: Any,
+    fp8_cfg: Mapping[str, Any] | None,
+    *,
+    zero_train_gen_mismatch: bool = False,
 ) -> None:
     fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
     fp8_cfg_recipe = (
         _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
     )
 
-    # A recipe can store primary weights in FP8/FP4 through its own
-    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
-    # NeMo-RL derives sequence padding, refit export, and reshard validation
-    # from fp8_cfg alone, so such weights would reach the inference engine as
-    # if they were BF16. Reject until the refit path understands them.
+    # A matched module's fp8_model_init comes from its own recipe block rather than
+    # from fp8_cfg.fp8_param, so a recipe that quantizes a module must repeat
+    # fp8_param to keep that module's primary weights in FP8. Only the value already
+    # configured in fp8_cfg is accepted: NeMo-RL derives sequence padding, refit
+    # export, and reshard validation from fp8_cfg, and a recipe that disagreed would
+    # send weights to the inference engine in a precision NeMo-RL does not expect.
+    fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
-            if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+            if block_cfg.get("fp4_param"):
                 raise ValueError(
-                    "megatron_cfg.te_precision_config_file sets fp8_param or "
-                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
-                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
-                    "weights would be sent to the inference engine as BF16. "
-                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                    "megatron_cfg.te_precision_config_file sets fp4_param in "
+                    f"'{config_key}.{block}'. NeMo-RL reads megatron_cfg.fp8_cfg "
+                    "for all FP8/FP4 parameter storage, so these weights would be "
+                    "sent to the inference engine as BF16."
+                )
+            if block_cfg.get("fp8_param") and not fp8_cfg_param:
+                raise ValueError(
+                    "megatron_cfg.te_precision_config_file sets fp8_param in "
+                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_param "
+                    "is not enabled. Enable megatron_cfg.fp8_cfg.fp8_param so FP8 "
+                    "parameter storage stays consistent with the padding and refit "
+                    "behavior NeMo-RL derives from fp8_cfg."
                 )
 
             if not fp8_cfg_enabled:
@@ -1555,6 +1612,32 @@ def _validate_te_precision_config(
                     "FP8 refit behavior from megatron_cfg.fp8_cfg.fp8_recipe, so "
                     "mixed FP8 precision recipes are not supported."
                 )
+            # Under zero_train_gen_mismatch the two flags cover different
+            # surrounding forwards. override_quantized_autocast replaces an
+            # already-open FP8 autocast with this block's MXFP8 recipe.
+            # override_nonquantized_autocast opens that recipe when the forward
+            # is BF16; otherwise the MXFP8 weights are dequantized and the
+            # module runs BF16 while generation still runs MXFP8.
+            if zero_train_gen_mismatch and fp8_recipe == "mxfp8":
+                missing = [
+                    name
+                    for name in (
+                        "override_quantized_autocast",
+                        "override_nonquantized_autocast",
+                    )
+                    if not block_cfg.get(name)
+                ]
+                if missing:
+                    raise ValueError(
+                        "zero_train_gen_mismatch requires "
+                        f"{' and '.join(missing)}=true in "
+                        f"'{config_key}.{block}'. override_quantized_autocast "
+                        "keeps this MXFP8 recipe when the surrounding forward "
+                        "is already inside an FP8 autocast; "
+                        "override_nonquantized_autocast turns it on when that "
+                        "forward is BF16. Both the training and evaluation "
+                        "recipes need both flags."
+                    )
 
 
 def _validate_nvfp4_pertoken_precision_recipe(quant_recipe: RecipeConfig) -> None:
@@ -1657,7 +1740,13 @@ def _apply_precision_config(
         # NeMo-RL constructs TransformerConfig directly and therefore bypasses
         # Megatron-LM's CLI path that normally turns this file into quant_recipe.
         quant_recipe = load_quantization_recipe(te_precision_config_file)
-        _validate_te_precision_config(quant_recipe, fp8_cfg)
+        _validate_te_precision_config(
+            quant_recipe,
+            fp8_cfg,
+            zero_train_gen_mismatch=bool(
+                megatron_cfg.get("zero_train_gen_mismatch")
+            ),
+        )
         model_cfg.quant_recipe = quant_recipe
 
     raw_fp4_cfg = megatron_cfg.get("fp4_cfg", None)
