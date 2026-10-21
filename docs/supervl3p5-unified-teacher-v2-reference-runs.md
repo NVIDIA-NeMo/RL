@@ -25,19 +25,19 @@ Additional V2 references:
 
 ### Recipes
 
-Set each recipe placeholder to its YAML in `<RECIPE_ROOT>`.
+YAML paths below are relative to the repository root on this branch. Use the selected path as `CONFIG` in the command below. Files marked `Local recipe` exist in the tested checkout but have not been published to the branch.
 
-| Run | YAML | Source availability in this documentation commit |
+| Run | YAML | Source availability |
 | --- | --- | --- |
-| 1 | `<RUN_1_YAML>` | Local recipe |
-| 2 | `<RUN_2_YAML>` | Tracked |
-| 3 | `<RUN_3_YAML>` | Tracked; local logging-tag edits remain separate |
-| 4 | `<RUN_4_YAML>` | Tracked |
-| 5 | `<RUN_5_YAML>` | Tracked |
-| 6 | `<RUN_6_YAML>` | Local recipe |
-| 7 | `<RUN_7_STREAM32_YAML>` | Local recipe; inherits the local OpenCode base YAML |
-| In-order | `<INORDER_YAML>` | Tracked |
-| Run 7 reference | `<OPENCODE_BASE_YAML>` | Local recipe |
+| 1 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-unified-teachers-ready-first-r3-32n4g.yaml` | Local recipe |
+| 2 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-unified-teachers-ready-first-32n4g.yaml` | Tracked |
+| 3 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-caprl-video-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked; local logging-tag edits remain separate |
+| 4 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-sav-visibility-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked |
+| 5 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-raven-grouping-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked |
+| 6 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-static-control-32n4g-megatron-ready-first-s1.v2.yaml` | Local recipe |
+| 7 | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1-stream32.v2.yaml` | Local recipe; inherits the local OpenCode base YAML |
+| In-order | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-unified-teachers-inorder-32n4g.yaml` | Tracked |
+| Run 7 reference | `configs/examples/recipes/vlm/vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1.v2.yaml` | Local recipe |
 
 This commit publishes the runbook and its documentation-index entry. It does not publish the local-only configs, runtime helpers, or OpenCode environment port. The commands below use the existing tested checkout and provisioned runtime; a fresh GitHub clone alone does not contain all Run 7 dependencies. Historical runs also used runtime YAMLs and command-line overrides. The reusable YAMLs do not imply that every earlier job used their current contents.
 
@@ -76,7 +76,7 @@ export MM_TRAINER_WANDB_PROJECT=rohit-unified-teacher-supervl3p5
 export MM_TRAINER_WANDB_ENTITY=nvidia
 export MM_TRAINER_RESULTS_DIR="<OUTPUT_DIR>"
 export GYM_EXTRA_DIR="<CUSTOM_GYM_DIR>"
-export CONFIG="<RECIPE_YAML>"
+export CONFIG="configs/examples/recipes/vlm/vlm_grpo-supervl3p5-caprl-video-32n4g-megatron-ready-first-s1.v2.yaml"
 
 test -r "$MM_TRAINER_DATA_PATH"
 test -r "<MODEL_CONFIG_JSON>"
@@ -121,7 +121,7 @@ The installer ports the published OpenCode environment into the existing Gym set
 The stream32 delta is:
 
 ```yaml
-defaults: <OPENCODE_BASE_YAML>
+defaults: vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1.v2.yaml
 
 async_rl:
   min_groups_for_streaming_train: 32
