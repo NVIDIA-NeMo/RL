@@ -35,10 +35,11 @@ Reference papers:
 """
 
 import math
+import warnings
 from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from nemo_rl.algorithms.legacy_ppo_diagnostics import raw_advantage_metrics
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -89,6 +90,18 @@ class GAEConfig(BaseModel, extra="allow"):
     # sequence-logprob error, multi-trace pad rows). "kept_rows": only the rows
     # that train. Rows excluded from the loss stay excluded either way.
     normalize_over: Literal["all_rows", "kept_rows"] = "all_rows"
+    # Clamp the critic's values to [lo, hi] before GAE: the range a return can take, e.g. (0, 1) for rewards in
+    # [0, 1] with gamma 1 and no KL in the reward. Clamping onto that range never moves a value farther from the
+    # realised return, so no token's advantage gets noisier. Policy advantages and bootstrapped returns use the
+    # clamped values; the value loss still trains the critic's raw outputs. None: off.
+    value_clamp: Optional[tuple[float, float]] = None
+
+    @field_validator("value_clamp")
+    @classmethod
+    def _ordered_clamp(cls, v: Optional[tuple[float, float]]) -> Optional[tuple[float, float]]:
+        if v is not None and not v[0] < v[1]:
+            raise ValueError(f"value_clamp must be (lo, hi) with lo < hi, got {v}")
+        return v
 
 
 class GRPOAdvantageEstimator:
@@ -402,6 +415,14 @@ class GeneralizedAdvantageEstimator:
         self.gae_lambda_policy = estimator_config.gae_lambda_policy
         # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
         self.length_adaptive_alpha = estimator_config.length_adaptive_alpha
+        self.value_clamp = estimator_config.value_clamp
+        if self.value_clamp is not None and loss_config.use_kl_in_reward and (
+            loss_config.reference_policy_kl_penalty > 0
+        ):
+            warnings.warn(
+                f"ppo.adv_estimator.value_clamp={self.value_clamp} with KL in the reward: "
+                "returns can leave the clamp range, so the clamp may bias the baseline."
+            )
 
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
@@ -529,6 +550,17 @@ class GeneralizedAdvantageEstimator:
             logprobs_reference,
         )
 
+        clamp_metrics: dict[str, float] = {}
+        if self.value_clamp is not None:
+            lo, hi = self.value_clamp
+            valid = mask.bool()
+            n_valid = valid.sum().clamp(min=1)
+            clamp_metrics = {
+                "adv_raw/value_clamped_high_frac": float(((values > hi) & valid).sum() / n_valid),
+                "adv_raw/value_clamped_low_frac": float(((values < lo) & valid).sum() / n_valid),
+            }
+            values = values.clamp(min=lo, max=hi)
+
         lam_value = self._resolve_lambda_value()
         lam_policy = self._resolve_lambda_policy(mask)
 
@@ -563,6 +595,7 @@ class GeneralizedAdvantageEstimator:
         self.last_metrics = raw_advantage_metrics(
             advantages, mask, self.normalize_advantages
         )
+        self.last_metrics.update(clamp_metrics)
 
         # Whiten advantages (optional) and zero out masked positions (always)
         if self.normalize_advantages:

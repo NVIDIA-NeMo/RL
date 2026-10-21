@@ -375,6 +375,39 @@ def test_gae_carry_forward_interior_gap():
 # ============================================================================
 
 
+def test_gae_value_clamp_bounds_the_baseline_to_the_return_range():
+    """value_clamp clamps the critic's values before GAE: with lambda = 1, A = R - clamp(V) and the
+    Monte Carlo returns stay R; no token's |advantage| grows, and the clamped fractions are logged."""
+    loss_config = _make_loss_config(kl_penalty=0.0)
+    rewards = torch.tensor([1.0, 0.0])
+    mask = torch.ones(2, 4)
+    values = torch.tensor([[0.5, 1.3, 1.1, 0.9], [-0.2, 0.4, 0.2, 0.1]])
+    kwargs = dict(
+        prompt_ids=torch.tensor([[0], [1]]), rewards=rewards, mask=mask, lengths=torch.tensor([4, 4])
+    )
+
+    plain = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, normalize_advantages=False), loss_config
+    )
+    adv, _ = plain.compute_advantage(values=values, **kwargs)
+    torch.testing.assert_close(adv, rewards[:, None] - values)
+    assert "adv_raw/value_clamped_high_frac" not in plain.last_metrics
+
+    clamped = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, normalize_advantages=False, value_clamp=(0.0, 1.0)),
+        loss_config,
+    )
+    adv_c, ret_c = clamped.compute_advantage(values=values, **kwargs)
+    torch.testing.assert_close(adv_c, rewards[:, None] - values.clamp(0.0, 1.0))
+    torch.testing.assert_close(ret_c, rewards[:, None].expand(2, 4))
+    assert bool((adv_c.abs() <= adv.abs() + 1e-6).all())
+    assert clamped.last_metrics["adv_raw/value_clamped_high_frac"] == pytest.approx(2 / 8)
+    assert clamped.last_metrics["adv_raw/value_clamped_low_frac"] == pytest.approx(1 / 8)
+
+    with pytest.raises(ValueError, match="lo < hi"):
+        GAEConfig(value_clamp=(1.0, 0.0))
+
+
 def test_raw_reward_basic_broadcast_and_masking():
     """RawRewardAdvantageEstimator broadcasts scalar reward across the response.
 
