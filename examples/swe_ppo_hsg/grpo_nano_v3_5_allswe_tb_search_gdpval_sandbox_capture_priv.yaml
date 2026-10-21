@@ -1,0 +1,72 @@
+# =============================================================================
+# GRPO arm of the GRPO vs PPO ablation on SWE + Terminal-Bench + search + GDPval (user, 2026-10-20: "i want to do
+# ablation of grpo vs ppo"). Everything is the PPO arm's recipe
+# (ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml): same environments, harnesses, masking, policy
+# loss (clip 0.2 / 0.28, dual-clip 3, TIS 5, no KL), token capture with subagent segment rows, sequence lengths and
+# async settings. Only the algorithm differs:
+# - `grpo` replaces `ppo`: no critic. Advantage = (reward - leave-one-out group mean) / group std, one value per
+#   rollout, given to all of its rows (the canonical row and its subagent segment rows);
+# - no critic blocks either (`value`, `value_loss_fn`: the SC refuses them without `ppo`).
+# Launch with v2.sh ALGO=grpo (it swaps the ppo.* overrides for grpo.* and drops the critic ones).
+# Masked rows (env mask rules, overlong filtering) take no gradient and, as in PPO, do not enter the baseline
+# (masked_sample_rewards_in_baseline: false).
+# =============================================================================
+defaults: ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml
+ppo: null
+value: null
+value_loss_fn: null
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  # SC clamps max_num_steps to max_num_epochs x batches, as in the PPO block.
+  max_num_epochs: 100000
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+  overlong_filtering: false
+  masked_sample_rewards_in_baseline: false
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
+  adv_estimator:
+    name: grpo
+    normalize_rewards: true
+    use_leave_one_out_baseline: true
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_grpo: null
+# The base recipe sizes these from ppo.*; v2.sh overrides the three async_rl ones on the command line anyway.
+async_rl:
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:2, ${grpo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2, ${grpo.num_prompts_per_step}}
+env:
+  nemo_gym:
+    # swe_internal_v1's agent block is a YAML-anchor copy, not an interpolation of swe_rebench's: set both.
+    swe_rebench_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+    swe_internal_v1_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}

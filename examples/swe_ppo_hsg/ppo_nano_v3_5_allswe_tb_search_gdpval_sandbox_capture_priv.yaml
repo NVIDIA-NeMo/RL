@@ -1,0 +1,64 @@
+# =============================================================================
+# The six-set SWE mix + Terminal-Bench + BrowseComp search + GDPval in one recipe (user, 2026-10-20: "run ppo on
+# gdpval+swe+tb+search"; the PPO arm of the GRPO vs PPO ablation, whose GRPO arm is
+# grpo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml). Rows carry their agent in `agent_ref`.
+#
+# Both environment overlays, unchanged:
+# - ppo_nano_v3_5_allswe_tb_search_sandbox_capture_priv.yaml: browsecomp_sandboxed_agent on policy_model_search,
+#   GLM-5.1 judge, search cache, 400 steps / 3600 s;
+# - ppo_nano_v3_5_allswe_tb_gdpval_sandbox_capture_priv.yaml: OpenHands in an OpenSandbox sandbox, rubric judge
+#   (bundled Qwen3.8-Flash-Next), 3600 s agent / 7200 s rollout cap.
+# Their dict blocks merge; their two lists (mask_sample_rules, nemo_gym.config_paths) are replaced on merge, so the
+# union is restated here. A mask rule whose field a rollout lacks never matches, so the rule sets do not interact.
+# The launcher (v2.sh) enables both env blocks from this file name (*search*, *gdpval*).
+# =============================================================================
+defaults:
+- ppo_nano_v3_5_allswe_tb_search_sandbox_capture_priv.yaml
+- ppo_nano_v3_5_allswe_tb_gdpval_sandbox_capture_priv.yaml
+env:
+  # SWE / TB rules + search stop reasons + GDPval's unfinished harness.
+  mask_sample_rules:
+  - name: agent_timeout
+    field: opencode_error_type
+    equals: timeout
+  - name: agent_timeout_exception
+    field: opencode_error_type
+    equals: TimeoutError
+  - name: agent_oom
+    field: opencode_exit_code
+    equals: 137
+  - name: eval_incomplete
+    field: evaluation_completed
+    equals: false
+  - name: context_limited
+    field: opencode_context_limited
+    equals: true
+  - name: search_stop_max_steps
+    field: response.stop_reason
+    equals: max_steps
+  - name: search_stop_context_full
+    field: response.stop_reason
+    equals: context_full
+  - name: search_stop_timeout
+    field: response.stop_reason
+    equals: timeout
+  - name: gdpval_harness_unfinished
+    field: agent_finished
+    equals: false
+  nemo_gym:
+    # SWE + TB + search + GDPval servers.
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/swe_rebench/configs/swe_rebench_opencode.yaml
+    - resources_servers/swe_internal_v1/configs/swe_internal_v1_opencode.yaml
+    - resources_servers/swemer_v1/configs/swemer_v1_opencode.yaml
+    - resources_servers/swemer_v2/configs/swemer_v2_opencode.yaml
+    - resources_servers/swemer_oml/configs/swemer_oml_opencode.yaml
+    - resources_servers/scale_swe/configs/scale_swe_opencode.yaml
+    - resources_servers/swe_next/configs/swe_next_opencode.yaml
+    - benchmarks/terminal_bench_2_1/opencode.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    - responses_api_agents/browsecomp_sandboxed_agent/configs/browsecomp_sandboxed_agent.yaml
+    - responses_api_agents/browsecomp_sandboxed_agent/configs/rl_training_servers.yaml
+    - responses_api_agents/gdpval_sandboxed_agent/configs/training.yaml
+    - resources_servers/gdpval_disaggregated/configs/training.yaml
