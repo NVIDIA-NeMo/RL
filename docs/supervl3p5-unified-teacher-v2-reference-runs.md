@@ -1,19 +1,14 @@
 # SuperVL3.5 unified vision GRPO: V2 reference runs
 
-Updated: 2026-10-21. This runbook records only the **V2 single-controller** runs. Run numbers match [Matthieu's reference](https://gitlab-master.nvidia.com/matthieul/nemo-rl/-/blob/matthieul/super_3p5_unified/docs/super35-unified-vision-grpo-reference-runs.md), checked at `ec0de5a80172bddca7db81b1b474283b9d9e657a`. There are no V1 run entries in this document.
-
-1. [The runs](#the-runs): recipes, W&B links, and completed steps.
-2. [Rerun a recipe](#rerun-a-recipe): container, environment, and UV commands.
-3. [What each run tests](#what-each-run-tests): dataset purpose and validated behavior.
-4. [Details](#details): data hashes, settings, results, and artifact locations.
+Updated: 2026-10-21. This runbook records the **V2 single-controller** runs.
 
 ## The runs
 
-All runs use `examples/run_grpo_single_controller.py`, 32 nodes with four GB200 GPUs each, and the same initial SuperVL3.5 HF checkpoint. Runs 1–6 are complete or stopped; their checkpoints were subsequently deleted at the user's request. Run 7's two five-step checkpoints are retained. Status and metrics below were checked against W&B and the filesystem on 2026-10-21.
+All runs use `<V2_ENTRYPOINT>` and the same initial SuperVL3.5 HF checkpoint at `<MODEL_DIR>`. Runs 1–6 are complete or stopped; their checkpoints were subsequently deleted at the user's request. Run 7's two five-step checkpoints are retained. Status and metrics below were checked against W&B and the filesystem on 2026-10-21.
 
 | # | V2 run | Sampler / staleness | R3 | Completed steps | W&B state / result | W&B |
 | --- | --- | --- | --- | ---: | --- | --- |
-| 1 | Unified teachers, R3 on | `ready_first` / 2 | On | 23 / 150 | `crashed`; four-hour allocation ended | [Run 1](https://forge.coreweave.com/wandb/nvidia/rohit-unified-teacher-supervl3p5/runs/super-vl-35-mixed-teachers-v2-ready-first-s2-r3-20261019) |
+| 1 | Unified teachers, R3 on | `ready_first` / 2 | On | 23 / 150 | `crashed`; runtime limit reached | [Run 1](https://forge.coreweave.com/wandb/nvidia/rohit-unified-teacher-supervl3p5/runs/super-vl-35-mixed-teachers-v2-ready-first-s2-r3-20261019) |
 | 2 | Unified teachers, R3 off | `ready_first` / 2 | Off | 274 / 300 | `finished`; target not reached | [Run 2](https://forge.coreweave.com/wandb/nvidia/rohit-unified-teacher-supervl3p5/runs/super-vl-35-mixed-teachers-v2-ready-first-s2-20261002) |
 | 3 | CapRL video | `ready_first` / 1 | Off | 50 / 50 | `finished` | [Run 3](https://forge.coreweave.com/wandb/nvidia/rohit-unified-teacher-supervl3p5/runs/supervl3p5-caprl-v2-ready-first-s1-20261019) |
 | 4 | SA-V visibility | `ready_first` / 1 | Off | 10 / 50 | 10 iterations completed; W&B `crashed` | [Run 4](https://forge.coreweave.com/wandb/nvidia/rohit-unified-teacher-supervl3p5/runs/supervl3p5-sav-v2-ready-first-s1-nor3-20261019) |
@@ -30,21 +25,21 @@ Additional V2 references:
 
 ### Recipes
 
-Paths are relative to `configs/examples/recipes/vlm/` in the tested checkout.
+Set each recipe placeholder to its YAML in `<RECIPE_ROOT>`.
 
 | Run | YAML | Source availability in this documentation commit |
 | --- | --- | --- |
-| 1 | `vlm_grpo-supervl3p5-unified-teachers-ready-first-r3-32n4g.yaml` | Local recipe |
-| 2 | `vlm_grpo-supervl3p5-unified-teachers-ready-first-32n4g.yaml` | Tracked |
-| 3 | `vlm_grpo-supervl3p5-caprl-video-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked; local logging-tag edits remain separate |
-| 4 | `vlm_grpo-supervl3p5-sav-visibility-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked |
-| 5 | `vlm_grpo-supervl3p5-raven-grouping-32n4g-megatron-ready-first-s1.v2.yaml` | Tracked |
-| 6 | `vlm_grpo-supervl3p5-static-control-32n4g-megatron-ready-first-s1.v2.yaml` | Local recipe |
-| 7 | `vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1-stream32.v2.yaml` | Local recipe; inherits the local OpenCode base YAML |
-| In-order | `vlm_grpo-supervl3p5-unified-teachers-inorder-32n4g.yaml` | Tracked |
-| Run 7 reference | `vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1.v2.yaml` | Local recipe |
+| 1 | `<RUN_1_YAML>` | Local recipe |
+| 2 | `<RUN_2_YAML>` | Tracked |
+| 3 | `<RUN_3_YAML>` | Tracked; local logging-tag edits remain separate |
+| 4 | `<RUN_4_YAML>` | Tracked |
+| 5 | `<RUN_5_YAML>` | Tracked |
+| 6 | `<RUN_6_YAML>` | Local recipe |
+| 7 | `<RUN_7_STREAM32_YAML>` | Local recipe; inherits the local OpenCode base YAML |
+| In-order | `<INORDER_YAML>` | Tracked |
+| Run 7 reference | `<OPENCODE_BASE_YAML>` | Local recipe |
 
-This commit publishes the runbook and its documentation-index entry. It does not publish the local-only configs, runtime helpers, or OpenCode environment port. The commands below use the existing tested checkout and provisioned runtime; a fresh GitHub clone alone does not contain all Run 7 dependencies. Historical jobs also used runtime YAMLs and command-line overrides. The reusable YAMLs do not imply that every earlier job used their current contents.
+This commit publishes the runbook and its documentation-index entry. It does not publish the local-only configs, runtime helpers, or OpenCode environment port. The commands below use the existing tested checkout and provisioned runtime; a fresh GitHub clone alone does not contain all Run 7 dependencies. Historical runs also used runtime YAMLs and command-line overrides. The reusable YAMLs do not imply that every earlier job used their current contents.
 
 ## Rerun a recipe
 
@@ -54,15 +49,14 @@ This commit publishes the runbook and its documentation-index entry. It does not
 | --- | --- |
 | GitHub branch | `NVIDIA-NeMo/RL:rohit/unified-teacher-supervl3p5` |
 | Training source commit | `b8e429c3803ad6b355b8d2dad5a7dd9b95f4745e`, plus recorded local recipe/runtime files |
-| HSG checkout | `/home/rohitkumarj/code/RL/nemo-rl-unified-teacher-supervl3p5` |
-| In-container checkout | `/opt/nemo-rl` |
-| Container | `/home/rohitkumarj/data/enroot-containers/rl.nightly.sep30.2026.sqsh` |
+| Checkout | `<CODE_DIR>` |
+| Container | `<CONTAINER_IMAGE>` |
 | Gym framework | `c004bce8068eaa35690be8705d3e263be10581e8`, plus the custom environments described below |
 | Megatron-Bridge | `1f8873bb00a8ddf3af811649f0a7efdb2363570c` |
 | Megatron-Core | `6a3660905a2736b5670baed1ca5954372937918b` |
 | Run 7 vLLM worker package | `0.29.0` |
 
-Use the project's existing mounts and nested Bridge/Core checkouts. Start the driver **once on the Ray head** of a provisioned 32-node allocation. For interactive tests and retries, reuse a persistent `rem getnode` allocation. The UV command does not allocate nodes, create mounts, or prepare the image's Python environments.
+Prepare `<RUNTIME_SETUP>` for your environment, then start one driver per run.
 
 The tested runtime keeps the container's pinned driver, Megatron, vLLM, and Gym environments, applies the existing RADIO final-LayerNorm backport, and makes custom Gym environments available. These are prerequisites for the commands below. `--no-sync` preserves those installed environments.
 
@@ -72,44 +66,43 @@ Run inside the container. Choose the YAML from the table and the exact data file
 
 ```bash
 set -euo pipefail
-cd /opt/nemo-rl
+cd "<CODE_DIR>"
 
-export MM_TRAINER_MODEL_PATH=/lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf
-export MM_TRAINER_DATA_PATH=/lustre/fs1/portfolios/nemotron/projects/nemotron_omni_vision/users/matthieul/data/grpo/v1base_caprl_video_20steps_2spare_seed20261015/training.jsonl
+export MM_TRAINER_MODEL_PATH="<MODEL_DIR>"
+export MM_TRAINER_DATA_PATH="<TRAINING_JSONL>"
 export MM_TRAINER_WANDB_ID="supervl3p5-caprl-v2-fresh-$(date -u +%Y%m%dT%H%M%SZ)"
 export MM_TRAINER_WANDB_NAME="$MM_TRAINER_WANDB_ID"
 export MM_TRAINER_WANDB_PROJECT=rohit-unified-teacher-supervl3p5
 export MM_TRAINER_WANDB_ENTITY=nvidia
-export MM_TRAINER_RESULTS_DIR="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/$MM_TRAINER_WANDB_ID"
-export GYM_EXTRA_DIR=/opt/nemo-rl/examples/nemo_gym/supervl3p5
-export CONFIG=configs/examples/recipes/vlm/vlm_grpo-supervl3p5-caprl-video-32n4g-megatron-ready-first-s1.v2.yaml
+export MM_TRAINER_RESULTS_DIR="<OUTPUT_DIR>"
+export GYM_EXTRA_DIR="<CUSTOM_GYM_DIR>"
+export CONFIG="<RECIPE_YAML>"
 
 test -r "$MM_TRAINER_DATA_PATH"
-test -r "$MM_TRAINER_MODEL_PATH/config.json"
+test -r "<MODEL_CONFIG_JSON>"
 test -r "$CONFIG"
 test ! -e "$MM_TRAINER_RESULTS_DIR"
 mkdir -p "$MM_TRAINER_RESULTS_DIR"
 
 # Existing helper in the tested checkout; not included in this docs commit.
-source docs/runbooks/supervl3p5/nemo-rl/scripts/env.sh
+source "<ENV_SETUP_SCRIPT>"
 export WANDB_RUN_ID="$MM_TRAINER_WANDB_ID"
 export WANDB_NAME="$MM_TRAINER_WANDB_NAME"
 export WANDB_RESUME=never
 
-uv run --no-sync examples/run_grpo_single_controller.py \
+uv run --no-sync "<V2_ENTRYPOINT>" \
   --config "$CONFIG" \
-  cluster.num_nodes=32 cluster.gpus_per_node=4 \
   logger.wandb_enabled=true logger.wandb.resume=never \
   logger.wandb.project="$MM_TRAINER_WANDB_PROJECT" \
   logger.wandb.name="$MM_TRAINER_WANDB_NAME" \
   logger.wandb.id="$MM_TRAINER_WANDB_ID" \
-  checkpointing.checkpoint_dir="$MM_TRAINER_RESULTS_DIR/checkpoints" \
+  checkpointing.checkpoint_dir="<CHECKPOINT_DIR>" \
   token_capture.control_auth_token=null
 ```
 
 Credentials come from the runtime environment. Forward the existing W&B credentials to the driver. Run 7 also requires an `OPENAI_API_KEY` accepted by its judge endpoint. The native W&B x-axis is **`nemo_rl/step`**.
 
-The short UV command assumes `uv run --no-sync` already selects the prepared driver environment. If it does not, the validated explicit spelling is `uv run --no-sync --python /opt/nemo_rl_venv/bin/python python examples/run_grpo_single_controller.py ...`. Do not run a dependency sync as a substitute for preparing this container.
+The short UV command assumes `uv run --no-sync` already selects the prepared driver environment. If it does not, the validated explicit spelling is `uv run --no-sync --python "<DRIVER_PYTHON>" python "<V2_ENTRYPOINT>" ...`. Do not run a dependency sync as a substitute for preparing this container.
 
 ### Run 7 additions
 
@@ -117,18 +110,18 @@ Use the OpenCode dataset and the stream32 YAML from the tables, with a fresh res
 
 ```bash
 : "${OPENAI_API_KEY:?Set the existing judge credential}"
-export TORCHINDUCTOR_CACHE_DIR="/tmp/supervl-run7-${SLURM_JOB_ID:-interactive}/inductor"
-export TRITON_CACHE_DIR="/tmp/supervl-run7-${SLURM_JOB_ID:-interactive}/triton"
-uv run --no-sync --python /opt/nemo_rl_venv/bin/python python \
-  examples/nemo_gym/supervl3p5/install_visual_coding.py
+export TORCHINDUCTOR_CACHE_DIR="<TORCHINDUCTOR_CACHE_DIR>"
+export TRITON_CACHE_DIR="<TRITON_CACHE_DIR>"
+uv run --no-sync --python "<DRIVER_PYTHON>" python \
+  "<OPENCODE_INSTALLER>"
 ```
 
-The installer ports the published OpenCode environment into the existing Gym setup. Keep the shared Gym-venv path in the Run 7 YAML, `${oc.env:MM_TRAINER_RESULTS_DIR}/cache/gym_venvs`; a node-local venv path previously caused missing `cv2` imports on remote actors. Do not replace the project's Gym checkout or add mounts for this run.
+The installer ports the published OpenCode environment into the existing Gym setup. Keep the shared Gym-venv path in the Run 7 YAML, `<SHARED_GYM_VENV_DIR>`; an environment that was not shared previously caused missing `cv2` imports in Gym actors.
 
 The stream32 delta is:
 
 ```yaml
-defaults: vlm_grpo-supervl3p5-visual-coding-opencode-32n4g-megatron-ready-first-s1.v2.yaml
+defaults: <OPENCODE_BASE_YAML>
 
 async_rl:
   min_groups_for_streaming_train: 32
@@ -138,9 +131,9 @@ This is the minimum number of prompt groups needed to begin streamed training. I
 
 ### Continue an existing run
 
-Reuse the same results/checkpoint directory and W&B ID, set `WANDB_RESUME=allow` and `logger.wandb.resume=allow`, and omit the fresh-directory check. First verify that a complete checkpoint exists and that no driver for that run is active. Keep the total step target and restored sampler/optimizer state consistent across allocations.
+Reuse the same results/checkpoint directory and W&B ID, set `WANDB_RESUME=allow` and `logger.wandb.resume=allow`, and omit the fresh-directory check. First verify that a complete checkpoint exists and that no driver for that run is active. Keep the total step target and restored sampler/optimizer state consistent across restarts.
 
-Runs 1–6 cannot currently resume from their recorded output directories because their checkpoints were deleted. Run 7's `step_5` checkpoints are retained. No continuation chain is currently scheduled for Run 7. Its YAML target of 209 steps is a ceiling, not a claim that 209 steps completed in one allocation.
+Runs 1–6 cannot currently resume from their recorded output directories because their checkpoints were deleted. Run 7's step-5 checkpoints are retained at `<RUN_7_CHECKPOINT>` and `<RUN_7_REFERENCE_CHECKPOINT>`. Its YAML target of 209 steps is a ceiling; five updates completed.
 
 ## What each run tests
 
@@ -156,7 +149,7 @@ Run 1 includes the cherry-picked media-position fixes from PR #4763, whereas the
 
 One row contains 64 cached frames from one video. The native-video path combines these into one lossless frame manifest. With temporal patch size 2, it forms 32 tubelets, rather than treating the frames as 64 independent images. The vision encoder and projection stay frozen.
 
-The focused real-row comparison matched the reference preprocessing: 8,192 visual tokens, 9,264 total prompt tokens, exactly equal prompt IDs and pixel/image-size tensors, one outbound `input_video`, and no outbound `input_image`. A four-GPU real-weight generation check also passed without OOM. The production run then completed 50 updates.
+The focused real-row comparison matched the reference preprocessing: 8,192 visual tokens, 9,264 total prompt tokens, exactly equal prompt IDs and pixel/image-size tensors, one outbound `input_video`, and no outbound `input_image`. A real-weight generation check also passed without OOM. The production run then completed 50 updates.
 
 The fix registered the actual Super processor class names in the native-video processor list. Synthetic tests alone had missed those classes; the regression included the real processor path.
 
@@ -189,7 +182,8 @@ OpenCode can write and run Python, inspect images, and make further model calls.
 | Setting | Value |
 | --- | --- |
 | Agent | `opencode_vision_agent`; OpenCode 1.17.11 |
-| Agent concurrency / session nodes | 512 / 4 |
+| Agent concurrency | 512 |
+| Session placement | `<SESSION_PLACEMENT>` |
 | Context / per-call output cap | 65,536 / 16,384 tokens |
 | Session timeout | 1,800 seconds; timeout scores 0 |
 | Sampling | Temperature 1.0, top-p 1.0 |
@@ -214,9 +208,9 @@ A separate real-weight vLLM test compared `async_scheduling: true` and `false`. 
 
 | Setting | Value |
 | --- | --- |
-| Policy / generation nodes | 16 / 16, four GPUs per node |
-| Policy parallelism | TP2 / CP2 / EP16 / PP1 |
-| Generation parallelism | TP4 / EP4 |
+| Runtime resources | `<RUNTIME_RESOURCES>` |
+| Policy parallelism | `<POLICY_PARALLELISM>` |
+| Generation parallelism | `<GENERATION_PARALLELISM>` |
 | Batch | 128 prompts × 16 generations = 2,048 sequences/update |
 | Context / ordinary output cap | 65,536 / 32,768 tokens; OpenCode per-call cap 16,384 |
 | GRPO | Leave-one-out baseline; reward normalization; sequence-level loss |
@@ -240,30 +234,28 @@ A separate real-weight vLLM test compared `async_scheduling: true` and `false`. 
 
 The 50-step single-source recipes can revisit their finite datasets. They are not single-pass evaluation runs. Historical unified-teacher continuations changed checkpointing from 10 to 50 steps. Staleness is a sampler-admission setting, not a guarantee that every measured sample-version lag equals that value.
 
-For Runs 3–7, `checkpoint_must_save_by: 00:03:45:00` is relative to the trainer's timer. Container/model bring-up also consumes the allocation; this setting does not guarantee a 15-minute wall-clock margin. Run 7 stream32 saved and exited before the four-hour Slurm deadline. Verify this margin again when changing the recipe or allocation length.
+Set `checkpoint_must_save_by: <CHECKPOINT_SAVE_DEADLINE>` for your runtime. This deadline is relative to the trainer's timer; include setup and final-save time when choosing it.
 
 ### Data files
 
 All runs start from:
 
-`/lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf`
+`<MODEL_DIR>`
 
 For Run 7, 64 weight shards and 16 model/tokenizer/processor files were checked byte-for-byte against the reference checkpoint. The 64 weight-shard hashes matched. This is identity evidence for that comparison, not a guarantee that every future runtime uses unchanged files.
 
-For Runs 3–7, paths below are relative to:
-
-`/lustre/fs1/portfolios/nemotron/projects/nemotron_omni_vision/users/matthieul/data/`
+Replace each training-file placeholder with its dataset. The hashes identify the files used for the recorded runs.
 
 | Runs | Training file | Rows | SHA-256 |
 | --- | --- | ---: | --- |
-| 1–2 and in-order | `/lustre/fsw/portfolios/coreai/users/cye/code/RL/workspace/datasets/mm-trainer-unified/training.jsonl` | 16,000 | `b1f23c69978d496de25aae7d47fae081c18eb773afb28c1db2fb6979c6be2dce` |
-| 3 | `grpo/v1base_caprl_video_20steps_2spare_seed20261015/training.jsonl` | 2,816 | `a6a6b04cfa012f1cd660c7097938a1cada986cd3dae001fc81dedadb60275ec1` |
-| 4 | `grpo/v1base_sav_visibility_24steps_2spare_seed20261015/training.jsonl` | 3,328 | `46565ca53ffbc3e5c83727981a3623a5f940d6fa411392d278d9957c28b19c47` |
-| 5 | `grpo/v1base_raven_grouping_18steps_2spare_seed20261015/training.jsonl` | 2,560 | `bf86c00e04632fdd2af296da495d05418d048b314d833e28b91115dacb111c47` |
-| 6 | `grpo/v1base_static_control_20steps_2spare_seed20261015/training.jsonl` | 2,816 | `50e5db5bb3572df2ebb1d4d541bfc324ff83a525a05fab55625504b9477bdaa3` |
-| 7, both variants | `super_pass4_rl/train_025_075_shuffled.jsonl` | 26,801 | `fd955f49c30022a35acc45f876c6964f4c4d710686a25568d2a1b073c900d0de` |
+| 1–2 and in-order | `<UNIFIED_TEACHERS_JSONL>` | 16,000 | `b1f23c69978d496de25aae7d47fae081c18eb773afb28c1db2fb6979c6be2dce` |
+| 3 | `<CAPRL_JSONL>` | 2,816 | `a6a6b04cfa012f1cd660c7097938a1cada986cd3dae001fc81dedadb60275ec1` |
+| 4 | `<SAV_JSONL>` | 3,328 | `46565ca53ffbc3e5c83727981a3623a5f940d6fa411392d278d9957c28b19c47` |
+| 5 | `<RAVEN_JSONL>` | 2,560 | `bf86c00e04632fdd2af296da495d05418d048b314d833e28b91115dacb111c47` |
+| 6 | `<STATIC_CONTROL_JSONL>` | 2,816 | `50e5db5bb3572df2ebb1d4d541bfc324ff83a525a05fab55625504b9477bdaa3` |
+| 7, both variants | `<OPENCODE_JSONL>` | 26,801 | `fd955f49c30022a35acc45f876c6964f4c4d710686a25568d2a1b073c900d0de` |
 
-Set `MM_TRAINER_DATA_PATH` explicitly. Keep absolute media paths readable on every worker. Runs 1–6 use file-backed images/frames under `/lustre`; Run 7 embeds its initial image in the JSONL. These recipes have no held-out validation dataset.
+Set `MM_TRAINER_DATA_PATH` explicitly. Provide the media through `<MEDIA_ROOT>`. Run 7 embeds its initial image in the JSONL. These recipes have no held-out validation dataset.
 
 ### Latest training results
 
@@ -293,39 +285,36 @@ Run 7 stream32's complete native updates:
 | 4 | 0.5713 | 1.0370 | 10 | 42.49 |
 | 5 | 0.5850 | 1.0392 | 7 | 42.89 |
 
-Every update had a 2,048-entry reward histogram and finite nonzero gradients. Shared warm steps 2–4 averaged 2,472.72 seconds, with aggregate throughput 105.92 valid tokens/second/GPU. Throughput is `sum(valid_tokens) / (128 × sum(total_step_time))`; do not average per-step rates or compare unrelated reward numerators. This short window is not a convergence test.
+Every update had a 2,048-entry reward histogram and finite nonzero gradients. Shared warm steps 2–4 averaged 2,472.72 seconds, with aggregate throughput 105.92 valid tokens/second/GPU. Throughput is `sum(valid_tokens) / (num_gpus × sum(total_step_time))`; do not average per-step rates or compare unrelated reward numerators. This short window is not a convergence test.
 
 ### Artifact index and checkpoint availability
 
-Experiment directories below are relative to:
+Set `<ARTIFACT_ROOT>` for your environment. Replace each output and checkpoint placeholder with the corresponding location.
 
-`/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/rem/unified-teacher-supervl3p5/experiments/`
+| Run | Output | Checkpoint availability |
+| --- | --- | --- |
+| 1 | `<RUN_1_OUTPUT_DIR>` | None; no complete policy checkpoint was found before cleanup |
+| 2 | `<RUN_2_OUTPUT_DIR>` | Deleted |
+| 3 | `<RUN_3_OUTPUT_DIR>` | Deleted; step 50 was verified before cleanup |
+| 4 | `<RUN_4_OUTPUT_DIR>` | Deleted; step 10 was verified before cleanup |
+| 5 | `<RUN_5_OUTPUT_DIR>` | Deleted; step 50 was verified before cleanup |
+| 6 | `<RUN_6_OUTPUT_DIR>` | Deleted; step 50 was verified before cleanup |
+| 7 | `<RUN_7_OUTPUT_DIR>` | Retained: step 5 at `<RUN_7_CHECKPOINT>` |
+| In-order | `<INORDER_OUTPUT_DIR>` | Deleted |
+| Run 7 reference | `<RUN_7_REFERENCE_OUTPUT_DIR>` | Retained: step 5 at `<RUN_7_REFERENCE_CHECKPOINT>` |
 
-The W&B run ID equals the experiment directory name except for the Run 7 reference, whose W&B ID has the `-r2` suffix. Checkpoint roots are `<experiment directory>/checkpoints`.
+Run 7 stream32's driver exited with code 0. Its checkpoint verifier checked the step/version metadata, optimizer entries, controller/storage metadata, rollout-recovery payload hash, and all referenced byte ranges across 64 DCP shards. This checks checkpoint completeness; it is not a full reload/resume test.
 
-| Run | Experiment directory | Historical job / allocation | Checkpoints available now |
-| --- | --- | --- | --- |
-| 1 | `super-vl-35-mixed-teachers-v2-ready-first-s2-r3-20261019` | 8068791 | None; no complete policy checkpoint was found before cleanup |
-| 2 | `super-vl-35-mixed-teachers-v2-ready-first-s2-20261002` | Last recorded continuation 7776838 | Deleted |
-| 3 | `supervl3p5-caprl-v2-ready-first-s1-20261019` | Finished in continuation 8074509 | Deleted; step 50 was verified before cleanup |
-| 4 | `supervl3p5-sav-v2-ready-first-s1-nor3-20261019` | Replacement chain started 8076888 | Deleted; step 10 was verified before cleanup |
-| 5 | `supervl3p5-raven-v2-ready-first-s1-nor3-20261019` | 8076894 | Deleted; step 50 was verified before cleanup |
-| 6 | `supervl3p5-static-control-v2-ready-first-s1-nor3-20261019` | Finished in continuation 8081499 | Deleted; step 50 was verified before cleanup |
-| 7 | `supervl3p5-visual-coding-v2-rf-s1-stream32-20261021` | 8107419 | **Retained: `checkpoints/step_5`** |
-| In-order | `super-vl-35-mixed-teachers-v2-test-batch4h-20261002` | Last recorded continuation chain began 7776751 | Deleted |
-| Run 7 reference | `supervl3p5-visual-coding-v2-ready-first-s1-nor3-20261020` | 8101416 | **Retained: `checkpoints/step_5`** |
+Useful records for Run 7 stream32:
 
-Run 7 stream32's driver exited with code 0 at **2026-10-21 05:38:53 UTC**, before its four-hour allocation deadline. Its checkpoint verifier checked the step/version metadata, optimizer entries, controller/storage metadata, rollout-recovery payload hash, and all referenced byte ranges across 64 DCP shards. This checks checkpoint completeness; it is not a full reload/resume test. Its production allocation and the focused-test allocation were released after verification.
+- `<SUBMITTED_PAYLOAD>` and `<UV_LAUNCH_SCRIPT>`: exact command and UV script used.
+- `<DRIVER_LOG>`: production driver output.
+- `<RUNTIME_CONFIG_CHECKS>`: 45 checked runtime settings.
+- `<NATIVE_UPDATE_CHECKS>`: five complete native W&B updates and their checks.
+- `<CHECKPOINT_VERIFICATION>`: retained checkpoint completeness checks.
+- `<DRIVER_EXIT_RECORD>`: final driver return code.
+- `<OPTIMIZATION_AUDIT>`: complete optimization/validation result.
+- `<SCHEDULER_COMPARISON>`: focused async-scheduling A/B result; no production variant was launched.
+- `<OPTIMIZATION_REPORT>`: chronological optimization report.
 
-Useful records under the Run 7 stream32 experiment directory:
-
-- `submitted-payload.sh` and `run.sh`: exact command and UV script used.
-- `driver-8107419.log`: production driver output.
-- `run-config-verified.json`: 45 checked runtime settings.
-- `completed-updates-native-check.json`: five complete native W&B updates and their checks.
-- `final-checkpoint-verification.json`: retained checkpoint completeness checks.
-- `allocation-launch-status.json`: final driver return code.
-- `optimization-final-audit.json`: complete optimization/validation result.
-- `scheduler-focus/comparison.json`: focused async-scheduling A/B result; no production variant was launched.
-
-The Run 7 reference directory also contains `baseline-parity.md`, the chronological optimization report. Exact launch receipts, runtime configs, validation records, and retained logs for other runs remain under their experiment directories even when checkpoints are absent.
+Exact launch receipts, runtime configs, validation records, and retained logs remain under the corresponding `<RUN_OUTPUT_DIR>`, even when checkpoints are absent.
