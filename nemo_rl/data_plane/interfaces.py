@@ -166,7 +166,6 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     # Unfinished NIXL transfers may retain this much memory before the
     # process refuses further transfers (DataPlaneFatal).
     graveyard_max_bytes: int = 4294967296
-    placement: dict[str, Any] = Field(default_factory=lambda: {"policy": "local_first"})
     store: dict[str, Any] = Field(default_factory=lambda: {"kind": "unit"})
     # SSD tier: {enabled, dir, staging_bytes, pickup_s}; puts the put area cannot take go to disk;
     # see tq_nixl.ssd_config. Checkpointing the store with it on is not supported.
