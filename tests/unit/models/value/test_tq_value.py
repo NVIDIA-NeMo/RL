@@ -116,6 +116,33 @@ def _make_tq_value() -> tuple[TQValue, MagicMock]:
 
 
 class TestTQValueFanout:
+    @pytest.mark.parametrize("training", [False, True])
+    def test_critic_dispatch_preserves_recorded_media_columns(self, training):
+        v, wg = _make_tq_value()
+        media_fields = ["pixel_values", "imgs_sizes", "num_frames"]
+        meta = _meta()
+        meta.fields = [*DP_VALUE_TRAIN_FIELDS, *media_fields, "advantages"]
+        original_fields = list(meta.fields)
+        wg.get_all_worker_results.return_value = [
+            {"global_loss": 1.0, "grad_norm": 0.5, "all_mb_metrics": {"loss": [1.0]}}
+        ]
+        with (
+            patch.object(TQValue, "_stamp_pad_seqlen"),
+            patch.object(TQValue, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.value.tq_value.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as shard,
+        ):
+            if training:
+                v.train_from_meta(meta, loss_fn="LF")
+            else:
+                v.get_values_from_meta(meta)
+        sent = shard.call_args.args[0]
+        assert set(media_fields).issubset(sent.fields)
+        assert "advantages" not in sent.fields
+        assert meta.fields == original_fields
+
     def test_get_values_from_meta_narrows_fields_and_returns_none(self):
         v, wg = _make_tq_value()
         meta = _meta()

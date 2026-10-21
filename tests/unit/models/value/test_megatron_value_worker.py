@@ -79,6 +79,8 @@ def test_get_values_suspends_activation_offload() -> None:
         cfg={"train_micro_batch_size": 1},
         model=model,
         _policy_like_cfg={},
+        media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=False,
         mcore_state=SimpleNamespace(straggler_timer=None),
     )
     observed_states: list[tuple[bool, bool]] = []
@@ -119,6 +121,133 @@ def test_get_values_suspends_activation_offload() -> None:
     assert observed_states == [(False, False)]
     assert model_config.fine_grained_activation_offloading is True
     assert manager.do_offload is True
+
+
+def test_get_values_uses_image_context_and_keeps_state_before_token_alignment() -> None:
+    """The same tokens with different recorded pixels must produce different values."""
+    from nemo_rl.data.multimodal_utils import PackedTensor
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    class VisionCritic(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(fine_grained_activation_offloading=False)
+
+        def forward(self, input_ids, position_ids, attention_mask, *, pixel_values):
+            assert (
+                position_ids is None
+            )  # Shared VLM helper derives positions in the model.
+            return input_ids.float().unsqueeze(-1) + pixel_values.sum()
+
+    model = VisionCritic()
+    ids = torch.tensor([[1, 2, 3]])
+    worker = SimpleNamespace(
+        cfg={"train_micro_batch_size": 1},
+        model=model,
+        _policy_like_cfg={},
+        media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=False,
+        mcore_state=SimpleNamespace(straggler_timer=None),
+    )
+
+    def run_forward_only(**kwargs):
+        output, collect = kwargs["forward_step_func"](kwargs["data_iterator"], model)
+        return [collect(output)[1]]
+
+    predictions = []
+    for pixel in (3.0, 9.0):
+        pixels = torch.tensor([pixel])
+        data = BatchedDataDict(
+            input_ids=ids.clone(),
+            input_lengths=torch.tensor([3]),
+            pixel_values=PackedTensor([pixels], dim_to_pack=0),
+        )
+        processed = SimpleNamespace(
+            data_dict=data,
+            input_ids_cp_sharded=data["input_ids"],
+            attention_mask=None,
+            position_ids=torch.arange(3).unsqueeze(0),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            padding_mask=None,
+            media_token_validity_mask=None,
+        )
+        with (
+            patch(
+                "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+                return_value=(iter([processed]), 1, 1, 3, 3),
+            ),
+            patch(
+                "nemo_rl.models.value.workers.megatron_value_worker.get_forward_backward_func",
+                return_value=run_forward_only,
+            ),
+            patch(
+                "nemo_rl.models.value.workers.megatron_value_worker.get_pipeline_model_parallel_group",
+                return_value=None,
+            ),
+            patch(
+                "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+                return_value=True,
+            ),
+            patch(
+                "nemo_rl.models.value.workers.megatron_value_worker.broadcast_tensor"
+            ),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.cuda.nvtx.range_push"),
+            patch("torch.cuda.nvtx.range_pop"),
+        ):
+            predictions.append(
+                MegatronValueWorkerImpl.get_values(worker, data)["values"]
+            )
+        torch.testing.assert_close(data["input_ids"], ids, rtol=0, atol=0)
+        torch.testing.assert_close(pixels, torch.tensor([pixel]), rtol=0, atol=0)
+    torch.testing.assert_close(predictions[0], torch.tensor([[0.0, 4.0, 5.0]]))
+    torch.testing.assert_close(predictions[1], torch.tensor([[0.0, 10.0, 11.0]]))
+
+
+def test_omni_value_head_replaces_used_decoder_head_and_skips_only_fresh_head() -> None:
+    from megatron.bridge.models.common.heads import LinearForLastLayer
+    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+        NemotronOmniModel,
+    )
+
+    from nemo_rl.models.value.workers.megatron_value_worker import make_value_head_hook
+
+    # Exercise the real Omni type and native value-head hook without constructing
+    # its 120B backbone. Registered parameter names match its decoder hierarchy.
+    model = object.__new__(NemotronOmniModel)
+    torch.nn.Module.__init__(model)
+    model.language_model = torch.nn.Module()
+    model.language_model.output_layer = torch.nn.Linear(3, 5, bias=False)
+    model.language_model.backbone = torch.nn.Linear(3, 3, bias=False)
+    model.sharded_state_dict = lambda prefix="", **kwargs: {
+        prefix + name: parameter for name, parameter in model.named_parameters()
+    }
+    with (
+        patch(
+            "megatron.bridge.models.common.heads.parallel_state.get_pipeline_model_parallel_world_size",
+            return_value=1,
+        ),
+        patch(
+            "megatron.bridge.models.common.heads.parallel_state.is_pipeline_last_stage",
+            return_value=True,
+        ),
+    ):
+        chunks = make_value_head_hook(hidden_size=3, sequence_parallel=False)([model])
+    assert chunks == [model]
+    assert isinstance(model.language_model.output_layer, LinearForLastLayer)
+    assert "output_layer" not in model._modules
+    values, _ = model.language_model.output_layer(torch.ones(2, 1, 3))
+    assert values.shape == (2, 1, 1)
+    values.sum().backward()
+    assert model.language_model.output_layer.weight.grad.shape == (1, 3)
+    assert "language_model.output_layer.weight" in model.sharded_state_dict()
+    with model.hide_loss_modules():
+        assert "language_model.output_layer.weight" not in model.sharded_state_dict()
+        assert "language_model.backbone.weight" in model.sharded_state_dict()
+    assert "language_model.output_layer.weight" in model.sharded_state_dict()
 
 
 def _create_value_test_config(
