@@ -118,7 +118,6 @@ def many_unit_system(ray_cluster):
         staging_bytes=64 << 20,
         namespace="nvdp-train-shape",
     )
-    conf.backend.NixlStore.placement = {"policy": "spread"}
     tq.init(conf)
     yield conf
     tq.close()

@@ -36,7 +36,6 @@ def per_node_spread_system(ray_cluster):
     nixl.pop("num_storage_units")
     nixl.storage_units_per_node = 3  # PR #4465 style: N units on each selected node
     nixl.node_ids = alive_node_ids()  # caller resolves all|inference|train to node ids
-    nixl.placement = {"policy": "spread"}  # SimpleStorage style even split
     tq.init(conf)
     yield conf
     tq.close()
