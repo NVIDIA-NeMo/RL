@@ -225,6 +225,20 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
     swe_agents_train:
       responses_api_agents:
         swe_agents:

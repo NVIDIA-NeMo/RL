@@ -1428,3 +1428,23 @@ class TestFTKeepLatestK:
 
         # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
+
+
+def test_a_non_numeric_staging_name_costs_only_the_span_label(
+    checkpoint_manager, checkpoint_dir
+):
+    """The span's step is read from the directory name, so it must never raise.
+
+    ``_rename_checkpoint`` publishes whatever sits between the second and third
+    underscore, so ``tmp_step_final`` becomes ``step_final``. The span wants an
+    int and cannot have one here; it drops the label rather than failing the
+    finalization that carries it.
+    """
+    staged = checkpoint_dir / "tmp_step_final"
+    staged.mkdir(parents=True)
+
+    checkpoint_manager.begin_finalization(staged, wait_fn=None)
+    checkpoint_manager.finalize_pending()
+
+    assert (checkpoint_dir / "step_final").exists()
+    assert not staged.exists()

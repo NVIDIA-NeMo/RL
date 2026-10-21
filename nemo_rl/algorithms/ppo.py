@@ -104,14 +104,20 @@ from nemo_rl.models.value import Value, ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.telemetry.vocabulary import TeedMetric, register_teed_metrics
+from nemo_rl.telemetry.vocabulary import (
+    INIT_TOTAL_CATEGORY,
+    TeedMetric,
+    register_teed_metrics,
+)
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -131,6 +137,7 @@ from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
     validate_offload_policy_before_refit,
 )
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -151,7 +158,7 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Drops partial restored targets; replacement rollouts use subsequent prompts.
     drop_incomplete_targets_on_restore: bool = False
 
@@ -418,21 +425,21 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # DTensor PPO value model currently doesn't support sequence packing and CP.
+        # Automodel PPO value model currently doesn't support sequence packing and CP.
         assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
         assert value_config["sequence_packing"]["enabled"] is False, (
-            "Sequence packing is currently not supported for the DTensor PPO value model. "
+            "Sequence packing is currently not supported for the Automodel PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
         assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
+            "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
         assert value_config["dynamic_batching"]["enabled"] is False, (
-            "Dynamic batching currently has some issue for the DTensor PPO value model. "
+            "Dynamic batching currently has some issue for the Automodel PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
         )
 
@@ -505,6 +512,12 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
+    if loss_fn.has_adaptive_loss_state():
+        raise ValueError(
+            "loss_fn.truncated_importance_sampling_type='adaptive-ppo-clip' needs "
+            "a trainer that advances its entropy controller; use GRPO or the "
+            "single controller instead of the legacy PPO trainer."
+        )
     value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
 
     # Validate force_on_policy_ratio
@@ -1021,12 +1034,12 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
+    # prepare refit info (sglang initializes refit state via its weight synchronizer)
     if backend != "sglang":
-        state_dict_info = policy.prepare_refit_info(
-            refit_payload_mode=policy_generation.get_refit_payload_mode()
-        )
         if policy_generation is not None:
-            policy_generation.prepare_refit_info(state_dict_info)
+            initialize_refit_metadata(policy, policy_generation)
+        else:
+            policy.prepare_refit_info()
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1377,6 +1390,7 @@ def ppo_train(
     val_at_end = master_config.ppo.val_at_end
     val_period = master_config.ppo.val_period
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1387,7 +1401,12 @@ def ppo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
+            )
             if not colocated_inference:
                 # Colocated refit offloads policy inside
                 # `refit_policy_generation`. Do it here so the value
@@ -1429,12 +1448,13 @@ def ppo_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.ppo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -1498,6 +1518,7 @@ def ppo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -1617,7 +1638,11 @@ def ppo_train(
 
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
+                            # Prompt-history assistant turns have no generation logprobs.
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -1790,7 +1815,6 @@ def ppo_train(
                             RLSpanGroup.POLICY_UPDATE,
                             "rl.ppo.value_training",
                             tracer=_tracer,
-                            **{"rl.iteration": total_steps + 1},
                         ),
                     ):
                         value_results = value_model.train(
@@ -1829,7 +1853,6 @@ def ppo_train(
                                 RLSpanGroup.POLICY_UPDATE,
                                 "rl.ppo.policy_training",
                                 tracer=_tracer,
-                                **{"rl.iteration": total_steps + 1},
                             ),
                         ):
                             train_results = policy.train(
@@ -1874,6 +1897,7 @@ def ppo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         if not colocated_inference:
@@ -2517,7 +2541,7 @@ def async_ppo_train(
         print("📦 Started continuous background trajectory collection")
 
         print(f"⏳ Waiting for replay buffer to be ready for step {step}...")
-        timer.start("init/total")
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             current_step_ready = ray.get(
@@ -2560,7 +2584,7 @@ def async_ppo_train(
             _raise_if_collector_stopped("waiting for the initial replay batch")
             wait_iterations += 1
             time.sleep(1.0)
-        timer.stop("init/total")
+        timer.stop(INIT_TOTAL_CATEGORY)
         print(f"✅ Buffer ready for step {step}! Starting async PPO training loop...")
     except Exception:
         _shutdown_workers(propagate_checkpoint_error=False)
@@ -2653,12 +2677,14 @@ def async_ppo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
-                    # PPO's inline loss-mask setup (unmask all assistant messages),
-                    # matching sync ppo_train — deliberately NOT GRPO's helper,
-                    # which only unmasks generated assistant messages.
+                    # Match sync PPO and GRPO: only generated assistant turns
+                    # contribute to loss, not assistant turns in prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -3174,7 +3200,7 @@ def async_ppo_train(
             driver_efficiency = {
                 cat: timer.reduce(cat, "sum")
                 for cat in [
-                    "init/total",
+                    INIT_TOTAL_CATEGORY,
                     "idle/buffer_starvation",
                     "idle/refit_bubble",
                     "idle/validation",
@@ -3242,7 +3268,7 @@ def validate(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("ppo"),
+        evaluate_span("ppo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 

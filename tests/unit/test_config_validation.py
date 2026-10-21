@@ -143,7 +143,7 @@ def test_all_config_files_have_required_keys(config_file):
         # ``distillation`` branch below. The multi-teacher cross-tokenizer config
         # is identified by its top-level ``teachers`` list (online distillation
         # uses a singular ``teacher``); the per-(student, teacher) projection path
-        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # now lives at ``teachers[i].aligner.projection_matrix_path`` rather than
         # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
         # as a fallback for any single-teacher config that still carries it.
         master_config_class = XTokenOffPolicyDistillationMasterConfig
@@ -308,8 +308,8 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
 def test_all_config_no_tp_size_accuracy_issues(config_file):
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
-    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
     """
 
     skip_config_files = [

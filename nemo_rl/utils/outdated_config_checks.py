@@ -77,6 +77,20 @@ def reject_outdated_automodel_block(config: dict[str, Any]) -> None:
             )
 
 
+def reject_outdated_teacher_projection_matrix_path(config: dict[str, Any]) -> None:
+    """Fail when an x-token teacher's projection path is outside its aligner block.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    for path, teacher_config in _train_backend_configs(config):
+        if path.startswith("teachers.") and "projection_matrix_path" in teacher_config:
+            raise ValueError(
+                f"{path}.projection_matrix_path is no longer supported; "
+                f"move it to {path}.aligner.projection_matrix_path."
+            )
+
+
 def reject_outdated_dataset_config(config: dict[str, Any]) -> None:
     """Fail when data still uses the flat pre-train/validation layout.
 
@@ -151,6 +165,7 @@ def check_outdated_config(config: dict[str, Any]) -> None:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
     """
     reject_outdated_automodel_block(config)
+    reject_outdated_teacher_projection_matrix_path(config)
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_refit_offload_key(config)

@@ -401,6 +401,21 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
+    swe_agents_train_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_train
+    swe_agents_val_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_agents_val
+
     skip_venv_if_present: false
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
     effort_levels:

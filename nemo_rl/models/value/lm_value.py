@@ -111,7 +111,7 @@ class Value(ValueInterface):
             worker_builder_cls = "nemo_rl.models.value.workers.automodel_value_worker.AutomodelValueWorker"
 
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
-            # DTensor V2 does not pipeline-parallel; pp_size stays at the
+            # Automodel does not pipeline-parallel; pp_size stays at the
             # default of 1 initialised above.
             cp_size = config["automodel_cfg"]["context_parallel_size"]
 
@@ -437,7 +437,7 @@ class Value(ValueInterface):
     ) -> None:
         """Save a checkpoint of the value model.
 
-        DTensor v2 checkpoint resources are configured when the Value is
+        Automodel checkpoint resources are configured when the Value is
         constructed. ``weights_path`` selects the destination for each save.
         """
         megatron_enabled = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))

@@ -66,6 +66,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     compute_seq_logprob_errors,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_efficiency_summary,
@@ -155,15 +156,18 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     current_trace_carrier,
     efficiency_span,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vocabulary import INIT_TOTAL_CATEGORY, WORKER_GROUP_ENV
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -192,6 +196,7 @@ from nemo_rl.weight_sync.factory import (
     create_weight_synchronizer,
     validate_offload_policy_before_refit,
 )
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -294,7 +299,7 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -430,6 +435,9 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
+    # off and on checkpoints that predate it.
+    cur_adaptive_ppo_clip_k: Optional[float] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -443,6 +451,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         trainer_version=None,
         sampler_name=None,
         sampler_dispatch_index=None,
+        cur_adaptive_ppo_clip_k=None,
     )
 
 
@@ -459,6 +468,54 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
+
+
+def _restore_adaptive_loss_state(
+    loss_fn: ClippedPGLossFn,
+    grpo_save_state: GRPOSaveState,
+) -> None:
+    """Restore adaptive-ppo-clip's k; checkpoints without it start from k=0."""
+    if grpo_save_state.cur_adaptive_ppo_clip_k is not None:
+        loss_fn.set_adaptive_ppo_clip_k(grpo_save_state.cur_adaptive_ppo_clip_k)
+
+
+def _update_adaptive_loss_state(
+    loss_fn: LossFunction,
+    metrics: dict[str, Any],
+) -> None:
+    """Advance the adaptive loss controller from a step's aggregated metrics.
+
+    Call once per completed training step, after the per-microbatch metrics
+    are reduced, so the controller sees the step's global entropy. Logs the
+    k this step trained with; the updated k is used by the next step.
+    """
+    if (
+        not isinstance(loss_fn, ClippedPGLossFn)
+        or not loss_fn.has_adaptive_loss_state()
+    ):
+        return
+
+    # metrics_level="full" always emits approx_entropy, so a missing key means a
+    # broken metrics path. Raise instead of silently freezing k for the run.
+    if "approx_entropy" not in metrics:
+        raise KeyError(
+            "adaptive-ppo-clip needs the step's approx_entropy, but the "
+            "aggregated training metrics do not contain it"
+        )
+    metrics["cur_adaptive_ppo_clip_k"] = loss_fn.cur_adaptive_ppo_clip_k
+    loss_fn.update_adaptive_loss_state(float(metrics["approx_entropy"]))
+
+
+def _save_adaptive_loss_state(
+    grpo_save_state: GRPOSaveState,
+    loss_fn: LossFunction,
+) -> None:
+    """Copy adaptive-ppo-clip's k into the save state; None when it is off."""
+    grpo_save_state.cur_adaptive_ppo_clip_k = (
+        loss_fn.cur_adaptive_ppo_clip_k
+        if isinstance(loss_fn, ClippedPGLossFn)
+        else None
+    )
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -896,6 +953,7 @@ def setup(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
+    _restore_adaptive_loss_state(loss_fn, grpo_save_state)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -1353,13 +1411,15 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the loop-level flag must agree.
-    if generation_config["backend"] == "megatron":
-        async_grpo_config = grpo_config.async_grpo
-        recompute_kv_cache = bool(
-            async_grpo_config is not None
-            and async_grpo_config.recompute_kv_cache_after_weight_updates
-        )
+    # `kv_cache_management_mode="recompute"`; the async loop's flag must agree.
+    # Synchronous GRPO does not consume this flag.
+    async_grpo_config = grpo_config.async_grpo
+    if (
+        generation_config["backend"] == "megatron"
+        and async_grpo_config is not None
+        and async_grpo_config.enabled
+    ):
+        recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
         kv_cache_mode = generation_config["mcore_generation_config"][
             "kv_cache_management_mode"
         ]
@@ -1999,11 +2059,10 @@ def setup(
         ) is None and _needs_hf_refit_handshake(
             backend, nccl_reshard_refit_enabled, colocated_inference
         ):
-            state_dict_info = policy.prepare_refit_info(
-                refit_payload_mode=policy_generation.get_refit_payload_mode()
-            )
             if policy_generation is not None:
-                policy_generation.prepare_refit_info(state_dict_info)
+                initialize_refit_metadata(policy, policy_generation)
+            else:
+                policy.prepare_refit_info()
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2840,10 +2899,15 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
+        configured_buffer_size_bytes = (
+            None
+            if _refit_buffer_size_gb is None
+            else int(_refit_buffer_size_gb * 1024**3)
+        )
         if colocated_inference:
             # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
+            if configured_buffer_size_bytes is not None:
+                buffer_size_bytes = configured_buffer_size_bytes
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -2866,7 +2930,7 @@ def refit_policy_generation(
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM)
+            # update weights through collective transport
             futures_train = policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
             )
@@ -3004,11 +3068,12 @@ def compute_and_apply_seq_logprob_error_masking(
 
     Args:
         train_data: Training data dict containing token_mask, sample_mask,
-                   prev_logprobs, and generation_logprobs. If masking is applied,
-                   sample_mask will be updated in-place.
+                   prev_logprobs, and generation_logprobs. Tokenless rows and
+                   sequences above the threshold are excluded from sample_mask.
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
-                                    exceeding this threshold. If None, only compute metrics.
+                                    exceeding this threshold. None disables threshold
+                                    filtering, but token/sample validity still applies.
         filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
 
     Returns:
@@ -3016,6 +3081,12 @@ def compute_and_apply_seq_logprob_error_masking(
         min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
         num_masked_seqs, masked_correct_pct
     """
+    # Rows without response loss tokens must not contribute to
+    # sequence-normalized losses or valid-sample counts.
+    train_data["sample_mask"] = train_data["sample_mask"] * train_data["token_mask"][
+        :, 1:
+    ].bool().any(dim=-1)
+
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
     sample_mask = train_data["sample_mask"]
@@ -3306,12 +3377,13 @@ def _grpo_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -3912,7 +3984,6 @@ def _grpo_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -4064,6 +4135,7 @@ def _grpo_train_impl(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "filtered_reward",
@@ -4076,7 +4148,9 @@ def _grpo_train_impl(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_draft_ratio_metrics(metrics)
 
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -4119,6 +4193,7 @@ def _grpo_train_impl(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -4462,7 +4537,7 @@ def validate(
     timer = Timer(context={"worker": "validator"})
     with (
         timer.time("total_validation_time"),
-        evaluate_span("grpo", **{"rl.step": step}),
+        evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
         # >= 1 is validated in setup().
@@ -4668,6 +4743,7 @@ def aggregate_rollout_metrics(
 
     Different metric types are aggregated according to their semantics:
     - Histogram observations: flattened into one step-level distribution
+    - Metrics ending with "/std_in_group": summarize the per-group values
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
     - "total_turns": summed
@@ -4686,6 +4762,10 @@ def aggregate_rollout_metrics(
             aggregated[k] = [observation for group in v for observation in group]
         elif not isinstance(v[0], (int, float)):
             aggregated[k] = v
+        elif k.endswith("/std_in_group"):
+            aggregated[f"{k}/mean"] = sum(v) / len(v)
+            aggregated[f"{k}/p05"] = float(np.percentile(v, 5))
+            aggregated[f"{k}/p95"] = float(np.percentile(v, 95))
         elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
@@ -4909,6 +4989,7 @@ def async_grpo_train(
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
@@ -5048,7 +5129,7 @@ def async_grpo_train(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         extra_env_vars={
             # Names this actor's spans the way RayWorkerGroup names its groups'.
-            "NRL_WORKER_GROUP": "trajectory_collector",
+            WORKER_GROUP_ENV: "trajectory_collector",
         },
     )
 
@@ -5109,6 +5190,7 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -5224,8 +5306,8 @@ def async_grpo_train(
     # rather than only as a scalar. Unbucketed by construction (see
     # UNBUCKETED_SPAN_CATEGORIES): the generation fleet is busy for this whole
     # window, and its spans join this trace.
-    with efficiency_span("init/total", tracer=_tracer):
-        timer.start("init/total")
+    with efficiency_span(INIT_TOTAL_CATEGORY, tracer=_tracer):
+        timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -5289,7 +5371,7 @@ def async_grpo_train(
 
         # Retained because the per-step timer.reset() below discards it; the
         # efficiency snapshot re-supplies it every step.
-        init_total_s = timer.stop("init/total")
+        init_total_s = timer.stop(INIT_TOTAL_CATEGORY)
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
@@ -5306,12 +5388,12 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with (
+                iteration_scope(step + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.grpo.step",
                     tracer=_tracer,
-                    **{"rl.iteration": step + 1},
                 ),
             ):
                 num_mask_sample_filtered = 0
@@ -5738,7 +5820,6 @@ def async_grpo_train(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.grpo.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": step + 1},
                     ),
                 ):
                     train_results = policy.train(
@@ -5817,6 +5898,7 @@ def async_grpo_train(
                                 policy,
                                 policy_generation,
                                 colocated_inference,
+                                _refit_buffer_size_gb=refit_buffer_size_gb,
                             )
                             POLICY_GENERATION_STALE = False
 
@@ -5977,6 +6059,7 @@ def async_grpo_train(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "global_valid_seqs",
@@ -5986,6 +6069,8 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                finalize_draft_ratio_metrics(metrics)
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -6011,6 +6096,7 @@ def async_grpo_train(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -6250,7 +6336,7 @@ def async_grpo_train(
             # at the end of every step drops it -- so re-supply the captured
             # value, or the series reports the real startup cost at step 1 and
             # zero for the rest of the run.
-            driver_efficiency["init/total"] = init_total_s
+            driver_efficiency[INIT_TOTAL_CATEGORY] = init_total_s
             merged_efficiency = {**driver_efficiency}
             for cat, dur in collector_efficiency.items():
                 merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur

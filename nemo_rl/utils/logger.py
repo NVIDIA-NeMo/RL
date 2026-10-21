@@ -45,6 +45,7 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 from nemo_rl.utils.train_data_dump import json_safe_nonfinite
 
@@ -905,10 +906,10 @@ class RayGpuMonitorLogger:
             metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
             # NOTE: It appears their docs say bytes, but it appears to be MB
             value /= 1024
-        elif metric_name == "ray_node_mem_used":
+        elif metric_name == RAY_NODE_MEM_USED:
             metric_name = f"node.{node_idx}.mem_gb"
             value /= 1024 * 1024 * 1024
-        elif metric_name == "ray_node_mem_total":
+        elif metric_name == RAY_NODE_MEM_TOTAL:
             metric_name = f"node.{node_idx}.mem_total_gb"
             value /= 1024 * 1024 * 1024
         else:

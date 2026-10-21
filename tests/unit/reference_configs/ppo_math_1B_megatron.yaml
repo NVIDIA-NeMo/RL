@@ -30,7 +30,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
     drop_incomplete_targets_on_restore: false
 
   reward_shaping:
@@ -78,6 +78,11 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  # Only used by adaptive-ppo-clip.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
@@ -174,6 +179,10 @@ policy:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
     flash_attention_version: 2
     bias_activation_fusion: True
@@ -373,6 +382,10 @@ value:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
     flash_attention_version: 2
     bias_activation_fusion: True

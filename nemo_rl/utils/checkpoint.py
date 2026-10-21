@@ -26,10 +26,12 @@ import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Iterator,
     Literal,
     Mapping,
     NotRequired,
@@ -43,12 +45,56 @@ import torch
 import yaml
 from pydantic import BaseModel
 
+from nemo_rl.telemetry.instrumentation import (
+    checkpoint_finalize_span,
+    current_trace_carrier,
+    remote_trace_context,
+)
+
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+@contextmanager
+def _finalize_telemetry(
+    carrier: Mapping[str, str], step: Optional[int]
+) -> Iterator[None]:
+    """Open ``rl.checkpoint.finalize``, or carry on without it if that fails.
+
+    Guarded because the block it wraps performs the rename that makes a
+    checkpoint resumable, and nothing in this package lets observability decide
+    whether that happens -- the same stance :meth:`_warn_on_delete_failure`
+    takes for pruning. Unguarded, a lens incompatibility would surface as a
+    failed save: the exception reaches ``finalize_pending`` as
+    ``_finalize_error``, so the run dies reporting a checkpoint failure *and*
+    skips the rename.
+
+    Only entering is guarded. A failure inside the block is the checkpoint's
+    own and must still reach both the span and the caller.
+    """
+    stack = ExitStack()
+    try:
+        stack.enter_context(remote_trace_context(carrier))
+        stack.enter_context(checkpoint_finalize_span(step))
+    # Deliberately broad: the point is that no failure from the telemetry stack,
+    # whatever it is, reaches the caller from here.
+    except Exception as e:
+        stack.close()
+        warnings.warn(
+            f"Could not open the checkpoint finalization span: {e!r}. "
+            "Finalization continues untraced; the checkpoint is unaffected.",
+            stacklevel=2,
+        )
+    # Yielded outside the except block so that a rename which then also fails is
+    # not reported as having happened "during handling" of the telemetry error,
+    # which points the reader at observability instead of at the rename. A
+    # closed ExitStack re-enters as an empty one, so this covers both paths.
+    with stack:
+        yield
 
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     """Load common state from either legacy or current MCore checkpoints."""
-    # Keep the optional MCore dependency out of DTensor and Automodel imports.
+    # Keep the optional MCore dependency out of the Automodel imports.
     try:
         from megatron.core.dist_checkpointing import load_common_state_dict
     except ImportError as error:
@@ -119,7 +165,7 @@ class PretrainedCheckpointConfig(TypedDict):
 
     When set, the policy will restore its initial weights from this checkpoint
     instead of loading them from ``model_name``. Supported by the Megatron backend
-    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+    only; the Automodel backend continues to use HuggingFace weights via ``model_name``.
 
     Attributes:
         path: Filesystem path to the checkpoint to load.
@@ -281,7 +327,7 @@ class CheckpointManager:
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
-            # DTensor path
+            # Automodel path
             if optimizer_path.exists():
                 return weights_path, optimizer_path
 
@@ -309,7 +355,7 @@ class CheckpointManager:
                         return weights_path, optimizer_path
 
             warnings.warn(
-                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"Optimizer state not found at {optimizer_path} (Automodel path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
                 "Optimizer will be freshly initialized.",
                 stacklevel=2,
@@ -422,19 +468,34 @@ class CheckpointManager:
         self.finalize_pending()
         self._pending_checkpoint_path = Path(checkpoint_path)
         self._finalize_error = None
+        # The step is only in the staging dir name (tmp_step_<n>); None if it
+        # does not parse, since this only labels a span.
+        try:
+            step = int(Path(checkpoint_path).name.split("_")[2])
+        except (IndexError, ValueError):
+            step = None
+        # Captured here because a bare Thread starts with an empty context: read
+        # it on the worker instead and the finalize span re-roots into a trace of
+        # its own, detached from the run that produced the checkpoint.
+        carrier = current_trace_carrier()
 
         def _finalize():
+            # The work is inside the span so a failed wait or rename is recorded
+            # on it, and the span is entered through a guard so the reverse
+            # cannot happen: telemetry must not be what skips the rename.
             try:
-                if wait_fn is not None:
-                    wait_fn()
-                self._rename_checkpoint(checkpoint_path)
-                # Prune old checkpoints off the critical path. Surface any
-                # failure via a done-callback so a broken delete is not silently
-                # swallowed (the discarded Future would otherwise hide it).
-                delete_future = self._delete_executor.submit(
-                    self.remove_old_checkpoints
-                )
-                delete_future.add_done_callback(self._warn_on_delete_failure)
+                with _finalize_telemetry(carrier, step):
+                    if wait_fn is not None:
+                        wait_fn()
+                    self._rename_checkpoint(checkpoint_path)
+                    # Prune old checkpoints off the critical path. Surface any
+                    # failure via a done-callback so a broken delete is not
+                    # silently swallowed (the discarded Future would otherwise
+                    # hide it).
+                    delete_future = self._delete_executor.submit(
+                        self.remove_old_checkpoints
+                    )
+                    delete_future.add_done_callback(self._warn_on_delete_failure)
             except Exception as e:
                 self._finalize_error = e
             finally:
