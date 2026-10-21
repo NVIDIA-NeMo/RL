@@ -1350,6 +1350,7 @@ def process_microbatch(
                         input_ids,
                         data_dict["input_lengths"],
                     )
+            cp_size = get_context_parallel_world_size()
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
@@ -1358,8 +1359,8 @@ def process_microbatch(
                 reset_attention_mask=False,
                 eod_mask_loss=False,
                 pad_mask_loss=False,
+                create_attention_mask=cp_size == 1,
             )
-            cp_size = get_context_parallel_world_size()
             if cp_size > 1:
                 # Unpacked context parallelism. mcore expects each rank to be
                 # handed its load-balanced sequence shard -- chunks ``cp_rank``
@@ -1368,7 +1369,7 @@ def process_microbatch(
                 # packed path above already does per sequence. position_ids ride
                 # the same layout.
                 #
-                # The dense [1, 1, S, S] mask built above is dropped: it is the
+                # No dense [1, 1, S, S] mask is built here: it would be the
                 # plain causal mask (reset_position_ids / reset_attention_mask
                 # are both False), which the attention backend applies itself,
                 # and TE's context-parallel attention requires that implicit

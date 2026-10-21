@@ -1113,6 +1113,41 @@ class TestProcessMicrobatch:
         assert result.padding_mask.shape == result.input_ids_cp_sharded.shape
         assert result.padding_mask.tolist() == [[False, False, True, True]]
 
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_process_microbatch_no_packing_builds_dense_mask_only_without_cp(
+        self, cp_size
+    ):
+        """Unpacked CP>1 never materializes the dense [1, 1, S, S] causal mask."""
+        from nemo_rl.models.megatron import data as megatron_data
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=cp_size,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids",
+                wraps=megatron_data.get_ltor_masks_and_position_ids,
+            ) as get_masks,
+        ):
+            result = megatron_data.process_microbatch(
+                {"input_ids": torch.arange(8).unsqueeze(0)},
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+            )
+
+        # Megatron defaults create_attention_mask to True.
+        create_mask = get_masks.call_args.kwargs.get("create_attention_mask", True)
+        assert create_mask is (cp_size == 1)
+        if cp_size == 1:
+            assert result.attention_mask.shape == (1, 1, 8, 8)
+        else:
+            assert result.attention_mask is None
+
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):
         """mtp_loss_mask defaults to None when not provided."""
