@@ -22,9 +22,8 @@ meta ``{"b","o","n","k","d","s"}`` carries no unit id.
 
 Layout under ``<checkpoint_dir>/nixl_store/``::
 
-    manifest.json        {"version": 1, "store": "unit" | "file", "shards": [...]}
-    unit-<id>.shard      live blobs of one unit, back to back          (unit store)
-    files/<blob>.blob    copies of the blob files                       (file store)
+    manifest.json        {"version": 1, "shards": [...]}
+    unit-<id>.shard      live blobs of one unit, back to back
 
 Blobs are copied with plain file I/O on the unit (sequential dump of a pinned
 slab; a few GB/s per unit on Lustre). A NIXL POSIX/GDS loopback path can
@@ -38,13 +37,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
 import ray
 
-from nemo_rl.data_plane.nixl.blobstore import FileStore, UnitSlabStore
+from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 from nemo_rl.data_plane.nixl.directory import ACTIVE
 from nemo_rl.data_plane.nixl.errors import UnitFull
 
@@ -71,13 +69,7 @@ def save_storage_checkpoint(
     """Dump every live blob reachable from ``client.store``; return the manifest."""
     root = _root(checkpoint_dir)
     root.mkdir(parents=True, exist_ok=True)
-    store = client.store
-    if isinstance(store, UnitSlabStore):
-        manifest = _save_units(store, root)
-    elif isinstance(store, FileStore):
-        manifest = _save_files(store, root)
-    else:
-        raise NotImplementedError(f"{type(store).__name__} does not support checkpoint")
+    manifest = _save_units(client.store, root)
     _write_json(root / MANIFEST, manifest)
     return manifest
 
@@ -114,25 +106,7 @@ def _save_units(store: UnitSlabStore, root: Path) -> dict[str, Any]:
                 "clears_during_save": int(r.get("clears_during_save", 0)),
             }
         )
-    return {"version": VERSION, "store": "unit", "shards": shards}
-
-
-def _save_files(store: FileStore, root: Path) -> dict[str, Any]:
-    snap = ray.get(store.directory.snapshot.remote())
-    files = root / "files"
-    files.mkdir(exist_ok=True)
-    blobs: dict[str, list[int]] = {}
-    for b, u in snap["blob_unit"].items():
-        if int(u) != -1:
-            continue
-        shutil.copyfile(store.path(b), files / f"{b}.blob")
-        blobs[b] = [int(snap["refs"].get(b, 0))]
-    return {
-        "version": VERSION,
-        "store": "file",
-        "root": store.root,
-        "shards": [{"unit_id": -1, "file": "files", "blobs": blobs}],
-    }
+    return {"version": VERSION, "shards": shards}
 
 
 # ============================================================================ load
@@ -147,22 +121,7 @@ def load_storage_checkpoint(
         raise ValueError(
             f"unsupported nixl_store checkpoint version {manifest.get('version')!r}"
         )
-    store = client.store
-    kind = (
-        "unit"
-        if isinstance(store, UnitSlabStore)
-        else "file"
-        if isinstance(store, FileStore)
-        else None
-    )
-    if kind != manifest["store"]:
-        raise ValueError(
-            f"checkpoint was taken with store={manifest['store']!r}, this client runs {kind!r}"
-        )
-    if kind == "unit":
-        _load_units(store, root, manifest)
-    else:
-        _load_files(store, root, manifest)
+    _load_units(client.store, root, manifest)
     return manifest
 
 
@@ -201,15 +160,3 @@ def _load_units(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -> N
     ray.get(store.directory.put_blobs.remote(placed))
     for b, u in placed:
         store._blob_unit[b] = u
-
-
-def _load_files(store: FileStore, root: Path, manifest: dict[str, Any]) -> None:
-    os.makedirs(store.root, exist_ok=True)
-    items: list[tuple[str, int, int]] = []
-    for shard in manifest["shards"]:
-        for b, (refs,) in shard["blobs"].items():
-            dst = store.path(b)
-            if not os.path.exists(dst):
-                shutil.copyfile(root / shard["file"] / f"{b}.blob", dst)
-            items.append((b, -1, int(refs)))
-    ray.get(store.directory.put_blobs.remote(items))

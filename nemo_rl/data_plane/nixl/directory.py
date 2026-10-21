@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""BlobDirectory: unit membership, blob → unit placement, and blob refcounts.
+"""BlobDirectory: unit membership and blob → unit placement.
 
 Deliberately tiny and not a catalog: no keys, fields, produced bits or
 cursors (the TransferQueue controller owns those in Phase A). It exists
 because TQ restores storage before the controller, so the locations the
 controller stores must be placement-free; this actor holds the placement.
-For actor-less stores (FileStore) it also holds the per-blob entry refcount
-so the last release can delete the file.
 """
 
 from __future__ import annotations
@@ -42,7 +40,6 @@ class BlobDirectory:
         self._epoch = 0
         self._units: dict[int, dict[str, Any]] = {}
         self._blob_unit: dict[str, int] = {}
-        self._refs: dict[str, int] = {}
 
     # ------------------------------------------------------------------ membership
     def register_unit(self, info: dict[str, Any]) -> int:
@@ -70,14 +67,11 @@ class BlobDirectory:
     def epoch(self) -> int:
         return self._epoch
 
-    # ------------------------------------------------------------------ placement / refs
-    def put_blobs(self, items: list[tuple]) -> None:
-        """``(blob_id, unit_id[, n_entries])``; ``unit_id=-1`` means an actor-less store."""
-        for item in items:
-            blob_id, unit_id = item[0], int(item[1])
-            self._blob_unit[blob_id] = unit_id
-            if len(item) > 2:
-                self._refs[blob_id] = int(item[2])
+    # ------------------------------------------------------------------ placement
+    def put_blobs(self, items: list[tuple[str, int]]) -> None:
+        """``(blob_id, unit_id)`` for every blob placed."""
+        for blob_id, unit_id in items:
+            self._blob_unit[blob_id] = int(unit_id)
 
     def where(self, blob_ids: list[str]) -> dict[str, int | str]:
         out: dict[str, int | str] = {}
@@ -85,39 +79,14 @@ class BlobDirectory:
             u = self._blob_unit.get(b)
             if u is None or u == -2:
                 out[b] = LOST
-            elif u == -1:
-                out[b] = -1
             else:
                 st = self._units.get(u, {}).get("state", DEAD)
                 out[b] = LOST if st == DEAD else u
         return out
-
-    def release(self, counts: list[tuple[str, int]]) -> list[str]:
-        """Decrement refcounts; return blobs that reached zero (and forget them)."""
-        gone: list[str] = []
-        for b, n in counts:
-            if b not in self._refs:
-                continue
-            self._refs[b] -= int(n)
-            if self._refs[b] <= 0:
-                del self._refs[b]
-                self._blob_unit.pop(b, None)
-                gone.append(b)
-        return gone
-
-    def forget(self, blob_ids: list[str]) -> None:
-        for b in blob_ids:
-            self._blob_unit.pop(b, None)
-            self._refs.pop(b, None)
-
-    def snapshot(self) -> dict[str, Any]:
-        """Blob placement and refcounts, for checkpointing actor-less stores."""
-        return {"blob_unit": dict(self._blob_unit), "refs": dict(self._refs)}
 
     def stats(self) -> dict[str, Any]:
         return {
             "epoch": self._epoch,
             "units": {u: i.get("state") for u, i in self._units.items()},
             "blobs": len(self._blob_unit),
-            "refs": len(self._refs),
         }

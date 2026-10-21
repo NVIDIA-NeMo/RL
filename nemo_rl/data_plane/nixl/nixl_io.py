@@ -19,8 +19,7 @@ the same path the checkpoint-engine refit uses.
 One ``NixlEndpoint`` per process. The agent is not thread-safe; callers
 serialise access (the KV client holds a lock, the unit is a Ray actor).
 
-Memory types: ``DRAM`` for host buffers (UCX), ``FILE`` for file
-descriptors (POSIX / GDS, loopback on the same agent).
+Memory type: ``DRAM`` host buffers over UCX.
 """
 
 from __future__ import annotations
@@ -164,7 +163,6 @@ class NixlEndpoint:
         backend: str = NIXL_DEFAULT_BACKEND_NAME,
         init_params: dict[str, Any] | None = None,
         prog_thread: bool = False,
-        extra_backends: Sequence[str] = (),
         require_rdma: bool = True,
     ) -> None:
         if backend == "UCX" and require_rdma:
@@ -182,10 +180,6 @@ class NixlEndpoint:
             name, backend, dict(init_params or {}), enable_prog_thread=prog_thread
         )
         self.backends = [backend]
-        for b in extra_backends:
-            if b not in self.backends:
-                self.agent.create_backend(b, {})
-                self.backends.append(b)
         self._regs: dict[Any, tuple[Any, list[str]]] = {}
         self._remotes: set[str] = set()
         # Local (addr, nbytes) ranges of transfers that failed without reaching
@@ -207,34 +201,17 @@ class NixlEndpoint:
             raise ValueError("array must be C-contiguous")
         addr = addr_of(arr)
         descs = self.agent.get_reg_descs([(addr, arr.nbytes, 0, "")], "DRAM")
-        # Register with every backend this endpoint created: a POSIX/GDS file
-        # transfer needs the DRAM side registered with that backend too.
         reg = self.agent.register_memory(descs, backends=list(self.backends))
         if reg is None:
             raise RuntimeError("register_memory(DRAM) failed")
         self._regs[addr] = (reg, list(self.backends))
         return addr
 
-    def register_file(self, fd: int, nbytes: int, *, backend: str = "POSIX") -> int:
-        """Register ``[0, nbytes)`` of an open file descriptor; returns ``fd`` as the handle."""
-        if backend not in self.backends:
-            self.agent.create_backend(backend, {})
-            self.backends.append(backend)
-        descs = self.agent.get_reg_descs([(0, int(nbytes), int(fd), "")], "FILE")
-        reg = self.agent.register_memory(descs, backends=[backend])
-        if reg is None:
-            raise RuntimeError("register_memory(FILE) failed")
-        self._regs[("fd", int(fd))] = (reg, [backend])
-        return int(fd)
-
     def deregister(self, addr: int) -> None:
         item = self._regs.pop(addr, None)
         if item is not None:
             reg, backends = item
             self.agent.deregister_memory(reg, backends=backends)
-
-    def deregister_file(self, fd: int) -> None:
-        self.deregister(("fd", int(fd)))  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ metadata
     def metadata(self) -> bytes:
@@ -267,14 +244,10 @@ class NixlEndpoint:
         remote_agent: str,
         *,
         timeout_s: float = 120.0,
-        remote_mem: str = "DRAM",
-        remote_dev: int = 0,
     ) -> None:
         """Blocking one-sided ``WRITE`` (local→remote) or ``READ`` (remote→local).
 
-        ``local`` and ``remote`` are parallel lists of ``(addr, nbytes)``. For
-        ``remote_mem="FILE"`` the remote addr is a file offset, ``remote_dev``
-        the registered fd and ``remote_agent`` this agent's own name.
+        ``local`` and ``remote`` are parallel lists of ``(addr, nbytes)``.
         """
         if op not in ("WRITE", "READ"):
             raise ValueError(op)
@@ -285,9 +258,7 @@ class NixlEndpoint:
             if a != b:
                 raise ValueError("descriptor lengths differ")
         ldesc = self.agent.get_xfer_descs([(a, n, 0) for a, n in local], "DRAM")
-        rdesc = self.agent.get_xfer_descs(
-            [(a, n, remote_dev) for a, n in remote], remote_mem
-        )
+        rdesc = self.agent.get_xfer_descs([(a, n, 0) for a, n in remote], "DRAM")
         # NIXL reports a broken peer by raising (NIXL_ERR_REMOTE_DISCONNECT,
         # NIXL_ERR_BACKEND, ...) from any of these calls. Surface all of them as
         # TransferError. The stores report it as retryable (TransferFailed ->

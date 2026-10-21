@@ -542,5 +542,3 @@ def test_ssd_config_validation():
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "pickup_s": 1.0}})
     with pytest.raises(ValueError, match="staging_bytes"):
         tq_nixl.ssd_config({**on, "ssd": {"enabled": True, "staging_bytes": 1 << 30}})
-    with pytest.raises(ValueError, match="store.kind"):
-        tq_nixl.ssd_config({**on, "store": {"kind": "file"}})
