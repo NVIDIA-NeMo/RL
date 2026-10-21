@@ -574,12 +574,12 @@ class TestBuildExactTokenMap:
         assert out["uncommon_teacher"].tolist() == [3]
 
     def test_strict_mode_collision_picks_lowest_student(self, tmp_path: Path):
-        """Strict (xtoken_loss=False) exact maps require weight 1.0 and a
-        ``-1`` sentinel in the second slot. On a teacher collision the lowest
-        student index wins; fuzzy rows (second slot != -1) are excluded.
+        """Strict (xtoken_loss=False) exact maps require a slot-0 weight of
+        1.0. On a teacher collision the lowest student index wins; fuzzy rows
+        (top weight below 1.0) are excluded.
 
           s0, s1 both exact-map to teacher 1 -> s0 wins (lowest index)
-          s2 fuzzy (second slot 0) -> excluded
+          s2 fuzzy (0.7 / 0.3) -> excluded
           s3 exact-maps to teacher 0 (unique)
         """
         indices = [[1, -1], [1, -1], [2, 0], [0, -1]]
@@ -593,6 +593,26 @@ class TestBuildExactTokenMap:
         assert out["common_student"].tolist() == [0, 3]
         assert out["common_teacher"].tolist() == [1, 0]
         assert out["uncommon_student"].tolist() == [1, 2]
+        assert out["uncommon_teacher"].tolist() == [2]
+
+    def test_strict_mode_accepts_zero_weight_trailing_ids(self, tmp_path: Path):
+        """Strict exact maps key on a top weight of 1.0 alone.
+
+        s0 -> teacher 1 @ 1.0 with a zero-weight trailing id (no -1 sentinel)
+        s1 fuzzy (0.7 / 0.3) -> uncommon
+        s2 -> teacher 0 @ 1.0 with the legacy -1 sentinel
+        """
+        indices = [[1, 0], [2, 1], [0, -1]]
+        likelihoods = [[1.0, 0.0], [0.7, 0.3], [1.0, 0.0]]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=False,
+            teacher_vocab_size=3,
+        )
+        assert out["common_student"].tolist() == [0, 2]
+        assert out["common_teacher"].tolist() == [1, 0]
+        assert out["uncommon_student"].tolist() == [1]
         assert out["uncommon_teacher"].tolist() == [2]
 
 
