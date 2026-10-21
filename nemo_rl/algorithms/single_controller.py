@@ -212,6 +212,7 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.train_data_dump import TrainDataDump
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
@@ -223,7 +224,6 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -758,13 +758,13 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+
         self._train_data_dump = (
             TrainDataDump(self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
             else None
         )
-        # Rows the stage reported writing this step, across every shard.
-        self._train_data_dump_rows = 0
+        self._train_data_dump_files: list[str] = []
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3648,9 +3648,9 @@ class SingleControllerActor:
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
-                            self._train_data_dump_rows,
+                            files=self._train_data_dump_files,
                         )
-                    self._train_data_dump_rows = 0
+                    self._train_data_dump_files.clear()
 
                 if not early_refit_done:
                     self._trainer_version += 1
@@ -5725,7 +5725,9 @@ class SingleControllerActor:
                 # Only the stage still holds the untruncated tensors, so it
                 # writes the dump and needs the step to name the file by.
                 train_step=(
-                    self._train_steps if self._train_data_dump is not None else None
+                    self._train_steps
+                    if self._advantage_stage_config.train_data_dump_dir is not None
+                    else None
                 ),
             )
             for shard in (shards if shards is not None else [meta])
@@ -5791,7 +5793,9 @@ class SingleControllerActor:
             self._timer.record(
                 "train_data_dump", outcome.train_data_dump_s, should_log=False
             )
-        self._train_data_dump_rows += outcome.train_data_dump_rows
+
+        if outcome.train_data_dump_file is not None:
+            self._train_data_dump_files.append(outcome.train_data_dump_file)
 
     # ── utility helpers ────────────────────────────────────────────────────
 

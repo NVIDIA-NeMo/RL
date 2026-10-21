@@ -1,150 +1,89 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+import json
 
+import pyarrow.parquet as pq
 import pytest
 import torch
 
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
-def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
-    writer = TrainDataDump(str(tmp_path))
-    size = 262144
-    tokens = torch.arange(size).reshape(1, -1)
-    for sid, length, mask in [("long", size, 1), ("masked", 3, 0)]:
-        writer.add_chunk(
-            step=4,
-            sample_ids=[sid],
-            tags=[{"prompt_idx": 12}],
-            input_lengths=torch.tensor([length]),
-            sequences={"token_ids": tokens, "advantages": tokens.float()},
-            scalars={"sample_loss_mask": torch.tensor([mask])},
-        )
-    final = tmp_path / "train_data_step5.jsonl"
-    assert not final.exists()
-    writer.finish_step(4)
-    rows = [json.loads(line) for line in final.read_text().splitlines()]
-    assert [r["idx"] for r in rows] == [0, 1]
-    assert rows[0]["token_ids"][0] == list(range(size))
-    assert rows[1]["token_ids"] == [[0, 1, 2]]
-    assert rows[1]["sample_loss_mask"] == [0]
-    assert rows[1]["metadata"] == [{"prompt_idx": 12}]
-    assert not final.with_suffix(".jsonl.partial").exists()
-    with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(5)
-
-
-def test_resume_replaces_partial_and_keeps_steps_apart(tmp_path: Path) -> None:
-    # An interrupted publish leaves a .partial behind; the next one overwrites
-    # it rather than appending to a half-written file.
-    stale = tmp_path / "train_data_step8.jsonl.partial"
-    stale.write_text("interrupted attempt\n")
-    writer = TrainDataDump(str(tmp_path))
-    args = dict(
-        sample_ids=["resumed"],
-        tags=None,
-        input_lengths=torch.tensor([1]),
-        sequences={"token_ids": torch.tensor([[9]])},
-        scalars={},
+def write(writer: TrainDataDump, *, step: int = 0, sample_id: str = "s") -> str:
+    return writer.add_chunk(
+        step=step,
+        sample_ids=[sample_id],
+        tags=[{"group_id": "g", "nested": {"attempt": 2}}],
+        input_lengths=torch.tensor([2]),
+        sequences={
+            "token_ids": torch.tensor([[7, 8, 0]]),
+            "advantages": torch.tensor([[0.25, -0.5, 99.0]], requires_grad=True),
+            "teacher_logprobs": torch.tensor([[-0.5, -torch.inf, 0.0]]),
+        },
+        scalars={"sample_loss_mask": torch.tensor([0])},
     )
-    writer.add_chunk(step=7, **args)
-    part = tmp_path / "train_data_step8.jsonl.part-0"
-    assert json.loads(part.read_text())["token_ids"] == [[9]]
-    # Each step owns its own part file, so moving on neither publishes nor
-    # corrupts the previous one.
-    writer.add_chunk(step=8, **args)
-    assert (tmp_path / "train_data_step9.jsonl.part-0").exists()
-    assert part.exists()
-    with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(42)
-    writer.finish_step(7)
-    published = tmp_path / "train_data_step8.jsonl"
-    assert json.loads(published.read_text())["idx"] == 0
-    assert not part.exists()
-    assert not stale.exists()
 
 
-def test_shards_write_separate_parts_and_merge_in_order(tmp_path: Path) -> None:
-    """The pool runs a step's shards concurrently, so each needs its own file.
+def test_concurrent_shards_write_readable_chunks(tmp_path: Path) -> None:
+    writers = [TrainDataDump(str(tmp_path), shard_id=str(i)) for i in range(3)]
+    with ThreadPoolExecutor(3) as pool:
+        list(pool.map(lambda i: write(writers[i], sample_id=f"s{i}"), range(3)))
+    root = tmp_path / "train_data_parquet"
+    assert len(list((root / "step-00000001").glob("*.parquet"))) == 3
+    rows = pq.read_table(root).to_pylist()
+    assert sorted(row["sample_id"] for row in rows) == ["s0", "s1", "s2"]
+    for row in rows:
+        assert row["token_ids"] == [7, 8]
+        assert row["teacher_logprobs"] == [-0.5, -float("inf")]
+        assert row["prev_logprobs"] is None
+    write(writers[0], step=1)
+    assert pq.read_table(root).num_rows == 4
 
-    idx has to be assigned by the merge: no single writer sees every row, and
-    a per-writer counter would hand the same index to every shard.
-    """
-    args: dict[str, Any] = dict(
-        tags=None,
-        input_lengths=torch.tensor([1]),
-        sequences={"token_ids": torch.tensor([[1]])},
-        scalars={},
+
+def test_long_jagged_rows_and_null_schema(tmp_path: Path) -> None:
+    writer = TrainDataDump(str(tmp_path))
+    length = 262144
+    tokens = torch.nested.as_nested_tensor(
+        [torch.arange(length), torch.tensor([5])], layout=torch.jagged
     )
-    shards = [TrainDataDump(str(tmp_path), shard_id=str(i)) for i in range(3)]
-    for i, shard in enumerate(shards):
-        shard.add_chunk(step=0, sample_ids=[f"s{i}"], **args)
-    assert sorted(p.name for p in tmp_path.glob("*.part-*")) == [
-        f"train_data_step1.jsonl.part-{i}" for i in range(3)
-    ]
-    # Any shard can publish: the merge reads the parts off disk rather than
-    # whatever that writer happens to have buffered.
-    shards[1].finish_step(0)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    assert [row["idx"] for row in rows] == [0, 1, 2]
-    assert [row["sample_id"] for row in rows] == [["s0"], ["s1"], ["s2"]]
-    assert not list(tmp_path.glob("*.part-*"))
-
-
-def test_unreachable_shard_fails_instead_of_publishing_a_short_dump(
-    tmp_path: Path,
-) -> None:
-    """A pool off the controller's filesystem writes parts it cannot see.
-
-    Those shards still run and still report their row counts, so without the
-    count check the merge would publish whatever happened to be local and the
-    dump would look complete while silently missing a shard.
-    """
-    reachable = TrainDataDump(str(tmp_path), shard_id="0")
-    reachable.add_chunk(
+    writer.add_chunk(
         step=0,
-        sample_ids=["here"],
+        sample_ids=["long", "short"],
         tags=None,
-        input_lengths=torch.tensor([1]),
-        sequences={"token_ids": torch.tensor([[1]])},
-        scalars={},
+        input_lengths=torch.tensor([length, 0]),
+        sequences={"token_ids": tokens},
+        scalars={
+            "prompt_ids": torch.nested.as_nested_tensor(
+                [torch.tensor([1, 2]), torch.tensor([3])], layout=torch.jagged
+            )
+        },
     )
-    controller = TrainDataDump(str(tmp_path))
-    # Two shards reported a row each; only one part landed on this filesystem.
-    with pytest.raises(RuntimeError, match="must share this filesystem"):
-        controller.finish_step(0, 2)
-    assert not list(tmp_path.glob("*.jsonl"))
-    assert not list(tmp_path.glob("*.partial"))
-    # The honest count still publishes.
-    controller.finish_step(0, 1)
-    assert (tmp_path / "train_data_step1.jsonl").exists()
-
-
-def test_controller_publishes_a_step_it_never_wrote(tmp_path: Path) -> None:
-    """With a pool the controller holds a dump that only ever merges.
-
-    It calls finish_step without a single add_chunk of its own, which the
-    pre-pool writer rejected because it keyed off its own row counter.
-    """
-    worker = TrainDataDump(str(tmp_path), shard_id="7")
-    worker.add_chunk(
-        step=2,
-        sample_ids=["only"],
-        tags=None,
-        input_lengths=torch.tensor([1]),
-        sequences={"token_ids": torch.tensor([[3]])},
-        scalars={},
+    rows = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
+    assert rows[0]["token_ids"] == list(range(length))
+    assert rows[1]["token_ids"] == []
+    assert [row["prompt_ids"] for row in rows] == [[1, 2], [3]]
+    assert all(
+        row["group_id"] is None and row["teacher_logprobs"] is None for row in rows
     )
-    controller = TrainDataDump(str(tmp_path))
-    controller.finish_step(2)
-    rows = (tmp_path / "train_data_step3.jsonl").read_text().splitlines()
-    assert [json.loads(line)["sample_id"] for line in rows] == [["only"]]
+
+
+def test_failed_write_is_not_discoverable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(table, path, **kwargs):
+        path.write_bytes(b"incomplete parquet")
+        raise OSError("disk full")
+
+    write(TrainDataDump(str(tmp_path)), sample_id="complete")
+    monkeypatch.setattr(pq, "write_table", fail)
+    with pytest.raises(OSError, match="disk full"):
+        write(TrainDataDump(str(tmp_path)))
+    assert len(list(tmp_path.rglob("*.parquet"))) == 1
+    assert pq.read_table(tmp_path / "train_data_parquet")["sample_id"].to_pylist() == [
+        "complete"
+    ]
+    assert list(tmp_path.rglob("*.partial"))
 
 
 @pytest.fixture
@@ -172,43 +111,6 @@ def chunk() -> dict[str, Any]:
     }
 
 
-def test_dump_preserves_singleton_batch_schema(
-    tmp_path: Path, chunk: dict[str, Any]
-) -> None:
-    original_advantages = chunk["sequences"]["advantages"].detach().clone()
-    writer = TrainDataDump(str(tmp_path / "nested" / "logs"))
-    writer.add_chunk(step=0, **chunk)
-    writer.finish_step(0)
-    rows = [
-        json.loads(line)
-        for line in (writer.log_dir / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    expected_keys = {
-        "idx",
-        "step",
-        "sample_id",
-        "input_lengths",
-        "metadata",
-        *chunk["sequences"],
-        *chunk["scalars"],
-    }
-    assert len(rows) == len(chunk["sample_ids"])
-    for i, row in enumerate(rows):
-        length = chunk["input_lengths"][i].item()
-        assert set(row) == expected_keys
-        assert row["idx"] == i
-        assert row["step"] == 1
-        assert row["sample_id"] == chunk["sample_ids"][i : i + 1]
-        assert row["input_lengths"] == [length]
-        assert row["metadata"] == chunk["tags"][i : i + 1]
-        for key, values in chunk["sequences"].items():
-            assert row[key] == values[i : i + 1, :length].tolist(), key
-        for key, values in chunk["scalars"].items():
-            assert row[key] == values[i : i + 1].tolist(), key
-    assert chunk["sequences"]["advantages"].requires_grad
-    torch.testing.assert_close(chunk["sequences"]["advantages"], original_advantages)
-
-
 @pytest.mark.parametrize(
     ("invalid_column", "existing_chunk"),
     [
@@ -231,7 +133,7 @@ def test_invalid_chunk_leaves_dump_unchanged(
     writer = TrainDataDump(str(tmp_path))
     if existing_chunk:
         writer.add_chunk(step=0, **chunk)
-    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    before = {str(p): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     if invalid_column in ("input_lengths", "tags"):
         chunk[invalid_column] = chunk[invalid_column][:1]
     elif invalid_column == "token_ids":
@@ -248,116 +150,90 @@ def test_invalid_chunk_leaves_dump_unchanged(
         )
     with pytest.raises(ValueError, match="column lengths|input length"):
         writer.add_chunk(step=0, **chunk)
-    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before
-    assert writer.rows == (2 if existing_chunk else 0)
-    assert writer.step == (0 if existing_chunk else None)
+    assert {
+        str(p): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()
+    } == before
 
 
-def test_jagged_columns_dump_real_rows_without_padding(tmp_path: Path) -> None:
-    # Two prompt groups with different prompt lengths: the data plane returns
-    # prompt_ids jagged, and padding them would append fake 0 tokens.
-    def jagged(rows: list[list[int]]) -> torch.Tensor:
-        return torch.nested.as_nested_tensor(
-            [torch.tensor(row) for row in rows], layout=torch.jagged
-        )
-
-    prompts = [[5, 6, 7], [5, 6, 7], [9, 8], [9, 8]]
-    tokens = [[5, 6, 7, 1, 2], [5, 6, 7, 3], [9, 8, 4], [9, 8, 5, 6]]
-    args = dict(
-        sample_ids=["p0_g0", "p0_g1", "p1_g0", "p1_g1"],
-        tags=None,
-        sequences={"token_ids": jagged(tokens)},
-        scalars={"prompt_ids": jagged(prompts)},
+def test_training_fields_survive_parquet(tmp_path: Path, chunk: dict[str, Any]) -> None:
+    chunk["sequences"].update(
+        values=torch.tensor([[0.125, 0.5, 99.0], [0.75, 99.0, 99.0]]),
+        returns=torch.tensor([[1.25, 1.5, 99.0], [1.75, 99.0, 99.0]]),
+        reference_logprobs=torch.full((2, 3), -0.75),
     )
-    writer = TrainDataDump(str(tmp_path))
-    with pytest.raises(ValueError, match="input length"):
-        # Validation is per row: 5 fits row 0 but exceeds jagged row 3.
-        writer.add_chunk(step=0, input_lengths=torch.tensor([5, 4, 3, 5]), **args)
-    writer.add_chunk(step=0, input_lengths=torch.tensor([5, 4, 3, 4]), **args)
-    writer.finish_step(0)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    assert [row["prompt_ids"] for row in rows] == [[p] for p in prompts]
-    assert [row["token_ids"] for row in rows] == [[t] for t in tokens]
-
-
-def test_zero_length_and_missing_optional_columns(
-    tmp_path: Path, chunk: dict[str, Any]
-) -> None:
-    writer = TrainDataDump(str(tmp_path))
-    chunk["input_lengths"] = torch.tensor([[0], [1]])
-    chunk["tags"] = None
-    chunk["scalars"] = {}
-    chunk["sequences"] = {"token_ids": chunk["sequences"]["token_ids"]}
-    writer.add_chunk(step=0, **chunk)
-    writer.finish_step(0)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    assert rows[0]["token_ids"] == [[]]
-    assert rows[0]["input_lengths"] == [0]
-    assert rows[1]["token_ids"] == [[20]]
-    assert all(row["metadata"] == [{}] for row in rows)
-    assert all("teacher_logprobs" not in row for row in rows)
-
-
-def test_consecutive_steps_reset_row_indices_and_preserve_prior_dump(
-    tmp_path: Path, chunk: dict[str, Any]
-) -> None:
     writer = TrainDataDump(str(tmp_path))
     writer.add_chunk(step=0, **chunk)
-    writer.finish_step(0)
-    first = tmp_path / "train_data_step1.jsonl"
-    original = first.read_bytes()
-    writer.add_chunk(step=1, **chunk)
-    writer.add_chunk(step=1, **chunk)
-    writer.finish_step(1)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step2.jsonl").read_text().splitlines()
-    ]
-    assert [row["idx"] for row in rows] == [0, 1, 2, 3]
-    assert [row["sample_id"] for row in rows] == [["a"], ["b"], ["a"], ["b"]]
-    assert all(row["step"] == 2 for row in rows)
-    assert first.read_bytes() == original
-    assert not list(tmp_path.glob("*.partial"))
+    table = pq.read_table(tmp_path / "train_data_parquet")
+    rows = table.to_pylist()
+    assert [row["sample_id"] for row in rows] == ["a", "b"]
+    assert [row["sample_loss_mask"] for row in rows] == [1, 0]
+    assert [row["rewards"] for row in rows] == [0.5, -1.0]
+    assert [row["input_lengths"] for row in rows] == [2, 1]
+    assert json.loads(rows[0]["metadata"]) == chunk["tags"][0]
+    for key in (
+        "token_ids",
+        "token_loss_mask",
+        "advantages",
+        "generation_logprobs",
+        "prev_logprobs",
+        "teacher_logprobs",
+        "reference_logprobs",
+        "values",
+        "returns",
+    ):
+        assert rows[0][key] == chunk["sequences"][key][0, :2].tolist()
+        assert rows[1][key] == chunk["sequences"][key][1, :1].tolist()
+    assert str(table.schema.field("values").type) == "list<element: float>"
+    assert chunk["sequences"]["advantages"].requires_grad
 
 
-def test_empty_chunk_cannot_publish_completed_step(tmp_path: Path) -> None:
+def test_manifest_lists_only_reported_chunks(tmp_path, monkeypatch):
     writer = TrainDataDump(str(tmp_path))
-    writer.add_chunk(
-        step=0,
-        sample_ids=[],
-        tags=None,
-        input_lengths=torch.empty(0, dtype=torch.long),
-        sequences={},
-        scalars={},
-    )
-    with pytest.raises(RuntimeError, match="no training dump"):
-        writer.finish_step(0)
-    assert not list(tmp_path.glob("*.jsonl"))
+    write(writer, sample_id="abandoned")
+    name = write(writer)
+    directory = tmp_path / "train_data_parquet" / "step-00000001"
+    original = (directory / name).read_bytes()
+
+    def no_footer_reads(*args, **kwargs):
+        pytest.fail("Finalization must not read Parquet footers")
+
+    monkeypatch.setattr(pq, "read_metadata", no_footer_reads)
+    writer.finish_step(0, files=[name])
+    manifest = json.loads((directory / "_manifest.json").read_text())
+    assert manifest == {"step": 1, "files": [name]}
+    assert (directory / name).read_bytes() == original
+    assert pq.read_table([directory / f for f in manifest["files"]]).num_rows == 1
+    with pytest.raises(FileExistsError):
+        writer.finish_step(0, files=[name])
 
 
-def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
-    values = torch.tensor([[0.0, -torch.inf, torch.inf, torch.nan]])
+@pytest.mark.parametrize("failure", ["missing", "empty", "publish"])
+def test_failed_finalization_has_no_manifest(tmp_path, monkeypatch, failure):
     writer = TrainDataDump(str(tmp_path))
-    writer.add_chunk(
-        step=0,
-        sample_ids=["sample"],
-        tags=None,
-        input_lengths=torch.tensor([4]),
-        sequences={"prev_logprobs": values},
-        scalars={},
+    name = write(writer)
+    directory = tmp_path / "train_data_parquet" / "step-00000001"
+    if failure == "missing":
+        (directory / name).unlink()
+    elif failure == "empty":
+        (directory / name).write_bytes(b"")
+    else:
+
+        def fail(*args):
+            raise OSError("publication failed")
+
+        monkeypatch.setattr("nemo_rl.utils.train_data_dump.os.replace", fail)
+    with pytest.raises((RuntimeError, OSError)):
+        writer.finish_step(0, files=[name])
+    assert not (directory / "_manifest.json").exists()
+
+
+def test_bfloat16_and_singleton_scalar_columns(tmp_path, chunk):
+    chunk["sequences"]["advantages"] = chunk["sequences"]["advantages"].to(
+        torch.bfloat16
     )
-    writer.finish_step(0)
-    text = (tmp_path / "train_data_step1.jsonl").read_text()
-
-    def reject_nonfinite(value):
-        raise AssertionError(value)
-
-    row = json.loads(text, parse_constant=reject_nonfinite)
-    assert row["prev_logprobs"] == [[0.0, None, None, None]]
-    assert torch.isneginf(values[0, 1])
+    chunk["scalars"]["rewards"] = chunk["scalars"]["rewards"].reshape(2, 1)
+    TrainDataDump(str(tmp_path)).add_chunk(step=0, **chunk)
+    rows = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
+    assert [row["rewards"] for row in rows] == [0.5, -1.0]
+    assert [row["prompt_ids"] for row in rows] == [[7, 8], [7, 8]]
+    assert [row["advantages"] for row in rows] == [[-0.5, 0.25], [0.5]]
