@@ -115,8 +115,8 @@ teachers:
   aligner:
     projection_matrix_path: null
     drop_first_assistant_chunk_kl: false
-    student_to_teacher_table_path: cross_tokenizer_data/csd/student_to_teacher.pt
-    teacher_to_student_table_path: cross_tokenizer_data/csd/teacher_to_student.pt
+    student_to_teacher_table_path: cross_tokenizer_data/csd/phi4mini/student_to_teacher.pt
+    teacher_to_student_table_path: cross_tokenizer_data/csd/phi4mini/teacher_to_student.pt
   weight: 1.0
   tokenizer:
     name: microsoft/Phi-4-mini-instruct
