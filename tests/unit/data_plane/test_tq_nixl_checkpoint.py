@@ -65,7 +65,6 @@ def _system(num_units: int):
     conf = make_tq_conf(
         num_units=num_units, slab_bytes=32 << 20, staging_bytes=16 << 20, namespace=NS
     )
-    conf.backend.NixlStore.placement = {"policy": "spread"}
     tq.init(conf)
     return tq, conf
 

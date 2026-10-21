@@ -80,9 +80,8 @@ from nemo_rl.data_plane.nixl.errors import (
     StaleRead,
 )
 from nemo_rl.data_plane.nixl.nixl_io import GRAVEYARD, NixlEndpoint
-from nemo_rl.data_plane.nixl.placement import make_placement
+from nemo_rl.data_plane.nixl.placement import Spread
 from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit
-from nemo_rl.distributed import numa_utils
 
 BACKEND_NAME = "NixlStore"
 DEFAULT_NAMESPACE = "nemo_rl_nixl"
@@ -220,14 +219,7 @@ class NixlKVClient(StorageKVClient):
         nixl_cfg = _as_dict(cfg.get("nixl") or {})
         store_cfg = _as_dict(cfg.get("store") or {})
         kind = store_cfg.get("kind", "unit")
-        # Socket binding (nemo_rl/distributed/numa_utils.py): a client already pinned
-        # inside one socket writes to its socket's unit first.
         init_params = dict(nixl_cfg.get("backend_init_params") or {})
-        self.numa: int | None = None
-        sockets = numa_utils.cpu_nodes() if cfg.get("numa", "auto") == "auto" else {}
-        if len(sockets) >= 2:
-            # Socket-first placement only; NICs are not restricted (see nixl_storage_unit).
-            self.numa = numa_utils.socket_of_affinity(sockets)
         self.ep = NixlEndpoint(
             f"client-{os.getpid()}-{uuid.uuid4().hex[:6]}",
             backend=nixl_cfg.get("backend_name", "UCX"),
@@ -278,15 +270,12 @@ class NixlKVClient(StorageKVClient):
             area = int(cfg.get("unit_slab_bytes", 1 << 30))
             area -= ssd["staging_bytes"] if ssd else 0
             self.max_blob_bytes = int(cfg.get("max_blob_bytes", area // 4))
-            pl = _as_dict(cfg.get("placement") or {})
             self.store = make_store(
                 "unit",
                 self.ep,
                 directory,
                 namespace=self.namespace,
-                placement=make_placement(
-                    pl.get("policy", "local_first"), start=os.getpid(), numa=self.numa
-                ),
+                placement=Spread(start=os.getpid()),
                 node_id=ray.get_runtime_context().get_node_id(),
                 timeout_s=self.timeout_s,
                 ssd=ssd is not None,
