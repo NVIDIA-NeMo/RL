@@ -15,11 +15,11 @@
 """Gate the training driver on the exact live Slurm GPU allocation."""
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def main():
@@ -37,13 +37,17 @@ def main():
             ray.init(address=os.environ["RAY_ADDRESS"], logging_level="ERROR")
             nodes = [node for node in ray.nodes() if node.get("Alive")]
             if len(nodes) == args.nodes:
-                counts = [int(node.get("Resources", {}).get("GPU", 0)) for node in nodes]
+                counts = [
+                    int(node.get("Resources", {}).get("GPU", 0)) for node in nodes
+                ]
                 if counts != [args.gpus_per_node] * args.nodes:
                     raise RuntimeError(f"Unexpected per-node Ray GPU counts: {counts}")
                 resources = ray.cluster_resources()
                 expected = args.nodes * args.gpus_per_node
                 if int(resources.get("worker_units", 0)) != expected:
-                    raise RuntimeError("Ray worker_units differ from the Slurm GPU allocation")
+                    raise RuntimeError(
+                        "Ray worker_units differ from the Slurm GPU allocation"
+                    )
                 receipt = {
                     "status": "pass",
                     "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -60,7 +64,12 @@ def main():
                     ],
                 }
                 args.output.write_text(json.dumps(receipt, indent=2) + "\n")
-                print(json.dumps({"status": "pass", "nodes": args.nodes, "gpus": expected}), flush=True)
+                print(
+                    json.dumps(
+                        {"status": "pass", "nodes": args.nodes, "gpus": expected}
+                    ),
+                    flush=True,
+                )
                 return
             if len(nodes) > args.nodes:
                 raise RuntimeError("Ray contains nodes outside this allocation")

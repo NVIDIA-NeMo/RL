@@ -10,16 +10,16 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
 import logging
-from pathlib import Path
 import struct
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/flint_sglang"

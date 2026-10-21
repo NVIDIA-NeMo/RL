@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Read small saved Adam step tensors without loading optimizer moments.
 
 Pass one --checkpoint and --expected-step pair per checkpoint. A checkpoint may
@@ -9,18 +22,27 @@ The input remains read-only and only the explicitly requested JSON is written.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import math
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 def locate_optimizer_directory(path: Path) -> Path:
-    candidates = [path, path / "policy" / "optimizer" / "optim", path / "optimizer" / "optim", path / "optim"]
-    found = [candidate for candidate in candidates if (candidate / ".metadata").is_file()]
+    candidates = [
+        path,
+        path / "policy" / "optimizer" / "optim",
+        path / "optimizer" / "optim",
+        path / "optim",
+    ]
+    found = [
+        candidate for candidate in candidates if (candidate / ".metadata").is_file()
+    ]
     if len(found) != 1:
-        raise ValueError(f"Expected one DCP optimizer directory under {path}; found {found}")
+        raise ValueError(
+            f"Expected one DCP optimizer directory under {path}; found {found}"
+        )
     return found[0]
 
 
@@ -32,7 +54,11 @@ def optimizer_step(path: Path, parameter_name: str = "lm_head") -> dict:
     directory = locate_optimizer_directory(path.resolve(strict=True))
     reader = dcp.FileSystemReader(directory)
     metadata = reader.read_metadata()
-    keys = sorted(key for key in metadata.state_dict_metadata if parameter_name in key and key.endswith(".step"))
+    keys = sorted(
+        key
+        for key in metadata.state_dict_metadata
+        if parameter_name in key and key.endswith(".step")
+    )
     if not keys:
         raise ValueError(f"No saved Adam step tensor matching {parameter_name!r}")
     state = {}
@@ -41,13 +67,22 @@ def optimizer_step(path: Path, parameter_name: str = "lm_head") -> dict:
         if not hasattr(spec, "size") or math.prod(spec.size) != 1:
             raise ValueError(f"Expected a scalar Adam step tensor: {key}")
         state[key] = torch.empty(spec.size, dtype=spec.properties.dtype)
-    dcp.load(state, storage_reader=reader, planner=DefaultLoadPlanner(allow_partial_load=True))
+    dcp.load(
+        state,
+        storage_reader=reader,
+        planner=DefaultLoadPlanner(allow_partial_load=True),
+    )
     values = {key: value.item() for key, value in state.items()}
     if len(set(values.values())) != 1:
         raise ValueError(f"Saved Adam step tensors disagree: {values}")
-    return {"checkpoint": str(path), "optimizer_directory": str(directory), "value": next(iter(values.values())),
-            "parameter_name_filter": parameter_name, "step_tensors": values,
-            "payload_elements_read": sum(value.numel() for value in state.values())}
+    return {
+        "checkpoint": str(path),
+        "optimizer_directory": str(directory),
+        "value": next(iter(values.values())),
+        "parameter_name_filter": parameter_name,
+        "step_tensors": values,
+        "payload_elements_read": sum(value.numel() for value in state.values()),
+    }
 
 
 def main() -> None:
@@ -62,10 +97,17 @@ def main() -> None:
     if not args.parameter_name or any(step < 0 for step in args.expected_step):
         parser.error("Parameter filter must be nonempty and expected steps nonnegative")
     output = args.output.resolve()
-    if any(path.resolve() == output or path.resolve() in output.parents for path in args.checkpoint):
+    if any(
+        path.resolve() == output or path.resolve() in output.parents
+        for path in args.checkpoint
+    ):
         raise ValueError("Write the audit outside the read-only checkpoint directories")
-    report = {"created_at_utc": datetime.now(timezone.utc).isoformat(), "status": "passed",
-              "scope": "Only selected Adam step tensors; optimizer moments and all other state are not read", "records": []}
+    report = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "passed",
+        "scope": "Only selected Adam step tensors; optimizer moments and all other state are not read",
+        "records": [],
+    }
     try:
         for path, expected in zip(args.checkpoint, args.expected_step):
             record = optimizer_step(path, args.parameter_name)

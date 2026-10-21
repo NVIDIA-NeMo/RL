@@ -22,13 +22,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
-from pathlib import Path
 import runpy
 import sys
-
+from pathlib import Path
 
 BASE_LAUNCHER = Path("/flint-work/tools/launch_grpo.py")
-BASE_LAUNCHER_SHA256 = "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
+BASE_LAUNCHER_SHA256 = "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"  # pragma: allowlist secret - SHA256 integrity checksum
 SGLANG_DIAGNOSTIC_EXECUTABLE = "/flint-run/tools/python-sglang-diagnostic.sh"
 
 
@@ -42,18 +41,24 @@ def actor_executable_mapping(*, synthetic_smoke=False, validate=True):
         "nemo_rl.models.generation.sglang.sglang_router.RouterActor": SGLANG_DIAGNOSTIC_EXECUTABLE,
     }
     if synthetic_smoke:
-        mapping["flint_smoke_environment.FlintSmokeEnvironment"] = "/opt/flint/bin/python-driver"
+        mapping["flint_smoke_environment.FlintSmokeEnvironment"] = (
+            "/opt/flint/bin/python-driver"
+        )
     if validate:
         for value in sorted(set(mapping.values())):
             executable = Path(value)
             if not executable.is_file():
                 raise FileNotFoundError(executable)
             if not os.access(executable, os.X_OK):
-                raise PermissionError(f"Actor executable is not executable: {executable}")
+                raise PermissionError(
+                    f"Actor executable is not executable: {executable}"
+                )
         if not Path("/opt/flint/bin/python-sglang").is_file():
             raise FileNotFoundError("/opt/flint/bin/python-sglang")
         if not os.access("/opt/flint/bin/python-sglang", os.X_OK):
-            raise PermissionError("SGLang profile is not executable: /opt/flint/bin/python-sglang")
+            raise PermissionError(
+                "SGLang profile is not executable: /opt/flint/bin/python-sglang"
+            )
     return mapping
 
 
@@ -65,7 +70,9 @@ def load_reviewed_capture_metrics():
     observed = hashlib.sha256(source).hexdigest()
     if observed != BASE_LAUNCHER_SHA256:
         raise RuntimeError(f"Unknown base launcher hash: {observed}")
-    specification = importlib.util.spec_from_file_location("flint_reviewed_launcher_helpers", BASE_LAUNCHER)
+    specification = importlib.util.spec_from_file_location(
+        "flint_reviewed_launcher_helpers", BASE_LAUNCHER
+    )
     if specification is None or specification.loader is None:
         raise RuntimeError("Cannot import the reviewed base launcher")
     module = importlib.util.module_from_spec(specification)
@@ -82,18 +89,25 @@ def main():
     # A driver-wide setting would also force synchronous Automodel execution.
     # The SGLang executable wrapper supplies the diagnostic setting per actor.
     if os.environ.get("CUDA_LAUNCH_BLOCKING") not in (None, "", "0"):
-        raise RuntimeError("CUDA_LAUNCH_BLOCKING must be scoped to the SGLang diagnostic executable")
+        raise RuntimeError(
+            "CUDA_LAUNCH_BLOCKING must be scoped to the SGLang diagnostic executable"
+        )
     os.environ["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1"
     os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "flint_sglang"
     assert os.environ["NEMO_RL_PY_EXECUTABLES_SYSTEM"] == "1"
 
     # Preserve native Flint registration before AutoConfig is used.
     from nemo_automodel._transformers import registry
-    from nemo_rl.distributed.ray_actor_environment_registry import ACTOR_ENVIRONMENT_REGISTRY
+
+    from nemo_rl.distributed.ray_actor_environment_registry import (
+        ACTOR_ENVIRONMENT_REGISTRY,
+    )
 
     assert "FlintForCausalLM" in registry.MODEL_ARCH_MAPPING
     synthetic_smoke = os.environ.get("FLINT_SYNTHETIC_SMOKE") == "1"
-    ACTOR_ENVIRONMENT_REGISTRY.update(actor_executable_mapping(synthetic_smoke=synthetic_smoke))
+    ACTOR_ENVIRONMENT_REGISTRY.update(
+        actor_executable_mapping(synthetic_smoke=synthetic_smoke)
+    )
     if synthetic_smoke:
         from nemo_rl.environments.utils import register_env
 

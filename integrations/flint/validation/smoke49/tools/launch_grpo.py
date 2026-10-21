@@ -1,3 +1,16 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Launch the private Flint GRPO check with the container's actor environments."""
 
 import os
@@ -33,7 +46,13 @@ def capture_metrics(path):
     def record(self, metrics, step, prefix="", step_metric=None, step_finished=False):
         original(self, metrics, step, prefix, step_metric, step_finished)
         with destination.open("a") as stream:
-            stream.write(json.dumps(normalize({"step": step, "prefix": prefix, "metrics": metrics}), allow_nan=False) + "\n")
+            stream.write(
+                json.dumps(
+                    normalize({"step": step, "prefix": prefix, "metrics": metrics}),
+                    allow_nan=False,
+                )
+                + "\n"
+            )
 
     Logger.log_metrics = record
 
@@ -43,6 +62,7 @@ def main():
     os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = "flint_sglang"
     # Register the local, native architecture before AutoConfig is used.
     from nemo_automodel._transformers import registry
+
     from nemo_rl.distributed.ray_actor_environment_registry import (
         ACTOR_ENVIRONMENT_REGISTRY,
     )
@@ -64,8 +84,8 @@ def main():
         from nemo_rl.environments.utils import register_env
 
         register_env("flint_smoke", "flint_smoke_environment.FlintSmokeEnvironment")
-        ACTOR_ENVIRONMENT_REGISTRY["flint_smoke_environment.FlintSmokeEnvironment"] = str(
-            Path("/opt/flint/bin/python-driver")
+        ACTOR_ENVIRONMENT_REGISTRY["flint_smoke_environment.FlintSmokeEnvironment"] = (
+            str(Path("/opt/flint/bin/python-driver"))
         )
     if os.environ.get("FLINT_METRICS_PATH"):
         capture_metrics(os.environ["FLINT_METRICS_PATH"])

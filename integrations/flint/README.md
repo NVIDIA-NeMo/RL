@@ -90,7 +90,9 @@ was not established. Do not interpret successful smoke tests as resolving those
 issues.
 
 `source-manifest.json` maps collected files to their original workspaces. It
-contains paths and hashes only. Generated validation output is kept outside Git.
+contains original source paths and hashes; collected copies may additionally have
+license headers, formatting, and portable recipe inheritance applied for CI.
+Generated validation output is kept outside Git.
 GPU functional tests require NVIDIA infrastructure and private model assets.
 Public CI results must be assessed separately from the historical validation.
 

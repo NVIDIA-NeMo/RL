@@ -2,486 +2,486 @@
   {
     "source": "work/flint-grpo-49layer-20261019/RL/pyproject.toml",
     "destination": "pyproject.toml",
-    "sha256": "f41e349c883df4654ccc021b29b9e35ad426dbfc9e975d0f417b559a571cff0f"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "f41e349c883df4654ccc021b29b9e35ad426dbfc9e975d0f417b559a571cff0f"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/automodel/checkpoint.py",
     "destination": "nemo_rl/models/automodel/checkpoint.py",
-    "sha256": "158936a45d607c354bbb0b132cee50d89c2883f56990a73b3f654d31d208b7fe"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "158936a45d607c354bbb0b132cee50d89c2883f56990a73b3f654d31d208b7fe"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/policy/__init__.py",
     "destination": "nemo_rl/models/policy/__init__.py",
-    "sha256": "f85d0801af1451ec39dd2119f18cee3c12492096c654e3a903ea5bb15a061526"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "f85d0801af1451ec39dd2119f18cee3c12492096c654e3a903ea5bb15a061526"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/policy/workers/automodel_policy_worker.py",
     "destination": "nemo_rl/models/policy/workers/automodel_policy_worker.py",
-    "sha256": "2b3e1c3d9ce6c7e35e99f3c8bf0a7519fb9f877937a9a2484fb42f336563ed04"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "2b3e1c3d9ce6c7e35e99f3c8bf0a7519fb9f877937a9a2484fb42f336563ed04"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/generation/sglang/sglang_router.py",
     "destination": "nemo_rl/models/generation/sglang/sglang_router.py",
-    "sha256": "659fb01147f9ecd5f5f9fc264ef791d47f2f9ee4085488cd435a30e923a4760a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "659fb01147f9ecd5f5f9fc264ef791d47f2f9ee4085488cd435a30e923a4760a"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/generation/sglang/config.py",
     "destination": "nemo_rl/models/generation/sglang/config.py",
-    "sha256": "6a3c203435487a671a74626fbc25bdf4d428bb8ffc9191ff046fb94145f8b91b"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6a3c203435487a671a74626fbc25bdf4d428bb8ffc9191ff046fb94145f8b91b"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/nemo_rl/models/generation/sglang/sglang_worker.py",
     "destination": "nemo_rl/models/generation/sglang/sglang_worker.py",
-    "sha256": "183161d7b6caabc466cbea08d73ffc361bba5fce2d6002f275d3109c2129a328"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "183161d7b6caabc466cbea08d73ffc361bba5fce2d6002f275d3109c2129a328"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/compat/test_automodel_mapping_compat.py",
     "destination": "tests/compat/test_automodel_mapping_compat.py",
-    "sha256": "81cb30d35d75a3a1d4d9e76815cab97e2e323a0b358691ca0313c626c6ac83fa"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "81cb30d35d75a3a1d4d9e76815cab97e2e323a0b358691ca0313c626c6ac83fa"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/compat/test_sglang_router_parent_guard.py",
     "destination": "tests/compat/test_sglang_router_parent_guard.py",
-    "sha256": "fddc9e46df6ce9b46e45711fb047b8267771b44d11cb14e31ee033c73b482386"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "fddc9e46df6ce9b46e45711fb047b8267771b44d11cb14e31ee033c73b482386"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/compat/test_policy_tokenizer_compat.py",
     "destination": "tests/compat/test_policy_tokenizer_compat.py",
-    "sha256": "99fadf993f386d3d68675f081e1831ad467c83fad576beee0d9d51a3395aaefe"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "99fadf993f386d3d68675f081e1831ad467c83fad576beee0d9d51a3395aaefe"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/compat/test_flint_grpo_compat.py",
     "destination": "tests/compat/test_flint_grpo_compat.py",
-    "sha256": "d871f6bca9d08f8ca71fdcdafe8af3705fe4d22ca99d26204b4794787285b227"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "d871f6bca9d08f8ca71fdcdafe8af3705fe4d22ca99d26204b4794787285b227"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/test_suites/flint-full49-private.txt",
     "destination": "tests/test_suites/flint-full49-private.txt",
-    "sha256": "fab92135a570d0ce3571184de486f1d671cd8b8aafad4dd00b0a901bae1cce3e"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "fab92135a570d0ce3571184de486f1d671cd8b8aafad4dd00b0a901bae1cce3e"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/test_suites/flint-private.txt",
     "destination": "tests/test_suites/flint-private.txt",
-    "sha256": "d49243f5fca0c871c04dacdbde9db92ed71d07fc9c7f846d06e07b5bce9b92f1"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "d49243f5fca0c871c04dacdbde9db92ed71d07fc9c7f846d06e07b5bce9b92f1"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/test_suites/llm/grpo-flint-4layer-1n4g-automodel-sglang-quick.sh",
     "destination": "tests/test_suites/llm/grpo-flint-4layer-1n4g-automodel-sglang-quick.sh",
-    "sha256": "0fe9c920ccf568e54ea03b2230c97490b1eb10c76ce9471684dc1810110f322a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "0fe9c920ccf568e54ea03b2230c97490b1eb10c76ce9471684dc1810110f322a"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/test_suites/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-synthetic-quick.sh",
     "destination": "tests/test_suites/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-synthetic-quick.sh",
-    "sha256": "50ad852e9f2cbbb9ccd733229bbd9672ed66286ea09d10edc01bfe59a4681fce"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "50ad852e9f2cbbb9ccd733229bbd9672ed66286ea09d10edc01bfe59a4681fce"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/tests/test_suites/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.sh",
     "destination": "tests/test_suites/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.sh",
-    "sha256": "12dba1e68ddcb9c15a1617fdc16bf3232ad58f9d1f29a5aec87de1b10b413afc"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "12dba1e68ddcb9c15a1617fdc16bf3232ad58f9d1f29a5aec87de1b10b413afc"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/examples/configs/grpo_math_1B_sglang.yaml",
     "destination": "examples/configs/grpo_math_1B_sglang.yaml",
-    "sha256": "548113dcc76db7b065a66d13b6c9211ea103763ed27398dd230f6761ef219012"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "548113dcc76db7b065a66d13b6c9211ea103763ed27398dd230f6761ef219012"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/examples/configs/recipes/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-synthetic-quick.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-synthetic-quick.yaml",
-    "sha256": "6ccc663a76eafbb1fd75e73cac9030b0de34be4adcf237612684a7e407bb602c"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6ccc663a76eafbb1fd75e73cac9030b0de34be4adcf237612684a7e407bb602c"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/examples/configs/recipes/llm/grpo-flint-4layer-1n4g-automodel-sglang-quick.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-4layer-1n4g-automodel-sglang-quick.yaml",
-    "sha256": "9917c27e3ff4b75fd6b2e6591554b8959887b16baa599734deeeffac45ae42e7"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "9917c27e3ff4b75fd6b2e6591554b8959887b16baa599734deeeffac45ae42e7"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/examples/configs/recipes/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.yaml",
-    "sha256": "18b391206e08cf81ad4dff7f87f3467763d0292d48269629edb8e6bb2b473070"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "18b391206e08cf81ad4dff7f87f3467763d0292d48269629edb8e6bb2b473070"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/RL/examples/configs/recipes/llm/grpo-flint-4layer-1n4g-automodel-sglang-synthetic-quick.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-4layer-1n4g-automodel-sglang-synthetic-quick.yaml",
-    "sha256": "ebc613e12ab43090543a73229ce0e63df9a9dc537d841e31aea80c12ef4c7fb8"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "ebc613e12ab43090543a73229ce0e63df9a9dc537d841e31aea80c12ef4c7fb8"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/evidence/sglang-flint.patch",
     "destination": "integrations/flint/patches/sglang-flint-refit.patch",
-    "sha256": "aa6a65c3ce2435056f970dcf5091e2f0ff2b83009d95402439bb6b75d8369cd3"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "aa6a65c3ce2435056f970dcf5091e2f0ff2b83009d95402439bb6b75d8369cd3"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/evidence/automodel-sink-checkpoint.patch",
     "destination": "integrations/flint/patches/automodel-sink-checkpoint.patch",
-    "sha256": "db6c7a20fc6f370c6da2a6b2c3cbe08e0bbd01df5f09fecafcd4d1d77394c03a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "db6c7a20fc6f370c6da2a6b2c3cbe08e0bbd01df5f09fecafcd4d1d77394c03a"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/sglang-overlay/hybrid-kv-offload.patch",
     "destination": "integrations/flint/patches/sglang-hybrid-kv-offload.patch",
-    "sha256": "9f18af7864112b0f0f8a63b286fd07a3eb78e896f2c170c75e4cab9c3eca19d0"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "9f18af7864112b0f0f8a63b286fd07a3eb78e896f2c170c75e4cab9c3eca19d0"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/sglang-overlay/hybrid-kv-offload.json",
     "destination": "integrations/flint/patches/hybrid-kv-offload.json",
-    "sha256": "f9f4e30db9cbe6093fd93a36aaa521ac2d490b69ae9e8bf8eb177f438a85c53c"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "f9f4e30db9cbe6093fd93a36aaa521ac2d490b69ae9e8bf8eb177f438a85c53c"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/launch_grpo.py",
     "destination": "integrations/flint/validation/smoke4/tools/launch_grpo.py",
-    "sha256": "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/test_audit_training_result.py",
     "destination": "integrations/flint/validation/smoke4/tools/test_audit_training_result.py",
-    "sha256": "ed0d530376a9cd0a2e2a0ae9f55f04217f46f787dab63c01d39c3c4bbfa49a30"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "ed0d530376a9cd0a2e2a0ae9f55f04217f46f787dab63c01d39c3c4bbfa49a30"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/test_create_four_layer_proxy.py",
     "destination": "integrations/flint/validation/smoke4/tools/test_create_four_layer_proxy.py",
-    "sha256": "fc30c3082918311de325dc138506bc216e05f521781c4533b0b06923a22cac57"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "fc30c3082918311de325dc138506bc216e05f521781c4533b0b06923a22cac57"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/check_config.py",
     "destination": "integrations/flint/validation/smoke4/tools/check_config.py",
-    "sha256": "daef77005f2ff6e6ea7a332c7b37fb3f8cec0404c445cee95702159fe30ff767"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "daef77005f2ff6e6ea7a332c7b37fb3f8cec0404c445cee95702159fe30ff767"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/create_four_layer_proxy.py",
     "destination": "integrations/flint/validation/smoke4/tools/create_four_layer_proxy.py",
-    "sha256": "1ab28e80e8c2453fba46ab9fade190bc962c75a07b6cd14faec7d7fffd5a8627"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "1ab28e80e8c2453fba46ab9fade190bc962c75a07b6cd14faec7d7fffd5a8627"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/find_changed_head_row.py",
     "destination": "integrations/flint/validation/smoke4/tools/find_changed_head_row.py",
-    "sha256": "9507a8c3a042368057a10d104d8d2c603b25373c4103bd9ba489e06e7e751b77"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "9507a8c3a042368057a10d104d8d2c603b25373c4103bd9ba489e06e7e751b77"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/check_resume_optimizer.py",
     "destination": "integrations/flint/validation/smoke4/tools/check_resume_optimizer.py",
-    "sha256": "0c2324c9a36ec831aa2cd3b4b29a5409adf1448984333838a46546a707743b88"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "0c2324c9a36ec831aa2cd3b4b29a5409adf1448984333838a46546a707743b88"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/check_sglang_config.py",
     "destination": "integrations/flint/validation/smoke4/tools/check_sglang_config.py",
-    "sha256": "66755b1f89d92025b56372c4436dbbcc473dddb08a86d14d712f562f39198497"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "66755b1f89d92025b56372c4436dbbcc473dddb08a86d14d712f562f39198497"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/launch_interactive.sh",
     "destination": "integrations/flint/validation/smoke4/tools/launch_interactive.sh",
-    "sha256": "6d50f5af95cb8b9793fa3222287454f0984784b615efd8a15178a2b8b770eaa8"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6d50f5af95cb8b9793fa3222287454f0984784b615efd8a15178a2b8b770eaa8"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/audit_training_result.py",
     "destination": "integrations/flint/validation/smoke4/tools/audit_training_result.py",
-    "sha256": "3ee289757d41460fdef0dd79c76120e6f854fb5033e0c068cfdf8c52cbbf7378"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "3ee289757d41460fdef0dd79c76120e6f854fb5033e0c068cfdf8c52cbbf7378"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/run_grpo.sh",
     "destination": "integrations/flint/validation/smoke4/tools/run_grpo.sh",
-    "sha256": "c08cab1bcb52bca59e5e7f190111f95aee86507925019964d3816407b41ef610"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "c08cab1bcb52bca59e5e7f190111f95aee86507925019964d3816407b41ef610"
   },
   {
     "source": "work/flint-grpo-4layer-20261019/tools/flint_smoke_environment.py",
     "destination": "integrations/flint/validation/smoke4/tools/flint_smoke_environment.py",
-    "sha256": "0ce238688fdd80cec17875dd14a58e09e31225fe79c8915c937afb43a6decc1d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "0ce238688fdd80cec17875dd14a58e09e31225fe79c8915c937afb43a6decc1d"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/launch_grpo.py",
     "destination": "integrations/flint/validation/smoke49/tools/launch_grpo.py",
-    "sha256": "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "7fa8b1359e55d4c08882f730f39ae1535e44551073a3dab0ec0ed646244ed39a"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/test_audit_training_result.py",
     "destination": "integrations/flint/validation/smoke49/tools/test_audit_training_result.py",
-    "sha256": "ed0d530376a9cd0a2e2a0ae9f55f04217f46f787dab63c01d39c3c4bbfa49a30"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "ed0d530376a9cd0a2e2a0ae9f55f04217f46f787dab63c01d39c3c4bbfa49a30"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/test_create_four_layer_proxy.py",
     "destination": "integrations/flint/validation/smoke49/tools/test_create_four_layer_proxy.py",
-    "sha256": "fc30c3082918311de325dc138506bc216e05f521781c4533b0b06923a22cac57"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "fc30c3082918311de325dc138506bc216e05f521781c4533b0b06923a22cac57"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/test_sink_checkpoint_fsdp.py",
     "destination": "integrations/flint/validation/smoke49/tools/test_sink_checkpoint_fsdp.py",
-    "sha256": "ddf0fc60450b248724a75a3f9afcc944664fd0cad8909656939f9b0bc3a3dcb0"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "ddf0fc60450b248724a75a3f9afcc944664fd0cad8909656939f9b0bc3a3dcb0"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_prompt_lengths.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_prompt_lengths.py",
-    "sha256": "e9a0ad49ceceec969015175b34589ef9de92f38393a37aeb3d16e7a3fcc8b066"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "e9a0ad49ceceec969015175b34589ef9de92f38393a37aeb3d16e7a3fcc8b066"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/apply_automodel_overlay.py",
     "destination": "integrations/flint/validation/smoke49/tools/apply_automodel_overlay.py",
-    "sha256": "5bd4b38e727e1b158f450000b299a868f119afb47c1dacfd4c2d74d6f521c1dd"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "5bd4b38e727e1b158f450000b299a868f119afb47c1dacfd4c2d74d6f521c1dd"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_config.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_config.py",
-    "sha256": "f1317df5950676762095e5ffde8854de2c8992d3d9580cdefb9a4b4cbcd85aec"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "f1317df5950676762095e5ffde8854de2c8992d3d9580cdefb9a4b4cbcd85aec"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_refit_checkpoint.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_refit_checkpoint.py",
-    "sha256": "a133bc690fce6231eab60dc679dd39effaf472990e0b70e90a8a317be1af7efd"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "a133bc690fce6231eab60dc679dd39effaf472990e0b70e90a8a317be1af7efd"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/run_resume_validation.sh",
     "destination": "integrations/flint/validation/smoke49/tools/run_resume_validation.sh",
-    "sha256": "5b22ae4d500141d3f6f0bf90acb484ba588c798d6f1d4a98719a459375e5d0d5"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "5b22ae4d500141d3f6f0bf90acb484ba588c798d6f1d4a98719a459375e5d0d5"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/create_four_layer_proxy.py",
     "destination": "integrations/flint/validation/smoke49/tools/create_four_layer_proxy.py",
-    "sha256": "1ab28e80e8c2453fba46ab9fade190bc962c75a07b6cd14faec7d7fffd5a8627"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "1ab28e80e8c2453fba46ab9fade190bc962c75a07b6cd14faec7d7fffd5a8627"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/run_resume_interactive.sbatch",
     "destination": "integrations/flint/validation/smoke49/tools/run_resume_interactive.sbatch",
-    "sha256": "4920688c4687fa136f2d28ea3eaee912bcf2ec9a9f5d001a98a6526732c1983f"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "4920688c4687fa136f2d28ea3eaee912bcf2ec9a9f5d001a98a6526732c1983f"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/run_phase.sh",
     "destination": "integrations/flint/validation/smoke49/tools/run_phase.sh",
-    "sha256": "8def71e7acdae80ebf7c6918c71b1befbb2f89ace0e91bc0ea57d095df72aac6"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "8def71e7acdae80ebf7c6918c71b1befbb2f89ace0e91bc0ea57d095df72aac6"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/find_changed_head_row.py",
     "destination": "integrations/flint/validation/smoke49/tools/find_changed_head_row.py",
-    "sha256": "eb83d71a813002e4320afff5c0e98a287d57d8458942dc5d50f26b03d8dbe587"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "eb83d71a813002e4320afff5c0e98a287d57d8458942dc5d50f26b03d8dbe587"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_resume_optimizer.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_resume_optimizer.py",
-    "sha256": "6e3e72c5281f09a5bfdae9ea37a45631dba5b16e1f8d9936c88c4969a32004a2"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6e3e72c5281f09a5bfdae9ea37a45631dba5b16e1f8d9936c88c4969a32004a2"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_sglang_config.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_sglang_config.py",
-    "sha256": "349ab60a1a393cff2aef32e01e5e2057295d6c789263efe3478865e6c1861e84"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "349ab60a1a393cff2aef32e01e5e2057295d6c789263efe3478865e6c1861e84"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/launch_interactive.sh",
     "destination": "integrations/flint/validation/smoke49/tools/launch_interactive.sh",
-    "sha256": "0b4b011573a634ff79e3692c20bf4e5eac89c0034ed48d58fc6919ee06dc551e"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "0b4b011573a634ff79e3692c20bf4e5eac89c0034ed48d58fc6919ee06dc551e"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/check_source_model.py",
     "destination": "integrations/flint/validation/smoke49/tools/check_source_model.py",
-    "sha256": "5e689a3e91744abb762d4abe852037f3422e3224732993eb07a50a5e8b5c5eb4"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "5e689a3e91744abb762d4abe852037f3422e3224732993eb07a50a5e8b5c5eb4"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/audit_training_result.py",
     "destination": "integrations/flint/validation/smoke49/tools/audit_training_result.py",
-    "sha256": "9c27baf9787e6e5338bbcb178f2a9aeca39bee903aa80dfb06f2302a4f9afd2b"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "9c27baf9787e6e5338bbcb178f2a9aeca39bee903aa80dfb06f2302a4f9afd2b"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/run_grpo.sh",
     "destination": "integrations/flint/validation/smoke49/tools/run_grpo.sh",
-    "sha256": "4eab26aefbbff0a3bbf473daf44d93757bd830096282b22752381a83f95271e9"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "4eab26aefbbff0a3bbf473daf44d93757bd830096282b22752381a83f95271e9"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/flint_smoke_environment.py",
     "destination": "integrations/flint/validation/smoke49/tools/flint_smoke_environment.py",
-    "sha256": "0ce238688fdd80cec17875dd14a58e09e31225fe79c8915c937afb43a6decc1d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "0ce238688fdd80cec17875dd14a58e09e31225fe79c8915c937afb43a6decc1d"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/tools/apply_sglang_overlay.py",
     "destination": "integrations/flint/validation/smoke49/tools/apply_sglang_overlay.py",
-    "sha256": "cc60058b19c0948398060c5af04d9653053f937d3cd9d66f2d3c29bc9a16a192"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "cc60058b19c0948398060c5af04d9653053f937d3cd9d66f2d3c29bc9a16a192"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/launch_grpo_diagnostic.py",
     "destination": "integrations/flint/validation/dapo-original/tools/launch_grpo_diagnostic.py",
-    "sha256": "37b60d337a54b828cd5486d4077d3f5210b7a22ef246b5fb393c0a94deaf53c3"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "37b60d337a54b828cd5486d4077d3f5210b7a22ef246b5fb393c0a94deaf53c3"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/checkpoint_window.py",
     "destination": "integrations/flint/validation/dapo-original/tools/checkpoint_window.py",
-    "sha256": "cbe8960afab12154b80204654065faa7b95e20232aecf04afe2ceecd33379ec0"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "cbe8960afab12154b80204654065faa7b95e20232aecf04afe2ceecd33379ec0"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/final_audit.py",
     "destination": "integrations/flint/validation/dapo-original/tools/final_audit.py",
-    "sha256": "87039f2af2c48ee0f9b72f1914268d913451fe753acef827ff40d947d187188b"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "87039f2af2c48ee0f9b72f1914268d913451fe753acef827ff40d947d187188b"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/run_training.sbatch",
     "destination": "integrations/flint/validation/dapo-original/tools/run_training.sbatch",
-    "sha256": "1370f5f819e1bf90376ca308255a700c5678e78fb8737c4db7b89a627cb80731"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "1370f5f819e1bf90376ca308255a700c5678e78fb8737c4db7b89a627cb80731"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/preflight_dapo.py",
     "destination": "integrations/flint/validation/dapo-original/tools/preflight_dapo.py",
-    "sha256": "d87ec4bd6c25616726b0953022f0fa45078a6e986f4a279ba40c5a6cc3b05e6a"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "d87ec4bd6c25616726b0953022f0fa45078a6e986f4a279ba40c5a6cc3b05e6a"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/watch_sglang_faults.py",
     "destination": "integrations/flint/validation/dapo-original/tools/watch_sglang_faults.py",
-    "sha256": "605fd5a62e15b1fcd080ff85f0d3cf0246d2f5d1b839df2a8095e11412460ee9"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "605fd5a62e15b1fcd080ff85f0d3cf0246d2f5d1b839df2a8095e11412460ee9"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/run_node.sh",
     "destination": "integrations/flint/validation/dapo-original/tools/run_node.sh",
-    "sha256": "c4948ef1e5f4edf03646b415ae7cc17f50ff62e48f9e0f73d5d5dceaed0ecac8"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "c4948ef1e5f4edf03646b415ae7cc17f50ff62e48f9e0f73d5d5dceaed0ecac8"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/python-sglang-diagnostic.sh",
     "destination": "integrations/flint/validation/dapo-original/tools/python-sglang-diagnostic.sh",
-    "sha256": "845b0d71c4cec9b5be94e7eb48e480c6a628363906e4476f38a6cc2564786e89"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "845b0d71c4cec9b5be94e7eb48e480c6a628363906e4476f38a6cc2564786e89"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/test_checkpoint_window.py",
     "destination": "integrations/flint/validation/dapo-original/tools/test_checkpoint_window.py",
-    "sha256": "40d7ebd98cc85aa66ced9b9ae4c89716405b059ab0d0102eaf953814af3266bf"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "40d7ebd98cc85aa66ced9b9ae4c89716405b059ab0d0102eaf953814af3266bf"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/wait_for_ray.py",
     "destination": "integrations/flint/validation/dapo-original/tools/wait_for_ray.py",
-    "sha256": "674c9422e527b876e6073d638c22b3a0cb7053e1acaee4385f02863a90158d8d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "674c9422e527b876e6073d638c22b3a0cb7053e1acaee4385f02863a90158d8d"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/test_watch_sglang_faults.py",
     "destination": "integrations/flint/validation/dapo-original/tools/test_watch_sglang_faults.py",
-    "sha256": "35587f1b7965ed1fdc71d798c05d2f11b65d9363e39953bf5cb38c376488fede"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "35587f1b7965ed1fdc71d798c05d2f11b65d9363e39953bf5cb38c376488fede"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/apply_runtime_overlays.py",
     "destination": "integrations/flint/validation/dapo-original/tools/apply_runtime_overlays.py",
-    "sha256": "56abd179530cae8df3b47ef4576ca9b13d53b97d1af5915316308305bab3e474"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "56abd179530cae8df3b47ef4576ca9b13d53b97d1af5915316308305bab3e474"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/tools/test_runtime_overlays.py",
     "destination": "integrations/flint/validation/dapo-original/tools/test_runtime_overlays.py",
-    "sha256": "6bbd8dd5132777d79effd49d04adb5a55075ea980efdc176b6ba812a72d31159"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6bbd8dd5132777d79effd49d04adb5a55075ea980efdc176b6ba812a72d31159"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/launch_grpo_diagnostic.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/launch_grpo_diagnostic.py",
-    "sha256": "50f6e5b64b8bd0d243c902f98b862cae491c688cb0dee7a67394dc780216d6d6"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "50f6e5b64b8bd0d243c902f98b862cae491c688cb0dee7a67394dc780216d6d6"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/checkpoint_window.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/checkpoint_window.py",
-    "sha256": "cbe8960afab12154b80204654065faa7b95e20232aecf04afe2ceecd33379ec0"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "cbe8960afab12154b80204654065faa7b95e20232aecf04afe2ceecd33379ec0"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/final_audit.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/final_audit.py",
-    "sha256": "87039f2af2c48ee0f9b72f1914268d913451fe753acef827ff40d947d187188b"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "87039f2af2c48ee0f9b72f1914268d913451fe753acef827ff40d947d187188b"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/run_training.sbatch",
     "destination": "integrations/flint/validation/dapo-4k/tools/run_training.sbatch",
-    "sha256": "443ab1d5a8806a7c8db7e5dc0cb5bacab8ddf7a7f89f1050fe143fdce3db5538"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "443ab1d5a8806a7c8db7e5dc0cb5bacab8ddf7a7f89f1050fe143fdce3db5538"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/check_wandb.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/check_wandb.py",
-    "sha256": "564f502604f75d5e46bd0f7ac3c828147933f76e7c9ce91a14f4f226a945d901"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "564f502604f75d5e46bd0f7ac3c828147933f76e7c9ce91a14f4f226a945d901"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/preflight_dapo.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/preflight_dapo.py",
-    "sha256": "92f2d332b222efb49f2e9c587e161033046d912bffb77c0117e8fbff619323fe"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "92f2d332b222efb49f2e9c587e161033046d912bffb77c0117e8fbff619323fe"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/watch_sglang_faults.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/watch_sglang_faults.py",
-    "sha256": "605fd5a62e15b1fcd080ff85f0d3cf0246d2f5d1b839df2a8095e11412460ee9"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "605fd5a62e15b1fcd080ff85f0d3cf0246d2f5d1b839df2a8095e11412460ee9"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/run_node.sh",
     "destination": "integrations/flint/validation/dapo-4k/tools/run_node.sh",
-    "sha256": "b596a49ee0a3f0321d784da2ad08f49f08f8a2950bcbde4ee6ad12c846eb9971"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "b596a49ee0a3f0321d784da2ad08f49f08f8a2950bcbde4ee6ad12c846eb9971"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/python-sglang-diagnostic.sh",
     "destination": "integrations/flint/validation/dapo-4k/tools/python-sglang-diagnostic.sh",
-    "sha256": "845b0d71c4cec9b5be94e7eb48e480c6a628363906e4476f38a6cc2564786e89"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "845b0d71c4cec9b5be94e7eb48e480c6a628363906e4476f38a6cc2564786e89"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/test_checkpoint_window.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/test_checkpoint_window.py",
-    "sha256": "40d7ebd98cc85aa66ced9b9ae4c89716405b059ab0d0102eaf953814af3266bf"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "40d7ebd98cc85aa66ced9b9ae4c89716405b059ab0d0102eaf953814af3266bf"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/wait_for_ray.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/wait_for_ray.py",
-    "sha256": "674c9422e527b876e6073d638c22b3a0cb7053e1acaee4385f02863a90158d8d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "674c9422e527b876e6073d638c22b3a0cb7053e1acaee4385f02863a90158d8d"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/test_watch_sglang_faults.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/test_watch_sglang_faults.py",
-    "sha256": "35587f1b7965ed1fdc71d798c05d2f11b65d9363e39953bf5cb38c376488fede"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "35587f1b7965ed1fdc71d798c05d2f11b65d9363e39953bf5cb38c376488fede"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/apply_runtime_overlays.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/apply_runtime_overlays.py",
-    "sha256": "56abd179530cae8df3b47ef4576ca9b13d53b97d1af5915316308305bab3e474"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "56abd179530cae8df3b47ef4576ca9b13d53b97d1af5915316308305bab3e474"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/tools/test_runtime_overlays.py",
     "destination": "integrations/flint/validation/dapo-4k/tools/test_runtime_overlays.py",
-    "sha256": "6bbd8dd5132777d79effd49d04adb5a55075ea980efdc176b6ba812a72d31159"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6bbd8dd5132777d79effd49d04adb5a55075ea980efdc176b6ba812a72d31159"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/step0_audit.py",
     "destination": "integrations/flint/validation/refit-step0/tools/step0_audit.py",
-    "sha256": "4247faad846be083e9a589a2a10ac1137b0b14aec4a2c03dc1efbc5b342828b2"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "4247faad846be083e9a589a2a10ac1137b0b14aec4a2c03dc1efbc5b342828b2"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/python-sglang-audit.sh",
     "destination": "integrations/flint/validation/refit-step0/tools/python-sglang-audit.sh",
-    "sha256": "7dfaca33fb8ba4213d6d4d9acbcd5df6f8d4730ff3c045bc5b85980268aacd88"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "7dfaca33fb8ba4213d6d4d9acbcd5df6f8d4730ff3c045bc5b85980268aacd88"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/test_step0_audit.py",
     "destination": "integrations/flint/validation/refit-step0/tools/test_step0_audit.py",
-    "sha256": "200942a05200056e77396962f0649cafb7d51282cc6bda9b0689120c62c5346b"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "200942a05200056e77396962f0649cafb7d51282cc6bda9b0689120c62c5346b"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/launch_audit.py",
     "destination": "integrations/flint/validation/refit-step0/tools/launch_audit.py",
-    "sha256": "d83e29785e06231100432d881fafe54793277276dc9f7a3c436ee1a13ad9b960"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "d83e29785e06231100432d881fafe54793277276dc9f7a3c436ee1a13ad9b960"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/sitecustomize.py",
     "destination": "integrations/flint/validation/refit-step0/tools/sitecustomize.py",
-    "sha256": "6efd1cd734eede325cf1b7674539f55597763ee36220e54cbfd01457511bcb5f"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6efd1cd734eede325cf1b7674539f55597763ee36220e54cbfd01457511bcb5f"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/run.sh",
     "destination": "integrations/flint/validation/refit-step0/tools/run.sh",
-    "sha256": "6996f71cbb76a07706680b91c568a4726348bd02c0e7cf870c60d22c99081c74"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "6996f71cbb76a07706680b91c568a4726348bd02c0e7cf870c60d22c99081c74"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/submit.sh",
     "destination": "integrations/flint/validation/refit-step0/tools/submit.sh",
-    "sha256": "a408e8e5915da698838ef3bfdb6582cc6f2c5704d0a6c98545796ce83fc854d5"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "a408e8e5915da698838ef3bfdb6582cc6f2c5704d0a6c98545796ce83fc854d5"
   },
   {
     "source": "work/flint-refit-step0-4layer-20261020/tools/finalize_audit.py",
     "destination": "integrations/flint/validation/refit-step0/tools/finalize_audit.py",
-    "sha256": "1bb4ad1bfd7dd14ad1fd0be6593af78eb833cc20b29e83f3fb2bd01249e2cdbc"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "1bb4ad1bfd7dd14ad1fd0be6593af78eb833cc20b29e83f3fb2bd01249e2cdbc"
   },
   {
     "source": "work/flint-dapo50-49layer-20261019/config/grpo-flint-dapo50.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-49layer-8n4g-automodel-sglang-dapo-original.yaml",
-    "sha256": "aa2767e0d0c814c7ad1a454551ca37cbc3cc2b5e8b03bfa753d68842c813f11d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "aa2767e0d0c814c7ad1a454551ca37cbc3cc2b5e8b03bfa753d68842c813f11d"
   },
   {
     "source": "work/flint-dapo50-49layer-4096-noshaping-filter-20261020/config/grpo-flint-dapo50.yaml",
     "destination": "examples/configs/recipes/llm/grpo-flint-49layer-8n4g-automodel-sglang-dapo-4k.yaml",
-    "sha256": "e513097689daf344aabc9a31fff28ad16800ffb8a5f7335100a86c6da56565b7"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "e513097689daf344aabc9a31fff28ad16800ffb8a5f7335100a86c6da56565b7"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/sglang-plugin/tests/test_refit.py",
     "destination": "integrations/flint/validation/sglang-plugin/test_refit.py",
-    "sha256": "2c9a6af4e9964f287de6b3f26d51ba340717168e4048f1b6cb07c827c0398b2d"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "2c9a6af4e9964f287de6b3f26d51ba340717168e4048f1b6cb07c827c0398b2d"
   },
   {
     "source": "work/flint-grpo-49layer-20261019/sglang-plugin/tests/test_fp32_head_candidate.py",
     "destination": "integrations/flint/validation/sglang-plugin/test_fp32_head_candidate.py",
-    "sha256": "7eef8dc6fad7683186ac222cc70b0c389c5066afa8c98d482c1ee9d046727513"
+    "sha256_note": "# pragma: allowlist secret - SHA256 integrity checksum", "sha256": "7eef8dc6fad7683186ac222cc70b0c389c5066afa8c98d482c1ee9d046727513"
   }
 ]

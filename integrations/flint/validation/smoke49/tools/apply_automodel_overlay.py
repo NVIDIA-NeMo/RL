@@ -18,18 +18,17 @@ from __future__ import annotations
 
 import argparse
 import ast
-from datetime import datetime, timezone
 import difflib
 import hashlib
 import json
 import os
-from pathlib import Path
 import stat
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 
-
-BASELINE_SHA256 = "dbe9b8eb7585cd01c28feaf3172ef886b76d90bcd95f4593f7bae08051a55593"
-CANDIDATE_SHA256 = "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c"
+BASELINE_SHA256 = "dbe9b8eb7585cd01c28feaf3172ef886b76d90bcd95f4593f7bae08051a55593"  # pragma: allowlist secret - SHA256 integrity checksum
+CANDIDATE_SHA256 = "e57d036664e889d4ac639d1aeec198c5e127d2926de00c0656ede4b233ed4a4c"  # pragma: allowlist secret - SHA256 integrity checksum
 RELATIVE_SOURCE = Path("nemo_automodel/components/models/flint/layers.py")
 TARGET = Path("/opt/flint/Automodel") / RELATIVE_SOURCE
 
@@ -61,7 +60,9 @@ def main() -> None:
     baseline = (workspace / "evidence/runtime-source/flint_layers.py").read_bytes()
     candidate = (workspace / "automodel-overlay" / RELATIVE_SOURCE).read_bytes()
     if digest(baseline) != BASELINE_SHA256 or digest(candidate) != CANDIDATE_SHA256:
-        raise RuntimeError("Captured baseline or proposed overlay differs from the reviewed hashes")
+        raise RuntimeError(
+            "Captured baseline or proposed overlay differs from the reviewed hashes"
+        )
     ast.parse(candidate, filename=str(TARGET))
     if TARGET.is_symlink() or TARGET.resolve() != TARGET:
         raise RuntimeError("Refusing to replace a redirected Automodel source path")
@@ -75,7 +76,9 @@ def main() -> None:
         status = "applied"
     after = digest(TARGET.read_bytes())
     if not args.check_only and after != CANDIDATE_SHA256:
-        raise RuntimeError("Automodel source did not match the overlay after replacement")
+        raise RuntimeError(
+            "Automodel source did not match the overlay after replacement"
+        )
     patch = "".join(
         difflib.unified_diff(
             baseline.decode().splitlines(keepends=True),
@@ -103,7 +106,11 @@ def main() -> None:
         (json.dumps(receipt, indent=2) + "\n").encode(),
         0o600,
     )
-    print(json.dumps({"status": status, "after_sha256": after, "check_only": args.check_only}))
+    print(
+        json.dumps(
+            {"status": status, "after_sha256": after, "check_only": args.check_only}
+        )
+    )
 
 
 if __name__ == "__main__":

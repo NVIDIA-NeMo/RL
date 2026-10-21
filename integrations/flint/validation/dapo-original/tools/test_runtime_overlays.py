@@ -19,14 +19,15 @@ import hashlib
 import importlib.util
 import io
 import json
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-
-SPEC = importlib.util.spec_from_file_location("runtime_overlay_wrapper", Path(__file__).with_name("apply_runtime_overlays.py"))
+SPEC = importlib.util.spec_from_file_location(
+    "runtime_overlay_wrapper", Path(__file__).with_name("apply_runtime_overlays.py")
+)
 WRAPPER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(WRAPPER)
 
@@ -79,7 +80,9 @@ class RuntimeOverlayTest(unittest.TestCase):
             path.write_bytes(content)
             path.chmod(mode)
 
-        self.sg = SimpleNamespace(digest=digest, atomic_write=atomic_write, prepare=self.prepare_sg)
+        self.sg = SimpleNamespace(
+            digest=digest, atomic_write=atomic_write, prepare=self.prepare_sg
+        )
 
     def prepare_sg(self, base):
         plans = []
@@ -87,15 +90,17 @@ class RuntimeOverlayTest(unittest.TestCase):
             before = digest(target.read_bytes())
             if before not in (digest(self.baseline), digest(self.candidate)):
                 raise RuntimeError("Unknown toy SGLang source")
-            plans.append({
-                "target": target,
-                "relative_path": target.name,
-                "candidate": self.candidate,
-                "baseline_sha256": digest(self.baseline),
-                "candidate_sha256": digest(self.candidate),
-                "before_sha256": before,
-                "mode": 0o600,
-            })
+            plans.append(
+                {
+                    "target": target,
+                    "relative_path": target.name,
+                    "candidate": self.candidate,
+                    "baseline_sha256": digest(self.baseline),
+                    "candidate_sha256": digest(self.candidate),
+                    "before_sha256": before,
+                    "mode": 0o600,
+                }
+            )
         return plans, b"toy review patch\n"
 
     def install(self):
@@ -128,7 +133,9 @@ class RuntimeOverlayTest(unittest.TestCase):
         self.assertEqual(self.router_target.read_bytes(), self.router_candidate)
         self.writes.clear()
         repeated = self.install()
-        self.assertTrue(all(record["status"] == "already_applied" for record in repeated["files"]))
+        self.assertTrue(
+            all(record["status"] == "already_applied" for record in repeated["files"])
+        )
         self.assertEqual(self.writes, [self.root / "new/evidence/receipt.json"])
         stored = json.loads(self.writes[0].read_text())
         self.assertFalse(any("candidate" in item for item in stored["files"]))
@@ -146,7 +153,10 @@ class RuntimeOverlayTest(unittest.TestCase):
     def test_router_alias_updates_policy_without_an_extra_router_keyword(self):
         self.install()
         namespace = {}
-        exec(compile(self.router_target.read_bytes(), str(self.router_target), "exec"), namespace)
+        exec(
+            compile(self.router_target.read_bytes(), str(self.router_target), "exec"),
+            namespace,
+        )
         arguments = namespace["RouterArgs"]()
         self.assertEqual(arguments.router_policy, "cache_aware")
         arguments.router_policy = "round_robin"
@@ -200,7 +210,11 @@ class RuntimeOverlayTest(unittest.TestCase):
             self.sg_second_target.write_bytes(b"changed during preparation\n")
             return plan
 
-        with patch.object(WRAPPER, "prepare_router_args", side_effect=change_prior_target_after_preparation):
+        with patch.object(
+            WRAPPER,
+            "prepare_router_args",
+            side_effect=change_prior_target_after_preparation,
+        ):
             with self.assertRaisesRegex(RuntimeError, "changed after preflight"):
                 self.install()
         self.assertEqual(self.target.read_bytes(), self.baseline)

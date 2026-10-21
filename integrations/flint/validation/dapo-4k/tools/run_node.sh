@@ -82,7 +82,7 @@ assert args.policy == "round_robin", "Managed-router policy did not reach the ac
 assert "router_policy" not in vars(args), "Unexpected router constructor keyword"
 assert dataclasses.asdict(args)["policy"] == "round_robin"
 source = Path(inspect.getfile(RouterArgs))
-assert hashlib.sha256(source.read_bytes()).hexdigest() == "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8"
+assert hashlib.sha256(source.read_bytes()).hexdigest() == "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8"  # pragma: allowlist secret - SHA256 integrity checksum
 Path(sys.argv[1]).write_text(json.dumps({"status": "pass", "requested_policy": args.router_policy,
     "effective_policy": args.policy, "extra_constructor_keyword": False,
     "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest()}, indent=2) + "\n")

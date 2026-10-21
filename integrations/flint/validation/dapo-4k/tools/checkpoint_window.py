@@ -15,20 +15,23 @@
 """Verify a finalized model/optimizer checkpoint before another batch window."""
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
-
+from datetime import datetime, timezone
+from pathlib import Path
 
 TARGET_STEP = 50
 
 
 def latest_checkpoint(root):
     checkpoints = root / "results/dapo50"
-    paths = [path for path in checkpoints.glob("step_*") if re.fullmatch(r"step_[0-9]+", path.name)]
+    paths = [
+        path
+        for path in checkpoints.glob("step_*")
+        if re.fullmatch(r"step_[0-9]+", path.name)
+    ]
     if not paths:
         return {"step": 0, "path": None}
     latest = max(paths, key=lambda path: int(path.name.split("_")[1]))
@@ -37,7 +40,11 @@ def latest_checkpoint(root):
     step = int(latest.name.split("_")[1])
     if not 1 <= step <= TARGET_STEP:
         raise RuntimeError(f"Unexpected finalized checkpoint step: {step}")
-    for relative in ["config.yaml", "training_info.json", "policy/optimizer/optim/.metadata"]:
+    for relative in [
+        "config.yaml",
+        "training_info.json",
+        "policy/optimizer/optim/.metadata",
+    ]:
         if not (latest / relative).is_file():
             raise RuntimeError(f"Finalized checkpoint is missing {relative}")
     info = json.loads((latest / "training_info.json").read_text())
@@ -54,9 +61,16 @@ def finish_window(root, starting, log_path):
         disposition = "complete"
     else:
         if checkpoint["step"] <= starting["step"]:
-            raise RuntimeError("A clean window did not advance its finalized checkpoint")
-        if "Timeout has been reached, stopping training early" not in log_path.read_text():
-            raise RuntimeError("Early success was not the configured graceful checkpoint timeout")
+            raise RuntimeError(
+                "A clean window did not advance its finalized checkpoint"
+            )
+        if (
+            "Timeout has been reached, stopping training early"
+            not in log_path.read_text()
+        ):
+            raise RuntimeError(
+                "Early success was not the configured graceful checkpoint timeout"
+            )
         disposition = "continue"
     return {
         "status": "pass",
@@ -95,14 +109,20 @@ def main():
         record = latest_checkpoint(args.run_root)
         minimum = int(os.environ.get("FLINT_EXPECTED_RESUME_STEP", "0"))
         if record["step"] < minimum:
-            raise RuntimeError("Expected continuation checkpoint is absent or older than the parent window")
-        record.update(status="pass", timestamp_utc=datetime.now(timezone.utc).isoformat())
+            raise RuntimeError(
+                "Expected continuation checkpoint is absent or older than the parent window"
+            )
+        record.update(
+            status="pass", timestamp_utc=datetime.now(timezone.utc).isoformat()
+        )
         write_json(args.output, record)
         print(record["step"])
     else:
         if args.starting is None or args.log is None:
             parser.error("finish requires --starting and --log")
-        record = finish_window(args.run_root, json.loads(args.starting.read_text()), args.log)
+        record = finish_window(
+            args.run_root, json.loads(args.starting.read_text()), args.log
+        )
         write_json(args.output, record)
         print(record["disposition"])
 
