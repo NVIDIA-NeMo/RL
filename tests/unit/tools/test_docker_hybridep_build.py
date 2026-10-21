@@ -136,12 +136,17 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
 
 def test_docker_image_keeps_uv_cache_by_default() -> None:
     dockerfile = REPO_ROOT / "docker/Dockerfile"
+    cache_mount_script = REPO_ROOT / "docker/uv_cache_mount.sh"
     lines = [line.strip() for line in dockerfile.read_text().splitlines()]
 
     declarations = [line for line in lines if line.startswith("ARG STRIP_UV_CACHE")]
     assert declarations, f"{dockerfile} does not declare STRIP_UV_CACHE"
     for declaration in declarations:
-        assert declaration in ("ARG STRIP_UV_CACHE", "ARG STRIP_UV_CACHE=0"), (
+        # Only the bare declaration (unset = empty = falsy) counts as "off by
+        # default". "=0" looks like "off" but isn't: every check in this repo
+        # (and in uv_cache_mount.sh) tests `[ -n "${STRIP_UV_CACHE:-}" ]`, and
+        # "0" is a non-empty string, so STRIP_UV_CACHE=0 would strip the cache.
+        assert declaration == "ARG STRIP_UV_CACHE", (
             f"{dockerfile} strips the uv cache by default: {declaration}"
         )
 
@@ -154,11 +159,19 @@ def test_docker_image_keeps_uv_cache_by_default() -> None:
         f"CI images must keep the uv cache: {callers} set STRIP_UV_CACHE"
     )
 
-    for line in lines:
-        if 'rm -rf "${UV_CACHE_DIR}"' in line:
-            assert "STRIP_UV_CACHE" in line, (
-                f"{dockerfile} deletes the uv cache without the opt-in: {line}"
-            )
+    # The materialize/sync-back/strip dance lives in uv_cache_mount.sh, not in
+    # the Dockerfile, so the deletion guard must be checked there.
+    cache_mount_lines = [
+        line.strip() for line in cache_mount_script.read_text().splitlines()
+    ]
+    deletions = [
+        line for line in lines + cache_mount_lines if 'rm -rf "${UV_CACHE_DIR}"' in line
+    ]
+    assert deletions, f"{cache_mount_script} does not delete the uv cache anywhere"
+    for line in deletions:
+        assert "STRIP_UV_CACHE" in line, (
+            f"deletes the uv cache without the opt-in: {line}"
+        )
 
 
 def test_uv_cache_mount_id_matches_build_container_workflow() -> None:
