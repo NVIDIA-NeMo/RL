@@ -1,185 +1,234 @@
 # LoGRA: low-rank gradient sketches for NeMo RL
 
-Independent research worker for **native GRPO**, without predicted-KL step control.
-Validated on Qwen2.5-Math-7B with two paired 100-update runs per method.
+LoGRA replaces persistent dense gradients of selected weights with low-rank
+sketches. The selected model weights still change; there is no persistent adapter
+branch. This research project adds two entrypoints without changing NeMo RL or
+AutoModel core code:
 
-## What this shows
+| Example | Training loop | Sketch optimizer | Rollout engine |
+|---|---|---|---|
+| `run_grpo.py` | Native synchronous GRPO | RowAdam; native AdamW on other weights | Native vLLM |
+| `run_cua.py` | Token REINFORCE on OSWorld desktops | SGD with finite-difference KL scaling | Native vLLM HTTP |
 
-Direct sketch accumulation during backward; RowAdam or SGD updates; native AdamW
-for non-target parameters; ordinary learning-rate scheduling; full-weight rollout
-synchronization. Dense mode calls the unmodified native worker's training method.
+Both examples use native **full-weight** policy synchronization. They do not
+implement compressed trainer-to-rollout transfers.
 
-## Running
+## 1. Environment
 
-From this directory, after preparing the repository's AutoModel/vLLM dependencies:
+Use the repository's [Docker setup](../../docs/docker.md) and
+[cluster setup](../../docs/cluster.md) to prepare NeMo RL with AutoModel and vLLM.
+This version targets NeMo RL main `26e2b802` and uses the native AutoModel worker
+and `policy.automodel_cfg` configuration block. Initialize the submodules before
+installing dependencies. From the repository root:
 
 ```bash
+git submodule update --init --recursive
+cd research/logra
 uv sync --locked --inexact --group test
-uv run run_grpo.py --config configs/grpo_logra_smoke.yaml
-uv run run_grpo.py --config configs/grpo_logra_smoke.yaml logra.enabled=false
 ```
 
-## Scope
+The workspace uses Python 3.13.14. CUA additionally requires the repository's
+`nemo_gym` extra and a separately provisioned OSWorld desktop runtime; follow
+[CUA environment and data setup](docs/cua-setup.md) before running it.
+Models, data, credentials, checkpoints, and logs remain outside Git.
 
-Dense HF linear layers, FSDP2, TP=CP=1, synchronous GRPO. No PEFT, MoE,
-quantization, or CPU parameter offload. Resume initially requires the same DP size.
+The measured runs below used a prepared Python 3.12.3 GPU container with
+PyTorch 2.13.0+cu130, Transformers 5.12.1 and vLLM 0.29.0. This is distinct from
+the workspace-locked Python environment; the private OSWorld runtime has not been
+validated in the latter. `analysis/environment.py` records imported versions and
+source paths so that differences are visible.
 
-## Testing
+## 2. GRPO: Qwen2.5-Math-7B
+
+Allocate eight GPUs and run these commands from `research/logra`:
+
+```bash
+# Two-update smoke test.
+uv run --locked run_grpo.py --config configs/grpo_logra_smoke.yaml
+
+# 100-update LoGRA experiment.
+uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
+  grpo.seed=42 logger.log_dir=/output/logra-s42 \
+  checkpointing.checkpoint_dir=/output/logra-s42/checkpoints
+
+# Native Dense AdamW control: only the worker's LoGRA toggle changes.
+uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
+  logra.enabled=false grpo.seed=42 logger.log_dir=/output/dense-s42 \
+  checkpointing.checkpoint_dir=/output/dense-s42/checkpoints
+```
+
+GSM8K is loaded through NeMo RL's dataset loader: `train` for training and the
+first 256 `test` questions for evaluation. Download the Qwen checkpoint and data
+in advance if compute nodes lack network access; override `policy.model_name`
+and `policy.tokenizer.name` with the local model path. Repeat the two experiments
+with `grpo.seed=43` and fresh output directories to reproduce the paired comparison.
+
+| Setting | Dense and LoGRA |
+|---|---|
+| Model / data | Qwen2.5-Math-7B / GSM8K |
+| Batch / context | 16 prompts × 8 responses; microbatch 1; 2,048 tokens |
+| Hardware | 8 A100 80GB: 4 training GPUs + 4 rollout GPUs |
+| Precision / memory | FP32 parameter storage, BF16 compute, activation checkpointing, packing |
+| Optimizer schedule | LR 5e-6; 50-update warmup from 10%, then constant; weight decay 0.01 |
+| Evaluation | 256 fixed questions every 10 updates; temperature/top-p 1.0/1.0 |
+
+LoGRA uses rank 256, refreshed Rademacher projections, projection seed 42 and
+RowAdam (`beta2=0.95`, `epsilon=1e-8`). RowAdam keeps one second moment per output
+row and no first moment. Other trainable parameters retain native AdamW. The
+native reference-policy KL penalty is 0.01 in both modes; **predicted-KL step
+control is not enabled in this GRPO recipe**.
+
+![Paired GRPO memory and evaluation curves](assets/grpo-7b-comparison.png)
+
+Two training seeds, 100 updates each; mean ± sample standard deviation:
+
+| Metric | Dense AdamW | LoGRA |
+|---|---:|---:|
+| Mean update peak, GiB / training GPU | 36.13 ± 0.03 | 19.36 ± 0.03 |
+| Maximum update peak, GiB / training GPU | 37.28 ± 0.19 | 20.15 ± 0.03 |
+| Final GSM8K subset score, % | 85.35 ± 5.25 | 88.48 ± 1.93 |
+
+Mean update peak falls by **46.40%**. Memory excludes rollout GPUs and is not a
+whole-node or time-averaged measurement. Both methods start at 42.97%; two seeds
+on a 256-question subset do not establish superiority or equivalence. The full
+curves include Dense seed 43's drop at the final evaluation.
+
+## 3. Computer use: ScaleCUA and OSWorld
+
+CUA needs model weights, task manifests, setup assets, a writable cache, and an
+authorized sandbox endpoint. See [setup instructions](docs/cua-setup.md) for their
+layout and manifest format. Provision the same paths and runtime on every node,
+and initialize Ray using the repository's cluster guide.
+
+```bash
+# From research/logra, on 4 nodes × 4 GB200 GPUs.
+export OSWORLD_ROOT=/assets/osworld
+export OSWORLD_CREDENTIAL_FILE=/private/sandbox.json
+export CUA_OUTPUT_DIR=/output/cua-s43
+
+# One-update, two-episode smoke with one held-out task; no checkpoints.
+uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
+  run_cua.py --config configs/cua_smoke.yaml \
+  osworld.setup_cache=/writable/osworld_setup_cache
+
+# Use a NEW output directory for training.
+export CUA_OUTPUT_DIR=/output/cua-training-s43
+uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
+  run_cua.py --config configs/cua_prod4.yaml training.max_steps=100 \
+  osworld.setup_cache=/writable/osworld_setup_cache
+
+# Resume the same experiment, retaining the original KL-annealing clock.
+uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
+  run_cua.py --config configs/cua_prod4.yaml training.max_steps=200 \
+  training.resume="$CUA_OUTPUT_DIR/checkpoints/step_100" \
+  training.eval_at_start=false osworld.setup_cache=/writable/osworld_setup_cache
+```
+
+`cua_prod4.yaml` is the validated v2/verifier recipe; its name is retained for
+existing launchers. `cua_osworld.yaml` retains the earlier mixed-template recipe,
+which is **a different experiment**. Setting only `training.max_steps` does not
+shorten `cua.kl_budget_steps`: the validated annealing schedule spans 600 updates.
+Inline evaluations default to every 50 updates plus the final update. For an
+independent evaluator, use the [checkpoint-request interface](docs/external-evaluation.md).
+
+| Setting | ScaleCUA recipe |
+|---|---|
+| Model | Nemotron Omni RFC0040 iter881 SFT checkpoint |
+| Resources | 8 training GPUs with EP8 + 8 rollout GPUs with four TP2 engines |
+| Data / desktop | 815 ScaleCUA rows, 813 task IDs; `osworld-v2` |
+| Collection | 128 completed episodes/update; 256 in flight; generation overlaps training |
+| Context / sampling | 32K total context; 8,192 tokens/turn; temperature/top-p 1.0/1.0 |
+| Objective | Token REINFORCE, prompt EMA baseline, token importance weights clipped to [0.5, 2] |
+| Compression | Rank-256 refreshed Rademacher; SGD; other weights frozen |
+| Step scaling | Proposal relative norm 6e-5; FD-KL budget 5e-4 → 5e-5 over 600 updates; α cap 3 |
+| Checkpoints | Every 100 updates and at the final update; model, optimizer, baseline and pending task tickets |
+
+![First 100 updates of ScaleCUA training](assets/cua-first100-training.png)
+
+![Matched original-stack evaluation of the initial and step-100 policy](assets/cua-first100-evaluation.png)
+
+The first 100 updates have mean training rewards of **62.93%** in updates 1–50
+and **64.25%** in updates 51–100; the median logged update time is **4.81 min**.
+A separately run original-stack evaluation gives **48.93% → 52.11%** over 361
+tasks. This is one trajectory and one evaluation per checkpoint, with partial
+verifier credit; the paired gain's task-level standard error is 2.41 points.
+It does not establish long-horizon stability or a statistically significant gain.
+The external evaluation uses a 49,152-token context, temperature/top-p 0.5/0.9
+and `osworld-v2`; the inline evaluator is not asserted to reproduce that protocol.
+
+Training and evaluation share 297 source task UUIDs and one exact instruction.
+Removing the identical instruction gives **49.06% → 51.98%** on 360 tasks;
+this subset is still not source-disjoint. Failed evaluation episodes remain in
+reported task means. The first-100-update figures are an explicitly selected
+window, not a claim about the whole longer trajectory.
+
+## 4. Code map and supported scope
+
+```text
+run_grpo.py       Native GRPO setup and loop
+run_cua.py        Desktop rollout → training batch → update → refit/checkpoint
+logra/
+  actor_environments.py, policy.py   Register/select research workers
+  worker.py                         Native worker extension, metrics and checkpointing
+  compression.py                    Linear sketches and transient expert-gradient projection
+  optimizer.py, row_adam.py          Sketch updates and optimizer state
+  setup.py, config.py                LR schedule and validated LoGRA settings
+  cua.py                            REINFORCE, baseline, route replay and FD-KL scaling
+  token_capture.py                  Exact tokens, screenshots and compressed CPU media
+  rollout_pool.py                    Asynchronous task tickets and resumable sampling
+  osworld.py                         Desktop adapters, batch construction and scoring
+  evaluation_queue.py                Requests for external checkpoint evaluation
+```
+
+GRPO supports FSDP2 dense HF linear layers with TP=CP=1, synchronous execution,
+and no PEFT, draft co-training, quantization or CPU parameter offload. CUA additionally supports the
+validated hybrid attention/Mamba/MoE model with EP. Linear layers collect sketches
+directly; fused experts briefly materialize their native dense gradient before
+projection. Fused Mamba `out_proj` hooks are bypassed and those weights remain
+frozen. Neither recipe claims arbitrary optimizer/model/backend compatibility.
+
+FD KL control rescales a proposal using probe contexts; it is not a hard bound
+on realized KL. Resume requires matching parallelism and CUA/OSWorld settings.
+Pending task tickets are restored, but unfinished desktops are rerun rather than
+resumed bit for bit. Old `logra.osworld` checkpoint class names remain importable.
+
+## 5. Tests and analysis
 
 ```bash
 uv run --locked --group test pytest tests/unit
 uv run --locked --group test python -m torch.distributed.run \
   --standalone --nproc-per-node=2 tests/functional/fsdp_equivalence.py
+uv run --locked --group test python -m torch.distributed.run \
+  --standalone --nproc-per-node=4 tests/functional/expert_equivalence.py
+uv run --locked --group test python -m torch.distributed.run \
+  --standalone --nproc-per-node=4 tests/functional/cua_equivalence.py
+bash tests/functional/grpo_logra.sh
+# Opt-in: real desktop/model prerequisites and full allocation are required.
+LOGRA_RUN_CUA_TEST=1 bash tests/functional/cua_logra.sh
 ```
 
-The two-GPU test checks the update against an explicit dense-gradient projection,
-including distributed averaging, global clipping and non-target AdamW updates.
-The 7B smoke configuration is also used to check save/resume with the same DP size.
-
-## Reproduction
-
-Run both commands from this directory on allocated eight-GPU nodes. Repeat with
-`grpo.seed=43` and distinct output directories for the second paired seed.
+The numerical tests cover distributed sketch averaging, clipping, expert updates,
+route replay, FD rollback/scaling and REINFORCE gradients. The model-level smoke
+can also check multimodal HTTP capture, refit and checkpoint reload:
 
 ```bash
-uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
-  logra.enabled=false grpo.seed=42 \
-  logger.log_dir=results/dense-s42 checkpointing.checkpoint_dir=results/dense-s42/checkpoints
-uv run --locked run_grpo.py --config configs/grpo_logra_7b.yaml \
-  logra.enabled=true grpo.seed=42 \
-  logger.log_dir=results/logra-s42 checkpointing.checkpoint_dir=results/logra-s42/checkpoints
+uv run --locked --project ../.. --extra automodel --extra nemo_gym python \
+  tests/functional/cua_model_smoke.py --config configs/cua_prod4.yaml --with-generation
 ```
 
-| Setting | Both methods |
-|---|---|
-| Model | Qwen2.5-Math-7B |
-| Algorithm and reward | Native synchronous GRPO and `hf_math_verify` |
-| Training data | GSM8K training split |
-| Evaluation | First 256 GSM8K test questions, one response per question, every 10 steps; temperature 1.0, top-p 1.0 |
-| Run length | 100 updates, training seeds 42 and 43 |
-| Batch | 16 prompts × 8 responses; global batch 128, microbatch 1 |
-| Context | 2,048 tokens including the prompt |
-| Hardware per run | 8 A100 80GB GPUs: 4 FSDP2 training ranks and 4 rollout workers |
-| Precision | FP32 parameter storage, BF16 computation |
-| Memory options | Activation checkpointing and sequence packing |
-| Learning rate | 5e-6; 50-step linear warmup from 10% of this rate, then constant |
-| Regularization | Weight decay 0.01; native reference-policy KL penalty 0.01 |
-| Rollout synchronization | Native full-weight synchronization |
+That model smoke uses four GPUs (EP2 training + TP2 rollout), synthetic screenshots,
+and no desktop unless `--with-desktop` is supplied. It is not a benchmark score.
+The opt-in CUA shell test skips when its external prerequisites have not been
+requested; a skip is not a successful end-to-end validation.
 
-Dense uses native AdamW. LoGRA uses rank 256, refreshed Rademacher projections,
-projection seed 42, and RowAdam (`beta2=0.95`, `epsilon=1e-8`) on attention and MLP
-linear weights. The selected weights are still updated: only their dense autograd
-gradient buffers are disabled. Other parameters use native AdamW. This experiment does not enable
-predicted-KL step control; the reference-policy KL penalty above belongs to the
-native GRPO loss and is identical in both methods.
-
-The validation container uses Python 3.12.3, PyTorch 2.13.0+cu130,
-Transformers 5.12.1, vLLM 0.29.0, Ray 2.55.1 and AutoModel commit
-`72daceffa54d77783e1f73a5ac165eb39b6b5ea1`. This is a preinstalled validation
-environment; it is not the repository's Python 3.13.14 locked environment.
-The workspace lock is checked separately with the repository-pinned uv 0.11.28.
-`analysis/environment.py` records the actual versions and imported source paths.
-
-## Measured results
-
-Fresh native GRPO runs, seeds 42 and 43, 100 updates each. Values below are
-mean ± sample standard deviation across seeds. Earlier smoke tests and historical
-implementations are excluded.
-
-![Native GRPO with Dense AdamW versus LoGRA: training memory and GSM8K accuracy](assets/grpo-7b-comparison.png)
-
-Qwen2.5-Math-7B trained for 100 GRPO updates. Lines show the mean across two
-seeds; shaded bands show sample standard deviation, without smoothing. Left:
-mean per-GPU update peak memory on the policy-training GPUs (rollout GPUs
-excluded). Right: accuracy on 256 fixed GSM8K test questions.
-
-| Metric | Native Dense AdamW | Native GRPO + LoGRA |
-|---|---:|---:|
-| Mean update peak, GiB per training GPU | 36.13 ± 0.03 | 19.36 ± 0.03 |
-| Maximum update peak, GiB per training GPU | 37.28 ± 0.19 | 20.15 ± 0.03 |
-| Final GSM8K subset accuracy, % | 85.35 ± 5.25 | 88.48 ± 1.93 |
-
-The first memory row averages each update's mean GPU peak over all 100 updates;
-the second takes its maximum over updates. These measurements exclude rollout
-GPUs and are not time-averaged or whole-node memory. The mean update peak falls
-by **46.40%**.
-
-| Training seed | Dense final accuracy, % | LoGRA final accuracy, % |
-|---|---:|---:|
-| 42 | 89.06 | 87.11 |
-| 43 | 81.64 | 89.84 |
-
-Both methods improve from 42.97% initial accuracy. LoGRA's final mean is 3.13
-percentage points higher, but two seeds on 256 evaluation questions do not
-establish superiority or equivalence. Dense seed 43 falls from 91.02% at step 90
-to 81.64% at step 100; Dense's best observed accuracy is higher than LoGRA's in
-both seeds. Report the full curves, not only the final point. No smoothing is used.
-
-All 100 training batches match between methods within each seed, and evaluation
-questions match across all steps and seeds. Raw results remain outside Git;
-the comparison figure is included here for reference. The analysis commands below
-regenerate it from native TensorBoard logs.
-
-Validation passed: 11 unit tests; two-GPU FSDP numerical equivalence; 7B save/resume
-in both modes; a final-source 7B smoke run; type, lint, format and workspace-lock
-checks; and native test-recipe registration checks.
-
-## Update rule
-
-For each target linear weight, backward accumulates a gradient sketch `S` rather
-than a full gradient. RowAdam maintains one second-moment value per output row:
-
-```text
-v = beta2 * v + (1 - beta2) * mean(S**2, columns)
-D = S / (sqrt(v / (1 - beta2**step)) + epsilon)
-W = (1 - lr * weight_decay) * W - lr * D @ A
-```
-
-`A` is the projection used to collect that step's sketch. It is refreshed only
-after the update. This row-wise variant has no first moment and does not restore
-the original gradient norm. There is no predicted-KL controller. Non-target
-parameters retain native AdamW and remain trainable unless explicitly frozen.
-Thus the comparison measures native GRPO before and after enabling LoGRA,
-including its row-wise optimizer; it is not an equivalence claim about dense Adam.
-
-## Configuration and code map
-
-| File | Responsibility |
-|---|---|
-| `run_grpo.py` | Native synchronous GRPO setup and loop |
-| `logra/policy.py`, `actor_environments.py` | Select and register the research worker |
-| `logra/worker.py` | Sketch synchronization, clipping, checkpoint and metrics integration |
-| `logra/compression.py` | Direct sketch accumulation and deterministic projections |
-| `logra/optimizer.py`, `row_adam.py` | Parameter updates and optimizer state |
-| `logra/setup.py` | Rebuild the native learning-rate schedule for optimizer groups |
-| `logra/config.py` | Validated project settings |
-| `analysis/` | Export raw scalar events and plot paired runs |
-
-Set `logra.enabled=false` for the native Dense AdamW control. Both modes use the
-same training loss, native reward verifier, data processing and full-weight
-rollout synchronization. `logra.optimizer=sgd` is a numerical-reference option;
-only the projected parameters use SGD in that mode.
-
-### Memory measurement
-
-`train/memory/mean_peak_allocated_gib` is the mean, across training GPUs, of each
-GPU's maximum PyTorch-allocated memory during one policy training call.
-`train/memory/max_peak_allocated_gib` reports the largest of those GPU peaks.
-Neither includes the separate rollout GPUs. This is **not** time-averaged GPU
-memory. Reserved allocator memory and allocation after the update are also logged.
-
-### Analysis
+Regenerate the GRPO figure from native TensorBoard logs (NumPy/Matplotlib required):
 
 ```bash
-uv run analysis/export_events.py /path/to/results --output /path/to/comparison.csv
-uv run analysis/plot_comparison.py /path/to/comparison.csv --output /path/to/comparison
-uv run analysis/summarize_comparison.py /path/to/comparison.csv --output /path/to/summary.json
+uv run analysis/export_events.py /path/to/results --output /output/comparison.csv
+uv run analysis/plot_comparison.py /output/comparison.csv --output /output/comparison
+uv run analysis/summarize_comparison.py /output/comparison.csv --output /output/summary.json
 ```
 
-Plotting uses NumPy and Matplotlib. Raw results remain outside the source tree.
-Missing evaluations are left missing; curves are not smoothed. Bands use sample
-standard deviation across seeds where multiple seeds are available.
-
-The summary command requires all 100 update measurements and all scheduled evaluations
-for both seeds. It reports final accuracy separately from the best observed accuracy
-and refuses to compare incomplete runs.
+Raw experiment artifacts remain outside the source tree. Analysis rejects missing
+updates/evaluations rather than interpolating them; bands are across-seed sample
+standard deviations.

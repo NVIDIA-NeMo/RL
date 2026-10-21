@@ -1,0 +1,14 @@
+# One real ScaleCUA update on the same model and 16-GPU layout as cua_prod4.
+# Requires the external desktop runtime, dataset, model, and authorized credentials.
+defaults: cua_prod4.yaml
+training:
+  max_steps: 1
+  batch_size: 2
+  rollout_pool_size: 2
+  eval_at_start: false
+  eval_period: 50
+  eval_limit: 1
+osworld:
+  concurrency: 2
+checkpointing:
+  enabled: false

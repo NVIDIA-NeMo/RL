@@ -1,0 +1,21 @@
+# Experiment artifacts and external assets must stay out of this research PR.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+logs/
+results/
+outputs/
+checkpoints/
+data/
+models/
+cache/
+.env
+.secrets/
+credentials/
+*.key
+*.pem
+*.pt
+*.pth
+*.safetensors

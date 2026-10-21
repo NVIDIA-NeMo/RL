@@ -1,0 +1,9 @@
+# Same native training recipe; evaluate saved checkpoints in Yi's original stack.
+# The external evaluator records its own engine, sampling and desktop settings.
+defaults: cua_prod4.yaml
+training:
+  eval_period: 50
+  eval_at_start: false
+  external_evaluation_dir: ${oc.env:CUA_EXTERNAL_EVALUATION_DIR}
+checkpointing:
+  save_period: 50

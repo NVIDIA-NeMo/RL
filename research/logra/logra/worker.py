@@ -12,24 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Research worker. Native batching/loss logic pinned to main 91077391."""
+"""Research worker. Native batching/loss logic pinned to main 26e2b802."""
 
 import os
 import warnings
 from contextlib import AbstractContextManager, nullcontext
-from typing import Any, Iterable, Optional, cast
+from functools import partial
+from typing import Any, Iterable, Iterator, Optional, cast
 
 import ray
 import torch
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 
+from logra.compression import local_weight_rows
 from logra.config import LoGRAConfig
+from logra.cua import CuaConfig, CuaUpdate
 from logra.optimizer import LoGRAOptimizer
 from logra.setup import build_scheduler
+from nemo_rl.algorithms.logits_sampling_utils import need_top_k_or_top_p_filtering
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import ChunkedDistributedLogprob
 from nemo_rl.models.automodel.data import (
+    ProcessedMicrobatch,
     check_sequence_dim,
     get_microbatch_iterator,
     process_global_batch,
@@ -39,14 +45,60 @@ from nemo_rl.models.automodel.train import (
     aggregate_training_statistics,
     automodel_forward_backward,
 )
+from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
-    DTensorPolicyWorkerV2Impl,
+from nemo_rl.models.policy.workers.automodel_policy_worker import (
+    AutomodelPolicyWorkerImpl,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 
 
-class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
+class CuaLossPostProcessor(LossPostProcessor):
+    """Reuse native chunked log probabilities to bound the FP32 working set."""
+
+    def __init__(self, vocab_group, **kwargs):
+        super().__init__(**kwargs)
+        if (
+            vocab_group.size() != 1
+            or self.cp_size != 1
+            or self.enable_seq_packing
+            or need_top_k_or_top_p_filtering(self.sampling_params)
+        ):
+            raise ValueError(
+                "CUA requires TP=CP=1, unpacked input and unfiltered training"
+            )
+        self.vocab_group = vocab_group
+
+    def __call__(
+        self,
+        logits,
+        data_dict,
+        processed_inputs,
+        global_valid_seqs,
+        global_valid_toks,
+        **kwargs,
+    ):
+        # Temperature was already applied by the native forward helper. Keep
+        # logits in BF16; the native kernel upcasts and recomputes 256 positions
+        # at a time instead of retaining a full [sequence, vocabulary] FP32 tensor.
+        logprobs = ChunkedDistributedLogprob.apply(
+            logits[:, :-1],
+            data_dict["input_ids"][:, 1:],
+            0,
+            logits.shape[-1],
+            256,
+            self.vocab_group,
+            not logits.requires_grad,
+        )
+        return self.loss_fn(
+            next_token_logprobs=logprobs,
+            data=data_dict,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+
+
+class LoGRAWorkerImpl(AutomodelPolicyWorkerImpl):
     optimizer: torch.optim.Optimizer | None
 
     def __init__(
@@ -58,14 +110,42 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
         init_reference_model=True,
         **kwargs,
     ):
+        draft = coerce_draft_config(config.get("draft"))
+        if draft is not None and draft.enabled:
+            raise ValueError("LoGRA does not support draft co-training")
         self.logra_config = LoGRAConfig.model_validate(config["logra"])
-        dtensor = config["dtensor_cfg"]
+        self.cua_config = (
+            CuaConfig.model_validate(config["cua"])
+            if config.get("cua") is not None
+            else None
+        )
+        self.cua_update: CuaUpdate | None = None
+        automodel = config["automodel_cfg"]
+        if self.cua_config is not None:
+            if (
+                not self.logra_config.enabled
+                or self.logra_config.optimizer != "sgd"
+                or not self.logra_config.freeze_non_target
+            ):
+                raise ValueError(
+                    "CUA requires LoGRA SGD with frozen non-target parameters"
+                )
+            if config["optimizer"]["kwargs"]["weight_decay"] != 0:
+                raise ValueError("CUA requires zero weight decay")
+            if (
+                config["train_micro_batch_size"] != 1
+                or config["sequence_packing"]["enabled"]
+                or config["dynamic_batching"]["enabled"]
+            ):
+                raise ValueError(
+                    "CUA requires un-packed fixed microbatches of size one"
+                )
         if (
-            dtensor["tensor_parallel_size"] != 1
-            or dtensor["context_parallel_size"] != 1
+            automodel["tensor_parallel_size"] != 1
+            or automodel["context_parallel_size"] != 1
         ):
             raise ValueError("LoGRA initially supports TP=CP=1")
-        if config.get("cpu_offload") or dtensor.get("cpu_offload"):
+        if config.get("cpu_offload") or automodel.get("cpu_offload"):
             raise ValueError("CPU offload is not validated for this research worker")
         # Delay all restore until the project optimizer exists. Reference capture
         # therefore remains anchored to the pretrained model, including on resume.
@@ -78,12 +158,19 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
             **kwargs,
         )
         if self.logra_config.enabled and init_optimizer:
-            if (
-                self.is_moe_model
-                or self.lora_enabled
-                or not dtensor["automodel_kwargs"].get("force_hf")
+            if self.lora_enabled:
+                raise ValueError("LoGRA does not use PEFT adapters")
+            if self.cua_config is None:
+                if self.is_moe_model or not automodel["automodel_kwargs"].get(
+                    "force_hf"
+                ):
+                    raise ValueError("The GRPO recipe requires dense HF linear layers")
+            elif self.is_moe_model and (
+                self.moe_mesh is None or self.moe_mesh["ep"].size() != self.dp_size
             ):
-                raise ValueError("LoGRA requires dense HF linear layers without PEFT")
+                raise ValueError("CUA requires EP across all training ranks (TP=CP=1)")
+            if self.optimizer is None:
+                raise RuntimeError("The native worker did not initialize an optimizer")
             # Native AdamW is lazy: no full moments have been allocated yet.
             # Undo scheduler initialization before building the replacement schedule.
             for group in self.optimizer.param_groups:
@@ -95,6 +182,32 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
             self.scheduler = build_scheduler(self.optimizer, config.get("scheduler"))
         if weights_path:
             self.load_checkpoint(weights_path, optimizer_path)
+        if self.cua_config is not None:
+            self.cua_update = CuaUpdate(self, self.cua_config)
+
+    def logra_manifest(self, sample_weights=False):
+        """Record targets; optional tiny expert samples support checkpoint audits."""
+        if not isinstance(self.optimizer, LoGRAOptimizer):
+            raise ValueError("No LoGRA optimizer is installed")
+        entries = []
+        for layer in self.optimizer.layers:
+            entry = {
+                "name": layer.name,
+                "shape": list(layer.weight.shape),
+                "dtype": str(layer.weight.dtype),
+                "rank": layer.projection.shape[0],
+            }
+            if sample_weights and layer.weight.ndim == 3:
+                local, offset = local_weight_rows(layer.weight)
+                rows = [0, local.shape[0] // 2, local.shape[0] - 1]
+                columns = [0, local.shape[1] // 2, local.shape[1] - 1]
+                entry["sample_rows"] = [offset + row for row in rows]
+                entry["sample_columns"] = columns
+                entry["sample_values"] = (
+                    local.detach()[rows][:, columns].float().tolist()
+                )
+            entries.append(entry)
+        return entries
 
     def record_memory(self, metrics):
         # GRPO sums unknown all_mb_metrics fields across workers. Divide by DP
@@ -166,6 +279,8 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
                 )
             self.optimizer.load_state_dict(state["optimizer"])
             self.scheduler.load_state_dict(state["scheduler"])
+        else:
+            self.optimizer.reset_master_weights()
 
     # The native NVTX decorator erases the parent signature for static checkers.
     def train(  # pyrefly: ignore [bad-override]
@@ -212,7 +327,12 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
             self.model.train()
 
         # Create loss post-processor
-        loss_post_processor = LossPostProcessor(
+        post_processor = (
+            partial(CuaLossPostProcessor, vocab_group=self.tp_mesh.get_group())
+            if self.cua_update is not None
+            else LossPostProcessor
+        )
+        loss_post_processor = post_processor(
             loss_fn=loss_fn,
             cfg=self.cfg,
             cp_mesh=self.cp_mesh,
@@ -223,7 +343,7 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
         )
 
         # Setup cache clearing callback if configured
-        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
             "clear_cache_every_n_steps"
         )
         if empty_cache_steps:
@@ -265,27 +385,39 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
                     tokenizer=self.tokenizer,
                 )
 
-                # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
-                    model=self.model,
-                    data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    device_mesh=self.device_mesh,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    autocast_context_factory=self._autocast_context,
-                    forward_only=eval_mode,
-                    is_reward_model=self._is_reward_model,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
-                    dp_size=self.dp_size,
-                    cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start,
+                batches_context: AbstractContextManager[
+                    Iterator[ProcessedMicrobatch]
+                ] = (
+                    self.cua_update.training_batches(processed_iterator)
+                    if self.cua_update is not None
+                    else nullcontext[Iterator[ProcessedMicrobatch]](processed_iterator)
                 )
+                with batches_context as training_iterator:
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=training_iterator,
+                        post_processing_fn=loss_post_processor,
+                        device_mesh=self.device_mesh,
+                        padding_token_id=self.tokenizer.pad_token_id or 0,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        is_reward_model=self._is_reward_model,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                        router_replay_gates=(
+                            self._router_replay_gates
+                            if self.cua_update is None
+                            else None
+                        ),
+                    )
 
                 # Extract losses and metrics from results
                 mb_losses = []
@@ -300,14 +432,15 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
                         if num_valid_samples > 0:
-                            mb_losses.append(loss.item())
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
                             all_mb_metrics.append(loss_metrics)
 
                 grad_norm: torch.Tensor | None = None
                 if not eval_mode:
                     if isinstance(self.optimizer, LoGRAOptimizer):
                         raw_grad_norm = self.optimizer.synchronize_and_clip(
-                            self.dp_mesh.get_group(), self.max_grad_norm
+                            self.dp_mesh.get_group(),
+                            None if self.cua_update is not None else self.max_grad_norm,
                         )
                     else:
                         raw_grad_norm = scale_grads_and_clip_grad_norm(
@@ -325,7 +458,20 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
                         )
                     grad_norm = torch.as_tensor(raw_grad_norm, device="cpu")
                     warn_if_inf_grad_norm(grad_norm)
-                    self.optimizer.step()
+                    if self.cua_update is not None:
+                        assert isinstance(self.optimizer, LoGRAOptimizer)
+                        step_metrics = self.cua_update.step(
+                            self.optimizer, raw_grad_norm
+                        )
+                        all_mb_metrics.append(
+                            {
+                                "cua/" + key: value
+                                / (self.dp_size * num_global_batches)
+                                for key, value in step_metrics.items()
+                            }
+                        )
+                    else:
+                        self.optimizer.step()
                     self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
@@ -354,7 +500,7 @@ class LoGRAWorkerImpl(DTensorPolicyWorkerV2Impl):
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
 class LoGRAWorker(LoGRAWorkerImpl):
     pass

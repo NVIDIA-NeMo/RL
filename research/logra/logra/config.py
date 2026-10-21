@@ -37,4 +37,8 @@ class LoGRAConfig(BaseModel, extra="forbid"):
         "up_proj",
         "down_proj",
     ]
+    # Explicit fused expert parameters; their dense gradients are transient.
+    target_parameters: list[str] = []
+    # Empty selects the whole model; VLM recipes restrict this to the language model.
+    target_prefixes: list[str] = []
     freeze_non_target: bool = False

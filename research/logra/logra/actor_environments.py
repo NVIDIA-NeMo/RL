@@ -24,10 +24,31 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 WORKER = "logra.worker.LoGRAWorker"
+GENERATION_WORKER = "logra.generation.CuaGenerationWorker"
 
 
-def register_actor_environments():
+def register_actor_environments(*, serial_refit: bool = False) -> None:
+    if serial_refit:
+        # Expert exports yield views across packed-buffer boundaries. One stream
+        # keeps those views ordered with their DTensor all-gathers.
+        os.environ["NRL_REFIT_NUM_BUFFERS"] = "1"
+        forwarded = {
+            key.strip()
+            for key in os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "").split(",")
+            if key.strip()
+        }
+        forwarded.add("NRL_REFIT_NUM_BUFFERS")
+        os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(forwarded))
     project = Path(__file__).resolve().parents[1]
+    if serial_refit:
+        # Keep vLLM in its native isolated environment while exposing this recipe.
+        ACTOR_ENVIRONMENT_REGISTRY[GENERATION_WORKER] = ACTOR_ENVIRONMENT_REGISTRY[
+            "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+        ]
+        search_path = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            dict.fromkeys([str(project), *filter(None, search_path)])
+        )
     ACTOR_ENVIRONMENT_REGISTRY[WORKER] = (
         PY_EXECUTABLES.SYSTEM
         if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM") == "1"
