@@ -52,6 +52,44 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.mcore
 
 
+def test_finish_training_refreshes_mamba_cache_before_parameter_offload() -> None:
+    """Mamba eval must read updated parameters before DDP releases their storage."""
+    # Megatron and its Mamba implementation are optional outside MCore tests.
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    model = MambaMixer.__new__(MambaMixer)
+    torch.nn.Module.__init__(model)
+    model.A_log = torch.nn.Parameter(torch.tensor([0.3]))
+    model._A_neg_exp_cache = torch.zeros(1)
+    model._A_neg_exp_cache_stale = True
+    expected = -torch.exp(model.A_log.detach().clone())
+
+    def release_parameters(
+        module: torch.nn.Module, device: str, **kwargs: Any
+    ) -> torch.nn.Module:
+        assert device == "cpu"
+        # Poison the released view instead of freeing storage under a live
+        # tensor, which could crash the CPU test process on an invalid read.
+        module.A_log.data.fill_(float("nan"))
+        return module
+
+    worker = MegatronValueWorkerImpl.__new__(MegatronValueWorkerImpl)
+    worker.model = model
+    worker.move_model = release_parameters
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = True
+    with patch("torch.cuda.empty_cache"), patch("gc.collect"):
+        worker.finish_training()
+
+    torch.testing.assert_close(model._A_neg_exp_cache, expected)
+    assert not model._A_neg_exp_cache_stale
+    assert not model.training
+
+
 @pytest.mark.parametrize("fused_logprobs", [False, True])
 def test_value_adapter_excludes_actor_vocabulary_logprob_controls(
     fused_logprobs: bool,
