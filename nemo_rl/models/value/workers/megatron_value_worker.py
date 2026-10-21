@@ -236,7 +236,7 @@ def _value_loss_prepare_fn(
 ) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
     """Prepare the value-head output for ``MseValueLossFn`` (LossPostProcessor prepare_fn).
 
-    All-gather across CP (packed only — CP requires packing), shift right by one
+    All-gather across CP, shift right by one
     so ``values[t] = V(state before token t)``, then truncate to ``data["returns"]``.
     """
     values = logits
@@ -847,8 +847,12 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         cp_group=get_context_parallel_group() if cp_size > 1 else None,
                     )
                 else:
-                    # [B, S]: shift right by 1 so values[t] = V(state before token t).
+                    # Restore [B, S] before shifting so CP boundary states align.
                     values = output_tensor.squeeze(-1)
+                    if get_context_parallel_world_size() > 1:
+                        values = allgather_cp_sharded_tensor(
+                            values, get_context_parallel_group(), seq_dim=1
+                        )
                     values = torch.cat(
                         [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
                     )

@@ -278,6 +278,90 @@ def test_get_values_uses_image_context_and_keeps_state_before_token_alignment() 
     torch.testing.assert_close(predictions[1], torch.tensor([[0.0, 10.0, 11.0]]))
 
 
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 0), (2, 1)])
+def test_get_values_unpacked_context_parallel_shifts_after_gather(
+    cp_size: int, cp_rank: int
+) -> None:
+    """Unpacked CP shards must reconstruct every state before shifting tokens."""
+    from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    full_values = torch.arange(1, 33, dtype=torch.float32).view(2, 16)
+    local_values = _get_tokens_on_this_cp_rank(full_values, cp_rank, cp_size)
+
+    class ShardedCritic(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(fine_grained_activation_offloading=False)
+
+        def forward(self, **kwargs: Any) -> torch.Tensor:
+            return local_values.unsqueeze(-1)
+
+    model = ShardedCritic()
+    data = BatchedDataDict(
+        input_ids=torch.ones((2, 16), dtype=torch.long),
+        input_lengths=torch.tensor([16, 13]),
+    )
+    processed = SimpleNamespace(
+        data_dict=data,
+        input_ids_cp_sharded=data["input_ids"],
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        cu_seqlens_padded=None,
+        padding_mask=None,
+        media_token_validity_mask=None,
+    )
+    worker = SimpleNamespace(
+        cfg={"train_micro_batch_size": 2},
+        model=model,
+        _policy_like_cfg={},
+        media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=False,
+        mcore_state=SimpleNamespace(straggler_timer=None),
+    )
+
+    def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
+        output, collect = kwargs["forward_step_func"](kwargs["data_iterator"], model)
+        return [collect(output)[1]]
+
+    def gather(values: torch.Tensor, group: Any, seq_dim: int) -> torch.Tensor:
+        assert seq_dim == 1
+        torch.testing.assert_close(values, local_values, rtol=0, atol=0)
+        return full_values
+
+    module = "nemo_rl.models.value.workers.megatron_value_worker"
+    with (
+        patch(
+            f"{module}.get_microbatch_iterator",
+            return_value=(iter([processed]), 1, 2, 16, 16),
+        ),
+        patch(f"{module}.get_forward_backward_func", return_value=run_forward_only),
+        patch(f"{module}.get_pipeline_model_parallel_group", return_value=None),
+        patch(f"{module}.is_pipeline_last_stage", return_value=True),
+        patch(f"{module}.get_context_parallel_world_size", return_value=cp_size),
+        patch(f"{module}.get_context_parallel_group", return_value=object()),
+        patch(f"{module}.allgather_cp_sharded_tensor", side_effect=gather) as gathered,
+        patch(f"{module}.broadcast_tensor"),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        result = MegatronValueWorkerImpl.get_values(worker, data)["values"]
+
+    expected = torch.tensor(
+        [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            [0, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert gathered.call_count == (1 if cp_size > 1 else 0)
+
+
 def test_omni_value_head_replaces_used_decoder_head_and_skips_only_fresh_head() -> None:
     from megatron.bridge.models.common.heads import LinearForLastLayer
     from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
