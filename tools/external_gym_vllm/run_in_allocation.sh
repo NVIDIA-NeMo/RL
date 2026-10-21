@@ -607,9 +607,31 @@ for pool in "${pool_names[@]}"; do
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 done
 
-deadline=$((SECONDS + max_startup_timeout))
-while true; do
-  all_ready=1
+# Fill each pool's load-balancer URL into the driver command. The URL is fixed once the load balancer
+# is up, so this does not need the replicas to be ready.
+substitute_pool_urls() {
+  local pool
+  for pool in "${pool_names[@]}"; do
+    echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
+    COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  done
+  export COMMAND
+}
+
+# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
+# Restrict those variables to component 0; srun also defaults to hetgroup 0.
+# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
+launch_driver() {
+  env \
+    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
+    SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
+    bash "${RAY_SUB}" &
+  ray_sub_pid=$!
+}
+
+# Whether every replica is registered healthy and every load balancer answers /models.
+pools_healthy() {
+  local pool ready all_ready=1
   for pool in "${pool_names[@]}"; do
     if ! ready=$(
       EXTERNAL_VLLM_STATE_DIR="${state_dirs[${pool}]}" \
@@ -625,38 +647,56 @@ while true; do
       all_ready=0
     fi
   done
-  (( all_ready == 1 )) && break
-  check_service_steps
+  (( all_ready == 1 )) || return 1
+  for pool in "${pool_names[@]}"; do
+    if ! curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; then
+      echo "[INFO] ${display_names[${pool}]} load balancer not answering /models yet"
+      return 1
+    fi
+  done
+}
+
+fail_startup() {
+  echo "[FATAL] $1" >&2
+  if [[ -n "${ray_sub_pid}" ]]; then
+    touch "${LOG_DIR}/ENDED"
+    kill "${ray_sub_pid}" 2>/dev/null || true
+    wait "${ray_sub_pid}" 2>/dev/null || true
+  fi
+  exit 1
+}
+
+# EXTERNAL_VLLM_START_DRIVER_EARLY=1 starts NeMo RL while the pools load, for pools the driver only
+# calls once rollouts finish (e.g. a judge). The readiness deadline and the service-step checks still
+# apply and end the job on failure. The default waits for healthy pools first.
+if [[ "${EXTERNAL_VLLM_START_DRIVER_EARLY:-0}" == "1" ]]; then
+  substitute_pool_urls
+  echo "[INFO] Starting NeMo RL while the external vLLM pools load"
+  launch_driver
+fi
+
+deadline=$((SECONDS + max_startup_timeout))
+driver_exited_early=0
+until pools_healthy; do
+  if [[ -n "${ray_sub_pid}" ]] && ! kill -0 "${ray_sub_pid}" 2>/dev/null; then
+    echo "[WARN] NeMo RL exited before the external vLLM pools were healthy" >&2
+    driver_exited_early=1
+    break
+  fi
+  check_service_steps || fail_startup "an external vLLM service step exited during startup"
   if (( SECONDS >= deadline )); then
-    echo "[FATAL] Timed out waiting for all external vLLM pools" >&2
-    exit 1
+    fail_startup "Timed out waiting for the external vLLM pools"
   fi
   sleep 15
 done
 
-for pool in "${pool_names[@]}"; do
-  until curl -sfm 10 "${pool_urls[${pool}]}/models" >/dev/null 2>&1; do
-    check_service_steps
-    if (( SECONDS >= deadline )); then
-      echo "[FATAL] ${display_names[${pool}]} load balancer failed its end-to-end /models probe" >&2
-      exit 1
-    fi
-    sleep 5
-  done
-  echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
-  COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
-done
-export COMMAND
-
-echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
-# ray.sub predates hetjobs and consumes the unsuffixed allocation variables.
-# Restrict those variables to component 0; srun also defaults to hetgroup 0.
-# `env` execs bash directly, so ray_sub_pid is the process that owns its traps.
-env \
-  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}" \
-  SLURM_JOB_NUM_NODES="${#ray_nodes[@]}" \
-  bash "${RAY_SUB}" &
-ray_sub_pid=$!
+if [[ -z "${ray_sub_pid}" ]]; then
+  substitute_pool_urls
+  echo "[INFO] External vLLM pools are healthy; starting NeMo RL"
+  launch_driver
+elif (( driver_exited_early == 0 )); then
+  echo "[INFO] External vLLM pools are healthy"
+fi
 
 while kill -0 "${ray_sub_pid}" 2>/dev/null; do
   if ! check_service_steps; then

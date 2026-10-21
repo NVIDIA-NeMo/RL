@@ -115,6 +115,14 @@ do not pass `--reasoning-parser` when Gym explicitly disables it.
 backend registry, the load balancer, URL substitution and the stop-training-on-exit contract are
 the same in both modes.
 
+### Driver start
+
+By default NeMo RL starts once every pool is healthy. With `EXTERNAL_VLLM_START_DRIVER_EARLY=1`
+the URLs are substituted and NeMo RL starts as soon as the load balancers are up, while the
+replicas load. Use it for pools the driver only calls after rollouts finish (a judge, for example).
+The readiness deadline (`POOL_STARTUP_TIMEOUT`) and the service-step checks still apply, and a
+pool that never becomes healthy still ends the job.
+
 ## Global contract
 
 Required variables:

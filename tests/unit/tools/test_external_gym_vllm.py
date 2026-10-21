@@ -616,7 +616,7 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "RAY_NODELIST" not in source
     assert "external-vllm-lb-preflight" not in source
     assert "if ! ready=$(" in source
-    assert 'env \\\n  SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
+    assert 'env \\\n    SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
     assert 'if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then' in source
     assert (
         'LOG_DIR="${BASE_LOG_DIR}/${SLURM_JOB_ID}-${SLURM_RESTART_COUNT}-logs"'
@@ -627,6 +627,26 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
         'echo "[${REPLICA_ID}] ERROR: vLLM exited with status ${vllm_status}"' in source
     )
     assert "if (( vllm_status == 0 )); then" in source
+
+
+def test_launcher_can_start_the_driver_while_pools_load():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+    early = source.index('if [[ "${EXTERNAL_VLLM_START_DRIVER_EARLY:-0}" == "1" ]]; then')
+    wait = source.index("until pools_healthy; do")
+    monitor = source.index('while kill -0 "${ray_sub_pid}"', wait)
+
+    # Early start: URLs filled in and the driver launched before the readiness wait.
+    assert early < wait
+    assert "substitute_pool_urls" in source[early:wait]
+    assert "launch_driver" in source[early:wait]
+    # The wait keeps the deadline and the service-step checks, and ends a running driver on failure.
+    readiness = source[wait:monitor]
+    assert "check_service_steps || fail_startup" in readiness
+    assert 'fail_startup "Timed out waiting for the external vLLM pools"' in readiness
+    fail = source[source.index("fail_startup() {"):source.index("fail_startup() {") + 400]
+    assert 'kill "${ray_sub_pid}"' in fail and 'touch "${LOG_DIR}/ENDED"' in fail
+    # Default start: the driver launches only after the pools are healthy.
+    assert 'if [[ -z "${ray_sub_pid}" ]]; then\n  substitute_pool_urls' in readiness
 
 
 def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
