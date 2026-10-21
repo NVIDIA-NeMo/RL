@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -143,6 +143,9 @@ class SglangSpecificArgs(TypedDict):
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
+    # Allow checkpoint-supplied Python config/model code. False selects a model
+    # already registered by SGLang or an installed general plugin.
+    trust_remote_code: NotRequired[bool]
     # Random seed for the engine; if None, SGLang picks one.
     random_seed: NotRequired[int]
     # Skip tokenizer init; callers must pass `input_ids` in generate requests.
@@ -203,6 +206,14 @@ class SglangSpecificArgs(TypedDict):
     allow_auto_truncate: NotRequired[bool]
     # Attention backend to use (e.g. "fa3", "triton", "flashinfer", "trtllm_mha"); None = auto.
     attention_backend: NotRequired[str | None]
+    # MoE execution backend; Flint requires a runner supporting sigmoid routing.
+    moe_runner_backend: NotRequired[str]
+    # Retain an FP32 output head, including after weight updates.
+    enable_fp32_lm_head: NotRequired[bool]
+    # Ratio of sliding-window cache tokens to full-attention cache tokens.
+    swa_full_tokens_ratio: NotRequired[float]
+    # Skip FlashInfer autotuning when a serving model requires fixed kernels.
+    disable_flashinfer_autotune: NotRequired[bool]
     # Enable multimodal serving for the model (no-op if model is text-only).
     enable_multimodal: NotRequired[bool]
     # Sampling kernel backend (e.g. "flashinfer", "pytorch"); None = auto.
@@ -213,6 +224,8 @@ class SglangSpecificArgs(TypedDict):
     mem_fraction_static: NotRequired[float | None]
     # Cap on concurrently running requests; None = auto.
     max_running_requests: NotRequired[int | None]
+    # Cap KV-cache tokens independently of the static GPU memory fraction.
+    max_total_tokens: NotRequired[int | None]
     # Token budget per chunked-prefill chunk; -1 disables chunked prefill.
     chunked_prefill_size: NotRequired[int | None]
     # Token budget per prefill batch (max with model context length).

@@ -1,0 +1,42 @@
+--- a/nemo_automodel/components/models/flint/layers.py
++++ b/nemo_automodel/components/models/flint/layers.py
+@@ -78,14 +78,20 @@
+         super().__init__()
+         self.softmax_offset = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+ 
+-    def forward(self) -> torch.Tensor:
++    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Return unscaled sink logits through the module's normal call path.
++
++        Args:
++            hidden_states: Caller activation, used only to provide a nonempty
++                FSDP input tuple during activation-checkpoint recomputation.
++                Its values and dtype do not affect the learned sink logits.
+ 
+         Returns:
+             FP32 tensor of shape [query_heads], with independent storage and
+             gradients to the parameter. The clone remains valid when nested
+             FSDP reshards/frees its gathered parameter after this call returns.
+         """
++        del hidden_states
+         return self.softmax_offset.clone()
+ 
+ 
+@@ -268,7 +274,7 @@
+                 query,
+                 key,
+                 value,
+-                sink=self._fp32_params(),
++                sink=self._fp32_params(hidden_states),
+                 window=self.sliding_window or 0,
+                 scale=self.head_dim**-0.5,
+             )
+@@ -340,7 +346,7 @@
+         value = value.repeat_interleave(repeats, dim=2).transpose(1, 2).float()
+         # Explicit casts alone do not defeat an enclosing autocast matmul policy.
+         with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+-            sinks = self._fp32_params().reshape(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
++            sinks = self._fp32_params(hidden_states).reshape(1, self.num_heads, 1, 1).expand(batch, -1, sequence, -1)
+             if self.backend.attn == "sdpa":
+                 # A zero-value sentinel category is algebraically the learned
+                 # sink, including dQ/dK and sink gradients. No detached LSE is

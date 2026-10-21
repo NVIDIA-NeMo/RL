@@ -1,0 +1,148 @@
+defaults: /flint-work/RL/examples/configs/recipes/llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.yaml
+
+# Full 49-layer Flint: fresh DAPO-Math-17k run on eight 4-GPU nodes.
+# The launcher owns /flint-run and stages both Hugging Face datasets there.
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_epochs: 1000
+  max_num_steps: 50
+  use_leave_one_out_baseline: false
+  skip_reference_policy_logprobs_calculation: true
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  val_period: 5
+  val_at_start: true
+  val_at_end: true
+  # The unaltered DAPO AIME-2024 split contains 960 rows: 30 problems x 32.
+  max_val_samples: 960
+  # Feed one full evaluation queue to all 32 replicas; keep 960 scored rows.
+  # The smaller serial batches left replicas idle behind uneven router queues.
+  val_batch_size: 960
+  val_num_generations_per_prompt: 1
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 3072
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /flint-run/results/dapo50
+  metric_name: null
+  keep_top_k: 2
+  save_period: 5
+  # DD:HH:MM:SS from GRPO-loop entry; reserve time for setup and checkpoint I/O
+  # inside each regular four-hour batch allocation, then resume in a new job.
+  checkpoint_must_save_by: "00:03:30:00"
+
+policy:
+  model_name: /flint-model
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  refit_buffer_size_gb: 1
+  max_total_sequence_length: 4096
+  offload_optimizer_for_logprob: true
+  automodel_cfg:
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    expert_parallel_size: 1
+    activation_checkpointing: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.95]
+      foreach: false
+      fused: false
+  # Automodel advances the scheduler once per GRPO step, after both Adam updates.
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  generation:
+    max_new_tokens: 3072
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    sglang_cfg:
+      context_length: 4096
+      # Keep the original expert runner for the user-requested checkpoint retry.
+      moe_runner_backend: flashinfer_trtllm_routed
+      tp_size: 1
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      max_running_requests: 8
+      # Eight concurrent requests may each use the full 4096-token context.
+      max_total_tokens: 32768
+      chunked_prefill_size: 1024
+      max_prefill_tokens: 4096
+      # Prefix caching is disabled; distribute real requests evenly instead of
+      # concentrating repeated AIME prompts on a subset of the allocated GPUs.
+      sglang_router_config:
+        router_policy: round_robin
+      sglang_server_config:
+        num_gpus: 32
+        num_gpus_per_engine: 1
+        needs_offload: true
+        cpu_weight_backup: true
+        sglang_server_concurrency: 8
+
+data:
+  # Replace the complete smoke data block so no local arithmetic path survives.
+  _override_: true
+  max_input_seq_length: 1024
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  log_dir: /flint-run/logs/dapo50
+  wandb_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

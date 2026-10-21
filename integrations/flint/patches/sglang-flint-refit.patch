@@ -1,0 +1,322 @@
+--- a/src/flint_sglang/model.py
++++ b/src/flint_sglang/model.py
+@@ -27,6 +27,7 @@
+ from pathlib import Path
+ 
+ import torch
++from flint_sglang.refit import RefitCoverage, install_runner_refit_hooks
+ from sglang.srt.distributed import get_pp_group
+ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+ from sglang.srt.layers.layernorm import RMSNorm
+@@ -259,6 +260,11 @@
+         self.lm_head = ParallelLMHead(
+             config.vocab_size,
+             config.hidden_size,
++            params_dtype=(
++                torch.float32
++                if quant_config is None and get_global_server_args().enable_fp32_lm_head
++                else None
++            ),
+             quant_config=quant_config,
+             prefix=add_prefix("lm_head", prefix),
+             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+@@ -281,14 +287,17 @@
+             ckpt_up_proj_name="up_proj",
+             num_experts=config.num_experts,
+         )
++        self._refit_coverage = RefitCoverage()
++        install_runner_refit_hooks(type(self))
+ 
+     def get_attention_sliding_window_size(self) -> int:
+         return self.config.sliding_window - 1
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False) -> None:
+-        """Load checkpoint tensors and fail if any tensor or parameter is left unmatched."""
++        """Require full initial coverage and cumulative full coverage during explicit refits."""
+         params = dict(self.named_parameters())
+         loaded_targets: set[str] = set()
++        loaded_names: set[str] = set()
+         unmatched: list[str] = []
+         attn_tp_size = get_parallel().attn_tp_size
+         attn_tp_rank = get_parallel().attn_tp_rank
+@@ -302,6 +311,11 @@
+                     tensor = _shard_heads(tensor, attn_tp_size=attn_tp_size, attn_tp_rank=attn_tp_rank)
+                 target = _target_param_name(name, self.stacked_params_mapping, self.expert_params_mapping)
+                 if target in params:
++                    if name in loaded_names:
++                        raise RuntimeError(f"Duplicate Flint checkpoint tensor: {name}")
++                    loaded_names.add(name)
++                    if self._refit_coverage.active:
++                        self._refit_coverage.record(name)
+                     loaded_targets.add(target)
+                 elif not self._skipped_by_parent_loader(
+                     name, target=target, is_mtp=is_mtp, off_stage_prefixes=off_stage_prefixes
+@@ -309,13 +323,20 @@
+                     unmatched.append(name)
+                 yield name, tensor
+ 
+-        Qwen3MoeForCausalLM.load_weights(self, canonical_weights(), is_mtp=is_mtp)
+-        _check_load_coverage(
+-            params=params,
+-            loaded_targets=loaded_targets,
+-            unmatched=unmatched,
+-            check_missing=not is_mtp and self.quant_config is None,
+-        )
++        try:
++            Qwen3MoeForCausalLM.load_weights(self, canonical_weights(), is_mtp=is_mtp)
++            _check_load_coverage(
++                params=params,
++                loaded_targets=loaded_targets,
++                unmatched=unmatched,
++                check_missing=not is_mtp and self.quant_config is None and not self._refit_coverage.active,
++            )
++            if not self._refit_coverage.active and not is_mtp and self.quant_config is None:
++                self._refit_coverage.initial_load(loaded_names)
++        except BaseException:
++            if self._refit_coverage.active:
++                self._refit_coverage.failed = True
++            raise
+ 
+     def _skipped_by_parent_loader(
+         self, name: str, *, target: str, is_mtp: bool, off_stage_prefixes: tuple[str, ...]
+@@ -336,6 +357,8 @@
+     """Fail fast on serving configurations that silently change Flint's outputs; warn on unvalidated ones."""
+     args = get_global_server_args()
+     _require_cuda_norm()
++    if getattr(args, "true_on_policy_contract", None) is not None:
++        raise RuntimeError("Flint requires true_on_policy_contract=None to preserve sigmoid expert routing")
+     if args.moe_runner_backend not in SUPPORTED_MOE_RUNNERS:
+         raise RuntimeError(
+             f"--moe-runner-backend {args.moe_runner_backend} bypasses or is not validated with Flint's sigmoid "
+--- a/src/flint_sglang/plugin.py
++++ b/src/flint_sglang/plugin.py
+@@ -6,6 +6,7 @@
+ """
+ 
+ import os
++import socket
+ 
+ from flint_sglang.configuration_flint import FlintConfig
+ from transformers import AutoConfig
+@@ -23,3 +24,9 @@
+     AutoConfig.register(FlintConfig.model_type, FlintConfig, exist_ok=True)
+     os.environ.setdefault(EXTERNAL_MODEL_PACKAGE_ENV, "flint_sglang")
+     os.environ.setdefault(CUDA_NORM_ENV, "1")
++    cache_base = os.environ.get("FLINT_TRITON_CACHE_BASE")
++    if cache_base:
++        # Every worker recomputes this after spawn instead of sharing its parent's cache.
++        os.environ["TRITON_CACHE_DIR"] = os.path.join(
++            cache_base, f"flint-{socket.gethostname()}-{os.getpid()}"
++        )
+--- /dev/null
++++ b/src/flint_sglang/refit.py
+@@ -0,0 +1,209 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Strict snapshot coverage for Miles SGLang's explicit weight-update sessions."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from functools import wraps
++import hashlib
++from inspect import signature
++import json
++import os
++from pathlib import Path
++import socket
++
++
++@dataclass
++class RefitCoverage:
++    """Track HF tensor names, including each fused projection and expert slice.
++
++    A failed update cannot be finalized. Callers must discard that engine because
++    tensor copies performed before the failure are not rolled back.
++    """
++
++    expected: frozenset[str] | None = None
++    loaded: set[str] | None = None
++    failed: bool = False
++
++    @property
++    def active(self) -> bool:
++        """Whether an explicit update session is open."""
++        return self.loaded is not None
++
++    def initial_load(self, names: set[str]) -> None:
++        """Record a successfully validated full load's exact active HF schema."""
++        if self.active:
++            raise RuntimeError(
++                "Cannot replace the Flint snapshot schema during a refit session"
++            )
++        if self.expected is not None and self.expected != names:
++            raise RuntimeError(
++                "A full Flint reload must match the initial checkpoint tensor names"
++            )
++        self.expected = frozenset(names)
++
++    def begin(self) -> None:
++        """Open coverage accounting after a successful initial full model load."""
++        if self.active:
++            raise RuntimeError("A Flint refit session is already open")
++        if not self.expected:
++            raise RuntimeError(
++                "Flint refit requires a successful full initial weight load"
++            )
++        self.loaded = set()
++        self.failed = False
++
++    def record(self, name: str) -> None:
++        """Validate and account for one canonical HF name before copying it."""
++        if not self.active:
++            raise RuntimeError("Flint bucket updates require begin_weight_update")
++        if self.failed:
++            raise RuntimeError(
++                "The Flint refit session failed; discard the partially updated engine"
++            )
++        if name not in self.expected:
++            self.failed = True
++            raise RuntimeError(f"Unexpected Flint refit tensor: {name}")
++        if name in self.loaded:
++            self.failed = True
++            raise RuntimeError(f"Duplicate Flint refit tensor: {name}")
++        self.loaded.add(name)
++
++    def validate(self) -> None:
++        """Require a complete successful snapshot before SGLang postprocessing."""
++        if not self.active:
++            raise RuntimeError("Flint end_weight_update called without an open session")
++        if self.failed:
++            raise RuntimeError(
++                "The Flint refit session failed; discard the partially updated engine"
++            )
++        missing = sorted(self.expected - self.loaded)
++        if missing:
++            self.failed = True
++            raise RuntimeError(
++                f"{len(missing)} Flint refit tensors were not loaded, e.g. {missing[:5]}"
++            )
++
++    def finish(self) -> None:
++        """Close accounting only after the runner's postprocessing succeeds."""
++        self.validate()
++        self.loaded = None
++
++
++def write_refit_audit(model: object, loaded_name_count: int) -> None:
++    """Optionally record small resident parameter samples after a complete refit."""
++    audit_root = os.environ.get("FLINT_REFIT_AUDIT_DIR")
++    if not audit_root:
++        return
++    # Torch and CUDA are optional when testing coverage alone; import only for
++    # an explicitly requested audit of a live serving model.
++    import torch
++
++    raw_row_start = os.environ.get("FLINT_REFIT_AUDIT_HEAD_ROW_START", "0")
++    if not raw_row_start.isascii() or not raw_row_start.isdecimal():
++        raise ValueError(
++            "FLINT_REFIT_AUDIT_HEAD_ROW_START must be a nonnegative integer"
++        )
++    head_row_start = int(raw_row_start)
++    if head_row_start >= model.lm_head.weight.shape[0]:
++        raise ValueError(
++            "FLINT_REFIT_AUDIT_HEAD_ROW_START must identify a resident head row"
++        )
++
++    def describe(name, weight, *, head=False):
++        selected = (
++            weight.detach()[head_row_start : head_row_start + 32, :32]
++            if head
++            else weight.detach()
++        )
++        sample = selected.to(device="cpu", dtype=torch.float32).contiguous()
++        result = {
++            "name": name,
++            "dtype": str(weight.dtype),
++            "shape": list(weight.shape),
++            "sample_shape": list(sample.shape),
++            "sample_dtype": "torch.float32",
++            "sample_sha256": hashlib.sha256(sample.numpy().tobytes()).hexdigest(),
++            "sample_values": sample.tolist(),
++        }
++        if head:
++            result["sample_row_start"] = head_row_start
++        return result
++
++    report = {
++        "schema_version": 1,
++        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
++        "hostname": socket.gethostname(),
++        "pid": os.getpid(),
++        "loaded_hf_name_count": loaded_name_count,
++        "head": describe("lm_head.weight", model.lm_head.weight, head=True),
++        "sinks": [
++            describe(name, value)
++            for name, value in model.named_parameters()
++            if name.endswith(".self_attn.softmax_offset")
++        ],
++    }
++    output = Path(audit_root)
++    output.mkdir(parents=True, exist_ok=True)
++    path = output / f"flint-refit-{report['hostname']}-{report['pid']}.jsonl"
++    with path.open("a", encoding="utf-8") as stream:
++        stream.write(json.dumps(report, allow_nan=False) + "\n")
++
++
++def install_runner_refit_hooks(
++    model_type: type, runner_type: type | None = None
++) -> None:
++    """Connect Flint coverage to the pinned Miles runner's session boundaries.
++
++    Miles commit 3003d70f has explicit runner begin/end methods but no model-level
++    hooks. Install this adapter only when constructing a Flint model, and leave
++    every other model's runner behavior untouched. ``runner_type`` permits a CPU
++    contract test without importing SGLang/CUDA.
++    """
++    if runner_type is None:
++        from sglang.srt.model_executor.model_runner import ModelRunner
++
++        runner_type = ModelRunner
++    original_begin = runner_type.begin_weight_update
++    original_end = runner_type.end_weight_update
++    if getattr(original_begin, "__flint_refit_model_type__", None) is model_type:
++        return
++    if tuple(signature(original_begin).parameters) != ("self",) or tuple(
++        signature(original_end).parameters
++    ) != ("self", "run_post_load"):
++        raise RuntimeError(
++            "Unsupported SGLang ModelRunner refit API; expected Miles 3003d70f"
++        )
++
++    @wraps(original_begin)
++    def begin(self):
++        if not isinstance(self.model, model_type):
++            return original_begin(self)
++        coverage = self.model._refit_coverage
++        coverage.begin()
++        try:
++            return original_begin(self)
++        except BaseException:
++            coverage.failed = True
++            raise
++
++    @wraps(original_end)
++    def end(self, run_post_load):
++        if not isinstance(self.model, model_type):
++            return original_end(self, run_post_load)
++        coverage = self.model._refit_coverage
++        coverage.validate()
++        try:
++            result = original_end(self, run_post_load)
++            write_refit_audit(self.model, len(coverage.loaded))
++        except BaseException:
++            coverage.failed = True
++            raise
++        coverage.finish()
++        return result
++
++    begin.__flint_refit_model_type__ = model_type
++    runner_type.begin_weight_update = begin
++    runner_type.end_weight_update = end

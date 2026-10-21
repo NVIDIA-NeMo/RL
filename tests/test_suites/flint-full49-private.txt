@@ -1,0 +1,4 @@
+# Full49 Flint preview weights and the pinned private container are required.
+# Kept separate from public nightly.txt because public CI cannot access them.
+llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-quick.sh
+llm/grpo-flint-49layer-1n4g-automodel-sglang-actckpt-synthetic-quick.sh

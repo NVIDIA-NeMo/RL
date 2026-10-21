@@ -1,0 +1,142 @@
+defaults: ../../grpo_math_1B_sglang.yaml
+
+# Full original 49-layer Flint integration smoke test; no model truncation.
+# All model and optimizer states are resumable raw checkpoints; no HF consolidation.
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_epochs: 2
+  max_num_steps: 2
+  use_leave_one_out_baseline: false
+  skip_reference_policy_logprobs_calculation: true
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /flint-work/results/math
+  metric_name: null
+  keep_top_k: 1
+  save_period: 1
+
+policy:
+  model_name: /flint-model
+  hf_config_overrides:
+    router_aux_loss_coef: 0.0
+    use_cache: false
+    residual_dtype: fp32
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  refit_buffer_size_gb: 1
+  max_total_sequence_length: 128
+  precision: bfloat16
+  offload_optimizer_for_logprob: true
+  automodel_cfg:
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: true
+    expert_parallel_size: 1
+    checkpoint:
+      model_save_format: safetensors
+      save_consolidated: "false"
+    automodel_kwargs:
+      force_hf: false
+      enable_hf_state_dict_adapter: true
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch
+        rope: torch
+        rope_fusion: false
+        experts: torch
+        dispatcher: torch
+        gate_precision: null
+  sequence_packing:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      # Avoid a full parameter-sized foreach/fused optimizer temporary.
+      foreach: false
+      fused: false
+  generation:
+    max_new_tokens: 16
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    sglang_cfg:
+      trust_remote_code: false
+      dtype: bfloat16
+      context_length: 128
+      attention_backend: fa4
+      moe_runner_backend: flashinfer_trtllm_routed
+      enable_fp32_lm_head: true
+      swa_full_tokens_ratio: 0.5
+      disable_flashinfer_autotune: true
+      disable_radix_cache: true
+      disable_overlap_schedule: true
+      disable_cuda_graph: true
+      cuda_graph_backend_prefill: disabled
+      cuda_graph_backend_decode: disabled
+      # Each TP1 replica holds the full approximately 80 GB BF16 model.
+      mem_fraction_static: 0.60
+      max_running_requests: 8
+      # Bound cache allocation for eight concurrent 128-token requests.
+      max_total_tokens: 4096
+      chunked_prefill_size: 128
+      max_prefill_tokens: 256
+      true_on_policy_contract: null
+      sglang_server_config:
+        # Serve one TP1 replica while all four trainer ranks participate in FSDP.
+        num_gpus: 1
+        needs_offload: true
+        cpu_weight_backup: true
+        sglang_server_concurrency: 8
+
+data:
+  shuffle: false
+  num_workers: 0
+  train:
+    dataset_name: ResponseDataset
+    data_path: /flint-work/data/math.jsonl
+    input_key: input
+    output_key: output
+    split_validation_size: 0
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+env:
+  math:
+    num_workers: 1
+    math_verify_impl: hf_math_verify
+
+logger:
+  log_dir: /flint-work/logs/math
+  wandb_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

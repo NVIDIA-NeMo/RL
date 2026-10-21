@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -158,8 +158,20 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
     if getattr(_orig, "_nrl_vision_patch", False):
         return
 
-    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None):
-        result = _orig(model_type, model_key_mapping)
+    def _patched_get_combined_key_mapping(
+        model_type, model_key_mapping=None, *, model=None
+    ):
+        # Current Automodel uses model to resolve scoped submodel renames. Omit
+        # an absent model to retain compatibility with its older two-arg API.
+        result = (
+            _orig(model_type, model_key_mapping, model=model)
+            if model is not None
+            else _orig(model_type, model_key_mapping)
+        )
+        # Scoped mappings are callables in current Automodel and already own
+        # their complete rename order; dictionary injection would destroy it.
+        if callable(result):
+            return result
         if model_type in _vision_nested:
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
