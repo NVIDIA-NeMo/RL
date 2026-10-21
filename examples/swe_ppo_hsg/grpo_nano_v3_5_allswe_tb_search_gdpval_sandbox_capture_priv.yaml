@@ -8,8 +8,10 @@
 #   rollout, given to all of its rows (the canonical row and its subagent segment rows);
 # - no critic blocks either (`value`, `value_loss_fn`: the SC refuses them without `ppo`).
 # Launch with v2.sh ALGO=grpo (it swaps the ppo.* overrides for grpo.* and drops the critic ones).
-# Masked rows (env mask rules, overlong filtering) take no gradient and, as in PPO, do not enter the baseline
-# (masked_sample_rewards_in_baseline: false).
+# Masked rows (env mask rules, overlong filtering) take no gradient but keep their reward (usually 0) in the group's
+# baseline and std (masked_sample_rewards_in_baseline: true; user, 2026-10-21: "those should be in baseline"), so a
+# timed-out or truncated rollout reads as a failure for its siblings -- as in the PPO arm, whose stage-B critic is
+# trained on masked and truncated rollouts with their rewards.
 # =============================================================================
 defaults: ppo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml
 ppo: null
@@ -31,7 +33,7 @@ grpo:
   val_batch_size: 256
   seed: 42
   overlong_filtering: false
-  masked_sample_rewards_in_baseline: false
+  masked_sample_rewards_in_baseline: true
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
