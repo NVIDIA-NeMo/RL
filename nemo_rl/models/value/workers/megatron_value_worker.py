@@ -433,6 +433,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             pretrained_path,
             weights_path,
             optimizer_path,
+            is_value_model=True,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg

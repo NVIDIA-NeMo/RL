@@ -751,6 +751,52 @@ class TestApplyParallelismConfig:
 
         assert model_cfg.context_parallel_size == 4
 
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    @pytest.mark.parametrize(
+        ("provider_name", "is_value_model", "supported"),
+        [
+            ("NemotronOmniModelProvider", True, True),
+            ("NemotronOmniModelProvider", False, False),
+            ("NemotronOmniLlavaModelProvider", True, False),
+            (None, True, False),
+        ],
+    )
+    def test_unpacked_context_parallel_is_limited_to_canonical_omni_critics(
+        self, cp_size, provider_name, is_value_model, supported
+    ):
+        from megatron.bridge.models.nemotron_omni import nemotron_omni_provider
+
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        model_cfg = (
+            object.__new__(getattr(nemotron_omni_provider, provider_name))
+            if provider_name is not None
+            else SimpleNamespace()
+        )
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 8,
+                "pipeline_model_parallel_size": 1,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "sequence_parallel": True,
+                "context_parallel_size": cp_size,
+            },
+            "sequence_packing": {"enabled": False},
+        }
+
+        if supported:
+            _apply_parallelism_config(model_cfg, config, is_value_model=is_value_model)
+            assert model_cfg.context_parallel_size == cp_size
+            assert config["sequence_packing"]["enabled"] is False
+        else:
+            with pytest.raises(
+                AssertionError, match="Sequence Packing must be enabled"
+            ):
+                _apply_parallelism_config(
+                    model_cfg, config, is_value_model=is_value_model
+                )
+
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:

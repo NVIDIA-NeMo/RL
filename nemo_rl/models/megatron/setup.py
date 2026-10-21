@@ -472,6 +472,7 @@ def validate_and_set_config(
     optimizer_path,
     *,
     skip_weight_load: bool = False,
+    is_value_model: bool = False,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
     # This guards the training cfg; the inference cfg is guarded in
@@ -549,6 +550,7 @@ def validate_and_set_config(
         weights_path,
         optimizer_path,
         skip_weight_load=skip_weight_load,
+        is_value_model=is_value_model,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -916,6 +918,7 @@ def setup_model_config(
     optimizer_path: Optional[str] = None,
     *,
     skip_weight_load: bool = False,
+    is_value_model: bool = False,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic.
 
@@ -928,6 +931,7 @@ def setup_model_config(
         weights_path: Path to save/load training weights.
         optimizer_path: Path to the optimizer state (None if not resuming).
         skip_weight_load: This policy never loads the checkpoint (weights arrive via refit).
+        is_value_model: Enable supported critic-specific context layouts.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
@@ -1009,7 +1013,7 @@ def setup_model_config(
         model_cfg = _merge_model_overrides(model_cfg, model_overrides)
 
     # Apply parallelism settings
-    _apply_parallelism_config(model_cfg, config)
+    _apply_parallelism_config(model_cfg, config, is_value_model=is_value_model)
 
     # Apply optional multimodal provider settings
     _apply_multimodal_config(model_cfg, config)
@@ -1200,7 +1204,9 @@ def _merge_model_override_value(
     return override_value
 
 
-def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
+def _apply_parallelism_config(
+    model_cfg: Any, config: PolicyConfig, *, is_value_model: bool = False
+) -> None:
     """Apply tensor/pipeline/context parallelism configuration."""
     model_cfg.tensor_model_parallel_size = config["megatron_cfg"][
         "tensor_model_parallel_size"
@@ -1218,12 +1224,23 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
-        # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
-        # GPTModel path) OR the model does it internally (mbridge VLM wrappers
-        # like Qwen3VL, auto-detected at model build). Both paths require
-        # cu_seqlens to flow via PackedSeqParams, so sequence_packing must be on.
-        assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore."
+        unpacked_omni_value_model = False
+        if is_value_model and not config["sequence_packing"]["enabled"]:
+            from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
+                NemotronOmniLlavaModelProvider,
+                NemotronOmniModelProvider,
+            )
+
+            # The canonical Omni model shards dense embeddings, positions and
+            # masks itself, after inserting media. The critic reassembles its
+            # values before token alignment. Other models and policy logprobs
+            # still require the packed input/loss preparation path.
+            unpacked_omni_value_model = isinstance(
+                model_cfg, NemotronOmniModelProvider
+            ) and not isinstance(model_cfg, NemotronOmniLlavaModelProvider)
+        assert config["sequence_packing"]["enabled"] or unpacked_omni_value_model, (
+            "Sequence Packing must be enabled to use Context Parallelism with MCore, "
+            "except for canonical Nemotron Omni value models with internal dense sharding."
         )
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
