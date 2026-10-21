@@ -1,10 +1,10 @@
-# Flint support for NeMo RL (private integration)
+# Flint support for NeMo RL
 
 This branch collects the changes used to run Flint GRPO with Automodel and
 SGLang. It is based on RL commit `e65b8b8b808e078b2217d2058d7e0fe5ee120799`,
-not a claim of compatibility with newer upstream revisions. The private `main`
-branch adds one administrative commit removing inherited GitHub workflows;
-upstream history is retained.
+not a claim of compatibility with newer upstream revisions. The public PR targets
+the `flint-support` integration branch at that tested baseline. Upstream history
+and inherited GitHub workflows are retained.
 
 ## Implementation
 
@@ -91,8 +91,8 @@ issues.
 
 `source-manifest.json` maps collected files to their original workspaces. It
 contains paths and hashes only. Generated validation output is kept outside Git.
-GitHub Actions is disabled in this private repository because upstream workflows
-require NVIDIA infrastructure and the private model assets.
+GPU functional tests require NVIDIA infrastructure and private model assets.
+Public CI results must be assessed separately from the historical validation.
 
 Fresh packaging checks: 30 CPU compatibility tests passed with Transformers
 5.18.0; 36 runtime-tool tests passed; 10 step-zero tensor audit tests passed.
