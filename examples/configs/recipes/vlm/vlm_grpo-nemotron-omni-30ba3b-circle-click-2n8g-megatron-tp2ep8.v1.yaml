@@ -145,6 +145,13 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/circle_click/configs/circle_click.yaml
+    circle_click_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: circle_click_simple_agent
     circle_click_simple_agent:
       responses_api_agents:
         simple_agent:

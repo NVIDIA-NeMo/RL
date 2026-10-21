@@ -43,6 +43,10 @@ RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
 RAY_CLUSTER_EXTERNAL = "attached_external"
 RAY_CLUSTER_REUSED_LOCAL = "reused_local"
 RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
 
 class ClusterConfig(BaseModel, extra="allow"):
@@ -457,20 +461,6 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
     Returns:
         How the cluster was obtained: one of the ``RAY_CLUSTER_*`` constants.
     """
-    # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
-    # captured into runtime_env (both by `dict(os.environ)` below and by
-    # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded
-    # into every actor, where they cause two failures in the TRT-LLM generation
-    # worker: (1) PMIX_/SLURM_STEP_ID make OMPI's MPI_Init abort with "OMPI was
-    # not built with SLURM's PMI support"; (2) any residual OMPI_/MPI_/SLURM_
-    # var makes TRT-LLM think it runs under an MPI launcher and pick the MPI
-    # orchestrator (MPI_Comm_Spawn -> MPI_ERR_SPAWN) instead of the Ray
-    # orchestrator. init_ray() runs before any worker group is built, so
-    # popping here cleans the env for all downstream captures.
-    for _k in list(os.environ):
-        if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
-            os.environ.pop(_k, None)
-
     # Ray actors deserialize constructor arguments before importing NeMo-RL.
     # Put Hugging Face's generated ``transformers_modules`` package on the
     # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
@@ -480,6 +470,11 @@ def _init_ray(log_dir: Optional[str] = None) -> str:
 
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")

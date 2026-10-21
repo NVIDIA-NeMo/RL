@@ -71,6 +71,7 @@ from nemo_rl.models.generation.vllm.utils import (
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
@@ -996,6 +997,7 @@ class VllmAsyncGenerationWorkerImpl(
         from vllm.entrypoints.serve.tokenize.serving import (
             ServingTokenization,
         )
+        from vllm.entrypoints.serve.utils.api_utils import with_cancellation
         from vllm.renderers.online_renderer import OnlineRenderer
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -1233,21 +1235,36 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
                 final_prompt_token_ids = splice.token_ids
-                media = await asyncio.to_thread(
-                    worker_self._capture_request_media,
-                    engine_prompt,
-                    admission=admission,
-                    splice=splice,
-                )
-                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
-
-                # Clamp after prefix replacement since the prompt length may have changed.
+                # Reject overflows before media validation can mask the length error.
                 if actual_request_max_tokens is not None:
                     self._clamp_max_tokens(
                         request,
                         actual_request_max_tokens,
                         final_prompt_token_ids,
                     )
+
+                media = await asyncio.to_thread(
+                    worker_self._capture_request_media,
+                    engine_prompt,
+                    admission=admission,
+                    splice=splice,
+                )
+                # Must precede the reassignment below: the remap reads the
+                # current value of prompt_token_ids as the template-coordinate
+                # sequence the placeholders were computed against. Reordering
+                # these two statements silently degrades to a no-op.
+                # Successful media capture already remapped these ranges.
+                if media is None and (
+                    mm_placeholders := engine_prompt.get("mm_placeholders")
+                ):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=mm_placeholders,
+                        splice=splice,
+                    )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Token capture, token-in mode: the spliced prompt is the
                 # exact engine prompt; begin_call re-checks the prefix it
@@ -1305,12 +1322,17 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 final_res = None
+                cancelled = False
 
                 async def capture_result_generator():
-                    nonlocal final_res
-                    async for res in result_generator:
-                        final_res = res
-                        yield res
+                    nonlocal final_res, cancelled
+                    try:
+                        async for res in result_generator:
+                            final_res = res
+                            yield res
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        raise
 
                 # Capture stages the raw arrays below and strips OpenAI logprobs
                 # after the terminal PUT. Skip only their object construction;
@@ -1328,6 +1350,16 @@ class VllmAsyncGenerationWorkerImpl(
                         *args,
                         **kwargs,
                     )
+                if cancelled:
+                    # vLLM's chat_completion_full_generator catches the
+                    # CancelledError that with_cancellation throws into the
+                    # handler task on a client disconnect and returns
+                    # ErrorResponse("Client disconnected") instead of
+                    # re-raising. Nobody reads that response (the wrapper has
+                    # already returned), and letting it through would make the
+                    # route label the capture "error_response". Re-raise so the
+                    # task finishes cancelled and the route sees the disconnect.
+                    raise asyncio.CancelledError()
                 if (
                     not isinstance(response, ChatCompletionResponse)
                     or final_res is None
@@ -1435,6 +1467,9 @@ class VllmAsyncGenerationWorkerImpl(
 
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
+        # Like vLLM's own routes: cancel the handler (and with it the engine
+        # request) when the client disconnects, instead of generating for nobody.
+        @with_cancellation
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
@@ -1546,6 +1581,13 @@ class VllmAsyncGenerationWorkerImpl(
                     },
                     status_code=400,
                 )
+            except asyncio.CancelledError:
+                # Client disconnected (see with_cancellation above). A cancel
+                # before generation starts propagates here directly; one that
+                # lands mid-generation is swallowed by vLLM and re-raised by
+                # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+                worker_self._abort_request_capture(request, reason="client_disconnect")
+                raise
             except BaseException:
                 worker_self._abort_request_capture(request, reason="engine_error")
                 raise
@@ -1564,9 +1606,17 @@ class VllmAsyncGenerationWorkerImpl(
                 # response; strips logprobs/ids (no-op when capture is off).
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
-                content = await asyncio.to_thread(
-                    worker_self._finish_request_capture, request, content
-                )
+                try:
+                    content = await asyncio.to_thread(
+                        worker_self._finish_request_capture, request, content
+                    )
+                except asyncio.CancelledError:
+                    # Queued executor work may never start after cancellation.
+                    # If staging already claimed the capture, abort is a no-op.
+                    worker_self._abort_request_capture(
+                        request, reason="client_disconnect"
+                    )
+                    raise
                 return JSONResponse(content=content)
 
             worker_self._abort_request_capture(request, reason="streaming_response")
@@ -2176,9 +2226,20 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""
