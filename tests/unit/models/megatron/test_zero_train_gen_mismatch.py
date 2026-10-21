@@ -183,11 +183,10 @@ def test_validate_rejects_a_missing_required_megatron_value():
     assert any("moe_permute_fusion must be False" in v for v in result.violations)
 
 
-def test_validate_rejects_chunked_prefill():
+def test_validate_allows_chunked_prefill():
     config = _policy_config()
     config["generation"]["mcore_generation_config"]["enable_chunked_prefill"] = True
-    result = _validate(config)
-    assert any("enable_chunked_prefill must be False" in v for v in result.violations)
+    assert _validate(config).violations == []
 
 
 # --------------------------------------------------------------------------- #

@@ -104,7 +104,7 @@ run trains normally but the KL is nonzero.
 | `transformer_impl` | `inference_optimized` | validated |
 | `logprobs_mode` | `raw_logprobs` | validated |
 | `temperature` / `top_p` / `top_k` | `1.0` / `1.0` / `null` | validated |
-| `enable_chunked_prefill` | `false` | validated |
+| `enable_chunked_prefill` | `true`, `max_tokens: 256`, `max_requests: 32` | hybrid needs `max_tokens` > Mamba chunk size (128); MCore needs `max_tokens >= max_requests` |
 | `tensor_model_parallel_size` | same as training (`1`) | validated |
 | `fp8_cfg` | **identical to the training block**, including `fp8: hybrid` | only `enabled` and `fp8_recipe` must match training (validated); `fp8` and `fp8_param` are **not validated** (this block replaces the training one wholesale, and the parent recipe has `e4m3`) |
 | `inference_grouped_gemm_backend` | `torch` | **not validated** (`flashinfer` is rejected unless training sets `moe_inference_training_forward`; that setup is in `nano-nvfp4-zero-kl`) |

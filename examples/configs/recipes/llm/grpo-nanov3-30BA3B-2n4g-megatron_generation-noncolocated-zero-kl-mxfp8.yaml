@@ -76,7 +76,12 @@ policy:
       sequence_parallel: false
       moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
-      enable_chunked_prefill: false
+      enable_chunked_prefill: true
+      # Batch-invariant SSM chunked prefill needs max_tokens > the Mamba chunk size (128),
+      # and MCore needs max_tokens >= max_requests. 32 prompts of ~100 tokens overflow a
+      # 256-token step, so most steps split a prompt.
+      max_tokens: 256
+      max_requests: 32
       enable_prefix_caching: false
       inference_grouped_gemm_backend: torch
       inference_moe_token_dispatcher_type: nvls

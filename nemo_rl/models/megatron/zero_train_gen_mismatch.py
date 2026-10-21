@@ -61,9 +61,7 @@ _ZERO_KL_MEGATRON_REQUIRED: dict[str, Any] = {
     "batch_invariant_collective": "ordered",
 }
 
-_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {
-    "enable_chunked_prefill": False,
-}
+_ZERO_KL_GENERATION_REQUIRED: dict[str, Any] = {}
 
 # Workspace-free cuBLAS (fixed reduction order) for the te_native backend.
 _TE_NATIVE_ENV_VARS = {
