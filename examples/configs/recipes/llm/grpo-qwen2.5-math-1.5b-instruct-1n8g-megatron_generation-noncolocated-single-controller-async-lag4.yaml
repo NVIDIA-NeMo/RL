@@ -18,4 +18,3 @@ policy:
     refit_transport: mcore
     mcore_generation_config:
       refit_backend: nccl
-      kv_cache_management_mode: recompute

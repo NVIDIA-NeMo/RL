@@ -44,6 +44,7 @@ from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import (
     configure_generation_config,
+    draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
 )
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
@@ -55,6 +56,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
@@ -77,6 +79,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
+    # The training loop runs in SingleControllerActor, whose flush=True prints only
+    # reach this driver: Ray forwards actor output here without flushing. When the
+    # driver's stdout is redirected (ray.sub -> ray-driver.log), Python
+    # block-buffers it, so step and coordination logs would arrive in bursts or
+    # only at exit. Line-buffer the driver so they show up as they are printed.
+    sys.stdout.reconfigure(line_buffering=True)
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
@@ -95,6 +103,7 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
@@ -118,8 +127,8 @@ def main() -> None:
     print("Final config:")
     pprint.pprint(config)
 
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
-    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
     if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
@@ -169,6 +178,9 @@ def main() -> None:
                     tokenizer,
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
+                    # Only used by Automodel draft co-training; SC supports only the
+                    # Megatron train backend today, so this is always False here.
+                    draft_full_refit=draft_full_refit_enabled(config.policy),
                 )
 
             # Its own phase rather than part of the tokenizer block: it resolves

@@ -45,15 +45,20 @@ from nemo_rl.models.generation.vllm.metric_names import (
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 VLLM_LOGPROB_FLOOR = -9999.0
 
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
-GROUPED_MOE_MXFP8_REFIT_ERROR = (
-    "MXFP8 refit does not support grouped MoE expert weights."
-)
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -130,19 +135,6 @@ def is_grouped_moe_expert_weight_name(name: str) -> bool:
     return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
 
 
-def assert_refit_unsupported_grouped_moe_params(
-    config: VllmConfig, state_dict_info: dict[str, Any]
-) -> None:
-    """Reject grouped MoE MXFP8 state-dict params before refit starts."""
-    vllm_cfg = config["vllm_cfg"]
-    if (
-        vllm_cfg.get("precision") == "fp8"
-        and vllm_cfg.get("is_mx")
-        and any(is_grouped_moe_expert_weight_name(name) for name in state_dict_info)
-    ):
-        raise AssertionError(GROUPED_MOE_MXFP8_REFIT_ERROR)
-
-
 def _as_routed_experts_tensor(
     value: Any, *, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -166,6 +158,17 @@ def _as_routed_experts_tensor(
             )
         G_ROUTED_EXPERTS_RANGE_CHECKED = True
     return tensor.to(dtype=dtype)
+
+
+def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
+    """Reject rollouts generated from a different prompt than the learner's."""
+    if actual != expected:
+        actual_length = None if actual is None else len(actual)
+        raise ValueError(
+            "vLLM processed prompt differs from the learner prompt: "
+            f"expected_length={len(expected)}, actual_length={actual_length}. "
+            "Refusing to train on a different prompt."
+        )
 
 
 def format_prompt_for_vllm_generation(
@@ -225,9 +228,10 @@ def format_prompt_for_vllm_generation(
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
-            # Raw processor content is valid only for the initial turn. Later
-            # turns use the updated pre-tokenized conversation plus the same
-            # modality data, preventing vLLM from regenerating the stale prompt.
+            # Later native turns clear the initial content to avoid replaying
+            # a stale prompt, sending updated token IDs with the same media.
+            # vLLM may re-expand image placeholders on that path; the worker's
+            # prompt validation rejects any resulting token-ID mismatch.
             prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
@@ -322,21 +326,15 @@ def pad_and_align_routed_expert_indices(
             "Router replay allows at most one surplus final-token route."
         )
 
-    default_route = torch.arange(
-        routed.shape[2],
+    full = torch.full(
+        (padded_length, routed.shape[1], routed.shape[2]),
+        R3_MISSING_ROUTE_SENTINEL,
         dtype=routed_experts_dtype,
         device=device,
-    )
-    full = (
-        default_route.view(1, 1, -1)
-        .expand(padded_length, routed.shape[1], routed.shape[2])
-        .clone()
     )
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
-    if stats["missing_routes"] > 0:
-        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 
