@@ -999,7 +999,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 MoE backend while a co-trained MTP drafter is enabled (unsupported
                 by the native layerwise refit lifecycle).
         """
-        self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        # Reject before storing any refit state. The draft check needs this
+        # refit's manifest, so it runs again once the manifest exists.
+        self._validate_native_layerwise_refit()
         pp_group = get_pp_group()
         pp_rank = int(getattr(pp_group, "rank_in_group", 0))
         pp_size = int(getattr(pp_group, "world_size", 1))
@@ -1030,8 +1032,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             target_owner_ranks=tuple(range(pp_size)),
             draft_owner_ranks=draft_owner_ranks,
         )
-        # Validate after the manifest exists, so the draft check sees this refit.
-        self._validate_native_layerwise_refit()
+        self._reject_native_refit_of_trtllm_moe_draft()
+        self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         _validate_draft_refit_info(
             self.model_runner,
             self._get_drafter_model(),
@@ -1536,13 +1538,17 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "a co-trained MTP drafter"
             )
 
+        self._reject_native_refit_of_trtllm_moe_draft()
+
+    def _reject_native_refit_of_trtllm_moe_draft(self) -> None:
         # Dense drafters sit outside the layerwise reload targets and take the
         # regular post-load pass in finalize. A TRTLLM MoE drafter would need
         # its own layerwise reload.
         manifest = self._model_update_manifest
         adapter = self._draft_runtime_adapter
         if (
-            manifest is not None
+            self._uses_unquantized_flashinfer_trtllm()
+            and manifest is not None
             and manifest.draft is not None
             and adapter is not None
             and adapter.model is not None

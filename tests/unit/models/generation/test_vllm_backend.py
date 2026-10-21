@@ -120,6 +120,7 @@ def test_prepare_refit_info_rejects_trtllm_moe_draft_before_first_refit(monkeypa
                 "draft.model.weight": ((2,), torch.float32),
             }
         )
+    assert not hasattr(ext, "state_dict_info")
 
 
 @pytest.mark.vllm
