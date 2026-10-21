@@ -190,6 +190,11 @@ def _assert_lora_modules_reachable(
     A LoRA module the merge cannot find reaches the inference engine as its
     bare base weight; nothing else reports it, and the only symptom is a
     slowly growing train/generation logprob mismatch many steps later.
+
+    Only ``LinearLoRA`` is covered because it is the only adapter this file
+    merges. When the grouped-expert LoRA merge lands (#3353), extend this
+    check to those adapter modules too so that path keeps the same loud
+    failure instead of silently refitting base expert weights.
     """
     unreachable = sorted(
         name
@@ -230,12 +235,8 @@ def _maybe_merge_lora_weight(
         if isinstance(module.lora_B.weight, DTensor)
         else module.lora_B.weight
     )
-    scale = getattr(module, "scale", None)
-
-    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
-        scale = module.alpha / module.dim
-    if scale is None:
-        scale = 1.0
+    # LinearLoRA._init_adapter always sets ``scale = alpha / dim``.
+    scale = getattr(module, "scale", 1.0)
 
     # Merge in fp32 and round once: computing ``B @ A`` and the sum in the base
     # dtype (bf16 in practice) rounds twice and can differ from an offline fp32
