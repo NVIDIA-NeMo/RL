@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "logra"
 version = "0.1.0"
-description = "Low-rank gradient sketches for native NeMo RL GRPO"
+description = "Low-rank gradient sketches for NeMo RL GRPO and computer use"
 readme = "README.md"
 requires-python = ">=3.13.14"
 dependencies = ["nemo-rl[automodel]"]

@@ -15,6 +15,7 @@
 """Native synchronous GRPO with a research-local LoGRA worker."""
 
 import argparse
+from typing import Any, cast
 
 from logra.actor_environments import register_actor_environments
 from logra.config import LoGRAConfig
@@ -33,6 +34,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 class ResearchConfig(MasterConfig):
@@ -45,14 +47,16 @@ def main():
     args, overrides = parser.parse_known_args()
     register_omegaconf_resolvers()
     raw = parse_hydra_overrides(load_config(args.config), overrides)
-    config = ResearchConfig.model_validate(OmegaConf.to_container(raw, resolve=True))
+    resolved = cast(dict[str, Any], OmegaConf.to_container(raw, resolve=True))
+    check_outdated_config(resolved)
+    config = ResearchConfig.model_validate(resolved)
     if config.grpo.async_grpo.enabled or (
         config.data_plane is not None and config.data_plane["enabled"]
     ):
         raise ValueError(
             "Initial research support is native synchronous GRPO without the data plane"
         )
-    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
     register_actor_environments()
     init_ray()
     tokenizer = get_tokenizer(config.policy["tokenizer"])

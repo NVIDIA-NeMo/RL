@@ -11,7 +11,7 @@ policy:
   model_name: Qwen/Qwen2.5-Math-7B
   tokenizer:
     name: ${policy.model_name}
-  dtensor_cfg:
+  automodel_cfg:
     automodel_kwargs:
       force_hf: true
     tensor_parallel_size: 1
