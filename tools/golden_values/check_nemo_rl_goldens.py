@@ -275,6 +275,13 @@ def main() -> None:
             print(f"  {name}: {expected!r} vs {got!r}")
     if mismatches:
         print(f"FAIL: {len(mismatches)} mismatches")
+        if any(m.metric == "initial_weights" for m in mismatches):
+            print(
+                "  The check run started from different weights than the golden. NeMo-RL "
+                "reuses its HF->Megatron conversion under $NRL_MEGATRON_CHECKPOINT_DIR "
+                "(default $HF_HOME/nemo_rl), keyed by the checkpoint path, so a checkpoint "
+                "rewritten at the same path loads stale weights."
+            )
         for mismatch in mismatches[:50]:
             print(f"  {mismatch}")
         sys.exit(1)

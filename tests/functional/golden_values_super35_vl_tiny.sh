@@ -36,6 +36,9 @@ CHECKPOINT="${EXP_DIR}/checkpoint"
 GOLDEN="${EXP_DIR}/golden.json.gz"
 rm -rf "${EXP_DIR}"
 mkdir -p "${EXP_DIR}"
+# NeMo-RL caches its HF->Megatron conversion by checkpoint path, and the
+# checkpoint below is rebuilt at the same path on every run.
+export NRL_MEGATRON_CHECKPOINT_DIR="${EXP_DIR}/megatron_checkpoints"
 cd "${PROJECT_ROOT}"
 
 # Config, remote code and tokenizer only; the 120B weights are never downloaded.

@@ -91,6 +91,13 @@ first place to look when a check fails.
 
 The default tolerances (relative) are stored in the golden file:
 
+- initial weights: 1e-6. Both runs load the same checkpoint, so the weights
+  before the first step match exactly; they did across layouts for both the
+  truncated and the full Super 3.5 VL. A mismatch means the check run loaded a
+  different model. NeMo-RL reuses its HF-to-Megatron conversion under
+  `$NRL_MEGATRON_CHECKPOINT_DIR` (default `$HF_HOME/nemo_rl`), keyed by the
+  checkpoint path, so after rewriting a checkpoint at the same path, point
+  `NRL_MEGATRON_CHECKPOINT_DIR` somewhere fresh.
 - loss: 5e-3
 - grad norm: 5e-2
 - weight update: 5e-2, size-weighted over all tensors in a step
@@ -105,8 +112,16 @@ over three runs on 2026-10-20:
 | TP=2 with sequence parallelism | 2e-4 | 2e-4 | 4-5% | 22-38% |
 
 The TP=2 noise is MoE routing flipping on bf16 near-ties under the different
-numerics. The CI test therefore gives TP=2 looser weight tolerances. For a new
-model:
+numerics. The CI test therefore gives TP=2 looser weight tolerances.
+
+The full public Nemotron 3.5 Super VL 120B
+(`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16`) was recorded and checked
+on 8 GB200 nodes at TP=2, EP=16 (DP=16) on 2026-10-21. NeMo-RL came within 9e-5
+(loss), 5e-3 (grad norm), 3% (updates) and 32% (worst tensor) of the reference,
+which passes the defaults. The record took 10 minutes and the check 8.5. The golden
+file is 9.3 MB compressed.
+
+For a new model:
 
 1. Record twice at two different layouts.
 2. Run the checker on each file against the other's run to see the noise floor.

@@ -117,6 +117,29 @@ def test_compare_passes_within_tolerance_and_flags_mismatches():
     assert all(str(m) for m in mismatches)
 
 
+def test_compare_flags_different_initial_weights():
+    updates = {"a.weight": torch.full((4, 4), 0.1), "b.weight": torch.full((8,), -0.2)}
+    golden = _golden(updates)
+    # A check run that loaded another model but applied the same update.
+    stale = copy.deepcopy(golden)
+    stale["weights"] = [
+        fingerprint_named_tensors(weights.items())
+        for weights in (
+            {"a.weight": torch.ones(4, 4) * 1.01, "b.weight": torch.zeros(8)},
+            {
+                "a.weight": torch.ones(4, 4) * 1.01 + updates["a.weight"],
+                "b.weight": updates["b.weight"],
+            },
+        )
+    ]
+    mismatches, worst = compare_goldens(golden, stale)
+    assert [(m.metric, m.step, m.name) for m in mismatches] == [
+        ("initial_weights", 0, "a.weight")
+    ]
+    assert "before the first step" in str(mismatches[0])
+    assert compare_goldens(golden, golden)[1]["initial_weights"] == 0
+
+
 def test_compare_rejects_different_weight_names():
     golden = _golden({"a.weight": torch.zeros(4, 4), "b.weight": torch.zeros(8)})
     other = copy.deepcopy(golden)

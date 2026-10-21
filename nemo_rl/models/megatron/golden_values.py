@@ -47,7 +47,11 @@ _CHUNK_NUMEL = 1 << 22
 # weight_update is the size-weighted error over all tensors in a step;
 # weight_update_per_tensor bounds each tensor, which is noisier (an MoE expert's
 # gradient moves when bf16 noise flips a near-tie in routing).
+# initial_weights compares each tensor before the first step: both runs load the
+# same checkpoint, so anything above float rounding of the fingerprint means the
+# check run started from a different model.
 DEFAULT_TOLERANCES = {
+    "initial_weights": 1e-6,
     "loss": 5e-3,
     "grad_norm": 5e-2,
     "weight_update": 5e-2,
@@ -193,7 +197,9 @@ class Mismatch:
 
     def __str__(self) -> str:
         where = f"step {self.step}" + (f" {self.name}" if self.name else "")
-        if self.metric.startswith("weight_update"):
+        if self.metric == "initial_weights":
+            values = "weights before the first step differ from the golden's"
+        elif self.metric.startswith("weight_update"):
             # For weights, expected is the golden update's size and actual the
             # size of the difference between the two runs' updates.
             values = f"update size {self.expected:.6g}, difference {self.actual:.6g}"
@@ -226,6 +232,8 @@ def compare_goldens(
     Returns the mismatches and, per metric, the largest relative error seen, so
     a passing run still shows how close it came.
 
+    Weights before the first step must match the golden's
+    (``initial_weights``), or the two runs didn't train the same model.
     Each step's weight update is compared through its signed projections, as
     the size-weighted error over all tensors (``weight_update``) and per tensor
     (``weight_update_per_tensor``). A tensor's size is floored at 1% of the
@@ -265,6 +273,21 @@ def compare_goldens(
                 f"{name}: golden shape {fingerprint['shape']}, check run shape "
                 f"{actual_weights[0][name]['shape']}"
             )
+        got = actual_weights[0][name]
+        projection_error = math.hypot(
+            *(a - e for a, e in zip(got["proj"], fingerprint["proj"]))
+        ) / max(math.hypot(*fingerprint["proj"]), 1e-30)
+        check(
+            "initial_weights",
+            0,
+            name,
+            fingerprint["sumsq"],
+            got["sumsq"],
+            max(
+                projection_error,
+                _relative_error(fingerprint["sumsq"], got["sumsq"]),
+            ),
+        )
     for step in range(1, len(golden_weights)):
         sizes, differences = {}, {}
         for name in golden_weights[0]:
