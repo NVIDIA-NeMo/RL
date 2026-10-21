@@ -90,33 +90,10 @@ def main() -> None:
     )
     colors = {"Dense AdamW": "#41658A", "LoGRA": "#B65D3C"}
     upper = max(float(matrix.max()) for matrix in matrices.values()) * 1.24
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=(10, 3.9),
-        gridspec_kw={"width_ratios": [1.55, 1]},
-        layout="constrained",
-    )
-    for method in methods:
-        matrix = matrices[method]
-        mean = matrix.mean(axis=0)
-        std = matrix.std(axis=0, ddof=1)
-        axes[0].plot(steps, mean, label=method, color=colors[method], linewidth=2.2)
-        axes[0].fill_between(
-            steps, mean - std, mean + std, color=colors[method], alpha=0.15
-        )
-    axes[0].set(
-        title="Sliding puzzle · Qwen2.5-7B-Instruct",
-        xlabel="Training update",
-        ylabel="Mean per-GPU update peak (GiB)",
-        ylim=(0, upper),
-        xlim=(1, args.steps),
-    )
-    axes[0].set_xticks(np.linspace(1, args.steps, min(5, args.steps), dtype=int))
-    axes[0].legend(frameon=False, loc="upper right", ncol=2)
+    fig, ax = plt.subplots(figsize=(5.3, 4.1), layout="constrained")
     means = [summary[m]["mean_update_peak_gib"] for m in methods]
     stds = [summary[m]["seed_std_gib"] for m in methods]
-    axes[1].bar(
+    ax.bar(
         range(2),
         means,
         yerr=stds,
@@ -125,27 +102,37 @@ def main() -> None:
         width=0.57,
         edgecolor="white",
     )
-    axes[1].set(
+    ax.set(
         xticks=range(2),
         xticklabels=methods,
-        ylabel="Mean update peak (GiB)",
-        title=f"{saving:.1f}% less training memory",
+        ylabel="Mean update peak / training GPU (GiB)",
+        title="Sliding puzzle · Qwen2.5-7B-Instruct",
         ylim=(0, upper),
     )
     for index, mean in enumerate(means):
-        axes[1].text(
+        ax.text(
             index,
             mean + max(means) * 0.04,
             f"{mean:.2f} GiB",
             ha="center",
-            fontweight="semibold",
+            fontweight="bold",
         )
-    for ax in axes:
-        ax.set_axisbelow(True)
-        ax.grid(axis="y", color="#E0E4E9", linewidth=0.7)
-        for spine in ax.spines.values():
-            spine.set_color("#88929D")
-            spine.set_linewidth(0.7)
+    ax.text(
+        0.97,
+        0.96,
+        f"{saving:.1f}% memory saving",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        color=colors["LoGRA"],
+    )
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", color="#E0E4E9", linewidth=0.7)
+    for spine in ax.spines.values():
+        spine.set_color("#88929D")
+        spine.set_linewidth(0.7)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for suffix in (".png", ".pdf"):
         fig.savefig(args.output.with_suffix(suffix), dpi=240, bbox_inches="tight")
