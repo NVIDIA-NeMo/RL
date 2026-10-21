@@ -90,6 +90,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayMetadataState,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
     TransactionalAdmissionSampler,
     create_sampler,
 )
@@ -5936,10 +5937,12 @@ class SingleControllerActor:
 
         Port of ppo.py's _async_ppo_generation_lead_steps.
         """
-        if not self._is_ppo:
+        if not self._is_ppo or not isinstance(self._sampler, InOrderSampler):
             return
-        steady = self._async_cfg.sampler.max_lookahead_versions
-        warmup = self._async_cfg.sampler.warmup_lookahead_versions
+        # Only in-order admission owns the critic-warmup lookahead schedule.
+        # Read its runtime knobs so custom InOrderSampler subclasses work too.
+        steady = self._sampler.max_lookahead_versions
+        warmup = self._sampler.warmup_lookahead_versions
         start = self._algo_cfg.policy_training_start_step
         if warmup is None or self._trainer_version >= start:
             window = steady

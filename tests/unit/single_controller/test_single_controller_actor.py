@@ -35,7 +35,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
     DataPlaneCheckpointBarrier,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler, InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
@@ -634,7 +634,12 @@ def _lookahead_controller(
             warmup_lookahead_versions=warmup_lookahead_versions,
         )
     )
-    ctrl._sampler = MagicMock()
+    ctrl._sampler = InOrderSampler(
+        MagicMock(),
+        max_lookahead_versions=max_lookahead_versions,
+        warmup_lookahead_versions=warmup_lookahead_versions,
+    )
+    ctrl._sampler.set_gate_window = MagicMock(wraps=ctrl._sampler.set_gate_window)
     return ctrl
 
 
