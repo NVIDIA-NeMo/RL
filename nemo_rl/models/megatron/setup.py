@@ -2306,6 +2306,42 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+def _create_freeze_parameter_patterns_pre_wrap_hook(
+    freeze_patterns: list[str],
+) -> Callable:
+    """Create a hook that freezes parameters whose names contain a pattern.
+
+    This deliberately matches the AutoModel backend's substring semantics
+    (``pattern in parameter_name``). The hook runs after the built-in and
+    caller-supplied model-construction hooks so parameters added by PEFT,
+    draft, or value-head hooks are included before the optimizer is built.
+    """
+    patterns = tuple(freeze_patterns)
+
+    def freeze_parameter_patterns(megatron_model):
+        model_chunks = (
+            megatron_model if isinstance(megatron_model, list) else [megatron_model]
+        )
+        n_matched = 0
+        n_frozen = 0
+        for model_chunk in model_chunks:
+            for name, param in model_chunk.named_parameters():
+                if any(pattern in name for pattern in patterns):
+                    n_matched += 1
+                    if param.requires_grad:
+                        param.requires_grad_(False)
+                        n_frozen += 1
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(
+                f"Freeze patterns matched {n_matched} parameters; newly froze "
+                f"{n_frozen}: freeze_parameter_patterns={list(patterns)}"
+            )
+        return megatron_model
+
+    return freeze_parameter_patterns
+
+
 _BRIDGE_SIGNAL_HANDLER_PATCHED = False
 
 
@@ -2534,9 +2570,10 @@ def setup_model_and_optimizer(
     if policy_cfg["megatron_cfg"]["freeze_moe_router"]:
 
         def freeze_moe_router(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
+            model_chunks = (
+                megatron_model if isinstance(megatron_model, list) else [megatron_model]
+            )
+            for model_module in model_chunks:
                 # Handle both wrapped (Float16Module) and unwrapped models
                 if isinstance(model_module, Float16Module):
                     model_module = model_module.module
@@ -2556,6 +2593,7 @@ def setup_model_and_optimizer(
                 for layer in model_module.decoder.layers:
                     if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
                         layer.mlp.router.weight.requires_grad = False
+            return megatron_model
 
         mixed_precision_wrapper = MoEFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
@@ -2694,6 +2732,12 @@ def setup_model_and_optimizer(
 
     if additional_pre_wrap_hooks:
         pre_wrap_hook.extend(additional_pre_wrap_hooks)
+
+    freeze_patterns = policy_cfg.get("freeze_parameter_patterns") or []
+    if freeze_patterns:
+        pre_wrap_hook.append(
+            _create_freeze_parameter_patterns_pre_wrap_hook(freeze_patterns)
+        )
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()

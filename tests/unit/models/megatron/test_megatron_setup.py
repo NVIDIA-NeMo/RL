@@ -4717,6 +4717,57 @@ class TestHandleModelImport:
 
 
 @pytest.mark.mcore
+class TestFreezeParameterPatternsPreWrapHook:
+    """Tests for the MCore equivalent of policy.freeze_parameter_patterns."""
+
+    def test_freezes_substring_matches_across_model_chunks(self, capsys):
+        from nemo_rl.models.megatron.setup import (
+            _create_freeze_parameter_patterns_pre_wrap_hook,
+        )
+
+        first_chunk = torch.nn.Module()
+        first_chunk.mtp = torch.nn.Linear(2, 2)
+        first_chunk.layer0 = torch.nn.Linear(2, 2)
+        # An already-frozen match is counted but must not be counted as newly frozen.
+        first_chunk.mtp.bias.requires_grad_(False)
+
+        second_chunk = torch.nn.Module()
+        second_chunk.mixer = torch.nn.Module()
+        second_chunk.mixer.gate = torch.nn.Linear(2, 2)
+        second_chunk.keep = torch.nn.Linear(2, 2)
+
+        model = [first_chunk, second_chunk]
+        hook = _create_freeze_parameter_patterns_pre_wrap_hook(
+            ["mtp", "mixer.gate", "layer[0]"]
+        )
+
+        result = hook(model)
+
+        assert result is model
+        assert all(not param.requires_grad for param in first_chunk.mtp.parameters())
+        assert all(
+            not param.requires_grad for param in second_chunk.mixer.gate.parameters()
+        )
+        # Patterns are literal substrings, not regular expressions.
+        assert all(param.requires_grad for param in first_chunk.layer0.parameters())
+        assert all(param.requires_grad for param in second_chunk.keep.parameters())
+        assert "matched 4 parameters; newly froze 3" in capsys.readouterr().out
+
+    def test_returns_single_model_unchanged_when_nothing_matches(self):
+        from nemo_rl.models.megatron.setup import (
+            _create_freeze_parameter_patterns_pre_wrap_hook,
+        )
+
+        model = torch.nn.Linear(2, 2)
+        hook = _create_freeze_parameter_patterns_pre_wrap_hook(["does.not.match"])
+
+        result = hook(model)
+
+        assert result is model
+        assert all(param.requires_grad for param in model.parameters())
+
+
+@pytest.mark.mcore
 class TestSetupModelAndOptimizer:
     """Tests for setup_model_and_optimizer function."""
 
@@ -4784,15 +4835,20 @@ class TestSetupModelAndOptimizer:
         mock_checkpoint_exists.return_value = False
 
         policy_cfg = {
+            "freeze_parameter_patterns": ["mtp"],
             "megatron_cfg": {
                 "freeze_moe_router": True,  # Enable MoE router freezing
-            }
+            },
         }
+
+        def additional_hook(model):
+            return model
 
         result = setup_model_and_optimizer(
             policy_cfg=policy_cfg,
             megatron_cfg=mock_megatron_cfg,
             load_optimizer=True,
+            additional_pre_wrap_hooks=[additional_hook],
         )
 
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
@@ -4801,8 +4857,18 @@ class TestSetupModelAndOptimizer:
         assert (
             call_kwargs["use_megatron_fsdp"] is mock_megatron_cfg.dist.use_megatron_fsdp
         )
-        # Check that pre_wrap_hook is not empty when freeze_moe_router is True
-        assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
+        hooks = call_kwargs.get("pre_wrap_hook", [])
+        assert [hook.__name__ for hook in hooks] == [
+            "freeze_moe_router",
+            "additional_hook",
+            "freeze_parameter_patterns",
+        ]
+        # Bridge composes these hooks by passing one hook's return value into the
+        # next, so each hook must preserve and return the model object.
+        hooked_model = mock_model
+        for hook in hooks:
+            hooked_model = hook(hooked_model)
+        assert hooked_model is mock_model
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 
