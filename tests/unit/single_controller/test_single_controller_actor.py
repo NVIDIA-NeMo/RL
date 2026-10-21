@@ -18,6 +18,7 @@ import asyncio
 import json
 import math
 import threading
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,7 +45,9 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
     InOrderSampler,
+    ReadyFirstSampler,
     ReadyFirstSamplerConfig,
+    WindowedSampler,
 )
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
@@ -2119,6 +2122,112 @@ def test_train_pump_still_fails_a_windowed_tail_below_the_floor() -> None:
 
     with pytest.raises(RuntimeError, match="below the floor"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+
+def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None:
+    """The stub drives the pump tests above, so it must not drift from the real one."""
+    windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
+    stub = _ClosesShortSampler(MagicMock())
+
+    assert stub.uses_replacement_pool == windowed.uses_replacement_pool
+    assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
+    for target_step in (None, 3):
+        assert stub.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        ) == windowed.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=7
+        )
+
+
+class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
+    """One group, then a filtered group reported through the real ready_first policy.
+
+    Stands in for a dynamic-sampling drop under ready_first: the group is filtered
+    after it finishes generating, so it carries no target_step and the pump is already
+    waiting on it. The credit goes through _credit_shortfall rather than writing the
+    dict, so the real ReadyFirstSampler.charge_step_for_lost_group decides the step.
+    """
+
+    def __init__(self, meta: KVBatchMeta) -> None:
+        super().__init__(meta)
+        self._real = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+        self.ctrl = None
+
+    uses_replacement_pool = True
+    closes_short_at_exhaustion = False
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return self._real.charge_step_for_lost_group(
+            target_step=target_step, assembling_version=assembling_version
+        )
+
+    async def select(self, **kwargs):
+        BaseSampler._validate_group_bounds(
+            kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
+        )
+        meta, num_groups = await super().select(**kwargs)
+        if meta is None:
+            # The pool is empty, so the filtered group is lost for good.
+            self.ctrl._credit_shortfall(None)
+        return meta, num_groups
+
+
+def test_train_pump_closes_a_ready_first_step_short_on_a_filtered_group(
+    monkeypatch,
+) -> None:
+    """End to end: an unstamped loss shrinks the step being assembled, not a later one."""
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    sampler = _ReadyFirstFilteringSampler(meta)
+    ctrl = _train_pump_controller(sampler=sampler)
+    sampler.ctrl = ctrl
+    # ceil(0.5 * 2) is 1, so closing on the one group it got is legal.
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+    # Rollouts are still running, so the pump cannot fall back to the exhausted path:
+    # it has to act on the credit or wait on a group nobody is generating.
+    ctrl._rollout_exhausted.clear()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 1, "the step is what shrank, not the run"
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["dropped_prompt_groups"] == 1
+    assert ctrl._batch_shortfall == {}, "pruned once the step it was charged to closed"
+
+
+def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step() -> (
+    None
+):
+    """Dynamic sampling under ready_first: spare first, then the step being assembled."""
+    ctrl = _train_pump_controller(
+        sampler=ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
+    )
+    ctrl._async_cfg.rollout_failure = SimpleNamespace(
+        min_step_batch_fraction=0.5,
+        on_dropped_prompt="replace",
+        max_replacement_attempts=1,
+    )
+    ctrl._replacement_reserve = deque(["spare0"])
+    ctrl._batch_shortfall = {}
+    ctrl._assembling_version = 4
+
+    assert ctrl._take_replacement(None, 0) == "spare0"
+    assert ctrl._take_replacement(None, 0) is None, "the pool is now empty"
+    ctrl._credit_shortfall(None)
+
+    assert ctrl._batch_shortfall == {4: 1}
+    assert ctrl._target_groups_for_step(4) == 1, "2 prompts per step, one lost"
+    assert ctrl._target_groups_for_step(5) == 2, "the next step is untouched"
 
 
 class _GatedUnstampedSampler(_FullStepSampler):

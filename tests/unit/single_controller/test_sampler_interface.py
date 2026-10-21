@@ -166,8 +166,19 @@ class TestDropAccounting:
             target_step=None, assembling_version=7
         )
         assert unstamped == 7
-        assert sampler.uses_replacement_pool is True
         assert sampler.closes_short_at_exhaustion is False
+
+    def test_weight_fifo_has_no_spare_pool_but_ready_first_does(self):
+        """A weight_fifo replacement lands in a newer weight bucket, so it has no pool."""
+        buf = FakeBuffer()
+        assert (
+            WeightFifoSampler(buf, max_staleness_versions=1).uses_replacement_pool
+            is False
+        )
+        assert (
+            ReadyFirstSampler(buf, max_staleness_versions=1).uses_replacement_pool
+            is True
+        )
 
     def test_windowed_charges_nothing_and_closes_short_at_the_end(self):
         sampler = WindowedSampler(FakeBuffer(), max_staleness_versions=1)
@@ -594,6 +605,24 @@ class TestWarnIfCustomSamplerLacksDropAccounting:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             warn_if_custom_sampler_lacks_drop_accounting(cfg)
+
+    def test_flags_assigned_in_init_are_warned_about_but_honoured_at_runtime(self):
+        """Setup inspects the class; the controller inspects the instance.
+
+        The two predicates disagree for this shape, so the warning is a false alarm.
+        The protocol asks for class attributes to keep them in step, and the warning
+        says so -- it must not claim the members are simply absent.
+        """
+        with pytest.warns(UserWarning) as record:
+            warn_if_custom_sampler_lacks_drop_accounting(
+                _custom("InstanceAttrDropAccounting")
+            )
+
+        text = str(record[0].message)
+        assert "class defines only ['charge_step_for_lost_group']" in text
+        assert "Declare the flags as class attributes" in text
+        # What the controller actually does with it, which is honour the flags.
+        assert isinstance(InstanceAttrDropAccounting(), DropAccountingSampler)
 
 
 class TestWindowedSelect:
@@ -1180,6 +1209,17 @@ class PartialDropAccounting:
     """Defines one member, which isinstance ignores because the rest are missing."""
 
     uses_replacement_pool = False
+
+
+class InstanceAttrDropAccounting:
+    """Assigns the flags in __init__, where the setup check cannot see them."""
+
+    def __init__(self) -> None:
+        self.uses_replacement_pool = False
+        self.closes_short_at_exhaustion = True
+
+    def charge_step_for_lost_group(self, *, target_step, assembling_version):
+        return None
 
 
 class FullDropAccounting:

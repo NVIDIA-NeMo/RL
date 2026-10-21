@@ -693,7 +693,16 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
         with pytest.warns(UserWarning, match="on_dropped_prompt"):
             validate_single_controller_config(cfg)
 
-    @pytest.mark.parametrize("sampler_name", ["in_order", "weight_fifo", "ready_first"])
+    def test_replacing_under_weight_fifo_is_warned_about(self):
+        """A replacement lands in a newer weight bucket, so there is no spare pool."""
+        cfg = _master_config(
+            sampler={"name": "weight_fifo"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+        with pytest.warns(UserWarning, match="on_dropped_prompt"):
+            validate_single_controller_config(cfg)
+
+    @pytest.mark.parametrize("sampler_name", ["in_order", "ready_first"])
     def test_a_sampler_that_uses_the_pool_is_not_warned_about(self, sampler_name):
         cfg = _master_config(
             sampler={"name": sampler_name},
@@ -717,14 +726,14 @@ class TestCombinationsThatCannotDoWhatTheyWereSetFor:
 
 
 class TestADropBudgetIsAcceptedUnderEverySampler:
-    """Each sampler says where a lost group is charged, so none can stall on one.
+    """Each sampler but weight_fifo says where a lost group is charged.
 
     A drop budget used to be rejected under a sampler that stamps no target step,
     because the lost group was charged to no step and that step waited on a group
     nobody was generating. See ``DropAccountingSampler``.
     """
 
-    @pytest.mark.parametrize("sampler_name", ["windowed", "weight_fifo", "ready_first"])
+    @pytest.mark.parametrize("sampler_name", ["windowed", "ready_first"])
     @pytest.mark.parametrize(
         "budget",
         [{"max_skipped_prompts": 1}, {"max_consecutive_dropped_prompts": 1}],
@@ -735,9 +744,25 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
         cfg = _master_config(sampler={"name": sampler_name}, rollout_failure=budget)
         validate_single_controller_config(cfg)
 
+    @pytest.mark.parametrize("on_dropped_prompt", ["shrink", "replace"])
+    @pytest.mark.parametrize(
+        "budget",
+        [{"max_skipped_prompts": 1}, {"max_consecutive_dropped_prompts": 1}],
+    )
+    def test_weight_fifo_rejects_a_nonzero_budget(self, budget, on_dropped_prompt):
+        """A lost group can neither be replaced nor charged to a weight bucket."""
+        cfg = _master_config(
+            sampler={"name": "weight_fifo"},
+            rollout_failure={**budget, "on_dropped_prompt": on_dropped_prompt},
+        )
+        with pytest.raises(ValueError, match="weight_fifo.*drop budget"):
+            validate_single_controller_config(cfg)
+
     def test_every_built_in_accepts_the_budget(self):
         """Read off the union, so a sampler added later is covered by default."""
-        built_ins = [n for n in _all_sampler_names() if n != "custom"]
+        built_ins = [
+            n for n in _all_sampler_names() if n not in ("custom", "weight_fifo")
+        ]
         assert built_ins, "the union should carry at least one built-in sampler"
         for sampler_name in built_ins:
             cfg = _master_config(
@@ -748,7 +773,7 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
 
     def test_shrink_mode_is_accepted_too(self):
         cfg = _master_config(
-            sampler={"name": "weight_fifo"},
+            sampler={"name": "ready_first"},
             rollout_failure={
                 "max_consecutive_dropped_prompts": 2,
                 "on_dropped_prompt": "shrink",

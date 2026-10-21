@@ -998,6 +998,73 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize(
+    ("saved_flag", "canonical_groups", "expected"),
+    [
+        pytest.param("absent", [], False, id="legacy-sidecar-empty-replay"),
+        pytest.param(
+            "absent", [{"group_id": "g0"}], True, id="legacy-sidecar-has-replay"
+        ),
+        pytest.param(False, [{"group_id": "g0"}], False, id="saved-false-wins"),
+        pytest.param(True, [], True, id="saved-true-wins"),
+    ],
+)
+def test_restore_decides_whether_a_batch_was_admitted(
+    tmp_path, saved_flag, canonical_groups, expected
+) -> None:
+    """A saved flag is used as is; a sidecar without one falls back to the replay state.
+
+    Sidecars written before the flag meant "a batch was admitted" carry whatever
+    ``sampler_stamps_target_steps`` was then, and the oldest carry none at all.
+    """
+
+    async def exercise() -> None:
+        state = build_rollout_recovery_state(
+            RolloutRecoveryLedger(),
+            batch_shortfall={},
+            sampler_stamps_target_steps=bool(saved_flag),
+        )
+        if saved_flag == "absent":
+            del state["sampler_stamps_target_steps"]
+        recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
+        torch.save(state, recovery_path)
+
+        ledger = RolloutRecoveryLedger()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller)
+        controller._restored_replay_groups_to_regenerate = []
+        controller._rollout_manager = _RecoveryRolloutManager(ledger)
+        controller._master_config = SimpleNamespace(
+            token_capture=SimpleNamespace(enabled=False)
+        )
+        controller._last_checkpoint_path = str(tmp_path)
+        controller._data_plane_checkpoint_metadata = {
+            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+            "rollout_recovery_group_count": 0,
+        }
+        controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
+        controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+        controller._dataloader = SimpleNamespace(dataset={}, collate_fn=rl_collate_fn)
+        controller._buffer = SimpleNamespace(
+            metadata_state_dict=lambda *, saved_capacity: {
+                "groups": canonical_groups,
+                "saved_capacity": saved_capacity,
+            },
+        )
+
+        await controller._maybe_restore_rollout_recovery(
+            restored_replay_groups=len(canonical_groups)
+        )
+
+        assert controller._batch_admitted is expected
+
+    asyncio.run(exercise())
+
+
 def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
     """A future phase must fail loudly instead of remaining owned forever."""
 

@@ -2057,7 +2057,8 @@ class RolloutManager:
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
-            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+            target_step: Training step this rollout targets, stamped on the buffer slot;
+                ``None`` when the sampler stamps no step.
             inflight_registry: Optional controller-owned mapping from group ID to
                 its dispatch task and start weight version.
             lineage_group_id: Stable group minted by the rollout ledger before
@@ -2074,7 +2075,7 @@ class RolloutManager:
             ``max_consecutive_dropped_prompts``. A ``SKIPPED`` prompt committed nothing,
             so the caller owns both its backpressure permit and the checkpoint-atomic
             transition from its retained ledger record to either a replacement prompt
-            or the shortfall for the training step it was stamped for.
+            or the shortfall for the training step it is charged to.
 
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out and the fleet has not

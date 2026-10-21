@@ -819,6 +819,27 @@ class TestSetup:
         assert rollout_manager.call_args.kwargs["reward_penalty_config"] is resolved
         assert actor_args.rollout_manager is rollout_manager.return_value
 
+    @pytest.mark.parametrize("use_dynamic_sampling", [True, False])
+    def test_checks_a_custom_sampler_for_drop_accounting_only_under_dynamic_sampling(
+        self, patched_factories, use_dynamic_sampling
+    ):
+        mc = _make_master_config()
+        mc.grpo.use_dynamic_sampling = use_dynamic_sampling
+
+        with (
+            patch.object(sc_setup_mod, "validate_single_controller_config"),
+            patch.object(
+                sc_setup_mod, "warn_if_custom_sampler_lacks_drop_accounting"
+            ) as warn_if_lacking,
+            patch.object(sc_setup_mod, "RolloutManager"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        if use_dynamic_sampling:
+            warn_if_lacking.assert_called_once_with(mc.async_rl.sampler)
+        else:
+            warn_if_lacking.assert_not_called()
+
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):

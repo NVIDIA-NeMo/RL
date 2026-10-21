@@ -537,6 +537,9 @@ class _FakeRolloutManager:
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
 
+    def set_tally_step_provider(self, provider: Any) -> None:
+        self.tally_step_provider = provider
+
     filter_zero_variance_groups = False
 
     def pop_step_reward_metrics(self, step: int) -> dict[str, float]:
@@ -1108,6 +1111,9 @@ class TestCounterRestore:
 
         assert actor._train_steps == 7
         assert actor._trainer_version == 11
+        # A group with no step of its own is charged to the step being assembled, so a
+        # resume that left this at 0 would charge the first loss to a long-closed step.
+        assert actor._assembling_version == 11
         assert actor._sampler.dispatch_index == 10
 
     def test_restores_exact_sampler_dispatch_index(self, tmp_path):
@@ -1132,6 +1138,7 @@ class TestCounterRestore:
 
         assert actor._train_steps == 0
         assert actor._trainer_version == 0
+        assert actor._assembling_version == 0
         assert actor._sampler.dispatch_index == -1
         assert actor._consumed_samples == 0
         assert actor._current_epoch == 0

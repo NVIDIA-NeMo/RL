@@ -2830,10 +2830,11 @@ class SingleControllerActor:
     def _target_groups_for_step(self, step: int) -> int:
         """How many prompt groups this step should train on, after dropped prompts.
 
-        ``num_prompts_per_step`` is the target; groups stamped for this step that were
-        given up on are subtracted, because they are never arriving and a sampler that
-        matches batches to steps exactly cannot substitute another step's groups for
-        them. Without this the pump waits on a group no one is generating.
+        ``num_prompts_per_step`` is the target; groups charged to this step that were
+        given up on are subtracted, because they are never arriving. Which step a lost
+        group is charged to is the sampler's call (see ``DropAccountingSampler``): the
+        step it was stamped for, the step being assembled, or none. Without this the
+        pump waits on a group no one is generating.
 
         The step trains on fewer samples than configured, which is the point: a smaller
         step beats a stalled run. The count is logged as ``dropped_prompt_groups`` so

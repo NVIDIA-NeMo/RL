@@ -195,6 +195,11 @@ class DropAccountingSampler(Protocol):
     sampler without these members the controller uses the gated defaults: the spare
     pool is on, the last step cannot close short, and the group is charged to its own
     ``target_step`` (or to the step being assembled if the sampler stamps none).
+
+    Declare the two flags as class attributes, not in ``__init__``. Setup validates the
+    sampler class before it is constructed, so flags that exist only on an instance are
+    invisible there and draw a warning even though the controller -- which checks the
+    instance -- would honour them.
     """
 
     uses_replacement_pool: ClassVar[bool]
@@ -643,6 +648,12 @@ class WeightFifoSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    # A replacement is dispatched at whatever the weight version is once the original
+    # was given up on. Unless the trainer has not moved since, that is a newer version
+    # than the bucket the replacement is meant to fill, and select -- which waits on the
+    # oldest in-window bucket alone -- then waits on a bucket nothing can top up. A pool
+    # that only works when the timing happens to line up is not one worth having.
+    uses_replacement_pool: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -969,6 +980,11 @@ def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
     ``isinstance``, so a class with only some of the members is treated as having none.
     That is easy to do by accident and changes behaviour silently, so name the members
     that are missing.
+
+    Checks the class, while the controller checks the constructed instance. A sampler
+    that assigns the flags in ``__init__`` is therefore warned about here and then
+    honoured at runtime. The protocol asks for class attributes precisely so the two
+    agree; the warning says so rather than pretending the members do not exist.
     """
     if not isinstance(cfg, CustomSamplerConfig):
         return
@@ -978,10 +994,10 @@ def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
     present = [m for m in _DROP_ACCOUNTING_MEMBERS if hasattr(sampler_cls, m)]
     missing = [m for m in _DROP_ACCOUNTING_MEMBERS if m not in present]
     detail = (
-        f"it defines only {present} and is missing {missing}, and a partial "
+        f"its class defines only {present} and is missing {missing}, and a partial "
         "implementation is ignored"
         if present
-        else "it does not implement DropAccountingSampler"
+        else "its class does not implement DropAccountingSampler"
     )
     warnings.warn(
         f"{sampler_cls.__name__} is used with dynamic sampling but {detail}. "
@@ -991,7 +1007,9 @@ def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
         "stamps none). That is right for a gated sampler. A sampler that keeps "
         "producing without a gate, like windowed, should implement "
         "DropAccountingSampler with uses_replacement_pool = False and "
-        "closes_short_at_exhaustion = True.",
+        "closes_short_at_exhaustion = True. Declare the flags as class attributes: "
+        "this check runs before the sampler is constructed, so flags assigned in "
+        "__init__ are not visible here even though the controller would honour them.",
         stacklevel=2,
     )
 

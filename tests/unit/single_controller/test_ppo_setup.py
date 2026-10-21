@@ -599,6 +599,7 @@ def _dynamic_sampling_config(
     on_dropped_prompt: str = "replace",
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
+    min_step_batch_fraction: float = 0.9,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
     mc = _make_master_config()
@@ -620,7 +621,10 @@ def _dynamic_sampling_config(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
         sampler=sampler_cfg,
-        rollout_failure={"on_dropped_prompt": on_dropped_prompt},
+        rollout_failure={
+            "on_dropped_prompt": on_dropped_prompt,
+            "min_step_batch_fraction": min_step_batch_fraction,
+        },
     )
     return mc
 
@@ -658,6 +662,38 @@ class TestDynamicSamplingValidation:
         mc = _dynamic_sampling_config(sampler="windowed", on_dropped_prompt="shrink")
 
         validate_single_controller_config(mc)
+
+    def test_windowed_warns_that_a_short_last_step_fails_under_the_default_floor(self):
+        """No spare pool, so the data ends mid-step and the tail is held to the floor."""
+        mc = _dynamic_sampling_config(sampler="windowed")
+
+        with pytest.warns(UserWarning, match="windowed sampler has no spare pool"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("sampler", "min_step_batch_fraction"),
+        [
+            # A floor of 1 lets the last step close on any non-empty remainder.
+            ("windowed", 1 / _NUM_PROMPTS_PER_STEP),
+            # Only windowed runs out of data mid-step; the others replace instead.
+            ("in_order", 0.9),
+            ("ready_first", 0.9),
+        ],
+    )
+    def test_no_tail_warning_when_the_last_step_cannot_fail(
+        self, sampler, min_step_batch_fraction
+    ):
+        mc = _dynamic_sampling_config(
+            sampler=sampler, min_step_batch_fraction=min_step_batch_fraction
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+
+        assert not [
+            w for w in caught if "windowed sampler has no spare pool" in str(w.message)
+        ]
 
     def test_a_gated_sampler_still_requires_replace(self):
         mc = _dynamic_sampling_config(sampler="ready_first", on_dropped_prompt="shrink")

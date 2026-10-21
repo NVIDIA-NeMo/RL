@@ -526,11 +526,8 @@ class TestReplaceDroppedPrompt:
 
     @pytest.mark.parametrize(
         "make_sampler",
-        [
-            lambda buf: WeightFifoSampler(buf, max_staleness_versions=1),
-            lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1),
-        ],
-        ids=["weight_fifo", "ready_first"],
+        [lambda buf: ReadyFirstSampler(buf, max_staleness_versions=1)],
+        ids=["ready_first"],
     )
     def test_a_gated_sampler_that_stamps_nothing_still_substitutes(self, make_sampler):
         """The pool does not depend on a stamp: the same slot just takes a new prompt."""
@@ -778,6 +775,16 @@ class TestTakeReplacement:
         ctrl._sampler = _PlainSampler()
         assert ctrl._take_replacement(None, 0) is not None
 
+    def test_the_per_slot_budget_stops_substituting(self):
+        ctrl = self._controller(max_replacement_attempts=2, spares=5)
+        assert ctrl._take_replacement(0, 1) is not None
+        assert ctrl._take_replacement(0, 2) is None
+
+    def test_an_empty_pool_shrinks_instead_of_waiting(self):
+        """At epoch end there is no more data; the step closes short, not never."""
+        ctrl = self._controller(spares=0)
+        assert ctrl._take_replacement(0, 0) is None
+
 
 class TestChargeShortfall:
     """Which step a permanently lost group is charged to, per sampler."""
@@ -839,16 +846,6 @@ class TestChargeShortfall:
         ctrl._assembling_version = 6
         ctrl._credit_shortfall(None)
         assert ctrl._batch_shortfall == {5: 1, 6: 1}
-
-    def test_the_per_slot_budget_stops_substituting(self):
-        ctrl = self._controller(max_replacement_attempts=2, spares=5)
-        assert ctrl._take_replacement(0, 1) is not None
-        assert ctrl._take_replacement(0, 2) is None
-
-    def test_an_empty_pool_shrinks_instead_of_waiting(self):
-        """At epoch end there is no more data; the step closes short, not never."""
-        ctrl = self._controller(spares=0)
-        assert ctrl._take_replacement(0, 0) is None
 
 
 class TestALostGroupDoesNotStallTheGate:
