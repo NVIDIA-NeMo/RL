@@ -7,15 +7,14 @@ from __future__ import annotations
 
 import argparse
 import ast
-from datetime import datetime, timezone
 import difflib
 import hashlib
 import json
 import os
-from pathlib import Path
 import stat
 import tempfile
-
+from datetime import datetime, timezone
+from pathlib import Path
 
 SITE_PACKAGES = Path("/opt/flint/envs/sglang/lib/python3.13/site-packages")
 PINS = {
@@ -50,9 +49,13 @@ def atomic_write(path, content, mode=0o600):
 
 
 def prepare(workspace, site_packages=SITE_PACKAGES):
-    manifest = json.loads((workspace / "sglang-overlay/hybrid-kv-offload.json").read_text())
+    manifest = json.loads(
+        (workspace / "sglang-overlay/hybrid-kv-offload.json").read_text()
+    )
     changes = manifest["changes"]
-    if len(changes) != len(PINS) or {change["relative_path"] for change in changes} != set(PINS):
+    if len(changes) != len(PINS) or {
+        change["relative_path"] for change in changes
+    } != set(PINS):
         raise RuntimeError("Unexpected SGLang overlay target list")
     plans, patch = [], []
     # Check every source, substitution, candidate, and target before changing any
@@ -60,9 +63,16 @@ def prepare(workspace, site_packages=SITE_PACKAGES):
     for change in changes:
         relative = Path(change["relative_path"])
         baseline_hash, candidate_hash = PINS[str(relative)]
-        if (change["baseline_sha256"], change["candidate_sha256"]) != (baseline_hash, candidate_hash):
+        if (change["baseline_sha256"], change["candidate_sha256"]) != (
+            baseline_hash,
+            candidate_hash,
+        ):
             raise RuntimeError("Overlay manifest differs from reviewed source pins")
-        baseline_path = workspace / "evidence/runtime-sglang-source" / relative.relative_to("sglang")
+        baseline_path = (
+            workspace
+            / "evidence/runtime-sglang-source"
+            / relative.relative_to("sglang")
+        )
         baseline = baseline_path.read_bytes()
         if digest(baseline) != baseline_hash:
             raise RuntimeError(f"Captured baseline hash differs: {relative}")
@@ -75,17 +85,37 @@ def prepare(workspace, site_packages=SITE_PACKAGES):
         ast.parse(candidate, filename=str(relative))
         target = site_packages / relative
         if target.is_symlink() or target.resolve() != target or not target.is_file():
-            raise RuntimeError(f"Refusing redirected or nonregular runtime source: {target}")
+            raise RuntimeError(
+                f"Refusing redirected or nonregular runtime source: {target}"
+            )
         before = digest(target.read_bytes())
         if before not in (baseline_hash, candidate_hash):
-            raise RuntimeError(f"Refusing unknown runtime source hash {before}: {target}")
-        plans.append({"target": target, "relative_path": str(relative), "candidate": candidate,
-                      "baseline_sha256": baseline_hash, "candidate_sha256": candidate_hash,
-                      "before_sha256": before, "mode": stat.S_IMODE(target.stat().st_mode)})
-        patch.extend(difflib.unified_diff(text.splitlines(True), candidate.decode().splitlines(True),
-                                          fromfile=f"a/{relative}", tofile=f"b/{relative}"))
+            raise RuntimeError(
+                f"Refusing unknown runtime source hash {before}: {target}"
+            )
+        plans.append(
+            {
+                "target": target,
+                "relative_path": str(relative),
+                "candidate": candidate,
+                "baseline_sha256": baseline_hash,
+                "candidate_sha256": candidate_hash,
+                "before_sha256": before,
+                "mode": stat.S_IMODE(target.stat().st_mode),
+            }
+        )
+        patch.extend(
+            difflib.unified_diff(
+                text.splitlines(True),
+                candidate.decode().splitlines(True),
+                fromfile=f"a/{relative}",
+                tofile=f"b/{relative}",
+            )
+        )
     expected_patch = "".join(patch).encode()
-    if (workspace / "sglang-overlay/hybrid-kv-offload.patch").read_bytes() != expected_patch:
+    if (
+        workspace / "sglang-overlay/hybrid-kv-offload.patch"
+    ).read_bytes() != expected_patch:
         raise RuntimeError("Review patch differs from verified source substitutions")
     return plans, expected_patch
 
@@ -97,25 +127,48 @@ def install(workspace, *, check_only=False, site_packages=SITE_PACKAGES):
         target = plan["target"]
         # Recheck immediately before replacing each file; do not overwrite a
         # concurrent edit made after the complete preflight.
-        if target.is_symlink() or target.resolve() != target or digest(target.read_bytes()) != plan["before_sha256"]:
+        if (
+            target.is_symlink()
+            or target.resolve() != target
+            or digest(target.read_bytes()) != plan["before_sha256"]
+        ):
             raise RuntimeError(f"Runtime source changed during preflight: {target}")
-        status = "already_applied" if plan["before_sha256"] == plan["candidate_sha256"] else "baseline_verified"
+        status = (
+            "already_applied"
+            if plan["before_sha256"] == plan["candidate_sha256"]
+            else "baseline_verified"
+        )
         if not check_only and status == "baseline_verified":
             atomic_write(target, plan["candidate"], plan["mode"])
             status = "applied"
         after = digest(target.read_bytes())
         if not check_only and after != plan["candidate_sha256"]:
-            raise RuntimeError(f"Runtime source did not match candidate after installation: {target}")
-        records.append({key: str(value) if isinstance(value, Path) else value for key, value in plan.items()
-                        if key not in ("candidate", "mode")})
+            raise RuntimeError(
+                f"Runtime source did not match candidate after installation: {target}"
+            )
+        records.append(
+            {
+                key: str(value) if isinstance(value, Path) else value
+                for key, value in plan.items()
+                if key not in ("candidate", "mode")
+            }
+        )
         records[-1].update(status=status, after_sha256=after)
-    receipt = {"schema_version": 1, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-               "status": "verified" if check_only else "applied_or_already_applied", "check_only": check_only,
-               "scope": "Propagate memory-saver enablement into both hybrid SWA leaf KV pools; no model weights or arithmetic changed",
-               "files": records, "patch_sha256": digest(patch)}
+    receipt = {
+        "schema_version": 1,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "verified" if check_only else "applied_or_already_applied",
+        "check_only": check_only,
+        "scope": "Propagate memory-saver enablement into both hybrid SWA leaf KV pools; no model weights or arithmetic changed",
+        "files": records,
+        "patch_sha256": digest(patch),
+    }
     if not check_only:
         atomic_write(workspace / "evidence/sglang-hybrid-kv-offload.patch", patch)
-        atomic_write(workspace / "evidence/sglang-runtime-overlay.json", (json.dumps(receipt, indent=2) + "\n").encode())
+        atomic_write(
+            workspace / "evidence/sglang-runtime-overlay.json",
+            (json.dumps(receipt, indent=2) + "\n").encode(),
+        )
     return receipt
 
 

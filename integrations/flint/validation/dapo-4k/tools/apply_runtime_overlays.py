@@ -18,18 +18,23 @@ from __future__ import annotations
 
 import argparse
 import ast
-from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
 import socket
 import stat
+from datetime import datetime, timezone
+from pathlib import Path
 
-
-ROUTER_ARGS_TARGET = Path("/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang_router/router_args.py")
-ROUTER_ARGS_BASELINE_SHA256 = "189b46ce5ed15067c7e97605d402e15767d64f5b2810b6fb2db77db22cbf8016"
-ROUTER_ARGS_CANDIDATE_SHA256 = "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8"
+ROUTER_ARGS_TARGET = Path(
+    "/opt/flint/envs/sglang/lib/python3.13/site-packages/sglang_router/router_args.py"
+)
+ROUTER_ARGS_BASELINE_SHA256 = (
+    "189b46ce5ed15067c7e97605d402e15767d64f5b2810b6fb2db77db22cbf8016"
+)
+ROUTER_ARGS_CANDIDATE_SHA256 = (
+    "09cd8984a1f693cc2efe40b963befd6d5bc578e972272e994a046f183807f3e8"
+)
 ROUTER_ARGS_SUFFIX = (
     b"\n\n# Compatibility for NeMo RL's managed-router configuration field.\n"
     b"RouterArgs.router_policy = property(lambda self: self.policy, lambda self, value: setattr(self, 'policy', value))\n"
@@ -82,7 +87,7 @@ def prepare_router_args():
     elif before == ROUTER_ARGS_CANDIDATE_SHA256:
         if not current.endswith(ROUTER_ARGS_SUFFIX):
             raise RuntimeError("Router candidate lacks its reviewed suffix")
-        baseline = current[:-len(ROUTER_ARGS_SUFFIX)]
+        baseline = current[: -len(ROUTER_ARGS_SUFFIX)]
     else:
         raise RuntimeError(f"Unknown router runtime source hash: {before}")
     if hashlib.sha256(baseline).hexdigest() != ROUTER_ARGS_BASELINE_SHA256:
@@ -103,7 +108,9 @@ def prepare_router_args():
 
 
 def install(base, receipt_path):
-    automodel = load_module(base / "tools/apply_automodel_overlay.py", "flint_auto_overlay")
+    automodel = load_module(
+        base / "tools/apply_automodel_overlay.py", "flint_auto_overlay"
+    )
     sglang = load_module(base / "tools/apply_sglang_overlay.py", "flint_sg_overlay")
     # Validate all four targets before replacing any runtime file. The SGLang
     # helper reads the already captured baseline; it makes no new source copies.
@@ -149,7 +156,15 @@ def install(base, receipt_path):
         "scope": "Container runtime targets only; earlier run and model sources are read-only",
     }
     sglang.atomic_write(receipt_path, (json.dumps(receipt, indent=2) + "\n").encode())
-    print(json.dumps({"status": "pass", "hostname": socket.gethostname(), "targets": len(records)}))
+    print(
+        json.dumps(
+            {
+                "status": "pass",
+                "hostname": socket.gethostname(),
+                "targets": len(records),
+            }
+        )
+    )
     return receipt
 
 
@@ -160,7 +175,9 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     if not output.is_relative_to(Path("/flint-run/evidence")):
-        raise RuntimeError("Runtime receipts must be written under the new run evidence directory")
+        raise RuntimeError(
+            "Runtime receipts must be written under the new run evidence directory"
+        )
     install(args.base, output)
 
 

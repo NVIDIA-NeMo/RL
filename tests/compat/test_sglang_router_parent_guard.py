@@ -5,12 +5,11 @@
 from __future__ import annotations
 
 import ast
-from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
-
 
 SOURCE = (
     Path(__file__).resolve().parents[2]

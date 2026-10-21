@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 
 import pytest
+import transformers
 from tokenizers import Tokenizer, normalizers, pre_tokenizers, processors
 from tokenizers.models import WordLevel
-import transformers
 from transformers import AutoTokenizer
 from transformers.models.auto import tokenization_auto
 

@@ -1,6 +1,4 @@
 defaults: ../../grpo_math_1B_sglang.yaml
-
-# First-four-layer integration proxy. This is not a convergence recipe.
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 2
@@ -9,14 +7,9 @@ grpo:
   use_leave_one_out_baseline: false
   skip_reference_policy_logprobs_calculation: true
   val_period: 0
-  val_at_start: false
-  val_at_end: false
   reward_scaling:
     enabled: true
     target_min: -1.0
-  reward_shaping:
-    enabled: false
-
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
@@ -24,14 +17,11 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-
 checkpointing:
-  enabled: true
   checkpoint_dir: /flint-work/results/math
   metric_name: null
   keep_top_k: 1
   save_period: 1
-
 policy:
   model_name: /flint-work/checkpoint
   hf_config_overrides:
@@ -43,12 +33,7 @@ policy:
   logprob_batch_size: 1
   refit_buffer_size_gb: 1
   max_total_sequence_length: 128
-  precision: bfloat16
   automodel_cfg:
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    sequence_parallel: false
-    activation_checkpointing: false
     automodel_kwargs:
       force_hf: false
       enable_hf_state_dict_adapter: true
@@ -66,13 +51,10 @@ policy:
     enabled: false
   optimizer:
     kwargs:
-      lr: 1.0e-6
+      lr: 1.0e-06
       weight_decay: 0.0
   generation:
     max_new_tokens: 16
-    temperature: 1.0
-    top_p: 1.0
-    top_k: null
     sglang_cfg:
       trust_remote_code: false
       dtype: bfloat16
@@ -85,7 +67,6 @@ policy:
       disable_radix_cache: true
       disable_overlap_schedule: true
       disable_cuda_graph: true
-      cuda_graph_backend_prefill: disabled
       cuda_graph_backend_decode: disabled
       mem_fraction_static: 0.25
       max_running_requests: 4
@@ -94,10 +75,7 @@ policy:
       true_on_policy_contract: null
       sglang_server_config:
         num_gpus: 4
-        needs_offload: true
-        cpu_weight_backup: true
         sglang_server_concurrency: 4
-
 data:
   shuffle: false
   num_workers: 0
@@ -109,21 +87,12 @@ data:
     split_validation_size: 0
   default:
     prompt_file: null
-    system_prompt_file: null
-    processor: math_hf_data_processor
-    env_name: math
-
 env:
   math:
     num_workers: 1
-    math_verify_impl: hf_math_verify
-
 logger:
   log_dir: /flint-work/logs/math
   wandb_enabled: false
-  tensorboard_enabled: false
   monitor_gpus: false
-
 cluster:
   gpus_per_node: 4
-  num_nodes: 1

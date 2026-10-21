@@ -16,11 +16,13 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
-SPEC = importlib.util.spec_from_file_location("checkpoint_window", Path(__file__).with_name("checkpoint_window.py"))
+SPEC = importlib.util.spec_from_file_location(
+    "checkpoint_window", Path(__file__).with_name("checkpoint_window.py")
+)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 

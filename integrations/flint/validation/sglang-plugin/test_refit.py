@@ -12,10 +12,10 @@ from __future__ import annotations
 import ast
 import importlib.util
 import logging
-from pathlib import Path
 import sys
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 SOURCE = Path(__file__).resolve().parents[1] / "src/flint_sglang"
 spec = importlib.util.spec_from_file_location("flint_refit_tested", SOURCE / "refit.py")

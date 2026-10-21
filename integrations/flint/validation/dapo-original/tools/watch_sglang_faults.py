@@ -23,18 +23,17 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import signal
 import sys
 import tempfile
 import time
-
+from datetime import datetime, timezone
+from pathlib import Path
 
 READ_BYTES = 64 * 1024
 MAX_LINE_BYTES = 1024 * 1024
@@ -74,7 +73,9 @@ def atomic_json(path, value):
 
 def validate_pid(pid):
     if pid <= 1 or pid in (os.getpid(), os.getppid()):
-        raise ValueError("Driver PID must exceed one and cannot be the watcher or its parent")
+        raise ValueError(
+            "Driver PID must exceed one and cannot be the watcher or its parent"
+        )
 
 
 def _native_pidfd(operation, first, second=0):
@@ -82,7 +83,9 @@ def _native_pidfd(operation, first, second=0):
     if operation not in {"pidfd_open", "pidfd_send_signal"}:
         raise ValueError("Unknown pidfd operation")
     if sys.platform != "linux":
-        raise RuntimeError("Linux pidfd support is required; refusing a PID-only signal fallback")
+        raise RuntimeError(
+            "Linux pidfd support is required; refusing a PID-only signal fallback"
+        )
     libc = ctypes.CDLL(None, use_errno=True)
     function = getattr(libc, operation, None)
     ctypes.set_errno(0)
@@ -92,7 +95,12 @@ def _native_pidfd(operation, first, second=0):
             function.argtypes = [ctypes.c_int, ctypes.c_uint]
             result = function(first, 0)
         else:
-            function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+            function.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
             result = function(first, second, None, 0)
     else:
         # These numbers are shared by Linux's verified aarch64 and x86_64 ABIs.
@@ -108,8 +116,13 @@ def _native_pidfd(operation, first, second=0):
         if operation == "pidfd_open":
             result = syscall(ctypes.c_long(434), ctypes.c_int(first), ctypes.c_uint(0))
         else:
-            result = syscall(ctypes.c_long(424), ctypes.c_int(first), ctypes.c_int(second),
-                             ctypes.c_void_p(), ctypes.c_uint(0))
+            result = syscall(
+                ctypes.c_long(424),
+                ctypes.c_int(first),
+                ctypes.c_int(second),
+                ctypes.c_void_p(),
+                ctypes.c_uint(0),
+            )
     if result < 0:
         error = ctypes.get_errno()
         raise OSError(error, f"{operation}: {os.strerror(error)}")
@@ -134,7 +147,7 @@ def _stat_identity(payload):
     closing = payload.rfind(")")
     if closing < 0:
         raise ValueError("Malformed Linux process stat")
-    fields = payload[closing + 2:].split()
+    fields = payload[closing + 2 :].split()
     if len(fields) < 20:
         raise ValueError("Incomplete Linux process stat")
     return fields[0], int(fields[19])  # state (field 3), starttime (field 22).
@@ -152,8 +165,11 @@ def read_identity(pid, proc_root=Path("/proc")):
         return None
     if state_again in ("Z", "X", "x") or born_again != born or not command:
         return None
-    return {"pid": pid, "start_time_ticks": born,
-            "cmdline_sha256": hashlib.sha256(command).hexdigest()}
+    return {
+        "pid": pid,
+        "start_time_ticks": born,
+        "cmdline_sha256": hashlib.sha256(command).hexdigest(),
+    }
 
 
 class ProcessGuard:
@@ -213,10 +229,12 @@ class FatalDetector:
         match = WORKER_PREFIX.match(content)
         context = match.group(1) if match else "driver"
         if match:
-            content = content[match.end():]
+            content = content[match.end() :]
         if "Traceback (most recent call last):" in content:
             self.tracebacks[context] = line_number
-        scheduler_fatal = bool(SGLANG_CONTEXT.fullmatch(context) and SCHEDULER_FATAL.fullmatch(content))
+        scheduler_fatal = bool(
+            SGLANG_CONTEXT.fullmatch(context) and SCHEDULER_FATAL.fullmatch(content)
+        )
         fatal = FATAL.fullmatch(content)
         if fatal is None and not scheduler_fatal:
             return None
@@ -224,10 +242,15 @@ class FatalDetector:
             first = self.tracebacks.get(context)
             if first is None or line_number - first > 4096:
                 return None
-        return {"exception_line": content, "worker_context": context,
-                "fatal_kind": "sglang_scheduler_exception" if scheduler_fatal else "cuda_illegal_memory_access",
-                "line_number": line_number,
-                "raw_line_sha256": hashlib.sha256(raw_line).hexdigest()}
+        return {
+            "exception_line": content,
+            "worker_context": context,
+            "fatal_kind": "sglang_scheduler_exception"
+            if scheduler_fatal
+            else "cuda_illegal_memory_access",
+            "line_number": line_number,
+            "raw_line_sha256": hashlib.sha256(raw_line).hexdigest(),
+        }
 
 
 class LogTail:
@@ -278,10 +301,16 @@ def watch(pid, log, output, *, interval=2.0, guard_factory=None, sleeper=None):
     validate_pid(pid)
     guard_factory = ProcessGuard.capture if guard_factory is None else guard_factory
     sleeper = time.sleep if sleeper is None else sleeper
-    receipt = {"schema_version": 1, "status": "watching", "driver_pid": pid,
-               "log_path": str(log), "started_at_utc": utc_now(),
-               "signal_scope": "Only supplied driver process through its pinned Linux pidfd",
-               "signal": "SIGTERM", "poll_interval_seconds": interval}
+    receipt = {
+        "schema_version": 1,
+        "status": "watching",
+        "driver_pid": pid,
+        "log_path": str(log),
+        "started_at_utc": utc_now(),
+        "signal_scope": "Only supplied driver process through its pinned Linux pidfd",
+        "signal": "SIGTERM",
+        "poll_interval_seconds": interval,
+    }
     guard, tail, fatal_seen = None, LogTail(log), False
     try:
         guard = guard_factory(pid)
@@ -294,8 +323,12 @@ def watch(pid, log, output, *, interval=2.0, guard_factory=None, sleeper=None):
         while True:
             state = guard.current_state()
             if state != "same":
-                receipt.update(status="fatal_detected_driver_ended" if fatal_seen else "driver_ended",
-                               terminal_driver_state=state)
+                receipt.update(
+                    status="fatal_detected_driver_ended"
+                    if fatal_seen
+                    else "driver_ended",
+                    terminal_driver_state=state,
+                )
                 return 0
             lines, read_data = tail.read()
             if not fatal_seen:
@@ -304,11 +337,17 @@ def watch(pid, log, output, *, interval=2.0, guard_factory=None, sleeper=None):
                     if match is None:
                         continue
                     fatal_seen = True
-                    receipt.update(status="fatal_detected", detected_at_utc=utc_now(),
-                                   detected_monotonic_ns=time.monotonic_ns(),
-                                   source={**match, "byte_offset": offset,
-                                           "file_identity": tail.file_identity()},
-                                   signal_action="pending_identity_check")
+                    receipt.update(
+                        status="fatal_detected",
+                        detected_at_utc=utc_now(),
+                        detected_monotonic_ns=time.monotonic_ns(),
+                        source={
+                            **match,
+                            "byte_offset": offset,
+                            "file_identity": tail.file_identity(),
+                        },
+                        signal_action="pending_identity_check",
+                    )
                     atomic_json(output, receipt)
                     receipt["signal_action"] = guard.terminate()
                     receipt["signal_checked_at_utc"] = utc_now()
@@ -317,8 +356,10 @@ def watch(pid, log, output, *, interval=2.0, guard_factory=None, sleeper=None):
             if fatal_seen or not read_data:
                 sleeper(interval)
     except Exception as error:
-        receipt.update(status="watcher_failed", error={"type": type(error).__name__,
-                                                       "message": str(error)})
+        receipt.update(
+            status="watcher_failed",
+            error={"type": type(error).__name__, "message": str(error)},
+        )
         return 1
     finally:
         if guard is not None:
