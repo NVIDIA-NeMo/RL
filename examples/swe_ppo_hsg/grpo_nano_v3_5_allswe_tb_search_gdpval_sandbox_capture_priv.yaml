@@ -18,7 +18,8 @@ ppo: null
 value: null
 value_loss_fn: null
 grpo:
-  num_prompts_per_step: 128
+  # 64 x 16 (user, 2026-10-21; was 128 x 16): at lag 1, 2,048 rollouts in flight, as the PPO arm's 512 x 1 at lag 3.
+  num_prompts_per_step: 64
   num_generations_per_prompt: 16
   max_rollout_turns: 1
   # SC clamps max_num_steps to max_num_epochs x batches, as in the PPO block.
