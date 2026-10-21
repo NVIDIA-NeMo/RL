@@ -78,6 +78,8 @@ def test_worker_merges_configured_env_vars_with_subclass_env_vars() -> None:
     apply_vllm_patches.assert_called_once_with(
         worker.py_executable,
         extra_env_vars=worker._extra_env_vars,
+        nemotron_h_fp32_lm_head=False,
+        require_moe_routed_experts_capture=False,
     )
 
 
