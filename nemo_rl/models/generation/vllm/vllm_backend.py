@@ -1536,11 +1536,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "a co-trained MTP drafter"
             )
 
+        # Dense drafters sit outside the layerwise reload targets and take the
+        # regular post-load pass in finalize. A TRTLLM MoE drafter would need
+        # its own layerwise reload.
         manifest = self._model_update_manifest
-        if manifest is not None and manifest.draft is not None:
+        adapter = self._draft_runtime_adapter
+        if (
+            manifest is not None
+            and manifest.draft is not None
+            and adapter is not None
+            and adapter.model is not None
+            and _model_uses_unquantized_flashinfer_trtllm(adapter.model)
+        ):
             raise RuntimeError(
                 "Unquantized FlashInfer TRTLLM refit does not yet support "
-                "a co-trained draft model"
+                "a co-trained draft model with TRTLLM MoE layers"
             )
 
     def _reject_unsupported_native_refit(
@@ -1591,6 +1601,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
 
             model = self.model_runner.model
             # DSV4 needs a full-model reload; BF16 TRTLLM reload stays scoped
@@ -1617,6 +1630,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                             model, reloaded_module_ids
                         )
                     _refresh_hpc_modules_after_layerwise_reload(model)
+                    self._maybe_process_draft_after_loading(
+                        process_weights_after_loading
+                    )
                     self._maybe_process_mtp_drafter_after_loading()
                 torch.cuda.synchronize()
 
