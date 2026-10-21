@@ -261,7 +261,10 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+# sbatch --chdir changes the job cwd, while SLURM_SUBMIT_DIR still names the
+# original submission directory. Ray propagates the driver cwd to its workers,
+# where an older checkout can otherwise shadow the requested PYTHONPATH.
+COMMON_SRUN_ARGS+=" --container-workdir=$(pwd -P)"
 if [[ -n "${CONTAINER_ENV_VARS:-}" ]]; then
   COMMON_SRUN_ARGS+=" --container-env=$CONTAINER_ENV_VARS"
 fi
