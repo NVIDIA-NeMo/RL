@@ -3549,6 +3549,14 @@ class SingleControllerActor:
                 will_save_checkpoint = self._master_config.checkpointing[
                     "enabled"
                 ] and (should_save_by_step or should_save_by_timeout)
+                loop_will_exit = is_last_step or should_save_by_timeout
+                skip_terminal_refit = will_save_checkpoint and loop_will_exit
+                if skip_terminal_refit:
+                    # Persist the committed learner before shutdown. Generation
+                    # will be initialized from that checkpoint on resume; a final
+                    # transfer only risks losing the update before it is durable.
+                    # Keep in-flight calls stamped with their actual old weights.
+                    self._rollout_permitted.clear()
                 # A colocated Megatron wake is itself the refit (prepare_for_generation reshards or
                 # shares the trainer's tensors), so a save-bound step skips _sync_weights and
                 # splits it: offload before the save, wake after it.
@@ -3571,6 +3579,15 @@ class SingleControllerActor:
                             pass
                         with self._timer.time("offload_before_refit"):
                             await asyncio.to_thread(self._trainer.offload_before_refit)
+                    elif skip_terminal_refit:
+                        # Settle deferred learner-side parameter gathers without
+                        # involving the generation fleet in the terminal save.
+                        with self._timer.time(
+                            "prepare_for_checkpoint/sync_policy_params"
+                        ):
+                            await asyncio.to_thread(
+                                self._trainer.sync_params_before_refit
+                            )
                     else:
                         # Named to match async GRPO's refit phase: training cannot
                         # proceed and generation is serving stale weights, so the
@@ -3587,8 +3604,9 @@ class SingleControllerActor:
                             aborted_stale_inflight_groups = await self._sync_weights(
                                 calibration_data=calibration_data,
                             )
-                self._retune_lookahead_versions()
-                self._rollout_manager.set_weight_version(self._trainer_version)
+                if not skip_terminal_refit:
+                    self._retune_lookahead_versions()
+                    self._rollout_manager.set_weight_version(self._trainer_version)
                 step_metrics.update(
                     {
                         "evicted_stale_prompt_groups": evicted_stale_prompt_groups,
@@ -3631,7 +3649,6 @@ class SingleControllerActor:
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
                         # Deliberately a bare wake, not `_sync_weights`.
-                        loop_will_exit = is_last_step or should_save_by_timeout
                         if not loop_will_exit:
                             with self._timer.time("weight_sync"):
                                 # The save onloaded model+optimizer; generation needs offload.

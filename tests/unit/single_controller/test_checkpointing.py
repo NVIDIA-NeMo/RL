@@ -1162,6 +1162,92 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    @pytest.mark.parametrize("blocking", [False, True])
+    @pytest.mark.parametrize("exit_reason", ["last_step", "timeout"])
+    def test_terminal_save_does_not_depend_on_generation_refit(
+        self, tmp_path: Path, blocking: bool, exit_reason: str
+    ) -> None:
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1 if exit_reason == "last_step" else 4,
+            save_period=100,
+            checkpoint_must_save_by=(
+                "00:00:00:00" if exit_reason == "timeout" else None
+            ),
+        )
+        events: list[str] = []
+        trainer = _RefitRecordingTrainer(events)
+        manager = _FakeRolloutManager(events)
+        synchronizer = _FakeWeightSynchronizer(events)
+        synchronizer.sync_weights = MagicMock(
+            side_effect=AssertionError("terminal save attempted a generation refit")
+        )
+
+        actor = _run_train_pump(
+            mc,
+            _make_actor_args(
+                trainer=trainer,
+                gen=_FakeGeneration(events if blocking else None),
+                weight_synchronizer=synchronizer,
+                rollout_manager=manager,
+            ),
+            seed=lambda actor: trainer.set_gate_probe(actor._rollout_permitted.is_set),
+        )
+
+        assert actor._train_steps == 1
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
+        info = _training_info(tmp_path / "checkpoints", 1)
+        assert info["trainer_version"] == 1
+        assert info["consumed_samples"] == 2
+        assert trainer.gate_open_during_save == [False]
+        assert not actor._rollout_permitted.is_set()
+        # The learner advanced, but generation still holds version zero.
+        # Neither live calls nor recovered replay may be relabeled as version one.
+        assert manager.weight_versions == []
+        synchronizer.sync_weights.assert_not_called()
+        assert "resume_deadlines" not in events
+
+    def test_periodic_streaming_save_refits_until_terminal_save(
+        self, tmp_path: Path
+    ) -> None:
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=1)
+        manager = _FakeRolloutManager()
+        synchronizer = _FakeWeightSynchronizer()
+
+        actor = _run_train_pump(
+            mc,
+            _make_actor_args(rollout_manager=manager, weight_synchronizer=synchronizer),
+        )
+
+        assert actor._train_steps == 2
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1", "step_2"}
+        assert synchronizer.sync_count == 1
+        assert manager.weight_versions == [1]
+        assert _training_info(tmp_path / "checkpoints", 2)["trainer_version"] == 2
+
+    def test_resume_initial_refit_publishes_the_saved_learner_version(
+        self, tmp_path: Path
+    ) -> None:
+        mc = _actor_master_config(tmp_path, max_num_steps=1, save_period=100)
+        _run_train_pump(mc, _make_actor_args())
+        saved = _get_grpo_save_state(_training_info(tmp_path / "checkpoints", 1))
+        manager = _FakeRolloutManager()
+        synchronizer = _FakeWeightSynchronizer()
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_actor_args(
+                save_state=saved,
+                weight_synchronizer=synchronizer,
+                rollout_manager=manager,
+            ),
+        )
+
+        assert actor._trainer_version == 1
+        assert actor._train_steps == 1
+        assert synchronizer.sync_count == 1
+        assert manager.weight_versions == [1]
+
     def test_saves_on_period_boundary_and_last_step(self, tmp_path):
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FakeTrainer()
