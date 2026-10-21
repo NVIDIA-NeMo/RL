@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[3]
@@ -131,3 +132,45 @@ def test_docker_images_build_deepep_with_multinode_hybridep() -> None:
             < nvml_link_dependency_purge_index
             < nvml_link_dependencies_purge_index
         ), f"{dockerfile} does not prepare multi-node DeepEP before dependency sync"
+
+
+def test_docker_image_keeps_uv_cache_by_default() -> None:
+    dockerfile = REPO_ROOT / "docker/Dockerfile"
+    lines = [line.strip() for line in dockerfile.read_text().splitlines()]
+
+    declarations = [line for line in lines if line.startswith("ARG STRIP_UV_CACHE")]
+    assert declarations, f"{dockerfile} does not declare STRIP_UV_CACHE"
+    for declaration in declarations:
+        assert declaration in ("ARG STRIP_UV_CACHE", "ARG STRIP_UV_CACHE=0"), (
+            f"{dockerfile} strips the uv cache by default: {declaration}"
+        )
+
+    callers = [
+        str(path.relative_to(REPO_ROOT))
+        for path in (REPO_ROOT / ".github").rglob("*")
+        if path.is_file() and "STRIP_UV_CACHE" in path.read_text(errors="ignore")
+    ]
+    assert not callers, (
+        f"CI images must keep the uv cache: {callers} set STRIP_UV_CACHE"
+    )
+
+    for line in lines:
+        if 'rm -rf "${UV_CACHE_DIR}"' in line:
+            assert "STRIP_UV_CACHE" in line, (
+                f"{dockerfile} deletes the uv cache without the opt-in: {line}"
+            )
+
+
+def test_uv_cache_mount_id_matches_build_container_workflow() -> None:
+    dockerfile_text = (REPO_ROOT / "docker/Dockerfile").read_text()
+    workflow_text = (REPO_ROOT / ".github/workflows/_build_container.yml").read_text()
+
+    ids = set(re.findall(r"id=uv-cache-([^,]+),", dockerfile_text))
+    assert len(ids) == 1, ids
+    # the workflow takes arch from PLATFORM, not a Dockerfile-resolved ARG
+    df_vars = set(re.findall(r"\$\{(\w+)\}", ids.pop())) - {"TARGETARCH"}
+
+    step = workflow_text.split("id: uv_cache\n", 1)[1].split("- name:", 1)[0]
+    wf_vars = set(re.findall(r"=\$\(resolve_arg (\w+)\)", step))
+
+    assert df_vars == wf_vars, (df_vars, wf_vars)

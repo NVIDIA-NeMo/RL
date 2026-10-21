@@ -24,6 +24,8 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+# Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
+#   --build-arg STRIP_UV_CACHE=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 # Global so every stage's uv cache mount id (BASE_IMAGE-UV_VERSION-HYBRID_EP_MULTINODE)
@@ -68,6 +70,12 @@ FROM scratch AS uv-cache-output-base
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
 COPY docker/install_apptainer.sh /
+
+# Shared helper for the uv cache mount's materialize/sync-back/strip dance
+# (docker/uv_cache_mount.sh), bind-mounted into every uv-writing RUN below so
+# the logic lives in one place instead of being pasted into each RUN body.
+FROM scratch AS uv-cache-helper
+COPY docker/uv_cache_mount.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -270,6 +278,7 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
+    --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # /root/.uv-cache-store is a BuildKit cache mount: durable across builds on
 # this id (seeded from the :uv-cache registry image on first-ever use), but
@@ -278,18 +287,18 @@ RUN --mount=type=ssh \
 # filesystem -- hardlinks silently fall back to full copies across a mount
 # boundary. So materialize a plain working copy at UV_CACHE_DIR for this RUN
 # (hardlinking stays exactly as before), and sync it back on exit so new
-# downloads persist for the next build. Every later RUN in this stage that
-# also invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase
-# 2, Gym prefetch) repeats this same dance around its own unchanged body.
+# downloads persist for the next build. This is the first uv-writing RUN in
+# the stage, so it force-copies the whole store in and prunes on sync-back
+# (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
+# invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase 2,
+# Gym prefetch) sources the same helper but only tops up what it adds,
+# instead of re-shipping the whole store again in its own layer.
 # Whether the materialized copy also ships in the final image (for the
 # RUNTIME_UID's offline `uv run --extra <backend>`, see base) or is stripped
 # back out is controlled by STRIP_UV_CACHE below.
-mkdir -p "${UV_CACHE_DIR}"
-rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
-trap '
-  rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
-  if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
-' EXIT
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore force
+trap 'uv_cache_persist prune' EXIT
 
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
@@ -418,17 +427,16 @@ RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked \
+    --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install RUN above,
 # repeated here because a BuildKit cache mount only applies to the RUN
 # instruction it's declared on -- this RUN's own uv sync calls below need the
-# plain, same-filesystem UV_CACHE_DIR too.
-mkdir -p "${UV_CACHE_DIR}"
-rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
-trap '
-  rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
-  if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
-' EXIT
+# plain, same-filesystem UV_CACHE_DIR too. UV_CACHE_DIR already exists from
+# that layer, so this only tops it up if STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
 
 # Lock/pyproject consistency is verified LATE here, for the whole image. The
 # dependency syncs above run --frozen (read-only on uv.lock: they neither update
@@ -672,7 +680,8 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
@@ -680,29 +689,26 @@ fi
 # Same materialize/sync-back/strip dance as the other uv-writing RUNs --
 # docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR override, so
 # it uses the image-wide UV_CACHE_DIR (set in base), which must be a plain
-# same-filesystem directory for hardlink installs.
-mkdir -p "${UV_CACHE_DIR}"
-rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
-trap '
-  rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
-  if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
-' EXIT
+# same-filesystem directory for hardlink installs. Already exists from the
+# hermetic stage unless STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
 bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 # Same materialize/sync-back/strip dance as the dependency-install and
 # TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
-# the plain, same-filesystem UV_CACHE_DIR to hardlink installs from.
-mkdir -p "${UV_CACHE_DIR}"
-rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
-trap '
-  rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
-  if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
-' EXIT
+# the plain, same-filesystem UV_CACHE_DIR to hardlink installs from. Already
+# exists from an earlier layer unless STRIP_UV_CACHE removed it there.
+source /tmp/uv-cache-helper/uv_cache_mount.sh
+uv_cache_restore
+trap 'uv_cache_persist' EXIT
 
 # Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
 # (the runtime default of the TRT-LLM build backend). It lives in that layer,
@@ -747,18 +753,17 @@ EOF
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
 ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.29.0
-RUN --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
+    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     # Same materialize/sync-back/strip dance as the other uv-writing RUNs.
     # The outer `uv run` here is symlink-mode (safe across the mount), but
     # prefetch_venvs.py's inner Gym venvs install with UV_LINK_MODE=hardlink,
-    # which needs the plain same-filesystem UV_CACHE_DIR.
-    mkdir -p "${UV_CACHE_DIR}"
-    rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
-    trap '
-      rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
-      if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
-    ' EXIT
+    # which needs the plain same-filesystem UV_CACHE_DIR. Already exists from
+    # an earlier layer unless STRIP_UV_CACHE removed it there.
+    source /tmp/uv-cache-helper/uv_cache_mount.sh
+    uv_cache_restore
+    trap 'uv_cache_persist' EXIT
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
@@ -851,6 +856,12 @@ if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
 fi
 mkdir -p /tmp/uv-cache-export
 cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
+# Keep only wheels built from source (e.g. DeepEP) in the next seed. Prebuilt
+# wheels (torch, vLLM, ...) are downloaded again by the next build into
+# UV_CACHE_DIR regardless, so versions the lock no longer uses don't pile up
+# in the seed across every build that doesn't bump BASE_IMAGE, UV_VERSION, or
+# HYBRID_EP_MULTINODE -- the only things that otherwise reset this cache.
+UV_CACHE_DIR=/tmp/uv-cache-export uv cache prune --ci
 echo "uv cache export payload:"
 du -sh /tmp/uv-cache-export
 EOF

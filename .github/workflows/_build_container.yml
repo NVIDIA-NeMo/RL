@@ -58,7 +58,7 @@ on:
       uv-cache-tag:
         required: false
         default: ""
-        description: Tag for the uv download-cache image (e.g. "uv-cache"). Empty disables the cache.
+        description: Prefix for the uv download-cache image tag (e.g. "uv-cache"); the target architecture and a hash of BASE_IMAGE, UV_VERSION and HYBRID_EP_MULTINODE are appended automatically. Empty disables the cache.
         type: string
       trtllm-cache-scope:
         required: false
