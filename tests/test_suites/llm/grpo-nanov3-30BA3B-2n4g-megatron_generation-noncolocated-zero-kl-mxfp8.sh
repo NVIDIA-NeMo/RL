@@ -1,8 +1,8 @@
 #!/bin/bash
 # Five-step GB200 test for zero train/generation KL on Nemotron Nano v3 30B-A3B (hybrid
-# Mamba + squared-ReLU MoE) with MXFP8 routed experts (attention, shared experts and Mamba
-# mixers BF16): Megatron training (TP1, EP4) against non-colocated Megatron
-# inference (torch MXFP8 grouped GEMM) with the batch-invariant kernel stack.
+# Mamba + squared-ReLU MoE) with MXFP8 linear_qkv, linear_proj and routed experts (attention
+# core, shared experts and Mamba mixers BF16): Megatron training (TP2, EP4) against non-colocated Megatron
+# inference (torch MXFP8 grouped GEMM, chunked prefill) with the batch-invariant kernel stack.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 

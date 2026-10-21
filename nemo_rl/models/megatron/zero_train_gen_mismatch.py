@@ -134,10 +134,11 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
             f"{', '.join(missing_fields)}."
         )
 
-    if megatron_cfg.get("tensor_model_parallel_size") != 1:
+    if (megatron_cfg.get("tensor_model_parallel_size") or 1) > 2:
         out.violations.append(
             "batch_invariant_mode=True currently requires "
-            "policy.megatron_cfg.tensor_model_parallel_size=1."
+            "policy.megatron_cfg.tensor_model_parallel_size <= 2: at TP >= 3 "
+            "Megatron-Core's TP reductions sum in a message-layout dependent order."
         )
     if megatron_cfg.get("context_parallel_size") != 1:
         out.violations.append(
@@ -273,8 +274,13 @@ def allow_installed_flash_attn_4() -> None:
     mcore_attention.HAVE_FA4 = True
 
 
-class _Tp1LocalLogprob:
-    """At TP size 1, use the log-softmax Megatron Inference uses (bitwise)."""
+class _FullVocabLogprob:
+    """Use the full-vocab log-softmax Megatron Inference uses (bitwise).
+
+    At TP size > 1 the vocab-parallel logits are all-gathered first: the
+    distributed log-softmax sums per-rank partial normalizers, which rounds
+    differently from Megatron Inference's single full-row reduction.
+    """
 
     def __init__(self, original: Any, *, chunked: bool) -> None:
         self._original = original
@@ -289,8 +295,36 @@ class _Tp1LocalLogprob:
         else:
             logits, target, start, end, group, inference_only = args
             chunk_size = None
-        if group is None or torch.distributed.get_world_size(group) != 1:
+        if group is None:
             return self._original.apply(*args)
+        if torch.distributed.get_world_size(group) > 1:
+            # Deferred: Megatron-Core exists only in worker venvs.
+            from megatron.core.tensor_parallel.mappings import (
+                gather_from_tensor_model_parallel_region,
+            )
+
+            # Gather per sequence chunk so only one chunk's full-vocab logits
+            # exist at a time. The gather is an exact copy; its backward splits
+            # the gradient back to the local shard.
+            seq_len = int(target.shape[1])
+            step = chunk_size or seq_len
+            out_chunks = []
+            for chunk_start in range(0, seq_len, step):
+                chunk_end = min(seq_len, chunk_start + step)
+                full_logits = gather_from_tensor_model_parallel_region(
+                    logits[:, chunk_start:chunk_end, :], group=group
+                )
+                out_chunks.append(
+                    model_utils._tp_target_logprobs(
+                        full_logits,
+                        target[:, chunk_start:chunk_end],
+                        vocab_start_index=0,
+                        vocab_end_index=full_logits.shape[-1],
+                        tp_group=None,
+                        inference_only=inference_only,
+                    )
+                )
+            return torch.cat(out_chunks, dim=1).contiguous()
         return model_utils._tp_target_logprobs(
             logits,
             target,
@@ -302,7 +336,7 @@ class _Tp1LocalLogprob:
         )
 
 
-def _use_fused_log_softmax_at_tp1() -> None:
+def _use_full_vocab_log_softmax() -> None:
     # Deferred: model_utils is heavy and only needed once the shim is installed.
     from nemo_rl.distributed import model_utils
 
@@ -311,8 +345,29 @@ def _use_fused_log_softmax_at_tp1() -> None:
         ("ChunkedDistributedLogprob", True),
     ):
         current = getattr(model_utils, name)
-        if not isinstance(current, _Tp1LocalLogprob):
-            setattr(model_utils, name, _Tp1LocalLogprob(current, chunked=chunked))
+        if not isinstance(current, _FullVocabLogprob):
+            setattr(model_utils, name, _FullVocabLogprob(current, chunked=chunked))
+
+
+def _enable_mcore_deterministic_tuning() -> None:
+    """Pin Megatron-Core's Triton kernel configs when MAMBA_DETERMINISTIC=1 is set.
+
+    Megatron-Core with ``megatron.core.tuning`` (NVIDIA/Megatron-LM#6076) no longer
+    reads MAMBA_DETERMINISTIC. Its SSM kernels, and the hybrid batch-invariant check
+    in TransformerConfig, follow ``set_deterministic_mode``, and ``install`` pins
+    every in-scope autotuner without timing, so training and generation pick the
+    same config per shape. Megatron's own training sets these from
+    --deterministic-mode, which NeMo-RL does not go through. Older Megatron-Core
+    reads the variable itself.
+    """
+    if not os.environ.get("MAMBA_DETERMINISTIC", "").startswith("1"):
+        return
+    try:
+        from megatron.core import tuning
+    except ImportError:
+        return
+    tuning.set_deterministic_mode(True)
+    tuning.install(deterministic=True)
 
 
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
@@ -333,7 +388,8 @@ def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     enable_mcore_batch_invariant_mode(
         backend=megatron_cfg["batch_invariant_backend"], collective=collective
     )
-    _use_fused_log_softmax_at_tp1()
+    _enable_mcore_deterministic_tuning()
+    _use_full_vocab_log_softmax()
     print(
         "[zero_train_gen_mismatch] batch-invariant kernels enabled: "
         f"backend={megatron_cfg['batch_invariant_backend']} "

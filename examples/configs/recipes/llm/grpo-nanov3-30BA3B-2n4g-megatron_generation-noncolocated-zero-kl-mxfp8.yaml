@@ -1,11 +1,8 @@
 # Nemotron Nano v3 30B-A3B (hybrid Mamba + squared-ReLU MoE) zero train/generation KL
-# with MXFP8 routed experts; attention, the shared experts and the Mamba mixers stay BF16.
-# The Nano MXFP8-rollouts recipe moved onto the Qwen3-30B-A3B zero-KL layout: one training
-# node (TP1, EP4) and one non-colocated Megatron generation node on the torch MXFP8
-# grouped GEMM, against TE's MXFP8 grouped GEMM in training.
-#
-# Needs Megatron-LM PR #7562 (batch-invariant squared ReLU and Mamba train/generation
-# parity) and PR #8195 (fp64 batch-invariant expert combine).
+# with MXFP8 linear_qkv, linear_proj and routed experts; the attention core, the shared
+# experts and the Mamba mixers stay BF16. One training node (TP2, EP4) and one non-colocated Megatron generation node
+# with the same layout, on the torch MXFP8 grouped GEMM against TE's MXFP8 grouped GEMM in
+# training, with chunked prefill.
 defaults: grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-mxfp8-rollouts.yaml
 grpo:
   max_num_steps: 5
@@ -44,12 +41,12 @@ policy:
       # With MAMBA_DETERMINISTIC, the SSM Triton ops otherwise skip autotuning and fall back
       # to their cheapest config.
       TRITON_CACHE_AUTOTUNING: '1'
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 4
-    sequence_parallel: false
+    sequence_parallel: true
     moe_router_dtype: fp32
     defer_fp32_logits: true
     activation_checkpointing: true
@@ -57,7 +54,7 @@ policy:
     # The batch-invariant generation squared ReLU reproduces the fused training op's
     # rounding; the unfused op rounds differently.
     use_fused_weighted_squared_relu: true
-    te_precision_config_file: examples/te_precision/nanov3_routed_experts_mxfp8.yaml
+    te_precision_config_file: examples/te_precision/nanov3_linear_mxfp8.yaml
     fp8_cfg:
       enabled: true
       fp8: hybrid
@@ -71,9 +68,10 @@ policy:
         gpus_per_node: ${cluster.gpus_per_node}
         num_nodes: 1
     mcore_generation_config:
-      tensor_model_parallel_size: 1
+      tensor_model_parallel_size: 2
       expert_model_parallel_size: 4
-      sequence_parallel: false
+      # Megatron Inference's inference_optimized layers require it at TP > 1.
+      sequence_parallel: true
       moe_router_dtype: fp32
       logprobs_mode: raw_logprobs
       enable_chunked_prefill: true
