@@ -706,20 +706,31 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def _get_mxfp8_linear_reload_roots(self) -> tuple[torch.nn.Module, ...]:
         roots = self._nrl_mxfp8_linear_reload_roots
         if roots is None:
-            from nemo_rl.models.generation.vllm.quantization.fp8 import (
-                uses_native_mxfp8_linear_refit,
-            )
+            # Test doubles may omit model_runner or its model. Skip the cache
+            # until a real model exists so a later scan still finds its roots.
+            model = getattr(getattr(self, "model_runner", None), "model", None)
+            modules = getattr(model, "modules", None)
+            if modules is None:
+                return ()
+            # Only modules with a linear kernel can be native MXFP8. Filter first
+            # so models without one never import the vLLM-heavy fp8 module.
+            candidates = [
+                module
+                for module in modules()
+                if getattr(getattr(module, "quant_method", None), "kernel", None)
+                is not None
+            ]
+            roots = ()
+            if candidates:
+                from nemo_rl.models.generation.vllm.quantization.fp8 import (
+                    uses_native_mxfp8_linear_refit,
+                )
 
-            modules = getattr(self.model_runner.model, "modules", None)
-            roots = (
-                tuple(
+                roots = tuple(
                     module
-                    for module in modules()
+                    for module in candidates
                     if uses_native_mxfp8_linear_refit(module)
                 )
-                if modules is not None
-                else ()
-            )
             self._nrl_mxfp8_linear_reload_roots = roots
         return roots
 

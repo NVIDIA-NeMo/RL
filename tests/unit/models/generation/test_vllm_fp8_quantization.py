@@ -3045,7 +3045,7 @@ def test_prequantized_grouped_expert_scale_rejects_unvalidated_layout(
     fp8_module, monkeypatch
 ):
     fp8 = fp8_module
-    fp8.global_fp8_config = types.SimpleNamespace(refit_prequantize=True)
+    fp8.global_fp8_config = types.SimpleNamespace(is_mx=False, refit_prequantize=True)
     monkeypatch.setattr(fp8, "_is_fp8_weight", lambda *_args: True)
     scale_name = "model.layers.0.mlp.experts.gate_up_proj_scale_from_checkpoint"
     runner = types.SimpleNamespace(
