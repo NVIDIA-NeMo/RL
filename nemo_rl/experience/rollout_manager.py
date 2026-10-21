@@ -1235,18 +1235,19 @@ class AsyncNemoGymRolloutImpl:
         return env_timing_metrics
 
     @staticmethod
-    def _retire_unreturned_ledgers(
-        nemo_gym_env: Any, inputs: list[dict], results: list[Optional[dict]]
-    ) -> None:
-        """Queue the capture ledgers of rows that returned no result.
+    def _retire_dispatch_ledgers(nemo_gym_env: Any, inputs: list[dict]) -> None:
+        """Queue the capture ledgers of every row in a finished dispatch.
 
-        The call is not awaited, because this runs while a failure or cancellation unwinds.
+        Called once the row re-dispatch loop is over, whether the dispatch succeeded or not.
+        Until then a row can be re-sent under the same rollout ID, and a retired ID would discard its capture.
+        Afterwards nothing reads these manifests again:
+        a returned row's receipt already carries its manifest,
+        and any later retry of the prompt group runs under fresh rollout IDs.
+        The call is not awaited, because it can run while a failure or cancellation unwinds.
         The actor batches the request with its own retirements and retries it.
         """
         rollout_ids = [
-            row["_ng_rollout_id"]
-            for row in inputs
-            if "_ng_rollout_id" in row and results[row["_rowidx"]] is None
+            row["_ng_rollout_id"] for row in inputs if "_ng_rollout_id" in row
         ]
         if not rollout_ids:
             return
@@ -1385,12 +1386,9 @@ class AsyncNemoGymRolloutImpl:
                     if last_error is None:
                         raise failure
                     raise failure from last_error
-            except BaseException:
-                # NeMo RL will never read these rows' manifests.
-                # Retire them on the actor that ran them, whose model server holds the ledgers.
-                # Rows with a result were retired when their manifest was read.
-                self._retire_unreturned_ledgers(nemo_gym_env, inputs, results)
-                raise
+            finally:
+                # Retire on the actor that ran the rows, whose model server holds the ledgers.
+                self._retire_dispatch_ledgers(nemo_gym_env, inputs)
 
             completed_results = [result for result in results if result is not None]
             completed_shaping = [
