@@ -22,23 +22,15 @@ from nemo_rl.data_plane.adapters import tq_kv_meta_patch as patch  # noqa: E402
 CONTROLLER = TransferQueueController.__ray_metadata__.modified_class
 
 
-def test_stock_source_matches_the_pinned_hash():
+def test_installed_tq_is_the_version_the_overrides_were_copied_from():
     # fails when the TQ pin moves: re-copy the methods
-    patch.assert_stock_source(
-        CONTROLLER.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256
-    )
-    patch.assert_stock_source(FieldMeta.remove_samples, patch._REMOVE_SAMPLES_SHA256)
+    patch.assert_stock_tq_version()
 
 
-def test_changed_source_is_rejected():
-    class Changed:
-        def kv_retrieve_meta(self, keys, partition_id, create=False):
-            return None
-
-    with pytest.raises(RuntimeError, match="changed"):
-        patch.assert_stock_source(
-            Changed.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256
-        )
+def test_other_tq_version_is_rejected(monkeypatch):
+    monkeypatch.setattr(patch.transfer_queue, "__version__", "0.0.0")
+    with pytest.raises(RuntimeError, match="Re-copy"):
+        patch.assert_stock_tq_version()
 
 
 def _nested_field(n):

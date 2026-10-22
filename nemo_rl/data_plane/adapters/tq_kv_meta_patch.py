@@ -24,25 +24,19 @@ only after ``RESCAN_REMOVED_FRACTION`` of them is gone.
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 """
 
-import hashlib
-import inspect
 import logging
 from typing import Any
 
 import ray
+import transfer_queue
 import transfer_queue.interface as interface
 from transfer_queue.controller import FieldMeta
 from transfer_queue.metadata import BatchMeta
 
 logger = logging.getLogger(__name__)
 
-# sha256 of the stock methods' source at the pinned TQ revision (see pyproject.toml).
-_KV_RETRIEVE_META_SHA256 = (
-    "25635dcd71647ad7a03e284976e0b7aebc04ba7b6829cad59df1532d46e15301"
-)
-_REMOVE_SAMPLES_SHA256 = (
-    "847e2e96135d7be868cfcc0865e6a69649e586e1dbe60178f2a3f5ef20afb09f"
-)
+# The TransferQueue version the overrides below were copied from (see the pin in pyproject.toml).
+STOCK_TQ_VERSION = "0.1.11"
 
 # A nested field rescans its shapes once this fraction of its live samples was removed.
 RESCAN_REMOVED_FRACTION = 1 / 8
@@ -152,28 +146,24 @@ def patch_field_meta() -> None:
     FieldMeta.removed_since_scan = 0
 
 
-def assert_stock_source(method: Any, sha256: str) -> None:
-    """Check that ``method``'s source still matches the copy this module overrides.
-
-    Args:
-        method: The stock TransferQueue method.
-        sha256: The sha256 of its source at the pinned TQ revision.
+def assert_stock_tq_version() -> None:
+    """Check that the installed TransferQueue is the version the overrides were copied from.
 
     Raises:
-        RuntimeError: If the source changed, which means the TQ pin moved.
+        RuntimeError: If the version differs, which means the TQ pin moved.
     """
-    if hashlib.sha256(inspect.getsource(method).encode()).hexdigest() != sha256:
+    if transfer_queue.__version__ != STOCK_TQ_VERSION:
         raise RuntimeError(
-            f"transfer_queue's {method.__qualname__} changed, so the tq_kv_meta_patch override would replace newer "
-            "code. The TQ pin in pyproject.toml has moved: re-copy the method."
+            f"transfer_queue is {transfer_queue.__version__}, but tq_kv_meta_patch copies methods from "
+            f"{STOCK_TQ_VERSION}. Re-copy kv_retrieve_meta and FieldMeta.remove_samples, then update "
+            "STOCK_TQ_VERSION."
         )
 
 
 def make_patched_controller(actor_class: Any) -> Any:
     """Return a Ray actor class that runs the controller with both overrides."""
+    assert_stock_tq_version()
     base = actor_class.__ray_metadata__.modified_class
-    assert_stock_source(base.kv_retrieve_meta, _KV_RETRIEVE_META_SHA256)
-    assert_stock_source(FieldMeta.remove_samples, _REMOVE_SAMPLES_SHA256)
 
     class PatchedController(base):
         _nrl_kv_meta_patched = True
