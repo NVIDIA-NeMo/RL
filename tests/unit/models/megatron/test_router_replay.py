@@ -190,7 +190,9 @@ def test_build_router_replay_tensors_maps_global_moe_layer_order():
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[1, 0, 1, 0])
+            self.config = SimpleNamespace(
+                num_layers=4, moe_layer_freq=[1, 0, 1, 0], moe_router_topk=2
+            )
             self.router_1 = DummyRouter(RouterReplay(), layer_number=1)
             self.router_3 = DummyRouter(RouterReplay(), layer_number=3)
 
@@ -230,7 +232,9 @@ def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 1, 0])
+            self.config = SimpleNamespace(
+                num_layers=4, moe_layer_freq=[0, 1, 1, 0], moe_router_topk=2
+            )
             self.router_2 = DummyRouter(RouterReplay(), layer_number=2)
             self.router_3 = DummyRouter(RouterReplay(), layer_number=3)
 
@@ -329,7 +333,9 @@ def test_router_replay_excludes_mtp_subtrees_by_default(monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.config = SimpleNamespace(
+                num_layers=1, moe_layer_freq=[1], moe_router_topk=2
+            )
             self.decoder_router = DummyRouter(RouterReplay(), layer_number=1)
             self.mtp = DummyMTPStack()
 
@@ -396,7 +402,9 @@ def test_router_replay_can_include_mtp_subtrees_when_env_disabled(monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.config = SimpleNamespace(
+                num_layers=1, moe_layer_freq=[1], moe_router_topk=2
+            )
             self.decoder_router = DummyRouter(RouterReplay(), layer_number=1)
             self.mtp = DummyMTPStack()
 
@@ -450,7 +458,9 @@ def test_router_replay_excluded_mtp_only_rank_noops(monkeypatch):
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=1, moe_layer_freq=[1])
+            self.config = SimpleNamespace(
+                num_layers=1, moe_layer_freq=[1], moe_router_topk=2
+            )
             self.mtp = DummyMTPStack()
 
     try:
@@ -497,7 +507,9 @@ def test_router_replay_assignments_use_layer_numbers_for_model_chunks():
                 )
 
     try:
-        config = SimpleNamespace(num_layers=8, moe_layer_freq=[1] * 8)
+        config = SimpleNamespace(
+            num_layers=8, moe_layer_freq=[1] * 8, moe_router_topk=2
+        )
         chunk_1 = DummyChunk([5, 7], config)
         chunk_0 = DummyChunk([1, 3], config)
         model_chunks = [chunk_1, chunk_0]
@@ -561,7 +573,9 @@ def test_build_router_replay_tensors_rejects_partial_padded_layer_payload():
         def __init__(self):
             super().__init__()
             self.config = SimpleNamespace(
-                num_layers=8, moe_layer_freq=[0, 1, 0, 1, 0, 1, 0, 0]
+                num_layers=8,
+                moe_layer_freq=[0, 1, 0, 1, 0, 1, 0, 0],
+                moe_router_topk=2,
             )
             self.router_2 = DummyRouter(RouterReplay(), layer_number=2)
             self.router_4 = DummyRouter(RouterReplay(), layer_number=4)
@@ -607,7 +621,9 @@ def test_router_replay_actions_are_scoped_to_model_instances():
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[1, 0, 1, 0])
+            self.config = SimpleNamespace(
+                num_layers=4, moe_layer_freq=[1, 0, 1, 0], moe_router_topk=2
+            )
             self.router_1 = DummyRouter(RouterReplay(), layer_number=1)
             self.router_3 = DummyRouter(RouterReplay(), layer_number=3)
 
@@ -675,7 +691,9 @@ def test_router_replay_noops_on_pp_rank_without_local_moe_layers():
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
+            self.config = SimpleNamespace(
+                num_layers=4, moe_layer_freq=[0, 1, 0, 1], moe_router_topk=2
+            )
             self.layer_1 = DenseLayer(layer_number=1)
             self.layer_3 = DenseLayer(layer_number=3)
 
@@ -711,7 +729,9 @@ def test_router_replay_requires_instances_on_pp_rank_with_local_moe_layers():
     class DummyModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
+            self.config = SimpleNamespace(
+                num_layers=4, moe_layer_freq=[0, 1, 0, 1], moe_router_topk=2
+            )
             self.layer_2 = MoeLayerWithoutReplay(layer_number=2)
 
     try:
@@ -1124,6 +1144,7 @@ def test_build_router_replay_tensors_splits_tokens_for_sequence_parallel(monkeyp
                 num_layers=4,
                 moe_layer_freq=[1, 0, 1, 0],
                 sequence_parallel=True,
+                moe_router_topk=2,
             )
             self.router_1 = DummyRouter(RouterReplay(), layer_number=1)
             self.router_3 = DummyRouter(RouterReplay(), layer_number=3)
@@ -1178,6 +1199,7 @@ def test_build_router_replay_tensors_skips_duplicate_check_by_default(monkeypatc
                 num_layers=1,
                 moe_layer_freq=[1],
                 num_moe_experts=8,
+                moe_router_topk=2,
             )
             self.router_1 = DummyRouter(RouterReplay(), layer_number=1)
 
@@ -1216,6 +1238,7 @@ def test_build_router_replay_tensors_rejects_duplicate_topk_rows_when_enabled(
                 num_layers=1,
                 moe_layer_freq=[1],
                 num_moe_experts=8,
+                moe_router_topk=2,
             )
             self.router_1 = DummyRouter(RouterReplay(), layer_number=1)
 

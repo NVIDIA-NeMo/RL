@@ -679,7 +679,7 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
     sink.media_pixel_dtype = torch.bfloat16
     stager = TQMegatronTokenStager(sink)
     capture = MagicMock()
-    capture.complete_call_from_response.return_value = MagicMock(
+    capture.complete_call.return_value = MagicMock(
         model_dump=lambda mode: {"disposition": "staged"}
     )
     stager._capture = capture
@@ -688,17 +688,13 @@ def test_megatron_stager_passes_media_tensors_as_attachments(media_tensors):
         if media_tensors is None
         else _minf_payload(multimodal=True, media_tensors=media_tensors)
     )
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="r0", model_call_id="c1", mode="text"
-    ).model_dump(mode="json")
     result = stager._stage_admitted(
         payload,
-        capture_payload=admission,
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 0)]),
+        call=SimpleNamespace(admission=SimpleNamespace(prev_len=0)),
         minf_params={MEDIA_PREV_COUNT_KEY: 0, MEDIA_PREV_SIZES_KEY: []},
     )
     assert result.response_metadata == {"ng_commit_coords": {"disposition": "staged"}}
-    attachments = capture.complete_call_from_response.call_args.kwargs["attachments"]
+    attachments = capture.complete_call.call_args.kwargs["attachments"]
     if not media_tensors:
         assert attachments is None
         return
