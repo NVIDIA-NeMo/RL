@@ -41,6 +41,17 @@ Create a shell script in the matching domain (`tests/test_suites/llm/` or `tests
 
 Append the driver script path (relative to `tests/test_suites/`) to @tests/test_suites/nightly.txt.
 
+### 4. Check rollout performance
+
+Every test that generates (vLLM, SGLang, TRT-LLM, Megatron inference or
+Dynamo) goes through the `rollout-perf` skill
+(@.agents/contributor-skills/rollout-perf/SKILL.md):
+1. Diagnose the first run.
+2. Prove the effective engine settings from the engine log, for example that
+   CUDA graphs are on.
+3. Set `NUM_MINUTES` from the measured wall time instead of copying the
+   240-minute template value.
+
 ## Recipe Naming Rules
 
 ### LLM Pattern
