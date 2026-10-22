@@ -37,6 +37,11 @@ policy:
     # Keep policy scoring and checkpoint recomputation on the qualified BF16
     # kernels. This requires the source-pinned native TE/MCore runtime.
     stable_policy_forward: true
+    # Match the vision kernels used by the qualified full-context runs.
+    model_overrides:
+      vision_attention_impl: torch_sdpa
+      vision_mlp_impl: torch
+      vision_qkv_impl: torch
     # Use Bridge's native Super-VL activation fusion. The unfused weighted
     # ReLU2 retains a full FP32 expert activation before its BF16 cast and
     # exhausts H100 memory during long-row backward recomputation.

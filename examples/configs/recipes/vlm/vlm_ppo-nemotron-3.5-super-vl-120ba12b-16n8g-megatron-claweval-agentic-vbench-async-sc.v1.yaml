@@ -60,7 +60,98 @@ value:
     enabled: false
     reward_model_type: regression
   dtensor_cfg: ${policy.dtensor_cfg}
-  megatron_cfg: ${policy.megatron_cfg}
+  # Keep a separate critic config tree: overriding an interpolated whole
+  # mapping also changes the actor. Share individual settings explicitly.
+  megatron_cfg:
+    enabled: ${policy.megatron_cfg.enabled}
+    checkpoint:
+      async_save: ${policy.megatron_cfg.checkpoint.async_save}
+    empty_unused_memory_level: ${policy.megatron_cfg.empty_unused_memory_level}
+    activation_checkpointing: ${policy.megatron_cfg.activation_checkpointing}
+    bias_activation_fusion: ${policy.megatron_cfg.bias_activation_fusion}
+    tensor_model_parallel_size: ${policy.megatron_cfg.tensor_model_parallel_size}
+    expert_tensor_parallel_size: ${policy.megatron_cfg.expert_tensor_parallel_size}
+    expert_model_parallel_size: ${policy.megatron_cfg.expert_model_parallel_size}
+    pipeline_model_parallel_size: ${policy.megatron_cfg.pipeline_model_parallel_size}
+    num_layers_in_first_pipeline_stage: ${policy.megatron_cfg.num_layers_in_first_pipeline_stage}
+    num_layers_in_last_pipeline_stage: ${policy.megatron_cfg.num_layers_in_last_pipeline_stage}
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.megatron_cfg.pipeline_dtype}
+    sequence_parallel: ${policy.megatron_cfg.sequence_parallel}
+    freeze_moe_router: ${policy.megatron_cfg.freeze_moe_router}
+    moe_router_dtype: ${policy.megatron_cfg.moe_router_dtype}
+    moe_router_load_balancing_type: ${policy.megatron_cfg.moe_router_load_balancing_type}
+    moe_router_bias_update_rate: ${policy.megatron_cfg.moe_router_bias_update_rate}
+    moe_permute_fusion: ${policy.megatron_cfg.moe_permute_fusion}
+    moe_enable_deepep: ${policy.megatron_cfg.moe_enable_deepep}
+    moe_token_dispatcher_type: ${policy.megatron_cfg.moe_token_dispatcher_type}
+    moe_aux_loss_coeff: ${policy.megatron_cfg.moe_aux_loss_coeff}
+    moe_router_enable_expert_bias: ${policy.megatron_cfg.moe_router_enable_expert_bias}
+    apply_rope_fusion: ${policy.megatron_cfg.apply_rope_fusion}
+    defer_fp32_logits: ${policy.megatron_cfg.defer_fp32_logits}
+    track_moe_metrics: ${policy.megatron_cfg.track_moe_metrics}
+    moe_per_layer_logging: ${policy.megatron_cfg.moe_per_layer_logging}
+    moe_shared_expert_overlap: ${policy.megatron_cfg.moe_shared_expert_overlap}
+    gradient_accumulation_fusion: ${policy.megatron_cfg.gradient_accumulation_fusion}
+    use_fused_weighted_squared_relu: ${policy.megatron_cfg.use_fused_weighted_squared_relu}
+    optimizer:
+      optimizer: ${policy.megatron_cfg.optimizer.optimizer}
+      lr: ${policy.megatron_cfg.optimizer.lr}
+      min_lr: ${policy.megatron_cfg.optimizer.min_lr}
+      weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      bf16: ${policy.megatron_cfg.optimizer.bf16}
+      fp16: ${policy.megatron_cfg.optimizer.fp16}
+      params_dtype: ${policy.megatron_cfg.optimizer.params_dtype}
+      adam_beta1: ${policy.megatron_cfg.optimizer.adam_beta1}
+      adam_beta2: ${policy.megatron_cfg.optimizer.adam_beta2}
+      adam_eps: ${policy.megatron_cfg.optimizer.adam_eps}
+      sgd_momentum: ${policy.megatron_cfg.optimizer.sgd_momentum}
+      clip_grad: ${policy.megatron_cfg.optimizer.clip_grad}
+      use_distributed_optimizer: ${policy.megatron_cfg.optimizer.use_distributed_optimizer}
+      use_precision_aware_optimizer: ${policy.megatron_cfg.optimizer.use_precision_aware_optimizer}
+      optimizer_cpu_offload: ${policy.megatron_cfg.optimizer.optimizer_cpu_offload}
+      optimizer_offload_fraction: ${policy.megatron_cfg.optimizer.optimizer_offload_fraction}
+      overlap_cpu_optimizer_d2h_h2d: ${policy.megatron_cfg.optimizer.overlap_cpu_optimizer_d2h_h2d}
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.scheduler.start_weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.scheduler.end_weight_decay}
+      weight_decay_incr_style: ${policy.megatron_cfg.scheduler.weight_decay_incr_style}
+      lr_decay_style: ${policy.megatron_cfg.scheduler.lr_decay_style}
+      lr_decay_iters: ${policy.megatron_cfg.scheduler.lr_decay_iters}
+      lr_warmup_iters: ${policy.megatron_cfg.scheduler.lr_warmup_iters}
+      lr_warmup_init: ${policy.megatron_cfg.scheduler.lr_warmup_init}
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: ${policy.megatron_cfg.distributed_data_parallel_config.grad_reduce_in_fp32}
+      overlap_grad_reduce: ${policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce}
+      overlap_param_gather: ${policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather}
+      average_in_collective: ${policy.megatron_cfg.distributed_data_parallel_config.average_in_collective}
+      use_custom_fsdp: ${policy.megatron_cfg.distributed_data_parallel_config.use_custom_fsdp}
+      data_parallel_sharding_strategy: ${policy.megatron_cfg.distributed_data_parallel_config.data_parallel_sharding_strategy}
+    env_vars:
+      NCCL_ALGO: ${policy.megatron_cfg.env_vars.NCCL_ALGO}
+      NCCL_PROTO: ${policy.megatron_cfg.env_vars.NCCL_PROTO}
+      NRL_REFIT_BUFFER_MEMORY_RATIO: ${policy.megatron_cfg.env_vars.NRL_REFIT_BUFFER_MEMORY_RATIO}
+      NRL_REFIT_NUM_BUFFERS: ${policy.megatron_cfg.env_vars.NRL_REFIT_NUM_BUFFERS}
+    mtp_num_layers: ${policy.megatron_cfg.mtp_num_layers}
+    radio_force_cpe_eval_mode: ${policy.megatron_cfg.radio_force_cpe_eval_mode}
+    freeze_vision_model: ${policy.megatron_cfg.freeze_vision_model}
+    freeze_vision_projection: ${policy.megatron_cfg.freeze_vision_projection}
+    freeze_sound_encoder: ${policy.megatron_cfg.freeze_sound_encoder}
+    freeze_sound_projection: ${policy.megatron_cfg.freeze_sound_projection}
+    mtp_use_repeated_layer: ${policy.megatron_cfg.mtp_use_repeated_layer}
+    mtp_detach_heads: ${policy.megatron_cfg.mtp_detach_heads}
+    mtp_loss_scaling_factor: ${policy.megatron_cfg.mtp_loss_scaling_factor}
+    fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
+    offload_logprob_logits_to_cpu: ${policy.megatron_cfg.offload_logprob_logits_to_cpu}
+    stable_policy_forward: ${policy.megatron_cfg.stable_policy_forward}
+    model_overrides:
+      vision_attention_impl: ${policy.megatron_cfg.model_overrides.vision_attention_impl}
+      vision_mlp_impl: ${policy.megatron_cfg.model_overrides.vision_mlp_impl}
+      vision_qkv_impl: ${policy.megatron_cfg.model_overrides.vision_qkv_impl}
+      # Full-KV attention avoids BF16 partial-output merging in native p2p CP.
+      # Full recomputation groups two decoder layers to reduce saved inputs.
+      cp_comm_type: all_gather
+      recompute_num_layers: 2
   hf_config_overrides: ${policy.hf_config_overrides}
   dynamic_batching: ${policy.dynamic_batching}
   sequence_packing: ${policy.sequence_packing}
