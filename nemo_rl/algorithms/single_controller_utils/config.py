@@ -479,6 +479,13 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
+    # Finalize async policy checkpoints (policy.megatron_cfg.checkpoint.async_save)
+    # at a later step boundary, once every rank's background write is done, instead
+    # of from a background thread whose blocking finalize holds the policy workers
+    # until the write lands. tmp_step_N is renamed to step_N after that finalize; the
+    # next save and training exit still finalize blocking. Shortens steps only with
+    # non-colocated generation: colocated refits finish the write before offloading.
+    defer_async_checkpoint_finalize: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -1359,6 +1366,21 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if async_config.defer_async_checkpoint_finalize:
+        megatron_cfg = master_config.policy.get("megatron_cfg")
+        megatron_checkpoint_cfg = (
+            megatron_cfg.get("checkpoint")
+            if megatron_cfg is not None and megatron_cfg["enabled"]
+            else None
+        )
+        if megatron_checkpoint_cfg is None or not megatron_checkpoint_cfg.get(
+            "async_save"
+        ):
+            raise ValueError(
+                "async_rl.defer_async_checkpoint_finalize requires the Megatron "
+                "policy backend with policy.megatron_cfg.checkpoint.async_save=true."
+            )
 
     reward_penalties_enabled = any(
         getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS

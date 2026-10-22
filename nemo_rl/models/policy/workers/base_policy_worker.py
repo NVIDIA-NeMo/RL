@@ -363,8 +363,14 @@ class AbstractPolicyWorker:
         pass
 
     def poll_async_save(self) -> bool:
-        """Finalize a completed async checkpoint write without waiting; True when none is pending."""
-        return True
+        """Finalize a completed async checkpoint write without waiting; True when none is pending.
+
+        Not implemented by default: answering True for a backend that writes in the
+        background would let the caller publish a checkpoint whose write hasn't landed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support polling async checkpoint saves."
+        )
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation

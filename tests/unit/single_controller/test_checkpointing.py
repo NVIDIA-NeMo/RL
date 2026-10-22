@@ -226,6 +226,26 @@ class _GatedFinalizeTrainer(_FakeTrainer):
         super().finalize_async_save()
 
 
+class _PollingTrainer(_FakeTrainer):
+    """Async-save stand-in for deferred finalize: poll_async_save answers in order."""
+
+    def __init__(self, poll_answers: list[bool], checkpoint_dir: Path) -> None:
+        super().__init__()
+        self._poll_answers = list(poll_answers)
+        self._checkpoint_dir = checkpoint_dir
+        self.poll_calls = 0
+        # Published step dirs at each save_checkpoint call, in call order.
+        self.published_at_save: list[set[str]] = []
+
+    def poll_async_save(self) -> bool:
+        self.poll_calls += 1
+        return self._poll_answers.pop(0) if self._poll_answers else False
+
+    def save_checkpoint(self, **kwargs: Any) -> None:
+        self.published_at_save.append(_step_dir_names(self._checkpoint_dir))
+        super().save_checkpoint(**kwargs)
+
+
 class _FailingFinalizeTrainer(_FakeTrainer):
     def finalize_async_save(self) -> None:
         raise RuntimeError("injected async-writer failure")
@@ -758,6 +778,7 @@ def _actor_master_config(
     rollout_checkpoint_attempt_interval_s: Optional[float] = None,
     token_capture_enabled: bool = False,
     load_replay_buffer: bool = True,
+    defer_finalize: bool = False,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -815,6 +836,7 @@ def _actor_master_config(
             min_groups_for_streaming_train=1,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
+            defer_async_checkpoint_finalize=defer_finalize,
         ),
         rollout_checkpointing=RolloutCheckpointConfig(
             snapshot_attempt_interval_s=rollout_checkpoint_attempt_interval_s
@@ -1438,6 +1460,48 @@ class TestSaveTrigger:
 
         # step_2 from ft_save_period, step_3 from last-step.
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
+
+    def test_deferred_finalize_publishes_after_a_successful_poll(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        # Step 3's poll finds the step-2 writes unfinished; step 4's finds them done.
+        trainer = _PollingTrainer([False, True], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        # step_2 was published by the poll, before the step-4 save started.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        # Only the save left pending at exit was finalized blocking.
+        assert trainer.finalize_calls == 1
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+        with open(ckpt_dir / "latest_checkpoint_status.json") as status_file:
+            assert json.load(status_file)["last_checkpoint_step"] == 4
+
+    def test_deferred_finalize_blocks_at_the_next_save_if_writes_are_unfinished(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=4, save_period=2, defer_finalize=True
+        )
+        ckpt_dir = tmp_path / "checkpoints"
+        trainer = _PollingTrainer([False, False], ckpt_dir)
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer))
+
+        assert trainer.poll_calls == 2
+        # The step-4 save first finalized and published step_2 itself.
+        assert trainer.published_at_save == [set(), {"step_2"}]
+        assert trainer.finalize_calls == 2
+        assert _step_dir_names(ckpt_dir) == {"step_2", "step_4"}
+
+    def test_deferred_finalize_requires_megatron_async_save(self, tmp_path):
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+
+        with pytest.raises(ValueError, match="checkpoint.async_save=true"):
+            validate_single_controller_config(mc)
 
 
 class TestFinalizerStateRelease:
