@@ -589,6 +589,7 @@ jobs:
         BUILD_DYNAMO=1
         TRTLLM_BUILD_JOBS=24
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
+        STRIP_UV_CACHE=1
 
   build-container-gb200:
     name: Build GB200/GCP container
