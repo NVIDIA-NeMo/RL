@@ -147,6 +147,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 refit_timeout_s=self._refit_timeout_s,
                 buffer_size_bytes=sender_spec.buffer_size_bytes,
                 num_buffers=sender_spec.num_buffers,
+                use_legacy_packing=sender_spec.use_legacy_packing,
             )
             futures_inference = self._generation.update_weights_from_collective(
                 refit_timeout_s=self._refit_timeout_s

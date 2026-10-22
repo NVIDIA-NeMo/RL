@@ -170,6 +170,7 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     assert sender.nccl_peer == "vllm"
     assert sender.buffer_size_bytes == VLLM_PACKED_BUFFER_SIZE_BYTES
     assert sender.num_buffers == VLLM_PACKED_NUM_BUFFERS
+    assert sender.use_legacy_packing
     assert generation.shutdown()
     assert generation.shutdown()
     assert calls.count("shutdown") == 1
