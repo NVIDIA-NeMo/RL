@@ -124,6 +124,7 @@ from nemo_rl.algorithms.single_controller_utils.legacy_diagnostics import (
     add_legacy_timing_aliases,
     fetch_generation_logger_metrics,
     group_key,
+    group_trajectory_age_metrics,
     is_pad_row,
     legacy_performance_metrics,
     legacy_setup_timing_metrics,
@@ -604,6 +605,9 @@ class SingleControllerActor:
         # (batch_mix/* metrics and chart).
         self._agent_by_group: dict[str, str] = {}
         self._batch_mix_history = BatchMixHistory()
+        # Trajectory ages of the step's batch for algorithms without the legacy PPO
+        # diagnostics (which report them for PPO); set at the advantage stage.
+        self._trajectory_age_metrics: dict[str, float] = {}
         teacher_worker_groups = getattr(actor_args, "teacher_worker_groups", None) or {}
         if teacher_worker_groups:
             self._teacher_coordinator: Optional[
@@ -3734,6 +3738,9 @@ class SingleControllerActor:
                     )
                 )
                 step_metrics.update(batch_mix_metrics(step_agent_names))
+                if self._legacy_diag is None:
+                    step_metrics.update(self._trajectory_age_metrics)
+                    self._trajectory_age_metrics = {}
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
@@ -6418,6 +6425,18 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+
+        if self._legacy_diag is None:
+            try:
+                self._trajectory_age_metrics = group_trajectory_age_metrics(
+                    meta.sample_ids,
+                    meta.tags,
+                    self._trainer_version,
+                    getattr(self._algo_cfg, "policy_training_start_step", 0),
+                )
+            except Exception as error:  # metrics must never fail a step
+                log.warning("Skipping trajectory age metrics: %s", error)
+                self._trajectory_age_metrics = {}
 
         if self._legacy_diag is not None:
             # The packed .pt dump needs the token ids, which nothing else here reads.

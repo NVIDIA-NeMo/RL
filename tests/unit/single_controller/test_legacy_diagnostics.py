@@ -29,6 +29,7 @@ from nemo_rl.algorithms.single_controller_utils.legacy_diagnostics import (
     add_legacy_timing_aliases,
     fetch_generation_logger_metrics,
     group_key,
+    group_trajectory_age_metrics,
     is_pad_row,
     legacy_efficiency_summary,
     legacy_setup_timing_metrics,
@@ -534,3 +535,24 @@ def test_timer_kwargs_only_for_callees_that_take_a_timer():
     assert timer_kwargs(with_kwargs, timer) == {}
     assert timer_kwargs(without, timer) == {}
     assert timer_kwargs(len, timer) in ({}, {"timer": timer})  # builtins: no crash
+
+
+def test_group_trajectory_age_metrics_take_one_version_per_group():
+    # Groups A (version 3, three rows), B (version 5), C (untagged); pad rows ignored.
+    sample_ids = ["A_g0", "A_g1", "A_g1_pad0", "B_g0", "C_g0"]
+    tags = [
+        {"weight_version": 3},
+        {"weight_version": 3},
+        {"weight_version": 0},
+        {"weight_version": 5},
+        {},
+    ]
+    m = group_trajectory_age_metrics(sample_ids, tags, 6, 0)
+    assert m["avg_trajectory_age"] == pytest.approx(2.0)  # (3 + 1) / 2
+    assert m["avg_trajectory_policy_age"] == pytest.approx(2.0)
+    assert m["max_trajectory_policy_age"] == 3.0
+    # Policy ages are freeze-aware like the PPO path's.
+    frozen = group_trajectory_age_metrics(sample_ids, tags, 6, 5)
+    assert frozen["max_trajectory_policy_age"] == 1.0
+    assert group_trajectory_age_metrics(["C_g0"], [{}], 6, 0) == {}
+    assert group_trajectory_age_metrics(["A_g0"], None, 6, 0) == {}

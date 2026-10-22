@@ -108,6 +108,28 @@ def group_key(sample_id: str) -> str:
     return base.rsplit("_g", 1)[0] if "_g" in base else base
 
 
+def group_trajectory_age_metrics(
+    sample_ids: Sequence[str],
+    tags: Optional[Sequence[Mapping[str, Any]]],
+    trainer_version: int,
+    policy_training_start_step: int,
+) -> dict[str, float]:
+    """``avg_trajectory_age`` / ``avg_trajectory_policy_age`` / ``max_trajectory_policy_age`` of a batch.
+
+    One generation ``weight_version`` per prompt group (its first tagged row), pad
+    rows skipped: the same metrics LegacyPPODiagnostics reports for PPO, for
+    algorithms that do not run it.
+    """
+    gen_versions: dict[str, int] = {}
+    for sample_id, tag in zip(sample_ids, tags or [{} for _ in sample_ids]):
+        version = (tag or {}).get("weight_version")
+        if version is not None and not is_pad_row(str(sample_id)):
+            gen_versions.setdefault(group_key(str(sample_id)), int(version))
+    return trajectory_age_metrics(
+        list(gen_versions.values()), trainer_version, policy_training_start_step
+    )
+
+
 class LegacyPPODiagnostics:
     """Stateful per-step collector of the legacy async-PPO diagnostics."""
 
