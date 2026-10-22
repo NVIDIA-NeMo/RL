@@ -15,15 +15,18 @@ import pytest
 import torch
 
 pytest.importorskip("transfer_queue")
-from nemo_rl.data_plane.adapters import tq_kv_meta_patch as patch  # noqa: E402
 from transfer_queue.controller import FieldMeta, TransferQueueController  # noqa: E402
+
+from nemo_rl.data_plane.adapters import tq_kv_meta_patch as patch  # noqa: E402
 
 CONTROLLER = TransferQueueController.__ray_metadata__.modified_class
 
 
 def test_stock_source_matches_the_pinned_hash():
     # fails when the TQ pin moves: re-copy the methods
-    patch.assert_stock_source(CONTROLLER.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256)
+    patch.assert_stock_source(
+        CONTROLLER.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256
+    )
     patch.assert_stock_source(FieldMeta.remove_samples, patch._REMOVE_SAMPLES_SHA256)
 
 
@@ -33,7 +36,9 @@ def test_changed_source_is_rejected():
             return None
 
     with pytest.raises(RuntimeError, match="changed"):
-        patch.assert_stock_source(Changed.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256)
+        patch.assert_stock_source(
+            Changed.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256
+        )
 
 
 def _nested_field(n):
@@ -47,7 +52,10 @@ def _nested_field(n):
 
 
 def _served_shapes(field_meta, indexes):
-    return [field_meta.per_sample_shapes[i] if field_meta.is_nested else field_meta.shape for i in indexes]
+    return [
+        field_meta.per_sample_shapes[i] if field_meta.is_nested else field_meta.shape
+        for i in indexes
+    ]
 
 
 def test_remove_samples_defers_the_rescan_until_an_eighth_is_gone(monkeypatch):
@@ -55,7 +63,9 @@ def test_remove_samples_defers_the_rescan_until_an_eighth_is_gone(monkeypatch):
     monkeypatch.setattr(FieldMeta, "removed_since_scan", 0, raising=False)
     field_meta = _nested_field(40)
 
-    field_meta.remove_samples([39])  # the odd shape is gone, but 1 of 39 is under an eighth
+    field_meta.remove_samples(
+        [39]
+    )  # the odd shape is gone, but 1 of 39 is under an eighth
     assert field_meta.is_nested is True
 
     field_meta.remove_samples([0, 1, 2, 3])  # 5 of 35 reaches an eighth
@@ -74,21 +84,55 @@ def test_remove_samples_override_serves_the_same_shapes_as_stock(monkeypatch):
         patch.remove_samples(patched, cleared)
         assert _served_shapes(patched, remaining) == _served_shapes(stock, remaining)
         assert patched.global_indexes == stock.global_indexes
-    assert (patched.is_nested, patched.shape, patched.dtype) == (stock.is_nested, stock.shape, stock.dtype)
+    assert (patched.is_nested, patched.shape, patched.dtype) == (
+        stock.is_nested,
+        stock.shape,
+        stock.dtype,
+    )
 
 
 def test_override_matches_stock_kv_retrieve_meta():
     ctl = CONTROLLER(polling_mode=True)
     schema = lambda fields: {  # noqa: E731
-        f: {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False} for f in fields
+        f: {
+            "dtype": torch.int64,
+            "shape": (2,),
+            "is_nested": False,
+            "is_non_tensor": False,
+        }
+        for f in fields
     }
-    indexes = list(ctl.kv_retrieve_meta(["a", "b", "c"], "p", create=True).global_indexes)
-    ctl.update_production_status("p", indexes, schema(["f0", "f1"]), {g: {} for g in indexes})
-    ctl.update_production_status("p", indexes[:1], schema(["f2"]), {indexes[0]: {}})  # only row "a"
+    indexes = list(
+        ctl.kv_retrieve_meta(["a", "b", "c"], "p", create=True).global_indexes
+    )
+    ctl.update_production_status(
+        "p", indexes, schema(["f0", "f1"]), {g: {} for g in indexes}
+    )
+    ctl.update_production_status(
+        "p", indexes[:1], schema(["f2"]), {indexes[0]: {}}
+    )  # only row "a"
 
     for keys in (["a"], ["a", "b"], ["b", "c"], ["a", "b", "c"], ["missing"], []):
         want = CONTROLLER.kv_retrieve_meta(ctl, keys, "p")
         got = patch.kv_retrieve_meta(ctl, keys, "p")
         assert list(got.global_indexes) == list(want.global_indexes)
         assert sorted(got.field_schema) == sorted(want.field_schema)
-    assert sorted(patch.kv_retrieve_meta(ctl, ["a", "b"], "p").field_schema) == ["f0", "f1"]
+    assert sorted(patch.kv_retrieve_meta(ctl, ["a", "b"], "p").field_schema) == [
+        "f0",
+        "f1",
+    ]
+
+
+def test_patched_controller_installs_both_overrides_on_start(monkeypatch):
+    monkeypatch.setattr(FieldMeta, "remove_samples", FieldMeta.remove_samples)
+    monkeypatch.setattr(FieldMeta, "removed_since_scan", 0, raising=False)
+    patched = patch.make_patched_controller(
+        TransferQueueController
+    ).__ray_metadata__.modified_class
+    # Ray wraps actor methods, so compare where the method comes from.
+    assert patched.kv_retrieve_meta.__module__ == patch.__name__
+    # Building the class patches nothing; starting the controller does.
+    assert FieldMeta.remove_samples is not patch.remove_samples
+
+    patched(polling_mode=True)
+    assert FieldMeta.remove_samples is patch.remove_samples

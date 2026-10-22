@@ -37,17 +37,28 @@ from transfer_queue.metadata import BatchMeta
 logger = logging.getLogger(__name__)
 
 # sha256 of the stock methods' source at the pinned TQ revision (see pyproject.toml).
-_KV_RETRIEVE_META_SHA256 = "25635dcd71647ad7a03e284976e0b7aebc04ba7b6829cad59df1532d46e15301"
-_REMOVE_SAMPLES_SHA256 = "847e2e96135d7be868cfcc0865e6a69649e586e1dbe60178f2a3f5ef20afb09f"
+_KV_RETRIEVE_META_SHA256 = (
+    "25635dcd71647ad7a03e284976e0b7aebc04ba7b6829cad59df1532d46e15301"
+)
+_REMOVE_SAMPLES_SHA256 = (
+    "847e2e96135d7be868cfcc0865e6a69649e586e1dbe60178f2a3f5ef20afb09f"
+)
 
 
-def kv_retrieve_meta(self, keys: list[str], partition_id: str, create: bool = False) -> BatchMeta:
-    logger.debug(f"[{self.controller_id}] Retrieve keys {keys} in partition {partition_id}")
+def kv_retrieve_meta(
+    self, keys: list[str], partition_id: str, create: bool = False
+) -> BatchMeta:
+    """Stock ``TransferQueueController.kv_retrieve_meta`` with one field-mask read."""
+    logger.debug(
+        f"[{self.controller_id}] Retrieve keys {keys} in partition {partition_id}"
+    )
 
     partition = self._get_partition(partition_id)
     if partition is None:
         if not create:
-            logger.warning(f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta.")
+            logger.warning(
+                f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta."
+            )
             return BatchMeta.empty()
 
         self.create_partition(partition_id)
@@ -64,7 +75,9 @@ def kv_retrieve_meta(self, keys: list[str], partition_id: str, create: bool = Fa
                 f"They will be excluded from the retrieved BatchMeta."
             )
         else:
-            batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
+            batch_global_indexes = partition.activate_pre_allocated_indexes(
+                len(none_indexes)
+            )
 
             if len(batch_global_indexes) < len(none_indexes):
                 new_global_indexes = self.index_manager.allocate_indexes(
@@ -77,24 +90,31 @@ def kv_retrieve_meta(self, keys: list[str], partition_id: str, create: bool = Fa
             for i in range(len(none_indexes)):
                 global_indexes[none_indexes[i]] = batch_global_indexes[i]
                 partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
-                partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+                partition.revert_keys_mapping[batch_global_indexes[i]] = keys[
+                    none_indexes[i]
+                ]
 
             partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
     verified_global_indexes = [idx for idx in global_indexes if idx is not None]
 
     # Fetch the fields every requested sample has. One .tolist(): per-field tensor reads are slow.
-    col_mask = partition.production_status[verified_global_indexes, :].all(dim=0).tolist()
+    col_mask = (
+        partition.production_status[verified_global_indexes, :].all(dim=0).tolist()
+    )
     data_fields = [
         field_name
         for field_name, col_idx in partition.field_name_mapping.items()
         if col_idx < len(col_mask) and col_mask[col_idx]
     ]
 
-    return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+    return self.generate_batch_meta(
+        partition_id, verified_global_indexes, data_fields, mode="force_fetch"
+    )
 
 
 def remove_samples(self, indexes: list[int]) -> None:
+    """Stock ``FieldMeta.remove_samples`` that rescans nested shapes only after an eighth is removed."""
     before = len(self.global_indexes)
     for idx in indexes:
         self.per_sample_shapes.pop(idx, None)
@@ -112,7 +132,8 @@ def remove_samples(self, indexes: list[int]) -> None:
         if self.is_nested and self.removed_since_scan * 8 >= len(self.global_indexes):
             self.removed_since_scan = 0
             remaining_shapes = set(
-                tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
+                tuple(shape) if isinstance(shape, list) else shape
+                for shape in self.per_sample_shapes.values()
             )
             if len(remaining_shapes) == 1:
                 self.is_nested = False
@@ -121,11 +142,21 @@ def remove_samples(self, indexes: list[int]) -> None:
 
 
 def patch_field_meta() -> None:
+    """Install ``remove_samples`` on ``FieldMeta`` in this process; the controller calls it on start."""
     FieldMeta.remove_samples = remove_samples
     FieldMeta.removed_since_scan = 0
 
 
 def assert_stock_source(method: Any, sha256: str) -> None:
+    """Check that ``method``'s source still matches the copy this module overrides.
+
+    Args:
+        method: The stock TransferQueue method.
+        sha256: The sha256 of its source at the pinned TQ revision.
+
+    Raises:
+        RuntimeError: If the source changed, which means the TQ pin moved.
+    """
     if hashlib.sha256(inspect.getsource(method).encode()).hexdigest() != sha256:
         raise RuntimeError(
             f"transfer_queue's {method.__qualname__} changed, so the tq_kv_meta_patch override would replace newer "
@@ -134,6 +165,7 @@ def assert_stock_source(method: Any, sha256: str) -> None:
 
 
 def make_patched_controller(actor_class: Any) -> Any:
+    """Return a Ray actor class that runs the controller with both overrides."""
     base = actor_class.__ray_metadata__.modified_class
     assert_stock_source(base.kv_retrieve_meta, _KV_RETRIEVE_META_SHA256)
     assert_stock_source(FieldMeta.remove_samples, _REMOVE_SAMPLES_SHA256)
@@ -152,5 +184,7 @@ def make_patched_controller(actor_class: Any) -> Any:
 def configure_controller_patch() -> None:
     """Make ``tq.init`` start the patched controller; call before it."""
     actor_class = interface.TransferQueueController
-    if not getattr(actor_class.__ray_metadata__.modified_class, "_nrl_kv_meta_patched", False):
+    if not getattr(
+        actor_class.__ray_metadata__.modified_class, "_nrl_kv_meta_patched", False
+    ):
         interface.TransferQueueController = make_patched_controller(actor_class)
