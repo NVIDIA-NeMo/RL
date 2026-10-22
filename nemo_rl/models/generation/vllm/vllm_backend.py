@@ -731,6 +731,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     for module in candidates
                     if uses_native_mxfp8_linear_refit(module)
                 )
+            if roots:
+                # The GB200 MXFP8 functional test greps this line.
+                kernels = sorted(
+                    {type(root.quant_method.kernel).__name__ for root in roots}
+                )
+                print(
+                    f"NRL_MXFP8_NATIVE_LINEAR_REFIT kernels={','.join(kernels)} "
+                    f"modules={len(roots)}"
+                )
             self._nrl_mxfp8_linear_reload_roots = roots
         return roots
 
