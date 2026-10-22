@@ -75,7 +75,8 @@ value:
     pipeline_model_parallel_size: ${policy.megatron_cfg.pipeline_model_parallel_size}
     num_layers_in_first_pipeline_stage: ${policy.megatron_cfg.num_layers_in_first_pipeline_stage}
     num_layers_in_last_pipeline_stage: ${policy.megatron_cfg.num_layers_in_last_pipeline_stage}
-    context_parallel_size: 2
+    # Split long critic contexts across four ranks on the eight training nodes.
+    context_parallel_size: 4
     pipeline_dtype: ${policy.megatron_cfg.pipeline_dtype}
     sequence_parallel: ${policy.megatron_cfg.sequence_parallel}
     freeze_moe_router: ${policy.megatron_cfg.freeze_moe_router}
