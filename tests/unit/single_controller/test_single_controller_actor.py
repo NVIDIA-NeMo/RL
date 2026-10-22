@@ -15,7 +15,6 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
-import json
 import math
 import threading
 from pathlib import Path
@@ -24,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pyarrow.parquet as pq
 import torch
 from ray.exceptions import ActorDiedError
 from tensordict import TensorDict
@@ -83,7 +83,6 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
@@ -230,7 +229,11 @@ def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, ob
 
 
 def _stamp_advantage_stage_config(
-    ctrl, *, shardable: bool = True, opd_full_enabled: bool = False
+    ctrl,
+    *,
+    shardable: bool = True,
+    opd_full_enabled: bool = False,
+    dump_dir: str | None = None,
 ) -> None:
     """Mirror the advantage-stage half of ``__init__`` onto a hand-built stub.
 
@@ -246,9 +249,6 @@ def _stamp_advantage_stage_config(
     """
     penalties_enabled = ctrl._message_level_advantage_penalties_enabled
     ctrl._advantage_actors = []
-    # Mirror the controller: a caller that installed a dump is asking for one,
-    # and the stage writes it, so the stage needs the same directory.
-    dump = getattr(ctrl, "_train_data_dump", None)
     ctrl._advantage_stage_config = AdvantageStageConfig(
         advantage=ctrl._advantage_cfg,
         algo=ctrl._algo_cfg,
@@ -259,15 +259,13 @@ def _stamp_advantage_stage_config(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
-        train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
+        train_data_dump_dir=dump_dir,
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
         config=ctrl._advantage_stage_config,
         advantage_estimator=ctrl._advantage_estimator,
     )
-    ctrl._train_data_dump = dump
-    ctrl._train_data_dump_rows = 0
     # _absorb_advantage_outcome accumulates into these unconditionally, so they
     # have to exist even for the non-OPD tests. Tests that assert on them set
     # their own values after this call.
@@ -821,6 +819,8 @@ async def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._trainer = SimpleNamespace(
         sync_params_before_refit=MagicMock(side_effect=lambda: events.append("params"))
     )
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
@@ -968,6 +968,8 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     ctrl._gen = gen
     ctrl._trainer = trainer
     ctrl._weight_synchronizer = synchronizer_cls(trainer, gen, refit_buffer_size_gb=1)
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
@@ -993,6 +995,8 @@ def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(return_value=False),
@@ -1032,6 +1036,8 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}}),
         sync_params_before_refit=MagicMock(),
     )
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
@@ -1068,6 +1074,8 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._gen = SimpleNamespace(
         pause_generation_for_refit=MagicMock(return_value=True),
@@ -1094,6 +1102,8 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> Non
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._gen = SimpleNamespace(
         pause_generation_for_refit=MagicMock(
@@ -1125,6 +1135,8 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
         sync_weights=MagicMock(side_effect=RuntimeError("refit failed"))
     )
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._gen = SimpleNamespace(
         pause_generation_for_refit=MagicMock(return_value=True),
@@ -1209,7 +1221,6 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1311,7 +1322,6 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
@@ -1385,7 +1395,6 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1485,7 +1494,6 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
@@ -1555,7 +1563,6 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
@@ -1619,7 +1626,6 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(seq_logprob_error_threshold=None)
@@ -1729,7 +1735,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
-    ctrl._train_data_dump = TrainDataDump(str(tmp_path))
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._train_steps = 0
     ctrl._is_ppo = False
@@ -1743,7 +1750,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
-    _stamp_advantage_stage_config(ctrl, opd_full_enabled=full_vocab)
+    _stamp_advantage_stage_config(
+        ctrl, opd_full_enabled=full_vocab, dump_dir=str(tmp_path)
+    )
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1824,18 +1833,14 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
-    ctrl._train_data_dump.finish_step(0)
-    dumped = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    assert dumped[0]["token_ids"] == [[10, 11, 12]]
+    dumped = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
+    assert dumped[0]["token_ids"] == [10, 11, 12]
     for row, written_row in zip(dumped, written_advantages.unbind()):
-        torch.testing.assert_close(torch.tensor(row["advantages"][0]), written_row)
-    assert dumped[0]["teacher_logprobs"] == [[0.75, 0.75, 0.75]]
-    assert dumped[0]["prev_logprobs"] == [[0.5, 0.5, 0.5]]
+        torch.testing.assert_close(torch.tensor(row["advantages"]), written_row)
+    assert dumped[0]["teacher_logprobs"] == [0.75, 0.75, 0.75]
+    assert dumped[0]["prev_logprobs"] == [0.5, 0.5, 0.5]
     # The dump writes each row's real prompt, without the estimator's padding.
-    assert [row["prompt_ids"] for row in dumped] == [[[10, 11]], [[20]]]
+    assert [row["prompt_ids"] for row in dumped] == [[10, 11], [20]]
     if tokenless_sample:
         torch.testing.assert_close(
             ctrl._dp_client.put_fields["sample_mask"], torch.tensor([1.0, 0.0])
@@ -1886,7 +1891,6 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ctrl._policy_logprobs_required = True
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = True
-    ctrl._train_data_dump = None
     ctrl._is_ppo = False
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
@@ -2264,7 +2268,6 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
-    ctrl._train_data_dump = None
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
@@ -2297,6 +2300,8 @@ def _train_pump_controller(*, sampler) -> object:
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
@@ -4111,7 +4116,9 @@ def test_streaming_ppo_filtered_single_token_has_finite_loss_and_gradients() -> 
     assert written["returns"][0, 1] == 2.0
 
 
-def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
+def test_advantage_stage_writes_gae_returns_alongside_advantages(
+    tmp_path: Path,
+) -> None:
     """The critic's regression target has to reach TQ, or the value train step
     fetches a column nobody wrote."""
     batch_size, sequence_length = 2, 4
@@ -4124,6 +4131,9 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             "token_mask": torch.ones(batch_size, sequence_length),
             "sample_mask": torch.ones(batch_size),
             "values": torch.zeros(batch_size, sequence_length),
+            "input_ids": torch.ones(batch_size, sequence_length, dtype=torch.long),
+            "input_lengths": torch.full((batch_size,), sequence_length),
+            "generation_logprobs": torch.zeros(batch_size, sequence_length),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
             "truncated": torch.zeros(batch_size, dtype=torch.bool),
         },
@@ -4150,7 +4160,10 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
+    ctrl._train_steps = 0
     ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
+    ctrl._timer = Timer()
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
         ppo=SimpleNamespace(
@@ -4164,7 +4177,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     # gae normalizes over the whole batch, so it is not shard-invariant.
-    _stamp_advantage_stage_config(ctrl, shardable=False)
+    _stamp_advantage_stage_config(ctrl, shardable=False, dump_dir=str(tmp_path))
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -4194,6 +4207,11 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
 
+    rows = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
+    assert [row["values"] for row in rows] == [[0.0] * 4, [0.0] * 4]
+    assert [row["returns"] for row in rows] == [[2.0] * 4, [1.0] * 4]
+    assert all(row["teacher_logprobs"] is None for row in rows)
+
 
 @pytest.mark.parametrize("dump_enabled", [False, True])
 def test_train_pump_logs_dump_timing_after_optimizer_step(
@@ -4213,10 +4231,12 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     ctrl._logger = MagicMock()
     ctrl._sync_weights = AsyncMock(return_value=1)
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
-    final = tmp_path / "train_data_step1.jsonl"
+    manifest = tmp_path / "train_data_parquet" / "step-00000001" / "_manifest.json"
     if dump_enabled:
+        from nemo_rl.utils.train_data_dump import TrainDataDump
+
         ctrl._train_data_dump = TrainDataDump(str(tmp_path))
-        ctrl._train_data_dump.add_chunk(
+        name = ctrl._train_data_dump.add_chunk(
             step=0,
             sample_ids=meta.sample_ids,
             tags=meta.tags,
@@ -4224,14 +4244,11 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
             sequences={"token_ids": torch.tensor([[10], [20]])},
             scalars={},
         )
-        # Seed chunk-write time to verify publication adds to the per-step sum.
+        ctrl._train_data_dump_files = [name]
         ctrl._timer.record("train_data_dump", 2.0)
-        # The chunk above stands in for the stage's write, so stand in for the
-        # row count it would have reported alongside it too.
-        ctrl._train_data_dump_rows = len(meta.sample_ids)
 
-    def finish_training() -> dict:
-        assert not final.exists()
+    def finish_training():
+        assert not manifest.exists()
         return {}
 
     ctrl._trainer.finish_train_step = MagicMock(side_effect=finish_training)
@@ -4244,11 +4261,10 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     ]
     assert len(logged_timings) == 1
     assert ("train_data_dump" in logged_timings[0]) is dump_enabled
-    assert final.exists() is dump_enabled
+    assert manifest.exists() is dump_enabled
+    assert ctrl._train_data_dump_files == []
     if dump_enabled:
-        assert math.isfinite(logged_timings[0]["train_data_dump"])
-        assert logged_timings[0]["train_data_dump"] > 2.0
-        assert not final.with_suffix(".jsonl.partial").exists()
+        assert logged_timings[0]["train_data_dump"] >= 2.0
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
 
 
