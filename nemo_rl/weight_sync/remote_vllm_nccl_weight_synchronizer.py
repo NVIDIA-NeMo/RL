@@ -104,10 +104,11 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
             http: Future[None] = self._executor.submit(call)
             pending = list(futures)
             while pending:
-                if http.done() and http.exception() is not None:
+                http_error = http.exception() if http.done() else None
+                if http_error is not None:
                     raise RuntimeError(
-                        f"External vLLM {what} failed: {http.exception()}"
-                    ) from http.exception()
+                        f"External vLLM {what} failed: {http_error}"
+                    ) from http_error
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"External vLLM {what} timed out")
@@ -165,7 +166,9 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
         )
         self._run_with_http(
             futures,
-            lambda: self._generation.client.init_weight_transfer_engine(init_info),
+            lambda: self._generation.client.init_weight_transfer_engine(
+                init_info, timeout_s=self._refit_timeout_s
+            ),
             "init_weight_transfer_engine",
         )
         self._update_info = update_info
@@ -184,9 +187,8 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
         if self._update_info is None:
             raise RuntimeError("init_communicator() must run before sync_weights()")
         update_info = asdict(self._update_info)
-        self._check_backend()
-
         self._stale = True
+        self._check_backend()
         version = self._next_version
         self._next_version += 1
         sender = self._generation.get_collective_sender_spec()
@@ -208,9 +210,11 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
         self, update_info: dict[str, Any], version: int, sender: CollectiveSenderSpec
     ) -> None:
         client = self._generation.client
-        self._generation.pause_generation_for_refit(clear_cache=True)
+        self._generation.pause_generation_for_refit(
+            clear_cache=True, timeout_s=self._refit_timeout_s
+        )
         # Never resume after a partial receive or failed layerwise load.
-        client.start_weight_update()
+        client.start_weight_update(timeout_s=self._refit_timeout_s)
         futures = self._policy.broadcast_weights_for_collective(
             refit_timeout_s=self._refit_timeout_s,
             buffer_size_bytes=sender.buffer_size_bytes,
@@ -218,10 +222,12 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
             use_legacy_packing=sender.use_legacy_packing,
         )
         self._run_with_http(
-            futures, lambda: client.update_weights(update_info), "update_weights"
+            futures,
+            lambda: client.update_weights(update_info, timeout_s=self._refit_timeout_s),
+            "update_weights",
         )
-        client.finish_weight_update(str(version))
-        self._generation.resume_generation_after_refit()
+        client.finish_weight_update(str(version), timeout_s=self._refit_timeout_s)
+        self._generation.resume_generation_after_refit(timeout_s=self._refit_timeout_s)
 
     def shutdown(self) -> None:
         """Close controller resources without resuming or terminating serving.

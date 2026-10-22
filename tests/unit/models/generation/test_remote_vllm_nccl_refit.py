@@ -154,18 +154,18 @@ class _FakeClient:
     def health(self, *, timeout_s: float | None = None) -> dict | None:
         return self._health
 
-    def init_weight_transfer_engine(self, init_info):  # noqa: ANN001, ANN201
+    def init_weight_transfer_engine(self, init_info, *, timeout_s=None):  # noqa: ANN001, ANN201
         self.calls.append(("init", init_info))
 
-    def start_weight_update(self) -> None:
+    def start_weight_update(self, *, timeout_s=None) -> None:
         self.calls.append(("start",))
 
-    def update_weights(self, update_info: dict) -> None:
+    def update_weights(self, update_info: dict, *, timeout_s=None) -> None:
         self.calls.append(("update", update_info))
         if self._fail_update:
             raise RuntimeError("External vLLM returned HTTP 400")
 
-    def finish_weight_update(self, weight_version: str) -> None:
+    def finish_weight_update(self, weight_version: str, *, timeout_s=None) -> None:
         self.calls.append(("finish", weight_version))
 
 
@@ -184,10 +184,10 @@ def _setup(
     )
     generation.client = _FakeClient(calls, health, fail_update)  # type: ignore[assignment]
     generation.pause_generation_for_refit = (  # type: ignore[method-assign]
-        lambda clear_cache: calls.append(("pause", clear_cache)) or True
+        lambda clear_cache, timeout_s=None: calls.append(("pause", clear_cache)) or True
     )
     generation.resume_generation_after_refit = (  # type: ignore[method-assign]
-        lambda: calls.append(("resume",)) or True
+        lambda timeout_s=None: calls.append(("resume",)) or True
     )
     info = {
         "backbone.layers.1.mixer.experts.0.up_proj.weight": (
@@ -340,7 +340,7 @@ def test_missing_policy_receiver_has_a_controller_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, synchronizer = _setup(
-        monkeypatch, health=None, broadcast_done=False, timeout_s=0.02
+        monkeypatch, health=None, broadcast_done=False, timeout_s=0.1
     )
     synchronizer.init_communicator()
     with pytest.raises(TimeoutError):

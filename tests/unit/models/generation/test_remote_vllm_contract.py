@@ -16,6 +16,7 @@ import json
 import urllib.request
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -225,3 +226,15 @@ def test_preflight_rejects_incompatible_serving_before_nccl_init(
     )
     with pytest.raises(RuntimeError, match=match):
         preflight_remote_vllm_service(_config())
+
+
+def test_generation_refit_lifecycle_forwards_controller_deadlines() -> None:
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": _config().model_dump()})
+    generation.client.pause = MagicMock()
+    generation.client.resume = MagicMock()
+    assert generation.pause_generation_for_refit(clear_cache=True, timeout_s=3.0)
+    generation.client.pause.assert_called_once_with(
+        mode="keep", clear_cache=True, timeout_s=3.0
+    )
+    assert generation.resume_generation_after_refit(timeout_s=4.0)
+    generation.client.resume.assert_called_once_with(timeout_s=4.0)

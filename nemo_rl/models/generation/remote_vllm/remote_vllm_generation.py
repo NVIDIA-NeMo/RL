@@ -130,16 +130,19 @@ class RemoteVllmGeneration(GenerationInterface):
         self.client.resume()
         self._paused_for_refit = False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: float | None = None
+    ) -> bool:
         self.client.pause(
             mode=self.remote_config.refit.inflight_policy,
             clear_cache=clear_cache,
+            timeout_s=timeout_s,
         )
         self._paused_for_refit = True
         return True
 
-    def resume_generation_after_refit(self) -> bool:
-        self.client.resume()
+    def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
+        self.client.resume(timeout_s=timeout_s)
         self._paused_for_refit = False
         return True
 
