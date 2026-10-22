@@ -21,6 +21,29 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 
 
+def test_speechlm_recipe_logs_typed_config_to_tensorboard(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.utils.logger import TensorboardConfig, TensorboardLogger
+
+    for name in ("MODEL", "DATA", "OUTPUT_DIR"):
+        monkeypatch.setenv(f"SPEECHLM_GSPO_{name}", str(tmp_path / name))
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.yaml"
+    )
+    params = MasterConfig(**OmegaConf.to_container(config, resolve=True)).model_dump()
+    # The validated native config keeps the exact trainable surface immutable.
+    assert isinstance(params["policy"]["native_model"]["trainable_names"], tuple)
+    logger = TensorboardLogger(TensorboardConfig(), log_dir=str(tmp_path / "logs"))
+    try:
+        logger.log_hyperparams(params)
+    finally:
+        logger.finish()
+
+
 def test_speechlm_recipe_uses_native_checkpoint_config(tmp_path, monkeypatch):
     from omegaconf import OmegaConf
 
