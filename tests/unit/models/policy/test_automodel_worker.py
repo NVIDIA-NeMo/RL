@@ -920,7 +920,7 @@ class TestAutomodelParamsGenerator:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
-class TestDTensorLoraParamsGenerator:
+class TestAutomodelLoraParamsGenerator:
     class FactorizedModel(nn.Module):
         def __init__(self, *, incomplete: bool = False):
             super().__init__()
@@ -939,6 +939,18 @@ class TestDTensorLoraParamsGenerator:
         assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
         assert all(tensor.dtype == torch.bfloat16 for tensor in tensors.values())
         assert all(tensor.is_contiguous() for tensor in tensors.values())
+
+    def test_accepts_activation_checkpoint_wrapped_parameter_names(self):
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        model = self.FactorizedModel()
+        model.layer = checkpoint_wrapper(model.layer)
+
+        tensors = dict(automodel_lora_params_generator(model, torch.bfloat16))
+
+        assert set(tensors) == {"layer.lora_A.weight", "layer.lora_B.weight"}
 
     def test_adapts_grouped_internal_factors_to_hf_pairs(self):
         from nemo_automodel.components.models.nemotron_v3.state_dict_adapter import (
@@ -1074,22 +1086,19 @@ class TestDTensorLoraParamsGenerator:
         }
         assert all(dtype == torch.bfloat16 for _, dtype in refit_info.values())
 
-    @pytest.mark.parametrize("mode", ["native", "merged"])
-    def test_ipc_producer_dispatches_configured_refit_mode(self, monkeypatch, mode):
+    def test_ipc_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
-        worker.lora_refit_mode = mode
+        worker.lora_refit_mode = "native"
         worker.cpu_offload = False
         worker.zmq_socket = object()
         worker.rank = 0
         worker.maybe_init_zmq = lambda: None
-        selected_modes = []
         sentinel = torch.ones(1)
 
         def refit_generator():
-            selected_modes.append(worker.lora_refit_mode)
             yield "sentinel", sentinel
 
         stream_impl = MagicMock()
@@ -1104,24 +1113,18 @@ class TestDTensorLoraParamsGenerator:
         assert list(stream_impl.call_args.kwargs["params_generator"]) == [
             ("sentinel", sentinel)
         ]
-        assert selected_modes == [mode]
 
-    @pytest.mark.parametrize("mode", ["native", "merged"])
-    def test_collective_producer_dispatches_configured_refit_mode(
-        self, monkeypatch, mode
-    ):
+    def test_collective_producer_uses_worker_refit_generator(self, monkeypatch):
         worker = object.__new__(AutomodelPolicyWorkerImpl)
         worker.model = self.FactorizedModel()
         worker.dtype = torch.bfloat16
         worker.lora_enabled = True
-        worker.lora_refit_mode = mode
+        worker.lora_refit_mode = "native"
         worker.cpu_offload = False
         worker.model_update_group = object()
-        selected_modes = []
         sentinel = torch.ones(1)
 
         def refit_generator():
-            selected_modes.append(worker.lora_refit_mode)
             yield "sentinel", sentinel
 
         producer = MagicMock()
@@ -1131,7 +1134,29 @@ class TestDTensorLoraParamsGenerator:
         worker._broadcast_weights_for_collective()
 
         assert list(producer.call_args.kwargs["iterator"]) == [("sentinel", sentinel)]
-        assert selected_modes == [mode]
+
+    @pytest.mark.parametrize(
+        ("mode", "expected"), [("native", "lora"), ("merged", "full")]
+    )
+    def test_refit_params_generator_selects_by_mode(self, monkeypatch, mode, expected):
+        worker = object.__new__(AutomodelPolicyWorkerImpl)
+        worker.model = self.FactorizedModel()
+        worker.draft_model = None
+        worker.dtype = torch.bfloat16
+        worker.lora_enabled = True
+        worker.lora_refit_mode = mode
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_lora_params_generator",
+            lambda *_: iter([("lora", torch.ones(1))]),
+        )
+        monkeypatch.setattr(
+            worker_mod,
+            "automodel_params_generator",
+            lambda *_, **__: iter([("full", torch.ones(1))]),
+        )
+
+        assert [name for name, _ in worker._refit_params_generator()] == [expected]
 
 
 @pytest.mark.automodel

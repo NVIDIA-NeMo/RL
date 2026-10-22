@@ -1667,9 +1667,9 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
         NATIVE_LORA_CONFIG_KEY,
     )
 
-    unstacked_mapper = object()
+    rename_mapper = object()
     weights_mapper = MagicMock()
-    weights_mapper.get_unstacked_mapper.return_value = unstacked_mapper
+    weights_mapper.get_rename_mapper.return_value = rename_mapper
     model = SimpleNamespace(hf_to_vllm_mapper=weights_mapper)
     adapter_manager = MagicMock()
     adapter_manager.model = model
@@ -1725,8 +1725,8 @@ def test_install_native_lora_replaces_and_activates_stable_adapter(monkeypatch):
     peft_helper.validate_legal.assert_called_once_with(lora_manager.lora_config)
     from_lora_tensors.assert_called_once()
     assert from_lora_tensors.call_args.kwargs["device"] == "cpu"
-    assert from_lora_tensors.call_args.kwargs["weights_mapper"] is unstacked_mapper
-    weights_mapper.get_unstacked_mapper.assert_called_once_with()
+    assert from_lora_tensors.call_args.kwargs["weights_mapper"] is rename_mapper
+    weights_mapper.get_rename_mapper.assert_called_once_with()
     adapter_manager.remove_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)
     adapter_manager.add_adapter.assert_called_once_with(lora)
     adapter_manager.activate_adapter.assert_called_once_with(NATIVE_LORA_ADAPTER_ID)

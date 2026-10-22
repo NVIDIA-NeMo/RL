@@ -31,12 +31,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     resolve_rollout_rank,
 )
 from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
-from nemo_rl.models.generation.vllm.lora_utils import (
-    NATIVE_LORA_ADAPTER_ID,
-    NativeLoraRefitSettings,
-    collect_native_lora,
-    native_lora_refit_settings,
-)
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     _assert_drafter_owns_modules,
@@ -44,6 +38,12 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     _is_full_draft_stream,
     _validate_draft_refit_info,
     disable_draft_module_sharing,
+)
+from nemo_rl.models.generation.vllm.lora_utils import (
+    NATIVE_LORA_ADAPTER_ID,
+    NativeLoraRefitSettings,
+    collect_native_lora,
+    native_lora_refit_settings,
 )
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
@@ -1412,7 +1412,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         model = adapter_manager.model
         weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
         if weights_mapper is not None:
-            weights_mapper = weights_mapper.get_unstacked_mapper()
+            weights_mapper = weights_mapper.get_rename_mapper()
         skip_prefixes = getattr(model, "lora_skip_prefixes", None)
         skipped_source_tensors = sorted(
             name

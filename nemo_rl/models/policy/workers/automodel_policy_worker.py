@@ -16,7 +16,7 @@ import gc
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Generator, Iterable, Literal, Optional, cast
+from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
 import torch
@@ -76,6 +76,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    LoraRefitMode,
     enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
@@ -442,10 +443,8 @@ class AutomodelPolicyWorkerImpl(
         )
         generation_config = config.get("generation")
         if self.lora_enabled and generation_config is not None:
-            self.lora_refit_mode: Literal["native", "merged"] = cast(
-                Literal["native", "merged"],
-                cast(dict[str, Any], generation_config)["lora_refit_mode"],
-            )
+            generation_dict = cast(dict[str, Any], generation_config)
+            self.lora_refit_mode: LoraRefitMode = generation_dict["lora_refit_mode"]
 
         print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
 
@@ -1347,7 +1346,9 @@ class AutomodelPolicyWorkerImpl(
         if self.lora_enabled and self.lora_refit_mode == "native":
             yield from automodel_lora_params_generator(self.model, self.dtype)
             return
-        yield from automodel_params_generator(self.model, self.dtype)
+        yield from automodel_params_generator(
+            self.model, self.dtype, draft_model=self.draft_model
+        )
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
