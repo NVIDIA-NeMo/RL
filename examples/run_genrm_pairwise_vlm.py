@@ -190,25 +190,35 @@ def flatten_to_single_turn(message_log):
 
     Media parts become inline `<image>` / `<video>` markers; the raw parts are returned, in order, for
     `extract_all_modals` to decode."""
+    def strip_prefix(text: str) -> str:
+        if text.lower().startswith("user:"):
+            return text[5:].strip()
+        if text.lower().startswith("assistant:"):
+            return text[10:].strip()
+        if text.lower().startswith("system:"):
+            return text[7:].strip()
+
+        return text
+
     ret = ""
     multimodal = []
     for idx, message in enumerate(message_log):
         if message["role"] == "system":
-            ret += "System: " + message["content"].strip() + "\n\n"
+            ret += "System: " + strip_prefix(message["content"]) + "\n\n"
         elif message["role"] == "user":
             if isinstance(message["content"], str):
-                ret += "User: " + message["content"].strip() + "\n\n"
+                ret += "User: " + strip_prefix(message["content"]) + "\n\n"
             else:
                 for payload in message["content"]:
                     if payload["type"] == "text":
-                        ret += "User: " + payload["text"].strip() + "\n\n"
+                        ret += "User: " + strip_prefix(payload["text"]) + "\n\n"
                     else:
                         ret += "User: " + _media_marker(payload["type"]) + "\n\n"
                         multimodal.append(payload)
         elif message["role"] == "assistant":
             resp_no_thinking1 = re.sub(r"(?i)(?s)(\<think\>)(.*?)(\<\/think\>)", "", message["content"]).strip()
             resp_no_thinking2 = re.sub(r"(?i)(?s)(.*?)(\<\/think\>)", "", resp_no_thinking1).strip()
-            ret += "Assistant: " + resp_no_thinking2 + "\n\n"
+            ret += "Assistant: " + strip_prefix(resp_no_thinking2) + "\n\n"
 
     return ret.strip(), multimodal
 

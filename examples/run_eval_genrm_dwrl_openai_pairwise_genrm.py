@@ -263,6 +263,11 @@ def parse_args():
                         default=None,
                         help="Location of HS3 eval file to use",
                         required=False)
+    optional.add_argument('--media_path',
+                        type=str,
+                        default=None,
+                        help="Location of media folder for multimodal",
+                        required=False)
 
     return parser.parse_args()
 
@@ -297,7 +302,7 @@ if __name__ == "__main__":
     elif args.dataset == "rewardbench2":
         dataset_loader = RewardBench2Dataset()
     elif args.dataset == "hs3local":
-        dataset_loader = HelpSteer3LocalDataset(args.hs3_file, split='validation', max_number=10000, double_swap=False)
+        dataset_loader = HelpSteer3LocalDataset(args.hs3_file, media_path=args.media_path, split='validation', max_number=10000, double_swap=False)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
     

@@ -550,7 +550,7 @@ def encode_non_text_input_data(turns, media_dir: pathlib.Path=None) -> None:
                     item[item["type"]]["url"] = item[item["type"]]["url"].format(b64=b64)
 
 
-class HelpSteer3LocalDataset(torch.utils.data.Dataset):
+class HelpSteer3LocalDatasetOld(torch.utils.data.Dataset):
     """Dataset for loading HelpSteer3 data from local JSONL files."""
     def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
         data = []
@@ -561,11 +561,11 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                 one = json.loads(line)
                 if one["args"]["num_responses"] == 2:
                     examples = []
+                    
                     preference = 0 if one["args"]["preference_ranking"] <= 3 else 1
                     encode_non_text_input_data(one["args"]["context"], media_path)
 
                     example = {
-                        #"prompt": format_genrm_prompt(one["args"]["context"], one["args"]["response1"], one["args"]["response2"]),
                         "num_responses": 2,
                         "helpfulness_1": one["args"]["helpfulness_1"],  
                         "helpfulness_2": one["args"]["helpfulness_2"],
@@ -581,7 +581,6 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
 
                     if double_swap:
                         example = {
-                            #"prompt": format_genrm_prompt(one["args"]["context"], one["args"]["response2"], one["args"]["response1"]),
                             "num_responses": 2,
                             "helpfulness_1": one["args"]["helpfulness_2"],  
                             "helpfulness_2": one["args"]["helpfulness_1"],
@@ -599,6 +598,77 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                         data.append(random.choice(examples))
                     else:
                         data += examples
+        
+        if shuffle_seed != -1:
+            rng = np.random.default_rng(shuffle_seed)
+            rng.shuffle(data)
+            print(f"Shuffled the dataset with {len(data)} samples using seed {shuffle_seed}")
+
+        if max_number != -1:
+            data = data[:max_number]
+            
+        #self.data = Dataset.from_list(data)
+        self.data = data
+        self.formatted_ds = self.data
+        self.task_name = task_name
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # Add task_name for compatibility with AllTaskProcessedDataset
+        item = self.data[idx].copy()
+        item["task_name"] = self.task_name
+        return item
+
+class HelpSteer3LocalDataset(torch.utils.data.Dataset):
+    """Dataset for loading HelpSteer3 data from local JSONL files."""
+    def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
+        data = []
+        if media_path is not None:
+            media_path = pathlib.Path(media_path)
+        with open(data_path, 'r', encoding='utf_8') as f:
+            for line in f:
+                one = json.loads(line)
+                examples = []
+                
+                gt_overall = one["ground_truth_overall"]
+                preference = 0 if gt_overall["ranking"] <= 3 else 1
+                encode_non_text_input_data(one["responses_create_params"]["input"], media_path)
+
+                example = {
+                    "num_responses": 2,
+                    "helpfulness_1": gt_overall["score_1"],
+                    "helpfulness_2": gt_overall["score_2"],
+                    "preference": preference, 
+                    "preference_ranking": gt_overall["ranking"],
+                    "context": one["responses_create_params"]["input"],
+                    "response1": one["response_1"],
+                    "response2": one["response_2"],
+                }
+                if "principle" in one:
+                    example["principle"] = one["principle"]
+                examples.append(example)
+
+                if double_swap:
+                    example = {
+                        "num_responses": 2,
+                        "helpfulness_1": gt_overall["score_1"],
+                        "helpfulness_2": gt_overall["score_2"],
+                        "preference": 1 - preference, 
+                        "preference_ranking": 7 - gt_overall["ranking"],
+                        "context": one["responses_create_params"]["input"],
+                        "response1": one["response_2"],
+                        "response2": one["response_1"],
+                    }
+                    if "principle" in one:
+                        example["principle"] = one["principle"]
+                    examples.append(example)
+
+                if split == "validation":
+                    data.append(random.choice(examples))
+                else:
+                    data += examples
         
         if shuffle_seed != -1:
             rng = np.random.default_rng(shuffle_seed)
