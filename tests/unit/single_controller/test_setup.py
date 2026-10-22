@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import threading
 import warnings
 from pathlib import Path
@@ -68,6 +69,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
@@ -1242,6 +1246,37 @@ class TestSetup:
                 "checkpointing.save_data_plane=true"
             ),
         ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_msc_checkpoint_dir_replaces_native_tq_requirement_with_warning(
+        self, patched_factories, tmp_path, monkeypatch
+    ):
+        # setup builds a real CheckpointManager, which resolves the MSC profile.
+        (tmp_path / "objects").mkdir()
+        msc_config = tmp_path / "msc.json"
+        msc_config.write_text(
+            json.dumps(
+                {
+                    "profiles": {
+                        "profile": {
+                            "storage_provider": {
+                                "type": "file",
+                                "options": {"base_path": str(tmp_path / "objects")},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("MSC_CONFIG", str(msc_config))
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing["checkpoint_dir"] = "msc://profile/run"
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.warns(UserWarning, match="msc:// checkpoint_dir"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_warns_when_custom_sampler_cannot_recover_buffered_rollouts(
@@ -2752,6 +2787,36 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+class TestAdaptiveLossRestore:
+    def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        save_state.cur_adaptive_ppo_clip_k = 0.5
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        patched_factories["ClippedPGLossFn"].side_effect = (
+            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        )
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+            )
+        )
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
@@ -3158,14 +3223,63 @@ class TestOPDFullValidation:
     until the first training forward.
     """
 
+    @pytest.mark.parametrize("full_vocab", [False, True])
+    def test_advantage_stage_config_derives_full_vocab_mode(self, full_vocab):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full.enabled = full_vocab
+        config.grpo.seq_logprob_error_threshold = 2.0
+
+        stage_config = AdvantageStageConfig.from_master_config(config)
+
+        assert stage_config.opd_full_enabled == full_vocab
+        assert stage_config.algo.seq_logprob_error_threshold == 2.0
+
     def test_accepts_the_shipped_recipe(self):
         config = _load_fullvocab_master_config()
         _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_is_a_no_op_when_full_is_absent(self):
+    @pytest.mark.parametrize(
+        ("top_k", "top_p", "expected_warning"),
+        [
+            (20, 1.0, True),
+            (None, 0.95, True),
+            (20, 0.95, True),
+            (None, 1.0, False),
+            (-1, 1.0, False),
+            (0, 1.0, False),
+        ],
+    )
+    def test_rollout_filtering_warns_without_changing_config(
+        self,
+        top_k: int | None,
+        top_p: float,
+        expected_warning: bool,
+        recwarn: pytest.WarningsRecorder,
+    ) -> None:
+        config = _load_fullvocab_master_config()
+        generation_config = config.policy["generation"]
+        generation_config.update(top_k=top_k, top_p=top_p)
+
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+        assert len(recwarn) == int(expected_warning)
+        if expected_warning:
+            message = str(recwarn[0].message)
+            assert "does not apply top-k/top-p filtering to policy logprobs" in message
+            assert "still applied during rollout" in message
+        assert (generation_config["top_k"], generation_config["top_p"]) == (
+            top_k,
+            top_p,
+        )
+
+    def test_is_a_no_op_when_full_is_absent(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.full = None
+        config.policy["generation"].update(top_k=20, top_p=0.95)
         _validate_opd_full_config(config, config.on_policy_distillation)
+        assert not recwarn
 
     def test_rejects_fused_linear_logprobs(self):
         """The fused forward bypasses output_layer, so the capture hook never fires."""

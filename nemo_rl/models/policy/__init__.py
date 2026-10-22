@@ -50,14 +50,14 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # Transformers 5.16.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.20.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.20. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -468,7 +468,7 @@ class MegatronConfig(TypedDict):
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
-    # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
+    # Options: 'flashinfer', 'torch', 'vllm'.
     inference_grouped_gemm_backend: NotRequired[str]
     # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
     # every decode step processes the full NVLS dispatcher buffer
