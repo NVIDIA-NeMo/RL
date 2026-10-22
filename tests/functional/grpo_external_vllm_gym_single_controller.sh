@@ -83,10 +83,11 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
 uv run "$PROJECT_ROOT/tests/check_metrics.py" "$RUN_DIR/train/metrics.json" \
     'len(data["train/gen_kl_error"]) >= 10' \
     'max(data["train/grad_norm"]) > 0' \
-    'len(data["timing/train/prepare_for_generation/nccl_refit_remote_vllm"]) >= 10'
+    'len(data["timing/train/prepare_for_generation/sync_policy_params"]) >= 10'
 
 # Verify that vLLM committed repeated native weight updates, in addition to the
-# controller reporting refit timings and the policy taking real optimizer steps.
+# controller preparing each refit and the policy taking real optimizer steps.
+# SingleController does not pass its timer into the transport synchronizer.
 curl --fail --silent --show-error "${BASE_URL%/v1}/weight_info" \
     > "$RUN_DIR/weight-info.json"
 jq -e '(.weight_version | tonumber) >= 10' "$RUN_DIR/weight-info.json"
