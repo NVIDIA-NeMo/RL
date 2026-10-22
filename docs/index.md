@@ -93,6 +93,13 @@ Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm R
 ::::{grid} 1 1 2 2
 :gutter: 3
 
+:::{grid-item-card} {octicon}`beaker` Hybrid AR + Diffusion GRPO
+:link: guides/hybrid-ar-diffusion
+:link-type: doc
+
+Anchor block-diffusion models to their pretraining objective with an auxiliary cross-entropy term during GRPO.
+:::
+
 :::{grid-item-card} {octicon}`mortar-board` GRPO DeepscaleR
 :link: guides/grpo-deepscaler
 :link-type: doc
@@ -321,6 +328,7 @@ guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md
+guides/hybrid-ar-diffusion.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
 guides/grpo-audio-visual.md
