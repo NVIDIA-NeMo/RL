@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 import torch
+from ray import cloudpickle
 
 from nemo_rl.models.generation.remote_vllm import (
     RemoteVllmClient,
@@ -249,6 +250,23 @@ def test_single_server_without_lb_health_is_one_engine(
     calls, synchronizer = _setup(monkeypatch, health=None)
     synchronizer.init_communicator()
     assert ("policy_init", 17, 16, "vllm") in calls
+
+
+def test_initialized_generation_can_be_passed_to_single_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, synchronizer = _setup(monkeypatch, health=None)
+    synchronizer.init_communicator()
+    generation = synchronizer._generation
+    generation.weight_synchronizer = synchronizer
+
+    restored = cloudpickle.loads(cloudpickle.dumps(generation))
+    assert restored.weight_synchronizer._generation is restored
+    restored.weight_synchronizer.sync_weights()
+    assert ("finish", "1") in restored.client.calls
+    assert not restored.weight_synchronizer.is_stale
+    restored.weight_synchronizer.shutdown()
+    synchronizer.shutdown()
 
 
 @pytest.mark.parametrize("control_fanout", [False, True])

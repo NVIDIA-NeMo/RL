@@ -93,8 +93,8 @@ vLLM's packing convention, including tensors larger than a packed buffer.
 A configured fleet-health refit deadline can shorten the collective deadline.
 
 A failed update leaves generation paused and prevents reuse of the failed
-synchronizer. Restart both training and serving before retrying. Controller
-shutdown releases its HTTP executor; NCCL communicators belong to the GPU
+synchronizer. Restart both training and serving before retrying. Each paired
+HTTP call releases its executor; NCCL communicators belong to the GPU
 processes and are reclaimed when those processes exit. NeMo-RL does not
 terminate the externally managed service. Do not share it with another
 training job while a communicator is active.

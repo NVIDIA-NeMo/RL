@@ -73,7 +73,6 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
         self._stale = True
         self._failed = False
         self._closed = False
-        self._executor = ThreadPoolExecutor(max_workers=1)
 
     @property
     def is_stale(self) -> bool:
@@ -100,8 +99,11 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
     ) -> None:
         """Run ``call`` beside the policy collective; fail fast if it fails."""
         deadline = time.monotonic() + self._refit_timeout_s
+        # Setup passes the initialized generation/synchronizer graph to a Ray
+        # actor. Keep thread pools out of that graph, since they cannot be pickled.
+        executor = ThreadPoolExecutor(max_workers=1)
         try:
-            http: Future[None] = self._executor.submit(call)
+            http: Future[None] = executor.submit(call)
             pending = list(futures)
             while pending:
                 http_error = http.exception() if http.done() else None
@@ -124,6 +126,9 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
             # calls have socket timeouts; shutdown must not wait on that thread.
             self._failed = True
             raise
+        finally:
+            # Do not wait for a timed-out control request during failure cleanup.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def init_communicator(self) -> None:
         self._check_usable()
@@ -238,4 +243,3 @@ class RemoteVllmNcclWeightSynchronizer(WeightSynchronizer):
         """
         self._closed = True
         self._update_info = None
-        self._executor.shutdown(wait=False, cancel_futures=True)
