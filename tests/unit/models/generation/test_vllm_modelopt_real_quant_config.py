@@ -161,7 +161,40 @@ def _clear_vllm_backend_modules(monkeypatch):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend",
         "nemo_rl.models.generation.vllm.vllm_backend",
     ):
+        parent_name, _, child_name = module_name.rpartition(".")
+        parent = importlib.import_module(parent_name)
+        # Imports overwrite both caches, including entries absent before the test.
+        monkeypatch.setattr(
+            parent, child_name, getattr(parent, child_name, None), raising=False
+        )
+        monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+        monkeypatch.delitem(sys.modules, module_name)
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_backend_import_restores_module_caches(monkeypatch, preloaded):
+    module_name = "nemo_rl.models.generation.vllm.vllm_backend"
+    parent = importlib.import_module("nemo_rl.models.generation.vllm")
+    original = types.ModuleType(module_name)
+    if preloaded:
+        monkeypatch.setitem(sys.modules, module_name, original)
+        monkeypatch.setattr(parent, "vllm_backend", original, raising=False)
+    else:
         monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.delattr(parent, "vllm_backend", raising=False)
+
+    with pytest.MonkeyPatch.context() as scoped:
+        _clear_vllm_backend_modules(scoped)
+        replacement = types.ModuleType(module_name)
+        sys.modules[module_name] = replacement
+        parent.vllm_backend = replacement
+
+    if preloaded:
+        assert sys.modules[module_name] is original
+        assert parent.vllm_backend is original
+    else:
+        assert module_name not in sys.modules
+        assert not hasattr(parent, "vllm_backend")
 
 
 def _import_vllm_quant_backend(monkeypatch):
