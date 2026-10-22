@@ -194,15 +194,10 @@ def _get_non_packed_sequence_pad_factor(cfg: dict[str, Any]) -> int:
     factor = lcm(
         cfg["make_sequence_length_divisible_by"],
         get_fp8_token_alignment(megatron_cfg),
+        # CP slicing precedes the SP scatter: their factors must multiply,
+        # rather than only sharing a common multiple before either split.
+        get_parallel_token_alignment(megatron_cfg),
     )
-    cp_size = megatron_cfg["context_parallel_size"]
-    if cp_size > 1:
-        factor = lcm(factor, cp_size * 2)
-    if (
-        megatron_cfg["tensor_model_parallel_size"] > 1
-        and megatron_cfg["sequence_parallel"]
-    ):
-        factor = lcm(factor, megatron_cfg["tensor_model_parallel_size"])
     return factor
 
 
