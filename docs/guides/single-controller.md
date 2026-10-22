@@ -588,6 +588,8 @@ per declared model-input field, use `encode_multimodal_for_wire` when writing it
 and carry `multimodal_row_tags` with the matching sample rows. Row selection must
 preserve these geometry tags. Empty rows reconstruct as `None`; model extensions
 must support absent inputs and reject placeholder tokens without their features.
+As for native media, Megatron does not pass `position_ids` to the model when any
+declared field is present, unless the model slices its own context-parallel inputs.
 
 Names must be Python identifiers. Native media, trainer fields, model forward
 arguments (including `input_ids`, `position_ids`, `attention_mask`, `labels`, and
@@ -604,10 +606,9 @@ the native client factory and SingleController actor do this from config.
 
 Checkpoints record the sorted unique declaration and reject changed declarations
 on either driver-side or actor-side recovery. Older native-media-only checkpoints
-without this metadata can resume only with no custom declaration. Earlier local
-custom-field backports without declaration metadata cannot establish this
-invariant and are rejected. Custom fields are currently supported by the ordinary
-SingleController rollout path, not token capture; setup rejects that combination.
+without this metadata can resume only with no custom declaration. Custom fields
+are currently supported by the ordinary SingleController rollout path, not token
+capture; setup rejects that combination.
 Other algorithms sharing the client factory gain field classification, but their
 application processors, model forward paths, and checkpoint lifecycles need
 separate qualification.

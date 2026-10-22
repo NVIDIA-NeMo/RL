@@ -329,7 +329,9 @@ def _register_single_controller_partitions(
 
     VLM token capture (``include_multimodal_fields`` with capture enabled) adds
     the media columns the generation workers (vLLM or Megatron Inference) stage
-    beside each captured call to the staging partition.
+    beside each captured call to the staging partition. A non-empty
+    ``data_plane.packed_multimodal_fields`` declaration also adds the media
+    columns, including the declared fields, which must already be registered.
     """
     algo_cfg = algo_config(master_config)
     policy_config = master_config.policy

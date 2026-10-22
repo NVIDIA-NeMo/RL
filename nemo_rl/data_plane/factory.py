@@ -121,7 +121,16 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
 
 
 def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
-    """Apply the packed-field declaration in each data-plane participant."""
+    """Apply the packed-field declaration in each data-plane participant.
+
+    Args:
+        cfg: Data-plane config whose ``packed_multimodal_fields`` declares the
+            custom packed inputs. ``None`` is a no-op; local configs declare none.
+
+    Raises:
+        ValueError: The declaration is invalid or differs from the one already
+            registered in this process.
+    """
     if cfg is None:
         return
     # Lazy: the native codec imports this package during data initialization.
@@ -189,7 +198,7 @@ def build_data_plane_client(
             "(which never engages the data plane) for that case."
         )
 
-    # Lazy: only data-plane clients need the packed-input registry.
+    # Lazy: the native codec imports this package during data initialization.
     from nemo_rl.data.multimodal_utils import packed_multimodal_field_registration
 
     names = (

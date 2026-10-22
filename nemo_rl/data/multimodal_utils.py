@@ -203,6 +203,14 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
     Repeating the same declaration is allowed. A different declaration,
     including omitting a previously supplied one, raises before data-plane I/O.
     Native fields and trainer/model/packing metadata names cannot be reclassified.
+
+    Args:
+        names: Custom packed model-input names, or ``None`` for no custom fields.
+
+    Raises:
+        ValueError: ``names`` is not a list of identifiers, contains a reserved or
+            native name or the ``__row_shapes`` suffix, or differs from the
+            declaration already registered in this process.
     """
     # Lazy to avoid the data/data_plane package initialization cycle.
     from nemo_rl.data_plane.schema import (
@@ -248,16 +256,20 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
         "seq_idx",
         "padding_mask",
     }
-    # Native packed fields remain valid transport inputs, but are not custom.
-    native_fields = PACKED_MULTIMODAL_FIELDS - (G_CUSTOM_PACKED_FIELDS or frozenset())
-    invalid = sorted(
-        name
-        for name in declaration
-        if name in reserved | native_fields or name.endswith(ROW_SHAPES_SUFFIX)
-    )
-    if invalid:
-        raise ValueError(f"packed_multimodal_fields contains reserved names: {invalid}")
     with G_PACKED_FIELDS_LOCK:
+        # Native packed fields remain valid transport inputs, but are not custom.
+        native_fields = PACKED_MULTIMODAL_FIELDS - (
+            G_CUSTOM_PACKED_FIELDS or frozenset()
+        )
+        invalid = sorted(
+            name
+            for name in declaration
+            if name in reserved | native_fields or name.endswith(ROW_SHAPES_SUFFIX)
+        )
+        if invalid:
+            raise ValueError(
+                f"packed_multimodal_fields contains reserved names: {invalid}"
+            )
         if G_CUSTOM_PACKED_FIELDS is not None and declaration != G_CUSTOM_PACKED_FIELDS:
             raise ValueError(
                 "packed_multimodal_fields must be identical for every client in a process: "
