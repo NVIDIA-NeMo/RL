@@ -92,6 +92,10 @@ echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
     | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt update
 apt install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}"
+# Remove EFA metrics plugins bundled with a vulnerable Go toolchain.
+# Match NVIDIA-NeMo/Automodel#4172 for both supported architectures.
+rm -rf "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-x64/plugins/efa_metrics" \
+    "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-sbsa-armv8/plugins/efa_metrics"
 rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc
 
 # To fix CVE-2025-68973
@@ -241,6 +245,7 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl docker/prune_setuptools_cache.sh /usr/local/libexec/prune_setuptools_cache.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -366,24 +371,7 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 # No venv uses the old copy (every venv resolves setuptools from uv.lock), so it is only
 # cache residue. The wheels-v6 index entries are removed too so uv has no dangling pointer
 # and simply re-downloads if it ever needs that version.
-prune_stale_setuptools_cache() {
-    local cache="$1" min=80.10.2 path ver
-    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
-        [[ -d "${path}" ]] || continue
-        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
-        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
-            rm -rf "${path%/*}"
-        fi
-    done
-    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
-        [[ -e "${path}" || -L "${path}" ]] || continue
-        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
-        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
-            rm -rf "${path}"
-        fi
-    done
-}
-prune_stale_setuptools_cache /root/.cache/uv
+bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
 
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
@@ -497,24 +485,7 @@ rm -rf /tmp/trtllm-build-venv
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
 # Same for stale setuptools (see the comment in the preceding dependency layer).
-prune_stale_setuptools_cache() {
-    local cache="$1" min=80.10.2 path ver
-    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
-        [[ -d "${path}" ]] || continue
-        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
-        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
-            rm -rf "${path%/*}"
-        fi
-    done
-    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
-        [[ -e "${path}" || -L "${path}" ]] || continue
-        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
-        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
-            rm -rf "${path}"
-        fi
-    done
-}
-prune_stale_setuptools_cache /root/.cache/uv
+bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -633,6 +604,9 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
+# Release-stage editable installs and Gym prefetch can cache old build-only
+# setuptools again. Prune after the final uv install, not just backend warmups.
+bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
 EOF
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
 # (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,

@@ -518,6 +518,7 @@ def mock_grpo_components():
                 "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_policy_before_refit": False,
                 "max_total_sequence_length": 2048,
                 "make_sequence_length_divisible_by": 1,
                 "generation": {
@@ -3458,6 +3459,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             return "127.0.0.1", 1234
 
     class DummyPolicy:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
         def print_node_ip_and_gpu_id(self):
             pass
 
@@ -3480,7 +3484,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     ):
         del (
             cluster,
-            config,
             tokenizer,
             processor,
             weights_path,
@@ -3488,7 +3491,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             init_optimizer,
             init_reference_model,
         )
-        return DummyPolicy()
+        return DummyPolicy(config)
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
@@ -5941,6 +5944,11 @@ class TestValidateFunction:
 class TestComputeAndApplySeqLogprobErrorMasking:
     """Tests for the compute_and_apply_seq_logprob_error_masking function."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        # These pure tensor tests do not need the module's environment fixture.
+        yield
+
     def _create_train_data(
         self,
         batch_size: int,
@@ -5990,6 +5998,20 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("threshold", [None, 2.0])
+    def test_support_filtered_tokenless_rows_are_excluded(self, threshold):
+        train_data = self._create_train_data(
+            2,
+            3,
+            torch.zeros(2, 3),
+            torch.zeros(2, 3),
+            token_mask=torch.tensor([[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]),
+        )
+        compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(2), threshold
+        )
+        torch.testing.assert_close(train_data["sample_mask"], torch.tensor([0.0, 1.0]))
 
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
@@ -6259,7 +6281,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
-        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""
@@ -6607,6 +6629,30 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "offload_policy", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, offload_policy, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            offload_policy_before_refit=offload_policy,
+        )
+        is expected
+    )
 
 
 def test_grpo_train_shuts_down_environments_after_failure():

@@ -62,6 +62,7 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
+from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
 from nemo_rl.models.generation.interfaces import RefitPayloadMode
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -1300,6 +1301,9 @@ class AutomodelPolicyWorkerImpl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        # Release recompute activations that MoE dispatch state keeps alive;
+        # otherwise they pin cached segments and empty_cache() cannot free them.
+        release_moe_dispatcher_state(self.model)
         gc.collect()
         torch.cuda.empty_cache()
 

@@ -36,6 +36,9 @@ policy:
       - '*.shared_experts.*'
     vllm_kwargs:
       moe_backend: auto
+      # Keep Megatron MTP training, but disable the incompatible vLLM drafter.
+      speculative_config:
+        num_speculative_tokens: 0
 
 logger:
   log_dir: logs/super120b-w4a4-real-300step

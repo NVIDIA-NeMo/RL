@@ -1203,6 +1203,47 @@ class _PastTheGuard(Exception):
     """Raised by the sentinel timer once the payload guard has been passed."""
 
 
+@pytest.mark.parametrize("full_vocab", [False, True])
+def test_full_vocab_logprobs_preserve_rollout_sampling(monkeypatch, full_vocab):
+    from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_mod
+
+    worker = object.__new__(worker_mod.MegatronPolicyWorkerImpl)
+    worker.timer = MagicMock()
+    worker.model = MagicMock()
+    worker.cfg = {"logprob_batch_size": 1, "megatron_cfg": {}}
+    worker.sampling_params = TrainingSamplingParams(top_k=3, top_p=0.9, temperature=0.6)
+    worker._opd_full_enabled = full_vocab
+    worker.media_placeholder_token_id = None
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    monkeypatch.setattr(
+        worker_mod, "get_microbatch_iterator", lambda *a, **k: ([], 1, 1, 4, 4)
+    )
+    captured = {}
+
+    def capture_processor(**kwargs):
+        captured.update(kwargs)
+        raise _PastTheGuard
+
+    monkeypatch.setattr(worker_mod, "LogprobsPostProcessor", capture_processor)
+    with torch.enable_grad(), pytest.raises(_PastTheGuard):
+        worker.get_logprobs(
+            data=BatchedDataDict(input_ids=torch.zeros(1, 4, dtype=torch.long))
+        )
+
+    params = captured["sampling_params"]
+    assert params.top_k == (None if full_vocab else 3)
+    assert params.top_p == (1.0 if full_vocab else 0.9)
+    assert params.temperature == 0.6
+    assert worker.sampling_params == TrainingSamplingParams(
+        top_k=3, top_p=0.9, temperature=0.6
+    )
+
+
 class _SentinelTimer:
     def start(self, name):
         raise _PastTheGuard(name)
@@ -2183,6 +2224,8 @@ def create_megatron_test_config(
         "logprob_chunk_size": logprob_chunk_size,
         "precision": precision,
         "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
         "generation": {
             "backend": generation_backend,
             "refit_transport": "mcore" if generation_backend == "megatron" else None,

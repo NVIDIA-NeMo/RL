@@ -179,7 +179,10 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
 
 # ===============================================================================
@@ -547,6 +550,19 @@ def _needs_hf_refit_handshake(
     if generation_backend == "megatron":
         return False
     return not (nccl_reshard_refit_enabled and not colocated_inference)
+
+
+def _uses_managed_noncolocated_refit(
+    generation_backend: str,
+    nccl_reshard_refit_enabled: bool,
+    offload_policy_before_refit: bool,
+) -> bool:
+    """Whether non-colocated setup must attach a weight synchronizer."""
+    return (
+        nccl_reshard_refit_enabled
+        or generation_backend == "dynamo"
+        or offload_policy_before_refit
+    )
 
 
 def _shutdown_completed_nemo_gym_startup(
@@ -1257,6 +1273,16 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=backend,
+        colocated=colocated_inference,
+        refit_transport=generation_config.get("refit_transport"),
+    )
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
     generation_config["_debug_payload_metrics"] = grpo_config.debug_payload_metrics
     remote_transport = None
@@ -1833,7 +1859,11 @@ def setup(
     ):
         t0 = time.perf_counter()
         # init collective
-        if nccl_reshard_refit_enabled or backend == "dynamo":
+        if _uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
+            offload_policy_before_refit=offload_policy_before_refit,
+        ):
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -2834,17 +2864,24 @@ def compute_and_apply_seq_logprob_error_masking(
 
     Args:
         train_data: Training data dict containing token_mask, sample_mask,
-                   prev_logprobs, and generation_logprobs. If masking is applied,
-                   sample_mask will be updated in-place.
+                   prev_logprobs, and generation_logprobs. Tokenless rows and
+                   sequences above the threshold are excluded from sample_mask.
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
-                                    exceeding this threshold. If None, only compute metrics.
+                                    exceeding this threshold. None disables threshold
+                                    filtering, but token/sample validity still applies.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
         min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
         num_masked_seqs, masked_correct_pct
     """
+    # The logprob worker already narrowed token_mask; empty rows must not
+    # contribute to sequence-normalized losses or valid-sample counts.
+    train_data["sample_mask"] = train_data["sample_mask"] * train_data["token_mask"][
+        :, 1:
+    ].bool().any(dim=-1)
+
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
     sample_mask = train_data["sample_mask"]
