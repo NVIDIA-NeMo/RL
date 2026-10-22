@@ -11,16 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validate the gym venv prefetch configs against Gym's real pydantic models.
+"""Validate the gym venv prefetch configs against Gym's real models and config parser.
 
 ``examples/nemo_gym/prefetch_*.yaml`` are only exercised by the rl-gym image
 build (``docker/Dockerfile``, gated on ``NEMO_GYM_PREFETCH_CONFIGS``), which no
 PR-time CI job runs. A Gym field that gains a new default-less entry therefore
 breaks the image build rather than the PR that drifts away from it. These tests
 run Gym's own ``model_validate`` on every standalone server block in those
-configs so the drift surfaces at PR time instead.
+configs so the drift surfaces at PR time instead. They also compose each config
+through Gym's own parser (strict environment servers), check that any file a
+config names under ``/opt/nemo-rl`` ships in this repo, and check that the
+Super 3.5 config keeps the services the newer blends added.
 
-Passing here does NOT mean the image build succeeds. Two known gaps:
+Passing here does NOT mean the image build succeeds. Known gaps:
 
 * ``prefetch_local_vllm_model`` is skipped whenever vllm is absent, which in CI is
   **always**: ``L0_Unit_Tests_Nemo_Gym.sh`` runs ``uv run --extra nemo_gym`` and vllm
@@ -29,6 +32,9 @@ Passing here does NOT mean the image build succeeds. Two known gaps:
   therefore unguarded here. Tracked in
   https://github.com/NVIDIA-NeMo/RL/issues/3806.
 * The ``UV_LINK_MODE``/``r2e_gym.sh`` half of the prefetch is not covered at all.
+* Nothing here creates a venv or starts a server, so install- and import-time
+  failures (e.g. ether0's rdkit needing system X11 libraries) still surface only
+  in the image build.
 """
 
 import glob
@@ -163,6 +169,72 @@ def test_super35_prefetch_covers_newer_service_venvs(server_instance: str) -> No
     ((server_type, servers),) = bundled[server_instance].items()
     ((server_name, block),) = servers.items()
     assert (gym.PARENT_DIR / server_type / server_name / block["entrypoint"]).is_file()
+
+
+# Where docker/Dockerfile puts the NeMo RL source (its WORKDIR and COPY target).
+CONTAINER_REPO_ROOT = "/opt/nemo-rl/"
+
+
+def _container_repo_paths(value):
+    """Yield every string in ``value`` that names a file under the image's NeMo RL source."""
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _container_repo_paths(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _container_repo_paths(item)
+    elif isinstance(value, str) and value.startswith(CONTAINER_REPO_ROOT):
+        yield value
+
+
+@pytest.mark.parametrize(
+    "config_path", PREFETCH_CONFIGS, ids=[os.path.basename(p) for p in PREFETCH_CONFIGS]
+)
+def test_prefetch_config_composes_with_gym_parser(config_path):
+    """Every prefetch config must compose through Gym's own config parser.
+
+    This is the static half of the image build's dry run: every ``config_paths``
+    entry resolves (nested includes and moved-path aliases too), every server
+    reference and ``_inherit_from`` source exists, no mandatory ``???`` value is
+    left unset, and every agent has a declared environment server. ``offline``
+    keeps the parse from probing ports or exporting environment variables.
+    """
+    pytest.importorskip("nemo_gym")
+    from nemo_gym.global_config import (
+        GlobalConfigDictParser,
+        GlobalConfigDictParserConfig,
+    )
+
+    nemo_gym_config = OmegaConf.to_container(load_config(config_path), resolve=True)[
+        "env"
+    ]["nemo_gym"]
+    nemo_gym_config["error_on_agent_without_environment_server"] = True
+    GlobalConfigDictParser().parse(
+        GlobalConfigDictParserConfig(
+            initial_global_config_dict=OmegaConf.create(nemo_gym_config),
+            skip_load_from_cli=True,
+            skip_load_from_dotenv=True,
+            offline=True,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "config_path", PREFETCH_CONFIGS, ids=[os.path.basename(p) for p in PREFETCH_CONFIGS]
+)
+def test_prefetch_config_container_paths_exist_in_repo(config_path):
+    """A file a prefetch config names under /opt/nemo-rl must ship in this repo.
+
+    The dry run reads it at server construction (e.g. bbh_hypotest's
+    ``problem_jsonl``), so a rename would only fail the image build.
+    """
+    config = OmegaConf.to_container(load_config(config_path), resolve=True)
+    for path in _container_repo_paths(config["env"]["nemo_gym"]):
+        relative_path = path.removeprefix(CONTAINER_REPO_ROOT)
+        assert os.path.isfile(os.path.join(REPO_ROOT, relative_path)), (
+            f"{os.path.basename(config_path)} names {path}, but {relative_path} "
+            "is not in the repo"
+        )
 
 
 @pytest.mark.parametrize(
