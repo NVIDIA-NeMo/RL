@@ -14,6 +14,7 @@
 
 """Refresh hybrid Adam parameters after distributed checkpoint state is loaded."""
 
+import gc
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,6 +28,28 @@ if TYPE_CHECKING:
     from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
         HybridDeviceOptimizer,
     )
+
+
+def release_unused_pinned_memory_after_checkpoint() -> int:
+    """Return unused checkpoint-era pinned blocks to the host operating system.
+
+    Hybrid's load hook rebuilds its pinned CPU working parameters. Tensor
+    references can be released while CUDA's host allocator keeps those old
+    blocks cached, increasing a colocated critic's initialization peak. Wait
+    for outstanding copies, then release only unoccupied cached blocks. This
+    leaves live masters, Adam state, model parameters and RNG untouched.
+    """
+    if not torch.cuda.is_initialized():
+        return 0
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is None:
+        return 0
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory.host_memory_stats()["allocated_bytes.current"]
+    empty_host_cache()
+    after = torch.cuda.memory.host_memory_stats()["allocated_bytes.current"]
+    return max(0, before - after)
 
 
 def checkpoint_bf16_master_dtypes(

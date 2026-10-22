@@ -92,6 +92,7 @@ from nemo_rl.models.megatron.optimizer_state_sync import (
     checkpoint_bf16_master_dtypes,
     preserve_hybrid_optimizer_state_dtypes,
     refresh_hybrid_optimizer_after_checkpoint,
+    release_unused_pinned_memory_after_checkpoint,
 )
 
 _HF_CONFIG_PATCHED = False
@@ -2719,6 +2720,12 @@ def setup_model_and_optimizer(
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
             elif resume_checkpoint_exists:
                 _force_sync_model_from_optimizer_fp32(optimizer)
+                if hybrid_optimizers:
+                    released = release_unused_pinned_memory_after_checkpoint()
+                    print(
+                        f"[HOST_MEMORY] rank={torch.distributed.get_rank()} "
+                        f"released_unused_pinned_checkpoint_bytes={released}"
+                    )
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)

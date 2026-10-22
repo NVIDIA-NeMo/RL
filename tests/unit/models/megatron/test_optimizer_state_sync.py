@@ -1,6 +1,7 @@
-"""CPU checks of genuine upstream hybrid state methods; CUDA is qualified separately."""
+"""Native hybrid state checks, including a GPU pinned-cache regression."""
 
 import gc
+import copy
 import importlib.util
 import weakref
 import struct
@@ -12,7 +13,77 @@ from nemo_rl.models.megatron.optimizer_state_sync import (
     checkpoint_bf16_master_dtypes,
     preserve_hybrid_optimizer_state_dtypes,
     refresh_hybrid_optimizer_after_checkpoint,
+    release_unused_pinned_memory_after_checkpoint,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
+def test_resume_releases_unused_pinned_cache_without_changing_next_step(hybrid_class):
+    parameter = torch.nn.Parameter(
+        torch.ones(1024, 8192, dtype=torch.bfloat16, device="cuda")
+    )
+
+    def native_optimizer(p):
+        return hybrid_class(
+            [p],
+            offload_fraction=1.0,
+            cpu_optimizer_cls=torch.optim.AdamW,
+            gpu_optimizer_cls=torch.optim.AdamW,
+            param_update_in_fp32=True,
+            pin_cpu_params=True,
+            pin_cpu_grads=True,
+            overlap_cpu_optimizer_d2h_h2d=False,
+            lr=3e-6,
+            betas=(0.9, 0.99),
+            eps=1e-8,
+            weight_decay=0,
+        )
+
+    optimizer = native_optimizer(parameter)
+    parameter.grad = torch.full_like(parameter, 0.125)
+    optimizer.step()
+    optimizer.zero_grad()
+    saved = copy.deepcopy(optimizer.state_dict())
+    for _ in range(3):
+        optimizer.load_state_dict(copy.deepcopy(saved))
+        refresh_hybrid_optimizer_after_checkpoint(optimizer)
+    reference_parameter = torch.nn.Parameter(parameter.detach().clone())
+    reference = native_optimizer(reference_parameter)
+    reference.load_state_dict(copy.deepcopy(saved))
+    refresh_hybrid_optimizer_after_checkpoint(reference)
+    masters_before = [
+        p.detach().clone() for p in optimizer.param_to_fp32_param.values()
+    ]
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state().clone()
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory.host_memory_stats()
+    released = release_unused_pinned_memory_after_checkpoint()
+    after = torch.cuda.memory.host_memory_stats()
+    assert released > 0
+    assert (
+        released == before["allocated_bytes.current"] - after["allocated_bytes.current"]
+    )
+    assert before["active_bytes.current"] == after["active_bytes.current"]
+    assert torch.equal(cpu_rng, torch.get_rng_state())
+    assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+    for master, expected in zip(
+        optimizer.param_to_fp32_param.values(), masters_before, strict=True
+    ):
+        assert torch.equal(master, expected)
+    parameter.grad = torch.full_like(parameter, 0.0625)
+    reference_parameter.grad = torch.full_like(reference_parameter, 0.0625)
+    optimizer.step()
+    reference.step()
+    torch.cuda.synchronize()
+    assert torch.equal(parameter, reference_parameter)
+    for actual, expected in zip(
+        optimizer.param_to_fp32_param.values(),
+        reference.param_to_fp32_param.values(),
+        strict=True,
+    ):
+        assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("use_tracker", [False, True])
