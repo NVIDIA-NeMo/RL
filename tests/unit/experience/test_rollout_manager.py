@@ -955,6 +955,7 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    dump_gym_results=False,
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -972,6 +973,7 @@ def _nemo_gym_impl(
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
         log_full_result_tables=log_full_result_tables,
+        dump_gym_results=dump_gym_results,
         reward_penalty_config=reward_penalty_config,
     )
 
@@ -1115,9 +1117,12 @@ def test_result_to_completion_truncated_on_length_incomplete_response(
     assert completion.truncated is expected_truncated
 
 
-@pytest.mark.parametrize("log_full_result_tables", [False, True])
+@pytest.mark.parametrize(
+    ("log_full_result_tables", "dump_gym_results"),
+    [(False, False), (True, False), (False, True)],
+)
 def test_streamed_receipt_callback_uses_current_completion_conversion(
-    log_full_result_tables,
+    log_full_result_tables, dump_gym_results
 ):
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
@@ -1140,7 +1145,11 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
 
             return stream()
 
-    impl = _nemo_gym_impl(False, log_full_result_tables=log_full_result_tables)
+    impl = _nemo_gym_impl(
+        False,
+        log_full_result_tables=log_full_result_tables,
+        dump_gym_results=dump_gym_results,
+    )
     env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     results = [None]
     shaping = [None]
@@ -1168,9 +1177,10 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == "resolved-agent"
-    assert (context.full_result_json is not None) is log_full_result_tables
-    if log_full_result_tables:
-        assert "reward" not in json.loads(context.full_result_json)
+    wants_result = log_full_result_tables or dump_gym_results
+    assert (context.full_result_json is not None) is wants_result
+    if wants_result:
+        assert json.loads(context.full_result_json)["reward"] == 1.0
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

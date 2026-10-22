@@ -264,6 +264,18 @@ class ExternalServiceReadinessConfig(BaseModel, extra="allow"):
         return self
 
 
+def should_dump_gym_results(master_config: Any) -> bool:
+    """Whether rows carry ``GYM_FULL_RESULT_FIELD`` for the training-data dump.
+
+    The row builders and the advantage stage both key on this, so the column a
+    producer writes is the column the stage fetches.
+    """
+    return bool(
+        master_config.async_rl.log_full_train_data
+        and should_use_nemo_gym(master_config)
+    )
+
+
 def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     """Determine whether NeMo Gym should handle rollouts and validation."""
     should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))

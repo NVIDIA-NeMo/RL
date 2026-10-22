@@ -953,6 +953,7 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        dump_gym_results: bool = False,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -963,6 +964,7 @@ class AsyncNemoGymRolloutImpl:
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
+        self._dump_gym_results = dump_gym_results
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
@@ -1195,14 +1197,9 @@ class AsyncNemoGymRolloutImpl:
                 result["reward_log_context"] = RewardLogContext(
                     agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                     full_result_json=json.dumps(
-                        {
-                            key: value
-                            for key, value in result["full_result"].items()
-                            if key != "reward"
-                        },
-                        separators=(",", ":"),
+                        result["full_result"], separators=(",", ":")
                     )
-                    if self._log_full_result_tables
+                    if self._log_full_result_tables or self._dump_gym_results
                     else None,
                 )
             else:
@@ -1673,6 +1670,7 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        dump_gym_results: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1712,6 +1710,7 @@ class RolloutManager:
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
             log_full_result_tables=log_full_result_tables,
+            dump_gym_results=dump_gym_results,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.

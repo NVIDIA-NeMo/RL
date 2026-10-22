@@ -105,6 +105,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    should_dump_gym_results,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -2114,6 +2115,7 @@ def setup_single_controller(
     )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    dump_gym_results = should_dump_gym_results(master_config)
     tq_buffer = TQReplayBuffer(
         dp_client,
         partition_id=partition_id,
@@ -2126,6 +2128,7 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
+        include_gym_full_result=dump_gym_results,
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
@@ -2149,6 +2152,7 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                dump_gym_results=dump_gym_results,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2186,6 +2190,7 @@ def setup_single_controller(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,
         ),
+        dump_gym_results=dump_gym_results,
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(

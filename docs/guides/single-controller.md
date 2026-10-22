@@ -558,7 +558,9 @@ samples and include full token IDs, token/sample loss masks, final clipped
 advantages, rewards, sample IDs and metadata, generation logprobs, and the
 student/teacher logprobs when computed. Only padding beyond `input_lengths`
 is removed; response content is not capped. Values follow the legacy
-singleton-batch JSONL shape. Chunks stream through `.jsonl.partial` files;
+singleton-batch JSONL shape. On a NeMo-Gym run each row also carries
+`gym_full_result`, the rollout's whole Gym result (`null` for a placeholder
+row). Chunks stream through `.jsonl.partial` files;
 the final name is published only after the optimizer step completes. A
 partial file is not proof of a completed training step.
 

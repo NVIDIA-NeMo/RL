@@ -51,7 +51,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, GYM_FULL_RESULT_FIELD
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -100,6 +100,23 @@ class TestInputFields:
         assert adv.values_field in fields
         assert adv.invalid_tool_call_mask_field in fields
         assert adv.malformed_thinking_mask_field in fields
+
+    def test_gym_result_column_is_fetched_only_for_a_gym_dump(self) -> None:
+        assert GYM_FULL_RESULT_FIELD not in _config().input_fields()
+        # Without the dump there is nothing to write it to.
+        assert GYM_FULL_RESULT_FIELD not in (
+            _config(dump_object_fields=(GYM_FULL_RESULT_FIELD,)).input_fields()
+        )
+        assert GYM_FULL_RESULT_FIELD not in (
+            _config(train_data_dump_dir="/tmp/dump").input_fields()
+        )
+        assert (
+            GYM_FULL_RESULT_FIELD
+            in _config(
+                train_data_dump_dir="/tmp/dump",
+                dump_object_fields=(GYM_FULL_RESULT_FIELD,),
+            ).input_fields()
+        )
 
     def test_repeated_batch_fields_do_not_duplicate_the_reward_column(self) -> None:
         adv = AdvantageConfig(repeated_batch_fields=["total_reward"])

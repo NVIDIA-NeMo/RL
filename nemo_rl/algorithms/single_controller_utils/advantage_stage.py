@@ -59,7 +59,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
-from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.schema import GYM_FULL_RESULT_FIELD, INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -102,6 +102,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # JSON-string object columns the dump copies per row (a Gym run's
+    # GYM_FULL_RESULT_FIELD); fetched only while the dump is on.
+    dump_object_fields: tuple[str, ...] = ()
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -119,6 +122,7 @@ class AdvantageStageConfig:
             algo_config,
             is_ppo_run,
         )
+        from nemo_rl.environments.nemo_gym import should_dump_gym_results
 
         is_ppo = is_ppo_run(master_config)
         algo_cfg = algo_config(master_config)
@@ -150,12 +154,16 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
-            # logger is still a TypedDict, so this is the same value the
-            # Logger exposes as base_log_dir.
+            # The same value the Logger exposes as base_log_dir.
             train_data_dump_dir=(
-                master_config.logger["log_dir"]
+                master_config.logger.log_dir
                 if master_config.async_rl.log_full_train_data
                 else None
+            ),
+            dump_object_fields=(
+                (GYM_FULL_RESULT_FIELD,)
+                if should_dump_gym_results(master_config)
+                else ()
             ),
         )
 
@@ -196,6 +204,7 @@ class AdvantageStageConfig:
                     INPUT_LENGTHS,
                     adv_cfg.prompt_ids_field,
                     adv_cfg.generation_logprobs_field,
+                    *self.dump_object_fields,
                 ]
             )
         return list(dict.fromkeys(fields))
@@ -549,6 +558,7 @@ class AdvantageComputer:
                     # group-index key the estimator reduces over.
                     "prompt_ids": data[adv_cfg.prompt_ids_field],
                 },
+                objects={field: data[field] for field in cfg.dump_object_fields},
             )
             train_data_dump_s = time.perf_counter() - dump_started
             train_data_dump_rows = len(meta.sample_ids)
