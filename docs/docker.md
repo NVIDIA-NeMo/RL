@@ -33,6 +33,12 @@ docker buildx build --build-context nemo-rl=. -f docker/Dockerfile \
 > [!NOTE]
 > The `--tag <registry>/nemo-rl:latest --push` flags are not necessary if you just want to build locally.
 
+## uv Cache Pruning
+
+The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an unprivileged runtime user can later run `uv run --extra <backend>` fully offline. Because the shared build cache this is seeded from persists across many builds, routine dependency-version bumps (torch, vLLM, SGLang, ...) leave each predecessor version's wheel behind -- `uv` only ever adds to its cache, it never removes a version a prior `uv.lock` pinned and the current one doesn't.
+
+Before the image ships, `docker/prune_uv_cache.py` removes exactly those superseded entries: anything in the cache that isn't a `(package, version)` pair the current `uv.lock` still pins, across every extra (installed in this build or not). It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
+
 ## Skipping vLLM or SGLang Dependencies
 
 If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
