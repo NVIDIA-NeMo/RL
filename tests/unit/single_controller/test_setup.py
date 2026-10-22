@@ -491,6 +491,14 @@ def test_forest_retains_shared_checkpoint_requirements(
     patched_factories["_build_trainer"].assert_not_called()
 
 
+def test_single_controller_rejects_discard_weights_on_sleep() -> None:
+    master_config = _make_master_config(colocated=True, backend="vllm")
+    master_config.policy["generation"]["vllm_cfg"]["discard_weights_on_sleep"] = True
+
+    with pytest.raises(NotImplementedError, match="#4659"):
+        validate_single_controller_config(master_config)
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
