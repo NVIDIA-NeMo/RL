@@ -362,6 +362,10 @@ class AbstractPolicyWorker:
         """Block until any in-flight async checkpoint write completes. No-op by default."""
         pass
 
+    def poll_async_save(self) -> bool:
+        """Finalize a completed async checkpoint write without waiting; True when none is pending."""
+        return True
+
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
         pass
