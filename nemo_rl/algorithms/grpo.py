@@ -2676,11 +2676,15 @@ def _attach_grpo_draft_sample_ids(
         raise ValueError("repeated GRPO batch does not contain complete prompt groups")
 
     task_names = repeated_batch.get("task_name", [None] * repeated_batch.size)
+    # BatchedDataDict columns may be lists or tensors; keys must match for both.
+    prompt_ids = repeated_batch["idx"]
+    if isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = prompt_ids.tolist()
     row_keys = [
         json.dumps(
             [
                 task_names[row],
-                repeated_batch["idx"][row],
+                prompt_ids[row],
                 row % num_generations_per_prompt,
             ],
             separators=(",", ":"),
