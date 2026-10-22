@@ -10,8 +10,10 @@ env:
       - name: "ocr"
         weight: 1.0
 checkpointing:
-  checkpoint_dir: results/flow_grpo-qwen-image-ocr-1n8g-dp8-lora
+  checkpoint_dir: results/flow_grpo-qwen-image-ocr-2n8g-dp16-lora
 logger:
-  log_dir: logs/flow_grpo-qwen-image-ocr-1n8g-dp8-lora
+  log_dir: logs/flow_grpo-qwen-image-ocr-2n8g-dp16-lora
   wandb:
-    name: flow_grpo-qwen-image-ocr-1n8g-dp8-lora
+    name: flow_grpo-qwen-image-ocr-2n8g-dp16-lora
+cluster:
+  num_nodes: 2

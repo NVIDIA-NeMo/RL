@@ -10,6 +10,9 @@ policy:
     real_quant: true
     vllm_kwargs:
       moe_backend: auto
+      # Keep Megatron MTP training, but disable the incompatible vLLM drafter.
+      speculative_config:
+        num_speculative_tokens: 0
       attention_config:
         use_trtllm_attention: false
 

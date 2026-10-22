@@ -64,6 +64,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     validate_single_controller_config,
 )
+from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -76,12 +77,17 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler_actor import RolloutReassemblerActor
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
+from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+    SGLangColocatedWeightSynchronizer,
+    SGLangDisaggregatedWeightSynchronizer,
+)
 
 
 class FakeWeightSynchronizer:
@@ -223,7 +229,9 @@ def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, ob
     ]
 
 
-def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
+def _stamp_advantage_stage_config(
+    ctrl, *, shardable: bool = True, opd_full_enabled: bool = False
+) -> None:
     """Mirror the advantage-stage half of ``__init__`` onto a hand-built stub.
 
     The stubs below construct the controller with ``object.__new__`` and assign
@@ -248,6 +256,7 @@ def _stamp_advantage_stage_config(ctrl, *, shardable: bool = True) -> None:
         policy_logprobs_required=ctrl._policy_logprobs_required,
         reference_logprobs_required=ctrl._reference_logprobs_required,
         teacher_logprobs_required=ctrl._teacher_logprobs_required,
+        opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
@@ -775,13 +784,27 @@ class TestLookaheadSchedule:
 
 
 @pytest.mark.parametrize(
-    ("recompute_kv_cache", "expected_invalidation_calls"),
-    [(False, 0), (True, 1)],
+    (
+        "generation_pause_supported",
+        "recompute_kv_cache",
+        "expected_invalidation_calls",
+    ),
+    [
+        (True, False, 0),
+        (True, True, 0),
+        (False, False, 0),
+        (False, True, 1),
+    ],
 )
-def test_sync_weights_honors_recompute_kv_cache_config(
+@pytest.mark.parametrize("use_nemo_gym", [False, True])
+@pytest.mark.asyncio
+async def test_sync_weights_honors_recompute_kv_cache_config(
+    generation_pause_supported: bool,
     recompute_kv_cache: bool,
     expected_invalidation_calls: int,
+    use_nemo_gym: bool,
 ) -> None:
+    events: list[str] = []
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
     ctrl._async_cfg = AsyncRLConfig(
@@ -792,28 +815,200 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # No fleet health: _sync_weights reconciles refit membership first, and with no
     # monitor there is nothing to reconcile.
     ctrl._gen_fleet = None
-    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
-    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._weight_synchronizer = SimpleNamespace(
+        sync_weights=MagicMock(side_effect=lambda **_: events.append("sync"))
+    )
+    ctrl._trainer = SimpleNamespace(
+        sync_params_before_refit=MagicMock(side_effect=lambda: events.append("params"))
+    )
     ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
-        invalidate_kv_cache=MagicMock(),
+        invalidate_kv_cache=MagicMock(
+            side_effect=lambda: events.append("invalidate") or True
+        ),
+        pause_generation_for_refit=MagicMock(
+            side_effect=lambda **_: events.append("pause") or generation_pause_supported
+        ),
         requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(
+            side_effect=lambda **_: (
+                events.append("resume") or generation_pause_supported
+            )
+        ),
     )
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(
+        env={"should_use_nemo_gym": use_nemo_gym},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
+            }
+        },
+        token_capture=SimpleNamespace(enabled=False),
+    )
+
+    stale_task = asyncio.create_task(asyncio.Event().wait())
+    ctrl._inflight_by_group_id = {"stale-group": (stale_task, 0)}
+    ctrl._trainer_version = 1
+    ctrl._sampler = SimpleNamespace(should_abort_inflight=MagicMock(return_value=True))
+    try:
+        aborted = await ctrl._sync_weights()
+        assert aborted == (0 if use_nemo_gym else 1)
+        assert stale_task.cancelled() is (not use_nemo_gym)
+        if use_nemo_gym:
+            ctrl._sampler.should_abort_inflight.assert_not_called()
+        else:
+            ctrl._sampler.should_abort_inflight.assert_called_once_with(
+                start_weight_version=0, current_train_weight=1
+            )
+    finally:
+        stale_task.cancel()
+        await asyncio.gather(stale_task, return_exceptions=True)
+
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
+    ctrl._gen.pause_generation_for_refit.assert_called_once_with(
+        clear_cache=recompute_kv_cache, timeout_s=ctrl._refit_await_budget_s()
+    )
+    ctrl._gen.resume_generation_after_refit.assert_called_once_with(
+        timeout_s=ctrl._refit_await_budget_s()
+    )
+    assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    assert events == [
+        "params",
+        "pause",
+        "sync",
+        "resume",
+        *(["invalidate"] if expected_invalidation_calls else []),
+    ]
+    assert ctrl._rollout_permitted.is_set()
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@pytest.mark.parametrize("recompute_kv_cache", [False, True])
+def test_sync_weights_sglang_flushes_only_while_paused(
+    monkeypatch: pytest.MonkeyPatch,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+    recompute_kv_cache: bool,
+) -> None:
+    """Use the real hooks and synchronizer; a flush after resume must fail."""
+    events: list[str] = []
+    paused = False
+
+    def pause(*, mode: str) -> None:
+        nonlocal paused
+        assert mode == "retract"
+        paused = True
+        events.append("pause")
+
+    def flush() -> None:
+        events.append("flush")
+        if not paused:
+            raise RuntimeError("SGLang refuses flush_cache with running requests")
+
+    def resume() -> None:
+        nonlocal paused
+        paused = False
+        events.append("resume")
+
+    def transfer(**_: Any) -> list:
+        assert paused
+        assert events[-1] == "begin"
+        events.append("transfer")
+        return []
+
+    engine = MagicMock()
+    engine.pause_generation.remote.side_effect = pause
+    engine.invalidate_kv_cache.remote.side_effect = flush
+    engine.continue_generation.remote.side_effect = resume
+    engine.begin_weight_update.remote.side_effect = lambda: events.append("begin")
+    engine.end_weight_update.remote.side_effect = lambda: events.append("end")
+    monkeypatch.setattr("ray.get", lambda refs: refs)
+
+    gen = object.__new__(SGLangGeneration)
+    # No server/router was started; avoid resource cleanup in __del__.
+    gen.shutdown = MagicMock()
+    gen.all_engines = [engine]
+    gen.num_new_engines = 0
+    gen.num_gpus_per_engine = 1
+    gen.num_gpus_per_node = 1
+    gen.gpu_offset = 0
+    gen.pause_generation_mode = "retract"
+    gen.needs_offload = False
+    gen._health_monitor = None
+    gen.rollout_engine_lock = None
+    gen.sglang_cfg = {
+        "sglang_cfg": {
+            "quantization": {"scheme": "bf16"},
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+        }
+    }
+    trainer = MagicMock()
+    trainer.update_weights_to_sglang_colocated.side_effect = transfer
+    trainer.update_weights_to_sglang_distributed.side_effect = transfer
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(
+        recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._gen = gen
+    ctrl._trainer = trainer
+    ctrl._weight_synchronizer = synchronizer_cls(trainer, gen, refit_buffer_size_gb=1)
+    ctrl._timer = Timer()
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
-    # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
 
-    asyncio.run(ctrl._sync_weights())
+    assert asyncio.run(ctrl._sync_weights()) == 0
 
-    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
-    ctrl._trainer.sync_params_before_refit.assert_called_once_with()
-    assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
+    assert events == ["pause", "flush", "begin", "transfer", "end", "resume"]
+    engine.invalidate_kv_cache.remote.assert_called_once_with()
     assert ctrl._rollout_permitted.is_set()
+    assert not paused
+
+
+def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig(recompute_kv_cache_after_weight_updates=True)
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._gen = SimpleNamespace(
+        invalidate_kv_cache=MagicMock(return_value=False),
+        pause_generation_for_refit=MagicMock(return_value=False),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=False),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(NotImplementedError, match="active-request KV state"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.invalidate_kv_cache.assert_called_once_with()
+    assert not ctrl._rollout_permitted.is_set()
 
 
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
@@ -829,7 +1024,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._gen = SimpleNamespace(
         invalidate_kv_cache=MagicMock(),
+        pause_generation_for_refit=MagicMock(return_value=True),
         requires_kv_scale_sync=True,
+        resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._trainer = SimpleNamespace(
         calibrate_qkv_fp8_scales=MagicMock(return_value={"layers": {"layer.0": 0.5}}),
@@ -860,6 +1057,89 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
         kv_scales={"layer.0": 0.5}
     )
     ctrl._trainer.sync_params_before_refit.assert_called_once_with()
+
+
+def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(return_value=True),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=False),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="successful refit pause"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_called_once_with(kv_scales=None)
+    assert not ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(
+            side_effect=RuntimeError("Failed to pause every async vLLM engine")
+        ),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=True),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._weight_synchronizer.sync_weights.assert_not_called()
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
+
+
+def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(
+        sync_weights=MagicMock(side_effect=RuntimeError("refit failed"))
+    )
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(return_value=True),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=True),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(env={})
+
+    with pytest.raises(RuntimeError, match="refit failed"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.resume_generation_after_refit.assert_not_called()
+    assert not ctrl._rollout_permitted.is_set()
 
 
 class _AdvantageDataPlane:
@@ -1067,7 +1347,10 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     )
 
 
-def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
+@pytest.mark.parametrize("support_mismatch", ["none", "token", "sample"])
+def test_advantage_stage_reports_seq_logprob_metrics_without_masking(
+    support_mismatch,
+) -> None:
     batch_size, sequence_length = 2, 5
     generation_logprobs = torch.zeros(batch_size, sequence_length)
     generation_logprobs[1, 1:] = 1.0
@@ -1087,6 +1370,10 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         batch_size=[batch_size],
     )
     data_plane = _AdvantageDataPlane(data)
+    if support_mismatch == "token":
+        data["token_mask"][0, 1] = 0
+    elif support_mismatch == "sample":
+        data["token_mask"][0, 1:] = 0
     estimator = _MaskRecordingAdvantageEstimator()
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1128,15 +1415,47 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     assert "prev_logprobs" in data_plane.selected_fields
     assert "generation_logprobs" in data_plane.selected_fields
     assert data_plane.written_fields is not None
-    assert "sample_mask" not in data_plane.written_fields
     assert estimator.mask is not None
-    assert estimator.mask.all()
+    if support_mismatch != "none":
+        expected_mask = torch.ones(batch_size, sequence_length)
+        if support_mismatch == "sample":
+            expected_mask[0, 1:] = 0
+        else:
+            expected_mask[0, 1] = 0
+        assert "token_mask" not in data_plane.written_fields
+        if support_mismatch == "sample":
+            torch.testing.assert_close(
+                data_plane.written_fields["sample_mask"], torch.tensor([0.0, 1.0])
+            )
+            expected_mask[0] = 0
+        torch.testing.assert_close(estimator.mask, expected_mask)
+    else:
+        assert estimator.mask.all()
+        assert "token_mask" not in data_plane.written_fields
+    if support_mismatch != "sample":
+        assert "sample_mask" not in data_plane.written_fields
     metrics = ctrl._step_log_dict["seq_logprob_error_metrics"]
     assert len(metrics) == 1
     assert metrics[0]["num_masked_seqs_by_logprob_error"] == 0
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [0]
     assert metrics[0]["max_seq_mult_prob_error"] == pytest.approx(math.e)
     assert metrics[0]["max_seq_mult_prob_error_after_mask"] == pytest.approx(math.e)
+    valid_seqs = 1 if support_mismatch == "sample" else 2
+    assert metrics[0]["_num_valid_seqs_before"] == valid_seqs
+    assert metrics[0]["_num_valid_seqs_after"] == valid_seqs
+    if support_mismatch == "sample":
+        # A second chunk has two valid rows with probability error 1.
+        data["prev_logprobs"].zero_()
+        data["generation_logprobs"].zero_()
+        data["token_mask"].fill_(1)
+        data["sample_mask"].fill_(1)
+        asyncio.run(ctrl._advantage_stage(meta))
+        reduced = single_controller.reduce_advantage_pump_metrics(**ctrl._step_log_dict)
+        expected_mean = (math.e + 2) / 3
+        assert reduced["mean_seq_mult_prob_error"] == pytest.approx(expected_mean)
+        assert reduced["mean_seq_mult_prob_error_after_mask"] == pytest.approx(
+            expected_mean
+        )
 
 
 def test_advantage_stage_clips_training_values_and_metrics() -> None:
@@ -1339,7 +1658,19 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     assert "advantages" in (result_meta.fields or [])
 
 
-def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("tokenless_sample", "empty_response_mask", "full_vocab"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, False, True),
+    ],
+)
+def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
+    tmp_path, tokenless_sample, empty_response_mask, full_vocab
+) -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -1358,7 +1689,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
             del sample_ids, partition_id
             assert "teacher_reference_logprobs" in select_fields
             assert "generation_logprobs" in select_fields
-            return TensorDict(
+            data = TensorDict(
                 {
                     "input_ids": torch.tensor([[10, 11, 12], [20, 21, 22]]),
                     "input_lengths": torch.tensor([3, 3]),
@@ -1368,7 +1699,11 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
                         layout=torch.jagged,
                     ),
                     "total_reward": torch.zeros(2),
-                    "token_mask": torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+                    "token_mask": torch.tensor(
+                        [[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]
+                        if tokenless_sample
+                        else [[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]
+                    ),
                     "sample_mask": torch.ones(2),
                     "mask_sample": torch.zeros(2, dtype=torch.bool),
                     "truncated": torch.zeros(2, dtype=torch.bool),
@@ -1378,6 +1713,11 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
                 },
                 batch_size=(2,),
             )
+            if empty_response_mask:
+                data["token_mask"].zero_()
+            elif full_vocab:
+                data["generation_logprobs"] += math.log(2.5)
+            return data
 
         def put_samples(self, sample_ids, partition_id, fields):
             del sample_ids, partition_id
@@ -1396,13 +1736,14 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
-            seq_logprob_error_threshold=None,
+            seq_logprob_error_threshold=2.0 if full_vocab else None,
             advantage_clip_high=0.1,
-        )
+        ),
+        on_policy_distillation={"enabled": True, "full": {"enabled": full_vocab}},
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
-    _stamp_advantage_stage_config(ctrl)
+    _stamp_advantage_stage_config(ctrl, opd_full_enabled=full_vocab)
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -1425,7 +1766,23 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
 
-    assert has_valid_training_tokens
+    assert has_valid_training_tokens == (not empty_response_mask)
+    assert ctrl._dp_client.put_fields is not None
+    if full_vocab:
+        metrics = ctrl._step_log_dict["seq_logprob_error_metrics"][0]
+        assert metrics["max_seq_mult_prob_error"] == pytest.approx(2.5)
+        assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    if empty_response_mask:
+        assert not captured_kwargs
+        fields = ctrl._dp_client.put_fields
+        torch.testing.assert_close(
+            tensor_field(fields, "advantages"), torch.zeros(2, 3)
+        )
+        expected_sample_mask = torch.zeros(2)
+        assert "token_mask" not in fields
+        torch.testing.assert_close(fields["sample_mask"], expected_sample_mask)
+        assert ctrl._opd_stat_count == 0
+        return
     assert set(captured_kwargs) >= {
         "teacher_logprobs",
         "prev_logprobs",
@@ -1439,23 +1796,27 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
     # both rows here were generated in one group, so they share one baseline
     # even though their prompts differ.
     assert captured_kwargs["prompt_ids"].tolist() == [[0], [0]]
-    assert torch.allclose(
-        captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"],
-        torch.full((2, 3), 0.25),
+    valid_mask = captured_kwargs["mask"].bool()
+    num_valid_tokens = 2 if tokenless_sample else 4
+    torch.testing.assert_close(
+        (captured_kwargs["teacher_logprobs"] - captured_kwargs["prev_logprobs"])[
+            valid_mask
+        ],
+        torch.full((num_valid_tokens,), 0.25),
     )
     assert "advantages" in (enriched.fields or [])
-    assert ctrl._opd_gap_sum == pytest.approx(1.0)
-    assert ctrl._opd_stat_sum == pytest.approx(1.0)
-    assert ctrl._opd_stat_sumsq == pytest.approx(0.25)
-    assert ctrl._opd_stat_count == 4
+    assert ctrl._opd_gap_sum == pytest.approx(0.25 * num_valid_tokens)
+    assert ctrl._opd_stat_sum == pytest.approx(0.25 * num_valid_tokens)
+    assert ctrl._opd_stat_sumsq == pytest.approx(0.25**2 * num_valid_tokens)
+    assert ctrl._opd_stat_count == num_valid_tokens
     assert ctrl._dp_client.put_fields is not None
-    written_advantages = ctrl._dp_client.put_fields["advantages"]
+    written_advantages = tensor_field(ctrl._dp_client.put_fields, "advantages")
     torch.testing.assert_close(
-        written_advantages,
-        torch.full_like(written_advantages, 0.1),
+        written_advantages[valid_mask],
+        torch.full((num_valid_tokens,), 0.1),
     )
     (logged,) = ctrl._step_log_dict["advantage_partials"]
-    assert logged.count == 4
+    assert logged.count == num_valid_tokens
     assert logged.minimum == pytest.approx(0.1)
     assert logged.maximum == pytest.approx(0.1)
 
@@ -1475,14 +1836,18 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(tmp_path) -> Non
     assert dumped[0]["prev_logprobs"] == [[0.5, 0.5, 0.5]]
     # The dump writes each row's real prompt, without the estimator's padding.
     assert [row["prompt_ids"] for row in dumped] == [[[10, 11]], [[20]]]
+    if tokenless_sample:
+        torch.testing.assert_close(
+            ctrl._dp_client.put_fields["sample_mask"], torch.tensor([1.0, 0.0])
+        )
 
 
 def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     """TROPD and the global baseline reshape the advantage, not the gap metric."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
-    token_mask = torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 0.0]])
-    prev_logprobs = torch.tensor([[-1.0, -2.0, -0.5], [-1.5, -3.0, -3.0]])
+    token_mask = torch.tensor([[1.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
+    prev_logprobs = torch.tensor([[-1.0, -2.0, -0.5], [-1.5, -1.5, -3.0]])
     teacher_logprobs = torch.tensor([[-0.5, -0.5, -2.0], [-1.0, -1.0, -1.0]])
 
     class FakeDataPlane:

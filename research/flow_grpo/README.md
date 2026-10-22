@@ -88,7 +88,7 @@ Recipes ship as thin overrides of the exemplar:
 | Recipe | Reward | Steps | Config |
 |---|---|---|---|
 | Exemplar | `genrm_ocr` | 300 | `research/flow_grpo/configs/recipes/flow_grpo_qwen_image_ocr.yaml` |
-| Nightly (CI convergence gate) | `ocr` (PaddleOCR, CPU) | 60 | `research/flow_grpo/configs/recipes/flow_grpo-qwen-image-ocr-1n8g-dp8-lora.yaml` |
+| Nightly (CI convergence gate) | `ocr` (PaddleOCR, CPU) | 60 | `research/flow_grpo/configs/recipes/flow_grpo-qwen-image-ocr-2n8g-dp16-lora.yaml` |
 
 The nightly recipe swaps in the CPU PaddleOCR reward so CI needs no served judge, and asserts a `val/reward_mean` gain plus healthy `train/mean_ratio` and `train/grad_norm` bounds.
 

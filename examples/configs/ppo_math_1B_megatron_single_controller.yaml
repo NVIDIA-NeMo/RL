@@ -39,7 +39,7 @@ async_rl:
     # throughout. Buffer capacity below must cover the wider of the two.
     warmup_lookahead_versions: null
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
   # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
   # Value training stays full batch.
