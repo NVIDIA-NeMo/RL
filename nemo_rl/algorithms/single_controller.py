@@ -457,6 +457,9 @@ class SingleControllerActor:
         )
         self._tracer = _telemetry.tracer if _telemetry is not None else None
 
+        from nemo_rl.data_plane.factory import configure_multimodal_fields
+
+        configure_multimodal_fields(master_config.data_plane)
         self._advantage_cfg = AdvantageConfig()
         self._partition_id: str = actor_args.partition_id
 
@@ -541,6 +544,9 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    packed_multimodal_fields=master_config.data_plane.get(
+                        "packed_multimodal_fields"
+                    ),
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
@@ -2019,6 +2025,11 @@ class SingleControllerActor:
                 self._rollout_manager.execution_row_multiple
                 if self._master_config.token_capture.forest_training
                 else None
+            ),
+            "packed_multimodal_fields": sorted(
+                set(
+                    self._master_config.data_plane.get("packed_multimodal_fields") or ()
+                )
             ),
         }
         if replay_metadata is not None:

@@ -150,6 +150,7 @@ class DataPlaneCheckpointMetadata(TypedDict):
     forest_execution_row_multiple: NotRequired[int | None]
     # opd_full only: checkpoint path per teacher_index.
     opd_full_teacher_checkpoints: NotRequired[list[str]]
+    packed_multimodal_fields: NotRequired[list[str]]
 
 
 def validate_forest_checkpoint_metadata(
