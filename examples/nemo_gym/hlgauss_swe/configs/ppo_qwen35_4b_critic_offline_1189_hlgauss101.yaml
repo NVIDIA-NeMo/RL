@@ -1,0 +1,34 @@
+# Classification critic on the exact 1189 stored groups used by the MSE run.
+defaults: ppo_qwen35_4b_critic_offline_1189.yaml
+
+value:
+  value_head:
+    type: categorical
+    num_bins: 101
+    v_min: -0.1
+    v_max: 1.1
+
+value_loss_fn:
+  type: hl_gauss
+  hl_gauss_sigma_ratio: 0.75
+  hl_gauss_label_smoothing: 0.0
+  cliprange: null
+
+# The old HL-Gauss PPO retry enabled invalid-tool penalties. This offline
+# comparison keeps the pretraining reward rules but leaves that penalty off.
+reward_penalties:
+  penalize_invalid_tool_call: false
+
+ppo:
+  invalid_tool_call_advantage: null
+  empty_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189-hlgauss101/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189-hlgauss101/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: qwen35-4b-critic-offline-1189-hlgauss101

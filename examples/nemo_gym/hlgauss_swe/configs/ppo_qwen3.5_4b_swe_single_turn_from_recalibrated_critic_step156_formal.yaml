@@ -1,0 +1,35 @@
+# Fresh PPO with the origin Qwen3.5-4B actor and the final E2E-pretrained
+# critic. Only value weights are warm-started; all PPO state is fresh.
+defaults: ppo_qwen3.5_4b_swe_single_turn_criticlr6e6_pretrained_step90_formal.yaml
+
+ppo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 500
+  ppo_epochs: 1
+  critic_train_epochs: 2
+  # No critic-only warmup: actor and critic both update from PPO Step 1.
+  policy_training_start_step: 0
+  # Weights-only initialization; optimizer/scheduler/dataloader/replay are fresh.
+  initial_value_weights_path: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen3.5-4b-swe-e2e-critic-pretrain-v0.7-seq64k-turn100-criticlr6e-6-epoch2-gpp8-rerun/checkpoints/step_171/value/weights
+  # Keep context-limit trajectories; Gym mask_sample remains the source of truth
+  # for invalid successful truncations and infrastructure failures.
+  overlong_filtering: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen3.5-4b-swe-single-turn-v0.7-seq64k-turn100-criticlr6e-6-criticpretrainstep171-originactor/checkpoints
+  save_period: 5
+  checkpoint_must_save_by: "00:03:35:00"
+  keep_top_k: 10
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen3.5-4b-swe-single-turn-v0.7-seq64k-turn100-criticlr6e-6-criticpretrainstep171-originactor/logs
+  monitor_gpus: true
+  tensorboard_enabled: false
+  wandb_enabled: true
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen3.5-4b-swe-single-turn-v0.7-seq64k-turn100-criticlr6e-6-criticpretrainstep171-originactor
+    log_nemo_gym_full_result_tables: false

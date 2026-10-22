@@ -1,0 +1,73 @@
+# Qwen3.5-4B critic-only pretraining on full E2E SWE/OpenHands rollouts.
+#
+# This intentionally inherits the validated single-turn PPO recipe so the
+# rollout distribution exactly matches downstream E2E PPO.  The actor stays at
+# the original Qwen3.5-4B checkpoint for the whole run; only the critic trains.
+defaults: ppo_qwen3.5_4b_swe_single_turn_formal.yaml
+
+ppo:
+  # Eight independent E2E trajectories per prompt, while holding the global
+  # training batch at 128 by reducing prompts per step from 128 to 16.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  overlong_filtering: false
+  max_num_steps: 500
+  ppo_epochs: 1
+  critic_train_epochs: 2
+  policy_training_start_step: 1000000000
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  async_ppo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    # The rollout policy is frozen, so collector rollouts remain on-policy for
+    # the entire critic-only run even if collection gets ahead of training.
+    warmup_max_trajectory_age_steps: 64
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+    drop_incomplete_targets_on_restore: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen3.5-4b-swe-e2e-critic-pretrain-v0.7-seq64k-turn100-criticlr6e-6-epoch2-gpp8-rerun/checkpoints
+  metric_name: train:critic/pre_update_explained_var
+  higher_is_better: true
+  save_period: 5
+  keep_top_k: 10
+  ft_save_period: 5
+  ft_keep_latest_k: 2
+  checkpoint_must_save_by: "00:03:35:00"
+  save_optimizer: true
+
+value:
+  train_global_batch_size: 128
+  megatron_cfg:
+    optimizer:
+      lr: 6.0e-6
+      min_lr: 6.0e-6
+      weight_decay: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_style: constant
+      lr_decay_iters: 1000000
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen3.5-4b-swe-e2e-critic-pretrain-v0.7-seq64k-turn100-criticlr6e-6-epoch2-gpp8-rerun/logs
+  monitor_gpus: true
+  tensorboard_enabled: false
+  wandb_enabled: true
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen3.5-4b-swe-e2e-critic-pretrain-v0.7-criticlr6e-6-epoch2-gpp8-rerun
+    log_nemo_gym_full_result_tables: false
+
+policy:
+  train_global_batch_size: 128

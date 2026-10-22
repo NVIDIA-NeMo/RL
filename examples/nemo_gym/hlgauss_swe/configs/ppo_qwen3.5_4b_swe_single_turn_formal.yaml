@@ -1,0 +1,380 @@
+# Qwen3.5-4B formal async PPO for the single-turn SWE/OpenHands Gym.
+# Local, self-contained experiment overlay; the base recipe is in this checkout.
+defaults: ../../../configs/ppo_math_1B_megatron.yaml
+
+ppo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_steps: 500
+  ppo_epochs: 1
+  critic_train_epochs: 1
+  # Critic-only warmup for displayed Steps 1-5; actor training starts at Step 6.
+  policy_training_start_step: 5
+  val_period: 999
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  overlong_filtering: false
+  use_dynamic_sampling: false
+  skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: null
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+  adv_estimator:
+    name: gae
+    gae_lambda: 1.0
+    gae_gamma: 1.0
+    normalize_advantages: true
+    gae_lambda_value: 1.0
+    gae_lambda_policy: null
+    length_adaptive_alpha: 0.0
+    cross_trajectory: false
+  async_ppo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    warmup_max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+    drop_incomplete_targets_on_restore: true
+
+loss_fn:
+  disable_ppo_ratio: false
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_importance_sampling_correction: true
+  use_direct_rollout_ratio: false
+  force_on_policy_ratio: false
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_ratio: 5.0
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  use_on_policy_kl_approximation: false
+  use_kl_in_reward: false
+
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/nemo-rl/results/ppo-qwen3.5-4b-swe-single-turn-v0.7-seq64k-turn100/checkpoints
+  save_period: 5
+  checkpoint_must_save_by: "00:03:35:00"
+  keep_top_k: 4
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/users/bihu/hf_models/Qwen3.5-4B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+    activation_checkpointing: true
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
+    defer_fp32_logits: true
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    freeze_moe_router: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_style: constant
+      lr_decay_iters: 1000000
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    sequence_length_round: 64
+  sequence_packing:
+    # Policy follows the already validated formal GRPO CP2 + packing path.
+    enabled: true
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 16
+  generation:
+    max_new_tokens: 65536
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 8
+    vllm_cfg:
+      async_engine: true
+      enable_prefix_caching: false
+      precision: bfloat16
+      kv_cache_dtype: auto
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: 65536
+      enforce_eager: false
+      use_deep_gemm: false
+      enable_vllm_metrics_logger: false
+      expose_http_server: true
+      skip_tokenizer_init: false
+      enable_thinking: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: qwen3
+        chat_template: |
+          {%- if tools %}
+              {{- '<|im_start|>system\n' }}
+              {%- if messages[0].role == 'system' %}
+                  {%- if messages[0].content is string %}
+                      {{- messages[0].content + '\n\n' }}
+                  {%- endif %}
+              {%- endif %}
+              {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+              {%- for tool in tools %}
+                  {{- "\n" }}
+                  {{- tool | tojson }}
+              {%- endfor %}
+              {{- "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n" }}
+          {%- else %}
+              {%- if messages[0].role == 'system' %}
+                  {%- if messages[0].content is string %}
+                      {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endif %}
+          {%- for message in messages %}
+              {%- if message.content is string %}
+                  {%- set content = message.content %}
+              {%- else %}
+                  {%- set content = '' %}
+              {%- endif %}
+              {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+                  {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+              {%- elif message.role == "assistant" %}
+                  {%- set reasoning_content = '' %}
+                  {%- if message.reasoning_content is string %}
+                      {%- set reasoning_content = message.reasoning_content %}
+                  {%- else %}
+                      {%- if '</think>' in content %}
+                          {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                          {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+                      {%- endif %}
+                  {%- endif %}
+                  {%- set reasoning_content = reasoning_content | trim %}
+                  {%- if reasoning_content %}
+                      {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content.lstrip('\n') }}
+                  {%- else %}
+                      {{- '<|im_start|>' + message.role + '\n' + content }}
+                  {%- endif %}
+                  {%- if message.tool_calls %}
+                      {%- for tool_call in message.tool_calls %}
+                          {%- if tool_call.function is defined %}
+                              {%- set tool_call = tool_call.function %}
+                          {%- endif %}
+                          {%- if loop.first %}
+                              {%- if content | trim %}
+                                  {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                              {%- else %}
+                                  {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                              {%- endif %}
+                          {%- else %}
+                              {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                          {%- endif %}
+                          {%- if tool_call.arguments is defined %}
+                              {%- for args_name, args_value in tool_call.arguments | items %}
+                                  {{- '<parameter=' + args_name + '>\n' }}
+                                  {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                                  {{- args_value }}
+                                  {{- '\n</parameter>\n' }}
+                              {%- endfor %}
+                          {%- endif %}
+                          {{- '</function>\n</tool_call>' }}
+                      {%- endfor %}
+                  {%- endif %}
+                  {{- '<|im_end|>\n' }}
+              {%- elif message.role == "tool" %}
+                  {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+                      {{- '<|im_start|>user' }}
+                  {%- endif %}
+                  {{- '\n<tool_response>\n' }}
+                  {{- content }}
+                  {{- '\n</tool_response>' }}
+                  {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+                      {{- '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endfor %}
+          {%- if add_generation_prompt %}
+              {%- if enable_thinking is defined and enable_thinking is false %}
+                  {{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+              {%- else %}
+                  {{- '<|im_start|>assistant\n<think>\n' }}
+              {%- endif %}
+          {%- endif %}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+
+value:
+  model_name: ${policy.model_name}
+  tokenizer:
+    name: ${value.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  max_total_sequence_length: 65536
+  make_sequence_length_divisible_by: 4
+  precision: bfloat16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    gradient_accumulation_fusion: false
+    optimizer:
+      lr: 2.0e-5
+      min_lr: 2.0e-5
+      weight_decay: 0.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_style: constant
+      lr_decay_iters: 1000000
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    sequence_length_round: 64
+  sequence_packing:
+    # Qwen3.5 GDN value inference cannot use CP2 + packing; keep the critic on
+    # the PPO-smoke path (CP1 + no packing).
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl
+  validation:
+    data_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    num_gpu_nodes: 4
+    skip_venv_if_present: true
+    uv_venv_dir: /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/gym
+    uv_cache_dir: /tmp/uv_cache
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/gym_swe_single_turn_train_only.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 100
+          concurrency: 768
+          swebench_agent_timeout: 1800
+          command_exec_timeout: 120
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+            - /lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif
+    use_absolute_ip: true
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/nemo-rl/results/ppo-qwen3.5-4b-swe-single-turn-v0.7-seq64k-turn100/logs
+  monitor_gpus: true
+  tensorboard_enabled: false
+  wandb_enabled: true
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen3.5-4b-swe-single-turn-v0.7
+    log_nemo_gym_full_result_tables: false
+
+cluster:
+  num_nodes: 6
+  gpus_per_node: 8

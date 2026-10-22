@@ -1,0 +1,60 @@
+# Same as ppo-qwen35-4bactor-4bcritic-offline1189-step225, but 128K context and 150 agent turns.
+# Policy CP4 and value CP2 + packing keep per-GPU tokens at the 64K run's level.
+defaults: ppo_qwen35_4bactor_4bcritic_offline1189_step225_formal.yaml
+
+policy:
+  max_total_sequence_length: 131072
+  make_sequence_length_divisible_by: 32
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 4
+  dynamic_batching:
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  sequence_packing:
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  generation:
+    max_new_tokens: 131072
+    colocated:
+      resources:
+        num_nodes: 4
+    vllm_cfg:
+      max_model_len: 131072
+
+value:
+  max_total_sequence_length: 131072
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 4
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 150
+
+cluster:
+  num_nodes: 8
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-step225-seq128k-turn150/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-step225-seq128k-turn150/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen35-4bactor-4bcritic-offline1189-step225-seq128k-turn150

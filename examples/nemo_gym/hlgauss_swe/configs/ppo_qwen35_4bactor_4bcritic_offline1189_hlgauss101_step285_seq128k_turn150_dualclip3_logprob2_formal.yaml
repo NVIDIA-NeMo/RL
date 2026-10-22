@@ -1,0 +1,38 @@
+# Fresh origin Qwen3.5-4B actor + held-out-selected HL-Gauss c285 critic.
+# Keep the established 128K/150-turn topology and dual-clip/logprob stability switches.
+defaults: ppo_qwen35_4bactor_4bcritic_offline1189_step225_seq128k_turn150_formal.yaml
+
+ppo:
+  initial_value_weights_path: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189-hlgauss101/eval_milestones/step_285/value/weights
+  seq_logprob_error_threshold: 2.0
+  invalid_tool_call_advantage: null
+  empty_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+loss_fn:
+  ratio_clip_c: 3.0
+
+value:
+  value_head:
+    type: categorical
+    num_bins: 101
+    v_min: -0.1
+    v_max: 1.1
+
+value_loss_fn:
+  type: hl_gauss
+  hl_gauss_sigma_ratio: 0.75
+  hl_gauss_label_smoothing: 0.0
+  cliprange: null
+
+reward_penalties:
+  penalize_invalid_tool_call: false
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-hlgauss101-step285-seq128k-turn150-dualclip3-logprob2/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-hlgauss101-step285-seq128k-turn150-dualclip3-logprob2/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen35-4bactor-4bcritic-offline1189-hlgauss101-step285-seq128k-turn150-dualclip3-logprob2

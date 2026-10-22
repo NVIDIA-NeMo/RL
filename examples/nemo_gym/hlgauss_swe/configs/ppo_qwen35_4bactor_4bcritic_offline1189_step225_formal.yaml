@@ -1,0 +1,14 @@
+# User-selected held-out 4B critic initialization; PPO settings match step410.
+defaults: ppo_qwen35_4bactor_4bcritic_offline1189_step410_formal.yaml
+
+ppo:
+  initial_value_weights_path: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189/eval_milestones/step_225/value/weights
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-step225/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4bactor-4bcritic-offline1189-step225/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen35-4bactor-4bcritic-offline1189-step225

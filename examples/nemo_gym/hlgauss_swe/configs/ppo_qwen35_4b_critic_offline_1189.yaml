@@ -1,0 +1,36 @@
+# Offline critic pretraining on the 1189 selected, already-collected GPP8 tasks.
+# Keep the original online 4B critic recipe's loss, optimizer, and model layout.
+defaults: ppo_qwen3.5_4b_swe_e2e_critic_pretrain_formal.yaml
+
+critic_pretrain:
+  shards_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-jiaqiz3145-openhands-gpp8-rollouts/views/pass_2_to_6_of_8
+  groups_per_step: 16
+  heldout_mod: 0
+  eval_period: 0
+  num_epochs: 1
+  repeat_forever: true
+  seed: 42
+
+# Match Jiaqi's PPO reward-zeroing rules on the stored Gym results. These are
+# Qwen3.5 token IDs, not the Nano IDs from Jiaqi's run.
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
+  token_ids:
+    unwanted: [248044]
+    think_open: 248068
+    think_close: 248069
+
+cluster:
+  num_nodes: 2
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-critic-offline-1189/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: qwen35-4b-critic-offline-1189
