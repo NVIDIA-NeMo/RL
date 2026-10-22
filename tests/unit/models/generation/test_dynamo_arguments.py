@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import warnings
 
 import pytest
 from pydantic import ValidationError
+from typing_extensions import get_protocol_members
 
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.arguments import (
@@ -885,3 +887,47 @@ def test_megatron_engine_config_rejects_unsupported_shapes(mutate, match) -> Non
 def test_megatron_engine_config_accepts_null_colocated() -> None:
     """A null colocated block means not colocated, as for vLLM engines."""
     assert DynamoConfig.model_validate(_megatron_config(colocated=None))
+
+
+def _call_shape(member: object) -> object:
+    """A protocol member's call shape: parameter names, kinds and defaults.
+
+    Annotations are left out on purpose: implementations legitimately narrow
+    them (``client_copy`` returns its own class). pyrefly checks types where an
+    implementation is assigned to a protocol-typed name.
+    """
+    if isinstance(member, property):
+        return "property"
+    return [
+        (param.name, param.kind, param.default)
+        for param in inspect.signature(member).parameters.values()
+    ]
+
+
+def test_vllm_refit_channel_already_fits_the_engine_seam() -> None:
+    """The protocols describe what the vLLM channel does; nothing to adapt.
+
+    ``isinstance`` on a runtime-checkable protocol only checks that the members
+    exist, so each member's call shape is compared as well.
+    """
+    from nemo_rl.models.generation.dynamo.protocols import RefitChannel
+    from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
+
+    channel = DynamoRefitChannel(
+        [
+            {
+                "instance_id": "a",
+                "system_url": "http://10.0.0.2:4000",
+                "role": "aggregated",
+            }
+        ],
+        engine_world_size=2,
+        control_timeout_s=1.0,
+    )
+    assert isinstance(channel, RefitChannel)
+    members = get_protocol_members(RefitChannel)
+    assert members
+    for name in sorted(members):
+        assert _call_shape(inspect.getattr_static(DynamoRefitChannel, name)) == (
+            _call_shape(inspect.getattr_static(RefitChannel, name))
+        ), name

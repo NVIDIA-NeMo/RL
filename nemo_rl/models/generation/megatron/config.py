@@ -22,6 +22,25 @@ from nemo_rl.models.policy import Fp8Config, PolicyConfig
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 
 
+def generation_runs_megatron_engines(generation_cfg: Mapping[str, Any]) -> bool:
+    """Whether generation runs on Megatron inference engines.
+
+    True for the Megatron backend and for Megatron engines served through the
+    Dynamo frontend. Both build their engines from ``mcore_generation_config``
+    and receive logical (Megatron-shaped) weights over the Megatron collective
+    path.
+
+    Args:
+        generation_cfg: ``policy.generation``, possibly empty.
+    """
+    backend = generation_cfg.get("backend")
+    if backend == "megatron":
+        return True
+    if backend == "dynamo":
+        return (generation_cfg.get("dynamo_cfg") or {}).get("engine") == "megatron"
+    return False
+
+
 def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     """Resolve native MCore staging bytes using NeMo-RL's collective default."""
     if configured_bytes is None:

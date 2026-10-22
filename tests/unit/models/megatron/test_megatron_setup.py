@@ -946,6 +946,35 @@ class TestApplyMoeConfig:
         assert not hasattr(model_cfg, "moe_grouped_gemm")
         assert not hasattr(model_cfg, "inference_flashinfer_mxfp8_token_capacity")
 
+    @pytest.mark.parametrize(
+        ("generation_cfg", "padded"),
+        [
+            ({"backend": "megatron"}, True),
+            ({"backend": "dynamo", "dynamo_cfg": {"engine": "megatron"}}, True),
+            ({"backend": "dynamo", "dynamo_cfg": {"engine": "vllm"}}, False),
+        ],
+        ids=["megatron", "dynamo_megatron", "dynamo_vllm"],
+    )
+    def test_cuda_graph_ep_inference_pads_experts_for_megatron_engines(
+        self, generation_cfg, padded
+    ):
+        """Megatron engines behind Dynamo get the same expert padding as backend=megatron."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock(expert_model_parallel_size=4)
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = False
+        config = {
+            "megatron_cfg": self._base_moe_megatron_cfg(),
+            "generation": {
+                **generation_cfg,
+                "mcore_generation_config": {"cuda_graph_impl": "local"},
+            },
+        }
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_pad_experts_for_cuda_graph_inference is padded
+
     def test_flashinfer_mxfp8_token_capacity_forwarded(self):
         """Without this key MCore runs FlashInfer MXFP8 MoE over the full dispatcher buffer."""
         from nemo_rl.models.megatron.setup import _apply_moe_config

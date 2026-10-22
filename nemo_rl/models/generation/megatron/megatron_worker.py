@@ -81,6 +81,7 @@ from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import CACHED_VIDEO_FRAME_MANIFEST_MAGIC
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.held_port import receive_held_socket
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -257,6 +258,20 @@ def _resolve_coordinator_policy(
     )
 
 
+@dataclass(frozen=True)
+class _DynamoAdapterSpec:
+    """What attach_dynamo_adapter recorded for the engine that is about to be built.
+
+    Attributes:
+        parent_event_address: ZMQ address the adapter listens on for engine
+            events (progress and ready).
+        role: ``"prefill"`` or ``"decode"``.
+    """
+
+    parent_event_address: str
+    role: str
+
+
 def _apply_optional_inference_config_kwargs(
     inference_config_kwargs: dict[str, Any],
     mcore_generation_config: dict[str, Any],
@@ -338,6 +353,7 @@ class MegatronGenerationMixin:
         self.inference_context = None
         self.inference_wrapped_model = None
         self.base_url = None
+        self.coordinator_addr = None
         self._inference_engine_initialized = False
         self._inference_engine_asleep = (
             True  # Start paused since we begin with training
@@ -347,6 +363,96 @@ class MegatronGenerationMixin:
         self._token_capture_enabled = False
         self._request_payload_stager = None
         self._request_prompt_preparer = None
+        # True between pause_for_refit and the suspend that follows it.
+        self._inference_engine_paused = False
+        # Set by attach_dynamo_adapter before the engine exists; None means the
+        # engine serves NeMo RL directly without a Dynamo adapter.
+        self._dynamo_adapter: Optional[_DynamoAdapterSpec] = None
+        self._dynamo_event_reporter = None
+
+    def attach_dynamo_adapter(self, *, parent_event_address: str, role: str) -> bool:
+        """Serve this engine through a Megatron Dynamo adapter.
+
+        Must run before the engine is built. From then on the engine is the
+        state-handoff variant, brings up the KV transfer agents for ``role``,
+        binds its coordinator on the node IP so the adapter and the peer role
+        can reach it, and rank zero reports readiness on
+        ``parent_event_address``.
+
+        Args:
+            parent_event_address: ZMQ address the adapter listens on for
+                engine events (progress and ready).
+            role: ``"prefill"`` or ``"decode"``.
+
+        Returns:
+            True, so the fan-out can be awaited uniformly.
+        """
+        if role not in ("prefill", "decode"):
+            raise ValueError(f"role must be 'prefill' or 'decode', got {role!r}")
+        if self._inference_engine_initialized:
+            raise RuntimeError(
+                "attach_dynamo_adapter must be called before the inference engine "
+                "is initialized"
+            )
+        self._dynamo_adapter = _DynamoAdapterSpec(
+            parent_event_address=parent_event_address, role=role
+        )
+        return True
+
+    def pinned_handoff_block_count(self) -> int:
+        """Prefill KV blocks still pinned for decode handoffs (0 without an engine).
+
+        Read on the inference loop: the engine pops entries from the pinned
+        block map there as decode releases them, so summing it from this thread
+        could see the map change size mid-iteration.
+        """
+        engine = self.dynamic_inference_engine
+        if engine is None or self._inference_loop is None:
+            return 0
+
+        async def _read() -> int:
+            return int(engine.pinned_handoff_block_count)
+
+        return asyncio.run_coroutine_threadsafe(_read(), self._inference_loop).result()
+
+    def dynamo_coordinator_address(self) -> Optional[str]:
+        """This engine's coordinator address once it is listening, else None."""
+        return self.coordinator_addr
+
+    def _start_dynamo_event_reporter(self) -> None:
+        """Connect the engine's events to the adapter before the coordinator starts."""
+        assert self._dynamo_adapter is not None
+        # Deferred: the Dynamo integration is optional (absent from older
+        # Megatron-LM) and only Dynamo-attached engines load it.
+        from megatron.inference.integrations.dynamo.telemetry import (
+            EngineEventReporter,
+        )
+
+        reporter = EngineEventReporter(
+            self.dynamic_inference_engine,
+            self._dynamo_adapter.parent_event_address,
+        )
+        self.dynamic_inference_engine.set_progress_callback(
+            lambda: reporter.observe("progress", {})
+        )
+        reporter.start()
+        self._dynamo_event_reporter = reporter
+
+    def _report_dynamo_ready(self) -> None:
+        """Rank zero tells the adapter where the coordinator is and what it serves."""
+        reporter = self._dynamo_event_reporter
+        if reporter is None or torch.distributed.get_rank() != 0:
+            return
+        # Deferred: only Dynamo-attached engines use it, and it ships only with
+        # the Megatron-LM versions that carry the Dynamo integration.
+        from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
+
+        endpoint = InferenceEngineEndpoint.from_engine(
+            self.coordinator_addr,
+            self.dynamic_inference_engine,
+            logical_data_parallel_size=1,
+        )
+        reporter.observe("ready", endpoint.to_dict())
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -696,6 +802,10 @@ class MegatronGenerationMixin:
         _apply_optional_inference_config_kwargs(
             inference_config_kwargs, mcore_generation_config
         )
+        if self._dynamo_adapter is not None:
+            # Prefill and decode engines are separate process groups, so the
+            # handoff must cross them; NIXL is the only transport that does.
+            inference_config_kwargs["kv_transport_backend"] = "nixl"
 
         inference_config = InferenceConfig(**inference_config_kwargs)
 
@@ -720,19 +830,46 @@ class MegatronGenerationMixin:
             inference_wrapped_model=self.inference_wrapped_model,
             tokenizer=self.megatron_tokenizer,
         )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
-        )
+        if self._dynamo_adapter is not None:
+            # Prefill/decode behind Dynamo: the state-handoff engine pins prefill
+            # blocks until decode releases them and imports them on decode.
+            # Deferred: the Dynamo integration is optional (absent from older
+            # Megatron-LM) and only Dynamo-attached engines load it.
+            from megatron.inference.integrations.dynamo.dynamic_engine import (
+                DynamoDynamicInferenceEngine,
+            )
+
+            self.dynamic_inference_engine = DynamoDynamicInferenceEngine(
+                text_generation_controller, self.inference_context
+            )
+            # Collective over the engine's model-parallel ranks. The Dynamo
+            # adapter claims every handoff before decode reads it, so unclaimed
+            # prefill offers may expire instead of staying pinned forever.
+            self.dynamic_inference_engine.setup_kv_transfer(
+                role=self._dynamo_adapter.role, require_handoff_claim=True
+            )
+        else:
+            self.dynamic_inference_engine = DynamicInferenceEngine(
+                text_generation_controller, self.inference_context
+            )
 
         self._inference_engine_initialized = True
         self._inference_engine_asleep = True
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
+        coordinator_kwargs: dict[str, Any] = {}
+        if self._dynamo_adapter is not None:
+            # The adapter sidecar and the peer role's engines connect to this
+            # coordinator from other processes and nodes.
+            coordinator_kwargs["hostname"] = _get_node_ip_local()
+            self._start_dynamo_event_reporter()
         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=None,
             launch_inference_coordinator=True,
+            **coordinator_kwargs,
         )
         if torch.distributed.get_rank() == 0:
             from megatron.core.inference.inference_client import InferenceClient
@@ -743,8 +880,29 @@ class MegatronGenerationMixin:
             result = self.inference_client.start()
             if result is not None:
                 await result
+        if self._dynamo_adapter is not None:
+            self._report_dynamo_ready()
 
         self._inference_engine_asleep = False
+        self._inference_engine_paused = False
+
+    def _pause(self) -> None:
+        """Pause scheduling without suspending. No-op if asleep or already paused.
+
+        Requests already admitted keep their KV; nothing new is scheduled until
+        the engine is woken. A prefill engine paused this way starts no new
+        handoff, which lets a caller wait for the pinned blocks to drain before
+        suspending it.
+        """
+        if self._inference_engine_asleep or self._inference_engine_paused:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._pause_engine(), self._inference_loop
+        )
+        future.result()
+        torch.distributed.barrier()
+        self._inference_engine_paused = True
+        print(f"[Rank {self.rank}] paused inference engine scheduling")
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
@@ -756,37 +914,54 @@ class MegatronGenerationMixin:
         future.result()
         torch.distributed.barrier()
         self._inference_engine_asleep = True
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _sleep_engine(self):
+    async def _pause_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.pause_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
 
+    async def _suspend_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.suspend_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
 
+    async def _sleep_engine(self):
+        # A pause that already happened (pause_for_refit) is not repeated.
+        if not self._inference_engine_paused:
+            await self._pause_engine()
+        await self._suspend_engine()
+
     def _wake(self) -> None:
-        """Resume + unpause the engine. No-op if already awake."""
-        if not self._inference_engine_asleep:
+        """Get the engine back to RUNNING. No-op if already running.
+
+        An asleep engine is resumed and unpaused; an engine that was only
+        paused (``pause_for_refit`` without the suspend) is just unpaused.
+        """
+        if self._inference_engine_asleep:
+            coroutine = self._wake_engine()
+        elif self._inference_engine_paused:
+            coroutine = self._unpause_engine()
+        else:
             return
-        future = asyncio.run_coroutine_threadsafe(
-            self._wake_engine(), self._inference_loop
-        )
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._inference_loop)
         future.result()
         torch.distributed.barrier()
         self._inference_engine_asleep = False
+        self._inference_engine_paused = False
         print(f"[Rank {self.rank}] resumed inference engine")
+
+    async def _unpause_engine(self):
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     async def _wake_engine(self):
         if torch.distributed.get_rank() == 0:
             self.inference_client.resume_engines()
         await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
+        await self._unpause_engine()
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""
@@ -2368,6 +2543,17 @@ class MegatronGenerationRefitMixin:
         )
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
+
+    def pause_for_refit(self) -> None:
+        """Stop scheduling new work ahead of a refit, without suspending.
+
+        Used on prefill engines so no new handoff starts while the caller waits
+        for decode to pull the blocks prefill still pins; ``suspend_for_refit``
+        then completes the sleep.
+        """
+        if not self._inference_engine_initialized:
+            return
+        self._pause()
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

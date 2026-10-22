@@ -205,9 +205,9 @@ class DynamoGeneration(GenerationInterface):
     ):
         validated_config = DynamoConfig.model_validate(config)
         if validated_config.is_megatron_engine:
-            # The config accepts Megatron engines; the fleet that serves them
-            # (refit channel, adapter sidecars, worker pool) is not wired into
-            # this facade yet.
+            # The config and the engine seam accept Megatron engines; the fleet
+            # that serves them (worker pool, refit channel, adapter sidecars) is
+            # not wired into this facade yet.
             raise NotImplementedError(
                 "dynamo_cfg.engine='megatron' is not served by DynamoGeneration yet"
             )
@@ -338,11 +338,17 @@ class DynamoGeneration(GenerationInterface):
         return channel.inference_world_size
 
     def get_refit_fleet_shape(self) -> RefitFleetShape:
-        """One DP shard per Dynamo engine, each with TP x PP refit ranks."""
+        """One DP shard per Dynamo engine, each with its own TP x PP refit ranks.
+
+        ``shard_widths`` is carried only when the engines differ in width, so a
+        uniform fleet (every vLLM fleet) keeps the evenly sharded membership.
+        """
         channel = self._require_refit_channel()
+        widths = channel.shard_widths
         return RefitFleetShape(
             dp_size=channel.num_engines,
             total_gen_workers=channel.inference_world_size,
+            shard_widths=None if len(set(widths)) <= 1 else widths,
         )
 
     def _require_refit_channel(self) -> DynamoRefitChannel:

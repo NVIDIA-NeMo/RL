@@ -304,6 +304,7 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
+    generation_runs_megatron_engines,
 )
 from nemo_rl.models.megatron.community_import import (
     import_model_from_hf_name,
@@ -1392,9 +1393,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
             "moe_pad_experts_for_cuda_graph_inference"
         ]
     generation_cfg = config.get("generation")
+    # Megatron engines behind Dynamo are built from mcore_generation_config too.
     mcore_gen_cfg = (
         (generation_cfg.get("mcore_generation_config") or {})
-        if generation_cfg is not None and generation_cfg.get("backend") == "megatron"
+        if generation_cfg is not None
+        and generation_runs_megatron_engines(generation_cfg)
         else {}
     )
     if (
