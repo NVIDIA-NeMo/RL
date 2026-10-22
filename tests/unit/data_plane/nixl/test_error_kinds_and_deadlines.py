@@ -39,6 +39,7 @@ from nemo_rl.data_plane.nixl.errors import (
 from nemo_rl.data_plane.nixl.nixl_io import Graveyard, NixlEndpoint
 from tests.unit.data_plane._nixl_helpers import StubCtl as _Ctl
 from tests.unit.data_plane._nixl_helpers import StubEp as _Ep
+from tests.unit.data_plane._nixl_helpers import bare_unit
 from tests.unit.data_plane._nixl_helpers import stub_store as _store
 
 
@@ -231,6 +232,20 @@ def test_put_succeeds_once_busy_clears(monkeypatch):
     s = _store(_Ctl({"alloc": alloc}))
     blob_id, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
     assert hint["so"] == 64
+
+
+def test_ram_only_unit_is_busy_while_room_is_quarantined():
+    u = bare_unit(8192, read_pin_s=0.2)
+    u.alloc("a", 8192, 1)
+    with pytest.raises(UnitFull):  # nothing will come back
+        u.alloc("b", 4096, 1)
+    u.release_many([("a", 1)])
+    with pytest.raises(DataPlaneBusy):  # comes back after read_pin_s
+        u.alloc("b", 4096, 1)
+    with pytest.raises(UnitFull):  # bigger than the slab: never fits
+        u.alloc("c", 16384, 1)
+    time.sleep(0.25)
+    assert u.alloc("b", 4096, 1) == 0
 
 
 def test_deadline_spent_after_alloc_frees_the_region_at_once():

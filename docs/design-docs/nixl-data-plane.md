@@ -58,12 +58,20 @@ The transport is RDMA only. Every client and unit checks the UCX environment
 before creating a NIXL backend and refuses TCP:
 
 ```bash
-export UCX_TLS=rc,self,sm
+export UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm      # the default when unset
 export UCX_NET_DEVICES=<rdma dev>:1,<rdma dev>:1   # RDMA devices, never eth0
 ```
 
 NIXL's UCX backend honours `UCX_*` env vars over its own parameters, so the
 environment is the only reliable lever.
+
+The `UCX_TLS` default is the list the NIXL checkpoint-engine refit uses
+(`refit_transport: nixl`, see the checkpoint-engine refit guide). The driver's
+`UCX_TLS` reaches every Ray worker, and the refit needs `cuda_copy` to register
+its GPU buffers (without it, refit hangs). `cuda_copy` and `cuda_ipc` never
+carry the data plane's CPU bytes off the node, so its cross-node traffic still
+goes over `rc` (RDMA) only. If you set `UCX_TLS` yourself with both features
+on, keep `cuda_copy,cuda_ipc` in it.
 
 ## Design points
 

@@ -505,6 +505,18 @@ class NixlStorageUnit:
         try:
             off = self.alloc_.alloc(nbytes)
         except UnitFull:
+            a = self.alloc_
+            if (
+                self.ssd_dir is None
+                and a.quarantined_bytes
+                and (a.free_bytes + a.quarantined_bytes >= align_up(nbytes, a.align))
+            ):
+                # Room comes back when the quarantine ends (read_pin_s): Busy
+                # makes the client wait for it, as _alloc_io does for the IO area.
+                raise DataPlaneBusy(
+                    f"unit {self.unit_id} has no room for {nbytes} B yet",
+                    reason="pressure",
+                ) from None
             # Best-effort RAM-first: the client asks spill=False of every unit
             # before it asks any unit to spill.
             if self.ssd_dir is None or not spill:

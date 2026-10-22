@@ -239,7 +239,7 @@ def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
     if preset:
         monkeypatch.setenv("UCX_TLS", preset)
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
-    assert os.environ["UCX_TLS"] == (preset or "rc,self,sm")
+    assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
 
 
