@@ -680,10 +680,11 @@ ARG NEMO_GYM_CUDA=cu130
 ARG NEMO_GYM_VLLM_VERSION=0.29.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
-    # ether0 imports rdkit, whose bundled cairo links these system libraries; the dry run
-    # below starts ether0, and so does every job that runs it. The base image lacks them.
-    # swe_agents' `playwright install --with-deps` pulls them in only when it finishes
-    # inside OpenHands' 2-minute `make build` timeout, so install them explicitly.
+    # ether0 imports rdkit, whose bundled cairo links these libraries. The dry run below
+    # starts ether0, and so does every job that runs it, but the base stage has no X11
+    # libraries. swe_agents' `playwright install --with-deps` adds them only sometimes, and
+    # never when no swe_agents config precedes ether0, so install them here. The install
+    # stays inside this gate, so images built without prefetch configs don't get them.
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends libexpat1 libx11-6 libxext6 libxrender1
