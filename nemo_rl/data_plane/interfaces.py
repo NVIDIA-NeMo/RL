@@ -127,8 +127,9 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     (alloc / release) to units over ZMQ. Ray only starts the units.
 
     Transport: RDMA only. Clients and units refuse to start unless ``UCX_TLS``
-    is an explicit RDMA list (e.g. ``rc,self,sm``) and ``UCX_NET_DEVICES`` names
-    RDMA devices; NIXL's UCX backend honours those env vars over its own params.
+    is an explicit RDMA list (default ``rc,cuda_copy,cuda_ipc,self,sm``, the
+    NIXL refit's list) and ``UCX_NET_DEVICES`` names RDMA devices; NIXL's UCX
+    backend honours those env vars over its own params.
 
     Unit placement, as in SimpleStorage or the Mooncake storage units:
     ``num_storage_units`` round-robins units over Ray nodes;
