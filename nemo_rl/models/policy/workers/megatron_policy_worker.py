@@ -31,6 +31,7 @@ import ray
 import torch
 from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
 from megatron.bridge.training.checkpointing import (
+    is_empty_async_queue,
     maybe_finalize_async_save,
     save_checkpoint,
 )
@@ -5154,6 +5155,27 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
             self._async_checkpoint_cuda_cache_active = False
+
+    def poll_async_save(self) -> bool:
+        """Finalize the async save if every rank's write is done, without waiting.
+
+        Returns True when no async save is left pending. NVRx agrees on completion
+        with an all-reduce over the default group, so every rank must call this at
+        the same point between steps, never concurrently with training.
+        """
+        ckpt_cfg = self.mcore_state.cfg.checkpoint
+        if not ckpt_cfg.async_save or is_empty_async_queue(self.mcore_state):
+            return True
+        if (
+            self._async_checkpoint_cuda_cache_active
+            and self._requires_nvrx_cuda_cache_release()
+        ):
+            # The colocated CUDA IPC cache must be released with the write; keep
+            # the blocking path for that case.
+            self.finalize_async_save()
+            return True
+        maybe_finalize_async_save(self.mcore_state, ckpt_cfg=ckpt_cfg, blocking=False)
+        return is_empty_async_queue(self.mcore_state)
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
