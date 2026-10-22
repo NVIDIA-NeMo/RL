@@ -1009,3 +1009,44 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     original = types.SimpleNamespace(apply=lambda *a: "orig")
     monkeypatch.setattr(shim, "_original", original)
     assert shim.apply(logits, target, 0, 16, None, True) == "orig"
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_gathered_vocab_logprob_backward_is_local_to_the_shard(
+    monkeypatch, chunk_size
+):
+    import torch
+
+    # TP 2, rank 1 owns vocab [8, 16); rank 0's half is a constant here.
+    other = torch.randn(2, 5, 8)
+
+    def fake_gather(shard, group):
+        start = shard_starts.pop(0)
+        return torch.cat([other[:, start : start + shard.shape[1]], shard], dim=-1)
+
+    mappings = types.SimpleNamespace(
+        gather_from_tensor_model_parallel_region=fake_gather
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
+    shard_starts = [0] if chunk_size is None else [0, 2, 4]
+
+    shard = torch.randn(2, 5, 8)
+    target = torch.randint(0, 16, (2, 5))
+    weights = torch.randn(2, 5)
+
+    reference_shard = shard.clone().requires_grad_()
+    reference = (
+        torch.log_softmax(torch.cat([other, reference_shard], dim=-1), dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    (reference * weights).sum().backward()
+
+    local_shard = shard.clone().requires_grad_()
+    out = zgm._GatheredVocabLogprob.apply(
+        local_shard, target, 8, 16, chunk_size, "tp2", False
+    )
+    (out * weights).sum().backward()
+
+    assert torch.equal(out.detach(), reference.detach())
+    torch.testing.assert_close(local_shard.grad, reference_shard.grad)

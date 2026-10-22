@@ -274,6 +274,95 @@ def allow_installed_flash_attn_4() -> None:
     mcore_attention.HAVE_FA4 = True
 
 
+class _GatheredVocabLogprob(torch.autograd.Function):
+    """Full-row log-softmax forward over gathered vocab shards; sharded backward.
+
+    The forward must match Megatron Inference bitwise, so it gathers each
+    sequence chunk and runs the same full-row log-softmax. The backward only
+    needs to be accurate: it rebuilds this rank's softmax slice from the saved
+    per-token log-sum-exp, so it needs no communication and holds no
+    full-vocab tensor.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]  Always ignore torch.autograd.Function.forward's type since it's always more specific than the base class
+        ctx: Any,
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+        chunk_size: int | None,
+        group: torch.distributed.ProcessGroup,
+        inference_only: bool,
+    ) -> torch.Tensor:
+        # Deferred: Megatron-Core exists only in worker venvs; model_utils is heavy.
+        from megatron.core.tensor_parallel.mappings import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        from nemo_rl.distributed import model_utils
+
+        seq_len = int(target.shape[1])
+        step = chunk_size or seq_len
+        out_chunks = []
+        lse_chunks = []
+        for chunk_start in range(0, seq_len, step):
+            chunk_end = min(seq_len, chunk_start + step)
+            full_logits = gather_from_tensor_model_parallel_region(
+                vocab_parallel_logits[:, chunk_start:chunk_end, :], group=group
+            )
+            out_chunks.append(
+                model_utils._tp_target_logprobs(
+                    full_logits,
+                    target[:, chunk_start:chunk_end],
+                    vocab_start_index=0,
+                    vocab_end_index=full_logits.shape[-1],
+                    tp_group=None,
+                    inference_only=True,
+                )
+            )
+            if not inference_only:
+                lse_chunks.append(torch.logsumexp(full_logits.float(), dim=-1))
+            del full_logits
+
+        if not inference_only:
+            ctx.save_for_backward(
+                vocab_parallel_logits, target, torch.cat(lse_chunks, dim=1)
+            )
+            ctx.vocab_start_index = vocab_start_index
+            ctx.vocab_end_index = vocab_end_index
+            ctx.step = step
+        return torch.cat(out_chunks, dim=1)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
+        grad_output = grad_outputs[0].float()
+        vocab_parallel_logits, target, lse = ctx.saved_tensors
+        target_mask = (target < ctx.vocab_start_index) | (
+            target >= ctx.vocab_end_index
+        )
+        local_target = (target - ctx.vocab_start_index).masked_fill(target_mask, 0)
+        chosen_grad = grad_output.masked_fill(target_mask, 0.0)
+
+        grad_input = torch.empty_like(vocab_parallel_logits)
+        seq_len = int(target.shape[1])
+        for chunk_start in range(0, seq_len, ctx.step):
+            chunk_end = min(seq_len, chunk_start + ctx.step)
+            # d(log p_t)/dx = onehot(t) - softmax(x), on this rank's vocab slice.
+            grad = torch.exp(
+                vocab_parallel_logits[:, chunk_start:chunk_end].float()
+                - lse[:, chunk_start:chunk_end, None]
+            ).mul_(-grad_output[:, chunk_start:chunk_end, None])
+            grad.scatter_add_(
+                -1,
+                local_target[:, chunk_start:chunk_end, None],
+                chosen_grad[:, chunk_start:chunk_end, None],
+            )
+            grad_input[:, chunk_start:chunk_end].copy_(grad)
+            del grad
+        return grad_input, None, None, None, None, None, None
+
+
 class _FullVocabLogprob:
     """Use the full-vocab log-softmax Megatron Inference uses (bitwise).
 
@@ -298,33 +387,9 @@ class _FullVocabLogprob:
         if group is None:
             return self._original.apply(*args)
         if torch.distributed.get_world_size(group) > 1:
-            # Deferred: Megatron-Core exists only in worker venvs.
-            from megatron.core.tensor_parallel.mappings import (
-                gather_from_tensor_model_parallel_region,
-            )
-
-            # Gather per sequence chunk so only one chunk's full-vocab logits
-            # exist at a time. The gather is an exact copy; its backward splits
-            # the gradient back to the local shard.
-            seq_len = int(target.shape[1])
-            step = chunk_size or seq_len
-            out_chunks = []
-            for chunk_start in range(0, seq_len, step):
-                chunk_end = min(seq_len, chunk_start + step)
-                full_logits = gather_from_tensor_model_parallel_region(
-                    logits[:, chunk_start:chunk_end, :], group=group
-                )
-                out_chunks.append(
-                    model_utils._tp_target_logprobs(
-                        full_logits,
-                        target[:, chunk_start:chunk_end],
-                        vocab_start_index=0,
-                        vocab_end_index=full_logits.shape[-1],
-                        tp_group=None,
-                        inference_only=inference_only,
-                    )
-                )
-            return torch.cat(out_chunks, dim=1).contiguous()
+            return _GatheredVocabLogprob.apply(
+                logits, target, start, end, chunk_size, group, inference_only
+            ).contiguous()
         return model_utils._tp_target_logprobs(
             logits,
             target,
