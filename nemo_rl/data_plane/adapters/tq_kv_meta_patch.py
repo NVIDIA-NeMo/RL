@@ -19,7 +19,7 @@ method with one ``.all(dim=0).tolist()`` instead; results are identical.
 
 The stock ``FieldMeta.remove_samples`` rescans every remaining shape of a nested field on each
 clear, so ``CLEAR_META`` grows with the number of live samples. ``remove_samples`` below rescans
-only after an eighth of them is gone.
+only after ``RESCAN_REMOVED_FRACTION`` of them is gone.
 
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 """
@@ -43,6 +43,9 @@ _KV_RETRIEVE_META_SHA256 = (
 _REMOVE_SAMPLES_SHA256 = (
     "847e2e96135d7be868cfcc0865e6a69649e586e1dbe60178f2a3f5ef20afb09f"
 )
+
+# A nested field rescans its shapes once this fraction of its live samples was removed.
+RESCAN_REMOVED_FRACTION = 1 / 8
 
 
 def kv_retrieve_meta(
@@ -114,7 +117,7 @@ def kv_retrieve_meta(
 
 
 def remove_samples(self, indexes: list[int]) -> None:
-    """Stock ``FieldMeta.remove_samples`` that rescans nested shapes only after an eighth is removed."""
+    """Stock ``FieldMeta.remove_samples`` that rescans nested shapes only after ``RESCAN_REMOVED_FRACTION``."""
     before = len(self.global_indexes)
     for idx in indexes:
         self.per_sample_shapes.pop(idx, None)
@@ -128,8 +131,10 @@ def remove_samples(self, indexes: list[int]) -> None:
         self.dtype = None
         self.per_sample_shapes.clear()
     else:
-        # Scanning every remaining shape is O(live), so only rescan after an eighth of them is gone.
-        if self.is_nested and self.removed_since_scan * 8 >= len(self.global_indexes):
+        # Scanning every remaining shape is O(live), so only rescan after a fraction of them is gone.
+        if self.is_nested and self.removed_since_scan >= RESCAN_REMOVED_FRACTION * len(
+            self.global_indexes
+        ):
             self.removed_since_scan = 0
             remaining_shapes = set(
                 tuple(shape) if isinstance(shape, list) else shape
