@@ -38,7 +38,7 @@ from nemo_rl.data.llm_message_utils import (
     validate_precomputed_loss_masks,
 )
 from nemo_rl.data.multimodal_utils import PER_TOKEN_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -860,9 +860,8 @@ def sft_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,
