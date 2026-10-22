@@ -104,18 +104,26 @@ not translate unsupported schemas. vLLM may reject an unsupported combination
 or select an unquantized fallback, so native-method inspection is required
 before a schema is considered qualified.
 
-The following ModelOpt real-quant limits were checked against vLLM 0.25.1.
-Recheck native methods when using another version:
+The following schema support was source-checked against the pinned
+[vLLM 0.29.0 ModelOpt loader](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/model_executor/layers/quantization/modelopt.py).
+These entries describe loader support, not end-to-end refit validation. Recheck
+native methods when using another version:
 
 | ModelOpt format | Uniform schema | Inside `MIXED_PRECISION` |
 |---|---:|---:|
 | `FP8`, `NVFP4`, `W4A16_NVFP4`, `MXFP8` | Supported | Supported |
-| `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_PB_WO` | Supported | **Not supported** |
+| `FP8_PER_CHANNEL_PER_TOKEN` | Supported | **Not supported** |
+| `FP8_PB_WO` | Supported | Dense linear layers only; **not MoE** |
 | `MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_NVFP4_FP8` | **Not supported** | **Not supported** |
 
-These are vLLM runtime limits. ModelOpt may export additional formats, but
-NeMo RL cannot use them for real-quant rollout until vLLM implements the
-corresponding native methods.
+These limits apply to the ModelOpt schema used by this refit path, not to
+ModelOpt export or every vLLM quantization loader. ModelOpt's
+[generic exporter](https://github.com/NVIDIA/Model-Optimizer/blob/0.48.0rc1/modelopt/torch/export/quant_utils.py)
+supports MXFP4 beyond GPT-OSS, but the pinned vLLM ModelOpt loader does not
+consume that format. ModelOpt's separate
+[GPT-OSS MXFP4 weight-only conversion example](https://github.com/NVIDIA/Model-Optimizer/tree/0.48.0rc1/examples/gpt-oss#deployment)
+emits a different checkpoint schema (`quant_method: "mxfp4"`) for vLLM's
+GPT-OSS loader; it does not establish generic ModelOpt MXFP4 refit support.
 
 NVFP4 W4A4 and W4A16 are supported recipe examples, not downstream mode
 branches. See [Quantization-Aware RL](../guides/quantization-aware-rl.md) for
