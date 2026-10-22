@@ -64,7 +64,8 @@ def check_rdma_only(env: Mapping[str, str] | None = None) -> str:
     if not tls:
         raise TransportPolicyError(
             "UCX_TLS is unset, so UCX may fall back to tcp. Set it to an RDMA list, "
-            "e.g. UCX_TLS=rc,self,sm (maybe_configure_data_plane_env sets this when unset)."
+            "e.g. UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm (maybe_configure_data_plane_env "
+            "sets this when unset)."
         )
     items = [t.strip() for t in tls.split(",") if t.strip()]
     if items[0].startswith("^"):
