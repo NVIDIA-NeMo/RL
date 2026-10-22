@@ -91,6 +91,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
@@ -1370,17 +1371,14 @@ def grpo_train_sync(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            torch.save(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         checkpointer.begin_finalization(
                             checkpoint_path,

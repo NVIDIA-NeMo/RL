@@ -147,6 +147,7 @@ from nemo_rl.utils.checkpoint import (
     validate_warm_start_checkpoint,
 )
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.path_utils import is_msc_path
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -1154,8 +1155,15 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        # msc:// checkpoints cannot hold data-plane snapshots, so the replay-capable
+        # sampler falls back to the same cursor-only recovery as the others.
+        checkpoint_dir_is_msc = is_msc_path(
+            master_config.checkpointing["checkpoint_dir"]
+        )
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.get("save_data_plane")
+            and not checkpoint_dir_is_msc
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -1170,11 +1178,12 @@ def setup_single_controller(
                     "checkpointing.enabled=false."
                 )
             raise ValueError(error_message)
-        if not sampler_supports_replay_recovery:
+        if not sampler_supports_replay_recovery or checkpoint_dir_is_msc:
+            reason = " with an msc:// checkpoint_dir" if checkpoint_dir_is_msc else ""
             warnings.warn(
                 f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
-                "completed buffered rollouts. On resume, the dataloader cursor "
-                "is restored while buffered prompt groups are discarded.",
+                f"completed buffered rollouts{reason}. On resume, the dataloader "
+                "cursor is restored while buffered prompt groups are discarded.",
                 UserWarning,
                 stacklevel=2,
             )
