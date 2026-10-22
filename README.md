@@ -11,6 +11,7 @@
 
 ## 📣 News
 
+* [10/22/2026] Nemotron 3.5 Super VL (120B-A12B) is now supported in NeMo RL with text DAPO, image GRPO, and NeMo Gym agentic training on the Automodel backend with vLLM generation! See the [model guide](docs/guides/models/nemotron/nemotron-3.5-super-vl.md) for recipes and training results.
 * [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
 * [10/07/2026] We shared the [NeMo-DCR preprint](https://huggingface.co/papers/2610.08430), which presents the delta-compressed refit method used in NeMo RL for fast, bitwise-exact sparse weight synchronization between training and rollout clusters.
 * [09/21/2026] DeepSeek V4.1 Flash RL is supported [on this branch](https://github.com/NVIDIA-NeMo/RL/tree/deepseek-v4.1-support) with the following [doc](https://github.com/NVIDIA-NeMo/RL/blob/deepseek-v4.1-support/docs/guides/models/deepseek/deepseek-v4.1-flash.md).
