@@ -1,6 +1,8 @@
 """CPU checks of genuine upstream hybrid state methods; CUDA is qualified separately."""
 
+import gc
 import importlib.util
+import weakref
 import struct
 from pathlib import Path
 
@@ -225,3 +227,21 @@ def test_saved_group_step_overrides_dummy_counter_before_adam(hybrid_class):
     optimizer.cpu_optimizers[0].step()
     reference.step()
     assert torch.equal(working, gold)
+
+
+def test_resume_releases_redundant_loaded_fp32_master(hybrid_class):
+    optimizer, parameter, working, master, *_ = make_optimizer(
+        hybrid_class, torch.bfloat16
+    )
+    loaded_master = weakref.ref(optimizer.state[parameter]["master_param"])
+    assert loaded_master() is not working
+
+    refresh_hybrid_optimizer_after_checkpoint(optimizer)
+    gc.collect()
+
+    # A resumed actor must release its extra full FP32 master before its
+    # colocated critic is built. Native CPU Adam already owns the exact copy.
+    assert loaded_master() is None
+    assert optimizer.state[parameter]["master_param"] is working
+    assert optimizer.cpu_optimizers[0].state[working]["master_param"] is working
+    assert torch.equal(working.view(torch.int32), master.view(torch.int32))

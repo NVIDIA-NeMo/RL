@@ -205,6 +205,12 @@ def refresh_hybrid_optimizer_after_checkpoint(
             else:
                 state["step"] = torch.tensor(float(saved_step), dtype=torch.float32)
     optimizer._sync_hdo_state_to_sub_optimizers()
+    # Native HDO has now copied the loaded FP32 masters into the parameters
+    # CPU Adam actually updates. Release the redundant checkpoint allocations
+    # before constructing a colocated critic. Its first step would make the
+    # same alias, but a resumed actor must not retain both copies until then.
+    for parameter, working in optimizer.param_to_fp32_param.items():
+        optimizer.state[parameter]["master_param"] = working
     for parameter, cpu_parameter in optimizer.gpu_params_map_cpu_copy.items():
         if parameter.dtype == torch.float32:
             # The loaded model parameter already is the full FP32 master.
