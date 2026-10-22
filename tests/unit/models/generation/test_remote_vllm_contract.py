@@ -34,6 +34,30 @@ from nemo_rl.weight_sync.remote_vllm_nccl_weight_synchronizer import (
 )
 
 
+@pytest.mark.parametrize(
+    "base_url", ["http://rollout.test:9210/v1", "https://rollout.test/v1"]
+)
+def test_remote_base_url_accepts_openai_v1(base_url: str) -> None:
+    assert _config(base_url=base_url).base_url == base_url
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://rollout.test:9210",
+        "http://rollout.test:9210/",
+        "http://rollout.test:9210/v1/",
+        "http://rollout.test:9210/v2",
+        "http://rollout.test:9210/prefix/v1",
+        "http://rollout.test:9210/v1?key=value",
+        "http://rollout.test:9210/v1#fragment",
+    ],
+)
+def test_remote_base_url_rejects_incompatible_gym_paths(base_url: str) -> None:
+    with pytest.raises(ValidationError, match="base_url must end in /v1"):
+        _config(base_url=base_url)
+
+
 def test_generation_config_builds_runtime_remote_service_schema() -> None:
     schema = TypeAdapter(GenerationConfig).json_schema()
     assert "RemoteVllmServiceConfig" in schema["$defs"]

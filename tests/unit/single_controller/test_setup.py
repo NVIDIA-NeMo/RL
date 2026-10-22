@@ -131,10 +131,12 @@ def test_spinup_gym_uses_remote_vllm_served_model_name(monkeypatch):
         master_config,
         ["http://rollout.example/v1"],
         MagicMock(),
+        policy_api_key=None,
     )
 
     assert actor is spinup.return_value
     assert spinup.call_args.kwargs["model_name"] == "policy"
+    assert spinup.call_args.kwargs["policy_api_key"] is None
 
 
 class _CheckpointingCustomSampler(WindowedSampler):

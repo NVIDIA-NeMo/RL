@@ -15,6 +15,7 @@
 """Configuration for an externally managed stock vLLM rollout server."""
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
 
@@ -39,7 +40,8 @@ class RemoteVllmRefitConfig(BaseModel, extra="forbid"):
 class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
     """Connection and control settings for one external vLLM deployment.
 
-    ``base_url`` may include the OpenAI ``/v1`` prefix. Control paths are
+    ``base_url`` must end in the OpenAI ``/v1`` path, without a trailing slash.
+    URL path prefixes, queries, and fragments are not supported. Control paths are
     resolved against the URL origin so the same endpoint can be handed to
     NeMo-Gym and used for vLLM's development endpoints.
     """
@@ -62,6 +64,12 @@ class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
     def validate_urls_and_timeouts(self) -> "RemoteVllmServiceConfig":
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("base_url must start with http:// or https://")
+        parsed = urlsplit(self.base_url)
+        if parsed.path != "/v1" or parsed.query or parsed.fragment:
+            raise ValueError(
+                "base_url must end in /v1 with no trailing slash, "
+                "path prefix, query, or fragment"
+            )
         path_fields = (
             "health_path",
             "models_path",

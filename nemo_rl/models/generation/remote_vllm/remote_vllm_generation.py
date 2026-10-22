@@ -64,6 +64,11 @@ class RemoteVllmGeneration(GenerationInterface):
             raise ValueError(
                 "remote_vllm NCCL refit currently requires a Megatron policy"
             )
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise NotImplementedError(
+                "async_rl.generation_fleet_health.enabled=true is not "
+                "supported for remote_vllm generation"
+            )
         if master_config.token_capture.enabled:
             raise NotImplementedError(
                 "remote_vllm does not yet support Single Controller token capture"

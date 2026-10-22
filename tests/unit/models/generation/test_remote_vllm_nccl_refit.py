@@ -66,6 +66,9 @@ def _master_config(refit_transport: str | None, **refit: Any) -> SimpleNamespace
             },
         },
         token_capture=SimpleNamespace(enabled=False),
+        async_rl=SimpleNamespace(
+            generation_fleet_health=SimpleNamespace(enabled=False, refit_timeout_s=None)
+        ),
     )
 
 
@@ -79,6 +82,19 @@ def test_external_transport_is_nccl_only() -> None:
     for refit in ({"transport": "hf_checkpoint"}, {"nccl_num_engines": 2}):
         with pytest.raises(ValueError):
             RemoteVllmServiceConfig.model_validate(_config_dict(**refit))
+
+
+@pytest.mark.parametrize("refit_timeout_s", [None, 120.0])
+def test_remote_fleet_health_validation(refit_timeout_s: float | None) -> None:
+    config = _master_config(None)
+    config.async_rl.generation_fleet_health.refit_timeout_s = refit_timeout_s
+    RemoteVllmGeneration.validate_settings(config)
+
+    config.async_rl.generation_fleet_health.enabled = True
+    with pytest.raises(
+        NotImplementedError, match="generation_fleet_health.enabled=true"
+    ):
+        RemoteVllmGeneration.validate_settings(config)
 
 
 def test_weight_transfer_requests_match_vllm_schema(

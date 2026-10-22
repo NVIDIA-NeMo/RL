@@ -102,7 +102,9 @@ training job while a communicator is active.
 The functional script
 `tests/functional/grpo_external_vllm_gym_single_controller.sh` launches one
 server, runs at least ten training steps, and checks nonzero policy gradients
-and recorded NCCL-refit timings. For an existing server, provide
+and trainer-side parameter-sync timings, and verifies the vLLM `/weight_info`
+version after training. The parameter-sync timing excludes the NCCL refit transfer.
+For an existing server, provide
 `EXTERNAL_VLLM_TEST_BASE_URL` and set `EXTERNAL_VLLM_TEST_ENGINE_WORLD_SIZE` to
 its TP * PP * DP size. These checks are functional smoke coverage, not a
 convergence or throughput benchmark.
