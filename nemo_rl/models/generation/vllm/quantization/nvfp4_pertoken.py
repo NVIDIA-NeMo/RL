@@ -418,13 +418,12 @@ class NvFp4PerTokenQuantizer:
 
     @staticmethod
     def _global_scale(*weights: torch.Tensor) -> torch.Tensor:
-        amax = (
-            torch.stack([w.abs().amax() for w in weights])
-            .amax()
-            .float()
-            .clamp_min(1e-8)
-        )
-        return (amax / _AMAX_DENOMINATOR).reshape(())
+        # One max-abs reduction per projection: abs().amax() would materialize
+        # a full-size temporary for every expert weight on every refit.
+        amax = torch.linalg.vector_norm(weights[0], float("inf"))
+        for weight in weights[1:]:
+            amax = torch.maximum(amax, torch.linalg.vector_norm(weight, float("inf")))
+        return (amax.float().clamp_min(1e-8) / _AMAX_DENOMINATOR).reshape(())
 
     @staticmethod
     def _scaled_fp4_quant(
