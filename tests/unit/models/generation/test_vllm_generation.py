@@ -97,6 +97,7 @@ basic_vllm_test_config: VllmConfig = {
         "load_format": "auto",
         "enforce_eager": "False",
         "kv_cache_dtype": "auto",
+        "discard_weights_on_sleep": False,
     },
     "colocated": {
         "enabled": True,
@@ -107,6 +108,109 @@ basic_vllm_test_config: VllmConfig = {
     },
     "vllm_kwargs": {},
 }
+
+
+def test_sync_sleep_uses_requested_sleep_level():
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = MagicMock()
+
+    worker.sleep(sleep_level=2)
+
+    worker.llm.sleep.assert_called_once_with(level=2)
+
+
+@pytest.mark.asyncio
+async def test_async_sleep_uses_requested_sleep_level():
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock()
+    worker.llm.reset_prefix_cache = AsyncMock()
+    worker.llm.reset_mm_cache = AsyncMock()
+    worker.llm.sleep = AsyncMock()
+
+    await worker.sleep_async(sleep_level=2)
+
+    worker.llm.sleep.assert_awaited_once_with(level=2)
+
+
+@pytest.mark.parametrize(
+    ("discard_weights", "expected_sleep_level"),
+    [
+        (False, 1),
+        (True, 2),
+    ],
+)
+def test_finish_generation_uses_requested_sleep_level(
+    monkeypatch: pytest.MonkeyPatch,
+    discard_weights: bool,
+    expected_sleep_level: int,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {
+        "colocated": {"enabled": True},
+        "vllm_cfg": {"async_engine": False},
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(ray, "get", lambda futures: futures)
+
+    assert generation.finish_generation(discard_weights=discard_weights)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "sleep",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        sleep_level=expected_sleep_level,
+    )
+
+
+@pytest.mark.parametrize(
+    ("async_engine", "expected_method"),
+    [(False, "reset_prefix_cache"), (True, "reset_prefix_cache_async")],
+)
+def test_finish_generation_never_sends_sleep_level_to_non_colocated_workers(
+    monkeypatch: pytest.MonkeyPatch,
+    async_engine: bool,
+    expected_method: str,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {
+        "colocated": {"enabled": False},
+        "vllm_cfg": {"async_engine": async_engine},
+        "vllm_kwargs": {},
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(ray, "get", lambda futures: futures)
+
+    assert generation.finish_generation(discard_weights=True)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        expected_method,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_finish_generation_selects_level_two_for_async_colocated_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {
+        "colocated": {"enabled": True},
+        "vllm_cfg": {"async_engine": True},
+        "vllm_kwargs": {},
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(ray, "get", lambda futures: futures)
+
+    assert generation.finish_generation(discard_weights=True)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "sleep_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        sleep_level=2,
+    )
 
 
 def _make_nvfp4_pertoken_generation_config() -> VllmConfig:
@@ -246,6 +350,31 @@ basic_automodel_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_vllm_generation_rejects_discard_for_non_colocated_workers() -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["colocated"]["enabled"] = False
+    config["vllm_cfg"]["discard_weights_on_sleep"] = True
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+
+    with pytest.raises(ValueError, match="has no effect"):
+        VllmGeneration(cluster, config, defer_model_load=True)
+
+
+@pytest.mark.parametrize("method", ["deepseek_mtp", "mtp", "eagle3"])
+def test_vllm_generation_rejects_discard_for_static_speculative_weights(
+    method: str,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["discard_weights_on_sleep"] = True
+    config["vllm_kwargs"]["speculative_config"] = {"method": method}
+    cluster = MagicMock()
+    cluster.world_size.return_value = 1
+
+    with pytest.raises(ValueError, match="drafter weights"):
+        VllmGeneration(cluster, config, defer_model_load=True)
 
 
 @pytest.mark.parametrize("async_engine", [False, True])

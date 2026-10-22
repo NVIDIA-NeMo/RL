@@ -705,7 +705,11 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {},
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -2582,6 +2586,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },

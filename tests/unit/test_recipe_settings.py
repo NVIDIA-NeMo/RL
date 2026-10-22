@@ -486,3 +486,18 @@ def test_deepseek_performance_recipes_preserve_checkpoint_save_mode(
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
     assert config.policy.megatron_cfg.checkpoint.async_save is expected_async_save
+
+
+@pytest.mark.parametrize(
+    "recipe_name",
+    [
+        "grpo-nemotron3-super-120BA12B-32n4g.yaml",
+        "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml",
+    ],
+)
+def test_nemotron3_super_recipes_discard_vllm_weights_on_sleep(
+    recipe_name: str,
+) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
+    assert config.policy.generation.vllm_cfg.discard_weights_on_sleep is True

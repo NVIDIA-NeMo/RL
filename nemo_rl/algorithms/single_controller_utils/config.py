@@ -1282,6 +1282,18 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
+    generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and cast(VllmConfig, generation_config)["vllm_cfg"].get(
+            "discard_weights_on_sleep"
+        )
+        is True
+    ):
+        raise NotImplementedError(
+            "generation.vllm_cfg.discard_weights_on_sleep is not supported by "
+            "SingleController. See #4659."
+        )
     if master_config.loss_fn.seq_logprob_error_in_loss:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
