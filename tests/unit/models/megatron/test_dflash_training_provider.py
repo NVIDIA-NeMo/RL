@@ -367,8 +367,8 @@ def _window_counts(*, excluded: int, eligible: int) -> SimpleNamespace:
     )
 
 
-def test_cp_boundary_exclusion_warns_when_microbatch_has_no_windows() -> None:
-    with pytest.warns(UserWarning, match="DSpark microbatch has no draft training"):
+def test_cp_boundary_exclusion_warns_when_batch_has_no_windows() -> None:
+    with pytest.warns(UserWarning, match="DSpark batch has no draft training"):
         _check_cp_boundary_exclusion(
             _window_counts(excluded=0, eligible=0),
             max_fraction=0.5,
@@ -378,7 +378,7 @@ def test_cp_boundary_exclusion_warns_when_microbatch_has_no_windows() -> None:
 
 @pytest.mark.parametrize(
     ("excluded", "eligible", "rejected"),
-    [(3, 1, True), (1, 3, False), (0, 4, False)],
+    [(3, 1, True), (2, 2, False), (1, 3, False), (0, 4, False)],
 )
 def test_cp_boundary_exclusion_rejects_only_fractions_above_limit(
     excluded: int, eligible: int, rejected: bool
@@ -397,31 +397,61 @@ def test_cp_boundary_exclusion_rejects_only_fractions_above_limit(
 def test_captured_layout_validation_rejects_mismatches_with_provider_label(
     label: str,
 ) -> None:
-    layout = build_draft_sequence_layout(
-        logical_sample_ids=torch.tensor([101, 303], dtype=torch.int64),
-        cu_seqlens_q=torch.tensor([0, 7, 12], dtype=torch.int64),
-        cu_seqlens_q_padded=torch.tensor([0, 8, 16], dtype=torch.int64),
-        cp_rank=1,
-        cp_size=2,
-        tp_rank=0,
-        tp_size=2,
-        device=torch.device("cpu"),
-    )
+    def build_layout(total_length: int):
+        return build_draft_sequence_layout(
+            logical_sample_ids=torch.tensor([101, 303], dtype=torch.int64),
+            cu_seqlens_q=torch.tensor([0, 7, total_length], dtype=torch.int64),
+            cu_seqlens_q_padded=torch.tensor([0, 8, 16], dtype=torch.int64),
+            cp_rank=1,
+            cp_size=2,
+            tp_rank=0,
+            tp_size=2,
+            device=torch.device("cpu"),
+        )
+
+    layout = build_layout(12)
     local_length = layout.cp_global_positions.numel()
     hidden = torch.randn(local_length, 1, 8)
     embeds = torch.randn(local_length, 1, 4)
     input_ids = torch.ones(1, local_length, dtype=torch.int64)
     cases = [
-        (CapturedStates(inputs_embeds=embeds), "did not capture target hidden states"),
-        (CapturedStates(hidden_states=hidden), "did not capture target embeddings"),
+        (
+            CapturedStates(inputs_embeds=embeds),
+            layout,
+            "did not capture target hidden states",
+        ),
+        (
+            CapturedStates(hidden_states=hidden),
+            layout,
+            "did not capture target embeddings",
+        ),
         (
             CapturedStates(hidden_states=hidden, inputs_embeds=embeds),
+            layout,
             "packed target output hidden states were not captured",
         ),
         (
             CapturedStates(
                 hidden_states=hidden, inputs_embeds=embeds, output_hidden=embeds
             ),
+            layout,
+            "different sequence layouts",
+        ),
+        (
+            CapturedStates(
+                hidden_states=hidden,
+                inputs_embeds=embeds,
+                output_hidden=embeds,
+                sequence_layout=build_layout(11),
+            ),
+            layout,
+            "different sequence layouts",
+        ),
+        (
+            CapturedStates(
+                hidden_states=hidden, inputs_embeds=embeds, sequence_layout=layout
+            ),
+            None,
             "different sequence layouts",
         ),
         (
@@ -431,14 +461,15 @@ def test_captured_layout_validation_rejects_mismatches_with_provider_label(
                 output_hidden=embeds,
                 sequence_layout=layout,
             ),
+            layout,
             "sequence-parallel captures were not reconstructed",
         ),
     ]
-    for captured, message in cases:
-        with pytest.raises((RuntimeError, ValueError), match=f"{label} .*{message}"):
+    for captured, sequence_layout, message in cases:
+        with pytest.raises(RuntimeError, match=f"{label} .*{message}"):
             _validate_captured_sequence_layout(
                 captured_states=captured,
-                sequence_layout=layout,
+                sequence_layout=sequence_layout,
                 input_ids_cp_local=input_ids,
                 label=label,
             )
@@ -460,10 +491,17 @@ def test_captured_layout_validation_rejects_mismatches_with_provider_label(
             hidden_states=hidden,
             inputs_embeds=embeds,
             output_hidden=embeds,
-            sequence_layout=layout,
+            sequence_layout=build_layout(12),
             sequence_is_reconstructed=True,
         ),
         sequence_layout=layout,
+        input_ids_cp_local=input_ids,
+        label=label,
+    )
+    assert returned[0] is hidden and returned[1] is embeds
+    returned = _validate_captured_sequence_layout(
+        captured_states=CapturedStates(hidden_states=hidden, inputs_embeds=embeds),
+        sequence_layout=None,
         input_ids_cp_local=input_ids,
         label=label,
     )

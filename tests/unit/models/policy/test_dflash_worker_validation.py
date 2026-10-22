@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -85,14 +86,22 @@ def _dspark_provider():
     return provider
 
 
+_BLOCK_DRAFT_PROVIDERS = pytest.mark.parametrize(
+    ("make_provider", "display_method"),
+    [(_provider, "DFlash"), (_dspark_provider, "DSpark")],
+    ids=["dflash", "dspark"],
+)
+
+
 def _provider_with_capabilities(
+    make_provider: Callable[[], Any] = _provider,
     *,
     context_parallel: bool = True,
     sequence_packing: bool = True,
     target_sequence_parallel: bool = True,
 ) -> Any:
     return SimpleNamespace(
-        config=_provider().config,
+        config=make_provider().config,
         supports_context_parallel=context_parallel,
         supports_sequence_packing=sequence_packing,
         supports_target_sequence_parallel=target_sequence_parallel,
@@ -326,19 +335,22 @@ def test_dspark_setup_rejects_mismatched_generation_method() -> None:
         )
 
 
+@_BLOCK_DRAFT_PROVIDERS
 @pytest.mark.parametrize("context_parallel_size", [3, 8])
 def test_block_draft_setup_rejects_context_parallel_size_outside_supported_set(
+    make_provider: Callable[[], Any],
+    display_method: str,
     context_parallel_size: int,
 ) -> None:
     with pytest.raises(ValueError) as error:
         _validate_draft_training_setup(
-            draft_provider=_provider(),
+            draft_provider=make_provider(),
             config={"sequence_packing": {"enabled": True}, "generation": None},
             model_cfg=_model_cfg(context_parallel_size=context_parallel_size),
         )
 
     assert str(error.value) == (
-        "DFlash co-training setup is unsupported: "
+        f"{display_method} co-training setup is unsupported: "
         "context_parallel_size must be one of 1, 2, or 4"
     )
 
@@ -364,24 +376,35 @@ def test_block_draft_setup_rejects_context_parallel_size_outside_supported_set(
     ],
     ids=["context_parallel", "sequence_packing", "target_sequence_parallel"],
 )
+@_BLOCK_DRAFT_PROVIDERS
 def test_block_draft_setup_rejects_layout_the_provider_cannot_support(
+    make_provider: Callable[[], Any],
+    display_method: str,
     capabilities: dict[str, bool],
     model_overrides: dict[str, Any],
     expected: str,
 ) -> None:
     with pytest.raises(ValueError) as error:
         _validate_draft_training_setup(
-            draft_provider=_provider_with_capabilities(**capabilities),
+            draft_provider=_provider_with_capabilities(make_provider, **capabilities),
             config={"sequence_packing": {"enabled": True}, "generation": None},
             model_cfg=_model_cfg(**model_overrides),
         )
 
-    assert str(error.value) == f"DFlash co-training setup is unsupported: {expected}"
+    assert (
+        str(error.value)
+        == f"{display_method} co-training setup is unsupported: {expected}"
+    )
 
 
-def test_block_draft_setup_ignores_missing_capabilities_for_unused_features() -> None:
+@_BLOCK_DRAFT_PROVIDERS
+def test_block_draft_setup_ignores_missing_capabilities_for_unused_features(
+    make_provider: Callable[[], Any],
+    display_method: str,
+) -> None:
     _validate_draft_training_setup(
         draft_provider=_provider_with_capabilities(
+            make_provider,
             context_parallel=False,
             sequence_packing=False,
             target_sequence_parallel=False,

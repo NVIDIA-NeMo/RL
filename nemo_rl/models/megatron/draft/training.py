@@ -163,8 +163,8 @@ def _check_cp_boundary_exclusion(
         )
     if no_windows:
         warnings.warn(
-            f"{label} microbatch has no draft training windows, so the draft "
-            "gets no gradient from it",
+            f"{label} batch has no draft training windows, so it adds no "
+            "draft gradient",
             stacklevel=3,
         )
 

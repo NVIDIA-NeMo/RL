@@ -236,6 +236,35 @@ def test_dflash_body_receives_cp_layout_and_group() -> None:
     assert "max_cp_boundary_exclusion_fraction" in ast.unparse(prepare_batch)
 
 
+def test_block_draft_speculators_label_shared_checks_with_their_own_name() -> None:
+    training = ast.parse(
+        (_REPO_ROOT / "nemo_rl/models/megatron/draft/training.py").read_text()
+    )
+    shared_checks = (
+        "_check_cp_boundary_exclusion",
+        "_validate_captured_sequence_layout",
+    )
+    for class_name, label in (
+        ("DFlashSpeculator", "DFlash"),
+        ("DSparkSpeculator", "DSpark"),
+    ):
+        cls = next(
+            node
+            for node in training.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        calls = sorted(
+            (node.func.id, ast.literal_eval(keyword.value))
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in shared_checks
+            for keyword in node.keywords
+            if keyword.arg == "label"
+        )
+        assert calls == [(name, label) for name in shared_checks]
+
+
 def test_draft_loss_wraps_packed_and_unpacked_policy_losses() -> None:
     train = ast.parse((_REPO_ROOT / "nemo_rl/models/megatron/train.py").read_text())
     loss_call = _function(
