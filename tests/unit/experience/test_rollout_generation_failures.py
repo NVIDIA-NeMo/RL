@@ -1659,6 +1659,73 @@ class TestGymEarlyStreamEnd:
         assert len(gym.events) == 1
         assert gym.streamed_past_the_failure
 
+    def test_a_failed_row_stops_counting_as_gym_owned_before_its_siblings_return(
+        self,
+    ):
+        """A checkpoint drain waits on every dispatched attempt Gym did not
+        export, and the siblings that would end the stream stay parked until
+        the checkpoint resumes, so a failed row must not wait for the stream."""
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failed(rowidx):
+            return GymRowFailure(
+                rowidx, GymTransportError("gym /run failed with broken pipe")
+            )
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                parked.set()
+                await resume.wait()
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts._stream = stream
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        async def exercise():
+            task = asyncio.create_task(run())
+            await asyncio.wait_for(parked.wait(), timeout=2)
+            held = ledger.gym_episodes_still_held(
+                {"tools/replica-0": list(episodes.values())}
+            )["tools/replica-0"]
+            resume.set()
+            completions, _, _ = await asyncio.wait_for(task, timeout=2)
+            return held, completions
+
+        held, completions = asyncio.run(exercise())
+
+        assert episodes[1] not in held
+        assert episodes[2] in held
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        # Replaced once on arrival; the cleanup after the stream reuses it.
+        assert len(ledger.get_group("g7").siblings[1].attempts) == 2
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_ends_a_prompt_group_stream_at_once(self):
+        """The whole cohort is replaced, so its other rows cannot save it."""
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert not gym.streamed_past_the_failure
+        asyncio.run(abandon())
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
     def test_a_data_failure_ends_the_group_at_once(self):
         gym = _RowFailingGym(RolloutDataFailure("prompt exceeds max_model_len"))
         run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=3)

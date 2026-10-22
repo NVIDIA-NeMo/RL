@@ -2964,6 +2964,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         on_completion,
         dispatch_recorder=None,
         admission_closed_rows=None,
+        recovery_granularity=None,
     ):
         del (
             total_rows,
@@ -2971,6 +2972,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             on_completion,
             dispatch_recorder,
             admission_closed_rows,
+            recovery_granularity,
         )
         selected.append(environment)
         for row in pending:
