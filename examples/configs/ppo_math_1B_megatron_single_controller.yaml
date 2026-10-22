@@ -218,7 +218,6 @@ policy:
   generation:
     # HTTP ports use the shared [3000, 4999) virtual-cluster defaults.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null
