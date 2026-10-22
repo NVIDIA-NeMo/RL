@@ -44,15 +44,17 @@ policy:
       refit_backend: nccl
       expose_http_server: true
       buffer_size_gb: 8
-      num_cuda_graphs: -1
       max_tokens: ${policy.max_total_sequence_length}
-      transformer_impl: transformer_engine
+      transformer_impl: inference_optimized
       activation_checkpointing: false
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 2
       expert_tensor_parallel_size: 1
       sequence_parallel: true
-      moe_pad_experts_for_cuda_graph_inference: true
+      moe_router_dtype: fp32
+      mamba_inference_ssm_states_dtype: float32
+      mamba_inference_conv_states_dtype: float32
+      use_cuda_graphs_for_non_decode_steps: false
       image_dynamic_resolution: true
       logprobs_mode: raw_logprobs
       megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper

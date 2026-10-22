@@ -189,6 +189,11 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -227,12 +232,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             hdo.update_fp32_param_by_new_param()
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -259,6 +259,11 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -286,12 +291,7 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             model_chunk.start_param_sync(force_sync=True)
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -1387,6 +1387,16 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     ):
         model_cfg.moe_router_num_groups = None
         model_cfg.moe_router_group_topk = None
+    if (
+        config["megatron_cfg"].get("transformer_impl") == "inference_optimized"
+        and getattr(model_cfg, "num_moe_experts", None)
+        and model_cfg.moe_router_dtype != "fp32"
+    ):
+        raise ValueError(
+            "transformer_impl=inference_optimized requires moe_router_dtype=fp32 "
+            f"for MoE models, got {model_cfg.moe_router_dtype!r}: set "
+            "policy.generation.mcore_generation_config.moe_router_dtype=fp32."
+        )
     if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
         model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
             "moe_pad_experts_for_cuda_graph_inference"
@@ -1481,6 +1491,19 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        if megatron_cfg["mtp_num_layers"] == 0:
+            # HybridProvider.finalize() otherwise retains a repeated MTP
+            # section from the checkpoint and builds one layer even though the
+            # recipe disabled MTP. Remove every inherited MTP source so the
+            # finalized pattern contains only the main decoder.
+            if getattr(model_cfg, "mtp_hybrid_override_pattern", None):
+                model_cfg.mtp_hybrid_override_pattern = None
+            if getattr(model_cfg, "mtp_use_repeated_layer", False):
+                model_cfg.mtp_use_repeated_layer = False
+            for pattern_attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+                pattern = getattr(model_cfg, pattern_attr, None)
+                if isinstance(pattern, str) and "/" in pattern:
+                    setattr(model_cfg, pattern_attr, pattern.split("/")[0])
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg:
@@ -2708,7 +2731,7 @@ def setup_model_and_optimizer(
         if optimizer is not None:
             if megatron_cfg.checkpoint.finetune:
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
-            elif resume_checkpoint_exists:
+            elif resume_checkpoint_exists and megatron_cfg.checkpoint.load_optim:
                 _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
