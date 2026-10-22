@@ -193,6 +193,9 @@ policy:
     enabled: false
     # Arbitrary overrides applied recursively to the Megatron Bridge model
     # provider before model instantiation. Do not duplicate first-class fields.
+    # For full activation checkpointing, {recompute_num_layers: 2} groups two
+    # consecutive layers per checkpoint. Larger groups save boundary activations
+    # but increase recomputation peaks. Omit to retain one layer per checkpoint.
     model_overrides: {}
     checkpoint:
       async_save: true

@@ -1740,12 +1740,31 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.parallel_output = True
 
     # Activation checkpointing
+    model_overrides = config["megatron_cfg"].get("model_overrides")
+    has_recompute_override = (
+        model_overrides is not None and "recompute_num_layers" in model_overrides
+    )
+    if model_overrides is not None and has_recompute_override:
+        if (
+            not config["megatron_cfg"]["activation_checkpointing"]
+            or config["megatron_cfg"].get("recompute_granularity") == "selective"
+        ):
+            raise ValueError(
+                "model_overrides.recompute_num_layers requires full activation "
+                "checkpointing."
+            )
+        recompute_num_layers = model_overrides["recompute_num_layers"]
+        if type(recompute_num_layers) is not int or recompute_num_layers < 1:
+            raise ValueError(
+                "model_overrides.recompute_num_layers must be a positive integer."
+            )
     if config["megatron_cfg"]["activation_checkpointing"]:
         granularity = config["megatron_cfg"].get("recompute_granularity", "full")
         model_cfg.recompute_granularity = granularity
         if granularity == "full":
             model_cfg.recompute_method = "uniform"
-            model_cfg.recompute_num_layers = 1
+            if not has_recompute_override:
+                model_cfg.recompute_num_layers = 1
         elif granularity == "selective":
             recompute_modules = config["megatron_cfg"].get("recompute_modules")
             if recompute_modules is not None:

@@ -2248,6 +2248,50 @@ class TestApplyPerformanceConfig:
         assert model_cfg.recompute_method == "uniform"
         assert model_cfg.recompute_num_layers == 1
 
+    def test_full_recompute_preserves_explicit_model_override(self) -> None:
+        """The performance phase must retain an already merged group size."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = SimpleNamespace(gated_linear_unit=True, recompute_num_layers=2)
+        config = self._config()
+        config["megatron_cfg"].update(
+            activation_checkpointing=True,
+            recompute_granularity="full",
+            model_overrides={"recompute_num_layers": 2},
+        )
+        _apply_performance_config(model_cfg, config)
+        assert model_cfg.recompute_num_layers == 2
+        assert model_cfg.recompute_method == "uniform"
+
+    @pytest.mark.parametrize("layers", [0, -1, True, 1.5, "2", None])
+    def test_full_recompute_rejects_invalid_group_sizes(self, layers: Any) -> None:
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        config = self._config()
+        config["megatron_cfg"].update(
+            activation_checkpointing=True,
+            model_overrides={"recompute_num_layers": layers},
+        )
+        with pytest.raises(ValueError, match="recompute_num_layers.*positive integer"):
+            _apply_performance_config(SimpleNamespace(gated_linear_unit=True), config)
+
+    @pytest.mark.parametrize(
+        "activation, granularity", [(False, "full"), (True, "selective")]
+    )
+    def test_explicit_recompute_groups_require_full_checkpointing(
+        self, activation: bool, granularity: str
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        config = self._config()
+        config["megatron_cfg"].update(
+            activation_checkpointing=activation,
+            recompute_granularity=granularity,
+            model_overrides={"recompute_num_layers": 2},
+        )
+        with pytest.raises(ValueError, match="recompute_num_layers.*full"):
+            _apply_performance_config(SimpleNamespace(gated_linear_unit=True), config)
+
     def test_expanded_omni_defaults_to_auto_attention(self, monkeypatch):
         """Expanded Omni uses backend dispatch without relying on a recipe."""
         from megatron.core.transformer.enums import AttnBackend
