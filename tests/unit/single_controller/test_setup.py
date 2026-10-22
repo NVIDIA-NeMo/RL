@@ -107,7 +107,7 @@ _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 def test_spinup_gym_uses_remote_vllm_served_model_name(monkeypatch):
     """Gym must address the remote service alias, not its checkpoint path."""
     spinup = MagicMock(return_value=object())
-    monkeypatch.setattr(sc_setup_mod, "spinup_nemo_gym_actor", spinup)
+    monkeypatch.setattr(sc_setup_mod, "build_nemo_gym_actors", spinup)
     master_config = SimpleNamespace(
         policy={
             "model_name": "/checkpoints/policy",

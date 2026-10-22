@@ -13,7 +13,6 @@ RUN_DIR=${EXTERNAL_VLLM_TEST_RUN_DIR:-$SCRIPT_DIR/grpo_external_vllm_gym_single_
 SERVER_PORT=${EXTERNAL_VLLM_TEST_PORT:-19210}
 BASE_URL=${EXTERNAL_VLLM_TEST_BASE_URL:-http://127.0.0.1:$SERVER_PORT/v1}
 mkdir -p "$RUN_DIR"
-EXPORT_DIR="$RUN_DIR/hf_exports"
 SERVER_PID=""
 cleanup() {
     if [[ -n "$SERVER_PID" ]]; then
@@ -29,6 +28,7 @@ if [[ -z "${EXTERNAL_VLLM_TEST_BASE_URL:-}" ]]; then
     --model "$MODEL" --served-model-name policy --port "$SERVER_PORT" \
     --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization 0.7 \
     --enable-auto-tool-choice --tool-call-parser hermes \
+    --weight-transfer-config '{"backend":"nccl"}' \
     > "$RUN_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     TRAIN_GPUS=${EXTERNAL_VLLM_TEST_TRAIN_GPU:-0}
@@ -65,12 +65,12 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     ++grpo.adv_estimator.minus_baseline=false \
     policy.train_global_batch_size=16 \
     policy.generation.backend=remote_vllm \
-    ++policy.generation.refit_transport=hf_checkpoint \
-    ++policy.generation.refit_cfg.hf_checkpoint.checkpoint_dir="$EXPORT_DIR" \
+    ++policy.generation.refit_transport=null \
     ++policy.generation.remote_vllm_cfg.base_url="$BASE_URL" \
     ++policy.generation.remote_vllm_cfg.served_model_name=policy \
     ++policy.generation.remote_vllm_cfg.max_model_len="$MAX_MODEL_LEN" \
-    ++policy.generation.remote_vllm_cfg.refit={} \
+    ++policy.generation.remote_vllm_cfg.refit.nccl_num_engines=1 \
+    ++policy.generation.remote_vllm_cfg.refit.nccl_engine_world_size="${EXTERNAL_VLLM_TEST_ENGINE_WORLD_SIZE:-1}" \
     cluster.gpus_per_node=1 \
     ++token_capture.enabled=false \
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.return_token_id_information=true \
@@ -81,6 +81,5 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
 
 uv run "$PROJECT_ROOT/tests/check_metrics.py" "$RUN_DIR/train/metrics.json" \
     'len(data["train/gen_kl_error"]) >= 10' \
-    'max(data["train/grad_norm"]) > 0'
-uv run python "$SCRIPT_DIR/check_hf_refit_exports.py" "$EXPORT_DIR" \
-    --minimum-versions 10 --output "$RUN_DIR/refit-validation.json"
+    'max(data["train/grad_norm"]) > 0' \
+    'len(data["timing/train/prepare_for_generation/nccl_refit_remote_vllm"]) >= 10'

@@ -20,10 +20,20 @@ from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validat
 
 
 class RemoteVllmRefitConfig(BaseModel, extra="forbid"):
-    """Disk-checkpoint refit settings for vLLM's development control API."""
+    """NCCL refit settings for one external vLLM 0.29.0 deployment.
+
+    ``nccl_engine_world_size`` counts all TP/PP/DP GPU workers in that one
+    deployment; the HTTP frontend and router are not NCCL participants.
+    Independent deployments and control fan-out are not supported yet.
+    """
 
     inflight_policy: Literal["abort", "wait", "keep"] = "keep"
     timeout_s: PositiveFloat = 1800.0
+    transport: Literal["nccl"] = "nccl"
+    nccl_engine_world_size: PositiveInt = 1
+    nccl_num_engines: Literal[1] = 1
+    nccl_packed_buffer_size_bytes: PositiveInt = 1024**3
+    nccl_packed_num_buffers: PositiveInt = 2
 
 
 class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
@@ -39,10 +49,9 @@ class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
     max_model_len: PositiveInt
     health_path: str = "/health"
     models_path: str = "/v1/models"
-    server_info_path: str = "/server_info"
+    server_info_path: str = "/server_info?config_format=json"
     pause_path: str = "/pause"
     resume_path: str = "/resume"
-    collective_rpc_path: str = "/collective_rpc"
     reset_prefix_cache_path: str = "/reset_prefix_cache"
     request_timeout_s: PositiveFloat = 600.0
     connect_timeout_s: PositiveFloat = 5.0
@@ -59,7 +68,6 @@ class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
             "server_info_path",
             "pause_path",
             "resume_path",
-            "collective_rpc_path",
             "reset_prefix_cache_path",
         )
         for field_name in path_fields:

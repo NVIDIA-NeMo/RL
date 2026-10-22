@@ -1,5 +1,5 @@
 #!/bin/bash
-# Separate serving environment: independent vLLM process, shared HF refit.
+# Separate serving environment: independent vLLM process, direct NCCL refit.
 set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")

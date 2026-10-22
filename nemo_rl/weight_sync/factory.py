@@ -20,6 +20,7 @@ topology (colocated vs. non-colocated) and the generation backend:
 - Megatron -> Megatron reshard synchronizer
 - vLLM colocated -> IPC (ZMQ + CUDA IPC handles)
 - vLLM non-colocated -> NCCL collective
+- external vLLM -> native NCCL weight-transfer engine (one deployment)
 - SGLang colocated -> Ray CUDA-IPC bucket transfer
 - SGLang non-colocated -> NCCL broadcast over SGLang's own weight-update group
 """
@@ -136,38 +137,34 @@ def create_weight_synchronizer(
         colocated=colocated,
         refit_transport=generation.cfg.get("refit_transport"),
     )
-    if generation.cfg.get("refit_transport") == "hf_checkpoint":
+    if generation_backend == REMOTE_VLLM_BACKEND:
+        if generation.cfg.get("refit_transport") is not None:
+            raise ValueError("remote_vllm NCCL refit requires refit_transport=null")
+        if not (policy_cfg.get("megatron_cfg") or {}).get("enabled"):
+            raise NotImplementedError(
+                "remote_vllm NCCL refit requires a Megatron policy"
+            )
+        # Draft weights need a separate target loader; reject them before setup.
         from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
-        if generation_backend not in {VLLM_BACKEND, REMOTE_VLLM_BACKEND}:
-            raise ValueError("hf_checkpoint refit requires the vLLM backend")
-        if colocated:
-            raise ValueError("hf_checkpoint refit requires non-colocated generation")
-        if not policy.cfg.get("megatron_cfg", {}).get("enabled"):
-            raise NotImplementedError("hf_checkpoint export requires a Megatron policy")
-        if (
-            generation_backend == VLLM_BACKEND
-            and not generation.cfg["vllm_cfg"]["async_engine"]
-        ):
-            raise ValueError("hf_checkpoint refit currently requires async_engine=true")
         if generation.cfg.get("quant_cfg") or draft_refit_enabled(
-            policy.cfg.get("draft")
+            policy_cfg.get("draft")
         ):
             raise NotImplementedError(
-                "hf_checkpoint refit does not support quant_cfg or draft policies"
+                "remote_vllm NCCL refit does not support quant_cfg or draft policies"
             )
-        # Optional vLLM configuration is imported only for this transport.
-        from nemo_rl.models.generation.vllm.config import normalize_vllm_refit_config
-        from nemo_rl.weight_sync.hf_checkpoint_weight_synchronizer import (
-            HfCheckpointWeightSynchronizer,
+        if colocated or train_cluster is None:
+            raise ValueError(
+                "remote_vllm NCCL refit requires non-colocated generation and "
+                "train_cluster"
+            )
+        from nemo_rl.weight_sync.remote_vllm_nccl_weight_synchronizer import (
+            RemoteVllmNcclWeightSynchronizer,
         )
 
-        config = normalize_vllm_refit_config(generation.cfg)
-        assert config is not None and config.hf_checkpoint is not None
-        return HfCheckpointWeightSynchronizer(policy, generation, config.hf_checkpoint)
-
-    if generation_backend == REMOTE_VLLM_BACKEND:
-        raise ValueError("remote_vllm requires refit_transport=hf_checkpoint")
+        return RemoteVllmNcclWeightSynchronizer(
+            policy, generation, train_cluster, refit_timeout_s=refit_timeout_s
+        )
 
     # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
     # checkpoint-engine normalization rejects that valid Megatron value.

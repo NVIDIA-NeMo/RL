@@ -125,14 +125,37 @@ class RemoteVllmClient:
             },
         )
 
-    def reload_weights(self, weights_path: str) -> None:
+    def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+        """Join one deployment's GPU workers to the policy NCCL group."""
         self.request(
             "POST",
-            self.config.collective_rpc_path,
-            body={
-                "method": "reload_weights",
-                "kwargs": {"weights_path": weights_path},
-            },
+            "/init_weight_transfer_engine",
+            body={"init_info": init_info},
+            timeout_s=self.config.refit.timeout_s,
+        )
+
+    def start_weight_update(self) -> None:
+        self.request(
+            "POST",
+            "/start_weight_update",
+            body={},
+            timeout_s=self.config.refit.timeout_s,
+        )
+
+    def update_weights(self, update_info: dict[str, Any]) -> None:
+        """Receive one full weight broadcast; returns once it has been loaded."""
+        self.request(
+            "POST",
+            "/update_weights",
+            body={"update_info": update_info},
+            timeout_s=self.config.refit.timeout_s,
+        )
+
+    def finish_weight_update(self, weight_version: str) -> None:
+        self.request(
+            "POST",
+            "/finish_weight_update",
+            body={"weight_version": weight_version},
             timeout_s=self.config.refit.timeout_s,
         )
 

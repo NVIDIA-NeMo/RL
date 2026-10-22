@@ -365,6 +365,7 @@ project-includes = [
   "nemo_rl/weight_sync/membership.py",
   "nemo_rl/weight_sync/nccl_reshard_utils.py",
   "nemo_rl/weight_sync/nccl_reshard_weight_synchronizer.py",
+  "nemo_rl/weight_sync/remote_vllm_nccl_weight_synchronizer.py",
   "nemo_rl/weight_sync/sglang_weight_synchronizer.py",
   "nemo_rl/weight_sync/vllm_remote_sparse_weight_synchronizer.py",
   "nemo_rl/weight_sync/xferdtensor.py",

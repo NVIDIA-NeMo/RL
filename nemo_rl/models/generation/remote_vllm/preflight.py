@@ -23,31 +23,30 @@ from nemo_rl.models.generation.remote_vllm_config import (
 )
 
 
+def validate_single_backend(health: dict[str, Any] | None) -> None:
+    """Reject independent replicas even when their router advertises fan-out."""
+    if health is None:
+        return  # Stock vLLM returns an empty successful /health response.
+    if "total_backends" in health:
+        total = health["total_backends"]
+        if type(total) is not int or total != 1:
+            raise RuntimeError(
+                "External vLLM NCCL refit requires exactly one engine deployment; "
+                f"/health reports total_backends={total!r}. "
+                "Control-plane fan-out is not supported yet."
+            )
+    if "healthy_backends" in health:
+        healthy = health["healthy_backends"]
+        if type(healthy) is not int or healthy != 1:
+            raise RuntimeError("External vLLM requires exactly one healthy backend")
+
+
 def preflight_remote_vllm_service(
     config: RemoteVllmServiceConfig,
 ) -> RemoteVllmServiceInfo:
-    """Verify health, model identity, and the development control surface.
-
-    The check is deliberately non-mutating. ``/server_info`` only exists when
-    ``VLLM_SERVER_DEV_MODE=1``, which is also what exposes ``/collective_rpc``.
-    """
+    """Check one vLLM 0.29.0 service and its native NCCL transfer settings."""
     client = RemoteVllmClient(config)
-    health = client.health(timeout_s=config.connect_timeout_s)
-    # The existing external-vLLM launcher puts a small load balancer in front
-    # of each pool. Its /health response exposes the backend count. A normal
-    # request proxy cannot make /collective_rpc global across independent
-    # engine deployments, so fail before training rather than silently refit
-    # only one replica. Native vLLM TP/PP/DP workers remain one backend here.
-    if health is not None and isinstance(health.get("total_backends"), int):
-        total_backends = health["total_backends"]
-        if total_backends != 1:
-            raise RuntimeError(
-                "External vLLM refit requires exactly one engine deployment "
-                "behind the configured URL; the load balancer reports "
-                f"{total_backends} independent backends. Add control-plane "
-                "fan-out before using multiple replicas."
-            )
-
+    validate_single_backend(client.health(timeout_s=config.connect_timeout_s))
     models = client.get_json(config.models_path, timeout_s=config.connect_timeout_s)
     model_entries = models.get("data")
     if not isinstance(model_entries, list):
@@ -62,13 +61,30 @@ def preflight_remote_vllm_service(
             "External vLLM model mismatch: controller expects "
             f"{config.served_model_name!r}, service reports {sorted(model_ids)!r}"
         )
-
-    raw_server_info: Any = client.get_json(
+    version = client.get_json("/version", timeout_s=config.connect_timeout_s).get(
+        "version"
+    )
+    if not isinstance(version, str) or version.split("+")[0] != "0.29.0":
+        raise RuntimeError(
+            f"External NCCL refit requires vLLM 0.29.0; service reports {version!r}"
+        )
+    raw_server_info = client.get_json(
         config.server_info_path, timeout_s=config.connect_timeout_s
     )
-    if not isinstance(raw_server_info, dict):
-        raise RuntimeError("External vLLM /server_info response is not an object")
-
+    vllm_config = raw_server_info.get("vllm_config")
+    if not isinstance(vllm_config, dict):
+        raise RuntimeError("External /server_info must use config_format=json")
+    transfer = vllm_config.get("weight_transfer_config")
+    if not isinstance(transfer, dict) or transfer.get("backend") != "nccl":
+        raise RuntimeError("External vLLM requires weight_transfer_config.backend=nccl")
+    world_size = client.get_json(
+        "/get_world_size", timeout_s=config.connect_timeout_s
+    ).get("world_size")
+    if type(world_size) is not int or world_size != config.refit.nccl_engine_world_size:
+        raise RuntimeError(
+            "External vLLM world size does not match refit.nccl_engine_world_size: "
+            f"{world_size!r} != {config.refit.nccl_engine_world_size}"
+        )
     return RemoteVllmServiceInfo(
         model=config.served_model_name,
         dev_mode_control_api=True,

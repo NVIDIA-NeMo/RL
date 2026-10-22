@@ -20,6 +20,7 @@ import ray
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
+    CollectiveSenderSpec,
     GenerationConfig,
     GenerationDatumSpec,
     GenerationInterface,
@@ -40,7 +41,7 @@ class RemoteVllmGeneration(GenerationInterface):
 
     NeMo-Gym sends rollout traffic directly to ``dp_openai_server_base_urls``.
     This object intentionally implements no native Ray generation path; it owns
-    only lifecycle and weight-reload control calls.
+    only lifecycle and NCCL weight-transfer control calls.
     """
 
     @classmethod
@@ -53,17 +54,20 @@ class RemoteVllmGeneration(GenerationInterface):
             )
         if generation["colocated"]["enabled"]:
             raise ValueError("remote_vllm generation cannot be colocated")
-        if generation.get("refit_transport") != "hf_checkpoint":
-            raise ValueError("remote_vllm requires refit_transport=hf_checkpoint")
+        RemoteVllmServiceConfig.model_validate(generation["remote_vllm_cfg"])
+        if generation.get("refit_transport") is not None:
+            raise ValueError(
+                "remote_vllm uses native NCCL refit; "
+                "policy.generation.refit_transport must be unset"
+            )
         if not master_config.policy.get("megatron_cfg", {}).get("enabled"):
             raise ValueError(
-                "remote_vllm checkpoint export currently requires a Megatron policy"
+                "remote_vllm NCCL refit currently requires a Megatron policy"
             )
         if master_config.token_capture.enabled:
             raise NotImplementedError(
                 "remote_vllm does not yet support Single Controller token capture"
             )
-        RemoteVllmServiceConfig.model_validate(generation["remote_vllm_cfg"])
 
     def __init__(self, config: GenerationConfig) -> None:
         self.cfg = config
@@ -83,7 +87,19 @@ class RemoteVllmGeneration(GenerationInterface):
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
         del ip, port, world_size, train_world_size
-        raise NotImplementedError("remote_vllm refit uses an HF checkpoint, not NCCL")
+        raise NotImplementedError(
+            "remote_vllm builds its NCCL group in RemoteVllmNcclWeightSynchronizer"
+        )
+
+    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
+        """VLLM's NCCL peer protocol and the packed geometry both sides use."""
+        refit = self.remote_config.refit
+        return CollectiveSenderSpec(
+            nccl_peer="vllm",
+            buffer_size_bytes=refit.nccl_packed_buffer_size_bytes,
+            num_buffers=refit.nccl_packed_num_buffers,
+            use_legacy_packing=True,
+        )
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool
@@ -126,11 +142,6 @@ class RemoteVllmGeneration(GenerationInterface):
         self.client.resume()
         self._paused_for_refit = False
         return True
-
-    def reload_weights(self, weights_path: str) -> None:
-        if not self._paused_for_refit:
-            raise RuntimeError("External vLLM must be paused before reloading weights")
-        self.client.reload_weights(weights_path)
 
     def invalidate_kv_cache(self) -> bool:
         self.client.reset_prefix_cache()
