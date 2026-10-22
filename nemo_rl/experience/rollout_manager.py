@@ -19,11 +19,12 @@ import copy
 import enum
 import json
 import math
+import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, TextIO
 
 import ray.exceptions
 import torch
@@ -954,6 +955,8 @@ class AsyncNemoGymRolloutImpl:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         dump_gym_results: bool = False,
+        # async_rl.log_gym_results: directory for every Gym result as it lands.
+        gym_results_dir: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -965,6 +968,9 @@ class AsyncNemoGymRolloutImpl:
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
         self._dump_gym_results = dump_gym_results
+        self._gym_results_dir = gym_results_dir
+        # Opened on first write, in the process that runs the rollouts.
+        self._gym_results_file: Optional[TextIO] = None
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
@@ -1207,6 +1213,8 @@ class AsyncNemoGymRolloutImpl:
                     [result], [inputs_by_rowidx[rowidx]], self._effort_config
                 )
             results[rowidx] = result
+            if self._gym_results_dir is not None:
+                self._log_gym_result(inputs_by_rowidx[rowidx], result)
             if on_completion is not None:
                 # Use the same conversion path as completed groups so streamed
                 # recovery records inherit the current mask and reward semantics.
@@ -1218,6 +1226,23 @@ class AsyncNemoGymRolloutImpl:
                 env_timing_metrics = timing_metrics
 
         return env_timing_metrics
+
+    def _log_gym_result(self, row: dict, result: dict) -> None:
+        """Append one Gym result as a JSON line, before any RL filtering sees it."""
+        if self._gym_results_file is None:
+            os.makedirs(self._gym_results_dir, exist_ok=True)
+            path = os.path.join(
+                self._gym_results_dir, f"gym_results.{os.getpid()}.jsonl"
+            )
+            self._gym_results_file = open(path, "a", buffering=1)
+        record = {
+            "group_id": row[NEMO_GYM_GROUP_ID_KEY],
+            "group_attempt": row[NEMO_GYM_GROUP_ATTEMPT_KEY],
+            "rollout_index": row[NEMO_GYM_ROLLOUT_INDEX_KEY],
+            "rollout_id": row.get("_ng_rollout_id"),
+            "full_result": result["full_result"],
+        }
+        self._gym_results_file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     async def _run_rollouts(
         self,
@@ -1671,6 +1696,7 @@ class RolloutManager:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         dump_gym_results: bool = False,
+        gym_results_dir: Optional[str] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1711,6 +1737,7 @@ class RolloutManager:
             mask_env_flagged_samples=mask_env_flagged_samples,
             log_full_result_tables=log_full_result_tables,
             dump_gym_results=dump_gym_results,
+            gym_results_dir=gym_results_dir,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.

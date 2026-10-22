@@ -2191,6 +2191,11 @@ def setup_single_controller(
             wandb_config=master_config.logger.wandb,
         ),
         dump_gym_results=dump_gym_results,
+        gym_results_dir=(
+            os.path.join(master_config.logger.log_dir, "gym_results")
+            if use_nemo_gym and master_config.async_rl.log_gym_results
+            else None
+        ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
