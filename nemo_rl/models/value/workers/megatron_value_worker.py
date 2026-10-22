@@ -168,6 +168,21 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool, output_size:
     return hook
 
 
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Mirrors the policy worker: mbridge's Qwen3VLModel (which also wraps Qwen3.5)
+    calls ``preprocess_packed_seqs`` itself, so it must receive an unpacked
+    ``[B, S]`` batch instead of NeMo-RL's pre-packed, CP-sharded one.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+
+
 def _categorical_support(config: ValueConfig) -> Optional[CategoricalValueSupport]:
     """Return the histogram support for a categorical value head, else ``None``."""
     head_cfg = config.get("value_head") or {"type": "scalar"}
@@ -460,6 +475,9 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self.optimizer,
         )
 
+        # Qwen3.5 packs and CP-shards inside its model forward, matching the policy worker.
+        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
     def enable_forward_pre_hook(self):
@@ -545,6 +563,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     self._policy_like_cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
                 )
                 total_num_microbatches += int(num_microbatches)
 
@@ -727,6 +746,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self._policy_like_cfg,
             value_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         def forward_step_fn(
