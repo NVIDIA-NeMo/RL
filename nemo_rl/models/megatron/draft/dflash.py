@@ -453,19 +453,22 @@ class DFlashBody(_ShardedModule):
                 "DFlash tensor parallel group size"
             )
         self.parallel_config = parallel_config
-        partitioned_dimensions = (
-            self.config.hidden_size,
-            self.config.intermediate_size,
-            self.config.num_attention_heads,
-            self.config.num_key_value_heads,
-        )
-        if any(
-            value % self.tensor_parallel_size != 0 for value in partitioned_dimensions
-        ):
+        partitioned_dimensions = {
+            "hidden_size": self.config.hidden_size,
+            "intermediate_size": self.config.intermediate_size,
+            "num_attention_heads": self.config.num_attention_heads,
+            "num_key_value_heads": self.config.num_key_value_heads,
+        }
+        indivisible = {
+            name: value
+            for name, value in partitioned_dimensions.items()
+            if value % self.tensor_parallel_size != 0
+        }
+        if indivisible:
             raise ValueError(
                 "DFlash dimensions must be divisible by tensor parallel size "
-                "(num_key_value_heads is the binding constraint: max TP=8 for "
-                "the pinned artifact)"
+                f"{self.tensor_parallel_size} (KV heads are not replicated): "
+                + ", ".join(f"{name}={value}" for name, value in indivisible.items())
             )
         self.num_attention_heads_per_partition = (
             self.config.num_attention_heads // self.tensor_parallel_size

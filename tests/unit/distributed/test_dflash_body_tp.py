@@ -458,6 +458,18 @@ def _run_tp2_rejects_sequence_parallel_config(rank: int, world_size: int) -> Non
     assert parallel_config.sequence_parallel is True
 
 
+def _run_tp4_rejects_indivisible_heads(rank: int, world_size: int) -> None:
+    with pytest.raises(
+        ValueError,
+        match="num_attention_heads=2, num_key_value_heads=2",
+    ):
+        DFlashBody(
+            _config(),
+            tp_group=torch.distributed.group.WORLD,
+            parallel_config=_fp32_parallel_config(4),
+        )
+
+
 def _run_tp2_subgroup_forward_gradient_and_replica_ids(
     rank: int, world_size: int
 ) -> None:
@@ -561,6 +573,10 @@ def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
 
 def test_tp2_rejects_sequence_parallel_config(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp2_rejects_sequence_parallel_config, world_size=2)
+
+
+def test_tp4_rejects_indivisible_heads(distributed_test_runner) -> None:
+    distributed_test_runner(_run_tp4_rejects_indivisible_heads, world_size=4)
 
 
 def test_tp2_subgroup_forward_gradient_and_replica_ids(distributed_test_runner) -> None:
