@@ -192,6 +192,55 @@ def test_finalization_tags_the_group_with_its_prompts_agent() -> None:
     assert ctrl._agent_by_group == {"group": "gdpval_train"}
 
 
+def _agent_controller() -> Any:
+    result = FinalizedGroup(
+        meta=_finalized_meta(),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    ctrl._privilege_store = None
+    ctrl._dataset_prompt = AsyncMock(
+        return_value={
+            "extra_env_info": {
+                "agent_ref": {
+                    "type": "responses_api_agents",
+                    "name": "swe_rebench_opencode",
+                }
+            }
+        }
+    )
+    return ctrl
+
+
+def test_agent_is_recorded_before_the_group_becomes_trainable() -> None:
+    # The train pump may consume a group the moment it is committed and pops its
+    # agent then; a group committed before its agent is recorded counts as unknown.
+    ctrl = _agent_controller()
+    agents_at_commit: list[dict[str, str]] = []
+    ctrl._buffer.commit_finalized = AsyncMock(
+        side_effect=lambda *args, **kwargs: agents_at_commit.append(
+            dict(ctrl._agent_by_group)
+        )
+    )
+
+    asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    assert agents_at_commit == [{"group": "swe_rebench_opencode"}]
+
+
+def test_failed_commit_leaves_no_agent_entry() -> None:
+    ctrl = _agent_controller()
+    ctrl._buffer.commit_finalized = AsyncMock(side_effect=RuntimeError("commit failed"))
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        asyncio.run(ctrl._finalize_with_actor(_request()))
+
+    assert ctrl._agent_by_group == {}
+
+
 def _privileged(ctrl: Any, env_info: dict[str, Any]) -> Any:
     """Give the controller a real privilege store and a dataset prompt lookup."""
     import torch

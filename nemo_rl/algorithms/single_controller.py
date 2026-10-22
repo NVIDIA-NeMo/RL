@@ -2096,8 +2096,6 @@ class SingleControllerActor:
         rollout_metrics = self._rollout_manager.pop_capture_rollout_metrics(
             request.group_id
         )
-        # Set when the privileged critic's prompt lookup already read the agent.
-        agent_name: Optional[str] = None
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2210,6 +2208,15 @@ class SingleControllerActor:
                                 env_info,
                                 int(request.prompt_idx),
                             )
+                        else:
+                            agent_name = await self._prompt_agent_name(
+                                request.prompt_idx
+                            )
+                        # Recorded before the commit: a committed group is
+                        # trainable at once, and the train pump pops this entry
+                        # when it consumes the group (a later write races it and
+                        # the group is counted as "unknown" in batch_mix).
+                        self._agent_by_group[request.group_id] = agent_name
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
@@ -2219,6 +2226,7 @@ class SingleControllerActor:
                             staging_keys=finalized.staging_keys,
                         )
                     except BaseException as commit_error:
+                        self._agent_by_group.pop(request.group_id, None)
                         try:
                             await self._cleanup_known_finalization_request_unlocked(
                                 cut, request
@@ -2253,11 +2261,6 @@ class SingleControllerActor:
             }
         )
         self._finalizer_metrics_by_group[request.group_id] = dict(finalized.metrics)
-        self._agent_by_group[request.group_id] = (
-            agent_name
-            if agent_name is not None
-            else await self._prompt_agent_name(request.prompt_idx)
-        )
         return finalized
 
     async def _cleanup_consumed_metas_unlocked(

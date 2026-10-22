@@ -1874,6 +1874,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._batch_promotions = {}
     ctrl._finalizer_metrics_by_group = {}
     ctrl._agent_by_group = {}
+    ctrl._trajectory_age_metrics = {}
     ctrl._batch_mix_history = BatchMixHistory()
     ctrl._step_log_dict = {
         "rewards": [],
