@@ -232,6 +232,7 @@ from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.experience.sample_ids import (
     extra_sample_ids_for,
     group_ids_in_order,
+    try_parse_sample_id,
 )
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -944,6 +945,7 @@ class SingleControllerActor:
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._maybe_restore_replay_buffer()
         await self._maybe_restore_privilege_prefixes(restored_replay_groups)
+        await self._record_restored_group_agents()
         replay_restore_seconds = time.monotonic() - replay_restore_started
         recovery_prepare_started = time.monotonic()
         # checkpoint_replay_buffer=false drops in-flight work on resume as well.
@@ -1803,6 +1805,26 @@ class SingleControllerActor:
             f"{len(metas)} restored replay group(s)",
             flush=True,
         )
+
+    async def _record_restored_group_agents(self) -> None:
+        """Record batch_mix agents for replay groups restored on resume.
+
+        Restored groups never pass through the finalizer, which is where a group's
+        agent is normally recorded, so without this they count as "unknown".
+        """
+        for meta in self._buffer.meta_list:
+            if meta is None:
+                continue
+            tags = meta.tags or []
+            for k, sample_id in enumerate(meta.sample_ids):
+                parsed = try_parse_sample_id(sample_id)
+                group_id = parsed[0] if parsed is not None else sample_id
+                if group_id in self._agent_by_group:
+                    continue
+                tag = tags[k] if k < len(tags) and isinstance(tags[k], dict) else {}
+                self._agent_by_group[group_id] = await self._prompt_agent_name(
+                    tag.get("prompt_idx")
+                )
 
     def _mark_prompt_pending(self, prompt_dataset_idx: Any) -> None:
         """Track a drawn prompt until a train step consumes it."""

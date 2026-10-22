@@ -28,7 +28,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneCheckpointBarrier,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils.batch_mix import BatchMixHistory
+from nemo_rl.algorithms.single_controller_utils.batch_mix import UNKNOWN_AGENT, BatchMixHistory
 from nemo_rl.algorithms.single_controller_utils.config import SegmentRowsConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
@@ -239,6 +239,28 @@ def test_failed_commit_leaves_no_agent_entry() -> None:
         asyncio.run(ctrl._finalize_with_actor(_request()))
 
     assert ctrl._agent_by_group == {}
+
+
+def test_restored_replay_groups_get_their_agents() -> None:
+    # Groups restored from the replay buffer on resume skip the finalizer, so their
+    # agent comes from each group's prompt; otherwise batch_mix counts them as unknown.
+    ctrl = _agent_controller()
+    ctrl._agent_by_group = {"kept": "browsecomp"}
+    ctrl._buffer.meta_list = [
+        SimpleNamespace(sample_ids=["restored_g0", "restored_g1"], tags=[{"prompt_idx": 7}, {"prompt_idx": 7}]),
+        SimpleNamespace(sample_ids=["kept_g0"], tags=[{"prompt_idx": 9}]),
+        None,
+        SimpleNamespace(sample_ids=["untagged_g0"], tags=None),
+    ]
+
+    asyncio.run(ctrl._record_restored_group_agents())
+
+    assert ctrl._agent_by_group == {
+        "kept": "browsecomp",
+        "restored": "swe_rebench_opencode",
+        "untagged": UNKNOWN_AGENT,
+    }
+    ctrl._dataset_prompt.assert_awaited_once_with(7)
 
 
 def _privileged(ctrl: Any, env_info: dict[str, Any]) -> Any:
