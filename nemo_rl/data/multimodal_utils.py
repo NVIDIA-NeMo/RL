@@ -207,10 +207,10 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
     # Lazy to avoid the data/data_plane package initialization cycle.
     from nemo_rl.data_plane.schema import (
         PER_TOKEN_STAGING_FIELDS,
-        ROUTED_EXPERTS_FIELD,
-        ROUTED_LEN_FIELD,
         ROUTED_EXPERTS_ENCODING_FIELD,
+        ROUTED_EXPERTS_FIELD,
         ROUTED_EXTRAS_METADATA_FIELD,
+        ROUTED_LEN_FIELD,
         SC_ROLLOUT_SCHEMA_FIELDS,
     )
 
