@@ -43,29 +43,27 @@ def test_draft_update_probe_reports_gradient_and_parameter_change() -> None:
     assert result.checksum_delta > 0
 
 
-def test_require_draft_update_tolerates_consistent_noop() -> None:
-    """Zero eligible draft windows yields grad 0 + unchanged params: a no-op."""
+@pytest.mark.parametrize("parameter_change", [0.0, 0.25], ids=["static", "decayed"])
+def test_require_draft_update_accepts_zero_gradient_step(
+    parameter_change: float,
+) -> None:
+    """A step without draft windows has no gradient.
+
+    Momentum and weight decay can still move the parameters on that step.
+    """
     module = torch.nn.Linear(3, 2, bias=False)
 
     probe = start_draft_update_probe(module)
+    with torch.no_grad():
+        module.weight.add_(parameter_change)
     result = finalize_draft_update_probe(module, probe)
 
-    require_draft_update(result)  # must not raise
+    require_draft_update(result)
     assert result.grad_l2 == 0
 
 
-def test_require_draft_update_rejects_inconsistent_evidence() -> None:
+def test_require_draft_update_rejects_gradient_without_parameter_change() -> None:
     module = torch.nn.Linear(3, 2, bias=False)
-
-    # Parameter change without a gradient.
-    probe = start_draft_update_probe(module)
-    with torch.no_grad():
-        module.weight.add_(0.25)
-    result = finalize_draft_update_probe(module, probe)
-    with pytest.raises(RuntimeError, match="without a gradient"):
-        require_draft_update(result)
-
-    # Gradient without a parameter change.
     module.weight.grad = torch.ones_like(module.weight)
     probe = start_draft_update_probe(module)
     result = finalize_draft_update_probe(module, probe)
