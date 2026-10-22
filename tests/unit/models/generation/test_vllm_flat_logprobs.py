@@ -16,11 +16,9 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("vllm")
+from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
 
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    _AsyncLLMHTTPClient,
-)
+pytestmark = pytest.mark.vllm
 
 
 def _client(*, flat_logprobs: bool) -> _AsyncLLMHTTPClient:
@@ -37,15 +35,21 @@ def _client(*, flat_logprobs: bool) -> _AsyncLLMHTTPClient:
 
 
 @pytest.mark.parametrize(
-    ("flat_logprobs", "logprobs", "expected"),
+    ("flat_logprobs", "logprobs", "prompt_logprobs", "expected"),
     [
-        (True, 0, True),  # logprobs requested: store them flat
-        (True, None, False),  # no logprobs requested: nothing to store
-        (False, 0, False),  # off: vLLM's default per-token objects
+        (True, 0, None, True),  # logprobs requested: store them flat
+        (True, None, None, False),  # no logprobs requested: nothing to store
+        (False, 0, None, False),  # off: vLLM's default per-token objects
+        # Prompt logprobs requested: vLLM's -inf clamp cannot edit flat storage.
+        (True, 0, 0, False),
     ],
 )
-def test_generate_sets_flat_logprobs(flat_logprobs, logprobs, expected):
-    sampling_params = SimpleNamespace(logprobs=logprobs, flat_logprobs=False)
+def test_generate_sets_flat_logprobs(
+    flat_logprobs, logprobs, prompt_logprobs, expected
+):
+    sampling_params = SimpleNamespace(
+        logprobs=logprobs, prompt_logprobs=prompt_logprobs, flat_logprobs=False
+    )
 
     _client(flat_logprobs=flat_logprobs).generate("prompt", sampling_params, "req-0")
 

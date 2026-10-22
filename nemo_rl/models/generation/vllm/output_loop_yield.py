@@ -53,6 +53,7 @@ def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
         reader_budget_s: How long the socket reader may run without yielding.
 
     Raises:
+        ValueError: If ``reader_budget_s`` is not positive.
         RuntimeError: If the installed vLLM does not have the internals this patches.
     """
     if reader_budget_s <= 0:
@@ -89,14 +90,18 @@ def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
     state = {"since": time.monotonic()}
 
     async def recv_multipart(*args, **kwargs):
-        t0 = time.monotonic()
-        frames = await original_recv(*args, **kwargs)
-        now = time.monotonic()
-        if now - t0 > 0.0005:
-            # The receive actually waited for a message, so the loop already got its
-            # turn: start a new budget.
-            state["since"] = now
-        elif now - state["since"] >= reader_budget_s:
+        # The zmq.asyncio socket returns a future that is already done when a message
+        # was waiting. Awaiting a done future does not yield, so that is exactly the case
+        # that can monopolize the loop.
+        future = original_recv(*args, **kwargs)
+        if not future.done():
+            # The receive waits for a message, so the loop gets its turn: start a new
+            # budget once it arrives.
+            frames = await future
+            state["since"] = time.monotonic()
+            return frames
+        frames = await future
+        if time.monotonic() - state["since"] >= reader_budget_s:
             await asyncio.sleep(0)
             state["since"] = time.monotonic()
         return frames

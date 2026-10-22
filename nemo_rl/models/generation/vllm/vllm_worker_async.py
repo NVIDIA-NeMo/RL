@@ -181,7 +181,14 @@ class _AsyncLLMHTTPClient:
         # engine loop; under a large backlog the cyclic GC's full collections over those
         # objects hold the GIL for tens of seconds. The values are the same, and
         # attach_token_information_to_chat_response_choices reads them the same way.
-        if self._flat_logprobs and sampling_params.logprobs is not None:
+        # flat_logprobs also flattens prompt logprobs, and vLLM's clamp_prompt_logprobs
+        # edits per-position copies of FlatLogprobs, so -inf prompt logprobs would reach
+        # JSON serialization; leave requests that ask for prompt logprobs unchanged.
+        if (
+            self._flat_logprobs
+            and sampling_params.logprobs is not None
+            and sampling_params.prompt_logprobs is None
+        ):
             sampling_params.flat_logprobs = True
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
