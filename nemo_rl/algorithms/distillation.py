@@ -40,7 +40,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -1133,10 +1133,7 @@ def _distillation_train_impl(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=student_policy.finalize_async_save,
