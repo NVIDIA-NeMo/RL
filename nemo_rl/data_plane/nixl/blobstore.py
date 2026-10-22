@@ -122,9 +122,9 @@ class UnitSlabStore:
         ssd: bool = False,
     ) -> None:
         self.ep = ep
-        # SSD tier on the units: a put commits after its WRITE is DONE, and
-        # every read is pinned (a demoted blob's slab region is reused without
-        # the read_pin_s quarantine hinted reads rely on).
+        # SSD tier on the units: a put commits after its WRITE is DONE. Put-area
+        # blobs keep their hints; a spilled put has none, so its reads resolve
+        # through the unit.
         self.ssd = ssd
         self.directory = directory
         self.namespace = namespace
@@ -416,10 +416,10 @@ class UnitSlabStore:
             )
             ray.get(actor.ping.remote(), timeout=10)
             return False
-        except ray.exceptions.GetTimeoutError:
+        except (ValueError, ray.exceptions.RayActorError):
+            pass  # name gone or the actor died
+        except Exception:  # noqa: BLE001 - a timeout or Ray hiccup: still alive
             return False
-        except Exception:  # noqa: BLE001 - name gone or RayActorError: the actor died
-            pass
         try:
             ray.get(self.directory.set_unit_state.remote(unit_id, DEAD))
             self._refresh_units()
