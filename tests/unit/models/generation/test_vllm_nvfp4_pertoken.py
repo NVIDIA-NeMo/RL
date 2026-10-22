@@ -843,6 +843,86 @@ def test_prequantized_extension_uses_native_ipc_reload(
     assert "[nvfp4_pertoken] refit: quantized 1 expert weight groups" in printed
 
 
+def _collective_extension(M, monkeypatch, weights, reload_weights):
+    """An NVFP4 extension whose broadcast yields ``weights`` (non-colocated refit)."""
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    def fake_broadcast_consumer(**kwargs):
+        assert kwargs["return_iterator"] is True
+        return iter(weights)
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", fake_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+    extension = M.NvFp4PerTokenWorkerExtension.__new__(M.NvFp4PerTokenWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(
+        model=object(), reload_weights=reload_weights
+    )
+    extension.state_dict_info = {name: (w.shape, w.dtype) for name, w in weights}
+    extension.model_update_group = None
+    extension._prepare_reload_weight_iterator = lambda weights: weights
+    extension._quantizer = _quantizer_with_layer_quantized(
+        M, True, is_gated=False
+    )
+    return extension
+
+
+def test_collective_reload_quantizes_like_ipc(nvfp4_module, monkeypatch, capsys):
+    """Non-colocated refit feeds the same quantizer into vLLM's native reload."""
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    prefix = "model.layers.0.mlp.experts.0"
+    weights = [
+        (f"{prefix}.up_proj.weight", torch.randn(8, 32)),
+        ("model.layers.0.norm.weight", torch.randn(32)),
+        (f"{prefix}.down_proj.weight", torch.randn(32, 8 * 2)),
+    ]
+    loaded = []
+
+    def reload_weights(**kwargs):
+        loaded.extend(kwargs["weights_iterator"])
+
+    extension = _collective_extension(M, monkeypatch, weights, reload_weights)
+    assert extension._update_weights_from_collective(refit_with_reload_api=True)
+
+    suffixes = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+    assert [name for name, _ in loaded] == [
+        *(f"{prefix}.up_proj.{suffix}" for suffix in suffixes),
+        "model.layers.0.norm.weight",
+        *(f"{prefix}.down_proj.{suffix}" for suffix in suffixes),
+    ]
+    # Passthrough tensors are cloned off the reused broadcast buffer.
+    assert loaded[4][1] is not weights[1][1]
+    assert torch.equal(loaded[4][1], weights[1][1])
+    printed = capsys.readouterr().out
+    assert "[nvfp4_pertoken] refit: quantized 2 expert weight groups" in printed
+
+
+def test_collective_reload_fails_when_reload_stops_early(nvfp4_module, monkeypatch):
+    M = nvfp4_module
+    _fake_scaled_fp4_quant(monkeypatch, M)
+    weights = [("model.layers.0.mlp.experts.0.up_proj.weight", torch.randn(8, 32))]
+
+    def reload_weights(**kwargs):
+        next(iter(kwargs["weights_iterator"]))
+
+    extension = _collective_extension(M, monkeypatch, weights, reload_weights)
+    with pytest.raises(RuntimeError, match="before exhausting"):
+        extension._update_weights_from_collective(refit_with_reload_api=True)
+
+
+def test_collective_refit_without_reload_api_is_rejected(nvfp4_module, monkeypatch):
+    """The in-place collective path would load BF16 into NVFP4 parameters."""
+    M = nvfp4_module
+    extension = _collective_extension(
+        M, monkeypatch, [], reload_weights=lambda **kwargs: None
+    )
+    with pytest.raises(RuntimeError, match="refit_with_reload_api=true"):
+        extension._update_weights_from_collective(refit_with_reload_api=False)
+
+
 def test_per_token_method_rebuilds_kernel_through_the_installed_vllm_signature(
     nvfp4_module, monkeypatch
 ):

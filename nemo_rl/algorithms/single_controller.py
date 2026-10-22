@@ -5093,7 +5093,9 @@ class SingleControllerActor:
     ) -> int:
         """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the pause gate. vLLM serves through the refit; it supports live weight updates.
+        SC owns the dispatch gate. vLLM serves through the refit; it supports live weight
+        updates, except under refit_with_reload_api, where decoding is paused (in-flight
+        requests are retained) until the update lands.
         A colocated engine is instead already stood down: the synchronizer's sync is the wake,
         and step 4 resumes dispatch.
 
@@ -5113,6 +5115,23 @@ class SingleControllerActor:
             weight synchronization.
         """
         self._rollout_permitted.clear()
+
+        generation_cfg = self._master_config.policy["generation"]
+        vllm_cfg = generation_cfg.get("vllm_cfg") or {}
+        pause_decode = (
+            generation_cfg["backend"] == "vllm"
+            and vllm_cfg.get("refit_with_reload_api", False)
+            and vllm_cfg.get("async_engine", False)
+            and not generation_cfg["colocated"]["enabled"]
+        )
+        if pause_decode:
+            # The dispatch gate does not stop requests already inside vLLM, and
+            # native reload swaps runtime parameters for meta tensors until the
+            # layer is reloaded. A failed refit leaves partial weights, so the
+            # engines resume only after a successful update.
+            await asyncio.to_thread(
+                self._gen.pause_generation_for_refit, clear_cache=False
+            )
 
         # TODO(#2625): Abort unconditionally once Gym-path abort is validated;
         # for now only the native path aborts stale in-flight requests.
@@ -5227,6 +5246,8 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
+        if pause_decode:
+            await asyncio.to_thread(self._gen.resume_generation_after_refit)
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups

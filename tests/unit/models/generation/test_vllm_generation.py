@@ -1208,6 +1208,7 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
         ({"quant_cfg": "recipe.yaml"}, "quant_cfg"),
         ({"real_quant": True}, "real_quant"),
         ({"refit_transport": "nixl"}, "refit_transport"),
+        ({"refit_transport": "nccl_reshard"}, "refit_transport"),
         (
             {
                 "vllm_kwargs": {
@@ -1252,13 +1253,24 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
     ],
 )
 def test_nvfp4_pertoken_rejects_unsupported_topology(mutation):
-    """The fused refit stream requires colocated rollout and vLLM EP=1."""
+    """Refit must reach vLLM's native reload, and vLLM must run EP=1."""
     config = _make_nvfp4_pertoken_generation_config()
     _deep_update(config, mutation)
     with pytest.raises(ValueError, match="nvfp4_pertoken_rollout"):
         configure_generation_config(
             config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
         )
+
+
+@pytest.mark.parametrize("async_engine", [False, True])
+def test_nvfp4_pertoken_accepts_non_colocated_reload_refit(async_engine: bool) -> None:
+    """Non-colocated rollout quantizes inside the collective native reload."""
+    config = _make_nvfp4_pertoken_generation_config()
+    config["colocated"]["enabled"] = False
+    config["vllm_cfg"].update(refit_with_reload_api=True, async_engine=async_engine)
+    configure_generation_config(
+        config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+    )
 
 
 @pytest.mark.parametrize("async_engine", [False, True])

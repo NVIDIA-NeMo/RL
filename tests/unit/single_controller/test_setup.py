@@ -688,19 +688,29 @@ def test_rollout_recovery_functional_config_resolves_to_runtime_contract(
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
-    @pytest.mark.parametrize("colocated", [False, True])
-    def test_nvfp4_pertoken_rejected_before_setup_factories(
-        self, patched_factories: dict[str, Any], colocated: bool
+    def test_nvfp4_pertoken_normalized_before_setup_factories(
+        self, patched_factories: dict[str, Any]
     ) -> None:
-        mc = _make_master_config(colocated=colocated, megatron_enabled=True)
+        mc = _make_master_config(megatron_enabled=True)
         mc.policy["generation"]["nvfp4_pertoken_rollout"] = {"enabled": True}
+        validate_single_controller_config(mc)
 
-        with pytest.raises(
-            ValueError,
-            match="SingleController does not support generation.nvfp4_pertoken_rollout",
+        class _Normalized(Exception):
+            pass
+
+        with (
+            patch.object(
+                sc_setup_mod,
+                "normalize_nvfp4_pertoken_policy_config",
+                side_effect=_Normalized,
+            ) as normalize,
+            pytest.raises(_Normalized),
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        normalize.assert_called_once_with(
+            mc.policy, entry_point="single_controller"
+        )
         for factory in (
             "setup_response_data",
             "_build_clusters",

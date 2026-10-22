@@ -152,7 +152,15 @@ def _make_controller(
     # empty registry makes _abort_stale_inflight a no-op -- neither is what this test
     # is about, but both have to exist for it to reach the refit.
     ctrl._master_config = SimpleNamespace(
-        env={}, token_capture=SimpleNamespace(enabled=False)
+        env={},
+        token_capture=SimpleNamespace(enabled=False),
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"async_engine": False},
+                "colocated": {"enabled": False},
+            }
+        },
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
@@ -162,6 +170,57 @@ def _make_controller(
 
 
 ABORTED = RefitAborted("refit broadcast exceeded 60.0s and was aborted")
+
+
+def _enable_reload_refit(ctrl) -> None:
+    ctrl._master_config.policy["generation"]["vllm_cfg"].update(
+        async_engine=True, refit_with_reload_api=True
+    )
+
+
+class TestDecodePauseDuringReloadRefit:
+    """Native reload swaps in meta tensors, so live decoding must stop first."""
+
+    def test_pause_precedes_transfer_and_resume_follows_success(self):
+        ctrl, _, sync = _make_controller(ABORTED)
+        _enable_reload_refit(ctrl)
+        events = []
+        ctrl._gen.pause_generation_for_refit = MagicMock(
+            side_effect=lambda **kw: events.append("pause") or True
+        )
+        ctrl._gen.resume_generation_after_refit = MagicMock(
+            side_effect=lambda: events.append("resume") or True
+        )
+        original = sync.sync_weights
+
+        def transfer(**kwargs):
+            events.append("transfer")
+            return original(**kwargs)
+
+        sync.sync_weights = transfer
+        asyncio.run(ctrl._sync_weights())
+        assert events == ["pause", "transfer", "transfer", "resume"]
+        ctrl._gen.pause_generation_for_refit.assert_called_once_with(clear_cache=False)
+
+    def test_failed_refit_keeps_decode_and_dispatch_paused(self):
+        ctrl, _, _ = _make_controller(ABORTED, with_monitor=False)
+        _enable_reload_refit(ctrl)
+        ctrl._gen.pause_generation_for_refit = MagicMock(return_value=True)
+        ctrl._gen.resume_generation_after_refit = MagicMock()
+        with pytest.raises(RefitAborted):
+            asyncio.run(ctrl._sync_weights())
+        ctrl._gen.resume_generation_after_refit.assert_not_called()
+        assert not ctrl._rollout_permitted.is_set()
+
+    def test_in_place_refit_keeps_live_decoding(self):
+        ctrl, _, _ = _make_controller(ABORTED)
+        ctrl._master_config.policy["generation"]["vllm_cfg"]["async_engine"] = True
+        ctrl._gen.pause_generation_for_refit = MagicMock()
+        ctrl._gen.resume_generation_after_refit = MagicMock()
+        asyncio.run(ctrl._sync_weights())
+        ctrl._gen.pause_generation_for_refit.assert_not_called()
+        ctrl._gen.resume_generation_after_refit.assert_not_called()
+        assert ctrl._rollout_permitted.is_set()
 
 
 class TestDeathInsideTheCollective:

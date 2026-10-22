@@ -430,8 +430,13 @@ def validate_nvfp4_pertoken_generation(
         )
     colocated = config.get("colocated") or {}
     vllm_cfg = config["vllm_cfg"]
-    if not colocated.get("enabled"):
-        raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
+    # Weights are quantized inside vLLM's native reload: the colocated IPC
+    # path always uses it, the non-colocated collective path only on request.
+    if not colocated.get("enabled") and not vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout without colocated rollout requires "
+            "generation.vllm_cfg.refit_with_reload_api=true"
+        )
     if vllm_cfg["pipeline_parallel_size"] > 1:
         raise ValueError(
             "generation.nvfp4_pertoken_rollout does not support vLLM PP>1 yet: "

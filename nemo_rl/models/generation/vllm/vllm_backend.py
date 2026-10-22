@@ -1610,6 +1610,14 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 "collective refit lifecycle."
             )
 
+        preparer = self._get_reload_weight_preparer()
+        if preparer is not None and not refit_with_reload_api:
+            raise RuntimeError(
+                "This worker prepares checkpoint weights for vLLM's native "
+                "reload API; collective refit requires "
+                "policy.generation.vllm_cfg.refit_with_reload_api=true."
+            )
+
         try:
             if refit_with_reload_api:
                 weight_iterator = packed_broadcast_consumer(
@@ -1623,10 +1631,30 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 reload_weight_iterator = self._prepare_reload_weight_iterator(
                     weight_iterator
                 )
+                preparer_finished = False
+                if preparer is not None:
+                    unprepared_iterator = reload_weight_iterator
+
+                    def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
+                        # One tensor per call: the broadcast buffer is reused,
+                        # and the preparer clones anything it keeps or passes on.
+                        nonlocal preparer_finished
+                        preparer.reset()
+                        for item in unprepared_iterator:
+                            yield from preparer.process([item])
+                        preparer.finish()
+                        preparer_finished = True
+
+                    reload_weight_iterator = iter_prepared_weights()
                 try:
                     self.model_runner.reload_weights(
                         weights_iterator=reload_weight_iterator
                     )
+                    if preparer is not None and not preparer_finished:
+                        raise RuntimeError(
+                            "vLLM reload_weights returned before exhausting the "
+                            "collective weight iterator"
+                        )
                 finally:
                     iterators_to_close = [reload_weight_iterator]
                     if reload_weight_iterator is not weight_iterator:

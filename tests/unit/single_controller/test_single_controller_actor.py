@@ -781,7 +781,15 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
-        env={}, token_capture=SimpleNamespace(enabled=False)
+        env={},
+        token_capture=SimpleNamespace(enabled=False),
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"async_engine": False},
+                "colocated": {"enabled": False},
+            }
+        },
     )
 
     asyncio.run(ctrl._sync_weights())
@@ -817,7 +825,15 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
-        env={}, token_capture=SimpleNamespace(enabled=False)
+        env={},
+        token_capture=SimpleNamespace(enabled=False),
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"async_engine": False},
+                "colocated": {"enabled": False},
+            }
+        },
     )
     calibration_data = BatchedDataDict(
         {

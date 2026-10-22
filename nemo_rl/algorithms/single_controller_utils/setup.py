@@ -131,7 +131,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    normalize_nvfp4_pertoken_policy_config,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -1082,6 +1085,13 @@ def setup_single_controller(
         )
 
         check_nccl_reshard_refit_support(master_config)
+
+    # Derive the rollout NVFP4 boundary from the Megatron one before any
+    # worker is built, as grpo.setup does for the other entry points.
+    if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(
+            policy_config, entry_point="single_controller"
+        )
 
     if algo_cfg.val_period > 0 or algo_cfg.val_at_start or algo_cfg.val_at_end:
         raise NotImplementedError(
