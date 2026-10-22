@@ -498,6 +498,7 @@ class NixlStorageUnit:
     def alloc(
         self, blob_id: str, nbytes: int, n_entries: int, spill: bool = True
     ) -> int:
+        nbytes = int(nbytes)  # an RPC value: a float would make float offsets
         now = time.monotonic()
         self._reclaim(now)
         if blob_id in self.blobs:
@@ -590,6 +591,8 @@ class NixlStorageUnit:
         rec = self.blobs.get(blob_id)
         if rec is None:
             return 0
+        if int(n_entries) <= 0:
+            raise ValueError(f"release of {blob_id}: n_entries must be > 0")
         rec.refs -= int(n_entries)
         if rec.refs > 0:
             return rec.refs
@@ -909,7 +912,10 @@ class NixlStorageUnit:
                     raise EOFError(f"short read restoring blob {b}")
                 view, w = memoryview(chunk), 0
                 while w < len(view):  # pwrite may write less than asked
-                    w += os.pwrite(fd, view[w:], done + w)
+                    n = os.pwrite(fd, view[w:], done + w)
+                    if n <= 0:
+                        raise OSError("write made no progress")
+                    w += n
                 done += len(chunk)
         except OSError as e:
             if fd is not None:
