@@ -5106,7 +5106,11 @@ def test_sync_nemo_gym_draft_ids_reach_training_provider(
     monkeypatch.setattr(
         grpo_mod,
         "calculate_baseline_and_std_per_prompt",
-        lambda *_args, **_kwargs: (torch.tensor([0.0]), torch.tensor([1.0])),
+        lambda *_args, **_kwargs: (
+            torch.tensor([0.0]),
+            torch.tensor([1.0]),
+            torch.tensor([False]),
+        ),
     )
     monkeypatch.setattr(
         grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
