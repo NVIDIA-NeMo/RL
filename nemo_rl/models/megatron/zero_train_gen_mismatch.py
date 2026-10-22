@@ -347,7 +347,7 @@ def validate_zero_train_gen_kl(
     call it before Ray allocates GPUs; workers also check the installed
     packages and the GPU.
     """
-    if "megatron_cfg" not in config:  # DTensor / Automodel policies
+    if "megatron_cfg" not in config:  # Automodel policies
         return
     result = validate_zero_train_gen_mismatch(
         config,

@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 import torch
 
+import nemo_rl.data_plane.adapters.mooncake_ssd_offload as offload
 import nemo_rl.data_plane.adapters.tq_mooncake_checkpoint as checkpoint_plugin
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     _load_storage_checkpoint,
@@ -81,14 +82,29 @@ class _FakeMemoryReplica:
         return self._memory
 
 
+class _FakeDiskReplica:
+    """A COMPLETE replica on its owner's SSD; Python sees no owner or size."""
+
+    status = SimpleNamespace(name="COMPLETE")
+
+    def is_memory_replica(self) -> bool:
+        return False
+
+    def is_local_disk_replica(self) -> bool:
+        return True
+
+
 class _FakeCluster:
     def __init__(
         self,
         objects: dict[str, bytes],
         owners: dict[str, tuple[str, ...]],
+        on_disk: set[str] | None = None,
     ) -> None:
         self.objects = dict(objects)
         self.owners = dict(owners)
+        # Keys offloaded to SSD and evicted from memory: only a disk replica.
+        self.on_disk = set(on_disk or ())
         self.get_calls: list[tuple[str, str]] = []
         self.upsert_calls: list[tuple[str, str, str]] = []
         self.buffers: dict[str, Any] = {
@@ -105,11 +121,22 @@ class _FakeStore:
         *,
         unregister_result: int = 0,
         owner_override: str | None = None,
+        evictable: bool = False,
+        full_attempts: int = 0,
+        evict_after_upsert: bool = False,
+        short_get: bool = False,
     ) -> None:
         self.cluster = cluster
         self.endpoint = endpoint
         self.unregister_result = unregister_result
         self.owner_override = owner_override
+        # SSD offload on: replicas are not hard-pinned and may be evicted.
+        self.evictable = evictable
+        # Upserts of each key fail this many times with NO_AVAILABLE_HANDLE.
+        self.full_attempts = full_attempts
+        self.upsert_attempts: dict[str, int] = {}
+        self.evict_after_upsert = evict_after_upsert
+        self.short_get = short_get
         self.registered: dict[int, int] = {}
         self.registrations: list[tuple[int, int]] = []
         self.replica_batches: list[list[str]] = []
@@ -120,12 +147,16 @@ class _FakeStore:
         return self.endpoint
 
     def get_size(self, key: str) -> int:
-        pytest.fail("checkpoint made a per-object size query")
+        if not self.evictable or key not in self.cluster.on_disk:
+            pytest.fail("checkpoint made a per-object size query")
+        return len(self.cluster.objects[key])
 
-    def _replicas(self, key: str) -> list[_FakeMemoryReplica]:
+    def _replicas(self, key: str) -> list[Any]:
         value = self.cluster.objects.get(key)
         if value is None:
             return []
+        if key in self.cluster.on_disk:
+            return [_FakeDiskReplica()]
         buffer = self.cluster.buffers.get(key)
         if buffer is None or bytes(buffer) != value:
             buffer = ctypes.create_string_buffer(value, len(value))
@@ -160,9 +191,20 @@ class _FakeStore:
     def batch_get_into(
         self, keys: list[str], pointers: list[int], sizes: list[int]
     ) -> list[int]:
-        pytest.fail(
-            "owner-local SAVE must not fetch or copy payload through native GET"
-        )
+        if not self.evictable:
+            pytest.fail(
+                "owner-local SAVE must not fetch or copy payload through native GET"
+            )
+        self.get_batches.append(list(keys))
+        results = []
+        for key, pointer, size in zip(keys, pointers, sizes, strict=True):
+            self._assert_registered(pointer, size)
+            value = self.cluster.objects[key]
+            assert size == len(value)
+            ctypes.memmove(pointer, value, size)
+            self.cluster.get_calls.append((self.endpoint, key))
+            results.append(size - 1 if self.short_get else size)
+        return results
 
     def unregister_buffer(self, pointer: int) -> int:
         if self.unregister_result == 0:
@@ -184,10 +226,17 @@ class _FakeStore:
         self, keys: list[str], pointers: list[int], sizes: list[int], config: Any
     ) -> list[int]:
         self.upsert_batches.append(list(keys))
-        return [
-            self.upsert_from(key, pointer, size, config)
-            for key, pointer, size in zip(keys, pointers, sizes, strict=True)
-        ]
+        results = []
+        for key, pointer, size in zip(keys, pointers, sizes, strict=True):
+            attempt = self.upsert_attempts.get(key, 0) + 1
+            self.upsert_attempts[key] = attempt
+            if attempt <= self.full_attempts:
+                results.append(-200)  # NO_AVAILABLE_HANDLE: memory is full
+                continue
+            results.append(self.upsert_from(key, pointer, size, config))
+            if self.evict_after_upsert:
+                self.cluster.on_disk.add(key)
+        return results
 
 
 def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
@@ -201,7 +250,7 @@ def _manager(store: _FakeStore, manager_id: str = "manager-a") -> Any:
     replica_config = SimpleNamespace(
         replica_num=1,
         with_soft_pin=False,
-        with_hard_pin=True,
+        with_hard_pin=not store.evictable,
         prefer_alloc_in_same_node=False,
         data_type=None,
     )
@@ -862,25 +911,13 @@ def test_save_does_not_commit_a_manifest_when_directory_fsync_fails(
     assert not (storage_dir / "manifest.json").exists()
 
 
-@pytest.mark.parametrize(
-    ("unsupported_mode", "message"),
-    [
-        ("unpinned", "hard-pinned"),
-        ("offload", "offload"),
-    ],
-)
-def test_checkpoint_participant_rejects_unsupported_runtime_modes(
-    unsupported_mode: str,
-    message: str,
-) -> None:
+def test_checkpoint_participant_rejects_tq_standalone_offload() -> None:
+    # TQ's own offload client owns none of the data; NeMo-RL never enables it.
     cluster = _source_cluster()
     manager = _managers(cluster, [_SOURCE_IDENTITIES[0]])[0]
-    if unsupported_mode == "unpinned":
-        manager.storage_client.replica_config.with_hard_pin = False
-    else:
-        manager.config["offload"] = {"enabled": True}
+    manager.config["offload"] = {"enabled": True}
 
-    with pytest.raises(NotImplementedError, match=message):
+    with pytest.raises(NotImplementedError, match="offload"):
         _participant(manager)
 
 
@@ -1845,3 +1882,147 @@ def test_save_rejects_incomplete_or_nonmemory_replicas(
                 current_endpoints=[endpoint],
             )
         )
+
+
+# --- SSD offload (evictable replicas) -------------------------------------------
+
+_EVICTABLE = {"evictable": True}
+
+
+def _evictable_managers(cluster: _FakeCluster, identities, **options) -> list[Any]:
+    return _managers(
+        cluster,
+        identities,
+        store_options={
+            manager_id: {**_EVICTABLE, **options} for manager_id, _ in identities
+        },
+    )
+
+
+@pytest.fixture
+def no_restore_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    sleeps: list[float] = []
+    monkeypatch.setattr(offload.time, "sleep", sleeps.append)
+    return sleeps
+
+
+def test_offload_save_reads_memory_and_disk_objects_through_native_get(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evictable replicas can move mid-save, so SAVE copies through native GET."""
+    cluster = _source_cluster()
+    cluster.on_disk = {"0@tokens:c1", "1@metadata"}  # offloaded, out of memory
+    managers = _evictable_managers(cluster, _SOURCE_IDENTITIES)
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+
+    _save_storage_checkpoint(managers[0], str(checkpoint_dir))
+
+    assert _saved_payloads(checkpoint_dir) == _payloads()
+    # Every object is read once through native GET, none from a borrowed address.
+    assert sorted(key for _, key in cluster.get_calls) == sorted(_payloads())
+    # Memory objects stay with their owner; disk-only ones go to the participant
+    # that discovered them, since Python cannot see a disk replica's owner.
+    saved_by = {
+        entry["key"]: entry["saved_owner"]
+        for entry in _manifest_objects(checkpoint_dir)
+    }
+    for key, owners in cluster.owners.items():
+        if key not in cluster.on_disk:
+            assert saved_by[key] == owners[0]
+    assert all(manager.storage_client._store.registered == {} for manager in managers)
+
+
+def test_offload_save_rejects_a_short_native_get(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cluster = _source_cluster()
+    managers = _evictable_managers(cluster, _SOURCE_IDENTITIES, short_get=True)
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+
+    with pytest.raises(RuntimeError, match="incomplete or invalid results"):
+        _save_storage_checkpoint(managers[0], str(checkpoint_dir))
+
+    assert not (checkpoint_dir / "mooncake_storage" / "manifest.json").exists()
+    assert all(manager.storage_client._store.registered == {} for manager in managers)
+
+
+def test_offload_save_rejects_an_object_with_no_readable_replica(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cluster = _source_cluster()
+    cluster.owners["1@tokens"] = ("10.9.9.9:19999",)  # memory on a dead owner
+    managers = _evictable_managers(cluster, _SOURCE_IDENTITIES)
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+
+    with pytest.raises(RuntimeError, match="no COMPLETE"):
+        _save_storage_checkpoint(managers[0], str(_checkpoint_dir(tmp_path)))
+    assert cluster.get_calls == []
+
+
+def _restore_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **options: Any
+) -> tuple[_FakeCluster, list[Any]]:
+    checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
+    restored = _FakeCluster({}, {})
+    managers = _evictable_managers(
+        restored,
+        [("current-a", "10.1.0.1:13301"), ("current-b", "10.1.0.2:13302")],
+        **options,
+    )
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+    _load_storage_checkpoint(managers[0], str(checkpoint_dir))
+    return restored, managers
+
+
+def test_offload_restore_waits_for_eviction_to_free_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_restore_backoff: list[float]
+) -> None:
+    """A full owner frees memory by offloading later; restore retries until then."""
+    restored, managers = _restore_with(tmp_path, monkeypatch, full_attempts=2)
+
+    assert restored.objects == _payloads()
+    attempts = {
+        key: count
+        for manager in managers
+        for key, count in manager.storage_client._store.upsert_attempts.items()
+    }
+    assert set(attempts.values()) == {3}
+    assert no_restore_backoff  # backed off between attempts
+    assert all(manager.storage_client._store.registered == {} for manager in managers)
+
+
+def test_offload_restore_gives_up_when_memory_never_frees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_restore_backoff: list[float]
+) -> None:
+    monkeypatch.setattr(offload, "PUT_WAIT_S", 0.0)
+    with pytest.raises(RuntimeError, match="memory stayed full"):
+        _restore_with(tmp_path, monkeypatch, full_attempts=1_000)
+
+
+def test_pinned_restore_does_not_retry_a_full_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_restore_backoff: list[float]
+) -> None:
+    """Hard-pinned memory never frees itself: fail at once, as before."""
+    checkpoint_dir, _, _, _ = _save_distributed_checkpoint(monkeypatch, tmp_path)
+    managers = _managers(
+        _FakeCluster({}, {}),
+        [("current-a", "10.1.0.1:13301")],
+        store_options={"current-a": {"full_attempts": 1}},
+    )
+    _wire_participants(monkeypatch, [_participant(manager) for manager in managers])
+
+    with pytest.raises(RuntimeError, match="incomplete or invalid results"):
+        _load_storage_checkpoint(managers[0], str(checkpoint_dir))
+    assert no_restore_backoff == []
+
+
+def test_offload_restore_accepts_objects_already_offloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restored objects may be evicted to SSD before verification runs."""
+    restored, _ = _restore_with(tmp_path, monkeypatch, evict_after_upsert=True)
+
+    assert restored.objects == _payloads()
+    assert restored.on_disk == set(_payloads())

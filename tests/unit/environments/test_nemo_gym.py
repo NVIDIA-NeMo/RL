@@ -32,7 +32,9 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.multimodal_utils import (
     MULTIMODAL_CONTENT_TYPES,
+    ROLLOUT_MATCHED_MEDIA_KEY,
     PackedTensor,
+    attach_image_model_inputs_to_message,
     image_to_data_url,
     video_path_to_data_url,
 )
@@ -70,6 +72,7 @@ from nemo_rl.environments.nemotron_utils import (
 )
 from nemo_rl.experience.rollouts import (
     _reattach_original_multimodal_payloads,
+    _reattach_static_multimodal_payloads_to_result,
     attach_static_multimodal_payload,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -638,6 +641,55 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     attach_static_multimodal_payload(target, source)
 
     assert target[1]["pixel_values"] is payload
+
+
+def test_reattach_keeps_rollout_matched_media_when_token_counts_already_match():
+    """Exact-count processor media is authoritative even without budget repair."""
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class _TextTokenizer:
+        model_input_names = ["input_ids"]
+
+    class _Processor:
+        image_token = "<image>"
+        image_processor = _ImageProcessor()
+        tokenizer = _TextTokenizer()
+        model_input_names = ["input_ids", "pixel_values", "num_tokens"]
+
+        def __call__(self, *, text, images, return_tensors):
+            assert text == "<image>"
+            assert len(images) == 1
+            assert return_tensors == "pt"
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "pixel_values": torch.tensor([[7.0]]),
+                "num_tokens": torch.tensor([256]),
+            }
+
+    target_user = {"role": "user", "content": "question"}
+    attach_image_model_inputs_to_message(
+        target_user,
+        images=[Image.new("RGB", (2, 2))],
+        processor=_Processor(),
+        expected_num_tokens_per_image=[256],
+    )
+    rollout_media = target_user["pixel_values"]
+    assert target_user[ROLLOUT_MATCHED_MEDIA_KEY] is True
+
+    result = {
+        "input_message_log": [target_user],
+        "message_log": [target_user],
+    }
+    static_media = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0)
+    _reattach_static_multimodal_payloads_to_result(
+        result,
+        [{"role": "user", "content": "question", "pixel_values": static_media}],
+    )
+
+    assert target_user["pixel_values"] is rollout_media
+    assert ROLLOUT_MATCHED_MEDIA_KEY not in target_user
 
 
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):
@@ -1725,6 +1777,115 @@ def test_nemo_gym_dedup_omits_actor_initial_tensor_and_preserves_later_media():
     ]
     assert on_users[0]["pixel_values"] is original_media
     assert on_users[1]["pixel_values"].as_tensor().item() == 2
+
+
+def test_nemo_gym_dedup_keeps_initial_media_with_pre_response_tool_image(
+    monkeypatch,
+):
+    """Rollout-budget repair must cover initial and tool images together."""
+    initial_url = image_to_data_url(Image.new("RGB", (512, 512), color=(1, 0, 0)))
+    tool_url = image_to_data_url(Image.new("RGB", (1024, 1024), color=(2, 0, 0)))
+    initial_input = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "inspect"},
+                {"type": "input_image", "image_url": initial_url},
+            ],
+        }
+    ]
+
+    image_start_id, image_id, image_end_id = 10, 11, 12
+    image_run = [image_start_id, *([image_id] * 256), image_end_id]
+    nemo_gym_result = {
+        "response": {
+            "agent_input": deepcopy(initial_input),
+            "seed_obs": deepcopy(initial_input),
+            "output": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": tool_url},
+                    ],
+                },
+                {
+                    "prompt_token_ids": [*image_run, *image_run],
+                    "generation_token_ids": [20],
+                    "generation_log_probs": [-0.1],
+                },
+            ],
+        },
+        "responses_create_params": {"input": deepcopy(initial_input)},
+        "reward": 1.0,
+    }
+
+    class _Tokenizer:
+        model_input_names = ["input_ids"]
+        unk_token_id = -1
+
+        def convert_tokens_to_ids(self, tokens):
+            ids = {
+                "<image>": image_id,
+                "<img>": image_start_id,
+                "</img>": image_end_id,
+            }
+            return [ids[token] for token in tokens]
+
+        def batch_decode(self, batch):
+            return ["decoded"] * len(batch)
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        image_token = "<image>"
+        image_start_token = "<img>"
+        image_end_token = "</img>"
+        image_processor = _ImageProcessor()
+        tokenizer = _Tokenizer()
+        model_input_names = ["input_ids", "pixel_values"]
+
+    def attach_repaired_images(message, *, images, expected_num_tokens_per_image, **_):
+        assert expected_num_tokens_per_image == [256, 256]
+        message["pixel_values"] = PackedTensor(
+            torch.tensor([[image.width] for image in images], dtype=torch.float32),
+            dim_to_pack=0,
+        )
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.attach_image_model_inputs_to_message",
+        attach_repaired_images,
+    )
+
+    class _MockSelf:
+        cfg = {}
+        _processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(),
+            {},
+            nemo_gym_result,
+            _Tokenizer(),
+            include_initial_multimodal_data=False,
+        )
+    )
+    assert result.get("_initial_multimodal_data_omitted") is False
+    original_media = PackedTensor(torch.tensor([[99.0]]), dim_to_pack=0)
+    _reattach_original_multimodal_payloads(
+        [result],
+        [[{"role": "user", "content": "", "pixel_values": original_media}]],
+    )
+
+    user_message = next(
+        message for message in result["message_log"] if message["role"] == "user"
+    )
+    assert user_message["pixel_values"].as_tensor().flatten().tolist() == [
+        512.0,
+        1024.0,
+    ]
+    assert user_message[ROLLOUT_MATCHED_MEDIA_KEY] is True
 
 
 @pytest.mark.parametrize(
