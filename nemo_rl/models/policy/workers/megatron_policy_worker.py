@@ -2636,9 +2636,13 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
+        sampling_params = self.sampling_params
+        if self._opd_full_enabled and sampling_params is not None:
+            # Full KL has no sampled-target support restriction; leave rollout unchanged.
+            sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
@@ -2658,7 +2662,7 @@ class MegatronPolicyWorkerImpl(
                 post_processing_fn=logprobs_post_processor,
                 forward_only=True,
                 defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
                 model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,

@@ -1479,7 +1479,7 @@ class TestFactory:
 
         assert policy.offload_before_refit.call_count == expected_calls
 
-    def test_refit_memory_release_rejects_dtensor_policy(self):
+    def test_refit_memory_release_rejects_automodel_policy(self):
         policy = _mock_policy()
         policy.cfg["offload_policy_before_refit"] = True
 
