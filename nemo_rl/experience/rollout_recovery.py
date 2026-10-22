@@ -1013,13 +1013,14 @@ class RolloutRecoveryLedger:
         *,
         generation_indices: Iterable[int],
     ) -> None:
-        """Replace dispatched attempts whose Gym stream ended before they returned.
+        """Replace dispatched attempts that will not return a result.
 
-        Gym runs every row of a ``/run`` as its own task, so a broken stream
-        stops none of them. Each Gym-owned attempt is queued for the next
-        checkpoint to retire, and its sibling gets a fresh attempt, so the
-        re-send runs under a new rollout ID and never overlaps the old episode.
-        Attempts that never reached Gym keep their identity.
+        Covers rows a Gym stream ended without and rows Gym failed. Gym runs
+        every row of a ``/run`` as its own task, so a broken stream stops none
+        of them. Each Gym-owned attempt is queued for the next checkpoint to
+        retire, and its sibling gets a fresh attempt, so the re-send runs under
+        a new rollout ID and never overlaps the old episode. Attempts that never
+        reached Gym, or were already replaced, keep their identity.
         """
         cut.require_live()
         record = self._require_group(group_id)
