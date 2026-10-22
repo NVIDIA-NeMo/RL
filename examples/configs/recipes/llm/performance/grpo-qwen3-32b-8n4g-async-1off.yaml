@@ -16,6 +16,7 @@ policy:
     pipeline_model_parallel_size: 1
     sequence_parallel: true
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:

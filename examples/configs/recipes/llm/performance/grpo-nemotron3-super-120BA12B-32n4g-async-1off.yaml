@@ -55,6 +55,7 @@ policy:
     # MTP — disabled
     mtp_num_layers: 0
   generation:
+    refit_transport: nccl_reshard
     colocated:
       enabled: false
       resources:
