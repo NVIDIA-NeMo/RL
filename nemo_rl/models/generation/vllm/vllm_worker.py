@@ -269,8 +269,6 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
-    _native_lora_request: Any = None
-
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 

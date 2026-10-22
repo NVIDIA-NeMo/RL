@@ -805,8 +805,23 @@ class TestSetup:
             }
         )
 
+        captured = {}
+        original_build = patched_factories["_build_generation"].return_value
+
+        def build_generation(inference_cluster, master_config, **kwargs):
+            del inference_cluster, kwargs
+            generation_config = master_config.policy["generation"]
+            captured["load_format"] = generation_config["vllm_cfg"]["load_format"]
+            captured["enable_lora"] = generation_config["vllm_kwargs"].get(
+                "enable_lora"
+            )
+            return original_build
+
+        patched_factories["_build_generation"].side_effect = build_generation
+
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        assert captured == {"load_format": "auto", "enable_lora": True}
         generation_config = mc.policy["generation"]
         assert generation_config["vllm_cfg"]["load_format"] == "auto"
         assert generation_config["vllm_kwargs"]["enable_lora"] is True

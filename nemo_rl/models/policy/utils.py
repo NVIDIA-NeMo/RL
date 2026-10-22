@@ -124,13 +124,7 @@ def validate_lora_refit_policy_config(
 
     automodel_config = policy_config.get("automodel_cfg") or {}
     automodel_lora = automodel_config.get("lora_cfg") or {}
-    megatron_config = policy_config.get("megatron_cfg") or {}
-    megatron_lora = megatron_config.get("peft") or {}
-    if not (
-        automodel_config.get("enabled")
-        and automodel_lora.get("enabled")
-        and not (megatron_config.get("enabled") and megatron_lora.get("enabled"))
-    ):
+    if not automodel_lora.get("enabled"):
         raise ValueError(
             "Native LoRA refit currently requires the Automodel LoRA policy. "
             "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
