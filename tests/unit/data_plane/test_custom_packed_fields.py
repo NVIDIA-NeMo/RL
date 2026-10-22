@@ -64,6 +64,12 @@ def isolated_packed_declaration():
         ["token_ids_delta"],
         ["pixel_values"],
         ["token_type_ids"],
+        ["token_ids"],
+        ["teacher_topk_logits"],
+        ["mtp_loss_mask"],
+        ["group_id"],
+        ["meta_idx"],
+        ["multimodal_row_tags"],
         ["features__row_shapes"],
         ["bad-name"],
         [123],
@@ -77,6 +83,16 @@ def test_rejects_reserved_or_malformed_declarations(names, entrypoint):
             mm.register_packed_multimodal_fields(names)
         else:
             configure_multimodal_fields({"packed_multimodal_fields": names})
+    assert mm.G_CUSTOM_PACKED_FIELDS is None
+
+
+def test_local_config_object_rejects_declaration():
+    from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
+
+    cfg = LocalDataPlaneConfig(packed_multimodal_fields=["features"])
+    for entrypoint in (configure_multimodal_fields, build_data_plane_client):
+        with pytest.raises(ValueError, match="packed_multimodal_fields"):
+            entrypoint(cfg)
     assert mm.G_CUSTOM_PACKED_FIELDS is None
 
 
