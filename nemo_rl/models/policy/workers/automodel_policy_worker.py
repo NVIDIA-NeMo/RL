@@ -25,6 +25,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -132,8 +133,20 @@ def _module_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
-    module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
+    # Key the module map by the names ``state_dict()`` uses. With activation
+    # checkpointing Automodel wraps every decoder block in torch's
+    # ``CheckpointWrapper``, whose ``_checkpoint_wrapped_module.`` component
+    # ``state_dict()`` strips but ``named_modules()`` keeps; keyed by raw module
+    # names the lookup below missed every ``LinearLoRA`` inside a block and the
+    # refit silently streamed bare base weights (generation never saw the
+    # trained adapters). ``canonical_parameter_fqn`` is Automodel's own
+    # state-dict spelling, shared with its checkpoint and optimizer code.
+    module_map = {
+        canonical_parameter_fqn(name): module for name, module in model.named_modules()
+    }
+    state_dict = model.state_dict()
+    _assert_lora_modules_reachable(module_map, state_dict)
+    for name, tensor in state_dict.items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -170,6 +183,34 @@ def automodel_params_generator(
             yield f"draft.{draft_refit_export_name(name)}", tensor
 
 
+def _assert_lora_modules_reachable(
+    module_map: dict[str, nn.Module], state_dict: dict[str, Any]
+) -> None:
+    """Fail loudly if a ``LinearLoRA`` has no matching ``state_dict`` weight.
+
+    A LoRA module the merge cannot find reaches the inference engine as its
+    bare base weight; nothing else reports it, and the only symptom is a
+    slowly growing train/generation logprob mismatch many steps later.
+
+    Only ``LinearLoRA`` is covered because it is the only adapter this file
+    merges. When the grouped-expert LoRA merge lands (#3353), extend this
+    check to those adapter modules too so that path keeps the same loud
+    failure instead of silently refitting base expert weights.
+    """
+    unreachable = sorted(
+        name
+        for name, module in module_map.items()
+        if isinstance(module, LinearLoRA) and f"{name}.weight" not in state_dict
+    )
+    if unreachable:
+        raise RuntimeError(
+            f"{len(unreachable)} LinearLoRA module(s) have no matching state_dict "
+            f"weight, so the refit would drop their LoRA update: {unreachable[:5]}. "
+            "A module wrapper is rewriting parameter names in a way "
+            "canonical_parameter_fqn does not undo."
+        )
+
+
 @torch.no_grad()
 def _maybe_merge_lora_weight(
     module_map: dict[str, nn.Module],
@@ -195,16 +236,16 @@ def _maybe_merge_lora_weight(
         if isinstance(module.lora_B.weight, DTensor)
         else module.lora_B.weight
     )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
-    scale = getattr(module, "scale", None)
+    # LinearLoRA._init_adapter always sets ``scale = alpha / dim``.
+    scale = getattr(module, "scale", 1.0)
 
-    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
-        scale = module.alpha / module.dim
-    if scale is None:
-        scale = 1.0
-
-    return tensor + torch.matmul(lora_b, lora_a) * scale
+    # Merge in fp32 and round once: computing ``B @ A`` and the sum in the base
+    # dtype (bf16 in practice) rounds twice and can differ from an offline fp32
+    # merge of the same adapter by one bf16 ulp per element.
+    lora_a = lora_a.to(device=tensor.device, dtype=torch.float32)
+    lora_b = lora_b.to(device=tensor.device, dtype=torch.float32)
+    merged = tensor.to(torch.float32) + torch.matmul(lora_b, lora_a) * scale
+    return merged.to(tensor.dtype)
 
 
 def _maybe_adapt_tensor_to_hf(

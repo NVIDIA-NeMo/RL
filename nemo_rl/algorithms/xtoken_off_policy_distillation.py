@@ -39,7 +39,6 @@ import os
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
-import torch
 from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -57,7 +56,7 @@ from nemo_rl.algorithms.x_token.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.data.xtoken.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
@@ -804,10 +803,7 @@ def xtoken_off_policy_distillation_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(ckpt_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), ckpt_path)
                         checkpointer.begin_finalization(
                             ckpt_path,
                             wait_fn=student_policy.finalize_async_save,

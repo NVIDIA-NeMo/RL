@@ -602,3 +602,28 @@ def test_setup_rejects_nonpositive_canonical_packing_alignment(
     config.policy["make_sequence_length_divisible_by"] = pad_multiple
     with pytest.raises(ValueError, match="to be positive"):
         setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "pretrained", [None, {"format": "megatron_bridge", "path": "/checkpoint"}]
+)
+def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    existing = {"format": "megatron_bridge", "path": "/policy-level"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.policy["pretrained_checkpoint"] = existing
+    config.checkpointing["pretrained_checkpoint"] = None
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy["pretrained_checkpoint"] == existing
