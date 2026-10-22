@@ -1,6 +1,7 @@
 defaults: ../../grpo_math_1B.yaml
 data_plane:
-  num_storage_units: 8
+  simple:
+    num_storage_units: 8
 grpo:
   num_prompts_per_step: 20
   num_generations_per_prompt: 64
@@ -25,8 +26,6 @@ checkpointing:
   keep_top_k: 20
   save_period: 20
   checkpoint_must_save_by: 00:03:20:00
-  model_save_format: torch_save
-  save_consolidated: false
 policy:
   model_name: ${oc.env:SPEECHLM_GSPO_MODEL}
   tokenizer:
@@ -328,6 +327,9 @@ policy:
   sequence_packing:
     enabled: false
   automodel_cfg:
+    checkpoint:
+      model_save_format: torch_save
+      save_consolidated: 'false'
     activation_checkpointing: true
     expert_parallel_size: 8
     moe_parallelizer:
