@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -82,6 +83,33 @@ def _dspark_provider():
     )
     assert provider is not None
     return provider
+
+
+def _provider_with_capabilities(
+    *,
+    context_parallel: bool = True,
+    sequence_packing: bool = True,
+    target_sequence_parallel: bool = True,
+) -> Any:
+    return SimpleNamespace(
+        config=_provider().config,
+        supports_context_parallel=context_parallel,
+        supports_sequence_packing=sequence_packing,
+        supports_target_sequence_parallel=target_sequence_parallel,
+    )
+
+
+def _model_cfg(**overrides: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "sequence_parallel": False,
+        "virtual_pipeline_model_parallel_size": None,
+        "num_layers": 4,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
 def test_dflash_setup_rejects_layout_and_target_mismatches_together() -> None:
@@ -296,3 +324,148 @@ def test_dspark_setup_rejects_mismatched_generation_method() -> None:
                 num_layers=4,
             ),
         )
+
+
+@pytest.mark.parametrize("context_parallel_size", [3, 8])
+def test_block_draft_setup_rejects_context_parallel_size_outside_supported_set(
+    context_parallel_size: int,
+) -> None:
+    with pytest.raises(ValueError) as error:
+        _validate_draft_training_setup(
+            draft_provider=_provider(),
+            config={"sequence_packing": {"enabled": True}, "generation": None},
+            model_cfg=_model_cfg(context_parallel_size=context_parallel_size),
+        )
+
+    assert str(error.value) == (
+        "DFlash co-training setup is unsupported: "
+        "context_parallel_size must be one of 1, 2, or 4"
+    )
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "model_overrides", "expected"),
+    [
+        (
+            {"context_parallel": False},
+            {"context_parallel_size": 2},
+            "provider does not support context parallel training",
+        ),
+        (
+            {"sequence_packing": False},
+            {},
+            "provider does not support sequence packing",
+        ),
+        (
+            {"target_sequence_parallel": False},
+            {"sequence_parallel": True},
+            "provider does not support target sequence parallelism",
+        ),
+    ],
+    ids=["context_parallel", "sequence_packing", "target_sequence_parallel"],
+)
+def test_block_draft_setup_rejects_layout_the_provider_cannot_support(
+    capabilities: dict[str, bool],
+    model_overrides: dict[str, Any],
+    expected: str,
+) -> None:
+    with pytest.raises(ValueError) as error:
+        _validate_draft_training_setup(
+            draft_provider=_provider_with_capabilities(**capabilities),
+            config={"sequence_packing": {"enabled": True}, "generation": None},
+            model_cfg=_model_cfg(**model_overrides),
+        )
+
+    assert str(error.value) == f"DFlash co-training setup is unsupported: {expected}"
+
+
+def test_block_draft_setup_ignores_missing_capabilities_for_unused_features() -> None:
+    _validate_draft_training_setup(
+        draft_provider=_provider_with_capabilities(
+            context_parallel=False,
+            sequence_packing=False,
+            target_sequence_parallel=False,
+        ),
+        config={"sequence_packing": {"enabled": False}, "generation": None},
+        model_cfg=_model_cfg(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_overrides", "mcore_generation_config", "expected"),
+    [
+        (
+            {"context_parallel_size": 2},
+            None,
+            "generation context_parallel_size must be 1",
+        ),
+        (
+            {"context_parallel_size": 4},
+            None,
+            "generation context_parallel_size must be 1",
+        ),
+        (
+            {"pipeline_model_parallel_size": 2},
+            None,
+            "generation pipeline_model_parallel_size must be 1",
+        ),
+        (
+            {"context_parallel_size": 2},
+            {"pipeline_model_parallel_size": 1},
+            "generation context_parallel_size must be 1",
+        ),
+    ],
+    ids=["cp2", "cp4", "pp2", "cp2_with_only_pp_overridden"],
+)
+def test_megatron_generation_inherits_training_parallelism_when_not_overridden(
+    model_overrides: dict[str, Any],
+    mcore_generation_config: dict[str, int] | None,
+    expected: str,
+) -> None:
+    generation: dict[str, Any] = {"backend": "megatron"}
+    if mcore_generation_config is not None:
+        generation["mcore_generation_config"] = mcore_generation_config
+
+    with pytest.raises(ValueError) as error:
+        _validate_draft_training_setup(
+            draft_provider=_provider(),
+            config={"sequence_packing": {"enabled": True}, "generation": generation},
+            model_cfg=_model_cfg(**model_overrides),
+        )
+
+    assert expected in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("backend", "mcore_generation_config", "context_parallel_size"),
+    [
+        ("vllm", None, 2),
+        ("vllm", None, 4),
+        (
+            "megatron",
+            {"pipeline_model_parallel_size": 1, "context_parallel_size": 1},
+            2,
+        ),
+        ("megatron", None, 1),
+    ],
+    ids=[
+        "vllm_cp2",
+        "vllm_cp4",
+        "megatron_explicit_override_cp2",
+        "megatron_cp1",
+    ],
+)
+def test_block_draft_setup_allows_generation_that_does_not_inherit_training_cp(
+    backend: str,
+    mcore_generation_config: dict[str, int] | None,
+    context_parallel_size: int,
+) -> None:
+    generation: dict[str, Any] = {"backend": backend}
+    if mcore_generation_config is not None:
+        generation["mcore_generation_config"] = mcore_generation_config
+
+    _validate_draft_training_setup(
+        draft_provider=_provider(),
+        config={"sequence_packing": {"enabled": True}, "generation": generation},
+        model_cfg=_model_cfg(context_parallel_size=context_parallel_size),
+    )
