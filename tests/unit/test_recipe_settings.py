@@ -26,6 +26,11 @@ from nemo_rl.utils.config import (
 
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
 FUNCTIONAL_ROOT = Path(__file__).parents[2] / "tests/functional"
+ASYNC_1OFF_NON_DEEPSEEK_RECIPES = sorted(
+    path
+    for path in (RECIPE_ROOT / "llm/performance").glob("grpo-*-async-1off*.yaml")
+    if "deepseek" not in path.name
+)
 MEGATRON_FUNCTIONAL_SCRIPTS = sorted(
     {
         path.name
@@ -208,3 +213,15 @@ def test_deepseek_performance_recipes_preserve_checkpoint_save_mode(
     register_omegaconf_resolvers()
     config = load_config(RECIPE_ROOT / "llm/performance" / recipe_name)
     assert config.policy.megatron_cfg.checkpoint.async_save is expected_async_save
+
+
+@pytest.mark.parametrize("recipe_path", ASYNC_1OFF_NON_DEEPSEEK_RECIPES)
+def test_non_deepseek_async_1off_recipes_use_nccl_reshard(
+    recipe_path: Path,
+) -> None:
+    register_omegaconf_resolvers()
+    config = load_config(recipe_path)
+    assert config.grpo.async_grpo.enabled is True
+    assert config.policy.megatron_cfg.enabled is True
+    assert config.policy.generation.colocated.enabled is False
+    assert config.policy.generation.refit_transport == "nccl_reshard"
