@@ -870,6 +870,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     master_config = MasterConfig.model_construct(
         **{
             "policy": {
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
@@ -995,8 +997,13 @@ def test_distillation_train_shuts_down_environments_after_success():
     shutdown.assert_called_once_with(task_to_env, task_to_env)
 
 
-@pytest.mark.parametrize("refit_transport", [None, "nixl"])
-def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
+@pytest.mark.parametrize(
+    ("refit_transport", "offload_policy_before_refit"),
+    [(None, False), (None, True), ("nixl", False)],
+)
+def test_distillation_setup_non_colocated_smoke(
+    monkeypatch, refit_transport, offload_policy_before_refit
+):
     """Smoke test: calling setup with a non-colocated config should succeed."""
     from unittest.mock import MagicMock, patch
 
@@ -1027,6 +1034,11 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
                 "automodel_cfg": {
                     "enabled": False,
                 },
+                "megatron_cfg": {
+                    "enabled": offload_policy_before_refit,
+                },
+                "offload_policy_before_refit": offload_policy_before_refit,
+                "offload_optimizer_for_refit": True,
                 "model_name": "test-policy",
             },
             "teacher": {
@@ -1136,7 +1148,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch, refit_transport):
         assert isinstance(result, tuple)
         assert result[3] is None
         mock_spinup_nemo_gym.assert_not_called()
-        if refit_transport == "nixl":
+        if refit_transport == "nixl" or offload_policy_before_refit:
             mock_create_synchronizer.assert_called_once()
             mock_create_synchronizer.return_value.init_communicator.assert_called_once()
             assert not DummyPolicy.collective_calls
@@ -1163,6 +1175,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
             "policy": {
                 "model_name": "test-policy",
                 "tokenizer": {"name": "test-policy", "use_fastokens": False},
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
@@ -1401,6 +1415,8 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     master_config = MasterConfig.model_construct(
         **{
             "policy": {
+                "offload_policy_before_refit": False,
+                "offload_optimizer_for_refit": True,
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
