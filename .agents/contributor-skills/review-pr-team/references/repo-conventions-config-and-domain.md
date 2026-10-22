@@ -1,4 +1,4 @@
-# Repo conventions config and domain
+# Repo conventions: config and domain
 
 NeMo-RL conventions and domain facts a reviewer needs.
 

@@ -1,6 +1,6 @@
 # Verify external behavior
 
-Claims about how Python, a library, a renderer or upstream code behaves must be checked
+Claims about how Python, a library, a renderer or upstream code behaves must be checked.
 
 - **Run a 10-line repro for any "Python/the runtime will lose/mask/wait/reorder" claim and quote the output.** Four lanes agreed `drain()` was the fix on #3592; a repro showed `asyncio.run` joins the executor anyway.
 - **Read the pinned upstream source before downgrading a finding that turns on one yes/no fact.** On #3591 four raw fetches of NCCL at the pinned tag turned a ~57% note into the top finding.
