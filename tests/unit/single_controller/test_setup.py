@@ -1721,7 +1721,7 @@ class TestSetup:
                     enable_vllm_metrics_logger=True
                 ),
                 "requires rollout_checkpointing.telemetry_interval_s",
-                id="undrained_metrics_sampler",
+                id="unread_metrics_logger",
             ),
         ],
     )

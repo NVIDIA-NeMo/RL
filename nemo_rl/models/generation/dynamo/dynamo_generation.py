@@ -196,13 +196,13 @@ class DynamoGeneration(GenerationInterface):
             generation["vllm_cfg"]["enable_vllm_metrics_logger"]
             and master_config.rollout_checkpointing.telemetry_interval_s is None
         ):
-            # The rollout telemetry pump is what drains the driver's sampler on this
-            # path; without it the sampler would accumulate for the whole run.
+            # The rollout telemetry pump is the only reader of Dynamo's metrics on
+            # this path; without it the flag would silently do nothing.
             raise ValueError(
                 "policy.generation.vllm_cfg.enable_vllm_metrics_logger requires "
                 "rollout_checkpointing.telemetry_interval_s with "
                 "policy.generation.backend='dynamo' under the SingleController; "
-                "the rollout telemetry pump drains the Dynamo metrics sampler."
+                "the rollout telemetry pump is what reports Dynamo's metrics."
             )
 
     def __init__(
@@ -281,15 +281,6 @@ class DynamoGeneration(GenerationInterface):
             else:
                 self.dp_openai_server_base_urls = [None]
                 print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
-
-            if vllm_cfg.enable_vllm_metrics_logger:
-                self._metrics_sampler = DynamoMetricsSampler(
-                    workers,
-                    interval_s=vllm_cfg.vllm_metrics_logger_interval,
-                    include_prefixes=dynamo_cfg.metrics_include_prefixes,
-                    exclude_prefixes=dynamo_cfg.metrics_exclude_prefixes,
-                )
-                self._metrics_sampler.start()
         except Exception:
             self.shutdown()
             raise
@@ -312,20 +303,43 @@ class DynamoGeneration(GenerationInterface):
         """Invalidate cached rollout state after synchronous generation."""
         return self.invalidate_kv_cache()
 
+    def _logger_sampler(self) -> DynamoMetricsSampler | None:
+        """Return this process's metrics sampler, starting it on first use.
+
+        The sampler owns a thread and locks, so it cannot travel with a pickled
+        copy: it starts in whichever process reads the metrics (the driver for
+        the legacy loops, the SingleController actor for its telemetry pump).
+        """
+        vllm_cfg = self.cfg["vllm_cfg"]
+        channel = self._refit_channel
+        if (
+            self._metrics_sampler is None
+            and vllm_cfg["enable_vllm_metrics_logger"]
+            and channel is not None
+        ):
+            self._metrics_sampler = DynamoMetricsSampler(
+                channel.workers,
+                interval_s=vllm_cfg["vllm_metrics_logger_interval"],
+                include_prefixes=self._dynamo_cfg.metrics_include_prefixes,
+                exclude_prefixes=self._dynamo_cfg.metrics_exclude_prefixes,
+            )
+            self._metrics_sampler.start()
+        return self._metrics_sampler
+
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""
-        sampler = self._metrics_sampler
+        sampler = self._logger_sampler()
         return {} if sampler is None else sampler.snapshot()
 
     def clear_logger_metrics(self) -> None:
         """Clear the Dynamo metric timelines for the next logging window."""
-        sampler = self._metrics_sampler
+        sampler = self._logger_sampler()
         if sampler is not None:
             sampler.clear()
 
     def drain_latest_logger_metrics(self) -> dict[str, Any]:
         """Return each worker's latest Dynamo metrics for rollout telemetry."""
-        sampler = self._metrics_sampler
+        sampler = self._logger_sampler()
         return {} if sampler is None else sampler.drain_latest()
 
     def get_inference_world_size(self) -> int:

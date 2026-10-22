@@ -30,6 +30,7 @@ from nemo_rl.models.generation.dynamo.config import (
     DynamoConfig,
     DynamoWorkerArgs,
 )
+from nemo_rl.models.generation.interfaces import DisaggConfig
 
 
 def _config(**overrides) -> dict:
@@ -181,9 +182,10 @@ def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     [
         ({"bad_words": ["foo"]}, ["bad_words"]),
         ({"ignore_eos": True}, ["ignore_eos"]),
-        ({"disaggregation": {"enabled": True}}, ["disaggregation"]),
+        # The validator receives disaggregation as a DisaggConfig, not a dict.
+        ({"disaggregation": DisaggConfig(enabled=True)}, ["disaggregation"]),
         # Inherited shared-YAML settings the exemplars carry stay quiet.
-        ({"disaggregation": {"enabled": False}}, []),
+        ({"disaggregation": DisaggConfig(enabled=False)}, []),
         ({"ignore_eos": False}, []),
         ({"refit_cfg": {"nixl": {}}, "mcore_generation_config": {"x": 1}}, []),
         ({"real_quant_export_cpu_offload": True}, []),

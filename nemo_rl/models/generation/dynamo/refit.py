@@ -149,6 +149,11 @@ class DynamoRefitChannel:
         return endpoints
 
     @property
+    def workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
+        """Return the managed workers' endpoints, as fixed at collective setup."""
+        return self._workers
+
+    @property
     def inference_world_size(self) -> int:
         return len(self._workers) * self._engine_world_size
 

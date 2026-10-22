@@ -130,6 +130,8 @@ _GENERATION_CLASSIFIED = {
 
 def _is_active(value: Any) -> bool:
     """Whether a setting is on; a block with an ``enabled`` switch counts only then."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
     if isinstance(value, dict) and "enabled" in value:
         return bool(value["enabled"])
     return bool(value)

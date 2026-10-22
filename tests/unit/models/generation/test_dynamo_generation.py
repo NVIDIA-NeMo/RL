@@ -358,6 +358,16 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     )
     assert restored._managed_runtime is None
 
+    # The metrics sampler starts in the process that reads it: the driver starts
+    # none, and the SingleController's telemetry pump starts it in the copy.
+    monkeypatch.setattr(metrics_module, "_http_get_text", lambda *args: None)
+    assert generation._metrics_sampler is None
+    assert not any(restored.drain_latest_logger_metrics().values())
+    assert restored._metrics_sampler is not None
+    assert restored._metrics_sampler._workers == restored._refit_channel.workers
+    assert restored.shutdown()
+    assert restored._metrics_sampler is None
+
 
 def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
     monkeypatch,
