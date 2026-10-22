@@ -16,9 +16,11 @@ weight refits, so frozen weights are never replaced by dummy initialization.
 ## Requirements
 
 Use compatible NeMo RL, NeMo Speech and NeMo Automodel checkouts. Speech must
-provide `SALMAutomodel(parameter_config=...)`, strict native checkpoint loading
-and validated partial perception refits. Automodel must provide `ParameterConfig`,
-`preserve_parameter_dtypes`, `compute_logits=False` and `compute_mtp=False`.
+provide component `automodel_freeze_config` and `perception_freeze_config`
+settings, strict native checkpoint loading and validated partial perception
+refits. Automodel must provide exact `FreezeConfig.unfreeze_parameters`
+selection, pre-shard frozen-storage preparation, `compute_logits=False` and
+`compute_mtp=False`.
 These come from companion pull requests
 ([Speech #16387](https://github.com/NVIDIA-NeMo/Speech/pull/16387),
 [Automodel #4377](https://github.com/NVIDIA-NeMo/Automodel/pull/4377) and
@@ -174,6 +176,11 @@ The update surface is configured by `policy.native_model.trainable_names`,
 `expected_trainable_tensors`, and `expected_trainable_scalars`; the complete list
 is in the recipe. No CTC parameter is selected. Keep the tested list when changing
 only the dataset or substituting a checkpoint of the same architecture.
+The native policy translates this list into Automodel's existing `FreezeConfig`:
+freeze all component modules, then unfreeze the exact selected parameter names.
+The loader uses FP32 storage; the BF16 FSDP2 compute policy reduces ordinary
+frozen storage before allocation while retaining model-required FP32 tensors.
+Exact-name, count and storage validation runs before the optimizer is created.
 
 Each offered batch has 40 recordings and 64 responses per recording. Dynamic
 sampling retains the first 20 nonconstant groups in order. It does not rank

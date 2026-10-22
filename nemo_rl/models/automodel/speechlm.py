@@ -23,7 +23,6 @@ import torch
 from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel
 from nemo.collections.speechlm2.parts.weight_loading import canonical_parameter_name
 from nemo.collections.speechlm2.vllm.salm.config import NeMoSpeechLMConfig
-from nemo_automodel.components.utils.parameter_config import ParameterConfig
 from omegaconf import OmegaConf
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import DTensor
@@ -46,7 +45,6 @@ class SpeechLMPolicy(SALMAutomodel):
         self,
         cfg: dict[str, Any],
         *,
-        parameter_config: ParameterConfig,
         native_model: SpeechLMNativeConfig | dict[str, Any],
     ) -> None:
         from nemo_rl.models.policy import (
@@ -66,9 +64,24 @@ class SpeechLMPolicy(SALMAutomodel):
         cfg["packed_encoder_sequences"] = False
         cfg["packed_encoder_cp"] = False
         cfg["cross_entropy_backend"] = "eager"
+        # Freeze each component, then enable only the configured exact names.
+        # Automodel applies this policy before loading and distributed wrapping.
+        for prefix, key in (
+            ("llm.", "automodel_freeze_config"),
+            ("perception.", "perception_freeze_config"),
+        ):
+            names = [
+                name.removeprefix(prefix)
+                for name in self.native_model["trainable_names"]
+                if name.startswith(prefix)
+            ]
+            cfg[key] = {
+                "freeze_modules": [{"glob": "*"}],
+                "unfreeze_parameters": names,
+            }
         # pyrefly resolves super() of the Any-typed nemo base to object.
         # pyrefly: ignore[bad-argument-count, unexpected-keyword]
-        super().__init__(cfg, parameter_config=parameter_config)
+        super().__init__(cfg)
 
     @classmethod
     def from_native_pretrained(
@@ -98,15 +111,11 @@ class SpeechLMPolicy(SALMAutomodel):
         )  # Optional Speech policy configuration.
 
         native_config = SpeechLMNativeConfig.model_validate(native_model).model_dump()
-        parameter_config = ParameterConfig(
-            tuple(native_config["trainable_names"]), torch.float32, torch.bfloat16
-        )
-        # Construct the frozen baseline, including frontend buffers/output dtype,
-        # in BF16. ParameterConfig promotes selected masters before strict load.
-        kwargs["torch_dtype"] = parameter_config.frozen_dtype
+        # FP32 loader storage protects trainable checkpoint values. FSDP's BF16
+        # compute policy reduces frozen storage before materialization.
+        kwargs["torch_dtype"] = torch.float32
         model = super().from_pretrained(
             model_name,
-            parameter_config=parameter_config,
             native_model=native_config,
             strict=True,
             **kwargs,

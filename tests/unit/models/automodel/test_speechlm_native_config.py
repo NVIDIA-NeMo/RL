@@ -24,7 +24,7 @@ from omegaconf import DictConfig
 from transformers import AutoConfig, NemotronHConfig
 
 pytest.importorskip("nemo.collections.speechlm2")
-pytest.importorskip("nemo_automodel.components.utils.parameter_config")
+pytest.importorskip("nemo_automodel.components.utils.model_utils")
 
 from nemo.collections.speechlm2.models.salm_automodel import SALMAutomodel  # noqa: E402
 
@@ -56,7 +56,7 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(
     loaded = AutoConfig.from_pretrained(tmp_path)
     assert math.isinf(loaded.time_step_limit[1])
 
-    def initialize(self, cfg, *, parameter_config):
+    def initialize(self, cfg):
         self.cfg = DictConfig(cfg)
         self.llm = None
         if cfg["init_configure_model"]:
@@ -81,7 +81,6 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(
     }
     model = SpeechLMPolicy(
         cfg,
-        parameter_config=None,
         native_model=native_config(
             model_config_overrides={"encoder_chunk_size_seconds": 20.0}
         ),
@@ -100,7 +99,7 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(
 
 
 @pytest.mark.parametrize("dtype", ["torch.float32", "float32", torch.float32])
-def test_native_loader_uses_frozen_baseline_at_speech_boundary(monkeypatch, dtype):
+def test_native_loader_uses_fp32_storage_at_speech_boundary(monkeypatch, dtype):
     observed = {}
     model = SimpleNamespace(
         training=True, validate_update_surface=lambda: None, train=lambda mode: None
@@ -117,22 +116,20 @@ def test_native_loader_uses_frozen_baseline_at_speech_boundary(monkeypatch, dtyp
         torch_dtype=dtype,
     )
     assert result is model
-    assert observed["torch_dtype"] == torch.bfloat16
+    assert observed["torch_dtype"] == torch.float32
     resolved = (
         getattr(torch, observed["torch_dtype"])
         if isinstance(observed["torch_dtype"], str)
         else observed["torch_dtype"]
     )
-    assert resolved == torch.bfloat16
-    assert observed["parameter_config"].trainable_dtype == torch.float32
-    assert observed["parameter_config"].frozen_dtype == torch.bfloat16
+    assert resolved == torch.float32
+    assert "parameter_config" not in observed
 
 
 def test_native_perception_selection_precedes_activation_checkpoint_wrapping(
     monkeypatch,
 ):
     from nemo.collections.speechlm2.models import salm_automodel
-    from nemo_automodel.components.utils.parameter_config import ParameterConfig
     from torch import nn
     from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
         checkpoint_wrapper,
@@ -169,9 +166,14 @@ def test_native_perception_selection_precedes_activation_checkpoint_wrapping(
                 "pretrained_llm": "fixture",
                 "torch_dtype": "float32",
                 "pretrained_weights": False,
+                "perception_freeze_config": {
+                    "freeze_modules": [{"glob": "*"}],
+                    "unfreeze_parameters": [
+                        name.removeprefix("perception.") for name in selected
+                    ],
+                },
             }
         ),
-        parameter_config=ParameterConfig(selected, torch.float32, torch.bfloat16),
         _mtp_enabled=False,
         setup_moe_options=lambda: None,
         _apply_mtp_training_mode=lambda mode: None,
@@ -196,7 +198,11 @@ def test_native_perception_selection_precedes_activation_checkpoint_wrapping(
     )
     # Run the production configure path and real selection/casting/wrappers;
     # only full backbone/ASR weight construction is replaced by tiny modules.
-    SALMAutomodel.configure_model(model, activation_checkpointing_perception=True)
+    SALMAutomodel.configure_model(
+        model,
+        activation_checkpointing_perception=True,
+        perception_mixed_precision=SimpleNamespace(param_dtype=torch.bfloat16),
+    )
     assert perception.checkpointing_enabled
     parameters = {
         name.replace("._checkpoint_wrapped_module", ""): value
@@ -232,9 +238,8 @@ def test_native_perception_selection_precedes_activation_checkpoint_wrapping(
 def test_moe_options_preserve_explicit_parameter_selection(explicit_selection):
     from nemo_automodel.components.moe.config import MoEConfig
     from nemo_automodel.components.moe.layers import Gate
-    from nemo_automodel.components.utils.parameter_config import (
-        ParameterConfig,
-        apply_parameter_config,
+    from nemo_automodel.components.utils.model_utils import (
+        apply_parameter_freezing,
     )
     from torch import nn
 
@@ -263,13 +268,22 @@ def test_moe_options_preserve_explicit_parameter_selection(explicit_selection):
     backbone.mtp = nn.Module()
     backbone.mtp.gate = Gate(config)
     selected = ("proj.weight", "selected_gate.weight", "selected_gate.bias")
-    parameter_config = ParameterConfig(selected) if explicit_selection else None
-    if parameter_config is not None:
-        apply_parameter_config(backbone, parameter_config)
+    freeze_config = (
+        {"freeze_modules": [{"glob": "*"}], "unfreeze_parameters": list(selected)}
+        if explicit_selection
+        else None
+    )
+    if freeze_config is not None:
+        apply_parameter_freezing(backbone, freeze_config)
     model = SimpleNamespace(
         llm=backbone,
-        parameter_config=parameter_config,
-        cfg=DictConfig({"train_gate": True, "aux_loss_coeff": 0.2}),
+        cfg=DictConfig(
+            {
+                "train_gate": True,
+                "aux_loss_coeff": 0.2,
+                "automodel_freeze_config": freeze_config,
+            }
+        ),
     )
     # Real Gate modules and real selection followed by the production MoE
     # override, in the same order as native model construction.
@@ -351,9 +365,12 @@ def test_native_loader_preserves_frozen_frontend_and_fp32_selected_weights(monke
                     "pretrained_llm": "fixture",
                     "torch_dtype": dtype_name,
                     "pretrained_weights": False,
+                    "perception_freeze_config": {
+                        "freeze_modules": [{"glob": "*"}],
+                        "unfreeze_parameters": ["proj.weight"],
+                    },
                 }
             ),
-            parameter_config=kwargs["parameter_config"],
             _mtp_enabled=False,
             setup_moe_options=lambda: None,
             _apply_mtp_training_mode=lambda mode: None,
@@ -361,7 +378,10 @@ def test_native_loader_preserves_frozen_frontend_and_fp32_selected_weights(monke
             validate_update_surface=lambda: None,
             train=lambda mode: None,
         )
-        SALMAutomodel.configure_model(model)
+        SALMAutomodel.configure_model(
+            model,
+            perception_mixed_precision=SimpleNamespace(param_dtype=torch.bfloat16),
+        )
         model.perception.load_state_dict(seed, strict=True)
         return model
 
