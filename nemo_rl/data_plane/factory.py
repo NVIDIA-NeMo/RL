@@ -120,12 +120,24 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
 
+def _declared_packed_fields(cfg: DataPlaneRuntimeConfig) -> list[str] | None:
+    """Return the packed-field declaration; typed local configs cannot declare one."""
+    if not isinstance(cfg, LocalDataPlaneConfig):
+        return cfg.get("packed_multimodal_fields")
+    if "packed_multimodal_fields" in (cfg.model_extra or {}):
+        raise ValueError(
+            "LocalDataPlaneConfig does not support packed_multimodal_fields"
+        )
+    return None
+
+
 def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
     """Apply the packed-field declaration in each data-plane participant.
 
     Args:
         cfg: Data-plane config whose ``packed_multimodal_fields`` declares the
-            custom packed inputs. ``None`` is a no-op; local configs declare none.
+            custom packed inputs. ``None`` is a no-op; a ``LocalDataPlaneConfig``
+            declares none and rejects the key.
 
     Raises:
         ValueError: The declaration is invalid or differs from the one already
@@ -136,11 +148,7 @@ def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
     # Lazy: the native codec imports this package during data initialization.
     from nemo_rl.data.multimodal_utils import register_packed_multimodal_fields
 
-    names = (
-        None
-        if isinstance(cfg, LocalDataPlaneConfig)
-        else cfg.get("packed_multimodal_fields")
-    )
+    names = _declared_packed_fields(cfg)
     register_packed_multimodal_fields(names)
 
 
@@ -201,11 +209,7 @@ def build_data_plane_client(
     # Lazy: the native codec imports this package during data initialization.
     from nemo_rl.data.multimodal_utils import packed_multimodal_field_registration
 
-    names = (
-        None
-        if isinstance(cfg, LocalDataPlaneConfig)
-        else cfg.get("packed_multimodal_fields")
-    )
+    names = _declared_packed_fields(cfg)
     with packed_multimodal_field_registration(names):
         impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
         if impl == "transfer_queue":

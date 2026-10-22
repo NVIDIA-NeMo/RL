@@ -611,4 +611,4 @@ are currently supported by the ordinary SingleController rollout path, not token
 capture; setup rejects that combination.
 Other algorithms sharing the client factory gain field classification, but their
 application processors, model forward paths, and checkpoint lifecycles need
-separate qualification.
+separate qualification. A typed `LocalDataPlaneConfig` (SFT v2) rejects the key.

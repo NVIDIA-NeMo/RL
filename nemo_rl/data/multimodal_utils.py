@@ -213,7 +213,10 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
             declaration already registered in this process.
     """
     # Lazy to avoid the data/data_plane package initialization cycle.
+    from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
     from nemo_rl.data_plane.schema import (
+        GROUP_ID_TAG,
+        META_IDX,
         PER_TOKEN_STAGING_FIELDS,
         ROUTED_EXPERTS_ENCODING_FIELD,
         ROUTED_EXPERTS_FIELD,
@@ -231,6 +234,7 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
     declaration = frozenset(names or ())
     reserved = {
         *SC_ROLLOUT_SCHEMA_FIELDS,
+        *TOKEN_ALIGNED_FIELDS,
         *PER_TOKEN_STAGING_FIELDS,
         *PER_TOKEN_MULTIMODAL_FIELDS,
         *VLLM_PROMPT_KEYS,
@@ -238,6 +242,16 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
         ROUTED_LEN_FIELD,
         ROUTED_EXPERTS_ENCODING_FIELD,
         ROUTED_EXTRAS_METADATA_FIELD,
+        META_IDX,
+        GROUP_ID_TAG,
+        "token_ids",
+        "loss_multiplier",
+        "teacher_topk_logits",
+        "teacher_topk_indices",
+        "mtp_loss_mask",
+        "prompt_idx",
+        "weight_version",
+        "multimodal_row_tags",
         "position_ids",
         "attention_mask",
         "attention_bias",
