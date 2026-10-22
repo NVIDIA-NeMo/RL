@@ -565,3 +565,49 @@ partial file is not proof of a completed training step.
 The per-step `timing/train/train_data_dump` metric reports wall-clock seconds
 summed across chunk preparation/writes and final-file publication. Chunk dump
 time is also included in `advantage_calculation`; these timings overlap.
+
+
+## Application-declared packed model inputs
+
+For external encoder features or other jagged model inputs, declare their names
+before starting any data-plane participant:
+
+```yaml
+data_plane:
+  enabled: true
+  packed_multimodal_fields: [encoder_features, projector_indices]
+token_capture:
+  enabled: false
+```
+
+The optional declaration defaults to no custom fields; native image/video/audio
+fields need no declaration. This seam uses the existing packed-field codec,
+partition schema, fetch selection, and checkpoint recovery. It does not add a
+processor or model implementation. The application must attach a `PackedTensor`
+per declared model-input field, use `encode_multimodal_for_wire` when writing it,
+and carry `multimodal_row_tags` with the matching sample rows. Row selection must
+preserve these geometry tags. Empty rows reconstruct as `None`; model extensions
+must support absent inputs and reject placeholder tokens without their features.
+
+Names must be Python identifiers. Native media, trainer fields, model forward
+arguments (including `input_ids`, `position_ids`, `attention_mask`, `labels`, and
+`decoder_input`), packing/router metadata, and the `__row_shapes` suffix are
+reserved. Both config-based and direct registration reject collisions.
+
+All clients in one process must use the same declaration, including clients that
+omit the key. Registration is idempotent for the same set, independent of list
+order; adding/removing fields or switching to an empty declaration raises.
+Failed first client construction rolls registration back. Use a separate process
+for an independent run with a different declaration. Every fresh or deserialized
+participant must install the same declaration before encoding or fetching data;
+the native client factory and SingleController actor do this from config.
+
+Checkpoints record the sorted unique declaration and reject changed declarations
+on either driver-side or actor-side recovery. Older native-media-only checkpoints
+without this metadata can resume only with no custom declaration. Earlier local
+custom-field backports without declaration metadata cannot establish this
+invariant and are rejected. Custom fields are currently supported by the ordinary
+SingleController rollout path, not token capture; setup rejects that combination.
+Other algorithms sharing the client factory gain field classification, but their
+application processors, model forward paths, and checkpoint lifecycles need
+separate qualification.

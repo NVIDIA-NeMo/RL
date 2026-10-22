@@ -2105,6 +2105,37 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
+    def test_saves_canonical_custom_field_declaration(self, tmp_path):
+        client = _FakeDPClient()
+        actor = SimpleNamespace(
+            _dp_client=client,
+            _partition_id="rollout_data",
+            _async_cfg=SimpleNamespace(sampler=SimpleNamespace(name="in_order")),
+            _teacher_coordinator=None,
+            _master_config=SimpleNamespace(
+                data_plane={
+                    "packed_multimodal_fields": [
+                        "z_features",
+                        "a_features",
+                        "z_features",
+                    ],
+                }
+            ),
+        )
+        asyncio.run(
+            _ACTOR_CLS._save_data_plane_checkpoint(
+                actor,
+                str(tmp_path),
+                train_steps=3,
+                trainer_version=3,
+                current_epoch=0,
+            )
+        )
+        assert client.save_calls[0]["metadata"]["packed_multimodal_fields"] == [
+            "a_features",
+            "z_features",
+        ]
+
     def test_metadata_uses_explicit_snapshot_identity(self, tmp_path):
         mc = _actor_master_config(
             tmp_path,
@@ -2140,6 +2171,7 @@ class TestDataPlaneCheckpoint:
         metadata = dp_client.save_calls[0]["metadata"]
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
+        assert metadata["packed_multimodal_fields"] == []
         assert metadata["single_controller_epoch"] == 2
 
     def test_saves_authoritative_tq_state_and_metadata_only_replay_index(
