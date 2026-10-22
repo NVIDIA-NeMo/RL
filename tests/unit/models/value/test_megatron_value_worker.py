@@ -32,7 +32,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import ray
@@ -123,7 +123,12 @@ def test_value_adapter_excludes_actor_vocabulary_logprob_controls(
     assert value_config["megatron_cfg"]["use_fused_linear_logprobs"] is fused_logprobs
 
 
-def test_get_values_suspends_activation_offload() -> None:
+@pytest.mark.parametrize("stable_forward", [False, True])
+@pytest.mark.parametrize("failure", [False, True])
+@torch.enable_grad()
+def test_get_values_suspends_activation_offload(
+    stable_forward: bool, failure: bool
+) -> None:
     """Value inference must preserve the activation-offload training warmup."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
         PipelineOffloadManager,
@@ -132,6 +137,10 @@ def test_get_values_suspends_activation_offload() -> None:
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
+    import transformer_engine.pytorch.module.grouped_linear as grouped
+
+    original_grouped_forward = grouped.general_grouped_gemm
+    original_grad_enabled = torch.is_grad_enabled()
 
     class OffloadManager:
         def __init__(self) -> None:
@@ -147,7 +156,10 @@ def test_get_values_suspends_activation_offload() -> None:
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
     model = SimpleNamespace(config=model_config, eval=lambda: None)
     worker = SimpleNamespace(
-        cfg={"train_micro_batch_size": 1},
+        cfg={
+            "train_micro_batch_size": 1,
+            "megatron_cfg": {"stable_policy_forward": stable_forward},
+        },
         model=model,
         _policy_like_cfg={},
         media_placeholder_token_id=None,
@@ -158,9 +170,15 @@ def test_get_values_suspends_activation_offload() -> None:
 
     def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
         assert kwargs["forward_only"] is True
+        assert not torch.is_grad_enabled()
+        assert (
+            grouped.general_grouped_gemm is not original_grouped_forward
+        ) is stable_forward
         observed_states.append(
             (model_config.fine_grained_activation_offloading, manager.do_offload)
         )
+        if failure:
+            raise RuntimeError("intentional value scheduler error")
         return [{"values": torch.tensor([[1.0]])}]
 
     with (
@@ -186,12 +204,91 @@ def test_get_values_suspends_activation_offload() -> None:
         patch("torch.cuda.nvtx.range_push"),
         patch("torch.cuda.nvtx.range_pop"),
     ):
-        result = MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
+        if failure:
+            with pytest.raises(RuntimeError, match="intentional value scheduler error"):
+                MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
+        else:
+            result = MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
+            torch.testing.assert_close(result["values"], torch.tensor([[1.0]]))
 
-    torch.testing.assert_close(result["values"], torch.tensor([[1.0]]))
+    assert torch.is_grad_enabled() is original_grad_enabled
+    assert grouped.general_grouped_gemm is original_grouped_forward
     assert observed_states == [(False, False)]
     assert model_config.fine_grained_activation_offloading is True
     assert manager.do_offload is True
+
+
+@pytest.mark.parametrize("stable_forward", [None, False, True])
+def test_value_train_forwards_stable_forward_setting(
+    stable_forward: bool | None,
+) -> None:
+    """Exercise the real critic training entry up to its native scheduler boundary."""
+    from nemo_rl.models.value.workers import megatron_value_worker as native
+
+    config: dict[str, Any] = {"train_global_batch_size": 1, "train_micro_batch_size": 1}
+    config["megatron_cfg"] = (
+        {} if stable_forward is None else {"stable_policy_forward": stable_forward}
+    )
+    worker = SimpleNamespace(
+        cfg=config,
+        dp_size=1,
+        model=SimpleNamespace(zero_grad_buffer=Mock(), train=Mock()),
+        optimizer=SimpleNamespace(zero_grad=Mock()),
+        media_placeholder_token_id=None,
+        _policy_like_cfg={},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        model_slices_context_parallel_inputs=False,
+        defer_fp32_logits=False,
+    )
+    calls = []
+    original_tensor = torch.tensor
+
+    def cpu_dataset_scalar(*args: Any, **kwargs: Any) -> torch.Tensor:
+        # Only the CUDA dataset-size scalar precedes this scheduler boundary.
+        assert kwargs.get("device") == "cuda"
+        kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    def stop_at_scheduler(**kwargs: Any) -> None:
+        assert kwargs.get("stable_policy_forward", False) is bool(stable_forward)
+        assert kwargs["forward_only"] is False
+        calls.append(kwargs)
+        raise RuntimeError("native value training boundary reached")
+
+    batch = BatchedDataDict(input_ids=torch.zeros(1, 8, dtype=torch.long))
+    with (
+        patch.object(native.torch, "tensor", side_effect=cpu_dataset_scalar),
+        patch.object(native.torch.distributed, "all_reduce"),
+        patch.object(
+            native.parallel_state, "get_data_parallel_group", return_value=None
+        ),
+        patch.object(
+            native,
+            "process_global_batch",
+            return_value={
+                "batch": batch,
+                "global_valid_seqs": 1,
+                "global_valid_toks": 8,
+            },
+        ),
+        patch.object(
+            native, "get_microbatch_iterator", return_value=(iter([]), 1, 1, 8, 8)
+        ),
+        patch.object(
+            native,
+            "get_rerun_state_machine",
+            return_value=SimpleNamespace(should_run_forward_backward=lambda _: True),
+        ),
+        patch.object(native, "LossPostProcessor", return_value=object()),
+        patch.object(
+            native, "megatron_forward_backward", side_effect=stop_at_scheduler
+        ),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+        pytest.raises(RuntimeError, match="native value training boundary reached"),
+    ):
+        native.MegatronValueWorkerImpl.train(worker, batch, object())
+    assert len(calls) == 1
 
 
 def test_get_values_uses_image_context_and_keeps_state_before_token_alignment() -> None:

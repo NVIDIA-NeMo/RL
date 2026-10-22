@@ -87,6 +87,7 @@ from nemo_rl.models.megatron.setup import (
     validate_megatron_config,
     validate_model_paths,
 )
+from nemo_rl.models.megatron.stable_forward import stabilized_forward
 from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     megatron_forward_backward,
@@ -642,6 +643,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                        stable_policy_forward=self.cfg["megatron_cfg"].get(
+                            "stable_policy_forward", False
+                        ),
                     )
 
                 # Empty unused memory
@@ -766,6 +770,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         return metrics
 
     @wrap_with_nvtx_name("megatron_value_worker/get_values")
+    @torch.no_grad()
     def get_values(
         self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
     ) -> BatchedDataDict[ValueOutputSpec]:
@@ -778,9 +783,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             BatchedDataDict with "values" key of shape [batch_size, seq_length].
         """
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-
         value_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -862,7 +864,14 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             return output_tensor, collection_fn
 
         forward_backward_func = get_forward_backward_func()
-        with suspend_activation_offload_for_forward_only(self.model, True):
+        with (
+            suspend_activation_offload_for_forward_only(self.model, True),
+            stabilized_forward(
+                enabled=self.cfg.get("megatron_cfg", {}).get(
+                    "stable_policy_forward", False
+                )
+            ),
+        ):
             list_of_values = forward_backward_func(
                 forward_step_func=forward_step_fn,
                 data_iterator=mb_iterator,
@@ -892,8 +901,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             values_tensor = broadcast_tensor(
                 None, get_pipeline_model_parallel_last_rank(), pp_grp
             )
-
-        no_grad.__exit__(None, None, None)
 
         return BatchedDataDict[ValueOutputSpec](values=values_tensor.cpu())
 
