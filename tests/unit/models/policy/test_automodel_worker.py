@@ -742,6 +742,89 @@ class TestAutomodelParamsGenerator:
         assert results["e_score_correction_bias"].dtype == torch.float32
         assert results["ordinary_buffer"].dtype == torch.bfloat16
 
+    @staticmethod
+    def _lora_block(seed: int = 0) -> nn.Module:
+        from nemo_automodel.components._peft.lora import LinearLoRA
+
+        torch.manual_seed(seed)
+        block = nn.Module()
+        block.proj = LinearLoRA(nn.Linear(8, 6, bias=False), dim=2, alpha=4)
+        nn.init.normal_(block.proj.lora_B.weight)  # zero-initialized otherwise
+        return block
+
+    @staticmethod
+    def _expected_merge(proj) -> torch.Tensor:
+        w = proj.weight.detach().float()
+        delta = (
+            proj.lora_B.weight.detach().float() @ proj.lora_A.weight.detach().float()
+        )
+        return (w + proj.scale * delta).to(proj.weight.dtype)
+
+    def test_merges_lora_inside_activation_checkpoint_wrapper(self):
+        """Refit merges LoRA into the weights of activation-checkpointed blocks.
+
+        ``CheckpointWrapper`` strips ``_checkpoint_wrapped_module.`` from
+        ``state_dict()`` keys but not from ``named_modules()``, so a lookup keyed by
+        raw module names misses every LoRA module inside a block and the refit
+        streams the bare base weight.
+        """
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            checkpoint_wrapper,
+        )
+
+        block = self._lora_block()
+        model = nn.Module()
+        model.layers = nn.ModuleList([checkpoint_wrapper(block)])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.float32))
+
+        assert set(results) == {"layers.0.proj.weight"}
+        torch.testing.assert_close(results["layers.0.proj.weight"], expected)
+        assert not torch.equal(
+            results["layers.0.proj.weight"], block.proj.weight.detach()
+        ), "refit tensor must not be the unmerged base weight"
+
+    def test_raises_when_lora_module_has_no_state_dict_weight(self):
+        """A LoRA module the merge cannot map to its weight would refit the base weight."""
+
+        class RenamingWrapper(nn.Module):
+            """Drops its ``inner.`` component from state_dict keys, like CheckpointWrapper."""
+
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+                self._register_state_dict_hook(self._strip_inner)
+
+            @staticmethod
+            def _strip_inner(module, state_dict, prefix, local_metadata):
+                inner = f"{prefix}inner."
+                for key in [k for k in state_dict if k.startswith(inner)]:
+                    state_dict[prefix + key[len(inner) :]] = state_dict.pop(key)
+
+        model = nn.Module()
+        model.block = RenamingWrapper(self._lora_block())
+
+        with pytest.raises(RuntimeError, match="block.inner.proj"):
+            list(automodel_params_generator(model, torch.float32))
+
+    def test_bf16_lora_merge_matches_offline_fp32_merge(self):
+        """The merged bf16 weight equals a single-rounded fp32 merge of the adapter.
+
+        Computing ``B @ A`` and the sum in bf16 rounds twice and can differ from the
+        offline merge (``W.float() + scale * B.float() @ A.float()``, cast once) by a
+        bf16 ulp; the refit must serve exactly the weights a merged checkpoint has.
+        """
+        block = self._lora_block(seed=1).to(torch.bfloat16)
+        model = nn.Module()
+        model.layers = nn.ModuleList([block])
+        expected = self._expected_merge(block.proj)
+
+        results = dict(automodel_params_generator(model, torch.bfloat16))
+
+        assert results["layers.0.proj.weight"].dtype == torch.bfloat16
+        assert torch.equal(results["layers.0.proj.weight"], expected)
+
     def test_contiguous_output(self):
         """Test that output tensors are contiguous."""
         # Arrange
