@@ -5120,7 +5120,7 @@ def test_sync_nemo_gym_draft_ids_reach_training_provider(
     master_config.grpo.use_dynamic_sampling = False
     master_config.policy["draft"] = draft_config
     master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
-    master_config.logger.update({"wandb_enabled": False, "wandb": {}})
+    master_config.logger.wandb_enabled = False
     master_config.env = {"should_use_nemo_gym": True}
 
     grpo_mod.grpo_train(
