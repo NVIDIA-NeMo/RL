@@ -37,6 +37,10 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_hf_config
 from tests.unit.test_utils import SimpleLossFn, UnitSequenceLossFn
 
 try:
+    from nemo_automodel.components.moe.megatron.token_dispatcher import (
+        MoEFlexTokenDispatcher,
+    )
+
     import nemo_rl.models.policy.workers.automodel_policy_worker as worker_mod
     from nemo_rl.models.automodel.config import (
         ModelAndOptimizerState,
@@ -315,6 +319,47 @@ def test_prepare_for_lp_inference_keep_train_buffers(monkeypatch, keep_train_buf
 
     assert model.eval_called
     assert offloaded_devices == ([] if keep_train_buffers else ["cpu"])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("entry", ["offload_before_refit", "offload_after_refit"])
+def test_offload_releases_moe_dispatcher_state_before_empty_cache(monkeypatch, entry):
+    """MoE dispatch state must be released before the allocator cache is emptied.
+
+    Otherwise the recompute activations it keeps alive pin cached segments and
+    colocated generation wakes up with too little free memory.
+    """
+    manager = SimpleNamespace(
+        num_experts=8, token_probs=torch.rand(4, 8, requires_grad=True) * 1.0
+    )
+    dispatcher = MoEFlexTokenDispatcher.__new__(MoEFlexTokenDispatcher)
+    dispatcher._comm_manager = manager
+    experts = nn.Linear(2, 2)
+    experts.token_dispatcher = dispatcher
+
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = nn.Sequential(experts)
+    worker.optimizer = None
+    worker.move_to_cpu = lambda model: model
+    token_probs_at_empty_cache = []
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    # The allocator wake-up is a real ``.cuda()`` call; keep this test CPU-only.
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: token_probs_at_empty_cache.append(manager.token_probs),
+    )
+
+    getattr(AutomodelPolicyWorkerImpl, entry)(worker)
+
+    assert token_probs_at_empty_cache == [None]
+    assert manager.num_experts == 8
 
 
 @pytest.mark.automodel

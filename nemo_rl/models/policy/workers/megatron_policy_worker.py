@@ -2636,9 +2636,13 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
+        sampling_params = self.sampling_params
+        if self._opd_full_enabled and sampling_params is not None:
+            # Full KL has no sampled-target support restriction; leave rollout unchanged.
+            sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
@@ -2658,7 +2662,7 @@ class MegatronPolicyWorkerImpl(
                 post_processing_fn=logprobs_post_processor,
                 forward_only=True,
                 defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
                 model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
@@ -3652,6 +3656,7 @@ class MegatronPolicyWorkerImpl(
         # when pre-quantized refit is enabled for the parameter.
         for name, tensor in base_iter:
             yield from self._maybe_prequantize_param(name, tensor)
+            del tensor
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -3918,6 +3923,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication.
 
@@ -3938,6 +3944,7 @@ class MegatronPolicyWorkerImpl(
                 kv_scales=kv_scales,
                 buffer_size_bytes=buffer_size_bytes,
                 num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
             )
         if guard.fired:
             # The aborted collective returned cleanly, so this is the only signal there is.
@@ -3952,6 +3959,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
@@ -3961,6 +3969,7 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
 
     def _build_layer_to_pp_stage(

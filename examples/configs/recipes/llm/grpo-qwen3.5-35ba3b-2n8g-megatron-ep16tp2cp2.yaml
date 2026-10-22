@@ -21,7 +21,7 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
-      enforce_eager: true
+      # CUDA graphs instead of enforce_eager (~5x faster generation), see #4569
 logger:
   wandb_enabled: true
   tensorboard_enabled: true
