@@ -86,6 +86,8 @@ env:
           allowed_agents: [browsecomp_agent, browsecomp_sandboxed_agent]
           domain: agent
           debug: false
+          # Errors, retries and slow cache reads still print; per-call search/browse/judge lines do not.
+          log_tool_calls: false
           search_provider: exa
           max_results: 10
           search_max_total_length: 30000
