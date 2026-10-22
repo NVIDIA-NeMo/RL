@@ -87,6 +87,35 @@ def test_remote_service_config_rejects_unknown_refit_fields() -> None:
         _config(refit={"checkpoint_dir": "/shared/hf-exports"})
 
 
+def test_gym_receives_external_service_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": _config().model_dump()})
+    assert generation.http_server_api_key is None
+    assert "Authorization" not in generation.client._headers()
+
+    monkeypatch.setenv("TEST_EXTERNAL_VLLM_API_KEY", "test-service-key")
+    config = _config(api_key_env_var="TEST_EXTERNAL_VLLM_API_KEY")
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": config.model_dump()})
+    assert generation.http_server_api_key == "test-service-key"
+    assert generation.client._headers()["Authorization"] == "Bearer test-service-key"
+    assert "test-service-key" not in config.model_dump_json()
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_gym_rejects_missing_external_service_api_key(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is None:
+        monkeypatch.delenv("TEST_EXTERNAL_VLLM_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("TEST_EXTERNAL_VLLM_API_KEY", value)
+    config = _config(api_key_env_var="TEST_EXTERNAL_VLLM_API_KEY")
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": config.model_dump()})
+    with pytest.raises(RuntimeError, match="configured but unset or empty"):
+        _ = generation.http_server_api_key
+
+
 def test_preflight_uses_stock_vllm_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

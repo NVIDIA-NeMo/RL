@@ -79,6 +79,11 @@ class RemoteVllmGeneration(GenerationInterface):
         self.weight_synchronizer = None
         self._paused_for_refit = False
 
+    @property
+    def http_server_api_key(self) -> str | None:
+        """Give Gym the same credential used for external control requests."""
+        return self.client.api_key
+
     def load_and_start(self) -> None:
         """Match the deferred local-vLLM setup hook; the service is already live."""
         preflight_remote_vllm_service(self.remote_config)

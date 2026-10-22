@@ -37,18 +37,25 @@ class RemoteVllmClient:
     def __init__(self, config: RemoteVllmServiceConfig) -> None:
         self.config = config
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json"}
+    @property
+    def api_key(self) -> str | None:
+        """Resolve the credential shared by control requests and Gym rollouts."""
         env_var = self.config.api_key_env_var
         if env_var is None:
-            return headers
+            return None
         api_key = os.environ.get(env_var)
         if not api_key:
             raise RuntimeError(
                 "External rollout API key environment variable "
                 f"{env_var!r} is configured but unset or empty"
             )
-        headers["Authorization"] = f"Bearer {api_key}"
+        return api_key
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Accept": "application/json"}
+        api_key = self.api_key
+        if api_key is not None:
+            headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
     def request(
