@@ -353,13 +353,15 @@ On first run, the HF model is automatically converted to a Megatron checkpoint. 
 export NRL_MEGATRON_CHECKPOINT_DIR="/path/to/your/megatron/checkpoints"
 ```
 
-## Differences from FP8 Training
+## Transformer Engine Training vs. ModelOpt QARL
 
-QARL (via ModelOpt) and NeMo RL's built-in [FP8 training](../fp8.md) (via TransformerEngine) serve different purposes:
+Low-precision training and deployment-matched QARL serve different purposes:
 
-- **TransformerEngine FP8** focuses on **speeding up pre-training and fine-tuning** using real quantization. It replaces linear layers with FP8-native implementations that compute directly in reduced precision for throughput gains.
+- **Transformer Engine (TE) FP8/FP4 training** uses native low-precision kernels and adaptive scales to reduce training cost while aiming for BF16-like learning. Enabling low-precision compute during RL is not, by itself, QARL: it does not ensure that training matches the final quantized inference recipe. See [FP8 training](../fp8.md) and the [TE training flow](https://docs.nvidia.com/deeplearning/transformer-engine/features/low_precision_training/introduction/introduction.html).
 
-- **ModelOpt QARL** focuses on **recovering accuracy under quantization** using quantization-aware training. The policy forward pass uses quantized weights and, depending on the recipe, quantized activations while the backward pass uses full-precision gradients, so the model learns to be robust to quantization error. vLLM generation can use fake quantization or native real-quant ModelOpt formats supported by both ModelOpt export and the pinned vLLM.
+- **ModelOpt QARL** trains the policy for its intended deployment quantization, including mixed formats across layers and calibrated scales where required. Simulated QAT uses QDQ in the forward pass and higher-precision backpropagation with STE; rollout can use fake quantization or native real-quant kernels. Export preserves the supported deployment recipe. See [ModelOpt QAT](https://nvidia.github.io/Model-Optimizer/guides/_basic_quantization.html#quantization-aware-training-qat-and-quantization-aware-distillation-qad).
+
+For calibrated ModelOpt NVFP4 QARL, "static" refers to the global scale: it is calibrated before QAT and held fixed, while block scales can still be computed dynamically. TE instead adapts its training scales to changing tensors for training efficiency; those scales are not calibrated for a fixed deployment recipe.
 
 ## Supported Quantization Formats
 
