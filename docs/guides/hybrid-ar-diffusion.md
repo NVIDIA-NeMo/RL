@@ -152,6 +152,59 @@ AR-mode decoding of the same checkpoints is unchanged — mean over steps 700–
 Within noise. This is expected: the CE term regularizes the diffusion objective, so it should
 not move AR-mode behaviour. Do not read this guide as claiming a general quality improvement.
 
+### Further evidence: a second base RL algorithm
+
+The results above add the CE term to **standard GRPO**. A second set of experiments added
+the same kind of masked-diffusion denoising loss to a different base algorithm, **JustGRPO**,
+on a second model family and on GSM8K / MATH-500, with confidence-threshold decoding at 0.9.
+JustGRPO rolls out with left-to-right, one-token-at-a-time unmasking, which gives an exactly
+factorized diffusion policy. Here its log-probabilities were scored blockwise, in
+`block_size` passes.
+
+**This was a related variant of the loss, not this exact implementation.** It was applied
+only to responses with positive group-relative advantage, and the masking ratio was drawn
+from U(0.05, 1). The weight was the same, λ = 0.1. Read these results as evidence that the
+denoising term helps diffusion-mode decoding regardless of which RL algorithm it is paired
+with, not as a replication of the numbers above.
+
+**LLaDA-8B-Instruct** (full-sequence diffusion, GSM8K, generation length 256, temperature 1):
+
+| decoding | JustGRPO | JustGRPO + denoising loss | Δ |
+| --- | ---: | ---: | ---: |
+| confidence threshold 0.9: accuracy | 84.3 | **88.6** | **+4.3** |
+| confidence threshold 0.9: tokens / forward pass | 5.59 | 4.97 | −11% |
+| one token per step: accuracy | 89.1¹ | **89.4** | +0.3 |
+
+¹ Published score, evaluated at temperature 0, so not strictly like-for-like.
+
+**Nemotron-Labs-Diffusion-3B** (block size 16, temperature 1). The ablation sets λ = 0 and
+keeps every other setting:
+
+| | GSM8K AR | GSM8K diffusion | GSM8K TPF | MATH-500 AR | MATH-500 diffusion | MATH-500 TPF |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| base model (no RL) | 87.9 | 88.4 | 2.7 | 77.6 | 74.8 | 3.0 |
+| JustGRPO, λ = 0 | **94.6** | 91.7 | 3.2 | **88.8** | 78.6 | 4.0 |
+| JustGRPO, λ = 0.1 | 94.5 | **94.3** | 4.5 | 87.8 | **84.2** | 3.5 |
+| Δ from the denoising loss | −0.1 | **+2.6** | +1.3 | −1.0 | **+5.6** | −0.5 |
+
+The pattern matches the ablation above:
+
+- **Diffusion-mode accuracy improves in every setting tested, under both base algorithms.**
+  With GRPO: +3.5 overall and +14.4 AIME-90 on the blend above. With JustGRPO: +4.3 on LLaDA
+  GSM8K, +2.6 on Nemotron GSM8K, and +5.6 on Nemotron MATH-500. Together these cover two RL
+  algorithms, two model families, full-sequence and block diffusion, and short and long
+  generations.
+- **The CE term closes most of the AR–diffusion gap that JustGRPO alone opens.** Without it,
+  Nemotron's diffusion mode trails its AR mode by 2.9 points on GSM8K and 10.2 on MATH-500.
+  With it, the gaps shrink to 0.2 and 3.6.
+- **AR-mode accuracy is essentially unchanged** (−0.1 and −1.0), consistent with the CE term
+  acting on the diffusion objective only.
+- **The throughput effect is mixed.** Tokens per forward pass fall on LLaDA GSM8K and
+  Nemotron MATH-500, as in the generation-time trade-off below, but rise from 3.2 to 4.5 on
+  Nemotron GSM8K.
+
+These numbers come from single training runs, with no seed variation measured.
+
 ### Training cost
 
 The two configs differ only in `ce_loss_weight`, so this is like-for-like. Medians over 1,595
@@ -201,7 +254,9 @@ exact match against a causal verifier rather than a confidence threshold.
 
 ## Limitations
 
-- Validated on one model family and one data blend.
+- This implementation was validated on one model family and one data blend. The supporting
+  results on LLaDA-8B and on GSM8K / MATH-500 used a related variant of the denoising loss
+  on top of JustGRPO rather than GRPO (see "Further evidence").
 - One `ce_loss_weight` value (0.1) against 0.0; no sweep over the weight.
 - Requires a Megatron policy worker that can build the `[noisy | clean]` batch; the built-in
   workers cannot, which is why `worker_extension_cls_fqn` is mandatory and validated at
