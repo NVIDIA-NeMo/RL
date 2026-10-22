@@ -1367,7 +1367,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def offload_to_cpu(self) -> None:
         """Offload to CPU to free GPU memory; currently only used by PPO."""
-        self.offload_after_refit()
+        if self.cfg.get("megatron_cfg", {}).get("enabled", False):
+            futures = self.worker_group.run_all_workers_single_data(
+                "offload_after_refit", clear_transient_caches=True
+            )
+            ray.get(futures)
+        else:
+            self.offload_after_refit()
 
     def save_checkpoint(
         self,

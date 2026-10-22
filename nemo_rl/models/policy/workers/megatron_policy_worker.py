@@ -4520,8 +4520,13 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
-    def offload_after_refit(self):
-        """Offload as much as possible on the CPU."""
+    def offload_after_refit(self, *, clear_transient_caches: bool = False):
+        """Offload as much as possible on the CPU.
+
+        Args:
+            clear_transient_caches: Release completed routing graphs when PPO
+                yields the shared training GPUs to its critic or checkpointer.
+        """
         # Finalize before replacing model-buffer storage. With cached NVRx async
         # saves, the persistent writer otherwise retains CUDA IPC handles to the
         # old storage after the model is moved to CPU.
@@ -4543,6 +4548,10 @@ class MegatronPolicyWorkerImpl(
         # -torch.exp(self.A_log.float()). Set the model in inference mode
         # before offloading the model parameters (including self.A_log).
         self.model.eval()
+        if clear_transient_caches:
+            # Dispatchers are not modules: moving model storage cannot release
+            # their routing tensors or the completed checkpoint graphs they own.
+            clear_transient_model_caches(self.model)
         self.model = self.move_model(
             self.model,
             "cpu",
