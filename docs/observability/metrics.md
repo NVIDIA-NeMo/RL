@@ -1,8 +1,8 @@
 # Metrics
 
-NeMo-RL emits six namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), and per-host memory (`rl.host.memory.*`).
+NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and per-process memory (`rl.process.memory.*`).
 
-Metrics are emitted **only when telemetry is exporting**. All of them are produced on the driver, which always exports: most pass through the driver's metrics logger, while `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer.
+Metrics are emitted **only when telemetry is exporting**. All but one are produced on the driver, which always exports: most pass through the driver's metrics logger, while `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. The exception is `rl.process.memory.pss`, which every exporting process — workers and driver alike — reports about itself.
 
 Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
 
@@ -245,7 +245,25 @@ One known gap follows from the same property. `RewardModelEnvironment` is a Ray 
 - Under colocation `lm_policy` and `vllm_policy` share GPUs and therefore a host, so `sum by (rl.worker_groups)` would count that host's memory once per group.
 - No worker group owns the raylet, the Ray **object store** (often tens of GB, and frequently the thing that actually ran a node out of memory) or — on the head node — the driver, yet all of them are in the number.
 
-Group on it to decide *which* hosts to look at; read `host.name` for the number itself. There is no breakdown inside `ray_node_mem_used`: getting one means per-process sampling (`psutil` RSS from inside each worker, where `rl.worker_group` and `nv.dl.rank` are already on the resource and nothing has to be inferred), and attributing a single process's RSS to tensors versus pinned buffers versus allocator arenas is a profiler's job, not a metric's.
+Group on it to decide *which* hosts to look at; read `host.name` for the number itself. There is no breakdown inside `ray_node_mem_used`; for which process holds the memory, see [`rl.process.memory.pss`](#per-process-memory-rlprocessmemory) below. Attributing a single process's memory to tensors versus pinned buffers versus allocator arenas is a profiler's job, not a metric's.
+
+## Per-process memory (`rl.process.memory.*`)
+
+`rl.host.memory.*` says how full a host is; this says who filled it. Every process that sets up telemetry — each worker in `init_telemetry_worker`, and the driver in `init_telemetry_driver` — reports one point about itself, from `nemo_rl/telemetry/process_memory.py`.
+
+| Metric | Type | Attributes |
+|---|---|---|
+| `rl.process.memory.pss` | Observable up-down counter (`By`) | `rl.worker_group`, `nv.dl.rank`, `process.pid` |
+
+- **The value covers the process and everything it forked** (`psutil.Process().children(recursive=True)`), so a vLLM `EngineCore` or a compile pool is charged to the worker that started it rather than to nobody.
+- **PSS, not RSS.** RSS counts a shared page — CUDA mappings, the object store's shared memory — once for every process mapping it, so summing RSS over-counts. PSS splits each shared page between its sharers, so `sum by (rl.worker_group)` and `sum by (host.name)` are meaningful. That is also why the type is an up-down counter: it is a quantity meant to be summed, which a gauge does not promise a backend.
+- **Labels are on the point, not only the resource.** Ranks restart at 0 in every worker group, so a backend that keys series on point attributes alone would merge rank 0 of every group. `rl.worker_group` is the group's `name_prefix` from `NRL_WORKER_GROUP` (an explicit `worker_group=` wins, as on the resource), `driver` for the driver, and absent for actors built outside `RayWorkerGroup`. `process.pid` starts a new series when a worker restarts, which is bounded but worth knowing.
+
+Why not Ray's own per-process series (`ray_component_uss_bytes`)? Ray keys worker processes on their title, which comes from the actor *class*: two groups built from the same class — distillation's teacher and student, multi-teacher distillation, the reward model's `Policy` beside the trained one — collapse into one series, and the title flips between `ray::<Class>` and `ray::<Class>.<method>` from one scrape to the next. Its Linux "USS" is RSS minus shared, and processes a worker forks itself are in no series at all.
+
+**Cost.** PSS is read from `/proc/<pid>/smaps_rollup` inside the export callback, once per export. The read grows with the process's mapping count: about 0.1 ms at a few hundred mappings, 5 ms at 10k and 11 ms at 30k (Linux 6.18). The full `smaps` file costs ~20× more and is never read.
+
+**Gaps.** Only processes that call `init_telemetry_worker` report. Today that leaves out SGLang, TRT-LLM, Megatron generation, Dynamo and the environment workers, and actors a worker launches through Ray rather than forks — vLLM's tensor-parallel workers under the Ray executor — which are not its OS children. The Ray object store is in no process's number; read it from `rl.host.memory.used`.
 
 ## Metric vs span tag vs resource attribute
 
