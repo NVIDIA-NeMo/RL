@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 import ray
+import yaml
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torch.distributed.checkpoint import FileSystemReader
@@ -1178,7 +1179,10 @@ def _validate_session_resume_checkpoint(
         # saved-config contract. Preserve their existing resume behavior.
         return
 
-    saved = OmegaConf.to_container(OmegaConf.load(saved_path), resolve=True)
+    # CheckpointManager writes resolved model data with yaml.safe_dump. Runtime
+    # environment strings can contain shell ${...} syntax, not interpolations.
+    with saved_path.open() as saved_file:
+        saved = yaml.safe_load(saved_file)
     if not isinstance(saved, Mapping):
         raise ValueError(f"Checkpoint config must be a mapping: {saved_path}")
     validate_session_resume_config(cast(Mapping[str, Any], saved), current)

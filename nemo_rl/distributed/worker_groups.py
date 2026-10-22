@@ -490,6 +490,8 @@ class RayWorkerGroup:
             self.cluster.get_master_address_and_port()
         )
 
+        # Runtime environment propagation must not mutate the caller's config.
+        env_vars = env_vars.copy()
         # Update env_vars with the current environment variables
         for k, v in os.environ.items():
             if k not in env_vars:

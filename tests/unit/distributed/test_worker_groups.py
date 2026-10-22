@@ -14,6 +14,7 @@
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -30,6 +31,29 @@ from nemo_rl.distributed.worker_groups import (
     RayWorkerGroup,
     _get_initializer_env_vars,
 )
+
+
+def test_worker_environment_does_not_mutate_caller_config(monkeypatch) -> None:
+    group = object.__new__(RayWorkerGroup)
+    group.cluster = SimpleNamespace(
+        get_master_address_and_port=lambda: ("127.0.0.1", 12345)
+    )
+    builder = SimpleNamespace(ray_actor_class_fqn="test.worker")
+    env_vars = {"CONFIGURED_ENV": "explicit"}
+    monkeypatch.setenv("EXPORTED_RUNTIME_ENV", "runtime")
+
+    def stop_before_actor_creation(actor_fqn: str) -> str:
+        raise RuntimeError("test stops after merging worker environment")
+
+    monkeypatch.setattr(
+        "nemo_rl.distributed.worker_groups.get_actor_python_env",
+        stop_before_actor_creation,
+    )
+    with pytest.raises(RuntimeError, match="test stops after merging"):
+        group._create_workers_from_bundle_indices(builder, [], env_vars)
+
+    assert list(env_vars) == ["CONFIGURED_ENV"]
+    assert env_vars["CONFIGURED_ENV"] == "explicit"
 
 
 def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):

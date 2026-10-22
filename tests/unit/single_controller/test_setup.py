@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import yaml
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
@@ -2768,6 +2769,37 @@ def test_session_resume_checkpoint_rejects_saved_semantic_drift(
 
     with pytest.raises(ValueError, match="training_mode, subagent limits"):
         sc_setup_mod._validate_session_resume_checkpoint(mc, str(checkpoint))
+
+
+@pytest.mark.parametrize("semantic_drift", [False, True])
+def test_session_resume_checkpoint_treats_exported_shell_functions_as_literals(
+    tmp_path: Path, semantic_drift: bool
+) -> None:
+    checkpoint = tmp_path / "step_8"
+    checkpoint.mkdir()
+    mc = _session_resume_master_config()
+    _write_session_resume_config(checkpoint, mc)
+    config_path = checkpoint / "config.yaml"
+    saved = yaml.safe_load(config_path.read_text())
+    saved["value"] = {
+        "megatron_cfg": {
+            "env_vars": {
+                "BASH_FUNC__module_raw%%": '() { echo "${@}"; }',
+                "LITERAL_INTERPOLATION": "${not_a_config_key}",
+            }
+        }
+    }
+    config_path.write_text(yaml.safe_dump(saved))
+    original = config_path.read_bytes()
+    if semantic_drift:
+        mc.env["nemo_gym"]["swe"]["responses_api_agents"]["swe_agents"][
+            "opencode_subagent_max_depth"
+        ] = 2
+        with pytest.raises(ValueError, match="training_mode, subagent limits"):
+            sc_setup_mod._validate_session_resume_checkpoint(mc, str(checkpoint))
+    else:
+        sc_setup_mod._validate_session_resume_checkpoint(mc, str(checkpoint))
+    assert config_path.read_bytes() == original
 
 
 class TestNativeTQRecoverySetup:
