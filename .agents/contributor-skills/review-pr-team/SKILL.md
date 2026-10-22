@@ -142,7 +142,10 @@ just saying "this is wrong."
 - Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
 - Read every `references/*.md` file in this skill's own directory. These are the shared review
   lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those
-  first when you pass the lessons on.
+  first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a
+  full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those
+  links when you pass the lessons on, and tell every agent to read the detail file whenever its rule
+  applies to what it is checking.
 - Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local
   store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine.
   New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown
@@ -430,7 +433,7 @@ Instructions:
   asking because it began "Separate from the above," — the ask itself was one line and perfectly clear once
   found.
   Give one recommended fix per AI. No menus: no "pick either", no "preferred … or if you'd rather …", no
-  "optional". If a weaker alternative is worth knowing, put it under `**Context — no action.**` or in a fold.
+  "optional". If you cannot pick one, ask the user before staging; do not hand the choice to the author.
 - **EVERY comment needs a one-line TL;DR**, bolded, immediately after the actionability declaration and
   before any prose. No length threshold — a comment without one fails the pre-POST audit. State the defect
   and its consequence, not the topic: "**TL;DR — in colocated mode the `mcore_generation_config` model keys
@@ -562,9 +565,7 @@ Instructions:
   `suggestion` block is directly committable, so it is far more actionable than prose — reach for it by default
   for any clear code/docs fix, not just docstrings and tests. Don't force one where it doesn't fit: if the fix
   spans multiple files, targets a line not in the diff, or is an operational/config/verification ask, give the
-  concrete change in prose. When several valid implementations exist, still show one but label it explicitly as
-  **one way to do it** (e.g. "one option — of several: …") so the author reads it as illustrative, not
-  prescriptive.
+  concrete change in prose. When several valid implementations exist, show only the one you recommend.
 - **Suggestion-or-say-why is a HARD rule, enforced per action item.** Before writing any AI's prose, answer:
   "can this fix be a committable `suggestion` block?" If yes, it MUST be one. If the edit spans multiple
   lines, create the comment as a multi-line thread (`addPullRequestReviewThread` with `startLine` + `line`,
@@ -1918,7 +1919,8 @@ bump the ★ or widen the rule.
 
 **Upstreaming.** When the user asks, move stable local lessons into the right `references/*.md` file
 (one rule per bullet: the rule in bold, then one short example), open a PR, and archive the moved local
-files so they are not read twice.
+files so they are not read twice. If the lesson has steps, commands or repo maps the one-line rule cannot
+carry, copy it into `references/details/` and end the rule with `Details: [name](details/name.md)`.
 
 Set `scope:` deliberately — it routes the lesson when it is upstreamed:
 - `general` → a review-process rule: a `references/` file, or this skill's text once it is stable.
