@@ -53,6 +53,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -122,6 +123,20 @@ class _ValueTrainStep:
     num_microbatches: int = 0
     num_chunks: int = 0
     failed: bool = False
+
+
+def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> None:
+    """Emit one rank-zero marker proving that media reached the value worker."""
+    if getattr(worker, "_reported_multimodal_input", False):
+        return
+    media_fields = sorted(field for field in PACKED_MULTIMODAL_FIELDS if field in data)
+    if not media_fields or getattr(worker, "rank", 0) != 0:
+        return
+    print(
+        "MegatronValueWorker multimodal input fields: " + ",".join(media_fields),
+        flush=True,
+    )
+    worker._reported_multimodal_input = True
 
 
 def _value_head_parent(chunk: GPTModel) -> tuple[Any, str]:
@@ -571,6 +586,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         """
         if self._train_step_state is not None:
             raise RuntimeError("finish or abort the open value train step before train")
+        _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -1037,6 +1053,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 "finish or abort the value train step before inference/offload"
             )
 
+        _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
