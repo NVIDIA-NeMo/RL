@@ -34,10 +34,14 @@ def put(monkeypatch, old_meta, fields):
     md = SimpleNamespace(_custom_backend_meta=old_meta)
 
     async def tq_put(self, data, metadata, data_parser=None):
-        metadata._custom_backend_meta = [{f: {"b": "new"} for f in data} for _ in old_meta]
+        metadata._custom_backend_meta = [
+            {f: {"b": "new"} for f in data} for _ in old_meta
+        ]
 
     monkeypatch.setattr(KVStorageManager, "put_data", tq_put)
-    monkeypatch.setattr(NixlStorageManager, "__del__", lambda self: None)  # __init__ skipped
+    monkeypatch.setattr(
+        NixlStorageManager, "__del__", lambda self: None
+    )  # __init__ skipped
     asyncio.run(mgr.put_data(dict.fromkeys(fields), md))
     return mgr.storage_client.cleared
 

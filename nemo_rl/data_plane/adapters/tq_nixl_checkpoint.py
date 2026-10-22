@@ -133,16 +133,19 @@ def _load_units(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -> N
     # Shard i starts on unit i (mod n); whatever does not fit spills to the next
     # unit in order, so N units restore onto N±k units without a planner. Each
     # round sends every shard with blobs left to its next unit at once, so the
-    # restore takes about one unit's read instead of the sum over units.
+    # restore takes about one unit's read instead of the sum over units. As for
+    # puts, every unit's RAM is tried before any unit spills to its SSD tier.
     shards = manifest["shards"]
     paths = [str(root / s["file"]) for s in shards]
     orders = [
         units[i % len(units) :] + units[: i % len(units)] for i in range(len(shards))
     ]
     pending = [dict(s["blobs"]) for s in shards]
-    for k in range(len(units)):
+    for spill, k in [(s, k) for s in (False, True) for k in range(len(units))]:
         futs = {
-            i: _unit_actor(store, orders[i][k]).load_shard.remote(paths[i], pending[i])
+            i: _unit_actor(store, orders[i][k]).load_shard.remote(
+                paths[i], pending[i], spill
+            )
             for i in range(len(shards))
             if pending[i]
         }

@@ -104,6 +104,20 @@ def _write_all(fd: int, view: memoryview) -> None:
         done += n
 
 
+_COPY_CHUNK = 64 << 20
+
+
+def _copy_out(fd: int, f, nbytes: int) -> None:
+    """Append the first ``nbytes`` of file ``fd`` to open file ``f``."""
+    done = 0
+    while done < nbytes:
+        chunk = os.pread(fd, min(nbytes - done, _COPY_CHUNK), done)
+        if not chunk:
+            raise OSError("short read copying a spilled blob")
+        f.write(chunk)
+        done += len(chunk)
+
+
 def _locked(fn):
     """Serialise a unit method under the unit lock.
 
@@ -329,12 +343,7 @@ class NixlStorageUnit:
         fd = None
         ok = False
         try:
-            # The file is unlinked at once and kept by its fd: nothing is left on
-            # the node's disk when the unit dies, however it dies. Named by a fresh
-            # uuid, not the client-supplied blob id, so no id can steer the path.
-            path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-            os.unlink(path)
+            fd = self._new_file()
             at = self.staging_base + rec.staged_off
             _write_all(fd, memoryview(self.slab)[at : at + rec.nbytes])
             ok = True
@@ -357,6 +366,18 @@ class NixlStorageUnit:
                 self.ssd_stats["spill_failures"] += 1
         if fd is not None and not (ok and not gone):
             _close(fd)
+
+    def _new_file(self) -> int:
+        """Open a fresh file in the SSD dir and unlink it at once; the fd keeps it.
+
+        Nothing is left on the node's disk when the unit dies, however it dies.
+        Named by a fresh uuid, not the client-supplied blob id, so no id can
+        steer the path.
+        """
+        path = os.path.join(self.ssd_dir, f"{uuid.uuid4().hex}.blob")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.unlink(path)
+        return fd
 
     def _start_stage(self, b: str, rec: BlobRec, now: float) -> None:
         """Stage a disk blob into the IO area, if room can be found."""
@@ -579,8 +600,11 @@ class NixlStorageUnit:
         if self.ssd_dir is None:
             self._free_region(rec)
             return
-        # SSD on: clients read every blob pinned, never by hint, so a copy is
-        # free once its pins end (design I4).
+        # SSD on: a copy is free once its pins end. Put-area blobs are also read
+        # by hint, without a pin: a hinted read issued after the release fails
+        # its footer tag check and raises. A READ already in flight while the
+        # region is reused is not guarded; consumers do not read a key while it
+        # is being cleared or overwritten, so a reasonable run never does this.
         now = time.monotonic()
         at = rec.pin_expiry(now)
         if rec.in_slab:
@@ -735,15 +759,21 @@ class NixlStorageUnit:
         served. Each snapshotted blob carries a hold: one released meanwhile is
         freed only after it is copied. Every exit, including an exception at
         any step, drops exactly the holds taken (one outer try).
+
+        SSD on: a disk blob is copied from its file, through a dup of its fd
+        taken just before the copy. A disk blob released meanwhile may already
+        have its file closed; the save then raises (a clear during a checkpoint
+        is outside TQ's contract). A spill not acknowledged yet is not
+        published, so it is skipped.
         """
-        if self.ssd_dir is not None:
-            raise NotImplementedError("save_shard with the SSD tier on")
         held: list[tuple[str, BlobRec, int]] = []
         try:
             with self._mu:
                 self.checkpointing = True
                 self.clears_during_save = 0
                 for b, rec in self.blobs.items():
+                    if not rec.in_slab and rec.disk is None:
+                        continue
                     rec.holds += 1
                     held.append((b, rec, rec.refs))
             index: dict[str, list[int]] = {}
@@ -752,7 +782,21 @@ class NixlStorageUnit:
             view = memoryview(self.slab)
             with open(tmp, "wb") as f:
                 for b, rec, refs in held:
-                    f.write(view[rec.off : rec.off + rec.nbytes])
+                    if rec.in_slab:
+                        f.write(view[rec.off : rec.off + rec.nbytes])
+                    else:
+                        with self._mu:
+                            fd = None if rec.disk is None else os.dup(rec.disk)
+                        if fd is None:
+                            raise RuntimeError(
+                                f"unit {self.unit_id}: blob {b} was released during "
+                                "save_shard; TransferQueue does not support clears "
+                                "during a checkpoint"
+                            )
+                        try:
+                            _copy_out(fd, f, rec.nbytes)
+                        finally:
+                            _close(fd)
                     index[b] = [pos, rec.nbytes, refs]
                     pos += rec.nbytes
                 f.flush()
@@ -778,18 +822,19 @@ class NixlStorageUnit:
         return {"blobs": index, "nbytes": pos, "clears_during_save": clears}
 
     def load_shard(
-        self, path: str, blobs: dict[str, list[int]]
+        self, path: str, blobs: dict[str, list[int]], spill: bool = False
     ) -> dict[str, list[str]]:
         """Read ``blobs`` (``blob_id -> [off_in_file, nbytes, refs]``) from ``path`` into fresh regions.
 
         Blobs that do not fit are returned under ``failed`` so the caller can
-        spill them to another unit; already-present blobs count as loaded.
+        try another unit; already-present blobs count as loaded. With ``spill``
+        and the SSD tier on, a blob the put area cannot take goes to a file
+        instead, as a spilled put would (the caller asks for that only once
+        every unit's RAM is full, as puts do).
 
         Regions are allocated under the unit lock but filled without it; a
         blob is published only once its bytes are in place.
         """
-        if self.ssd_dir is not None:
-            raise NotImplementedError("load_shard with the SSD tier on")
         loaded: list[str] = []
         failed: list[str] = []
         view = memoryview(self.slab)
@@ -804,8 +849,11 @@ class NixlStorageUnit:
                     try:
                         dst = self.alloc_.alloc(nbytes)
                     except UnitFull:
-                        failed.append(b)
-                        continue
+                        dst = None
+                if dst is None:
+                    ok = spill and self._load_to_disk(f, b, int(off), nbytes, int(refs))
+                    (loaded if ok else failed).append(b)
+                    continue
                 try:
                     f.seek(int(off))
                     target = view[dst : dst + nbytes]
@@ -828,3 +876,47 @@ class NixlStorageUnit:
                     )
                 loaded.append(b)
         return {"loaded": loaded, "failed": failed}
+
+    def _load_to_disk(self, f, b: str, off: int, nbytes: int, refs: int) -> bool:
+        """Restore one blob from checkpoint file ``f`` into a fresh SSD file.
+
+        False (the caller tries another unit) with the SSD tier off, if the blob
+        could never be staged back for a read, or if the disk write fails.
+        """
+        io = self.staging_
+        if io is None or align_up(nbytes, io.align) > io.capacity:
+            return False
+        fd = None
+        try:
+            fd = self._new_file()
+            f.seek(off)
+            done = 0
+            while done < nbytes:
+                chunk = f.read(min(nbytes - done, _COPY_CHUNK))
+                if not chunk:  # a bad checkpoint, not a full disk: fail the restore
+                    raise EOFError(f"short read restoring blob {b}")
+                view, w = memoryview(chunk), 0
+                while w < len(view):  # pwrite may write less than asked
+                    w += os.pwrite(fd, view[w:], done + w)
+                done += len(chunk)
+        except OSError as e:
+            if fd is not None:
+                _close(fd)
+            log.warning("unit %d: restoring %s to disk failed: %s", self.unit_id, b, e)
+            return False
+        except BaseException:
+            if fd is not None:
+                _close(fd)
+            raise
+        with self._mu:
+            self.blobs[b] = BlobRec(
+                off=0,
+                nbytes=nbytes,
+                refs=refs,
+                created_at=time.monotonic(),
+                in_slab=False,
+                disk=fd,
+            )
+            self.ssd_stats["spilled_bytes"] += nbytes
+            self.ssd_stats["spills"] += 1
+        return True
