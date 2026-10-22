@@ -132,7 +132,8 @@ def encode_value(
             str(v.dtype).removeprefix("torch."),
             tuple(v.shape),
         )
-    if isinstance(v, np.ndarray) and v.dtype != object:
+    # Exact ndarray, no record fields: subclasses (masked...) and structured go pickled.
+    if type(v) is np.ndarray and v.dtype != object and v.dtype.fields is None:
         mv, keep = _numpy_bytes(v)
         return mv, keep, KIND_NUMPY, v.dtype.str, tuple(v.shape)
     b = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
