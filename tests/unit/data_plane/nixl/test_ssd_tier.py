@@ -395,10 +395,98 @@ def test_freed_region_loses_its_footer():
     assert u.slab[off] == 7  # only the footer is wiped
 
 
-def test_checkpoint_is_refused_with_ssd_on(tmp_path):
-    u = _unit(tmp_path)
-    with pytest.raises(NotImplementedError):
+def _spilled(u):
+    """Six blobs in the put area, two on disk: fills 1..8."""
+    _fill(u)
+    _put(u, "b6", 7)
+    _put(u, "b7", 8)
+    assert u.stats()["disk_only_blobs"] == 2
+
+
+def _fill_of(b):
+    return int(b[1:]) + 1
+
+
+def test_checkpoint_saves_put_area_and_disk_blobs(tmp_path):
+    u = _unit(tmp_path / "u")
+    _spilled(u)
+    fds = _open_fds()
+    res = u.save_shard(str(tmp_path / "s"))
+    assert _open_fds() == fds  # each dup'd fd is closed after its copy
+    assert sorted(res["blobs"]) == [f"b{i}" for i in range(8)]
+    raw = (tmp_path / "s").read_bytes()
+    assert res["nbytes"] == len(raw) == 8 * BLOB
+    for b, (off, n, refs) in res["blobs"].items():
+        assert set(raw[off : off + n]) == {_fill_of(b)} and refs == 1
+    assert all(r.holds == 0 for r in u.blobs.values())
+
+
+def test_checkpoint_raises_if_a_disk_blob_is_released_during_it(tmp_path, monkeypatch):
+    u = _unit(tmp_path / "u")
+    _spilled(u)
+    dup = os.dup
+
+    def release_b7_first(fd):
+        rec = u.blobs.pop("b7", None)  # a clear, then its stage closes the file
+        if rec is not None:
+            os.close(rec.disk)
+            rec.disk = None
+        return dup(fd)
+
+    monkeypatch.setattr(nixl_storage_unit.os, "dup", release_b7_first)
+    with pytest.raises(RuntimeError, match="released during save_shard"):
         u.save_shard(str(tmp_path / "s"))
+    assert all(r.holds == 0 for r in u.blobs.values())
+    assert not u.checkpointing
+
+
+def test_checkpoint_skips_a_spill_not_acknowledged_yet(tmp_path, monkeypatch):
+    u = _unit(tmp_path / "u")
+    _fill(u)
+    go, entered = _gate_pwrite(monkeypatch)
+    off = u.alloc("s", BLOB, 1)
+    u.slab[off : off + BLOB] = 9
+    assert u.commit("s") == "pending"
+    assert entered.wait(5)
+    res = u.save_shard(str(tmp_path / "s"))
+    go.set()
+    assert "s" not in res["blobs"] and len(res["blobs"]) == 6
+
+
+def test_restore_spills_only_when_asked_and_reads_back(tmp_path):
+    src = _unit(tmp_path / "a")
+    _spilled(src)
+    res = src.save_shard(str(tmp_path / "s"))
+    dst = _unit(tmp_path / "b")
+    first = dst.load_shard(str(tmp_path / "s"), res["blobs"])
+    assert len(first["loaded"]) == 6 and len(first["failed"]) == 2  # RAM only
+    left = {b: res["blobs"][b] for b in first["failed"]}
+    second = dst.load_shard(str(tmp_path / "s"), left, spill=True)
+    assert sorted(second["loaded"]) == sorted(left) and not second["failed"]
+    assert dst.stats()["disk_only_blobs"] == 2
+    for b in res["blobs"]:
+        data, pin = _read(dst, b)
+        assert set(data) == {_fill_of(b)}, b
+        dst.unpin(pin)
+
+
+def test_restore_with_a_full_disk_leaves_the_blob_to_another_unit(
+    tmp_path, monkeypatch
+):
+    src = _unit(tmp_path / "a")
+    _spilled(src)
+    res = src.save_shard(str(tmp_path / "s"))
+    dst = _unit(tmp_path / "b")
+    _fill(dst)  # put area full
+
+    def no_space(*a):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(nixl_storage_unit.os, "pwrite", no_space)
+    blobs = {f"r{b}": v for b, v in res["blobs"].items()}
+    out = dst.load_shard(str(tmp_path / "s"), blobs, spill=True)
+    assert not out["loaded"] and len(out["failed"]) == 8
+    assert not any(b.startswith("r") for b in dst.blobs)
 
 
 # ------------------------------------------------------------------ client

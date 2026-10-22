@@ -164,7 +164,7 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     # process refuses further transfers (DataPlaneFatal).
     graveyard_max_bytes: int = 4294967296
     # SSD tier: {enabled, dir, staging_bytes, pickup_s}; puts the put area cannot take go to disk;
-    # see tq_nixl.ssd_config. Checkpointing the store with it on is not supported.
+    # see tq_nixl.ssd_config.
     ssd: dict[str, Any] = Field(default_factory=lambda: {"enabled": False})
     nixl: dict[str, Any] = Field(
         default_factory=lambda: {"backend_name": "UCX", "backend_init_params": {}}
@@ -220,13 +220,8 @@ def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     checkpointing settings decide whether a run saves data-plane state;
     normal PUTs remain memory-only. An unrecognized future backend defaults to
     unsupported until its storage payload and controller metadata are both
-    known to round-trip through a checkpoint. NIXL with its SSD tier on cannot
-    checkpoint yet (the unit refuses save/load_shard).
+    known to round-trip through a checkpoint.
     """
-    if cfg["backend"] == "nixl":
-        ssd = backend_config(cfg).model_dump().get("ssd") or {}
-        if ssd.get("enabled", False):
-            return False
     return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
 
 
