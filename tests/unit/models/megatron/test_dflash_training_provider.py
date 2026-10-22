@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -26,7 +27,9 @@ from nemo_rl.models.megatron.draft.hidden_capture import CapturedStates
 from nemo_rl.models.megatron.draft.sequence_layout import build_draft_sequence_layout
 from nemo_rl.models.megatron.draft.training import (
     DFlashForwardOutput,
+    _check_cp_boundary_exclusion,
     _embed_draft_mask_tokens,
+    _validate_captured_sequence_layout,
     resolve_draft_speculator,
 )
 from nemo_rl.models.policy.draft_config import MegatronDFlashDraftConfig
@@ -355,3 +358,113 @@ def test_dflash_provider_consumes_reconstructed_sp_captures_on_cp_owner() -> Non
     stats.normalized(normalization_counts=stats.counts).backward()
     assert draft.scale.grad is not None
     assert teacher_logits.grad is None
+
+
+def _window_counts(*, excluded: int, eligible: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        excluded_window_count=torch.tensor(excluded, dtype=torch.int64),
+        eligible_window_count=torch.tensor(eligible, dtype=torch.int64),
+    )
+
+
+def test_cp_boundary_exclusion_warns_when_microbatch_has_no_windows() -> None:
+    with pytest.warns(UserWarning, match="DSpark microbatch has no draft training"):
+        _check_cp_boundary_exclusion(
+            _window_counts(excluded=0, eligible=0),
+            max_fraction=0.5,
+            label="DSpark",
+        )
+
+
+@pytest.mark.parametrize(
+    ("excluded", "eligible", "rejected"),
+    [(3, 1, True), (1, 3, False), (0, 4, False)],
+)
+def test_cp_boundary_exclusion_rejects_only_fractions_above_limit(
+    excluded: int, eligible: int, rejected: bool
+) -> None:
+    plan = _window_counts(excluded=excluded, eligible=eligible)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        if rejected:
+            with pytest.raises(ValueError, match="DFlash CP boundary exclusion"):
+                _check_cp_boundary_exclusion(plan, max_fraction=0.5, label="DFlash")
+        else:
+            _check_cp_boundary_exclusion(plan, max_fraction=0.5, label="DFlash")
+
+
+@pytest.mark.parametrize("label", ["DFlash", "DSpark"])
+def test_captured_layout_validation_rejects_mismatches_with_provider_label(
+    label: str,
+) -> None:
+    layout = build_draft_sequence_layout(
+        logical_sample_ids=torch.tensor([101, 303], dtype=torch.int64),
+        cu_seqlens_q=torch.tensor([0, 7, 12], dtype=torch.int64),
+        cu_seqlens_q_padded=torch.tensor([0, 8, 16], dtype=torch.int64),
+        cp_rank=1,
+        cp_size=2,
+        tp_rank=0,
+        tp_size=2,
+        device=torch.device("cpu"),
+    )
+    local_length = layout.cp_global_positions.numel()
+    hidden = torch.randn(local_length, 1, 8)
+    embeds = torch.randn(local_length, 1, 4)
+    input_ids = torch.ones(1, local_length, dtype=torch.int64)
+    cases = [
+        (CapturedStates(inputs_embeds=embeds), "did not capture target hidden states"),
+        (CapturedStates(hidden_states=hidden), "did not capture target embeddings"),
+        (
+            CapturedStates(hidden_states=hidden, inputs_embeds=embeds),
+            "packed target output hidden states were not captured",
+        ),
+        (
+            CapturedStates(
+                hidden_states=hidden, inputs_embeds=embeds, output_hidden=embeds
+            ),
+            "different sequence layouts",
+        ),
+        (
+            CapturedStates(
+                hidden_states=hidden,
+                inputs_embeds=embeds,
+                output_hidden=embeds,
+                sequence_layout=layout,
+            ),
+            "sequence-parallel captures were not reconstructed",
+        ),
+    ]
+    for captured, message in cases:
+        with pytest.raises((RuntimeError, ValueError), match=f"{label} .*{message}"):
+            _validate_captured_sequence_layout(
+                captured_states=captured,
+                sequence_layout=layout,
+                input_ids_cp_local=input_ids,
+                label=label,
+            )
+    with pytest.raises(ValueError, match=f"{label} packed input_ids_cp_local"):
+        _validate_captured_sequence_layout(
+            captured_states=CapturedStates(
+                hidden_states=hidden,
+                inputs_embeds=embeds,
+                output_hidden=embeds,
+                sequence_layout=layout,
+                sequence_is_reconstructed=True,
+            ),
+            sequence_layout=layout,
+            input_ids_cp_local=input_ids[:, :-1],
+            label=label,
+        )
+    returned = _validate_captured_sequence_layout(
+        captured_states=CapturedStates(
+            hidden_states=hidden,
+            inputs_embeds=embeds,
+            output_hidden=embeds,
+            sequence_layout=layout,
+            sequence_is_reconstructed=True,
+        ),
+        sequence_layout=layout,
+        input_ids_cp_local=input_ids,
+        label=label,
+    )
+    assert returned[0] is hidden and returned[1] is embeds

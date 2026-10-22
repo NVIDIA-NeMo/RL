@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, cast
@@ -137,6 +138,87 @@ def _embed_draft_mask_tokens(
             "target-SP mask embedding gather did not reconstruct the padded block"
         )
     return gathered_embeddings[:gamma].transpose(0, 1).contiguous()
+
+
+def _check_cp_boundary_exclusion(
+    plan: DFlashBatchPlan | DSparkBatchPlan,
+    *,
+    max_fraction: float,
+    label: str,
+) -> None:
+    """Reject plans that lose too many windows at CP boundaries."""
+    total_windows = plan.excluded_window_count + plan.eligible_window_count
+    exclusion_fraction = plan.excluded_window_count.to(torch.float32) / (
+        total_windows.clamp_min(1).to(torch.float32)
+    )
+    exceeds_limit, no_windows = torch.stack(
+        (
+            (total_windows > 0) & (exclusion_fraction > max_fraction),
+            total_windows == 0,
+        )
+    ).tolist()
+    if exceeds_limit:
+        raise ValueError(
+            f"{label} CP boundary exclusion exceeds max_cp_boundary_exclusion_fraction"
+        )
+    if no_windows:
+        warnings.warn(
+            f"{label} microbatch has no draft training windows, so the draft "
+            "gets no gradient from it",
+            stacklevel=3,
+        )
+
+
+def _validate_captured_sequence_layout(
+    *,
+    captured_states: CapturedStates,
+    sequence_layout: DraftSequenceLayout | None,
+    input_ids_cp_local: Tensor,
+    label: str,
+) -> tuple[Tensor, Tensor]:
+    """Check block-draft target captures against the microbatch layout.
+
+    Returns:
+        The captured target hidden states and input embeddings.
+    """
+    hidden_states = captured_states.hidden_states
+    inputs_embeds = captured_states.inputs_embeds
+    if hidden_states is None:
+        raise RuntimeError(f"{label} training did not capture target hidden states")
+    if inputs_embeds is None:
+        raise RuntimeError(f"{label} training did not capture target embeddings")
+    if sequence_layout is not None and captured_states.output_hidden is None:
+        raise RuntimeError(
+            f"{label} packed target output hidden states were not captured"
+        )
+    if captured_states.sequence_layout is not sequence_layout:
+        captured_layout = captured_states.sequence_layout
+        layouts_match = (
+            captured_layout is not None
+            and sequence_layout is not None
+            and captured_layout.cp_rank == sequence_layout.cp_rank
+            and captured_layout.tp_rank == sequence_layout.tp_rank
+            and torch.equal(captured_layout.descriptor, sequence_layout.descriptor)
+        )
+        if not layouts_match:
+            raise RuntimeError(
+                f"{label} target captures and microbatch use different sequence layouts"
+            )
+    if sequence_layout is not None:
+        expected_input_shape = (1, sequence_layout.cp_global_positions.numel())
+        if input_ids_cp_local.shape != expected_input_shape:
+            raise ValueError(
+                f"{label} packed input_ids_cp_local must have shape "
+                f"{expected_input_shape}, got {tuple(input_ids_cp_local.shape)}"
+            )
+        if (
+            sequence_layout.tp_size > 1
+            and not captured_states.sequence_is_reconstructed
+        ):
+            raise RuntimeError(
+                f"{label} target sequence-parallel captures were not reconstructed"
+            )
+    return hidden_states, inputs_embeds
 
 
 class DraftTrainingProvider(Protocol):
@@ -510,18 +592,11 @@ class DFlashSpeculator:
             seed=self.config.seed,
             sequence_layout=sequence_layout,
         )
-        total_windows = plan.excluded_window_count + plan.eligible_window_count
-        exclusion_fraction = plan.excluded_window_count.to(torch.float32) / (
-            total_windows.clamp_min(1).to(torch.float32)
+        _check_cp_boundary_exclusion(
+            plan,
+            max_fraction=self.config.max_cp_boundary_exclusion_fraction,
+            label="DFlash",
         )
-        exceeds_limit = (total_windows > 0) & (
-            exclusion_fraction > self.config.max_cp_boundary_exclusion_fraction
-        )
-        if bool(exceeds_limit.item()):
-            raise ValueError(
-                "DFlash CP boundary exclusion exceeds "
-                "max_cp_boundary_exclusion_fraction"
-            )
         return plan
 
     def forward(
@@ -541,44 +616,12 @@ class DFlashSpeculator:
     ) -> None:
         # The sequence layout already carries the packed segment boundaries.
         del attention_mask, packed_seq_params
-        if captured_states.hidden_states is None:
-            raise RuntimeError("DFlash training did not capture target hidden states")
-        if captured_states.inputs_embeds is None:
-            raise RuntimeError("DFlash training did not capture target embeddings")
-        if sequence_layout is not None and captured_states.output_hidden is None:
-            raise RuntimeError(
-                "DFlash packed target output hidden states were not captured"
-            )
-        if captured_states.sequence_layout is not sequence_layout:
-            captured_layout = captured_states.sequence_layout
-            layouts_match = (
-                captured_layout is not None
-                and sequence_layout is not None
-                and captured_layout.cp_rank == sequence_layout.cp_rank
-                and captured_layout.tp_rank == sequence_layout.tp_rank
-                and torch.equal(captured_layout.descriptor, sequence_layout.descriptor)
-            )
-            if not layouts_match:
-                raise RuntimeError(
-                    "DFlash target captures and microbatch use different sequence layouts"
-                )
-        if sequence_layout is not None:
-            expected_input_shape = (
-                1,
-                sequence_layout.cp_global_positions.numel(),
-            )
-            if input_ids_cp_local.shape != expected_input_shape:
-                raise ValueError(
-                    "DFlash packed input_ids_cp_local must have shape "
-                    f"{expected_input_shape}, got {tuple(input_ids_cp_local.shape)}"
-                )
-            if (
-                sequence_layout.tp_size > 1
-                and not captured_states.sequence_is_reconstructed
-            ):
-                raise RuntimeError(
-                    "DFlash target sequence-parallel captures were not reconstructed"
-                )
+        hidden_states, inputs_embeds = _validate_captured_sequence_layout(
+            captured_states=captured_states,
+            sequence_layout=sequence_layout,
+            input_ids_cp_local=input_ids_cp_local,
+            label="DFlash",
+        )
         plan = self.prepare_batch(
             data,
             optimizer_step=optimizer_step,
@@ -586,12 +629,12 @@ class DFlashSpeculator:
         )
         hidden_size = int(cast(DFlashBody, draft_model).config.hidden_size)
         target_taps = (
-            captured_states.hidden_states.detach()
+            hidden_states.detach()
             .unflatten(-1, (len(self.capture_layer_ids()), hidden_size))
             .permute(1, 0, 2, 3)
             .contiguous()
         )
-        input_embeddings = captured_states.inputs_embeds.detach().transpose(0, 1)
+        input_embeddings = inputs_embeds.detach().transpose(0, 1)
         if sequence_layout is None:
             anchor_embeddings = input_embeddings[
                 plan.sample_rows,
@@ -863,18 +906,11 @@ class DSparkSpeculator:
             seed=self.config.seed,
             sequence_layout=sequence_layout,
         )
-        total_windows = plan.excluded_window_count + plan.eligible_window_count
-        exclusion_fraction = plan.excluded_window_count.to(torch.float32) / (
-            total_windows.clamp_min(1).to(torch.float32)
+        _check_cp_boundary_exclusion(
+            plan,
+            max_fraction=self.config.max_cp_boundary_exclusion_fraction,
+            label="DSpark",
         )
-        exceeds_limit = (total_windows > 0) & (
-            exclusion_fraction > self.config.max_cp_boundary_exclusion_fraction
-        )
-        if bool(exceeds_limit.item()):
-            raise ValueError(
-                "DSpark CP boundary exclusion exceeds "
-                "max_cp_boundary_exclusion_fraction"
-            )
         return plan
 
     @staticmethod
@@ -939,44 +975,12 @@ class DSparkSpeculator:
     ) -> None:
         # The sequence layout already carries the packed segment boundaries.
         del attention_mask, packed_seq_params
-        if captured_states.hidden_states is None:
-            raise RuntimeError("DSpark training did not capture target hidden states")
-        if captured_states.inputs_embeds is None:
-            raise RuntimeError("DSpark training did not capture target embeddings")
-        if sequence_layout is not None and captured_states.output_hidden is None:
-            raise RuntimeError(
-                "DSpark packed target output hidden states were not captured"
-            )
-        if captured_states.sequence_layout is not sequence_layout:
-            captured_layout = captured_states.sequence_layout
-            layouts_match = (
-                captured_layout is not None
-                and sequence_layout is not None
-                and captured_layout.cp_rank == sequence_layout.cp_rank
-                and captured_layout.tp_rank == sequence_layout.tp_rank
-                and torch.equal(captured_layout.descriptor, sequence_layout.descriptor)
-            )
-            if not layouts_match:
-                raise RuntimeError(
-                    "DSpark target captures and microbatch use different sequence layouts"
-                )
-        if sequence_layout is not None:
-            expected_input_shape = (
-                1,
-                sequence_layout.cp_global_positions.numel(),
-            )
-            if input_ids_cp_local.shape != expected_input_shape:
-                raise ValueError(
-                    "DSpark packed input_ids_cp_local must have shape "
-                    f"{expected_input_shape}, got {tuple(input_ids_cp_local.shape)}"
-                )
-            if (
-                sequence_layout.tp_size > 1
-                and not captured_states.sequence_is_reconstructed
-            ):
-                raise RuntimeError(
-                    "DSpark target sequence-parallel captures were not reconstructed"
-                )
+        hidden_states, inputs_embeds = _validate_captured_sequence_layout(
+            captured_states=captured_states,
+            sequence_layout=sequence_layout,
+            input_ids_cp_local=input_ids_cp_local,
+            label="DSpark",
+        )
         plan = self.prepare_batch(
             data,
             optimizer_step=optimizer_step,
@@ -985,12 +989,12 @@ class DSparkSpeculator:
         adapter = cast(Any, unwrap_model(draft_model))
         hidden_size = int(adapter.body.config.hidden_size)
         target_taps = (
-            captured_states.hidden_states.detach()
+            hidden_states.detach()
             .unflatten(-1, (len(self.capture_layer_ids()), hidden_size))
             .permute(1, 0, 2, 3)
             .contiguous()
         )
-        input_embeddings = captured_states.inputs_embeds.detach().transpose(0, 1)
+        input_embeddings = inputs_embeds.detach().transpose(0, 1)
         if sequence_layout is None:
             anchor_embeddings = input_embeddings[
                 plan.sample_rows,
