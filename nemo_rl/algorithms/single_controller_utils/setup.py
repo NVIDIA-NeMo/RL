@@ -1686,6 +1686,17 @@ def setup_single_controller(
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
 
+    # NIXL units with storage_unit_placement=inference read the inference
+    # placement groups when TQ bootstraps inside the trainer build, which runs
+    # in parallel with the generation build: reserve them first.
+    nixl_block = dp_config.get("nixl") or {}
+    if (
+        not colocated
+        and dp_config["backend"] == "nixl"
+        and nixl_block.get("storage_unit_placement") == "inference"
+    ):
+        inference_cluster.get_placement_groups()
+
     # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
     # after the train/teacher claims above, and used twice: TQ's bootstrap in
     # the trainer pins SimpleStorageUnits to it, and start_storage_units below
