@@ -72,7 +72,7 @@ For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/n
 
 NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
 
-RL sends each prompt group to an actor hosting the selected server. The server's Gym configuration determines how the task runs, including forwarding to an agent through `legacy_agent`. Existing flat rows remain supported through `agent_ref.name` or `task_source`.
+RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
 
 ### Shard NeMo Gym across nodes
 

@@ -265,6 +265,31 @@ def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
     )
 
 
+def _get_environment_server_agent_ref(
+    global_config: Mapping[str, Any], server_name: str
+) -> dict[str, Any]:
+    """Require the single-agent server contract used for taskset rollouts."""
+    entry = global_config.get(server_name)
+    servers = entry.get("environment_servers") if isinstance(entry, Mapping) else None
+    if not isinstance(servers, Mapping) or len(servers) != 1:
+        raise ShardConfigError(
+            f"Config entry {server_name!r} must declare exactly one Environment Server"
+        )
+    server = next(iter(servers.values()))
+    agent_ref = server.get("agent_server") if isinstance(server, Mapping) else None
+    if (
+        not isinstance(agent_ref, Mapping)
+        or agent_ref.get("type") != "responses_api_agents"
+        or not isinstance(agent_ref.get("name"), str)
+        or not agent_ref["name"]
+    ):
+        raise ShardConfigError(
+            f"Environment Server {server_name!r} must declare an agent_server "
+            "reference for NeMo-RL's single-agent training integration"
+        )
+    return dict(agent_ref)
+
+
 def _prepare_materialized_nemo_gym_rows(
     rows: list[dict],
     global_config: Mapping[str, Any],
@@ -285,29 +310,9 @@ def _prepare_materialized_nemo_gym_rows(
             continue
         TaskId.model_validate(row["task_id"])
         server_name = get_nemo_gym_route_name(row, environment_server_routes)
-        entry = global_config.get(server_name)
-        servers = (
-            entry.get("environment_servers") if isinstance(entry, Mapping) else None
-        )
-        if not isinstance(servers, Mapping) or len(servers) != 1:
-            raise ValueError(
-                f"Taskset {row['task_id']['taskset']!r} routes to {server_name!r}, "
-                "which must declare exactly one Environment Server"
-            )
-        server = next(iter(servers.values()))
-        agent_ref = server.get("agent_server") if isinstance(server, Mapping) else None
-        if (
-            not isinstance(agent_ref, Mapping)
-            or agent_ref.get("type") != "responses_api_agents"
-            or not isinstance(agent_ref.get("name"), str)
-            or not agent_ref["name"]
-        ):
-            raise ValueError(
-                f"Environment Server {server_name!r} must declare an agent_server "
-                "reference for NeMo-RL's single-agent training integration"
-            )
+        agent_ref = _get_environment_server_agent_ref(global_config, server_name)
         row["_ng_environment_server"] = server_name
-        row["agent_ref"] = dict(agent_ref)
+        row["agent_ref"] = agent_ref
         if maybe_rollout_id_from_run_body(row) is None:
             # Sync training and validation carry RL group coordinates instead
             # of Gym task indices. Include the retry attempt without using
@@ -321,9 +326,9 @@ def _prepare_materialized_nemo_gym_rows(
 def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
     """Validate an episode reply and retain its training result and IDs.
 
-    Replies to flat rows and flat compatibility-server replies are opaque and
-    must not be unwrapped just because a verifier returns a field called
-    ``result``. Reported episode failures are exceptions, never scored rollouts.
+    Replies to flat rows and successful flat compatibility-server replies are
+    opaque and must not be unwrapped just because a verifier returns a field
+    called ``result``. Reported episode failures are exceptions, never scored rollouts.
     """
     if not is_nemo_gym_task(row):
         return reply
@@ -336,6 +341,17 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         and isinstance(reply.get("task_id"), Mapping)
         and ("result" in reply or "failure" in reply)
     ):
+        # single_agent_turn_legacy reports episode failures in a flat HTTP 200 body.
+        if isinstance(reply, Mapping) and reply.get("_ng_failure_class"):
+            detail = (
+                f"NeMo-Gym task {row['task_id']} failed: "
+                f"{reply.get('_ng_failure_message')}"
+            )
+            if reply.get("_ng_failure_stage"):
+                detail += f" (stage={reply['_ng_failure_stage']})"
+            if reply.get("_ng_failure_terminal"):
+                raise GymTerminalEpisodeFailure(detail)
+            raise GymTransportError(detail)
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
@@ -1329,7 +1345,7 @@ Depending on your data shape, you may want to change these values."""
         return entries
 
     def list_environment_server_routes(self) -> dict[str, str]:
-        """Cache taskset routes from Gym's merged config on first discovery.
+        """Validate local taskset destinations and cache Gym's merged routes.
 
         Shared maps can name servers hosted by other actors. The driver checks
         destinations against all actors after startup.
@@ -1345,7 +1361,8 @@ Depending on your data shape, you may want to change these values."""
         # Gym is installed only in the actor's runtime environment.
         from nemo_gym.global_config import get_global_config_dict
 
-        routes = get_global_config_dict().get("environment_server_routes")
+        resolved = get_global_config_dict()
+        routes = resolved.get("environment_server_routes")
         if routes is None:
             routes = {}
         if not isinstance(routes, Mapping) or not all(
@@ -1359,6 +1376,18 @@ Depending on your data shape, you may want to change these values."""
                 "environment_server_routes must map non-empty taskset names "
                 "to non-empty Environment Server names."
             )
+        for server_name in set(routes.values()):
+            entry = resolved.get(server_name)
+            servers = (
+                entry.get("environment_servers") if isinstance(entry, Mapping) else None
+            )
+            # Match list_entries: only validate servers hosted by this actor.
+            # Shared routes may point to another actor's Environment Server.
+            if isinstance(servers, Mapping) and any(
+                isinstance(server, Mapping) and "entrypoint" in server
+                for server in servers.values()
+            ):
+                _get_environment_server_agent_ref(resolved, server_name)
         self._environment_server_routes = dict(routes)
         return dict(self._environment_server_routes)
 
@@ -1663,7 +1692,7 @@ Depending on your data shape, you may want to change these values."""
         if is_nemo_gym_task(nemo_gym_row):
             from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
-            # Normalization already matched the reply to this request identity.
+            # Episode replies were matched to this request identity during normalization.
             rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
             assert rollout_id is not None
         else:
@@ -3354,6 +3383,7 @@ def validate_dataset_agent_coverage(
             and datasets without gym rows are skipped.
         reject_materialized_tasks: Set when recovery overrides require the
             agent or task-source fields that materialized rows do not provide.
+            Applies only to the ``training`` split; validation does not use recovery.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts or contains
@@ -3376,11 +3406,12 @@ def validate_dataset_agent_coverage(
             referenced = _iter_dataset_agent_names(
                 dataset,
                 shard_set.environment_server_routes,
-                reject_materialized_tasks=reject_materialized_tasks,
+                reject_materialized_tasks=reject_materialized_tasks
+                and split == "training",
             )
         except ValueError as error:
             raise ShardSetupError(
-                f"The {split} dataset cannot be routed: {error}"
+                f"The {split} dataset failed NeMo-Gym validation: {error}"
             ) from error
         unhosted = sorted(referenced - hosted)
         if unhosted:

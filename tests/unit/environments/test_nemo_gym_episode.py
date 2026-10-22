@@ -125,20 +125,10 @@ def test_flat_row_preparation_and_result_are_opaque():
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
-@pytest.mark.parametrize(
-    "reply",
-    [
-        {"reward": 0.75, "result": {"benchmark_specific": True}},
-        {
-            "_ng_failure_class": "environment_server_failed",
-            "_ng_failure_terminal": True,
-            "_ng_failure_message": "verification failed",
-        },
-    ],
-)
-def test_materialized_task_keeps_flat_compatibility_results_opaque(reply: dict) -> None:
+def test_materialized_task_keeps_flat_compatibility_results_opaque() -> None:
     row = _row()
     _prepare([row])
+    reply = {"reward": 0.75, "result": {"benchmark_specific": True}}
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
@@ -191,8 +181,9 @@ def test_episode_reply_identity_must_match_request(key):
         (False, GymTransportError, FailureClass.INFRA),
     ],
 )
+@pytest.mark.parametrize("compatibility_response", [False, True])
 def test_handled_episode_failure_is_never_a_scored_result(
-    terminal, error_type, failure_class
+    terminal, error_type, failure_class, compatibility_response
 ):
     row = _row()
     _prepare([row])
@@ -204,6 +195,13 @@ def test_handled_episode_failure_is_never_a_scored_result(
         "stage": "verification",
         "partial_response": {"id": "partial"},
     }
+    if compatibility_response:
+        reply = {
+            "_ng_failure_class": "environment_server_failed",
+            "_ng_failure_terminal": terminal,
+            "_ng_failure_message": "verification failed",
+            "_ng_failure_stage": "verification",
+        }
     with pytest.raises(
         error_type, match="verification failed.*stage=verification"
     ) as error:
