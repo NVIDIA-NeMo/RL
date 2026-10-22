@@ -2498,6 +2498,102 @@ def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
         assert events == [("finalize", False)]
 
 
+def _manual_gc_worker(monkeypatch, megatron_cfg):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {"megatron_cfg": megatron_cfg}
+    events = []
+    monkeypatch.setattr(worker_module.gc, "disable", lambda: events.append("disable"))
+    monkeypatch.setattr(worker_module.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(
+        worker_module.os,
+        "register_at_fork",
+        lambda **kwargs: events.append(("register_at_fork", kwargs["after_in_child"])),
+    )
+    return worker, events
+
+
+def test_megatron_manual_gc_is_off_without_the_config_key(monkeypatch):
+    worker, events = _manual_gc_worker(monkeypatch, {})
+
+    worker._maybe_enable_manual_gc()
+    for _ in range(3):
+        worker._maybe_run_manual_gc()
+
+    assert events == []
+    assert worker._manual_gc_interval is None
+
+
+def test_megatron_manual_gc_collects_every_interval(monkeypatch):
+    import gc
+
+    worker, events = _manual_gc_worker(
+        monkeypatch, {"manual_gc": True, "manual_gc_interval": 2}
+    )
+
+    worker._maybe_enable_manual_gc()
+    # Automatic GC goes off, forked children get it back, one collection up front.
+    assert events == ["disable", ("register_at_fork", gc.enable), "collect"]
+
+    events.clear()
+    for _ in range(5):
+        worker._maybe_run_manual_gc()
+    assert events == ["collect", "collect"]  # after steps 2 and 4
+
+
+def test_megatron_manual_gc_interval_zero_never_collects(monkeypatch):
+    worker, events = _manual_gc_worker(
+        monkeypatch, {"manual_gc": True, "manual_gc_interval": 0}
+    )
+
+    worker._maybe_enable_manual_gc()
+    events.clear()
+    for _ in range(5):
+        worker._maybe_run_manual_gc()
+
+    assert events == []
+
+
+def test_megatron_manual_gc_rejects_a_negative_interval(monkeypatch):
+    worker, events = _manual_gc_worker(
+        monkeypatch, {"manual_gc": True, "manual_gc_interval": -1}
+    )
+
+    with pytest.raises(ValueError, match="manual_gc_interval"):
+        worker._maybe_enable_manual_gc()
+    assert events == []
+
+
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_megatron_finish_train_step_runs_manual_gc_only_after_success(
+    monkeypatch, body_fails
+):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker._assert_step_open = lambda: {}
+    worker._set_mtp_grad_scale_func = lambda func: None
+    worker._restore_saved_mcore_hooks = lambda state: None
+    worker._maybe_run_manual_gc = MagicMock()
+
+    def body(state):
+        if body_fails:
+            raise RuntimeError("finish failed")
+        return {"loss": 1.0}
+
+    worker._finish_train_step_body = body
+
+    if body_fails:
+        with pytest.raises(RuntimeError, match="finish failed"):
+            worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
+        worker._maybe_run_manual_gc.assert_not_called()
+    else:
+        result = worker_module.MegatronPolicyWorkerImpl.finish_train_step(worker)
+        assert result == {"loss": 1.0}
+        worker._maybe_run_manual_gc.assert_called_once_with()
+
+
 def test_megatron_move_model_does_not_serialize_extra_state():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,

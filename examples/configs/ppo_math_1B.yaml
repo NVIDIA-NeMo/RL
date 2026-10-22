@@ -158,6 +158,10 @@ policy:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (0 = never collect).
+    manual_gc: false
+    manual_gc_interval: 0
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".

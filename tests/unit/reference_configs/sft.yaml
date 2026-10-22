@@ -120,6 +120,10 @@ policy:
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (0 = never collect).
+    manual_gc: false
+    manual_gc_interval: 0
     activation_checkpointing: false
     cuda_graph_impl: "none"
     cuda_graph_modules: []
