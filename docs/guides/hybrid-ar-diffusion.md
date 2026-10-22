@@ -84,7 +84,7 @@ overall accuracy.
 
 ### Ablation: does the CE term help?
 
-Diffusion-mode decoding, single deterministic run at temperature 0.
+Diffusion-mode decoding; each RL column is a 20-run validation average.
 
 | | base model | `ce_loss_weight=0.0` | `ce_loss_weight=0.1` |
 | --- | ---: | ---: | ---: |
@@ -98,6 +98,8 @@ Diffusion-mode decoding, single deterministic run at temperature 0.
 | ifbench | — | 0.737 | **0.776** |
 | mmlu_pro | 0.563 | 0.582 | **0.617** |
 | mmlu_redux | 0.710 | 0.679 | **0.715** |
+| tokens / forward pass | 2.554 | **2.646** | 2.106 |
+| mean generated tokens | 308 | 417 | 768 |
 
 Every dataset improves or ties against the CE-free run; none regresses. The gain concentrates
 on math — AIME-90 nearly doubles.
@@ -110,28 +112,30 @@ decoding.
 ### Decode modes on the CE-trained model
 
 The same CE-trained weights can be decoded three ways. Each column is that mode's own best
-checkpoint; all three happen to peak at or near step 1600.
+checkpoint; all three peak between steps 1400 and 1600.
 
 | | Diffusion<br>(20-rep avg) | AR-mode<br>(5-rep avg) | Linear speculation<br>(single, greedy) |
 | --- | ---: | ---: | ---: |
-| best checkpoint | step_1600 | step_1400 | step_1600 |
-| **overall** | 0.6297 | 0.6517 | **0.6624** |
-| **AIME-90** | 0.3417 | 0.4133 | **0.4444** |
-| aime24 | 0.377 | **0.460** | 0.400 |
-| aime25 | 0.317 | 0.393 | **0.433** |
-| aime26 | 0.332 | 0.387 | **0.500** |
-| hmmt | 0.162 | 0.220 | **0.267** |
-| ifbench | 0.758 | 0.752 | **0.775** |
-| mmlu_pro | 0.608 | 0.630 | **0.641** |
-| mmlu_redux | 0.710 | 0.735 | **0.743** |
-| **tokens / forward pass** | 2.03 | 1.00 | **2.99** |
+| best checkpoint | step_1600 | step_1400 | step_1400 |
+| **overall** | 0.6297 | 0.6517 | **0.6541** |
+| **AIME-90** | 0.3417 | **0.4133** | 0.3778 |
+| aime24 | 0.377 | 0.460 | **0.533** |
+| aime25 | 0.317 | **0.393** | 0.333 |
+| aime26 | 0.332 | **0.387** | 0.267 |
+| hmmt | 0.162 | 0.220 | **0.333** |
+| ifbench | **0.758** | 0.752 | 0.745 |
+| mmlu_pro | 0.608 | 0.630 | **0.631** |
+| mmlu_redux | 0.710 | 0.735 | **0.744** |
+| **tokens / forward pass** | 2.03 | 1.00 | **3.17** |
 
 Linear self-speculative decoding — one bidirectional block draft verified by a causal pass,
-accepting the matching prefix — is the strongest mode on this checkpoint on both axes: it
-edges out AR-mode accuracy (+1.1pp overall, +3.1pp AIME-90) while committing ~3× as many
-tokens per forward pass. Confidence-threshold diffusion decoding is the weakest of the three
-on accuracy, and its throughput advantage over AR is roughly half what linear speculation
-achieves.
+accepting the matching prefix — keeps AR-mode accuracy (0.654 vs 0.652 overall) while
+committing 3.17 tokens per forward pass, against 1.0 for AR and 2.03 for confidence-threshold
+diffusion decoding. That makes it faster than diffusion decoding and more accurate (+2.4pp
+overall). Its per-dataset profile differs from AR's: it is ahead on aime24, hmmt and
+mmlu_redux, but behind on AIME-90 pooled (0.378 vs 0.413), so treat overall parity, not a
+uniform win, as the claim. Its column is a single greedy run, while the AR column averages 5
+reps.
 
 This matters for the generation-cost trade-off below: the CE term's cost to
 confidence-threshold decoding does not have to be paid, because a better decode mode exists
@@ -177,20 +181,19 @@ mechanism is visible in the last row: longer reasoning means lower per-position 
 fewer tokens clear the unmasking threshold each denoising step.
 
 This cost is specific to confidence-threshold decoding and is recoverable. Linear
-self-speculative decoding on the *same* CE-trained checkpoint reaches **2.93** tokens per
+self-speculative decoding on the *same* CE-trained checkpoint reaches **3.17** tokens per
 forward pass — above even the CE-free model's 2.65 — because its acceptance test is an
 exact match against a causal verifier rather than a confidence threshold.
 
 ### Reading these numbers
 
-- **The ablation table is single deterministic runs at temperature 0**, not averages. The
-  decode-mode table is different: its diffusion column is a 20-rep average at temperature 1.0
-  (overall σ ≈ 0.002 across reps) and its AR column a 5-rep average. Linear speculation is
-  inherently greedy — it supports temperature 0 only — so it is a single run with no
+- **The ablation's RL columns are 20-run validation averages.** In the decode-mode table,
+  the diffusion column is a 20-rep average (overall σ ≈ 0.002 across reps) and the AR column
+  a 5-rep average. Linear speculation is inherently greedy, so it is a single run with no
   sampling noise to average.
-- The two tables are therefore not directly comparable cell-to-cell: 0.6376 (ablation,
-  temp 0) and 0.6297 (decode modes, temp 1.0 20-rep) are the same checkpoint measured two
-  ways.
+- The two tables come from separate evaluation runs, so compare within a table rather than
+  across tables: the step_1600 checkpoint scores 0.6376 in the ablation and 0.6297 in the
+  decode-mode table.
 - AIME-90 pools 90 problems, so its standard deviation is ≈0.03. Treat the pooled figure as
   the reliable one and the per-AIME-dataset deltas as indicative.
 - The base-model diffusion run has no IFBench entry, so its 0.5882 overall is computed over a
