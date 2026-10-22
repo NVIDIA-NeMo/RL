@@ -52,6 +52,9 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training (non-colocated generation).
+  defer_async_checkpoint_finalize: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
