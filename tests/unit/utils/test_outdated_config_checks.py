@@ -300,32 +300,55 @@ def test_absent_checkpointing_passes():
 
 
 # ============================================================================
-# reject_outdated_mcore_refit_offload_key
+# reject_outdated_mcore_generation_keys
 # ============================================================================
 
 
-@pytest.mark.parametrize("value", [True, False])
-def test_outdated_mcore_refit_offload_key_is_rejected(value):
-    config = {
-        "policy": {
-            "generation": {
-                "mcore_generation_config": {"offload_policy_before_refit": value}
-            }
-        }
-    }
+@pytest.mark.parametrize(
+    ("key", "value", "replacement"),
+    [
+        ("offload_policy_before_refit", True, r"policy\.offload_policy_before_refit"),
+        ("offload_policy_before_refit", False, r"policy\.offload_policy_before_refit"),
+        ("buffer_guaranteed_fraction", 0.1, "paused_buffer_size_gb"),
+        ("unified_memory_level", 0, "kv_cache_management_mode"),
+    ],
+)
+def test_removed_mcore_generation_key_is_rejected(key, value, replacement):
     with pytest.raises(
         ValueError,
-        match=r"policy\.generation\.mcore_generation_config\.offload_policy_before_refit.*policy\.offload_policy_before_refit",
+        match=rf"policy\.generation\.mcore_generation_config\.{key}.*{replacement}",
     ):
-        check_outdated_config(config)
+        check_outdated_config(
+            {"policy": {"generation": {"mcore_generation_config": {key: value}}}}
+        )
 
 
-def test_policy_level_refit_offload_key_passes():
+def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
+    with pytest.raises(ValueError, match="offload_policy_before_refit"):
+        check_outdated_config(
+            {
+                "policy": {
+                    "generation": {
+                        "mcore_generation_config": {
+                            "offload_policy_before_refit": True,
+                            "buffer_guaranteed_fraction": 0.1,
+                            "unified_memory_level": 0,
+                        }
+                    }
+                }
+            }
+        )
+
     check_outdated_config(
         {
             "policy": {
                 "offload_policy_before_refit": True,
-                "generation": {"mcore_generation_config": {}},
+                "generation": {
+                    "mcore_generation_config": {
+                        "buffer_size_gb": 10,
+                        "kv_cache_management_mode": "persist",
+                    }
+                },
             }
         }
     )

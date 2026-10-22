@@ -94,13 +94,6 @@ class TrtllmAsyncGenerationWorkerImpl:
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             "NCCL_CUMEM_ENABLE": "1",
             "PATH": worker_path,
-            # The container runs as root, and Open MPI / PRTE refuse to start
-            # as root unless explicitly allowed. Set unconditionally so the
-            # engine's MPI init works whatever the launch environment carries.
-            "OMPI_ALLOW_RUN_AS_ROOT": "1",
-            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
-            "PRTE_ALLOW_RUN_AS_ROOT": "1",
-            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
         }
         init_kwargs: dict[str, Any] = {}
 
