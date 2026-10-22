@@ -500,8 +500,8 @@ class MegatronGeneration(GenerationInterface):
         workers = self.worker_group.workers
         ranked_workers: list[tuple[Any, int, int]] = []
         for shard_idx, rank_prefix in active.shard_prefixes.items():
-            worker_start = shard_idx * active.workers_per_shard
-            for local_rank in range(active.workers_per_shard):
+            worker_start = active.worker_offset(shard_idx)
+            for local_rank in range(active.workers_per_shard[shard_idx]):
                 worker_idx = worker_start + local_rank
                 if worker_idx >= len(workers):
                     raise RuntimeError(

@@ -440,11 +440,13 @@ class RefitFleetShape:
     """How a generation backend's refit ranks divide into DP shards.
 
     Refit membership (``nemo_rl.weight_sync.membership``) tracks shards by index and
-    gives each a contiguous block of ``total_gen_workers // dp_size`` ranks.
+    gives each a contiguous block of ranks: ``total_gen_workers // dp_size`` each
+    when ``shard_widths`` is None, otherwise ``shard_widths[i]`` for shard ``i``.
     """
 
     dp_size: int
     total_gen_workers: int
+    shard_widths: tuple[int, ...] | None = None
 
 
 def agreed_media_columns(

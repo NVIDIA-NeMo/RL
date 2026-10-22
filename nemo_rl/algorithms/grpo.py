@@ -659,6 +659,15 @@ def setup(
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
     elif generation_config["backend"] == "dynamo":
+        # Megatron engines are built by the SingleController setup only; refuse
+        # them before the vLLM-only normalization below rejects the config with
+        # an unrelated vllm_kwargs error.
+        if generation_config["dynamo_cfg"]["engine"] == "megatron":
+            raise NotImplementedError(
+                "policy.generation.dynamo_cfg.engine='megatron' runs only under "
+                "the SingleController (examples/run_grpo_single_controller.py); "
+                "use that entrypoint or dynamo_cfg.engine='vllm'"
+            )
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
         if grpo_config.async_grpo.in_flight_weight_updates:
@@ -1222,9 +1231,10 @@ def setup(
                 elif generation_config["backend"] == "dynamo":
                     # Under PD disaggregation, a replica's prefill and decode
                     # engines, as for TRT-LLM.
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).replica_width
+                    dynamo_config = DynamoConfig.model_validate(generation_config)
+                    gpus_per_instance = dynamo_config.replica_width(
+                        dynamo_config.replica_layout(policy_config)
+                    )
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)

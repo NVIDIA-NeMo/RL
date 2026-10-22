@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -197,10 +198,25 @@ class MCoreGenerationConfig(GenerationConfig):
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 
-def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]:
-    """The `megatron_cfg` a dedicated inference model runs with."""
+def merged_inference_megatron_cfg(
+    policy_config: PolicyConfig, overrides: Optional[Mapping[str, Any]] = None
+) -> dict[str, Any]:
+    """The `megatron_cfg` a dedicated inference model runs with.
+
+    Args:
+        policy_config: The policy config whose ``megatron_cfg`` is the base and
+            whose ``generation.mcore_generation_config`` overrides it.
+        overrides: Layout keys applied on top of ``mcore_generation_config``,
+            for an inference model whose layout differs from the shared one
+            (a prefill or decode worker with its own TP or PP). Applied before
+            the keys this merge pins, so context parallelism stays off.
+    """
     generation_config = cast(MCoreGenerationConfig, policy_config["generation"])
-    overrides = dict(generation_config.get("mcore_generation_config") or {})
+    gen_overrides: dict[str, Any] = {
+        **(generation_config.get("mcore_generation_config") or {}),
+        **(overrides or {}),
+    }
+    overrides = dict(gen_overrides)
     explicit_cp = overrides.pop("context_parallel_size", None)
     if explicit_cp is not None and explicit_cp != 1:
         raise ValueError(
@@ -235,9 +251,6 @@ def merged_inference_megatron_cfg(policy_config: PolicyConfig) -> dict[str, Any]
     # for dense models). An explicitly requested gen-side ETP>1 is unsatisfiable,
     # so name the config key rather than letting MCore assert at model build.
     if merged.get("transformer_impl") == "inference_optimized":
-        gen_overrides = cast(
-            dict[str, Any], generation_config.get("mcore_generation_config") or {}
-        )
         explicit_etp = cast(
             Optional[int], gen_overrides.get("expert_tensor_parallel_size")
         )

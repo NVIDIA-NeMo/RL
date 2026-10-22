@@ -35,17 +35,28 @@ class RefitMembership:
             the broadcast root (rank 0) stable across a rebuild.
         shard_prefixes: surviving shard index -> its rank prefix within the generation
             block. Insertion-ordered by shard index.
-        workers_per_shard: Ray workers backing one shard (tp x pp).
+        workers_per_shard: Ray workers backing each shard (tp x pp), indexed by shard,
+            for every shard the fleet was built with, dead or alive. Shards may differ
+            in width, as when prefill shards run a wider tensor parallel than decode
+            shards; every shard of an evenly sharded fleet has the same entry.
     """
 
     world_size: int
     train_world_size: int
     shard_prefixes: dict[int, int]
-    workers_per_shard: int
+    workers_per_shard: tuple[int, ...]
 
     @property
     def surviving_shards(self) -> list[int]:
         return list(self.shard_prefixes)
+
+    def worker_offset(self, shard: int) -> int:
+        """Index of shard ``shard``'s first Ray worker in the fleet's worker list.
+
+        The worker list is laid out shard by shard and never shrinks when a shard
+        dies, so the offset counts every lower-indexed shard, surviving or not.
+        """
+        return sum(self.workers_per_shard[:shard])
 
 
 class NoSurvivingShards(RuntimeError):
@@ -58,6 +69,7 @@ def desired_membership(
     dp_size: int,
     total_gen_workers: int,
     train_world_size: int,
+    shard_widths: Sequence[int] | None = None,
 ) -> RefitMembership:
     """The membership the refit communicator *should* have, given who is absent.
 
@@ -74,6 +86,7 @@ def desired_membership(
         dp_size=dp_size,
         total_gen_workers=total_gen_workers,
         train_world_size=train_world_size,
+        shard_widths=shard_widths,
     )
 
 
@@ -124,6 +137,7 @@ def plan_refit_membership(
     dp_size: int,
     total_gen_workers: int,
     train_world_size: int,
+    shard_widths: Sequence[int] | None = None,
 ) -> RefitMembership:
     """Lay out a refit communicator containing only the surviving generation shards.
 
@@ -141,6 +155,10 @@ def plan_refit_membership(
         dp_size: generation data-parallel size, i.e. the shard count.
         total_gen_workers: Ray workers across the whole generation fleet.
         train_world_size: training ranks, all of which stay in the communicator.
+        shard_widths: ranks each shard spans, indexed by shard, when the shards are not
+            all the same width (a prefill shard at TP 4 next to decode shards at TP 2).
+            None means ``total_gen_workers`` splits evenly across ``dp_size`` shards.
+            Either way each surviving shard starts where the previous survivor ends.
 
     Raises:
         NoSurvivingShards: if nothing survives.
@@ -148,11 +166,26 @@ def plan_refit_membership(
     """
     if dp_size <= 0:
         raise ValueError(f"dp_size must be positive, got {dp_size}")
-    if total_gen_workers % dp_size != 0:
-        raise ValueError(
-            f"generation fleet is not evenly sharded: {total_gen_workers} workers "
-            f"across dp_size={dp_size}"
-        )
+    if shard_widths is None:
+        if total_gen_workers % dp_size != 0:
+            raise ValueError(
+                f"generation fleet is not evenly sharded: {total_gen_workers} workers "
+                f"across dp_size={dp_size}"
+            )
+        widths = (total_gen_workers // dp_size,) * dp_size
+    else:
+        if len(shard_widths) != dp_size:
+            raise ValueError(
+                f"shard_widths has {len(shard_widths)} entries for dp_size={dp_size}"
+            )
+        if any(width <= 0 for width in shard_widths):
+            raise ValueError(f"every shard width must be positive, got {shard_widths}")
+        if sum(shard_widths) != total_gen_workers:
+            raise ValueError(
+                f"shard_widths {tuple(shard_widths)} sum to {sum(shard_widths)}, not "
+                f"total_gen_workers={total_gen_workers}"
+            )
+        widths = tuple(int(width) for width in shard_widths)
 
     unique = sorted(set(surviving_shards))
     if not unique:
@@ -165,13 +198,14 @@ def plan_refit_membership(
             f"shard indices {out_of_range} are outside the fleet (dp_size={dp_size})"
         )
 
-    workers_per_shard = total_gen_workers // dp_size
-    prefixes = {
-        shard: position * workers_per_shard for position, shard in enumerate(unique)
-    }
+    prefixes: dict[int, int] = {}
+    next_prefix = 0
+    for shard in unique:
+        prefixes[shard] = next_prefix
+        next_prefix += widths[shard]
     return RefitMembership(
-        world_size=train_world_size + len(unique) * workers_per_shard,
+        world_size=train_world_size + next_prefix,
         train_world_size=train_world_size,
         shard_prefixes=prefixes,
-        workers_per_shard=workers_per_shard,
+        workers_per_shard=widths,
     )
