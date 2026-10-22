@@ -16,7 +16,7 @@ For the full list of supported models, see
   backend, colocated and non-colocated with vLLM.
 - **[Gemma](gemma/index.md)** — Gemma 4 text-only DAPO and VLM GRPO recipes on
   AutoModel, including Context Parallel layouts for the text-only variants.
-- **[MiniMax](minimax/index.md)** — MiniMax-M3 GRPO with AutoModel training
+- **[MiniMax](minimax/index.md)** — MiniMax-M3 and M3.1 GRPO with AutoModel training
   and BF16 vLLM generation, including validated scope and known limitations.
 - **[Nemotron](nemotron/index.md)** — post-training recipes for Nemotron 3
   Nano, Nano Omni, Super, Ultra, and Nemotron 3.5 Lightning, spanning the

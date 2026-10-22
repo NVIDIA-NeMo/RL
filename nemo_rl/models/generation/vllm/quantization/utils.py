@@ -82,6 +82,16 @@ def resolve_module_from_param_name(
         for original_name in original_names:
             if reversed_mapping.setdefault(original_name, fused_name) != fused_name:
                 ambiguous_shards.add(original_name)
+    # The M3.1 vLLM loader also fuses indexer Q/K into qkv_proj, but its
+    # packed_modules_mapping omits these aliases. Fill gaps without overriding
+    # explicit mappings or bypassing the ambiguous-shard guard below.
+    if getattr(getattr(model, "config", None), "model_type", None) in {
+        "minimax_m3_vl",
+        "minimax_m3_tiny",
+    }:
+        for alias in ("index_q_proj", "index_k_proj"):
+            reversed_mapping.setdefault(alias, "qkv_proj")
+
     leaf = module_path[-1]
     if leaf in reversed_mapping and leaf not in ambiguous_shards:
         module_path[-1] = reversed_mapping[leaf]

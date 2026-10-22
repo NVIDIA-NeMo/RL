@@ -82,7 +82,7 @@ def _locked_file_patch(file_path: str):
 
 def _patch_vllm_init_workers_ray(
     py_executable: str, extra_env_vars: list[str] | None
-) -> bool:
+) -> bool | None:
     """Patch vLLM's Ray executor env propagation and worker runtime_env.
 
     1. Pass custom runtime_env in _init_workers_ray call (file patch).
@@ -113,12 +113,25 @@ def _patch_vllm_init_workers_ray(
         accordingly.
 
     Returns:
-        Whether the v1 runtime_env source patch is in place. The env-var merge
-        in step 2 cannot fail, but step 1 is anchored on a call-site string; if
-        that moves upstream the py_executable injection silently stops
-        happening, so the caller must not report success unconditionally.
+        True if the v1 runtime_env source patch is in place, False if the
+        legacy executor exists but its anchor was not found, or None if only
+        the V2 executor exists. Environment propagation applies in all three
+        cases, independently of the legacy source patch.
     """
-    file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
+    env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
+    existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
+    merged = {
+        var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
+    }
+    os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
+
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
+    except RuntimeError:
+        # Upstream #61712 removed the legacy executor. Env propagation still
+        # applies to V2; require its source so broken installations still fail.
+        _get_vllm_file("v1/executor/ray_executor_v2.py")
+        return None
 
     old_line = "self._init_workers_ray(placement_group)"
     new_line = (
@@ -133,13 +146,6 @@ def _patch_vllm_init_workers_ray(
         elif old_line in content:
             write_back(content.replace(old_line, new_line))
             applied = True
-
-    env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
-    existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
-    merged = {
-        var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
-    }
-    os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
 
     return applied
 
@@ -597,182 +603,6 @@ def _patch_vllm_radio_layerscale_loader(logger) -> None:
     logger.info("Successfully patched vLLM RADIO LayerScale loading.")
 
 
-def _patch_vllm_radio_final_layernorm(logger) -> None:
-    """Port checkpoint-backed Super Omni final vision LayerNorm to vLLM 0.29.
-
-    The layer runs in FP32 before pixel shuffle/projection. Both affine
-    parameters must load before activation, including dummy startup + refit.
-    Supports stock vLLM 0.29 source or this patch's complete output. Custom
-    forks, including the already-fixed serving fork below, are not recognized;
-    unexpected source layouts fail before writing rather than being skipped.
-    References: RL #4036 and TomerBN-Nvidia/vllm commit 10908b9f.
-    """
-    try:
-        file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
-    except RuntimeError:
-        logger.warning("Could not locate the Nemotron VL model for final LayerNorm.")
-        return
-
-    replacements = (
-        (
-            """            self.mlp1 = mlp1.to(llm_dtype)
-            self.sound_encoder: ProjectedParakeet | None = None
-""",
-            """            self.mlp1 = mlp1.to(llm_dtype)
-            self.vision_final_layernorm: nn.LayerNorm | None = None
-            if (
-                getattr(config.text_config, "num_nextn_predict_layers", 0) or 0
-            ) > 0:
-                # Keep the tiny affine in fp32 so normalization matches the
-                # Megatron scoring path; checkpoint BF16 values load into it.
-                self.vision_final_layernorm = nn.LayerNorm(
-                    vit_hidden_size,
-                    eps=getattr(vision_config, "layer_norm_eps", 1.0e-6),
-                ).float()
-            self._loaded_vision_final_layernorm_params: set[str] = set()
-            self._vision_final_layernorm_enabled = False
-            self.sound_encoder: ProjectedParakeet | None = None
-""",
-        ),
-        (
-            """        return x
-
-    def extract_feature_dynamic(
-""",
-            """        return x
-
-    def _apply_vision_final_layernorm(
-        self, vit_embeds: torch.Tensor
-    ) -> torch.Tensor:
-        if not self._vision_final_layernorm_enabled:
-            return vit_embeds
-        assert self.vision_final_layernorm is not None
-        output_dtype = vit_embeds.dtype
-        return self.vision_final_layernorm(vit_embeds.float()).to(output_dtype)
-
-    def extract_feature_dynamic(
-""",
-        ),
-        (
-            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
-        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-""",
-            """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
-        vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
-        vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-""",
-        ),
-        (
-            """            else:
-                _, vit_embeds = self.vision_model(chunk)
-            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-""",
-            """            else:
-                _, vit_embeds = self.vision_model(chunk)
-            vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
-            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
-""",
-        ),
-        (
-            """            connector=["mlp1", "sound_encoder.projection"],
-""",
-            """            connector=[
-                "mlp1",
-                "vision_final_layernorm",
-                "sound_encoder.projection",
-            ],
-""",
-        ),
-        (
-            """        adapter_dict = dict(self.mlp1.named_parameters())
-""",
-            """        adapter_dict = dict(self.mlp1.named_parameters())
-        final_layernorm_dict = (
-            dict(self.vision_final_layernorm.named_parameters())
-            if load_multimodal_weights and self.vision_final_layernorm is not None
-            else {}
-        )
-""",
-        ),
-        (
-            """        def is_vision_weights(name: str) -> bool:
-""",
-            """        def get_final_layernorm_name(name: str) -> str | None:
-            for prefix in (
-                "vision_final_layernorm.",
-                "vision_projector.vision_final_layernorm.",
-            ):
-                if name.startswith(prefix):
-                    return name.removeprefix(prefix)
-            return None
-
-        def is_vision_weights(name: str) -> bool:
-""",
-        ),
-        (
-            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
-        vision_weights: list[tuple[str, torch.Tensor]] = []
-""",
-            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
-        final_layernorm_weights: list[tuple[str, torch.Tensor]] = []
-        vision_weights: list[tuple[str, torch.Tensor]] = []
-""",
-        ),
-        (
-            """                elif is_vision_weights(name):
-""",
-            """                elif (
-                    final_layernorm_name := get_final_layernorm_name(name)
-                ) is not None:
-                    if not load_multimodal_weights:
-                        continue
-                    if self.vision_final_layernorm is None:
-                        raise ValueError(
-                            "Checkpoint has final vision LayerNorm weights but "
-                            "the model configuration did not construct the layer"
-                        )
-                    final_layernorm_weights.append(
-                        (final_layernorm_name, w.detach().clone())
-                    )
-                elif is_vision_weights(name):
-""",
-        ),
-        (
-            """            self.vision_model.load_weights(vision_weights)
-            if self.sound_encoder is not None and len(sound_weights) > 0:
-""",
-            """            for trimmed_name, w in final_layernorm_weights:
-                param = final_layernorm_dict[trimmed_name]
-                with torch.no_grad():
-                    default_weight_loader(param, w)
-                self._loaded_vision_final_layernorm_params.add(trimmed_name)
-            if final_layernorm_weights and (
-                self._loaded_vision_final_layernorm_params >= final_layernorm_dict.keys()
-            ):
-                self._vision_final_layernorm_enabled = True
-                logger.info_once(
-                    "Loaded RADIO final LayerNorm affine parameters",
-                    scope="global",
-                )
-            self.vision_model.load_weights(vision_weights)
-            if self.sound_encoder is not None and len(sound_weights) > 0:
-""",
-        ),
-    )
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if all(new in content for _, new in replacements):
-            return
-        if any(content.count(old) != 1 for old, _ in replacements):
-            raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.29 model source "
-                f"or its fully patched equivalent: {file_to_patch}"
-            )
-        for old, new in replacements:
-            content = content.replace(old, new, 1)
-        write_back(content)
-    logger.info("Patched checkpoint-backed Super Omni final vision LayerNorm.")
-
-
 def _patch_vllm_glm_decoder_sequence_parallel_moe(logger) -> None:
     """Restore the vLLM 0.24 decoder boundary for GLM DSA models.
 
@@ -1201,7 +1031,6 @@ def ensure_vllm_source_compat() -> None:
     patch_logger = init_logger("vllm_patch")
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
-    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
 
 
@@ -1227,15 +1056,19 @@ def _apply_vllm_patches(
     else:
         os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
-    # Whether the v1 patch matters at all depends on which executor vLLM will
-    # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
-    # _init_workers_ray; the patch is only load-bearing when it is set to "0".
-    # Reporting the same way in both cases either cries wolf or hides a real
-    # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    # The source layout takes precedence over the legacy executor selector:
+    # newer vLLM ignores that flag after removing the legacy executor.
     applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
+    uses_v1_executor = applied is not None and not getattr(
+        envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True
+    )
 
-    if applied and uses_v1_executor:
+    if applied is None:
+        patch_logger.info(
+            "vLLM has removed the legacy Ray executor and uses RayExecutorV2; "
+            "workers inherit py_executable from this actor's runtime_env."
+        )
+    elif applied and uses_v1_executor:
         patch_logger.info(
             "Successfully patched vllm v1 _init_workers_ray; Ray workers will "
             "launch under %s.",
@@ -1259,8 +1092,8 @@ def _apply_vllm_patches(
         )
     else:
         patch_logger.info(
-            "vllm v1 _init_workers_ray anchor not found, which is harmless "
-            "here: RayExecutorV2 is selected and does not use it."
+            "vllm v1 _init_workers_ray patch not needed here: "
+            "RayExecutorV2 is selected and does not use it."
         )
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
@@ -1268,7 +1101,6 @@ def _apply_vllm_patches(
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
-    _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger

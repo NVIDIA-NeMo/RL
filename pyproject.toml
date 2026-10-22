@@ -26,11 +26,11 @@ dependencies = [
   "pip",        # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
-  # wheels were built against (vllm/mcore/automodel/trtllm: 2.13.0; sglang:
+  # wheels were built against (vllm/automodel: 2.14.0; mcore/trtllm: 2.13.0; sglang:
   # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
-  # both. The ceiling keeps the driver venv from drifting to a newer torch on a
-  # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
-  "torch>=2.11,<2.14",
+  # all three. The ceiling keeps the driver venv from drifting to a newer torch on a
+  # relock; it resolves to the highest allowed (2.14.0), matching vLLM.
+  "torch>=2.11,<=2.14.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.58.0",                                                                                # CVE mitigation
@@ -54,12 +54,11 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
+  "torchvision>=0.26,<=0.29.0",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.29 <-> 2.14)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Allow Transformers 5.18 for M3.1 while retaining older backend-specific pins.
+  "transformers>=5.5.0,<=5.18.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -84,7 +83,7 @@ dependencies = [
   # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
   # run's trace rather than starting its own.
   "nemo-lens[sdk,aiohttp]>=0.2.0",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
+  "nvidia-cudnn-cu13==9.24.0.43; sys_platform != 'darwin'", # for transformer-engine no build isolation
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
   # see https://github.com/state-spaces/mamba/issues/640.
@@ -130,9 +129,10 @@ dependencies = [
 
 [project.optional-dependencies]
 automodel = [
+  "nvidia-cudnn-frontend==1.31.0; sys_platform == 'linux'",
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
+  "torch==2.14.0",
+  "torchvision==0.29.0",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -141,35 +141,45 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # M3.1 Automodel PR #6 checkpoint and processor support.
+  "transformers==5.18.0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
+  "transformer-engine[pytorch,core_cu13]==2.19.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.29.0 cu130 wheels.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
-  "transformers==5.12.1",
+  "nvidia-cudnn-frontend==1.31.0; sys_platform == 'linux'",
+  # ABI of the private M3.1 vLLM source build.
+  "torch==2.14.0",
+  "torchvision==0.29.0",
+  "transformers==5.18.0",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
+  # Use vLLM's bundled DeepGEMM, which includes the PyTorch 2.14 fix.
+  # An external 2.5.0 install would shadow that newer bundled implementation.
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # Use the locally built M3.1 wheel configured in tool.uv.sources below.
+  "vllm",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.7.2",
+  "flashinfer-cubin==0.7.2",
+  "flashinfer-jit-cache==0.7.2",
+  # Direct requirements activate the explicit uv index mappings below.
+  "flashinfer-jit-cache-sm100a==0.7.2",
+  "flashinfer-jit-cache-sm103a==0.7.2",
+  "flashinfer-jit-cache-sm110a==0.7.2; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2",
+  "flashinfer-jit-cache-sm121a==0.7.2; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.2",
+  "flashinfer-jit-cache-sm89==0.7.2",
+  "flashinfer-jit-cache-sm90a==0.7.2",
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -314,6 +324,7 @@ test = [
 ]
 
 [tool.uv.sources]
+vllm = { path = "vllm-0.32.0rc1.dev410+g1b5577b44.cu132-cp313-cp313-linux_x86_64.whl" }
 # tensorrt-llm is built from source via a custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/.
 # prepare_metadata_for_build_wheel returns static metadata fast (for `uv lock`);
 # build_wheel triggers the actual ~60-min compilation (during `uv sync --extra trtllm`).
@@ -367,6 +378,15 @@ nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# FlashInfer 0.7 splits its JIT cache into architecture-specific distributions.
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -404,9 +424,9 @@ explicit = true
 
 [tool.uv]
 managed = true
+# The local M3.1 vLLM wheel is built for x86_64 only.
 environments = [
   "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
@@ -438,10 +458,9 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13]==2.18.0",
+  "transformer-engine[pytorch,core_cu13]==2.19.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-cu13==9.24.0.43; sys_platform != 'darwin'",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
@@ -556,6 +575,9 @@ constraint-dependencies = [
 # Qwen3.5 model and every Blackwell vLLM worker with `ModuleNotFoundError: cutlass.cute`.
 
 conflicts = [
+  # M3.1's vLLM requires MCP 2; the pinned Gym requires MCP 1.
+  # This day-0 environment supports native math rollouts without token capture.
+  [{ extra = "vllm" }, { extra = "nemo_gym" }],
   [{ extra = "automodel" }, { extra = "sglang" }],
   [{ extra = "mcore" }, { extra = "sglang" }],
   [{ extra = "vllm" }, { extra = "sglang" }],
@@ -593,6 +615,7 @@ flash_mla = [{ requirement = "torch", match-runtime = true }]
 # torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
 # sync with docker/Dockerfile's BASE_IMAGE CUDA major version (currently cuda13.x).
 [tool.uv.extra-build-variables]
+transformer-engine-torch = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl", NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_WITH_NCCL_EP = "0" }
 torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # flash-attn 2.8.1 has no prebuilt wheel for torch >= 2.11, so it compiles from the sdist.
 # Its setup.py sizes MAX_JOBS from psutil's *host* free memory (not the container cgroup)
@@ -600,9 +623,28 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # fan-out gets the CUDA compiler OOM-killed (`ResourceExhausted`, dozens of
 # `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
-flash-attn = { MAX_JOBS = "4" }
+# Use 8 jobs x 4 nvcc threads for the x86_64 M3.1 build.
+flash-attn = { MAX_JOBS = "8" }
 
 # Needed when building from source
+[[tool.uv.dependency-metadata]]
+# The 0.7.2 shim wheels have different metadata on x86_64 and aarch64.
+# Express that difference with markers so uv does not reuse ARM-only provider
+# requirements from the aarch64 wheel when resolving x86_64.
+name = "flashinfer-jit-cache"
+version = "0.7.2+cu130"
+requires-python = ">=3.9"
+requires-dist = [
+  "flashinfer-jit-cache-sm100a==0.7.2+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.2+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.2+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2+cu130",
+  "flashinfer-jit-cache-sm121a==0.7.2+cu130; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm80==0.7.2+cu130",
+  "flashinfer-jit-cache-sm89==0.7.2+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.2+cu130",
+]
+
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]

@@ -306,7 +306,11 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         if callable(get_text_config)
         else getattr(config, "text_config", config)
     )
-    num_hidden_layers = text_config.num_hidden_layers
+    num_hidden_layers = (
+        text_config["num_hidden_layers"]
+        if isinstance(text_config, dict)
+        else text_config.num_hidden_layers
+    )
     for field_name, value in (
         ("num_first_layers_in_bf16", num_first_layers_in_bf16),
         ("num_last_layers_in_bf16", num_last_layers_in_bf16),

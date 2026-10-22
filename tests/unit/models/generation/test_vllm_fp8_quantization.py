@@ -449,20 +449,26 @@ def test_init_fp8_rejects_invalid_bf16_layer_boundaries(
     assert fp8.global_fp8_config is None
 
 
-def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
+@pytest.mark.parametrize("text_config_type", [dict, types.SimpleNamespace])
+@pytest.mark.parametrize("use_get_text_config", [False, True])
+def test_init_fp8_reads_layer_count_from_text_config(
+    fp8_module, monkeypatch, text_config_type, use_get_text_config
+):
     fp8 = fp8_module
     num_hidden_layers = 8
     param_names = [
         f"layers.{layer_idx}.mlp.experts.up_proj.weight"
         for layer_idx in range(num_hidden_layers)
     ]
+    text_config = text_config_type(num_hidden_layers=num_hidden_layers)
+    config = types.SimpleNamespace(text_config=text_config)
+    if use_get_text_config:
+        config.get_text_config = lambda: text_config
 
     monkeypatch.setattr(
         fp8.AutoConfig,
         "from_pretrained",
-        lambda *_args, **_kwargs: types.SimpleNamespace(
-            text_config=types.SimpleNamespace(num_hidden_layers=num_hidden_layers)
-        ),
+        lambda *_args, **_kwargs: config,
     )
     from_config_calls = []
 
@@ -2849,7 +2855,20 @@ def test_get_module_resolves_shards_shared_by_two_fused_modules(
     assert module is expected
 
 
-def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
+@pytest.mark.parametrize(
+    "model_type,projection,resolves",
+    [
+        ("llama", "k_proj", True),
+        ("minimax_m3_vl", "index_q_proj", True),
+        ("minimax_m3_vl", "index_k_proj", True),
+        ("minimax_m3_tiny", "index_q_proj", True),
+        ("minimax_m3_tiny", "index_k_proj", True),
+        ("llama", "index_q_proj", False),
+    ],
+)
+def test_get_module_still_uses_unambiguous_packed_mapping(
+    fp8_module, model_type, projection, resolves
+):
     class Attn(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -2870,11 +2889,39 @@ def test_get_module_still_uses_unambiguous_packed_mapping(fp8_module):
 
         def __init__(self):
             super().__init__()
-            self.config = types.SimpleNamespace(model_type="llama")
+            self.config = types.SimpleNamespace(model_type=model_type)
             self.model = Decoder()
 
     model = Model()
     module = fp8_module.get_module_from_param_name(
-        model, "model.layers.0.self_attn.k_proj.weight"
+        model, f"model.layers.0.self_attn.{projection}.weight"
     )
-    assert module is model.model.layers[0].self_attn.qkv_proj
+    expected = model.model.layers[0].self_attn.qkv_proj if resolves else None
+    assert module is expected
+
+
+@pytest.mark.parametrize("projection", ["index_q_proj", "index_k_proj"])
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_minimax_indexer_alias_preserves_explicit_packed_mapping(
+    fp8_module, projection, ambiguous
+):
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(model_type="minimax_m3_vl")
+    model.qkv_proj = torch.nn.Linear(4, 4, bias=False)
+    model.index_qkv_proj = torch.nn.Linear(4, 4, bias=False)
+    model.packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+    }
+    if ambiguous:
+        model.packed_modules_mapping["another_index_proj"] = [projection]
+
+    resolution = fp8_module.resolve_module_from_param_name(
+        model, f"{projection}.weight"
+    )
+
+    if ambiguous:
+        assert resolution is None
+    else:
+        assert resolution.module is model.index_qkv_proj
+        assert resolution.mapped_path == ("index_qkv_proj",)

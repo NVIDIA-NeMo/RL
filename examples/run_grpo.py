@@ -253,6 +253,10 @@ def main() -> None:
                 policy_generation.shutdown()
             except Exception as error:
                 print(f"Error shutting down generation: {error}", flush=True)
+            if policy is not policy_generation:
+                # Release policy actors while Ray and Python imports are still
+                # available, rather than leaving cleanup to Policy.__del__.
+                policy.shutdown()
     finally:
         # Flush on the failure paths too, and before cluster teardown: the OTel
         # SDK's own atexit hook is registered ahead of Ray's and so runs after

@@ -782,7 +782,6 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_ray_executor_v2_tcpstore_port",
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
-        "_patch_vllm_radio_final_layernorm",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)
@@ -1011,3 +1010,91 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+@pytest.mark.parametrize("legacy_present", [False, True])
+@pytest.mark.parametrize("use_ray_v2", [False, True, None])
+def test_apply_vllm_patches_handles_removed_legacy_executor(
+    monkeypatch, tmp_path, caplog, legacy_present, use_ray_v2
+):
+    """V2-only installs ignore the old selector but retain env propagation."""
+    _install_fake_vllm_modules(monkeypatch)
+    envs = sys.modules["vllm.envs"]
+    if use_ray_v2 is None:
+        monkeypatch.delattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND")
+    else:
+        monkeypatch.setattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", use_ray_v2)
+
+    executor_dir = tmp_path / "v1" / "executor"
+    executor_dir.mkdir(parents=True)
+    (executor_dir / "ray_executor_v2.py").write_text("# V2 executor\n")
+    legacy_executor = executor_dir / "ray_executor.py"
+    if legacy_present:
+        legacy_executor.write_text("self._init_workers_ray(placement_group)\n")
+
+    def fake_find_spec(name):
+        assert name == "vllm"
+        return SimpleNamespace(submodule_search_locations=[str(tmp_path)])
+
+    monkeypatch.setattr(patches, "find_spec", fake_find_spec)
+    init_workers_patch = patches._patch_vllm_init_workers_ray
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(patches, "_patch_vllm_init_workers_ray", init_workers_patch)
+    monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "PRESET")
+
+    with caplog.at_level(logging.INFO, logger="vllm_patch"):
+        patches._apply_vllm_patches("worker-python", extra_env_vars=["CUSTOM_VAR"])
+
+    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
+        "CUSTOM_VAR,PRESET,RAY_ENABLE_UV_RUN_RUNTIME_ENV"
+    )
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    if legacy_present:
+        assert 'runtime_env={"py_executable": "worker-python"}' in (
+            legacy_executor.read_text()
+        )
+    else:
+        assert not legacy_executor.exists()
+        assert "has removed the legacy Ray executor" in caplog.text
+
+
+def test_init_workers_ray_reports_removed_legacy_executor(monkeypatch, tmp_path):
+    executor_dir = tmp_path / "v1" / "executor"
+    executor_dir.mkdir(parents=True)
+    (executor_dir / "ray_executor_v2.py").write_text("# V2 executor\n")
+    monkeypatch.setattr(
+        patches,
+        "find_spec",
+        lambda _name: SimpleNamespace(submodule_search_locations=[str(tmp_path)]),
+    )
+    monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "PRESET")
+
+    assert patches._patch_vllm_init_workers_ray("worker-python", ["CUSTOM"]) is None
+    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
+        "CUSTOM,PRESET,RAY_ENABLE_UV_RUN_RUNTIME_ENV"
+    )
+
+
+def test_apply_vllm_patches_reports_legacy_patch_failure(monkeypatch, caplog):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.setattr(
+        sys.modules["vllm.envs"], "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", False
+    )
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+
+    with caplog.at_level(logging.ERROR, logger="vllm_patch"):
+        patches._apply_vllm_patches("worker-python")
+
+    assert "vllm v1 _init_workers_ray patch did NOT apply" in caplog.text
+    assert "has removed the legacy Ray executor" not in caplog.text
+
+
+def test_init_workers_ray_rejects_missing_executors(monkeypatch, tmp_path):
+    """An incomplete install must not be mistaken for a V2-only install."""
+    monkeypatch.setattr(
+        patches,
+        "find_spec",
+        lambda _name: SimpleNamespace(submodule_search_locations=[str(tmp_path)]),
+    )
+    with pytest.raises(RuntimeError, match="ray_executor_v2.py"):
+        patches._patch_vllm_init_workers_ray("worker-python", None)

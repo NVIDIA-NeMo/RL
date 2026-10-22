@@ -1295,6 +1295,28 @@ class TestSaveLoadIntegration:
 
 
 @pytest.mark.automodel
+def test_qwen_vl_mapping_wrapper_forwards_model(monkeypatch):
+    import nemo_automodel.components.checkpoint.checkpointing as am_ckpt
+
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    model = object()
+    calls = []
+    mapping = {"source": "target"}
+
+    def get_mapping(model_type, model_key_mapping=None, *, model=None):
+        calls.append((model_type, model_key_mapping, model))
+        return mapping
+
+    monkeypatch.delenv("NRL_DISABLE_QWENVL_VISION_PATCH", raising=False)
+    monkeypatch.setattr(am_ckpt, "get_combined_key_mapping", get_mapping)
+    ckpt_mod._patch_qwen_vl_vision_key_mapping()
+
+    assert am_ckpt.get_combined_key_mapping("minimax_m3_vl", model=model) is mapping
+    assert calls == [("minimax_m3_vl", None, model)]
+
+
+@pytest.mark.automodel
 def test_qwen_vl_vision_key_mapping_workaround_still_needed():
     """Tripwire for the temporary Qwen-VL vision-tower key-mapping workaround.
 
