@@ -69,6 +69,7 @@ SC_TEST_RUN_DIR="$RUN_DIR/train" \
     ++policy.generation.remote_vllm_cfg.base_url="$BASE_URL" \
     ++policy.generation.remote_vllm_cfg.served_model_name=policy \
     ++policy.generation.remote_vllm_cfg.max_model_len="$MAX_MODEL_LEN" \
+    ++policy.generation.remote_vllm_cfg.refit.transport=nccl \
     ++policy.generation.remote_vllm_cfg.refit.nccl_num_engines=1 \
     ++policy.generation.remote_vllm_cfg.refit.nccl_engine_world_size="${EXTERNAL_VLLM_TEST_ENGINE_WORLD_SIZE:-1}" \
     cluster.gpus_per_node=1 \
@@ -83,3 +84,9 @@ uv run "$PROJECT_ROOT/tests/check_metrics.py" "$RUN_DIR/train/metrics.json" \
     'len(data["train/gen_kl_error"]) >= 10' \
     'max(data["train/grad_norm"]) > 0' \
     'len(data["timing/train/prepare_for_generation/nccl_refit_remote_vllm"]) >= 10'
+
+# Verify that vLLM committed repeated native weight updates, in addition to the
+# controller reporting refit timings and the policy taking real optimizer steps.
+curl --fail --silent --show-error "${BASE_URL%/v1}/weight_info" \
+    > "$RUN_DIR/weight-info.json"
+jq -e '(.weight_version | tonumber) >= 10' "$RUN_DIR/weight-info.json"
