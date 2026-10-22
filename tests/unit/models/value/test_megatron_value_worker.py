@@ -184,7 +184,9 @@ def test_get_values_suspends_activation_offload() -> None:
     assert manager.do_offload is True
 
 
-def test_get_values_passes_multimodal_batch_to_model_forward() -> None:
+def test_get_values_passes_multimodal_batch_to_model_forward(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Value inference must not silently become image-blind."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
@@ -253,6 +255,10 @@ def test_get_values_passes_multimodal_batch_to_model_forward() -> None:
     assert model_forward.call_args.kwargs["data_dict"] is batch
     assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
     torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
+    assert (
+        "MegatronValueWorker multimodal input fields: image_grid_thw,pixel_values"
+        in capsys.readouterr().out
+    )
 
 
 def _create_value_test_config(

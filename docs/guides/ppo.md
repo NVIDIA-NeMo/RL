@@ -38,6 +38,23 @@ We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that cont
 
 The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **Automodel backend** (`value.automodel_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
+### Multimodal PPO
+
+The Single-Controller path supports multimodal PPO with vLLM generation and
+Megatron policy/value workers. The critic must use the same VLM architecture
+and tokenizer as the policy (for example,
+`value.model_name: ${policy.model_name}`) so both workers consume the same
+packed media representation.
+
+The validated configuration uses a Qwen2.5-VL-style wrapper with TP=2,
+PP=1, CP=1, and sequence packing disabled. Wrappers that self-pack inputs or
+slice context-parallel inputs, such as Qwen3-VL, are not yet supported by this
+value-worker path. See the
+[Qwen2.5-VL-3B Geometry3K recipe](../../examples/configs/recipes/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.yaml)
+for a complete configuration.
+
+![Matched PPO and GRPO fixed-set accuracy](../assets/vlm-ppo-vs-grpo-fixed-accuracy.png)
+
 ### Deployment Architectures
 
 By default, PPO uses a colocated architecture where the **policy**, **value model**, and **generation engine** share one `RayVirtualCluster`. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for the other components.

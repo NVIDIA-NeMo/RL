@@ -461,6 +461,12 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 
 The SC path is still under active development. Feature gaps are tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625). Notable items:
 
+- Multimodal/VLM PPO is supported with vLLM generation and Megatron policy/value
+  workers for Qwen2.5-VL-style wrappers. The critic must use the same VLM as the
+  policy. The validated path uses TP=2, PP=1, CP=1, and no sequence packing;
+  wrappers that self-pack or slice context-parallel inputs are not yet
+  supported by the value worker. See the
+  [multimodal PPO guide](./ppo.md#multimodal-ppo).
 - Multimodal/VLM GRPO is supported with Megatron generation. Set
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
