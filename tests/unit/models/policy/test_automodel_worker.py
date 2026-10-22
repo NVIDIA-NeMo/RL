@@ -84,6 +84,7 @@ def create_test_config(
         "offload_optimizer_for_logprob": False,
         "generation": {
             "backend": "hf",
+            "lora_refit_mode": "merged",
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": None,
