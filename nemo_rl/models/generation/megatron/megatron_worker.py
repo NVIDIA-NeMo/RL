@@ -1570,10 +1570,10 @@ class MegatronGenerationRefitMixin:
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
 
-        # port+1 to avoid collision with the caller's rendezvous on `port`.
+        # Use the exact port selected and tracked by the cluster allocator.
         store = torch.distributed.TCPStore(
             host_name=ip,
-            port=port + 1,
+            port=port,
             world_size=world_size,
             is_master=(global_rank == 0),
         )
