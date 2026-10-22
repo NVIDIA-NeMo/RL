@@ -171,9 +171,13 @@ provider-specific draft loss. NeMo RL logs the normalized value as
 `train/draft_loss`.
 
 Set `policy.draft.update_probe_enabled=true` for a short diagnostic run. After
-the optimizer step, NeMo RL checks that the draft model had nonzero gradients
-and that at least one draft parameter changed. Disable the probe for ordinary
-training.
+the optimizer step, NeMo RL compares the draft gradient norm with the draft
+parameter change. The two must agree. Both are zero when the step has no
+eligible draft windows. Both are nonzero when the draft trains. If only one is
+zero, NeMo RL raises an error. The probe does not detect a draft that never
+trains. For that check, make sure that `train/draft_loss` stays above zero. The
+DFlash and DSpark nightly tests check this value. Disable the probe for
+ordinary training.
 
 To use a separate learning-rate schedule for draft parameters, set:
 
