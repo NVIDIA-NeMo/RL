@@ -4056,6 +4056,11 @@ def _grpo_train_impl(
                         processor=processor,
                     )
                     policy_generation.finish_generation()
+                    if colocated_inference:
+                        # Validation offloads the trainer; restore it before refitting
+                        # engines that may release weights without a CPU backup.
+                        policy.prepare_for_lp_inference()
+                        POLICY_GENERATION_STALE = True
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
