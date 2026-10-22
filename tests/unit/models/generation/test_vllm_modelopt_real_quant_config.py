@@ -294,18 +294,22 @@ def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatc
     )
 
 
+@pytest.mark.vllm
 def test_fake_quant_worker_inherits_nixl_worker():
-    patch_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
     from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
 
     assert issubclass(patch_mod.FakeQuantWorker, NixlVllmWorker)
 
 
+@pytest.mark.vllm
 def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
-    patch_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
 
     class Model(torch.nn.Module):
@@ -331,6 +335,7 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
     model.experts.w2_input_scale.copy_(torch.arange(4, dtype=torch.float32))
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     "backend",
     [
@@ -342,8 +347,9 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
     ],
 )
 def test_real_quant_moe_scales_use_native_reload_copyback(backend):
-    patch_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
         NvFp4MoeBackend,
@@ -405,9 +411,11 @@ def test_real_quant_moe_scales_use_native_reload_copyback(backend):
         torch.testing.assert_close(layer.weight, torch.full((2,), value))
 
 
+@pytest.mark.vllm
 def test_real_quant_moe_rejects_unhandled_reload_backends() -> None:
-    patch_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
@@ -428,9 +436,11 @@ def test_real_quant_moe_rejects_unhandled_reload_backends() -> None:
             patch_mod._preserve_nvfp4_moe_reload_scales(layer)
 
 
+@pytest.mark.vllm
 def test_real_quant_worker_loads_model_outside_inference_mode(monkeypatch):
-    patch_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
     from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
 
