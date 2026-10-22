@@ -776,6 +776,7 @@ def _actor_master_config(
                 "backend": "vllm",
                 "top_k": None,
                 "top_p": 1.0,
+                "vllm_cfg": {},
                 "colocated": {"enabled": False},
             },
         },
@@ -2872,6 +2873,7 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "megatron_cfg": {"enabled": False},
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {},
                 "colocated": {"enabled": False, "resources": {}},
             },
         },

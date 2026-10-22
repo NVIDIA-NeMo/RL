@@ -1383,6 +1383,10 @@ def setup(
 
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
+    discard_vllm_weights_on_sleep = (
+        backend == "vllm"
+        and generation_config["vllm_cfg"].get("discard_weights_on_sleep") is True
+    )
     offload_policy_before_refit = policy_config["offload_policy_before_refit"]
     validate_offload_policy_before_refit(
         enabled=offload_policy_before_refit,
@@ -1491,7 +1495,7 @@ def setup(
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
         pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
+        pg.finish_generation(discard_weights=discard_vllm_weights_on_sleep)
         return pg, time.perf_counter() - t0
 
     def init_sglang():
@@ -1785,7 +1789,9 @@ def setup(
                 """Complete the deferred vLLM model load started above."""
                 t0 = time.perf_counter()
                 deferred_vllm.load_and_start()
-                deferred_vllm.finish_generation()
+                deferred_vllm.finish_generation(
+                    discard_weights=discard_vllm_weights_on_sleep
+                )
                 return deferred_vllm, time.perf_counter() - t0
 
             def init_nemo_gym():
@@ -3284,6 +3290,13 @@ def _grpo_train_impl(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    discard_weights_on_sleep = (
+        master_config.policy["generation"]["backend"] == "vllm"
+        and master_config.policy["generation"]["vllm_cfg"].get(
+            "discard_weights_on_sleep"
+        )
+        is True
+    )
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
@@ -3317,7 +3330,9 @@ def _grpo_train_impl(
             logger=logger,
             processor=processor,
         )
-        policy_generation.finish_generation()
+        policy_generation.finish_generation(discard_weights=discard_weights_on_sleep)
+        if discard_weights_on_sleep:
+            POLICY_GENERATION_STALE = True
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
         if master_config.grpo.debug_payload_metrics:
@@ -3599,7 +3614,6 @@ def _grpo_train_impl(
                         )
                     repeated_batch[PROMPT_GROUP_IDS_KEY] = prompt_group_ids
                     del prompt_group_ids
-                    policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -3727,6 +3741,13 @@ def _grpo_train_impl(
                     )
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
+
+                    with timer.time("generation_finalize"):
+                        policy_generation.finish_generation(
+                            discard_weights=(
+                                discard_weights_on_sleep and is_batch_complete
+                            )
+                        )
 
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
@@ -4055,7 +4076,11 @@ def _grpo_train_impl(
                         logger=logger,
                         processor=processor,
                     )
-                    policy_generation.finish_generation()
+                    policy_generation.finish_generation(
+                        discard_weights=discard_weights_on_sleep or is_last_step
+                    )
+                    if discard_weights_on_sleep and not is_last_step:
+                        POLICY_GENERATION_STALE = True
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
@@ -4871,6 +4896,21 @@ def _raise_if_collector_stopped(
     )
 
 
+def _raise_if_async_grpo_discard_weights_on_sleep_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Reject vLLM weight-discard sleeps on the unsupported async trainer."""
+    generation_config = master_config.policy["generation"]
+    if (
+        generation_config["backend"] == "vllm"
+        and generation_config["vllm_cfg"].get("discard_weights_on_sleep") is True
+    ):
+        raise NotImplementedError(
+            "generation.vllm_cfg.discard_weights_on_sleep is not supported by "
+            "async_grpo_train. See #4659."
+        )
+
+
 @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
@@ -4995,6 +5035,7 @@ def async_grpo_train(
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
+    _raise_if_async_grpo_discard_weights_on_sleep_enabled(master_config)
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
     ), "Colocated async GRPO is only supported for the Megatron generation backend."
