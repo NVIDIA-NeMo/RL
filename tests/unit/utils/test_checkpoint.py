@@ -288,11 +288,11 @@ def test_get_best_checkpoint_path_bias_recent_if_equal(
     # Force the checkpoint history into the adversarial (older-first) order so the
     # test fails deterministically without the recency tie-break, regardless of the
     # underlying filesystem's glob ordering.
-    import nemo_rl.utils.checkpoint as checkpoint_mod
+    import glob
 
-    orig_glob = checkpoint_mod.glob.glob
+    orig_glob = glob.glob
     monkeypatch.setattr(
-        checkpoint_mod.glob,
+        glob,
         "glob",
         lambda pattern: sorted(
             orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
@@ -1176,7 +1176,7 @@ class TestContextManager:
 
 
 class TestRenameCheckpointSwap:
-    """Tests for _rename_checkpoint when the target step dir already exists."""
+    """Tests for publishing a checkpoint when the target step dir already exists."""
 
     def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
         """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
