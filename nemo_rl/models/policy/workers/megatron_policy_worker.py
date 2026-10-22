@@ -662,6 +662,9 @@ class MegatronPolicyWorkerImpl(
         inference swaps weights only). Inspect nested routers, not just the outer
         VLM config, after checkpoint settings and provider overrides resolve.
         """
+        # TODO: Exclude artificial inputs from expert-bias update counts; see
+        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+        # meanwhile: dummy rows can affect the counts despite zero policy loss.
         for chunk in _unwrapped_chunks(self.model):
             for module in chunk.modules():
                 if not isinstance(module, Router):
@@ -675,15 +678,10 @@ class MegatronPolicyWorkerImpl(
                     or config.moe_pad_experts_for_cuda_graph_inference
                     or config.moe_token_dropping
                     or get_aux_loss_track_names(config)
-                    or (
-                        module.enable_expert_bias
-                        and not module.frozen_expert_bias
-                        and config.moe_router_bias_update_rate != 0
-                    )
                 ):
                     raise ValueError(
                         "Forest execution padding requires dropless per-token MoE routing "
-                        "without auxiliary losses or router-bias updates"
+                        "without auxiliary losses"
                     )
 
     def _get_replica_group(self) -> Optional[Any]:

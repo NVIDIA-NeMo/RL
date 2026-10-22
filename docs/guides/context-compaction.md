@@ -170,7 +170,7 @@ rollout_checkpointing:
   snapshot_attempt_interval_s: null
 ```
 
-The learner must use non-interleaved Megatron with fixed batches or ordinary sequence packing (`policy.sequence_packing.enabled: true`). Fixed-batch train and logprob microbatch sizes must be positive integers; packed execution uses the existing token-budget bin planner. Dynamic batching remains unsupported. Setup checks the actual loaded model before any rollout runs: dense models pass; MoE models must use supported dropless per-token routing without auxiliary losses, capacity limits or active router-bias updates. These restrictions keep padding and borrowed inputs from changing real tokens' routing or gradients.
+The learner must use non-interleaved Megatron with fixed batches or ordinary sequence packing (`policy.sequence_packing.enabled: true`). Fixed-batch train and logprob microbatch sizes must be positive integers; packed execution uses the existing token-budget bin planner. Dynamic batching remains unsupported. Setup checks the actual loaded model before any rollout runs: dense models pass; MoE models must use supported dropless per-token routing without auxiliary losses or capacity limits. Router-bias updates are allowed, but execution-padding and borrowed inputs can still contribute to expert-load counts and affect subsequent bias updates. Artificial-input exclusion is tracked separately in [#4519](https://github.com/NVIDIA-NeMo/RL/pull/4519); it is not included here. Model-specific router-mask restrictions still apply.
 
 ![Six logical rollouts produce thirteen real training rows and three padding rows across four data-parallel ranks.](../assets/context-compaction/cc-batch-size.svg)
 
