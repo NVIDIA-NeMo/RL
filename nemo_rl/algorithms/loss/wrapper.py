@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from copy import copy
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -251,18 +252,11 @@ class SequencePackingFusionLossWrapper:
 class DraftLossWrapper:
     """Combine policy loss with draft soft cross-entropy loss.
 
-    Two layouts are supported:
-
-    - Unpacked (default): ``prepare_fn`` (``prepare_loss_input`` with
-      ``LossInputType.DRAFT``) builds the shifted teacher logits and token mask
-      from the ``[B, S]`` batch, and the student logits come from
-      ``data["student_logits"]``.
-    - Packed (``cu_seqlens_q`` given): the draft cross-entropy is computed once
-      over the packed ``[1, T_packed]`` layout. The teacher logits are
-      left-shifted within each packed segment and restricted to the draft
-      vocabulary, and the token mask is packed with the same per-sequence
-      shift; ``student_logits`` must be passed explicitly (it is kept out of
-      the data dict so the packing loss wrappers never slice it).
+    With a ``draft_provider``, the provider owns the draft objective for every
+    layout, including packed sequences. Without one, ``prepare_fn``
+    (``prepare_loss_input`` with ``LossInputType.DRAFT``) builds the shifted
+    teacher logits and token mask from the unpacked ``[B, S]`` batch, and the
+    student logits come from ``data["student_logits"]``.
     """
 
     def __init__(
@@ -275,10 +269,8 @@ class DraftLossWrapper:
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         defer_normalization: bool = False,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-        d2t: Optional[torch.Tensor] = None,
-        student_logits: Optional[torch.Tensor] = None,
+        draft_provider: Any | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
         token_chunk_size: int = DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
     ):
         self.loss_fn = loss_fn
@@ -289,67 +281,13 @@ class DraftLossWrapper:
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
         self.defer_normalization = defer_normalization
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_q_padded = (
-            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
-        )
-        self.d2t = d2t
-        self.student_logits = student_logits
-        if cu_seqlens_q is not None and student_logits is None:
-            raise ValueError("student_logits must be passed explicitly in packed mode.")
-        if cu_seqlens_q is not None and defer_normalization:
-            # The packed path normalizes inside _packed_draft_loss and emits no
-            # step payload, so a deferred caller would silently keep the policy
-            # denominator on the draft gradients. Fail loudly instead.
-            raise ValueError(
-                "deferred draft normalization is not supported in packed mode."
-            )
-        if cu_seqlens_q is None and prepare_fn is None:
-            raise ValueError("prepare_fn is required in unpacked mode.")
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
+        if prepare_fn is None and draft_provider is None:
+            raise ValueError("prepare_fn is required without a draft provider.")
         self.draft_loss_fn = DraftCrossEntropyLossFn(
             vocab_parallel_group=vocab_parallel_group,
             token_chunk_size=token_chunk_size,
-        )
-
-    def _packed_draft_loss(
-        self,
-        next_token_logits: torch.Tensor,
-        data: BatchedDataDict[Any],
-        global_valid_seqs: torch.Tensor | None,
-        global_valid_toks: torch.Tensor,
-    ) -> torch.Tensor:
-        from nemo_rl.algorithms.loss.utils import (
-            map_teacher_logits_to_draft_vocab,
-            pack_rolled_draft_token_mask,
-            roll_packed_seq_dim,
-        )
-
-        teacher_logits = roll_packed_seq_dim(
-            next_token_logits.detach(), self.cu_seqlens_q_padded, seq_dim=1
-        )
-        teacher_logits = map_teacher_logits_to_draft_vocab(
-            teacher_logits,
-            self.d2t,
-            vocab_parallel_rank=self.vocab_parallel_rank,
-            vocab_parallel_group=self.vocab_parallel_group,
-        )
-        token_mask = pack_rolled_draft_token_mask(
-            data["token_mask"],
-            data["sample_mask"],
-            self.cu_seqlens_q,
-            self.cu_seqlens_q_padded,
-        )
-        # sample_mask is already folded into the packed token mask.
-        ones_sample_mask = torch.ones(
-            1, dtype=token_mask.dtype, device=token_mask.device
-        )
-        return self.draft_loss_fn(
-            teacher_logits=teacher_logits,
-            student_logits=self.student_logits,
-            token_mask=token_mask,
-            data=BatchedDataDict({"sample_mask": ones_sample_mask}),
-            global_valid_seqs=global_valid_seqs,
-            global_valid_toks=global_valid_toks,
         )
 
     def __call__(
@@ -362,9 +300,23 @@ class DraftLossWrapper:
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if global_valid_toks is None:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
+        policy_data = data
+        if self.draft_provider is not None:
+            transient_output_keys = {
+                "dflash_output",
+                "dspark_output",
+                "eagle3_output",
+            } & data.keys()
+            if transient_output_keys:
+                policy_data = copy(data)
+                policy_data.data = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in transient_output_keys
+                }
         policy_loss, metrics = self.loss_fn(
             next_token_logits,
-            data,
+            policy_data,
             global_valid_seqs,
             global_valid_toks,
             **kwargs,
@@ -373,16 +325,11 @@ class DraftLossWrapper:
         # Function-local import: step_state lives under models.megatron.draft,
         # whose package import pulls the modelopt chain non-megatron users avoid.
         from nemo_rl.models.megatron.draft.step_state import (
-            DRAFT_LOSS_METRIC_KEY,
             DRAFT_STEP_PAYLOAD_KEY,
             DraftStepState,
         )
 
-        if self.cu_seqlens_q is not None:
-            draft_loss = self._packed_draft_loss(
-                next_token_logits, data, global_valid_seqs, global_valid_toks
-            )
-        else:
+        if self.draft_provider is None:
             loss_input, data = self.prepare_fn(
                 logits=next_token_logits,
                 data=data,
@@ -391,20 +338,56 @@ class DraftLossWrapper:
                 vocab_parallel_group=self.vocab_parallel_group,
                 context_parallel_group=self.context_parallel_group,
             )
-            if self.defer_normalization:
-                stats = self.draft_loss_fn.loss_stats(data=data, **loss_input)
-                draft_loss = stats.normalized(
-                    normalization_counts=torch.ones_like(stats.counts),
-                )
-                # Deferred payloads are only consumed by the Megatron split API.
-                metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
-            else:
+            stats = (
+                self.draft_loss_fn.loss_stats(data=data, **loss_input)
+                if self.defer_normalization
+                else None
+            )
+        else:
+            stats = self.draft_provider.loss_stats(
+                target_logits=next_token_logits,
+                data=data,
+                prepare_fn=self.prepare_fn,
+                vocab_parallel_rank=self.vocab_parallel_rank,
+                vocab_parallel_group=self.vocab_parallel_group,
+                context_parallel_group=self.context_parallel_group,
+            )
+        if self.defer_normalization:
+            assert stats is not None
+            draft_loss = (stats.numerators * stats.weights).sum()
+            # Deferred payloads are only consumed by the Megatron split API.
+            metrics[DRAFT_STEP_PAYLOAD_KEY] = DraftStepState.metric_payload(stats)
+        else:
+            if self.draft_provider is None:
                 draft_loss = self.draft_loss_fn(
                     data=data,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                     **loss_input,
                 )
+            else:
+                assert stats is not None
+                if self.draft_provider.config.speculator_type in ("dflash", "dspark"):
+                    if self.draft_normalization_counts is None:
+                        raise RuntimeError(
+                            "block-draft synchronous loss requires full-batch global counts"
+                        )
+                    normalization_counts = self.draft_normalization_counts
+                else:
+                    normalization_counts = global_valid_toks.reshape(1)
+                draft_loss = stats.normalized(
+                    normalization_counts=normalization_counts,
+                )
+        return self._combine(policy_loss, draft_loss, metrics)
+
+    def _combine(
+        self,
+        policy_loss: torch.Tensor,
+        draft_loss: torch.Tensor,
+        metrics: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        from nemo_rl.models.megatron.draft.step_state import DRAFT_LOSS_METRIC_KEY
+
         combined_loss = policy_loss + self.loss_weight * draft_loss
         draft_loss_value = float(draft_loss.detach().item())
         if not self.defer_normalization:

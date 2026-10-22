@@ -1389,6 +1389,8 @@ class AutomodelPolicyWorkerImpl(
             post_iter_func=automodel_post_iter_func,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            # vLLM's native consumer (Dynamo) does not read the NeMo readiness token.
+            preflight_checked=use_legacy_packing,
             use_legacy_packing=use_legacy_packing,
         )
 

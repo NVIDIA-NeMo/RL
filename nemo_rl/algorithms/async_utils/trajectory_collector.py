@@ -30,6 +30,8 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    _attach_grpo_draft_sample_ids,
+    _draft_needs_sample_ids,
     _get_effort_config,
 )
 from nemo_rl.algorithms.grpo import (
@@ -202,6 +204,7 @@ class AsyncTrajectoryCollector:
         self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
         self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
         self._max_rollout_turns = algorithm_config.max_rollout_turns
+        self._draft_needs_sample_ids = _draft_needs_sample_ids(master_config.policy)
         self.replay_buffer = replay_buffer
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
@@ -926,6 +929,10 @@ class AsyncTrajectoryCollector:
                 num_generations,
                 share_immutable_media=self._deduplicate_multimodal_data,
             )
+            if self._draft_needs_sample_ids:
+                _attach_grpo_draft_sample_ids(
+                    repeated_batch, num_generations_per_prompt=num_generations
+                )
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     repeated_batch,
@@ -1856,6 +1863,9 @@ class AsyncTrajectoryCollector:
             )
             for group_index in range(expected_prompt_groups)
         ]
+        # NeMo-Gym rebuilds each group's batch without the input columns, so
+        # carry the stable draft IDs from the input rows the same way.
+        input_draft_sample_ids = repeated_batch.get("draft_sample_ids")
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
@@ -1896,6 +1906,13 @@ class AsyncTrajectoryCollector:
                             f"Rollout stream yielded prompt group {group_index} twice"
                         )
                     scheduled_group_indices.add(group_index)
+                    if input_draft_sample_ids is not None:
+                        rollout_result.final_batch["draft_sample_ids"] = (
+                            input_draft_sample_ids[
+                                group_index * num_generations : (group_index + 1)
+                                * num_generations
+                            ]
+                        )
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(
