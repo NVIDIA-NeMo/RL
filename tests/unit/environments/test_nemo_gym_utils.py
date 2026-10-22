@@ -709,7 +709,22 @@ def test_list_entries_before_spinup_raises():
     "routes", [None, {}, {"workplace:train": "workplace_environment"}]
 )
 def test_list_environment_server_routes_caches_the_resolved_gym_config(routes):
-    resolved = DictConfig({"environment_server_routes": routes})
+    resolved = DictConfig(
+        {
+            "environment_server_routes": routes,
+            "workplace_environment": {
+                "environment_servers": {
+                    "single_agent_turn": {
+                        "entrypoint": "app.py",
+                        "agent_server": {
+                            "type": "responses_api_agents",
+                            "name": "workplace_agent",
+                        },
+                    }
+                }
+            },
+        }
+    )
     with _stub_gym_resolved_config(resolved) as get_config:
         actor = _spun_up_actor()
         first_routes = actor.list_environment_server_routes()
@@ -732,6 +747,76 @@ def test_list_environment_server_routes_rejects_malformed_routes(routes):
     with _stub_gym_resolved_config(DictConfig({"environment_server_routes": routes})):
         with pytest.raises(nemo_gym_mod.ShardConfigError, match="must map non-empty"):
             _spun_up_actor().list_environment_server_routes()
+
+
+@pytest.mark.parametrize(
+    "servers, error",
+    [
+        (
+            {"first": {"entrypoint": "app.py"}, "second": {"entrypoint": "app.py"}},
+            "exactly one Environment Server",
+        ),
+        (
+            {
+                "nemo_user_sim_environment": {
+                    "entrypoint": "app.py",
+                    "user_agent": {"type": "responses_api_agents", "name": "user"},
+                    "assistant_agent": {
+                        "type": "responses_api_agents",
+                        "name": "assistant",
+                    },
+                }
+            },
+            "agent_server reference",
+        ),
+        *[
+            (
+                {"single_agent_turn": {"entrypoint": "app.py", "agent_server": ref}},
+                "agent_server reference",
+            )
+            for ref in (
+                {"type": "resources_servers", "name": "agent"},
+                {"type": "responses_api_agents", "name": ""},
+                {"type": "responses_api_agents", "name": 1},
+            )
+        ],
+    ],
+)
+def test_list_environment_server_routes_rejects_unsupported_local_servers(
+    servers, error
+):
+    resolved = DictConfig(
+        {
+            "environment_server_routes": {"tasks": "environment"},
+            "environment": {"environment_servers": servers},
+        }
+    )
+    with _stub_gym_resolved_config(resolved):
+        actor = _spun_up_actor()
+        with pytest.raises(nemo_gym_mod.ShardConfigError, match=error):
+            actor.list_environment_server_routes()
+        assert actor._environment_server_routes is None
+
+
+def test_list_environment_server_routes_skips_remote_and_unrouted_servers():
+    routes = {"tasks": "remote_environment", "other_tasks": "missing_locally"}
+    resolved = DictConfig(
+        {
+            "environment_server_routes": routes,
+            # An entry without an entrypoint does not start a local server.
+            "remote_environment": {
+                "environment_servers": {"single_agent_turn": {"host": "10.0.0.1"}}
+            },
+            # Unrouted servers need not satisfy RL's taskset contract.
+            "unrouted_environment": {
+                "environment_servers": {
+                    "nemo_user_sim_environment": {"entrypoint": "app.py"}
+                }
+            },
+        }
+    )
+    with _stub_gym_resolved_config(resolved):
+        assert _spun_up_actor().list_environment_server_routes() == routes
 
 
 def test_list_environment_server_routes_before_spinup_raises():
@@ -1522,7 +1607,8 @@ def test_materialized_dataset_coverage_resolves_tasksets_before_matching_shards(
         nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
 
 
-def test_materialized_rows_reject_recovery_overrides_in_nested_mixed_dataset() -> None:
+@pytest.mark.parametrize("split", ["training", "validation"])
+def test_materialized_recovery_guard_only_rejects_training_rows(split: str) -> None:
     shard_set = _sharded_set({"alpha": "left", "workplace_environment": "tools"})
     shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
     rows = [
@@ -1537,9 +1623,24 @@ def test_materialized_rows_reject_recovery_overrides_in_nested_mixed_dataset() -
         },
     ]
     datasets = {
-        "train": _gym_dataset("alpha"),
-        "validation": {"mixed": SimpleNamespace(dataset=rows)},
+        "training": _gym_dataset("alpha"),
+        split: {"mixed": SimpleNamespace(dataset=rows)},
     }
+
+    if split == "validation":
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set, datasets, reject_materialized_tasks=True
+        )
+        # Skipping the recovery restriction must not skip route validation.
+        shard_set.environment_server_routes = {}
+        with pytest.raises(
+            nemo_gym_mod.ShardSetupError,
+            match="validation.*No environment server route",
+        ):
+            nemo_gym_mod.validate_dataset_agent_coverage(
+                shard_set, datasets, reject_materialized_tasks=True
+            )
+        return
 
     with pytest.raises(nemo_gym_mod.ShardSetupError) as excinfo:
         nemo_gym_mod.validate_dataset_agent_coverage(
@@ -1547,8 +1648,9 @@ def test_materialized_rows_reject_recovery_overrides_in_nested_mixed_dataset() -
         )
 
     message = str(excinfo.value)
-    assert "validation" in message
-    assert "agent_granularity_overrides" in message
+    assert "training" in message
+    assert "cannot be routed" not in message
+    assert "rollout_recovery.agent_granularity_overrides" in message
     assert "task_source_granularity_overrides" in message
     assert "default_granularity" in message
 
@@ -1575,7 +1677,9 @@ def test_materialized_recovery_guard_checks_cached_sources_and_loaded_fallback(
     )
     shard_set = _sharded_set({"workplace_environment": "tools"})
     shard_set.environment_server_routes = {"workplace:train": "workplace_environment"}
-    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": dataset})
+    nemo_gym_mod.validate_dataset_agent_coverage(
+        shard_set, {"validation": dataset}, reject_materialized_tasks=True
+    )
 
     if changed_source:
         source_path.write_text(
@@ -1583,10 +1687,10 @@ def test_materialized_recovery_guard_checks_cached_sources_and_loaded_fallback(
         )
 
     with pytest.raises(
-        nemo_gym_mod.ShardSetupError, match="validation.*agent_granularity_overrides"
+        nemo_gym_mod.ShardSetupError, match="training.*agent_granularity_overrides"
     ):
         nemo_gym_mod.validate_dataset_agent_coverage(
-            shard_set, {"validation": dataset}, reject_materialized_tasks=True
+            shard_set, {"training": dataset}, reject_materialized_tasks=True
         )
     if not changed_source:
         loaded_rows.__iter__.assert_not_called()
@@ -1600,7 +1704,7 @@ def test_flat_rows_still_allow_recovery_overrides() -> None:
 
     nemo_gym_mod.validate_dataset_agent_coverage(
         _sharded_set({"alpha": "left", "math_tools": "right"}),
-        {"train": rows},
+        {"training": rows},
         reject_materialized_tasks=True,
     )
 
