@@ -1125,8 +1125,6 @@ def setup_model_config(
     # serialized defaults. Apply explicit recipe controls before model
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
-    from nemo_rl.models.policy import provider_override_allowed
-
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
         if not provider_override_allowed(config["megatron_cfg"], vlm_key):
             continue
@@ -1503,8 +1501,6 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
-    from nemo_rl.models.policy import provider_override_allowed
-
     megatron_cfg = config["megatron_cfg"]
 
     def _allowed(key: str) -> bool:
@@ -1528,7 +1524,9 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
                 pattern = getattr(model_cfg, pattern_attr, None)
                 if isinstance(pattern, str) and "/" in pattern:
                     setattr(model_cfg, pattern_attr, pattern.split("/")[0])
-    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed("mtp_loss_scaling_factor"):
+    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed(
+        "mtp_loss_scaling_factor"
+    ):
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg and _allowed("mtp_use_repeated_layer"):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]

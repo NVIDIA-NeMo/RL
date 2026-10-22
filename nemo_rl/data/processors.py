@@ -1011,10 +1011,8 @@ def nemo_gym_data_processor(
                 "nor a dynamic min_num_patches/max_num_patches budget."
             )
 
-        # Keep the logical tile cap for Megatron postprocessing and send its
-        # vLLM-facing equivalent with the Gym request. The vLLM
-        # NanoNemotronVLProcessor uses max_num_tiles for both InternVL and
-        # dynamic-resolution checkpoints.
+        # Record the cap so Gym can require captured media for this row, and
+        # send the same budget to vLLM's image processor.
         extra_env_info["_nemo_rl_image_max_num_tiles"] = image_max_num_tiles
         from nemo_rl.environments.nemo_gym_multimodal import (
             _inject_vllm_mm_processor_kwargs,

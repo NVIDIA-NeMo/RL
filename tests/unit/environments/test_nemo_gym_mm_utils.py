@@ -78,6 +78,13 @@ def test_extract_input_images_ignores_text_function_call_output():
     assert _extract_input_images_from_message(item) == []
 
 
+@pytest.mark.parametrize("source", ["https://example.com/result", "file:///tmp/result"])
+def test_text_tool_output_preserves_initial_images(source):
+    output = [{"type": "function_call_output", "output": source}, _assistant([1])]
+    per_turn = _index_per_turn_images(output, input_messages=[_user(_image((2, 2)))])
+    assert [[image.size for image in turn] for turn in per_turn] == [[(2, 2)]]
+
+
 @pytest.mark.parametrize("error_type", [FileNotFoundError, OSError, ValueError])
 def test_extract_input_images_rejects_unresolvable_declared_sources(
     monkeypatch, error_type

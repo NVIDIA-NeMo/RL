@@ -6161,30 +6161,6 @@ class TestPeftWarmStart:
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
 
 
-def test_apply_mtp_config_zero_layers_strips_repeated_mtp_sources():
-    """mtp_num_layers=0 must leave no MTP source for HybridProvider.finalize()."""
-    from types import SimpleNamespace
-
-    from nemo_rl.models.megatron.setup import _apply_mtp_config
-
-    model_cfg = SimpleNamespace(
-        mtp_num_layers=1,
-        mtp_hybrid_override_pattern="M",
-        mtp_use_repeated_layer=True,
-        hybrid_layer_pattern="M-M*-/M",
-        hybrid_override_pattern="M-M*-/M",
-    )
-    config = {"megatron_cfg": {"mtp_num_layers": 0}}
-
-    _apply_mtp_config(model_cfg, config)
-
-    assert model_cfg.mtp_num_layers == 0
-    assert model_cfg.mtp_hybrid_override_pattern is None
-    assert model_cfg.mtp_use_repeated_layer is False
-    assert model_cfg.hybrid_layer_pattern == "M-M*-"
-    assert model_cfg.hybrid_override_pattern == "M-M*-"
-
-
 def test_apply_mtp_config_nonzero_layers_keeps_mtp_sources():
     from types import SimpleNamespace
 

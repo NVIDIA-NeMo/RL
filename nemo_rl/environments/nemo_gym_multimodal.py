@@ -250,7 +250,7 @@ def _has_image_before_first_trainable_output(output: list[dict]) -> bool:
             continue
         if item.get("type") == "function_call_output":
             source = item.get("output")
-            if isinstance(source, str) and _looks_like_image_src(source):
+            if isinstance(source, str) and source.startswith("data:image/"):
                 return True
         content = item.get("content") or []
         if not isinstance(content, list):
