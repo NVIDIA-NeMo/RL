@@ -115,7 +115,7 @@ def _dense_loss(
     return combined.sum() / counts.sum(), (*numerators, combined, counts)
 
 
-def _run_tp2_provider_objective(rank: int, world_size: int) -> None:
+def _run_tp_provider_objective(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     vocab_size, hidden_size, markov_rank = 12, 6, 4
@@ -324,7 +324,7 @@ def _run_dp2_raw_additive_stats(
     )
 
 
-def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
+def _run_tp_tv_only_gradient(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     vocab_size, hidden_size, markov_rank = 4, 1, 1
@@ -454,7 +454,7 @@ def _run_tp2_tv_only_gradient(rank: int, world_size: int) -> None:
     torch.testing.assert_close(empty_hidden.grad, torch.zeros_like(empty_hidden))
 
 
-def _run_tp2_global_acceptance_overlap(rank: int, world_size: int) -> None:
+def _run_tp_global_acceptance_overlap(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     target_probabilities = torch.tensor([0.4, 0.1, 0.1, 0.4], device=device)
@@ -503,7 +503,7 @@ def _run_tp2_global_acceptance_overlap(rank: int, world_size: int) -> None:
     )
 
 
-def _run_tp2_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
+def _run_tp_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     target_vocab_size, draft_vocab_size = 11, 8
@@ -602,7 +602,7 @@ def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
     assert slot_weights.grad is None
 
 
-def _run_tp2_provider_checkpoint(
+def _run_tp_provider_checkpoint(
     rank: int,
     world_size: int,
     checkpoint_dir: str,
@@ -680,7 +680,7 @@ def _run_tp2_provider_checkpoint(
         )
 
 
-def _run_tp2_explicit_sampled_label(rank: int, world_size: int) -> None:
+def _run_tp_explicit_sampled_label(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     full_target_logits = torch.tensor(
@@ -729,7 +729,7 @@ def _run_tp2_explicit_sampled_label(rank: int, world_size: int) -> None:
     torch.testing.assert_close(hidden.grad, reference_hidden.grad)
 
 
-def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
+def _run_tp_provider_preflight(rank: int, world_size: int, case: str) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     local_vocab_size, hidden_size = 4, 3
@@ -775,7 +775,7 @@ def _run_tp2_provider_preflight(rank: int, world_size: int, case: str) -> None:
         )
 
 
-def _run_tp2_provider_group_drift(rank: int, world_size: int) -> None:
+def _run_tp_provider_group_drift(rank: int, world_size: int) -> None:
     tp_group = torch.distributed.new_group(ranks=list(range(world_size)))
     device = torch.device("cuda")
     vocab_size, hidden_size = 8, 3
@@ -811,8 +811,15 @@ def _run_tp2_provider_group_drift(rank: int, world_size: int) -> None:
         )
 
 
-def test_tp2_bf16_output_and_hidden_head_gradients(distributed_test_runner) -> None:
-    distributed_test_runner(_run_tp2_provider_objective, world_size=2)
+_TP_SIZES = (2, 4)
+
+
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_bf16_output_and_hidden_head_gradients(
+    distributed_test_runner,
+    tp_size: int,
+) -> None:
+    distributed_test_runner(_run_tp_provider_objective, world_size=tp_size)
 
 
 @pytest.mark.parametrize(
@@ -828,55 +835,71 @@ def test_dp2_raw_stats_sum_across_ranks(
     )
 
 
-def test_tp2_tv_only_gradient_uses_global_softmax_jacobian_expectation(
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_tv_only_gradient_uses_global_softmax_jacobian_expectation(
     distributed_test_runner,
+    tp_size: int,
 ) -> None:
-    distributed_test_runner(_run_tp2_tv_only_gradient, world_size=2)
+    distributed_test_runner(_run_tp_tv_only_gradient, world_size=tp_size)
 
 
-def test_tp2_confidence_uses_global_acceptance_overlap(
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_confidence_uses_global_acceptance_overlap(
     distributed_test_runner,
+    tp_size: int,
 ) -> None:
-    distributed_test_runner(_run_tp2_global_acceptance_overlap, world_size=2)
+    distributed_test_runner(_run_tp_global_acceptance_overlap, world_size=tp_size)
 
 
-def test_tp2_split_vocab_mapping_and_bounds(distributed_test_runner) -> None:
-    distributed_test_runner(_run_tp2_split_vocab_mapping_and_bounds, world_size=2)
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_split_vocab_mapping_and_bounds(
+    distributed_test_runner,
+    tp_size: int,
+) -> None:
+    distributed_test_runner(_run_tp_split_vocab_mapping_and_bounds, world_size=tp_size)
 
 
 def test_dp2_normalized_gradient_uses_global_counts(distributed_test_runner) -> None:
     distributed_test_runner(_run_dp2_global_normalization_gradient, world_size=2)
 
 
-def test_tp2_hard_ce_uses_explicit_sampled_label(
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_hard_ce_uses_explicit_sampled_label(
     distributed_test_runner,
+    tp_size: int,
 ) -> None:
-    distributed_test_runner(_run_tp2_explicit_sampled_label, world_size=2)
+    distributed_test_runner(_run_tp_explicit_sampled_label, world_size=tp_size)
 
 
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
 @pytest.mark.parametrize("case", ["shape", "dtype", "device"])
-def test_tp2_provider_preflight_rejects_rank_local_live_head_mismatch(
+def test_tp_provider_preflight_rejects_rank_local_live_head_mismatch(
     distributed_test_runner,
     case: str,
+    tp_size: int,
 ) -> None:
     distributed_test_runner(
-        partial(_run_tp2_provider_preflight, case=case), world_size=2
+        partial(_run_tp_provider_preflight, case=case), world_size=tp_size
     )
 
 
-def test_tp2_provider_preflight_rejects_rank_local_group_mismatch(
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_provider_preflight_rejects_rank_local_group_mismatch(
     distributed_test_runner,
+    tp_size: int,
 ) -> None:
-    distributed_test_runner(_run_tp2_provider_group_drift, world_size=2)
+    distributed_test_runner(_run_tp_provider_group_drift, world_size=tp_size)
 
 
 @pytest.mark.mcore
-def test_tp2_real_mcore_checkpoint_round_trip(
+@pytest.mark.parametrize("tp_size", _TP_SIZES)
+def test_tp_real_mcore_checkpoint_round_trip(
     distributed_test_runner,
     tmp_path: Path,
+    tp_size: int,
 ) -> None:
     pytest.importorskip("megatron.core.dist_checkpointing")
     distributed_test_runner(
-        partial(_run_tp2_provider_checkpoint, checkpoint_dir=str(tmp_path / "dcp")),
-        world_size=2,
+        partial(_run_tp_provider_checkpoint, checkpoint_dir=str(tmp_path / "dcp")),
+        world_size=tp_size,
     )
