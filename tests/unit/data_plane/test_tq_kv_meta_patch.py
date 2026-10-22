@@ -16,13 +16,15 @@ import torch
 
 pytest.importorskip("transfer_queue")
 from nemo_rl.data_plane.adapters import tq_kv_meta_patch as patch  # noqa: E402
-from transfer_queue.controller import TransferQueueController  # noqa: E402
+from transfer_queue.controller import FieldMeta, TransferQueueController  # noqa: E402
 
 CONTROLLER = TransferQueueController.__ray_metadata__.modified_class
 
 
 def test_stock_source_matches_the_pinned_hash():
-    patch.assert_stock_source(CONTROLLER)  # fails when the TQ pin moves: re-copy the method
+    # fails when the TQ pin moves: re-copy the methods
+    patch.assert_stock_source(CONTROLLER.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256)
+    patch.assert_stock_source(FieldMeta.remove_samples, patch._REMOVE_SAMPLES_SHA256)
 
 
 def test_changed_source_is_rejected():
@@ -31,7 +33,48 @@ def test_changed_source_is_rejected():
             return None
 
     with pytest.raises(RuntimeError, match="changed"):
-        patch.assert_stock_source(Changed)
+        patch.assert_stock_source(Changed.kv_retrieve_meta, patch._KV_RETRIEVE_META_SHA256)
+
+
+def _nested_field(n):
+    return FieldMeta(
+        global_indexes=set(range(n)),
+        dtype="torch.float32",
+        is_nested=True,
+        is_non_tensor=False,
+        per_sample_shapes={i: (256,) if i < n - 1 else (128,) for i in range(n)},
+    )
+
+
+def _served_shapes(field_meta, indexes):
+    return [field_meta.per_sample_shapes[i] if field_meta.is_nested else field_meta.shape for i in indexes]
+
+
+def test_remove_samples_defers_the_rescan_until_an_eighth_is_gone(monkeypatch):
+    monkeypatch.setattr(FieldMeta, "remove_samples", patch.remove_samples)
+    monkeypatch.setattr(FieldMeta, "removed_since_scan", 0, raising=False)
+    field_meta = _nested_field(40)
+
+    field_meta.remove_samples([39])  # the odd shape is gone, but 1 of 39 is under an eighth
+    assert field_meta.is_nested is True
+
+    field_meta.remove_samples([0, 1, 2, 3])  # 5 of 35 reaches an eighth
+    assert field_meta.is_nested is False
+    assert field_meta.shape == (256,)
+    assert field_meta.per_sample_shapes == {}
+
+
+def test_remove_samples_override_serves_the_same_shapes_as_stock(monkeypatch):
+    stock, patched = _nested_field(40), _nested_field(40)
+    monkeypatch.setattr(FieldMeta, "removed_since_scan", 0, raising=False)
+    remaining = list(range(40))
+    while remaining:
+        cleared, remaining = remaining[:4], remaining[4:]
+        FieldMeta.remove_samples(stock, cleared)
+        patch.remove_samples(patched, cleared)
+        assert _served_shapes(patched, remaining) == _served_shapes(stock, remaining)
+        assert patched.global_indexes == stock.global_indexes
+    assert (patched.is_nested, patched.shape, patched.dtype) == (stock.is_nested, stock.shape, stock.dtype)
 
 
 def test_override_matches_stock_kv_retrieve_meta():

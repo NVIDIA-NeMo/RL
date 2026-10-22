@@ -11,12 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Cheaper ``kv_retrieve_meta`` for the TransferQueue controller.
+"""Cheaper ``kv_retrieve_meta`` and ``FieldMeta.remove_samples`` for the TransferQueue controller.
 
-The stock method reads a torch tensor once per field, about a quarter of a put+get
+The stock ``kv_retrieve_meta`` reads a torch tensor once per field, about a quarter of a put+get
 cycle on the single-threaded controller. ``kv_retrieve_meta`` below is the stock
-method with one ``.all(dim=0).tolist()`` instead; results are identical. The
-controller is a Ray actor, so it is overridden in a subclass started by ``tq.init``.
+method with one ``.all(dim=0).tolist()`` instead; results are identical.
+
+The stock ``FieldMeta.remove_samples`` rescans every remaining shape of a nested field on each
+clear, so ``CLEAR_META`` grows with the number of live samples. ``remove_samples`` below rescans
+only after an eighth of them is gone.
+
+The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 """
 
 import hashlib
@@ -26,12 +31,14 @@ from typing import Any
 
 import ray
 import transfer_queue.interface as interface
+from transfer_queue.controller import FieldMeta
 from transfer_queue.metadata import BatchMeta
 
 logger = logging.getLogger(__name__)
 
-# sha256 of the stock method's source at the pinned TQ revision (see pyproject.toml).
-_STOCK_SHA256 = "25635dcd71647ad7a03e284976e0b7aebc04ba7b6829cad59df1532d46e15301"
+# sha256 of the stock methods' source at the pinned TQ revision (see pyproject.toml).
+_KV_RETRIEVE_META_SHA256 = "25635dcd71647ad7a03e284976e0b7aebc04ba7b6829cad59df1532d46e15301"
+_REMOVE_SAMPLES_SHA256 = "847e2e96135d7be868cfcc0865e6a69649e586e1dbe60178f2a3f5ef20afb09f"
 
 
 def kv_retrieve_meta(self, keys: list[str], partition_id: str, create: bool = False) -> BatchMeta:
@@ -87,21 +94,57 @@ def kv_retrieve_meta(self, keys: list[str], partition_id: str, create: bool = Fa
     return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
 
-def assert_stock_source(cls: type) -> None:
-    if hashlib.sha256(inspect.getsource(cls.kv_retrieve_meta).encode()).hexdigest() != _STOCK_SHA256:
+def remove_samples(self, indexes: list[int]) -> None:
+    before = len(self.global_indexes)
+    for idx in indexes:
+        self.per_sample_shapes.pop(idx, None)
+        self.global_indexes.discard(idx)
+    self.removed_since_scan += before - len(self.global_indexes)
+
+    if len(self.global_indexes) == 0:
+        self.is_nested = None
+        self.is_non_tensor = None
+        self.shape = None
+        self.dtype = None
+        self.per_sample_shapes.clear()
+    else:
+        # Scanning every remaining shape is O(live), so only rescan after an eighth of them is gone.
+        if self.is_nested and self.removed_since_scan * 8 >= len(self.global_indexes):
+            self.removed_since_scan = 0
+            remaining_shapes = set(
+                tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
+            )
+            if len(remaining_shapes) == 1:
+                self.is_nested = False
+                self.shape = next(iter(remaining_shapes))
+                self.per_sample_shapes.clear()
+
+
+def patch_field_meta() -> None:
+    FieldMeta.remove_samples = remove_samples
+    FieldMeta.removed_since_scan = 0
+
+
+def assert_stock_source(method: Any, sha256: str) -> None:
+    if hashlib.sha256(inspect.getsource(method).encode()).hexdigest() != sha256:
         raise RuntimeError(
-            "transfer_queue's kv_retrieve_meta changed, so the tq_kv_meta_patch override would replace newer "
+            f"transfer_queue's {method.__qualname__} changed, so the tq_kv_meta_patch override would replace newer "
             "code. The TQ pin in pyproject.toml has moved: re-copy the method."
         )
 
 
 def make_patched_controller(actor_class: Any) -> Any:
     base = actor_class.__ray_metadata__.modified_class
-    assert_stock_source(base)
+    assert_stock_source(base.kv_retrieve_meta, _KV_RETRIEVE_META_SHA256)
+    assert_stock_source(FieldMeta.remove_samples, _REMOVE_SAMPLES_SHA256)
 
     class PatchedController(base):
         _nrl_kv_meta_patched = True
         kv_retrieve_meta = kv_retrieve_meta
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            patch_field_meta()
+            super().__init__(*args, **kwargs)
 
     return ray.remote(**actor_class._default_options)(PatchedController)
 
