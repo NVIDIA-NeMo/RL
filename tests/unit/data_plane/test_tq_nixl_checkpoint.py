@@ -149,7 +149,7 @@ def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypat
             self.u, self.room = u, room
             self.load_shard = SimpleNamespace(remote=self._load)
 
-        def _load(self, path, blobs):
+        def _load(self, path, blobs, spill):
             events.append(("send", self.u, path))
             loaded, failed = [], []
             for b in blobs:
@@ -182,3 +182,53 @@ def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypat
     assert [e[0] for e in events[:2]] == ["send", "send"]  # both shards before a wait
     assert store._blob_unit == {"a": 0, "c": 1, "b": 1}
     assert sorted(put) == sorted(store._blob_unit.items())
+
+
+def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(
+    ray_cluster, tmp_path_factory
+):
+    """SSD tier on: spilled blobs are saved from their files, and a restore the
+    put area cannot hold spills the rest to disk; every value reads back exact."""
+    import transfer_queue as tq
+
+    import nemo_rl.data_plane.adapters.tq_nixl as tq_nixl
+
+    MiB = 1 << 20
+    ckpt = REPO / ".nvdp_store" / f"ckpt-{uuid.uuid4().hex[:8]}"
+    ns = "nvdp-ckpt-ssd"
+
+    def system(n):
+        # 8 MiB slab per unit: 4 MiB put area + 4 MiB IO area.
+        conf = make_tq_conf(num_units=n, slab_bytes=8 * MiB, namespace=ns)
+        conf.backend.NixlStore.op_timeout_s = 60.0
+        conf.backend.NixlStore.ssd = {
+            "enabled": True,
+            "dir": str(tmp_path_factory.mktemp("ssd")),
+            "staging_bytes": 4 * MiB,
+        }
+        tq.init(conf)
+        units = [ray.get_actor(f"NixlStorageUnit#{i}", namespace=ns) for i in range(n)]
+        return conf, units
+
+    def stats(units):
+        return [ray.get(h.stats.remote()) for h in units]
+
+    conf, units = system(2)
+    keys = [f"d{i}" for i in range(14)]  # 14 MiB through 8 MiB of put area
+    vals = [torch.randn(1, MiB // 4) for _ in keys]
+    for k, v in zip(keys, vals):
+        tq.kv_batch_put([k], "train", fields=TensorDict({"x": v}, batch_size=[1]))
+    assert sum(s["disk_only_blobs"] for s in stats(units)) >= 4
+    tq.save_checkpoint(str(ckpt))
+    tq.close()
+    tq_nixl.shutdown(conf)
+
+    conf, units = system(1)
+    tq.load_checkpoint(str(ckpt))
+    (st,) = stats(units)
+    assert st["blobs"] == 14 and st["disk_only_blobs"] >= 8, st
+    for k, v in zip(keys, vals):
+        got = tq.kv_batch_get([k], "train", select_fields=["x"])
+        assert torch.equal(dense(got["x"]), v), k
+    tq.close()
+    tq_nixl.shutdown(conf)
