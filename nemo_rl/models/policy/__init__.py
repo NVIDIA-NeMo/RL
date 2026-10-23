@@ -567,6 +567,9 @@ class MegatronConfig(TypedDict):
     # No effect when use_fused_linear_logprobs is set, which bypasses the
     # output layer's logits path.
     fp32_lm_head: NotRequired[bool]
+    # Opt in to exact GELU for Super's 32 vision MLPs, matching vLLM RADIO.
+    # False/absent keeps the model's activation. Requires unfused activations.
+    super_vision_exact_gelu: NotRequired[bool]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).

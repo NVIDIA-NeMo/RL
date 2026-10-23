@@ -131,6 +131,7 @@ from nemo_rl.models.megatron.train import (
     should_reduce_loss_across_context_parallel,
     strip_context_parallel_local_loss_metric,
 )
+from nemo_rl.models.megatron.vision_activation import set_super_vision_exact_gelu
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -998,6 +999,8 @@ class MegatronPolicyWorkerImpl(
 
         self.mcore_state = model_and_optimizer_state.state
         self.model = model_and_optimizer_state.model
+        if config["megatron_cfg"].get("super_vision_exact_gelu"):
+            set_super_vision_exact_gelu(self.model)
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context

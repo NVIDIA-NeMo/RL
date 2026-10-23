@@ -337,6 +337,7 @@ guides/environments.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md
+guides/super-vision-exact-gelu.md
 guides/async-grpo.md
 guides/single-controller.md
 guides/quantization-aware-rl.md
