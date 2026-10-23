@@ -14,6 +14,7 @@
 
 """Unit tests for automodel setup utilities."""
 
+import datetime
 import os
 import sys
 from types import SimpleNamespace
@@ -33,6 +34,8 @@ from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.config import DistributedContext
 from nemo_rl.models.automodel.setup import (
+    _distributed_timeout_minutes,
+    _init_process_group,
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
@@ -3054,4 +3057,48 @@ class TestLoadInitialLoraAdapterEndToEnd:
                 restore_from=weights_path,
                 lora_cfg=_lora_cfg(),
                 model_name="tiny-model",
+            )
+
+
+class TestDistributedTimeoutMinutes:
+    """automodel_cfg.distributed_timeout_minutes reaches the default process group."""
+
+    @staticmethod
+    def _init_call(automodel_cfg, cpu_offload=False):
+        runtime_config = SimpleNamespace(cpu_offload=cpu_offload)
+        with patch("torch.distributed.init_process_group") as mock_init:
+            _init_process_group({"automodel_cfg": automodel_cfg}, runtime_config)
+        return mock_init.call_args
+
+    @pytest.mark.parametrize("minutes", [45, 0.5])
+    def test_forwards_timeout(self, minutes):
+        call_args = self._init_call({"distributed_timeout_minutes": minutes})
+
+        assert call_args.kwargs == {
+            "backend": "nccl",
+            "timeout": datetime.timedelta(minutes=minutes),
+        }
+
+    def test_forwards_timeout_with_cpu_offload_backend(self):
+        call_args = self._init_call({"distributed_timeout_minutes": 30}, cpu_offload=True)
+
+        assert call_args.kwargs == {
+            "backend": "cuda:nccl,cpu:gloo",
+            "timeout": datetime.timedelta(minutes=30),
+        }
+
+    @pytest.mark.parametrize("automodel_cfg", [{}, {"distributed_timeout_minutes": None}])
+    def test_unset_keeps_torch_default(self, automodel_cfg):
+        call_args = self._init_call(automodel_cfg)
+
+        assert call_args.kwargs == {"backend": "nccl"}
+
+    @pytest.mark.parametrize("minutes", [0, -5])
+    def test_non_positive_timeout_is_rejected(self, minutes):
+        with pytest.raises(
+            ValueError,
+            match=r"^automodel_cfg\.distributed_timeout_minutes must be positive",
+        ):
+            _distributed_timeout_minutes(
+                {"automodel_cfg": {"distributed_timeout_minutes": minutes}}
             )

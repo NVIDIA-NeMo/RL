@@ -14,6 +14,7 @@
 
 """Setup utilities for automodel-based training in NeMo RL."""
 
+import datetime
 import importlib
 import inspect
 import json
@@ -479,6 +480,34 @@ def setup_reference_model_state(
     return get_cpu_state_dict(model.state_dict().items(), pin_memory=True)
 
 
+def _distributed_timeout_minutes(config: PolicyConfig) -> Optional[float]:
+    """Return ``automodel_cfg.distributed_timeout_minutes``, or None when unset."""
+    timeout_minutes = config["automodel_cfg"].get("distributed_timeout_minutes")
+    if timeout_minutes is not None and timeout_minutes <= 0:
+        raise ValueError(
+            "automodel_cfg.distributed_timeout_minutes must be positive, "
+            f"got {timeout_minutes}"
+        )
+    return timeout_minutes
+
+
+def _init_process_group(config: PolicyConfig, runtime_config: RuntimeConfig) -> None:
+    """Initialize the default process group, honoring the configured collective timeout.
+
+    ``automodel_cfg.distributed_timeout_minutes`` replaces torch's default (10 minutes
+    for NCCL) for the default group; every FSDP2 / expert-parallel sub-group created
+    from it inherits the value. Unset keeps torch's default.
+    """
+    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
+    timeout_minutes = _distributed_timeout_minutes(config)
+    if timeout_minutes is None:
+        torch.distributed.init_process_group(backend=backend)
+    else:
+        torch.distributed.init_process_group(
+            backend=backend, timeout=datetime.timedelta(minutes=timeout_minutes)
+        )
+
+
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
@@ -496,8 +525,7 @@ def setup_distributed(
         DistributedContext containing device meshes and distributed configuration
     """
     # Initialize process group
-    backend = "nccl" if not runtime_config.cpu_offload else "cuda:nccl,cpu:gloo"
-    torch.distributed.init_process_group(backend=backend)
+    _init_process_group(config, runtime_config)
     world_size = torch.distributed.get_world_size()
 
     # Extract configuration values
