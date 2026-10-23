@@ -105,6 +105,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -1825,6 +1826,8 @@ def setup_single_controller(
         )
 
     if use_nemo_gym:
+        # Before the Gym build task below reads master_config.env.
+        set_nemo_gym_log_dir(master_config.env, master_config.logger.log_dir)
         if megatron_backend:
             # Megatron serves one frontend per model-parallel group; pre-publish
             # every address so Gym can spread sessions over all of them.
