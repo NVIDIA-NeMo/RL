@@ -400,6 +400,26 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension(RefitBuilderInterface):
+    def __new__(cls, *args, **kwargs):
+        # vLLM injects this mixin before constructing each engine worker. Apply
+        # the model fix in that process before model loading/encoder profiling;
+        # shared installed vLLM files and other running workers stay untouched.
+        config = kwargs.get("vllm_config")
+        if config is None and args:
+            config = args[0]
+        hf_config = getattr(getattr(config, "model_config", None), "hf_config", None)
+        vision_config = getattr(hf_config, "vision_config", None)
+        vision_type = (
+            vision_config.get("model_type")
+            if isinstance(vision_config, dict)
+            else getattr(vision_config, "model_type", None)
+        )
+        if vision_type == "radio":
+            from nemo_rl.models.generation.vllm.radio_cpe import install_radio_cpe_crop
+
+            install_radio_cpe_crop()
+        return super().__new__(cls)
+
     # Per-PP-stage refit groups, None until init_nccl_reshard_comm_group builds them.
     # Declared rather than sprung into existence so a rebuild can release the previous
     # ones without probing, matching AbstractPolicyWorker.model_update_group. None and
