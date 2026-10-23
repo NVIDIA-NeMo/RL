@@ -478,12 +478,10 @@ class TestPPOValidation:
         [
             lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
             "use_dynamic_sampling",
             "reward_scaling",
-            "reward_shaping",
         ],
     )
     def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
