@@ -64,6 +64,7 @@ policy:
     vllm_cfg:
       async_engine: true
       tensor_parallel_size: 4
+      expert_parallel_size: 4
       gpu_memory_utilization: 0.7
       env_vars:
         NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
