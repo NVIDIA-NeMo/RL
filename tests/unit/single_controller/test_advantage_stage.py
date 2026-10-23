@@ -31,7 +31,8 @@ from nemo_rl.algorithms.advantage_estimator import (
     OPDAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import GRPOConfig, RewardScalingConfig
+from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -592,6 +593,7 @@ def _controller(
     dump_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
+    reward_scaling: RewardScalingConfig | None = None,
 ):
     """Build the controller stub _advantage_stage needs, and nothing more.
 
@@ -603,6 +605,7 @@ def _controller(
         num_generations_per_prompt=GROUP_SIZE,
         adv_estimator=AdvEstimatorConfig(name=estimator_name),
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        **({} if reward_scaling is None else {"reward_scaling": reward_scaling}),
     )
     is_opd = estimator_name == "opd"
     estimator = (
@@ -798,6 +801,89 @@ def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
     assert [call for actor in ctrl._advantage_actors for call in actor.calls] == [
         NUM_GROUPS * GROUP_SIZE
     ]
+
+
+def _run_with_scaling(reward_scaling, num_actors: int):
+    """One advantage stage under a reward_scaling block, local or sharded."""
+    store = _RowStore(_rows())
+    ctrl = _controller("grpo", num_actors, store, reward_scaling=reward_scaling)
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    advantages = torch.stack(
+        [store.rows[f"s{i}"]["advantages"] for i in range(NUM_GROUPS * GROUP_SIZE)]
+    )
+    metrics = reduce_advantage_pump_metrics(
+        reward_partials=ctrl._step_log_dict["reward_partials"],
+        advantage_partials=ctrl._step_log_dict["advantage_partials"],
+        sequence_lengths=[],
+        num_mask_sample_filtered=ctrl._step_log_dict["num_mask_sample_filtered"],
+        seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
+    )
+    return store, advantages, metrics
+
+
+class TestRewardScaling:
+    """The one reward transform the stage applies, and where it applies it.
+
+    ``_rows`` rewards are 0/1 and GRPO normalizes by the group std, so an
+    affine remap leaves the advantages untouched and a test written on, say,
+    target_min=-1 would pass whether or not the scale ran. These use a source
+    interval that *clamps* -- the part of the map that is observable.
+    """
+
+    # Clamps every reward to source_max, so the batch collapses onto one value.
+    COLLAPSING = RewardScalingConfig(
+        enabled=True,
+        source_min=-5.0,
+        source_max=-4.0,
+        target_min=0.0,
+        target_max=1.0,
+    )
+
+    def test_disabled_leaves_rewards_and_advantages_alone(self) -> None:
+        _, advantages, metrics = _run_with_scaling(None, 0)
+        _, off_adv, off_metrics = _run_with_scaling(
+            RewardScalingConfig(enabled=False, source_min=-5.0, source_max=-4.0), 0
+        )
+        torch.testing.assert_close(advantages, off_adv)
+        assert metrics[REWARD_KEY] == pytest.approx(off_metrics[REWARD_KEY])
+        # Sanity: unscaled really is the fixture's 0/1, so the cases below
+        # measure a change.
+        assert metrics[REWARD_KEY] != pytest.approx(1.0)
+
+    def test_scale_runs_before_the_baseline(self) -> None:
+        # Collapsed rewards make each group's baseline equal its rows. Scaling
+        # after the baseline, or not at all, leaves the 0/1 spread.
+        _, advantages, _ = _run_with_scaling(self.COLLAPSING, 0)
+        torch.testing.assert_close(advantages, torch.zeros_like(advantages))
+
+    def test_the_logged_reward_is_the_scaled_one(self) -> None:
+        # v1 logs metrics["reward"] off the post-scale total_reward.
+        _, _, metrics = _run_with_scaling(self.COLLAPSING, 0)
+        assert metrics[REWARD_KEY] == pytest.approx(1.0)
+
+    def test_the_raw_reward_column_is_not_rewritten(self) -> None:
+        # DataPlane keeps the env's reward, so a re-read row is not scaled twice.
+        store, _, _ = _run_with_scaling(self.COLLAPSING, 0)
+        raw = torch.stack(
+            [
+                store.rows[f"s{i}"]["total_reward"]
+                for i in range(NUM_GROUPS * GROUP_SIZE)
+            ]
+        )
+        torch.testing.assert_close(raw, torch.stack(list(_raw_rewards())))
+
+    def test_sharding_is_unaffected(self) -> None:
+        # Per-row, so it must not make the stage shard-dependent.
+        _, adv_local, metrics_local = _run_with_scaling(self.COLLAPSING, 0)
+        _, adv_pool, metrics_pool = _run_with_scaling(self.COLLAPSING, 3)
+        torch.testing.assert_close(adv_pool, adv_local)
+        assert metrics_pool == pytest.approx(metrics_local)
+
+
+def _raw_rewards():
+    """The fixture's unscaled rewards, in sample-id order."""
+    rows = _rows()
+    return [rows[f"s{i}"]["total_reward"] for i in range(NUM_GROUPS * GROUP_SIZE)]
 
 
 def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:

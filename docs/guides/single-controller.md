@@ -545,7 +545,12 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
-- Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
+- Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
+  - `reward_scaling` — supported. The advantage stage applies it ahead of the baseline and the logged `reward`, as v1 does. Setup rejects `source_min >= source_max`, which the remap divides by.
+  - `overlong_filtering` — supported. Truncated completions are excluded from the loss through `sample_mask`.
+  - Environment-flagged sample masking — supported. A step in which every completion is filtered is rejected rather than skipped.
+  - `reward_shaping` — not implemented on either algorithm block; setup rejects it.
+  - `use_dynamic_sampling` — not implemented on either algorithm block; setup rejects it.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported.
 
