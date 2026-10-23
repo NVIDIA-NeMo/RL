@@ -9,8 +9,8 @@ set -eou pipefail
 
 REFIT_PREQUANTIZE=${REFIT_PREQUANTIZE:-true}
 # Optional native MXFP8 linear backend: flashinfer_cutedsl or flashinfer_trtllm.
-# Native legs enable CUDA graphs and run 3 steps, so refit must keep the
-# graph-visible runtime storage across repeated reloads.
+# Every leg enables CUDA graphs and runs 3 steps so repeated refits exercise
+# the graph-visible runtime storage.
 LINEAR_BACKEND=${LINEAR_BACKEND:-}
 EXP_NAME=$(basename "$0" .sh)-prequant-$REFIT_PREQUANTIZE${LINEAR_BACKEND:+-$LINEAR_BACKEND}
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
@@ -22,8 +22,8 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf "$EXP_DIR" "$LOG_DIR"
 mkdir -p "$EXP_DIR" "$LOG_DIR"
 
-MAX_NUM_STEPS=2
-ENFORCE_EAGER=true
+MAX_NUM_STEPS=3
+ENFORCE_EAGER=false
 BACKEND_ARGS=()
 case "$LINEAR_BACKEND" in
     "") ;;
@@ -35,8 +35,6 @@ case "$LINEAR_BACKEND" in
         ;;
 esac
 if [[ -n "$LINEAR_BACKEND" ]]; then
-    MAX_NUM_STEPS=3
-    ENFORCE_EAGER=false
     BACKEND_ARGS=("++policy.generation.vllm_kwargs.linear_backend=$LINEAR_BACKEND")
 fi
 
