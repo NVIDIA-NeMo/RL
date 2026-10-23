@@ -641,11 +641,17 @@ jobs:
   update-uv-cache:
     name: Update uv build cache
     needs: [build-container, org-member-pre-flight]
+    # always() is required: without a status function GitHub implies success(), which also
+    # requires every transitive need to succeed. cicd-wait-in-queue and prepare-megatron-lock
+    # are skipped on main pushes, so this job was silently skipped on every run.
     if: >-
       ${{
+        always() &&
         github.ref == 'refs/heads/main' &&
         vars.UV_BUILD_CACHE == 'enabled' &&
-        needs.build-container.result == 'success'
+        needs.org-member-pre-flight.result == 'success' &&
+        needs.build-container.result == 'success' &&
+        !cancelled()
       }}
     runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     env:
@@ -674,11 +680,15 @@ jobs:
   update-uv-cache-gb200:
     name: Update GB200 uv build cache
     needs: [build-container-gb200, gb200-config]
+    # always(): see update-uv-cache.
     if: >-
       ${{
+        always() &&
         github.ref == 'refs/heads/main' &&
         vars.UV_BUILD_CACHE == 'enabled' &&
-        needs.build-container-gb200.result == 'success'
+        needs.gb200-config.result == 'success' &&
+        needs.build-container-gb200.result == 'success' &&
+        !cancelled()
       }}
     runs-on: ${{ vars.GB200_RUNNER }}
     env:
