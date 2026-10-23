@@ -3351,14 +3351,17 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
         selected.append(environment)
         for row in pending:
-            results[row["_rowidx"]] = {"input_message_log": [{"token_ids": [1]}]}
+            results[row["_rowidx"]] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 0.0},
+            }
             shaping[row["_rowidx"]] = SimpleNamespace(
                 length_rewards_low=[], rewards_low=[], low_lengths=[], high_lengths=[]
             )
 
     impl._stream_rows = fake_stream_rows
     impl._results_to_completions = lambda _results: ([object()], {})
-    impl._compute_rollout_metrics = lambda *_args: {}
+    impl._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     impl._compute_reward_penalty_metrics = lambda *_args: {}
     owner = GymCheckpointInstance("tools", 1).instance_id
 
