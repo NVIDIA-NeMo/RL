@@ -353,6 +353,11 @@ class SingleControllerActor:
     All other actors are passive — they expose methods and wait to be called.
     """
 
+    # async_rl.defer_async_checkpoint_finalize, and the (tmp_step_N path, step) of a
+    # policy save whose async write has not been finalized and published yet.
+    _defer_checkpoint_finalize: bool = False
+    _pending_checkpoint: Optional[tuple[PathLike, int]] = None
+
     # True from the moment a failed refit pulls every shard out of service until the
     # retry puts them back; the exhaustion check stands down for that window. See
     # _recovery_window.
@@ -600,6 +605,9 @@ class SingleControllerActor:
         # actor_args only carries the driver-side restore products
         # (save_state, last_checkpoint_path).
         self._checkpointer = CheckpointManager(master_config.checkpointing)
+        self._defer_checkpoint_finalize = (
+            master_config.async_rl.defer_async_checkpoint_finalize
+        )
         self._timeout = TimeoutChecker(
             timeout=master_config.checkpointing["checkpoint_must_save_by"],
             fit_last_save_time=True,
@@ -2997,6 +3005,11 @@ class SingleControllerActor:
                     **{"rl.weight_version": version_during_step},
                 ),
             ):
+                if self._pending_checkpoint is not None:
+                    # Before this step's first policy-worker call, so the finalize
+                    # collectives run at the same point on every rank.
+                    with self._timer.time("checkpoint_finalize"):
+                        await self._finish_pending_save(blocking=False)
                 # One span per starvation episode, not per 5ms poll.
                 starvation_span: Optional[Any] = None
                 starvation_polls = 0
@@ -3890,6 +3903,7 @@ class SingleControllerActor:
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
+        await self._finish_pending_save(blocking=True)
 
     async def _stall_watchdog_pump(self) -> None:
         """Report rollout health, and detect stalls nothing else catches.
@@ -5148,6 +5162,8 @@ class SingleControllerActor:
         is_final_checkpoint: bool,
     ) -> None:
         """Serialize full and rollout-only checkpoint publication."""
+        # The workers would wait for a still-pending save anyway; publish it first.
+        await self._finish_pending_save(blocking=True)
         async with self._checkpoint_save_lock:
             await self._save_checkpoint_impl(
                 step_metrics,
@@ -5358,6 +5374,10 @@ class SingleControllerActor:
                 ).write_bytes,
                 rollout_recovery_payload,
             )
+        if self._defer_checkpoint_finalize:
+            # Published by _finish_pending_save at a later step boundary.
+            self._pending_checkpoint = (checkpoint_path, self._train_steps)
+            return
         # Rename happens in the background once the async weight writes
         # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
@@ -5369,6 +5389,32 @@ class SingleControllerActor:
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
         )
+
+    async def _finish_pending_save(self, *, blocking: bool) -> None:
+        """Finalize and publish a save deferred by defer_async_checkpoint_finalize.
+
+        Called only from the train pump, between policy-worker calls: the finalize
+        runs collectives on the training communicator, so every rank must reach it
+        at the same point. A non-blocking poll finalizes the save on every worker
+        only once all ranks' background writes are done; until then the write
+        overlaps training. tmp_step_N becomes step_N after the finalize, under the
+        same lock as every other checkpoint publication.
+        """
+        if self._pending_checkpoint is None:
+            return
+        if blocking:
+            await asyncio.to_thread(self._trainer.finalize_async_save)
+        elif not await asyncio.to_thread(self._trainer.poll_async_save):
+            return
+        checkpoint_path, step = self._pending_checkpoint
+        self._pending_checkpoint = None
+        async with self._checkpoint_save_lock:
+            self._checkpointer.begin_finalization(checkpoint_path)
+            await asyncio.to_thread(
+                _write_latest_checkpoint_status,
+                self._checkpointer,
+                last_checkpoint_step=step,
+            )
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
     # the race against this bound. They need to hit the deadline, abort, unwind, raise,
