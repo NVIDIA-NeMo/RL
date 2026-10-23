@@ -287,7 +287,7 @@ def test_exit_on_timeout(mock_components, capsys, tmp_path):
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
     with (
-        patch("nemo_rl.algorithms.rm.torch.save"),
+        patch("nemo_rl.algorithms.rm.save_dataloader_state"),
         patch("nemo_rl.algorithms.rm.TimeoutChecker") as mock_timeout_class,
     ):
         mock_timeout_instance = MagicMock()
@@ -355,7 +355,7 @@ def test_ft_save_period_triggers_periodic_saves(mock_components):
 
     rm_save_state = _initial_rm_save_state()
 
-    with patch("nemo_rl.algorithms.rm.torch.save"):
+    with patch("nemo_rl.algorithms.rm.save_dataloader_state"):
         rm_train(
             mock_components["policy"],
             mock_components["train_dataloader"],
