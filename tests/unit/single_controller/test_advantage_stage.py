@@ -83,6 +83,7 @@ def test_from_master_config_uses_typed_logger(
         ppo=None,
         loss_fn=ClippedPGLossConfig(),
         on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
         logger=LoggerConfig(log_dir=str(tmp_path)),
         async_rl=SimpleNamespace(log_full_train_data=log_full_train_data),
     )
