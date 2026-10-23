@@ -70,6 +70,19 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 > [!NOTE]
 > If you skip vLLM, SGLang, or TRT-LLM during the build but later try to use those backends at runtime, the dependencies will be fetched and built on-demand. This may add significant setup time on first use.
 
+## Stripping the uv Cache
+
+By default, the release image keeps `uv`'s download cache (`/root/.cache/uv`) on disk, which can accelerate re-installs. The tradeoff is a larger image.
+
+For size-sensitive builds that don't need that, drop the cache from the final image with `STRIP_UV_CACHE`:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg STRIP_UV_CACHE=1 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
