@@ -7,7 +7,7 @@ complete support matrix, see [Model Support](../../../about/model-support.md).
 
 - **[MiniMax-M3](minimax-m3.md)** — Run GRPO with the AutoModel training
   backend and BF16 vLLM generation, including validated scope and known limitations.
-- **[MiniMax-M3.1](minimax-m3-1.md)** — Run BF16 GRPO with the AutoModel training
+- **[MiniMax-M3.1](minimax-m3-1-flash.md)** — Run BF16 GRPO with the AutoModel training
   backend (CP2/EP128) and vLLM generation, including validated scope and known limitations.
 
 ```{toctree}
@@ -15,5 +15,5 @@ complete support matrix, see [Model Support](../../../about/model-support.md).
 :maxdepth: 1
 
 minimax-m3.md
-minimax-m3-1.md
+minimax-m3-1-flash.md
 ```
