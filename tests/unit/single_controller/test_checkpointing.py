@@ -1632,7 +1632,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = (
             interval_s
         )
-        gym_commit = object()
+        gym_commit = SimpleNamespace(manifest=SimpleNamespace(restarts={}))
         validated_commits: list[object] = []
 
         @contextlib.asynccontextmanager
@@ -1688,7 +1688,7 @@ class TestPeriodicRolloutCheckpoint:
         @contextlib.asynccontextmanager
         async def prepared_gym_checkpoint(_path, *, checkpoint_id):
             async with coordinator.prepared(checkpoint_id):
-                yield object()
+                yield SimpleNamespace(manifest=SimpleNamespace(restarts={}))
 
         async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
             return None

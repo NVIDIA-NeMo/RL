@@ -387,6 +387,18 @@ class GymCheckpointCoordinator:
             deadline_ts=deadline_ts,
         )
 
+    async def restart_only_servers(self) -> dict[str, list[str]]:
+        """Return each instance's Gym participants whose rollouts start over after a crash."""
+        deadline_ts = self._deadline()
+        return await self._collect(
+            "status",
+            {
+                instance_id: handle.checkpoint_restart_only_servers.remote()
+                for instance_id, handle in self._handles.items()
+            },
+            deadline_ts=deadline_ts,
+        )
+
     def _validate_inventory(
         self,
         episodes_by_instance: Mapping[str, tuple[GymCheckpointEpisode, ...]],
