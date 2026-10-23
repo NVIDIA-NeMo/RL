@@ -670,6 +670,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
+    # Opt in only after confirming Gym's prepared Python environment suits finalizers.
+    # Matching dependency declarations and registered environments are also required.
+    try_reuse_gym_env_for_finalizers: bool = False
 
 
 @dataclass(frozen=True)
