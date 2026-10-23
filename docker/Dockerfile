@@ -24,6 +24,8 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+# Optional: drop the uv download cache from the image (smaller, but no accelerated/offline re-install):
+#   --build-arg STRIP_UV_CACHE=1
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.05-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -201,6 +203,11 @@ ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
+# Set to any non-empty value to delete the uv download cache (/root/.cache/uv) from the
+# dependency-install and TRT-LLM layers before each commits, trading a smaller image for
+# losing any accelerated/offline re-install from that cache. Off by default. Size-sensitive
+# builds opt in with --build-arg STRIP_UV_CACHE=1.
+ARG STRIP_UV_CACHE
 ARG TRTLLM_BUILD_JOBS=24
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
@@ -373,7 +380,15 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 # and simply re-downloads if it ever needs that version.
 bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
 
-echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+# STRIP_UV_CACHE deletes the cache before this layer commits, so the TRT-LLM
+# layer below starts from an empty one instead (its own uv syncs just
+# re-download; see the mkdir -p guard there). No cache-key seed marker is
+# written in that case since there is nothing left to seed future builds from.
+if [ -n "${STRIP_UV_CACHE:-}" ]; then
+    rm -rf /root/.cache/uv
+else
+    echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+fi
 EOF
 
 # Keep the frequently changing TRT-LLM build inputs after the other backend
@@ -420,6 +435,9 @@ rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
 # cache the mount stays empty. The build below therefore also mirrors the
 # current content-addressed wheel into /opt/trtllm_wheels, which IS part of this
 # layer; the release stage and runtime `uv run --extra trtllm` read it from there.
+# The dependency layer's uv cache may have been stripped (STRIP_UV_CACHE); uv
+# recreates /root/.cache/uv on demand, but the `du` below needs it to exist first.
+mkdir -p /root/.cache/uv
 echo "TRT-LLM cache state before build:"
 du -sh /root/.cache/uv /root/.cache/trtllm-wheels
 
@@ -486,6 +504,13 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 
 # Same for stale setuptools (see the comment in the preceding dependency layer).
 bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
+
+# Delete this layer's own uv cache contents before it commits -- see the
+# dependency layer's strip above for why this has to happen per-layer rather
+# than once at the end.
+if [ -n "${STRIP_UV_CACHE:-}" ]; then
+    rm -rf /root/.cache/uv
+fi
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
