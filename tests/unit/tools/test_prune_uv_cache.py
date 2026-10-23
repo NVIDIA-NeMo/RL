@@ -239,10 +239,11 @@ def test_second_run_is_a_no_op(cache: Path) -> None:
     assert prune_uv_cache.prune(cache, keep, set(), dry_run=False) == (0, 0)
 
 
-def test_dockerfile_prunes_in_the_layers_that_fill_the_cache() -> None:
+def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
     # Deleting cache files in a later layer only hides them; the image still ships
-    # them. So the prune must run inside the dependency RUN that seeds and fills
-    # the cache, and Dynamo's wheels must never land in the shared cache.
+    # them. So the prune runs inside the dependency RUN -- and before its first sync,
+    # so it only judges seed content and never deletes the build-isolation deps
+    # (setuptools, a build-time torch, ...) the syncs resolve outside uv.lock.
     lines = (REPO_ROOT / "docker" / "Dockerfile").read_text().splitlines()
     code = [(i, line) for i, line in enumerate(lines) if not line.startswith("#")]
 
@@ -251,19 +252,55 @@ def test_dockerfile_prunes_in_the_layers_that_fill_the_cache() -> None:
     )
     seed_run = next(i for i, l in code if "from=uv-cache-seed" in l)
     run_end = next(i for i, l in code if i > seed_run and l == "EOF")
-    prefetch_end = lines.index("done < /opt/actor_venvs.tsv")
-    cache_key = next(i for i, l in code if '.cache-key"' in l and l.startswith("echo"))
+    seed_copy = next(i for i, l in code if "/tmp/uv-cache-seed/" in l and "rsync" in l)
+    venv = next(i for i, l in code if i > seed_run and l == "uv venv --seed")
+    first_sync = next(i for i, l in code if i > seed_run and "uv sync" in l)
     prunes = [
         i for i, l in code if "prune_uv_cache.py" in l and not l.startswith("COPY")
     ]
 
+    # The script comes from the recipe's own context: an older NRL_GIT_REF lacks it.
+    assert "--from=" not in lines[copy_script]
     assert copy_script < seed_run
     assert len(prunes) == 1, "prune must run exactly once, in the dependency RUN"
-    assert seed_run < prefetch_end < prunes[0] < cache_key < run_end
+    assert seed_run < seed_copy < venv < prunes[0] < first_sync < run_end
 
     dynamo = next(i for i, l in code if "docker/dynamo/install.sh" in l and "bash" in l)
     assert lines[dynamo].startswith("UV_CACHE_DIR=/tmp/")
     assert lines[dynamo + 1].startswith("rm -rf /tmp/")
+
+
+@pytest.mark.parametrize("suffix", [".http", ".msgpack", ".lock", ".rev"])
+def test_compares_sdist_version_directories_verbatim(cache: Path, suffix: str) -> None:
+    version = f"1.0+foo{suffix}"
+    sdists = cache / "sdists-v9" / "pypi" / "pkg"
+    _link(sdists / version / "rev" / "wheel", _archive(cache, "built"))
+
+    prune_uv_cache.prune(cache, {("pkg", version)}, set(), dry_run=False)
+    assert _names(sdists) == {version}
+    assert _names(cache / "archive-v0") == {"built"}
+
+    # Pinning only the shorter version must not keep the longer one.
+    prune_uv_cache.prune(cache, {("pkg", "1.0+foo")}, set(), dry_run=False)
+    assert _names(sdists) == set()
+    assert _names(cache / "archive-v0") == set()
+
+
+def test_keeps_archives_of_a_package_named_src(cache: Path) -> None:
+    pypi = cache / "wheels-v6" / "pypi"
+    _wheel(pypi, "src", "1.0-py3-none-any", "wheel-kept")
+    _wheel(pypi, "src", "0.9-py3-none-any", "wheel-old")
+    sdists = cache / "sdists-v9" / "pypi"
+    _link(sdists / "src" / "1.0" / "rev" / "wheel", _archive(cache, "sdist-kept"))
+    _link(sdists / "src" / "0.9" / "rev" / "wheel", _archive(cache, "sdist-old"))
+    # A link inside an unpacked source tree does not keep its target alive.
+    _link(sdists / "src" / "1.0" / "rev" / "src" / "x", _archive(cache, "in-src"))
+
+    prune_uv_cache.prune(cache, {("src", "1.0")}, set(), dry_run=False)
+
+    assert _names(pypi / "src") == {"1.0-py3-none-any", "1.0-py3-none-any.http"}
+    assert _names(sdists / "src") == {"1.0"}
+    assert _names(cache / "archive-v0") == {"wheel-kept", "sdist-kept"}
 
 
 def test_main_refuses_a_suspiciously_small_lock(

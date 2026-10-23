@@ -124,7 +124,14 @@ def plan_removals(
                 continue
             name = normalize(name_dir.name)
             for entry in name_dir.iterdir():
-                version = entry_version(entry.name)
+                if root.relative_to(cache_dir).parts[0].startswith("sdists-v") and (
+                    entry.is_dir() and not entry.is_symlink()
+                ):
+                    # An sdist version directory is the bare version, compared verbatim:
+                    # stripping a metadata suffix would change a version like `1.0+foo.http`.
+                    version = entry.name if entry.name[:1].isdigit() else None
+                else:
+                    version = entry_version(entry.name)
                 if version is not None and (name, version) not in versions:
                     removals.append(entry)
     commit_dirs = [
@@ -139,12 +146,22 @@ def plan_removals(
 
 def _reachable_archives(cache_dir: Path, removed: set[Path]) -> set[str]:
     archive_root = (cache_dir / "archive-v0").resolve()
+    registry_roots = set(_registry_roots(cache_dir))
     reachable = set()
     for bucket in [*cache_dir.glob("wheels-v*"), *cache_dir.glob("sdists-v*")]:
         for dirpath, dirnames, filenames in os.walk(bucket):
             here = Path(dirpath)
+            # Skip the unpacked source trees inside sdist builds (`<rev>/src`), but not
+            # a package that happens to be named `src`.
             dirnames[:] = [
-                d for d in dirnames if d != "src" and here / d not in removed
+                d
+                for d in dirnames
+                if here / d not in removed
+                and (
+                    d != "src"
+                    or bucket.name.startswith("wheels-v")
+                    or here in registry_roots
+                )
             ]
             # os.walk lists directory symlinks under dirnames without following them.
             for name in [*filenames, *dirnames]:

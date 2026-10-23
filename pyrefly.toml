@@ -25,6 +25,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "docker/prune_uv_cache.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness

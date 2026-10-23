@@ -243,7 +243,8 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
-COPY --from=nemo-rl docker/prune_uv_cache.py ./docker/prune_uv_cache.py
+# Part of this recipe, not of the selected source: an older NRL_GIT_REF has no such script.
+COPY docker/prune_uv_cache.py /usr/local/bin/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -260,9 +261,20 @@ elif [ -n "$SEED_KEY" ]; then
     echo "Seeding uv cache (key=${CACHE_KEY})"
     mkdir -p "${UV_CACHE_DIR}"
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ "${UV_CACHE_DIR}/" 2>/dev/null || true
+    SEEDED=1
 fi
 
 uv venv --seed
+# Drop what the seed carried in that uv.lock no longer pins -- versions from older locks
+# (see docker/prune_uv_cache.py). It runs before any sync, so it only ever judges seed
+# content: build-isolation deps the syncs below resolve outside uv.lock (setuptools, a
+# build-time torch, ...) are kept. And it runs in this RUN because deleting files in a
+# later layer only hides them; the image would still ship every byte.
+if [[ -n "${SEEDED:-}" ]]; then
+    du -sh "${UV_CACHE_DIR}"
+    "${UV_PROJECT_ENVIRONMENT}/bin/python" /usr/local/bin/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+    du -sh "${UV_CACHE_DIR}"
+fi
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
@@ -354,13 +366,6 @@ rm -rf /var/lib/apt/lists/*
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
-
-# Drop cache entries uv.lock no longer pins -- versions the seed carried in from older locks
-# (see docker/prune_uv_cache.py). It has to run here, in the layer that writes them: deleting
-# them in a later layer only hides them, and the image still ships every byte.
-du -sh "${UV_CACHE_DIR}"
-"${UV_PROJECT_ENVIRONMENT}/bin/python" docker/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
-du -sh "${UV_CACHE_DIR}"
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
