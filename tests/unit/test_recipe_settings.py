@@ -238,3 +238,31 @@ def test_qwen235_async_refit_buffer_size_matches_on_both_sides() -> None:
     )
 
     assert train_ratio == generation_ratio == "0.005"
+
+
+def test_nemotron3_super_bf16_trtllm_async_refit_uses_generation_ep() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "llm/performance/grpo-nemotron3-super-120BA12B-32n4g-async-1off.yaml"
+    )
+    generation = config.policy.generation
+
+    assert generation.refit_transport == "nccl_reshard"
+    assert generation.vllm_kwargs.moe_backend == "flashinfer_trtllm"
+    assert (
+        generation.vllm_cfg.expert_parallel_size
+        == generation.vllm_cfg.tensor_parallel_size
+        == 4
+    )
+
+
+def test_nemotron3_super_mxfp8_rollout_keeps_generation_tp_sharding() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT
+        / "llm/performance/grpo-nemotron3-super-120BA12B-32n4g-async-1off-mxfp8-rollout.yaml"
+    )
+
+    assert config.policy.generation.vllm_cfg.precision == "fp8"
+    assert config.policy.generation.vllm_cfg.expert_parallel_size == 1
