@@ -22,10 +22,16 @@ episodes a Gym restore installed. A two-process functional test can therefore
 prove that a restored episode returns to the same Gym instance under
 ``gym_attempt + 1`` and continues from its saved turn, without depending on log
 wording.
+
+When ``SC_PREFIX_RECOVERY_STAGING_KEYS`` is set, the hook also records the live
+token-capture staging keys before each training chunk, so a prefix-recovery run
+can prove restored prefix rows were retired before training. The trained rows
+themselves come from ``async_rl.log_full_train_data``.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -36,6 +42,44 @@ from examples import run_grpo_single_controller
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from tests.functional._single_controller_hook_utils import append_event, find_group
+
+
+class _StagingKeyProbe:
+    """Test-only TQPolicy wrapper that records live staging keys per train step."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        output_path: Path,
+        initial_train_step: int,
+        partition: str,
+    ) -> None:
+        self._delegate = delegate
+        self._output_path = output_path
+        self._train_step = initial_train_step
+        self._partition = partition
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    def begin_train_step(self, *args: Any, **kwargs: Any) -> Any:
+        result = self._delegate.begin_train_step(*args, **kwargs)
+        self._train_step += 1
+        return result
+
+    def train_microbatches_from_meta(self, meta: Any, *args: Any, **kwargs: Any) -> Any:
+        keys = self._delegate.dp_client.list_sample_ids(partition_id=self._partition)
+        with self._output_path.open("a") as stream:
+            record = {
+                "train_step": self._train_step,
+                "staging_sample_ids": sorted(keys),
+            }
+            stream.write(json.dumps(record) + "\n")
+        return self._delegate.train_microbatches_from_meta(meta, *args, **kwargs)
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -211,6 +255,7 @@ _original_setup_single_controller = run_grpo_single_controller.setup_single_cont
 
 def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     actor_args, timing_metrics = _original_setup_single_controller(*args, **kwargs)
+    master_config = args[0] if args else kwargs["master_config"]
     manager = actor_args.rollout_manager
     impl = manager._impl
     events_path = Path(
@@ -230,6 +275,14 @@ def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
     # gates checkpoint admission and Gym recovery on
     # ``isinstance(self._impl, AsyncNemoGymRolloutImpl)``.
     impl.run_rollout = instrumented.run_rollout
+    staging_keys_path = os.environ.get("SC_PREFIX_RECOVERY_STAGING_KEYS")
+    if staging_keys_path is not None:
+        actor_args.trainer_handle = _StagingKeyProbe(
+            actor_args.trainer_handle,
+            output_path=Path(staging_keys_path),
+            initial_train_step=int(actor_args.save_state.current_step),
+            partition=master_config.token_capture.staging_partition,
+        )
     return actor_args, timing_metrics
 
 
