@@ -1174,13 +1174,22 @@ def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_etp() -> Non
         check_nccl_reshard_refit_support(config)
 
 
-def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_mtp() -> None:
+@pytest.mark.parametrize("native_refit", [None, False, True])
+@pytest.mark.parametrize("mtp_layers", [0, 5])
+@pytest.mark.parametrize("spec_method", [None, "mtp", "deepseek_mtp", "eagle3"])
+def test_check_nccl_reshard_refit_support_mtp_training_and_speculation(
+    native_refit: bool | None, mtp_layers: int, spec_method: str | None
+) -> None:
     config = _valid_nccl_reshard_config()
-    config.policy["megatron_cfg"]["native_mxfp8_refit"] = True
     config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    if spec_method is not None:
+        config.policy["generation"]["vllm_kwargs"] = {
+            "speculative_config": {"method": spec_method}
+        }
     config.policy["megatron_cfg"].update(
         {
-            "mtp_num_layers": 1,
+            "mtp_num_layers": mtp_layers,
+            "mtp_detach_heads": True,
             "fp8_cfg": {
                 "enabled": True,
                 "fp8_param": True,
@@ -1188,8 +1197,13 @@ def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_mtp() -> Non
             },
         }
     )
+    if native_refit is not None:
+        config.policy["megatron_cfg"]["native_mxfp8_refit"] = native_refit
 
-    with pytest.raises(ValueError, match="co-trained MTP"):
+    if native_refit and mtp_layers and spec_method in ("mtp", "deepseek_mtp"):
+        with pytest.raises(ValueError, match="co-trained MTP speculative drafter"):
+            check_nccl_reshard_refit_support(config)
+    else:
         check_nccl_reshard_refit_support(config)
 
 

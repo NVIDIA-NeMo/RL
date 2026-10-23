@@ -800,10 +800,19 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "(fp8_cfg.enabled=True, fp8_param=True, fp8_recipe='mxfp8') "
                     "and vLLM MXFP8 (precision='fp8', is_mx=True)."
                 )
-            if (megatron_cfg.get("mtp_num_layers", 0) or 0) > 0:
+            # BF16 MTP training weights stay on the misc transfer path. Only an
+            # active co-trained speculative drafter needs the unsupported native
+            # reload lifecycle; MTP training alone does not require a drafter.
+            spec_cfg = vllm_kwargs.get("speculative_config") or {}
+            co_trained_mtp_drafter = (
+                megatron_cfg.get("mtp_num_layers", 0) or 0
+            ) > 0 and spec_cfg.get("method") in ("mtp", "deepseek_mtp")
+            if co_trained_mtp_drafter:
                 violations.append(
-                    "native MXFP8 refit does not yet support a co-trained MTP "
-                    "drafter; load static MTP weights from the generation checkpoint."
+                    "native MXFP8 refit does not yet support refreshing a co-trained "
+                    "MTP speculative drafter; disable MTP speculative decoding or "
+                    "load static MTP weights from the generation checkpoint with "
+                    "policy.megatron_cfg.mtp_num_layers=0"
                 )
             train_tp = megatron_cfg.get("tensor_model_parallel_size", 1)
             train_etp = megatron_cfg.get("expert_tensor_parallel_size")

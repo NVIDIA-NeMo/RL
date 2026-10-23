@@ -2207,3 +2207,29 @@ def test_native_mxfp8_refit_keeps_bf16_misc_disjoint_from_adapter(
     }
     assert set(misc_names) == set(refit_info["misc_meta"])
     assert native_names.isdisjoint(misc_names)
+
+
+def test_native_mxfp8_prepare_allows_bf16_mtp_training_without_speculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extension, adapter = _make_native_speculative_extension(
+        method="mtp", draft_quantization=None
+    )
+    extension.model_runner.vllm_config.speculative_config = None
+    extension.model_runner.drafter = None
+    extension.model_runner.speculator = None
+    refit_info = _native_down_refit_info()
+    mtp_name = "mtp.layers.0.mlp.experts.0.down_proj.weight"
+    refit_info["misc_meta"][mtp_name] = {"shape": [32, 32], "dtype": "torch.bfloat16"}
+    monkeypatch.setattr(
+        "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
+        lambda info: info,
+    )
+
+    extension.prepare_nccl_reshard_refit_info(refit_info)
+
+    adapter.validate_plan.assert_called_once_with(refit_info)
+    adapter.prepare.assert_called_once_with(refit_info)
+    assert extension.nccl_reshard_refit_info["misc_meta"][mtp_name]["dtype"] == (
+        "torch.bfloat16"
+    )

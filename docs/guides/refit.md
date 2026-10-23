@@ -23,6 +23,25 @@ packed collective; Megatron's native refit must be selected explicitly with
 `refit_cfg.nixl`. Because one selector chooses the transport, sparse delta and
 NIXL cannot both be active.
 
+## Direct MXFP8 weights
+
+Direct MXFP8 transfer is disabled by default. With the flag absent or false,
+MXFP8 training weights follow the existing BF16 export and transfer path, then
+vLLM quantizes them again.
+
+To transfer the native MXFP8 weight bytes and E8M0 scales instead, opt in with
+`policy.megatron_cfg.native_mxfp8_refit: true`. This requires
+`policy.megatron_cfg.fp8_cfg.enabled: true`, `fp8_param: true`, and
+`fp8_recipe: mxfp8`, together with `policy.generation.vllm_cfg.precision: fp8`,
+`is_mx: true`, and `policy.generation.refit_transport: nccl_reshard`.
+The native path supports mixed BF16/MXFP8 parameters. Megatron generation's
+logical-weight refit continues to use BF16 payloads.
+
+BF16 MTP layers can remain in training when MTP speculative decoding is disabled.
+Keep them excluded from the TE quantization recipe; their refit weights use the
+miscellaneous-weight path. Refreshing a co-trained MTP speculative drafter with
+native MXFP8 refit remains unsupported.
+
 ## vLLM Reload API
 
 For non-colocated vLLM using the default NCCL transport, set
