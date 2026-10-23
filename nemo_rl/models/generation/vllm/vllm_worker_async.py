@@ -143,9 +143,16 @@ class _AsyncLLMHTTPClient:
     Add each new member here and decide whether it must run on the engine loop.
     """
 
-    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        engine_client: Any,
+        engine_loop: asyncio.AbstractEventLoop,
+        *,
+        flat_logprobs: bool,
+    ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
+        self._flat_logprobs = flat_logprobs
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -169,6 +176,20 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
+        # vllm_cfg.flat_logprobs: store this request's logprobs flat. output_handler
+        # would otherwise build a dict plus a Logprob object per generated token on the
+        # engine loop; under a large backlog the cyclic GC's full collections over those
+        # objects hold the GIL for tens of seconds. The values are the same, and
+        # attach_token_information_to_chat_response_choices reads them the same way.
+        # flat_logprobs also flattens prompt logprobs, and vLLM's clamp_prompt_logprobs
+        # edits per-position copies of FlatLogprobs, so -inf prompt logprobs would reach
+        # JSON serialization; leave requests that ask for prompt logprobs unchanged.
+        if (
+            self._flat_logprobs
+            and sampling_params.logprobs is not None
+            and sampling_params.prompt_logprobs is None
+        ):
+            sampling_params.flat_logprobs = True
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -417,6 +438,19 @@ class VllmAsyncGenerationWorkerImpl(
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
+        # Keep vLLM's output loops from monopolizing this actor's event loop under a
+        # generation backlog (see output_loop_yield.py).
+        output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
+            "output_loop_yield_budget_ms"
+        )
+        if output_loop_yield_budget_ms is not None:
+            from nemo_rl.models.generation.vllm.output_loop_yield import (
+                install_output_loop_yield,
+            )
+
+            install_output_loop_yield(
+                self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
+            )
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
@@ -572,7 +606,11 @@ class VllmAsyncGenerationWorkerImpl(
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
         if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self._http_engine_client = _AsyncLLMHTTPClient(
+                self.llm,
+                self._engine_loop,
+                flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+            )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
