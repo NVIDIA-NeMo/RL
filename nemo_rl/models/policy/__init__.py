@@ -378,8 +378,16 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 
 class MegatronConfig(TypedDict):
+    # Optional opt-in: transmit native MXFP8 values/scales to vLLM via NCCL
+    # reshard. Absent/false keeps the BF16 dequantize/requantize roundtrip.
+    native_mxfp8_refit: NotRequired[bool]
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Keep global leading/trailing transformer layers in BF16 when a per-module
+    # precision recipe is active.
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
     # provider fields and must not duplicate first-class megatron_cfg fields.

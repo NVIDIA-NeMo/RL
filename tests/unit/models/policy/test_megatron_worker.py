@@ -414,11 +414,18 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
+def test_nccl_reshard_all_misc_refit_supports_empty_bulk(
+    pp_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.parallel_state."
+        "get_pipeline_model_parallel_rank",
+        lambda: pp_size - 1,
+    )
     misc_name = "model.layers.0.mlp.experts.down_proj"
     task = SimpleNamespace(
         global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
@@ -440,6 +447,7 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
     worker._build_layer_to_pp_stage = MagicMock()
     worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
 
+    assert not hasattr(worker, "my_pp_stage")
     info = worker.prepare_nccl_reshard_refit_info(
         train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": pp_size},
         gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
@@ -447,6 +455,7 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         gen_world_size=1,
     )
 
+    assert worker.my_pp_stage == pp_size - 1
     assert info["layer_names"] == []
     assert info["per_layer_params"] == {}
     assert list(info["misc_meta"]) == [misc_name]
@@ -2086,6 +2095,302 @@ def test_sync_params_before_refit_gathers_pending_bf16_params(
         )
     elif parked:
         assert buffer.param_data.untyped_storage().nbytes() == 0
+
+
+@pytest.mark.parametrize(
+    ("enabled", "fp8_param", "fp8_recipe", "precision", "is_mx", "expected"),
+    [
+        (True, True, "mxfp8", "fp8", True, True),
+        (False, True, "mxfp8", "fp8", True, False),
+        (True, False, "mxfp8", "fp8", True, False),
+        (True, True, "blockwise", "fp8", True, False),
+        (True, True, "mxfp8", "bf16", True, False),
+        (True, True, "mxfp8", "fp8", False, False),
+        (True, True, "mxfp8", "fp8", None, False),
+    ],
+)
+@pytest.mark.parametrize("backend", ["vllm", "megatron"])
+@pytest.mark.parametrize("native_mxfp8_refit", [None, False, True])
+def test_native_mxfp8_export_selection(
+    enabled: bool,
+    fp8_param: bool,
+    fp8_recipe: str,
+    precision: str,
+    is_mx: Optional[bool],
+    expected: bool,
+    backend: str,
+    native_mxfp8_refit: Optional[bool],
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "enabled": enabled,
+        "fp8_param": fp8_param,
+        "fp8_recipe": fp8_recipe,
+    }
+    worker.cfg = {
+        "megatron_cfg": {},
+        "generation": {
+            "backend": backend,
+            "vllm_cfg": {
+                "precision": precision,
+                "is_mx": is_mx,
+            },
+        },
+    }
+
+    if native_mxfp8_refit is not None:
+        worker.cfg["megatron_cfg"]["native_mxfp8_refit"] = native_mxfp8_refit
+    assert worker._is_native_mxfp8_export() is (
+        expected and backend == "vllm" and native_mxfp8_refit is True
+    )
+
+
+def test_native_mxfp8_refit_syncs_shared_storage_before_reading_components() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = MagicMock()
+    worker.model = MagicMock()
+    worker._is_native_mxfp8_export = MagicMock(return_value=True)
+    worker._uses_mxfp8_overlap_shared_param_buffer = MagicMock(return_value=True)
+    worker._materialize_model_params_for_read = MagicMock()
+
+    worker._sync_native_mxfp8_params_for_refit()
+
+    worker._materialize_model_params_for_read.assert_called_once_with()
+    worker.optimizer.prepare_model_params_for_param_sync.assert_not_called()
+
+
+def test_model_param_materialization_handles_nested_optimizers_and_pp_chunks() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events: list[tuple[str, str]] = []
+
+    class ModelChunk:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def start_param_sync(self, *, force_sync: bool) -> None:
+            assert force_sync
+            events.append(("sync", self.name))
+
+    class LeafOptimizer:
+        is_stub_optimizer = False
+
+        def __init__(self, name: str, model_chunks: list[ModelChunk]) -> None:
+            self.name = name
+            self.model_chunks = model_chunks
+
+        def _copy_main_params_to_param_buffer(self) -> None:
+            events.append(("stage", self.name))
+
+    chunk_0 = ModelChunk("pp0")
+    chunk_1 = ModelChunk("pp1")
+    nested = SimpleNamespace(
+        chained_optimizers=[
+            LeafOptimizer("dense", [chunk_0]),
+            LeafOptimizer("expert", [chunk_1]),
+        ]
+    )
+    root = SimpleNamespace(chained_optimizers=[nested, LeafOptimizer("mtp", [chunk_0])])
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = root
+    worker.model = MagicMock()
+    worker._train_step_state = None
+
+    worker._materialize_model_params_for_read()
+
+    assert events == [
+        ("stage", "dense"),
+        ("stage", "expert"),
+        ("stage", "mtp"),
+        ("sync", "pp0"),
+        ("sync", "pp1"),
+    ]
+    worker.model.zero_grad_buffer.assert_not_called()
+
+
+def test_model_param_materialization_rejects_an_open_train_step() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    stage = MagicMock()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = SimpleNamespace(_copy_main_params_to_param_buffer=stage)
+    worker._train_step_state = {"num_chunks": 1}
+
+    with pytest.raises(RuntimeError, match="while a train step is open"):
+        worker._materialize_model_params_for_read()
+
+    stage.assert_not_called()
+
+
+def test_native_mxfp8_refit_skips_param_sync_without_shared_storage() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.optimizer = MagicMock()
+    worker.model = MagicMock()
+    worker._is_native_mxfp8_export = MagicMock(return_value=True)
+    worker._uses_mxfp8_overlap_shared_param_buffer = MagicMock(return_value=False)
+    worker._materialize_model_params_for_read = MagicMock()
+
+    worker._sync_native_mxfp8_params_for_refit()
+
+    worker._materialize_model_params_for_read.assert_not_called()
+
+
+def test_native_mxfp8_transfer_uses_metadata_component_order(monkeypatch) -> None:
+    import nemo_rl.weight_sync.xferdtensor as xfer_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import (
+        HFToLocalParamMap,
+        LocalParamSpec,
+    )
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    weight = torch.empty(64, 256, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(64, 8, dtype=torch.uint8)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    worker.pp_comm_group = object()
+    worker.hf_to_local_param_map = HFToLocalParamMap(
+        specs={
+            (name, "weight"): LocalParamSpec(base=weight, wire_dtype=weight.dtype),
+            (name, "weight_scale"): LocalParamSpec(base=scale, wire_dtype=scale.dtype),
+        }
+    )
+    worker.nccl_reshard_refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": name,
+                    "pp_stage": 0,
+                    "src_mesh_info": "src-mesh",
+                    "dst_mesh_info": "dst-mesh",
+                    "components": [
+                        {
+                            "role": "weight_scale",
+                            "global_shape": [64, 8],
+                            "src_placements": ["scale-src"],
+                            "dst_placements": ["scale-dst"],
+                        },
+                        {
+                            "role": "weight",
+                            "global_shape": [64, 256],
+                            "src_placements": ["weight-src"],
+                            "dst_placements": ["weight-dst"],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    worker._broadcast_misc_params_packed = lambda **_: None
+    refs = []
+    transfers = []
+
+    class FakeDTensorRef:
+        def __init__(self, *, local_tensor, global_shape):
+            self.local_tensor = local_tensor
+            self.global_shape = global_shape
+            refs.append(self)
+
+    monkeypatch.setattr(xfer_module, "DTensorRef", FakeDTensorRef)
+    monkeypatch.setattr(
+        xfer_module,
+        "xferdtensor",
+        lambda *args: transfers.append(args),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+
+    worker._nccl_reshard_refit()
+
+    assert [ref.global_shape for ref in refs] == [[64, 8], [64, 256]]
+    assert [ref.local_tensor for ref in refs] == [scale, weight]
+    assert [(call[2], call[5]) for call in transfers] == [
+        (["scale-src"], ["scale-dst"]),
+        (["weight-src"], ["weight-dst"]),
+    ]
+
+
+def test_native_mxfp8_missing_role_fails_before_collective(monkeypatch) -> None:
+    import nemo_rl.weight_sync.xferdtensor as xfer_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.nccl_reshard_utils import (
+        HFToLocalParamMap,
+        LocalParamSpec,
+    )
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    worker.pp_comm_group = object()
+    worker.hf_to_local_param_map = HFToLocalParamMap(
+        specs={
+            (name, "weight"): LocalParamSpec(
+                base=torch.empty(4, 32, dtype=torch.bfloat16)
+            )
+        }
+    )
+    worker.nccl_reshard_refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": name,
+                    "pp_stage": 0,
+                    "src_mesh_info": "src-mesh",
+                    "dst_mesh_info": "dst-mesh",
+                    "components": [
+                        {
+                            "role": "weight",
+                            "global_shape": [4, 32],
+                            "src_placements": [],
+                            "dst_placements": [],
+                        },
+                        {
+                            "role": "weight_scale",
+                            "global_shape": [4, 1],
+                            "src_placements": [],
+                            "dst_placements": [],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    transfers = []
+    monkeypatch.setattr(
+        xfer_module,
+        "xferdtensor",
+        lambda *args: transfers.append(args),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "stream")
+
+    with pytest.raises(RuntimeError, match=f"{name!r}.*'weight_scale'"):
+        worker._nccl_reshard_refit()
+
+    assert transfers == []
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):

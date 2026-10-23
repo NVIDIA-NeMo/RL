@@ -23,12 +23,14 @@ torch.distributed, no model object — so this module runs on CPU with no extras
 
 import pickle
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
     LocalParamSpec,
     MeshInfo,
     RefitCtx,
@@ -44,6 +46,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     make_nccl_reshard_refit_info_wire_safe,
     restore_refit_info_placements,
 )
+from nemo_rl.weight_sync.refit_components import component_plan_digest
 
 
 def test_local_param_spec_defaults_to_bf16():
@@ -1073,3 +1076,330 @@ def test_wire_safe_pickle_is_independent_of_a_patched_storage_loader(monkeypatch
 
     assert b"dummy_unpickler_module" in pickle.dumps(info)
     assert b"dummy_unpickler_module" not in pickle.dumps(wire)
+
+
+def test_hf_to_local_param_map_normalizes_legacy_keys() -> None:
+    spec = LocalParamSpec(base=torch.empty(1))
+    mapping = HFToLocalParamMap(specs={"x.weight": spec})
+
+    assert mapping.get("x.weight") is spec
+    assert mapping.get("x.weight", role="weight") is spec
+    assert mapping.get("x.weight", role="weight_scale") is None
+
+
+def test_check_nccl_reshard_refit_support_accepts_bf16_to_mxfp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_keeps_matching_blockwise_fp8() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"]["precision"] = "fp8"
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_native_mxfp8_pair() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["native_mxfp8_refit"] = True
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "expected_violation"),
+    [
+        (
+            {},
+            "native_mxfp8_refit=True requires",
+        ),
+        (
+            {"precision": "fp8"},
+            "native_mxfp8_refit=True requires",
+        ),
+        (
+            {"precision": "fp8", "is_mx": False},
+            "native_mxfp8_refit=True requires",
+        ),
+        (
+            {"precision": "fp8", "is_mx": 1},
+            "native_mxfp8_refit=True requires",
+        ),
+    ],
+)
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_format_mismatches(
+    vllm_cfg: dict[str, object], expected_violation: str
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["native_mxfp8_refit"] = True
+    config.policy["generation"]["vllm_cfg"].update(vllm_cfg)
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+
+    with pytest.raises(ValueError, match=expected_violation):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_etp() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"].update(
+        {
+            "expert_tensor_parallel_size": 2,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8_param": True,
+                "fp8_recipe": "mxfp8",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="expert_tensor_parallel_size must be 1"):
+        check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_rejects_native_mxfp8_with_mtp() -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["megatron_cfg"]["native_mxfp8_refit"] = True
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"].update(
+        {
+            "mtp_num_layers": 1,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8_param": True,
+                "fp8_recipe": "mxfp8",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="co-trained MTP"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize("gemm_backend", ["torch", "flashinfer"])
+def test_check_nccl_reshard_accepts_supported_grouped_gemm_backends(
+    gemm_backend: str,
+) -> None:
+    config = _valid_nccl_reshard_config()
+    config.policy["precision"] = "bfloat16"
+    config.policy["generation"] = {
+        "backend": "megatron",
+        "refit_transport": "nccl_reshard",
+        "colocated": {"enabled": False},
+        "mcore_generation_config": {
+            "pipeline_model_parallel_size": 1,
+            "inference_grouped_gemm_backend": gemm_backend,
+            "transformer_impl": "inference_optimized",
+            "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+        },
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
+def _native_mxfp8_metadata(
+    hidden: int = 32, inter: int = 128
+) -> dict[str, dict[str, Any]]:
+    return {
+        "model.layers.0.mlp.down_proj.weight": {
+            "shape": [hidden, inter],
+            "dtype": "torch.float8_e4m3fn",
+            "components": [
+                {
+                    "role": "weight",
+                    "shape": [hidden, inter],
+                    "dtype": "torch.float8_e4m3fn",
+                },
+                {
+                    "role": "weight_scale",
+                    "shape": [hidden, inter // 32],
+                    "dtype": "torch.uint8",
+                },
+            ],
+        }
+    }
+
+
+def test_build_refit_info_preserves_native_mxfp8_components() -> None:
+    info = build_nccl_reshard_refit_info(
+        _native_mxfp8_metadata(),
+        train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=4,
+    )
+    param = _find(info, "model.layers.0.mlp.down_proj.weight")
+
+    assert [component["role"] for component in param["components"]] == [
+        "weight",
+        "weight_scale",
+    ]
+    assert param["components"][0]["global_shape"] == (32, 128)
+    assert param["components"][1]["global_shape"] == (32, 4)
+    for component in param["components"]:
+        assert any(
+            isinstance(placement, Shard) and placement.dim == 1
+            for placement in component["src_placements"]
+        )
+        assert any(
+            isinstance(placement, Shard) and placement.dim == 1
+            for placement in component["dst_placements"]
+        )
+
+
+def test_build_refit_info_rejects_incomplete_local_mxfp8_blocks() -> None:
+    metadata = _native_mxfp8_metadata()
+    param = metadata["model.layers.0.mlp.down_proj.weight"]
+    param["shape"] = [32, 64]
+    param["components"][0]["shape"] = [32, 64]
+    param["components"][1]["shape"] = [32, 2]
+
+    with pytest.raises(ValueError, match="local K.*divisible by 32"):
+        build_nccl_reshard_refit_info(
+            metadata,
+            train_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+            train_world_size=4,
+            gen_world_size=4,
+        )
+
+
+def test_build_refit_info_preserves_grouped_native_mxfp8_components() -> None:
+    metadata = {
+        "model.layers.0.mlp.experts.0.down_proj.weight": {
+            "shape": [32, 64],
+            "dtype": "torch.float8_e4m3fn",
+            "components": [
+                {
+                    "role": "weight",
+                    "shape": [32, 64],
+                    "dtype": "torch.float8_e4m3fn",
+                },
+                {
+                    "role": "weight_scale",
+                    "shape": [32, 2],
+                    "dtype": "torch.uint8",
+                },
+            ],
+        },
+        "model.layers.0.mlp.experts.1.down_proj.weight": {
+            "shape": [32, 64],
+            "dtype": "torch.float8_e4m3fn",
+            "components": [
+                {
+                    "role": "weight",
+                    "shape": [32, 64],
+                    "dtype": "torch.float8_e4m3fn",
+                },
+                {
+                    "role": "weight_scale",
+                    "shape": [32, 2],
+                    "dtype": "torch.uint8",
+                },
+            ],
+        },
+    }
+    info = build_nccl_reshard_refit_info(
+        metadata,
+        train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
+        gen_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=2,
+    )
+    param = _find(info, "model.layers.0.mlp.experts.down_proj.weight")
+
+    assert param["grouped_expert_proj"] == "down_proj"
+    assert [component["global_shape"] for component in param["components"]] == [
+        (2, 32, 64),
+        (2, 32, 2),
+    ]
+    for component in param["components"]:
+        assert any(
+            isinstance(placement, Shard) and placement.dim == 0
+            for placement in component["src_placements"]
+        )
+
+
+def _native_refit_info_for_wire() -> dict[str, Any]:
+    return build_nccl_reshard_refit_info(
+        _native_mxfp8_metadata(),
+        train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
+        train_world_size=2,
+        gen_world_size=4,
+    )
+
+
+def test_wire_safe_then_restore_reproduces_component_placements() -> None:
+    info = _native_refit_info_for_wire()
+
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+    components = wire["per_layer_params"]["model.layers.0"][0]["components"]
+    assert all(
+        isinstance(placement, dict)
+        for component in components
+        for placement in component["src_placements"] + component["dst_placements"]
+    )
+
+    restored = restore_refit_info_placements(wire)
+    restored_components = restored["per_layer_params"]["model.layers.0"][0][
+        "components"
+    ]
+    original_components = info["per_layer_params"]["model.layers.0"][0]["components"]
+    for restored_component, original_component in zip(
+        restored_components, original_components, strict=True
+    ):
+        assert (
+            restored_component["src_placements"] == original_component["src_placements"]
+        )
+        assert (
+            restored_component["dst_placements"] == original_component["dst_placements"]
+        )
+
+
+def test_restore_refit_info_rejects_plan_digest_mismatch() -> None:
+    info = _native_refit_info_for_wire()
+    info["plan_digest"] = component_plan_digest(info)
+    wire = make_nccl_reshard_refit_info_wire_safe(info)
+    wire["per_layer_params"]["model.layers.0"][0]["components"][1]["dtype"] = (
+        "torch.float16"
+    )
+    recomputed_digest = component_plan_digest(wire)
+
+    with pytest.raises(ValueError, match="refit plan digest mismatch") as exc_info:
+        restore_refit_info_placements(wire)
+
+    message = str(exc_info.value)
+    assert info["plan_digest"] in message
+    assert recomputed_digest in message
+
+
+@pytest.mark.parametrize("native_mxfp8_refit", [None, False, True])
+def test_native_mxfp8_refit_is_optional(native_mxfp8_refit):
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update({"precision": "fp8", "is_mx": True})
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+    }
+    if native_mxfp8_refit is not None:
+        config.policy["megatron_cfg"]["native_mxfp8_refit"] = native_mxfp8_refit
+    check_nccl_reshard_refit_support(config)
