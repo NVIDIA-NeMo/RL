@@ -1013,9 +1013,7 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
 
 
 @pytest.mark.parametrize("chunked", [False, True])
-def test_logprob_shim_backward_is_the_replaced_functions_backward(
-    monkeypatch, chunked
-):
+def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, chunked):
     import torch
 
     def full_row(shard):

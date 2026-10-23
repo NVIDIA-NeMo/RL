@@ -52,7 +52,9 @@ def _run_logprob_contract(rank, world_size, *, dtype, chunk_size):
     # A large common offset: the gradient must not depend on it.
     full[0, 0] += 2.0**24
     full = full.to(dtype)
-    target = torch.randint(0, _VOCAB, (_BATCH, _SEQ), device=device, generator=generator)
+    target = torch.randint(
+        0, _VOCAB, (_BATCH, _SEQ), device=device, generator=generator
+    )
     # Targets in every rank's shard, including both shard edges.
     shard = _VOCAB // world_size
     for r in range(world_size):

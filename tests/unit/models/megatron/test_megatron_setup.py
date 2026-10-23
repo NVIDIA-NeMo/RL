@@ -1605,7 +1605,10 @@ class TestApplyPrecisionConfig:
             ({"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": {}}, True),
             ({"training_recipe": {}, "evaluation_recipe": _MXFP8_BLOCK}, True),
             ({"training_recipe": _MXFP8_BLOCK}, False),
-            ({"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": _MXFP8_BLOCK}, False),
+            (
+                {"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": _MXFP8_BLOCK},
+                False,
+            ),
             ({"training_recipe": {}, "evaluation_recipe": {}}, False),
         ],
         ids=["mxfp8-empty", "empty-mxfp8", "mxfp8-inherit", "mxfp8-mxfp8", "bf16-bf16"],

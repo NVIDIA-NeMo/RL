@@ -1758,9 +1758,7 @@ def _apply_precision_config(
         _validate_te_precision_config(
             quant_recipe,
             fp8_cfg,
-            zero_train_gen_mismatch=bool(
-                megatron_cfg.get("zero_train_gen_mismatch")
-            ),
+            zero_train_gen_mismatch=bool(megatron_cfg.get("zero_train_gen_mismatch")),
         )
         model_cfg.quant_recipe = quant_recipe
 
