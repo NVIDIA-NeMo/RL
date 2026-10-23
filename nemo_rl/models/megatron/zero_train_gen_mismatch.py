@@ -274,14 +274,14 @@ def allow_installed_flash_attn_4() -> None:
     mcore_attention.HAVE_FA4 = True
 
 
-class _GatheredVocabLogprob(torch.autograd.Function):
-    """Full-row log-softmax forward over gathered vocab shards; sharded backward.
+class _GenAlignedLogprob(torch.autograd.Function):
+    """Megatron Inference's log-probs forward; the replaced function's backward.
 
-    The forward must match Megatron Inference bitwise, so it gathers each
-    sequence chunk and runs the same full-row log-softmax. The backward only
-    needs to be accurate: it rebuilds this rank's softmax slice from the saved
-    per-token log-sum-exp, so it needs no communication and holds no
-    full-vocab tensor.
+    The forward gathers each sequence chunk's vocab shards (a no-op at TP 1)
+    and runs the same full-row log-softmax as Megatron Inference, so it matches
+    generation bitwise. The backward re-runs the replaced NeMo-RL function on
+    the saved logits and returns its gradient, so for a given output gradient
+    it is bitwise the gradient of a run without this mode.
     """
 
     @staticmethod
@@ -289,11 +289,11 @@ class _GatheredVocabLogprob(torch.autograd.Function):
         ctx: Any,
         vocab_parallel_logits: torch.Tensor,
         target: torch.Tensor,
-        vocab_start_index: int,
-        vocab_end_index: int,
         chunk_size: int | None,
         group: torch.distributed.ProcessGroup,
         inference_only: bool,
+        original: Any,
+        original_args: tuple[Any, ...],
     ) -> torch.Tensor:
         # Deferred: Megatron-Core exists only in worker venvs; model_utils is heavy.
         from megatron.core.tensor_parallel.mappings import (
@@ -305,7 +305,6 @@ class _GatheredVocabLogprob(torch.autograd.Function):
         seq_len = int(target.shape[1])
         step = chunk_size or seq_len
         out_chunks = []
-        lse_chunks = []
         for chunk_start in range(0, seq_len, step):
             chunk_end = min(seq_len, chunk_start + step)
             full_logits = gather_from_tensor_model_parallel_region(
@@ -321,54 +320,31 @@ class _GatheredVocabLogprob(torch.autograd.Function):
                     inference_only=True,
                 )
             )
-            if not inference_only:
-                lse_chunks.append(torch.logsumexp(full_logits.float(), dim=-1))
             del full_logits
 
         if not inference_only:
-            ctx.save_for_backward(
-                vocab_parallel_logits, target, torch.cat(lse_chunks, dim=1)
-            )
-            ctx.vocab_start_index = vocab_start_index
-            ctx.vocab_end_index = vocab_end_index
-            ctx.step = step
+            ctx.save_for_backward(vocab_parallel_logits, target)
+            ctx.original = original
+            ctx.original_args = original_args
         return torch.cat(out_chunks, dim=1)
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
-        grad_output = grad_outputs[0].float()
-        vocab_parallel_logits, target, lse = ctx.saved_tensors
-        target_mask = (target < ctx.vocab_start_index) | (
-            target >= ctx.vocab_end_index
-        )
-        local_target = (target - ctx.vocab_start_index).masked_fill(target_mask, 0)
-        chosen_grad = grad_output.masked_fill(target_mask, 0.0)
-
-        grad_input = torch.empty_like(vocab_parallel_logits)
-        seq_len = int(target.shape[1])
-        for chunk_start in range(0, seq_len, ctx.step):
-            chunk_end = min(seq_len, chunk_start + ctx.step)
-            # d(log p_t)/dx = onehot(t) - softmax(x), on this rank's vocab slice.
-            grad = torch.exp(
-                vocab_parallel_logits[:, chunk_start:chunk_end].float()
-                - lse[:, chunk_start:chunk_end, None]
-            ).mul_(-grad_output[:, chunk_start:chunk_end, None])
-            grad.scatter_add_(
-                -1,
-                local_target[:, chunk_start:chunk_end, None],
-                chosen_grad[:, chunk_start:chunk_end, None],
-            )
-            grad_input[:, chunk_start:chunk_end].copy_(grad)
-            del grad
+        vocab_parallel_logits, target = ctx.saved_tensors
+        with torch.enable_grad():
+            logits = vocab_parallel_logits.detach().requires_grad_()
+            logprobs = ctx.original.apply(logits, target, *ctx.original_args, False)
+            (grad_input,) = torch.autograd.grad(logprobs, logits, grad_outputs[0])
         return grad_input, None, None, None, None, None, None
 
 
 class _FullVocabLogprob:
-    """Use the full-vocab log-softmax Megatron Inference uses (bitwise).
+    """Forward with Megatron Inference's full-row log-softmax; backward unchanged.
 
-    At TP size > 1 the vocab-parallel logits are all-gathered first: the
-    distributed log-softmax sums per-rank partial normalizers, which rounds
-    differently from Megatron Inference's single full-row reduction.
+    The distributed log-softmax sums per-rank partial normalizers, which rounds
+    differently from Megatron Inference's single full-row reduction, so the
+    forward all-gathers the vocab-parallel logits first. Gradients come from
+    the replaced function (see ``_GenAlignedLogprob``).
     """
 
     def __init__(self, original: Any, *, chunked: bool) -> None:
@@ -376,29 +352,20 @@ class _FullVocabLogprob:
         self._chunked = chunked
 
     def apply(self, *args: Any) -> Any:
-        # Deferred: model_utils is heavy and only needed once the shim is installed.
-        from nemo_rl.distributed import model_utils
-
-        if self._chunked:
-            logits, target, start, end, chunk_size, group, inference_only = args
-        else:
-            logits, target, start, end, group, inference_only = args
-            chunk_size = None
+        logits, target, *original_args, inference_only = args
+        group = original_args[-1]
+        chunk_size = original_args[2] if self._chunked else None
         if group is None:
             return self._original.apply(*args)
-        if torch.distributed.get_world_size(group) > 1:
-            return _GatheredVocabLogprob.apply(
-                logits, target, start, end, chunk_size, group, inference_only
-            ).contiguous()
-        return model_utils._tp_target_logprobs(
+        return _GenAlignedLogprob.apply(
             logits,
             target,
-            vocab_start_index=start,
-            vocab_end_index=end,
-            tp_group=None,
-            chunk_size=chunk_size,
-            inference_only=inference_only,
-        )
+            chunk_size,
+            group,
+            inference_only,
+            self._original,
+            tuple(original_args),
+        ).contiguous()
 
 
 def _use_full_vocab_log_softmax() -> None:

@@ -959,8 +959,23 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     zgm._use_full_vocab_log_softmax()
     zgm._use_full_vocab_log_softmax()  # idempotent: must not wrap twice
 
-    sizes = {"tp1": 1, "tp2": 2}
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sizes[group])
+    # TP 2, rank 1: rank 0's half is a function of rank 1's, so any sequence
+    # slice of the shard gathers to the matching slice of the full row. MCore's
+    # gather returns its input unchanged at TP 1.
+    def full_row(shard):
+        return torch.cat([shard.flip(-1) * 0.5, shard], dim=-1)
+
+    gathered = []
+
+    def fake_gather(shard, group):
+        gathered.append((shard.shape[1], group))
+        return shard if group == "tp1" else full_row(shard)
+
+    mappings = types.SimpleNamespace(
+        gather_from_tensor_model_parallel_region=fake_gather
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
+
     logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     target = torch.randint(0, 16, (2, 5))
     expected = (
@@ -976,22 +991,8 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
 
     chunked = model_utils.ChunkedDistributedLogprob
     assert torch.equal(chunked.apply(logits, target, 0, 16, 2, "tp1", True), expected)
+    gathered.clear()
 
-    # TP 2, rank 1: rank 0's half is a function of rank 1's, so any sequence
-    # slice of the shard gathers to the matching slice of the full row.
-    def full_row(shard):
-        return torch.cat([shard.flip(-1) * 0.5, shard], dim=-1)
-
-    gathered = []
-
-    def fake_gather(shard, group):
-        gathered.append((shard.shape[1], group))
-        return full_row(shard)
-
-    mappings = types.SimpleNamespace(
-        gather_from_tensor_model_parallel_region=fake_gather
-    )
-    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
     shard = logits[..., 8:]
     expected_tp2 = (
         torch.log_softmax(full_row(shard).float(), dim=-1)
@@ -1011,42 +1012,52 @@ def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     assert shim.apply(logits, target, 0, 16, None, True) == "orig"
 
 
-@pytest.mark.parametrize("chunk_size", [None, 2])
-def test_gathered_vocab_logprob_backward_is_local_to_the_shard(
-    monkeypatch, chunk_size
+@pytest.mark.parametrize("chunked", [False, True])
+def test_logprob_shim_backward_is_the_replaced_functions_backward(
+    monkeypatch, chunked
 ):
     import torch
 
-    # TP 2, rank 1 owns vocab [8, 16); rank 0's half is a constant here.
-    other = torch.randn(2, 5, 8)
-
-    def fake_gather(shard, group):
-        start = shard_starts.pop(0)
-        return torch.cat([other[:, start : start + shard.shape[1]], shard], dim=-1)
+    def full_row(shard):
+        return torch.cat([shard.flip(-1) * 0.5, shard], dim=-1)
 
     mappings = types.SimpleNamespace(
-        gather_from_tensor_model_parallel_region=fake_gather
+        gather_from_tensor_model_parallel_region=lambda shard, group: full_row(shard)
     )
     monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
-    shard_starts = [0] if chunk_size is None else [0, 2, 4]
 
-    shard = torch.randn(2, 5, 8)
+    calls = []
+
+    class Original(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits, target, *rest):
+            calls.append(rest)
+            ctx.save_for_backward(logits)
+            return logits.float().sin().sum(-1)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (logits,) = ctx.saved_tensors
+            grad = logits.float().cos() * grad_output.unsqueeze(-1) * 3.0
+            return (grad,) + (None,) * (len(calls[-1]) + 1)
+
+    original_args = (8, 16, 2, "tp2") if chunked else (8, 16, "tp2")
+    shard = torch.randn(2, 5, 8, dtype=torch.bfloat16)
     target = torch.randint(0, 16, (2, 5))
-    weights = torch.randn(2, 5)
+    grad_output = torch.randn(2, 5)
 
-    reference_shard = shard.clone().requires_grad_()
-    reference = (
-        torch.log_softmax(torch.cat([other, reference_shard], dim=-1), dim=-1)
-        .gather(-1, target.unsqueeze(-1))
-        .squeeze(-1)
+    reference_logits = shard.clone().requires_grad_()
+    Original.apply(reference_logits, target, *original_args, False).backward(
+        grad_output
     )
-    (reference * weights).sum().backward()
 
-    local_shard = shard.clone().requires_grad_()
-    out = zgm._GatheredVocabLogprob.apply(
-        local_shard, target, 8, 16, chunk_size, "tp2", False
-    )
-    (out * weights).sum().backward()
+    calls.clear()
+    logits = shard.clone().requires_grad_()
+    shim = zgm._FullVocabLogprob(Original, chunked=chunked)
+    out = shim.apply(logits, target, *original_args, False)
+    assert calls == []  # the forward does not call the replaced function
+    out.backward(grad_output)
 
-    assert torch.equal(out.detach(), reference.detach())
-    torch.testing.assert_close(local_shard.grad, reference_shard.grad)
+    assert calls == [(*original_args, False)]
+    assert logits.grad.dtype == torch.bfloat16
+    assert torch.equal(logits.grad, reference_logits.grad)

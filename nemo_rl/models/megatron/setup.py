@@ -1529,6 +1529,14 @@ def _quant_recipe_name(recipe: Any) -> str | None:
     return str(getattr(recipe, "value", recipe))
 
 
+def _recipe_block_precision(block_cfg: Mapping[str, Any]) -> str:
+    fp8_recipe = _quant_recipe_name(block_cfg.get("fp8_quantization_recipe"))
+    if fp8_recipe is not None:
+        return f"fp8 ({fp8_recipe})"
+    fp4_recipe = _quant_recipe_name(block_cfg.get("fp4_quantization_recipe"))
+    return fp4_recipe if fp4_recipe is not None else "bf16"
+
+
 def _validate_te_precision_config(
     quant_recipe: Any,
     fp8_cfg: Mapping[str, Any] | None,
@@ -1549,6 +1557,24 @@ def _validate_te_precision_config(
     fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
+        if zero_train_gen_mismatch:
+            # An absent evaluation_recipe inherits training_recipe; an explicit
+            # empty one means BF16.
+            training_cfg = payload.get("training_recipe") or {}
+            evaluation_cfg = payload.get("evaluation_recipe")
+            if evaluation_cfg is None:
+                evaluation_cfg = training_cfg
+            training_precision = _recipe_block_precision(training_cfg)
+            evaluation_precision = _recipe_block_precision(evaluation_cfg)
+            if training_precision != evaluation_precision:
+                raise ValueError(
+                    "zero_train_gen_mismatch requires the same precision in "
+                    f"'{config_key}.training_recipe' ({training_precision}) and "
+                    f"'{config_key}.evaluation_recipe' ({evaluation_precision}): "
+                    "log-prob forwards and the generation model read "
+                    "evaluation_recipe. An empty evaluation_recipe means BF16; "
+                    "omit it to inherit training_recipe."
+                )
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
             if block_cfg.get("fp4_param"):

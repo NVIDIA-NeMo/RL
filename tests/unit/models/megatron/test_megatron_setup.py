@@ -1592,6 +1592,58 @@ class TestApplyPrecisionConfig:
             else:
                 _apply_precision_config(model_cfg, config, torch.bfloat16)
 
+    _MXFP8_BLOCK = {
+        "fp8_quantization_recipe": "mxfp8",
+        "override_quantized_autocast": True,
+        "override_nonquantized_autocast": True,
+    }
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    @pytest.mark.parametrize(
+        ("recipes", "mismatch"),
+        [
+            ({"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": {}}, True),
+            ({"training_recipe": {}, "evaluation_recipe": _MXFP8_BLOCK}, True),
+            ({"training_recipe": _MXFP8_BLOCK}, False),
+            ({"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": _MXFP8_BLOCK}, False),
+            ({"training_recipe": {}, "evaluation_recipe": {}}, False),
+        ],
+        ids=["mxfp8-empty", "empty-mxfp8", "mxfp8-inherit", "mxfp8-mxfp8", "bf16-bf16"],
+    )
+    @pytest.mark.parametrize("zero_train_gen_mismatch", [True, False])
+    def test_zero_kl_requires_matching_training_and_evaluation_precision(
+        self, mock_load_recipe, tmp_path, recipes, mismatch, zero_train_gen_mismatch
+    ):
+        """An explicit empty evaluation_recipe is BF16, not inherited training."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {"block": {k: dict(v) for k, v in recipes.items()}}
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "zero_train_gen_mismatch": zero_train_gen_mismatch,
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            if zero_train_gen_mismatch and mismatch:
+                with pytest.raises(ValueError, match="the same precision"):
+                    _apply_precision_config(model_cfg, config, torch.bfloat16)
+            else:
+                _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     @pytest.mark.parametrize(
         "megatron_cfg",
@@ -4140,6 +4192,7 @@ class TestSetupModelConfig:
 
         model_cfg = self._make_model_cfg_mock()
         model_cfg.multi_latent_attention = False
+        model_cfg.is_hybrid_model = False
         model_cfg.hybrid_layer_pattern = None
         model_cfg.experimental_attention_variant = None
         setattr(model_cfg, field_name, field_value)
@@ -4171,6 +4224,7 @@ class TestSetupModelConfig:
 
         model_cfg = self._make_model_cfg_mock()
         model_cfg.multi_latent_attention = False
+        model_cfg.is_hybrid_model = False
         model_cfg.hybrid_layer_pattern = None
         model_cfg.experimental_attention_variant = None
         bridge = MagicMock()
