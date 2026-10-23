@@ -544,10 +544,12 @@ class _AsyncLLMHTTPClient:
         engine_client: Any,
         engine_loop: asyncio.AbstractEventLoop,
         *,
+        flat_logprobs: bool,
         disable_direct_route_snapshot: bool | None = None,
     ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
+        self._flat_logprobs = flat_logprobs
         self._route_snapshot_state_verified = False
         self._disable_direct_route_snapshot = disable_direct_route_snapshot
         self._route_retention_lock = threading.Lock()
@@ -578,6 +580,15 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         **kwargs: Any,
     ) -> AsyncGenerator[Any, None]:
+        # Flat engine storage avoids retaining a dict and Logprob objects per
+        # token. Keep prompt-logprob requests unchanged: vLLM's prompt clamp
+        # mutates per-position dictionaries, which flat storage reconstructs.
+        if (
+            self._flat_logprobs
+            and sampling_params.logprobs is not None
+            and sampling_params.prompt_logprobs is None
+        ):
+            sampling_params.flat_logprobs = True
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(
@@ -1120,6 +1131,23 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
+        output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
+            "output_loop_yield_budget_ms"
+        )
+        if output_loop_yield_budget_ms is not None:
+            # vLLM is optional outside the generation worker's environment.
+            from nemo_rl.models.generation.vllm.output_loop_yield import (
+                install_output_loop_yield,
+            )
+
+            install_output_loop_yield(
+                self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
+            )
+            LOGGER.info(
+                "vllm_output_loop_yield enabled reader_budget_ms=%s",
+                output_loop_yield_budget_ms,
+            )
+
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
@@ -1297,9 +1325,14 @@ class VllmAsyncGenerationWorkerImpl(
             self._http_engine_client = _AsyncLLMHTTPClient(
                 self.llm,
                 self._engine_loop,
+                flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
                 disable_direct_route_snapshot=self.cfg.get(
                     "disable_direct_route_snapshot"
                 ),
+            )
+            LOGGER.info(
+                "vllm_flat_logprobs enabled=%s",
+                bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
             )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()

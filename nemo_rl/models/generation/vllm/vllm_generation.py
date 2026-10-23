@@ -51,6 +51,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    validate_vllm_async_actor_settings,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
@@ -220,6 +221,8 @@ class VllmGeneration(GenerationInterface):
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
         """
+        validate_vllm_async_actor_settings(config)
+
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load

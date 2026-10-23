@@ -768,6 +768,7 @@ def make_group_worker(m, loop, *, count=3):
             vllm_config=None,
         ),
         loop,
+        flat_logprobs=False,
     )
     worker._snapshot_engine_routed_experts_many = (
         m._snapshot_engine_routed_experts_many.__get__(worker, type(worker))
@@ -1589,6 +1590,7 @@ def test_direct_route_guards_keep_the_owner_loop_fallback(
             client._engine_client,
             owner_loop,
             disable_direct_route_snapshot=True,
+            flat_logprobs=False,
         )
         client.check_route_snapshot_support()
     elif guard == "unverified":

@@ -93,6 +93,12 @@ class VllmSpecificArgs(TypedDict):
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # Flat per-request logprob storage avoids long GC pauses over per-token
+    # objects. Requires async_engine and expose_http_server; default off.
+    flat_logprobs: NotRequired[bool]
+    # Positive output-reader work budget in ms, e.g. 20. Also yields between
+    # output-handler steps. Requires async_engine; null disables the patch.
+    output_loop_yield_budget_ms: NotRequired[float | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -252,6 +258,34 @@ class VllmConfig(GenerationConfig):
     # be combined with quant_cfg. Its runtime environment must already be in
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
+
+
+def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
+    """Reject async-actor options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("flat_logprobs") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
+            "through the async engine's HTTP server; it requires async_engine: true "
+            "and expose_http_server: true."
+        )
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is None:
+        return
+    if not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+            "async_engine: true."
+        )
+    if budget_ms <= 0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
+            f"(or null to disable), got {budget_ms}."
+        )
 
 
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
