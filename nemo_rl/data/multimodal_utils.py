@@ -142,6 +142,8 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
 
 # Packed per-sample: jagged. ``PackedTensor`` in-memory; a single
 # ``torch.nested`` value on the wire, whose rows carry their own shapes.
+# Mutable: ``register_packed_multimodal_fields`` adds declared custom fields in
+# place, so import the set itself and never keep a derived copy.
 PACKED_MULTIMODAL_FIELDS = set(
     {
         "pixel_values",
@@ -187,7 +189,7 @@ ROW_GEOMETRY_PREPROCESS_KWARGS = "preprocess_kwargs"
 # *and* train) must ship so the trainer's forward matches the rollout. One wire
 # field per logical field: ``PACKED`` fields travel as a single nested tensor
 # whose rows carry their own shapes, and per-token fields are rectangular and
-# travel as plain tensors.
+# travel as plain tensors. Mutated in place like ``PACKED_MULTIMODAL_FIELDS``.
 WIRE_MULTIMODAL_FIELDS = set(PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS)
 
 
@@ -296,7 +298,19 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
 
 @contextmanager
 def packed_multimodal_field_registration(names: list[str] | None) -> Iterator[None]:
-    """Register during client construction; roll back a failed first construction."""
+    """Register during client construction; roll back a failed first construction.
+
+    Args:
+        names: Custom packed model-input names, or ``None`` for no custom fields.
+
+    Yields:
+        None. ``G_PACKED_FIELDS_LOCK`` is held for the body, so client
+        construction runs with the declaration installed.
+
+    Raises:
+        ValueError: The declaration is invalid or differs from the one already
+            registered in this process.
+    """
     global G_CUSTOM_PACKED_FIELDS
     with G_PACKED_FIELDS_LOCK:
         previous = G_CUSTOM_PACKED_FIELDS

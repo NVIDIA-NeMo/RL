@@ -267,6 +267,9 @@ data_plane:
     storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
     num_storage_units: null          # null = 2 per selected node
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+  # Additional PackedTensor model inputs; native media needs no declaration.
+  # Immutable across clients and checkpoint resume. Token capture unsupported.
+  packed_multimodal_fields: []
   # observability:                    # NotRequired
   #   enabled: false
 

@@ -153,6 +153,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.factory import configure_multimodal_fields
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     is_metrics_client,
@@ -389,8 +390,6 @@ class SingleControllerActor:
             worker_group="single_controller",
         )
         self._tracer = _telemetry.tracer if _telemetry is not None else None
-
-        from nemo_rl.data_plane.factory import configure_multimodal_fields
 
         configure_multimodal_fields(master_config.data_plane)
         self._advantage_cfg = AdvantageConfig()
