@@ -50,6 +50,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.rollout_checkpointing import DataPlaneRolloutCheckpointing
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     _pooled_opd_metrics,
@@ -65,6 +66,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
+from nemo_rl.experience.environment_checkpoint import NoEnvironmentCheckpoint
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -88,6 +90,7 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+from tests.unit.single_controller._restore_helpers import use_dispatch
 
 
 class FakeWeightSynchronizer:
@@ -321,8 +324,10 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
     single_controller.configure_checkpoint_workers.assert_called_once_with([])
     dp_client.register_partition.assert_not_called()
-    assert controller._data_plane_checkpoint_metadata == metadata
-    assert controller._rollout_checkpoint_load_metrics == {
+    # Restore, which runs later in _run_pumps, gets what this load produced.
+    checkpoint = controller._rollout_checkpointing._restorer.checkpoint
+    assert checkpoint.data_plane_metadata == metadata
+    assert checkpoint.load_metrics == {
         "snapshot_resolution_seconds": 1.0,
         "tq_load_seconds": 5.0,
     }
@@ -355,7 +360,10 @@ def test_fresh_mooncake_init_registers_partition(
         configure.assert_not_called()
     dp_client.load_checkpoint.assert_not_called()
     dp_client.register_partition.assert_called_once()
-    assert controller._data_plane_checkpoint_metadata is None
+    assert (
+        controller._rollout_checkpointing._restorer.checkpoint.data_plane_metadata
+        is None
+    )
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
@@ -838,7 +846,7 @@ async def test_sync_weights_honors_recompute_kv_cache_config(
             )
         ),
     )
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(
         env={"should_use_nemo_gym": use_nemo_gym},
         policy={
@@ -972,7 +980,7 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
@@ -1002,7 +1010,7 @@ def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
         resume_generation_after_refit=MagicMock(return_value=False),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(NotImplementedError, match="active-request KV state"):
@@ -1035,7 +1043,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
     ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
@@ -1076,7 +1084,7 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
         resume_generation_after_refit=MagicMock(return_value=False),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="successful refit pause"):
@@ -1104,7 +1112,7 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> Non
         resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
@@ -1133,7 +1141,7 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
         resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="refit failed"):
@@ -2235,6 +2243,26 @@ class _NoOpDataPlane:
         del kwargs
 
 
+def _commit_window_checkpointing() -> DataPlaneRolloutCheckpointing:
+    """Rollout checkpointing with only what the train pump's commit window uses."""
+    return DataPlaneRolloutCheckpointing(
+        host=None,  # type: ignore[arg-type]
+        master_config=None,  # type: ignore[arg-type]
+        dp_client=None,
+        partition_id="rollout_data",
+        buffer=None,  # type: ignore[arg-type]
+        rollout_manager=None,  # type: ignore[arg-type]
+        checkpointer=None,  # type: ignore[arg-type]
+        timeout=None,  # type: ignore[arg-type]
+        data_plane_barrier=DataPlaneCheckpointBarrier(),
+        environment_checkpoint=NoEnvironmentCheckpoint(),
+        bootstrap_identity=None,
+        teacher_coordinator=None,
+        restorer=None,  # type: ignore[arg-type]
+        dispatch=None,  # type: ignore[arg-type]
+    )
+
+
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
@@ -2276,8 +2304,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._optimizer_commit_in_progress = False
-    ctrl._optimizer_commit_started = asyncio.Event()
+    ctrl._rollout_checkpointing = _commit_window_checkpointing()
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
@@ -2303,8 +2330,6 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
-    ctrl._checkpoint_save_lock = asyncio.Lock()
-    ctrl._optimizer_commit_in_progress = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
@@ -3352,7 +3377,7 @@ def _streaming_ppo_controller(
     async def sync_weights(*, calibration_data) -> int:
         assert calibration_data is None
         assert ctrl._trainer_version == 1
-        assert ctrl._optimizer_commit_in_progress
+        assert ctrl._rollout_checkpointing._optimizer_commit_in_progress
         calls.append("refit")
         return 0
 
@@ -3401,7 +3426,7 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
             assert ctrl._value.inference_prepared
             assert ctrl._trainer.gradients_offloaded == ctrl._trainer.step_open
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
             assert "clear_samples" not in calls
             if attempts <= 4:
                 assert calls.count("critic.prepare_for_inference") == 2
@@ -3664,7 +3689,7 @@ def test_streaming_ppo_selection_failure_does_not_commit_pending_step(
     assert "critic.train_from_meta" not in calls
     assert "refit" not in calls
     assert "clear_samples" not in calls
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -3677,8 +3702,10 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
     train_epochs = ctrl._value_train_epochs
 
     async def check_snapshot_then_train(meta: KVBatchMeta, *, num_epochs: int) -> dict:
-        assert ctrl._optimizer_commit_in_progress
-        snapshot = await ctrl._save_rollout_checkpoint(force=True)
+        assert ctrl._rollout_checkpointing._optimizer_commit_in_progress
+        snapshot = await ctrl._rollout_checkpointing._save_rollout_checkpoint(
+            force=True
+        )
         assert not snapshot.saved
         assert snapshot.reason == "optimizer_commit_in_progress"
         assert ctrl._trainer_version == (0 if warmup else 1)
@@ -3688,7 +3715,7 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
     assert ctrl._trainer_version == ctrl._train_steps == 1
     assert calls.count("refit") == (0 if warmup else 1)
 
@@ -3753,7 +3780,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)
         assert ctrl._trainer_version == ctrl._train_steps == 1
-        assert not ctrl._optimizer_commit_in_progress
+        assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
         assert "critic/loss" in metrics
         calls.append("checkpoint")
 
@@ -3817,7 +3844,7 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize(
@@ -3942,7 +3969,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
     async def run_with_inflight_snapshot() -> None:
         waiting_for_snapshot = asyncio.Event()
-        acquire = ctrl._checkpoint_save_lock.acquire
+        acquire = ctrl._rollout_checkpointing._checkpoint_save_lock.acquire
 
         async def observe_acquire() -> bool:
             waiting_for_snapshot.set()
@@ -3950,8 +3977,12 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
         # A snapshot has captured the old train step and is still writing it.
         # Signal the exact lock acquisition instead of relying on a timed sleep.
-        async with ctrl._checkpoint_save_lock:
-            monkeypatch.setattr(ctrl._checkpoint_save_lock, "acquire", observe_acquire)
+        async with ctrl._rollout_checkpointing._checkpoint_save_lock:
+            monkeypatch.setattr(
+                ctrl._rollout_checkpointing._checkpoint_save_lock,
+                "acquire",
+                observe_acquire,
+            )
             pump = asyncio.create_task(ctrl._train_pump())
             await asyncio.wait_for(waiting_for_snapshot.wait(), timeout=1.0)
             assert len(ctrl._trainer.trained_metas) == (len(metas) if streaming else 1)
@@ -3959,7 +3990,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
             assert "critic.train_from_meta" not in calls
             assert "refit" not in calls
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
 
         await asyncio.wait_for(pump, timeout=1.0)
 
@@ -3971,7 +4002,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_checkpointing._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("warmup", [False, True])

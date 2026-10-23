@@ -583,7 +583,7 @@ class AsyncRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -607,7 +607,7 @@ class AsyncRolloutImpl:
         assert recovery_granularity is RecoveryGranularity.SIBLING, (
             "recovery granularity is only supported on the NeMo-Gym path"
         )
-        assert gym_instance_id is None, (
+        assert environment_instance_id is None, (
             "Gym checkpoint ownership is only supported on the NeMo-Gym path"
         )
         assert dispatch_recorder is None, (
@@ -1063,7 +1063,7 @@ class AsyncNemoGymRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -1095,7 +1095,7 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            gym_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
         )
         # Token-capture receipt rows carry empty message logs by design: the
@@ -1856,7 +1856,7 @@ class _LedgerDispatchRecorder:
 
     manager: RolloutManager
     group_id: str
-    gym_instance_id: Optional[str]
+    environment_instance_id: Optional[str]
 
     @asynccontextmanager
     async def submitting(
@@ -1880,7 +1880,7 @@ class _LedgerDispatchRecorder:
                         cut,
                         self.group_id,
                         generation_indices=reserved,
-                        gym_instance_id=self.gym_instance_id,
+                        environment_instance_id=self.environment_instance_id,
                     )
 
             yield mark_dispatched
@@ -2147,14 +2147,14 @@ class RolloutManager:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
             assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
-            assert gym_instance_id is None
+            assert environment_instance_id is None
             assert dispatch_recorder is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
@@ -2164,7 +2164,7 @@ class RolloutManager:
             generation_indices=generation_indices,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            environment_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
         )
 
@@ -2568,12 +2568,12 @@ class RolloutManager:
         for generation_index in pending_indices:
             owner = recovery_group.siblings[
                 generation_index
-            ].current_attempt.gym_instance_id
+            ].current_attempt.environment_instance_id
             if owner is not None:
                 pending_owners.add(owner)
         if len(pending_owners) > 1:
             raise RuntimeError(
-                f"recovery group {recovery_group.group_id!r} spans multiple Gym "
+                f"recovery group {recovery_group.group_id!r} spans multiple environment "
                 f"checkpoint instances: {sorted(pending_owners)!r}"
             )
         group_id = recovery_group.group_id
@@ -2586,9 +2586,9 @@ class RolloutManager:
             attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                 max(len(sibling.attempts) for sibling in recovery_group.siblings) - 1
             )
-        gym_instance_id: Optional[str] = None
+        environment_instance_id: Optional[str] = None
         if pending_owners:
-            gym_instance_id = next(iter(pending_owners))
+            environment_instance_id = next(iter(pending_owners))
         elif (
             pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
         ):
@@ -2596,7 +2596,7 @@ class RolloutManager:
                 raise RuntimeError(
                     "turn-level recovery requires the NeMo-Gym rollout path"
                 )
-            gym_instance_id = self._impl.select_checkpoint_instance(
+            environment_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample
             )
         self._tq_buffer.reserve(
@@ -2706,7 +2706,7 @@ class RolloutManager:
                         dispatch_recorder = _LedgerDispatchRecorder(
                             manager=self,
                             group_id=group_id,
-                            gym_instance_id=gym_instance_id,
+                            environment_instance_id=environment_instance_id,
                         )
                     else:
                         async with self._recovery_mutation() as cut:
@@ -2714,7 +2714,7 @@ class RolloutManager:
                                 cut,
                                 group_id,
                                 generation_indices=pending_indices,
-                                gym_instance_id=gym_instance_id,
+                                environment_instance_id=environment_instance_id,
                             )
                     await self.run_rollout(
                         attempt_input_sample,
@@ -2722,7 +2722,7 @@ class RolloutManager:
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
-                        gym_instance_id=gym_instance_id,
+                        environment_instance_id=environment_instance_id,
                         dispatch_recorder=dispatch_recorder,
                     )
             finally:

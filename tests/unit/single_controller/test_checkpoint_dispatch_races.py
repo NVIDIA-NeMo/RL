@@ -34,7 +34,7 @@ import hashlib
 import threading
 import warnings
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +53,11 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import _initial_grpo_save_state
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
+from nemo_rl.algorithms.rollout_checkpointing import (
+    CheckpointToRestore,
+    DataPlaneRolloutCheckpointing,
+    RolloutRestorer,
+)
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
@@ -70,6 +75,8 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
     load_gym_checkpoint_manifest,
     write_gym_checkpoint_manifest,
 )
+from nemo_rl.environments.gym_environment_checkpoint import GymEnvironmentCheckpoint
+from nemo_rl.experience.environment_checkpoint import NoEnvironmentCheckpoint
 from nemo_rl.experience.rollout_manager import (
     RequestDeadlineRegistry,
     RolloutOutcome,
@@ -86,6 +93,10 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
 )
 from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.single_controller._restore_helpers import (
+    restorer_for,
+    use_dispatch,
+)
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
     patch_converter,
@@ -292,23 +303,79 @@ def _deadline_pausing_manager(
     )
 
 
+async def _no_staging_keys() -> list[str]:
+    return []
+
+
 def _controller_for(
     coordinator: GymCheckpointCoordinator,
     ledger: Optional[RolloutRecoveryLedger] = None,
     *,
     manager: Optional[Any] = None,
+    list_staging_keys: Callable[[], Awaitable[list[str]]] = _no_staging_keys,
+    allow_restart_only_servers: bool = False,
 ) -> Any:
     """A bare controller wired for Gym checkpoint coordination, and nothing else."""
     controller = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    controller._gym_checkpoint_coordinator = coordinator
-    controller._rollout_dispatch_admission_gate = DataPlaneCheckpointBarrier()
     controller._rollout_manager = (
         manager if manager is not None else _deadline_pausing_manager()
     )
     controller._rollout_recovery_ledger = (
         ledger if ledger is not None else RolloutRecoveryLedger()
     )
+    controller._environment_checkpoint = GymEnvironmentCheckpoint(
+        coordinator,
+        ledger=controller._rollout_recovery_ledger,
+        rollout_manager=controller._rollout_manager,
+        list_staging_keys=list_staging_keys,
+        allow_restart_only_servers=allow_restart_only_servers,
+    )
     return controller
+
+
+def _environment_phase_checkpointing(
+    environment_checkpoint: Any,
+) -> DataPlaneRolloutCheckpointing:
+    """Rollout checkpointing with only what the environment phase and commit use."""
+    return DataPlaneRolloutCheckpointing(
+        host=None,  # type: ignore[arg-type]
+        master_config=None,  # type: ignore[arg-type]
+        dp_client=None,
+        partition_id="rollout_data",
+        buffer=None,  # type: ignore[arg-type]
+        rollout_manager=None,  # type: ignore[arg-type]
+        checkpointer=None,  # type: ignore[arg-type]
+        timeout=None,  # type: ignore[arg-type]
+        data_plane_barrier=DataPlaneCheckpointBarrier(),
+        environment_checkpoint=environment_checkpoint,
+        bootstrap_identity=None,
+        teacher_coordinator=None,
+        restorer=None,  # type: ignore[arg-type]
+        dispatch=None,  # type: ignore[arg-type]
+    )
+
+
+def _gym_environment_for(
+    controller: Any, coordinator: GymCheckpointCoordinator
+) -> GymEnvironmentCheckpoint:
+    """The Gym checkpoint a turn-level controller builds, over ``coordinator``."""
+    return GymEnvironmentCheckpoint(
+        coordinator,
+        ledger=controller._rollout_manager.recovery_ledger,
+        rollout_manager=controller._rollout_manager,
+        list_staging_keys=_no_staging_keys,
+    )
+
+
+@contextlib.asynccontextmanager
+async def _gym_commit(
+    controller: Any, checkpoint_path: Path, *, checkpoint_id: str
+) -> AsyncIterator[GymCheckpointCommitResult]:
+    """Gym's commit for one snapshot, while Gym is parked."""
+    async with controller._environment_checkpoint.snapshot(
+        checkpoint_path, checkpoint_id=checkpoint_id
+    ) as snapshot:
+        yield snapshot.commit
 
 
 class _BlockingRolloutManager:
@@ -526,7 +593,7 @@ def _rehydration_controller(
 def _run_rehydration(controller: Any) -> None:
     async def rehydrate() -> None:
         async with controller._data_plane_checkpoint_barrier.mutation() as cut:
-            await controller._rehydrate_rollout_recovery_prompts(cut)
+            await restorer_for(controller)._rehydrate_rollout_recovery_prompts(cut)
 
     asyncio.run(rehydrate())
 
@@ -573,7 +640,6 @@ def _reserve_controller() -> Any:
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._replacement_reserve = deque()
     controller._sampler_stamps_target_steps = True
-    controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
@@ -583,6 +649,7 @@ def _reserve_controller() -> Any:
     )
     controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
     controller._rollout_manager = _LedgerFacade()
+    use_dispatch(controller, records_prompt_groups=True)
     return controller
 
 
@@ -705,7 +772,12 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
-        controller._gym_checkpoint_coordinator = gym_coordinator(gym_actor)
+        controller._environment_checkpoint = _gym_environment_for(
+            controller, gym_coordinator(gym_actor)
+        )
+        controller._rollout_checkpointing = controller._build_rollout_checkpointing(
+            CheckpointToRestore()
+        )
         try:
             await controller._save_checkpoint(
                 {"loss": 1.0},
@@ -723,8 +795,11 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
     # A trainer checkpoint never holds Gym state, and never calls Gym.
     assert gym_actor.calls == []
     assert not list(checkpoint.glob("gym*"))
-    assert controller._rollout_checkpoint_wakeup.is_set()
-    assert controller._last_rollout_snapshot_mutation_version is None
+    assert controller._rollout_checkpointing._rollout_checkpoint_wakeup.is_set()
+    assert (
+        controller._rollout_checkpointing._last_rollout_snapshot_mutation_version
+        is None
+    )
 
 
 def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> None:
@@ -755,14 +830,15 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
                 )
 
         completion = asyncio.create_task(complete_on_wire_reply())
-        async with controller._prepared_gym_checkpoint(
+        async with _gym_commit(
+            controller,
             tmp_path,
             checkpoint_id="save-1",
         ) as gym_commit:
             assert gym_commit is not None
             assert gym_commit.manifest.instances == {"tools/replica-0": ()}
             async with barrier.checkpoint() as cut:
-                await controller._validate_gym_checkpoint_cut(
+                await controller._environment_checkpoint.validate_cut(
                     cut, gym_commit, checkpoint_path=tmp_path
                 )
                 assert ledger.expected_staging_keys() == {"on-wire/call-0"}
@@ -771,7 +847,11 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
 
         assert actor.operations() == ["prepare", "renew", "commit", "tq-cut", "resume"]
         (commit_call,) = [call for call in actor.calls if call[0] == "commit"]
-        assert commit_call[1] == ("save-1", str(tmp_path), (group.gym_episode(0),))
+        assert commit_call[1] == (
+            "save-1",
+            str(tmp_path),
+            (group.environment_episode(0),),
+        )
 
     asyncio.run(exercise())
 
@@ -785,22 +865,21 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
     async def exercise() -> None:
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
         controller = _controller_for(gym_coordinator(actor))
-        controller._optimizer_commit_in_progress = False
-        controller._optimizer_commit_started = asyncio.Event()
+        rollout_checkpointing = _environment_phase_checkpointing(
+            controller._environment_checkpoint
+        )
         async with contextlib.AsyncExitStack() as stack:
             phase = asyncio.create_task(
-                controller._enter_gym_phase_unless_a_step_commits(
+                rollout_checkpointing._enter_environment_phase_unless_a_step_commits(
                     stack,
-                    controller._prepared_gym_checkpoint(
-                        tmp_path, checkpoint_id="save-1"
-                    ),
+                    _gym_commit(controller, tmp_path, checkpoint_id="save-1"),
                 )
             )
             await asyncio.wait_for(
                 actor.commit_started.wait(), timeout=_ASYNC_TEST_TIMEOUT_S
             )
             if step_commits:
-                controller._begin_optimizer_commit()
+                rollout_checkpointing._begin_optimizer_commit()
             else:
                 actor.release_commit.set()
             entered, gym_commit = await asyncio.wait_for(
@@ -813,8 +892,10 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
                 assert actor.operations()[-1] == "resume"
                 assert not actor.checkpoint_open
                 async with asyncio.timeout(_ASYNC_TEST_TIMEOUT_S):
-                    async with controller._rollout_dispatch_admission_gate.mutation(
-                        "gym_dispatch"
+                    async with (
+                        controller._environment_checkpoint.admission_gate.mutation(
+                            "gym_dispatch"
+                        )
                     ):
                         pass
             else:
@@ -838,7 +919,8 @@ def test_completion_callback_can_run_while_gym_commit_is_pending(
         controller = _controller_for(gym_coordinator(actor), ledger)
 
         async def checkpoint() -> GymCheckpointCommitResult:
-            async with controller._prepared_gym_checkpoint(
+            async with _gym_commit(
+                controller,
                 tmp_path,
                 checkpoint_id="save-1",
             ) as gym_commit:
@@ -940,7 +1022,8 @@ def test_turn_checkpoint_aborts_when_candidate_is_neither_exported_nor_drained(
         )
 
         with pytest.raises(TimeoutError, match="neither|classify every candidate"):
-            async with controller._prepared_gym_checkpoint(
+            async with _gym_commit(
+                controller,
                 tmp_path,
                 checkpoint_id="save-1",
             ):
@@ -961,7 +1044,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
         async with DataPlaneCheckpointBarrier().mutation() as cut:
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
-        (stranded,) = ledger.gym_checkpoint_inventory(frozenset({"tools/replica-0"}))[
+        (stranded,) = ledger.environment_inventory(frozenset({"tools/replica-0"}))[
             "tools/replica-0"
         ]
         actor = FakeGymActor(exported_episodes=(), unowned_live_episodes=(stranded,))
@@ -970,7 +1053,8 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
         )
 
         async def checkpoint() -> None:
-            async with controller._prepared_gym_checkpoint(
+            async with _gym_commit(
+                controller,
                 tmp_path,
                 checkpoint_id="save-1",
             ):
@@ -1003,12 +1087,17 @@ def _dispatched_turn_group(
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
-    ledger.mark_group_dispatched(cut, group.group_id, gym_instance_id="tools/replica-0")
+    ledger.mark_group_dispatched(
+        cut, group.group_id, environment_instance_id="tools/replica-0"
+    )
     return ledger.get_group(group.group_id)
 
 
 def _gym_episodes(group: PromptGroupRecoveryRecord) -> set[GymCheckpointEpisode]:
-    return {group.gym_episode(sibling.generation_index) for sibling in group.siblings}
+    return {
+        group.environment_episode(sibling.generation_index)
+        for sibling in group.siblings
+    }
 
 
 def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
@@ -1034,7 +1123,8 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
         actor = FakeGymActor(live=abandoned)
         controller = _controller_for(gym_coordinator(actor), ledger)
 
-        async with controller._prepared_gym_checkpoint(
+        async with _gym_commit(
+            controller,
             tmp_path,
             checkpoint_id="save-1",
         ) as gym_commit:
@@ -1055,7 +1145,7 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
             sorted(episode.rollout_id for episode in abandoned)
         )
         assert actor.live == set()
-        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+        assert ledger.environment_forgets({"tools/replica-0"}) == {
             "tools/replica-0": ()
         }
 
@@ -1079,13 +1169,14 @@ def test_turn_checkpoint_retires_each_dropped_attempt_only_once(
         controller = _controller_for(gym_coordinator(actor), ledger)
         for checkpoint_id in ("save-1", "save-2"):
             (tmp_path / checkpoint_id).mkdir()
-            async with controller._prepared_gym_checkpoint(
+            async with _gym_commit(
+                controller,
                 tmp_path / checkpoint_id,
                 checkpoint_id=checkpoint_id,
             ):
                 pass
 
-        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        assert ledger.environment_retirements({"tools/replica-0"}) == {
             "tools/replica-0": ()
         }
         retires = [call for call in actor.calls if call[0] == "retire"]
@@ -1121,8 +1212,8 @@ def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forg
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            async with controller._prepared_gym_checkpoint(
-                tmp_path, checkpoint_id="save-1"
+            async with _gym_commit(
+                controller, tmp_path, checkpoint_id="save-1"
             ) as gym_commit:
                 assert gym_commit is not None
 
@@ -1130,7 +1221,7 @@ def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forg
         assert operations[:4] == ["retire", "forget", "retire", "forget"]
         assert operations[4] == "prepare"
         assert frozenset(actor.calls[2][1][1]) == frozenset(abandoned)
-        pending = ledger.gym_checkpoint_forgets({"tools/replica-0"})
+        pending = ledger.environment_forgets({"tools/replica-0"})
         forgot_warnings = [w for w in caught if "could not forget" in str(w.message)]
         if forget_failures == 1:
             assert pending == {"tools/replica-0": ()}
@@ -1157,7 +1248,7 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
             ledger.abandon_unsealed(cut, group.group_id)
             ledger.prepare_incomplete_retry(cut, group.group_id)
             ledger.mark_group_dispatched(
-                cut, group.group_id, gym_instance_id="tools/replica-0"
+                cut, group.group_id, environment_instance_id="tools/replica-0"
             )
         replacements = _gym_episodes(ledger.get_group(group.group_id))
         assert replacements.isdisjoint(abandoned)
@@ -1165,7 +1256,8 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
         actor = FakeGymActor(live=abandoned | replacements)
         controller = _controller_for(gym_coordinator(actor), ledger)
 
-        async with controller._prepared_gym_checkpoint(
+        async with _gym_commit(
+            controller,
             tmp_path,
             checkpoint_id="save-1",
         ) as gym_commit:
@@ -1198,18 +1290,15 @@ def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
         saved, restart = sorted(_gym_episodes(group))
         actor = FakeGymActor(live={saved, restart}, restarts=(restart,))
         controller = _controller_for(gym_coordinator(actor), ledger)
-        controller._dp_client = NoOpDataPlaneClient()
-        controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition="rollout_staging")
-        )
 
-        async with controller._prepared_gym_checkpoint(
+        async with _gym_commit(
+            controller,
             tmp_path,
             checkpoint_id="save-1",
         ) as gym_commit:
             assert gym_commit is not None
             async with barrier.checkpoint() as cut:
-                await controller._validate_gym_checkpoint_cut(
+                await controller._environment_checkpoint.validate_cut(
                     cut, gym_commit, checkpoint_path=tmp_path
                 )
 
@@ -1230,22 +1319,20 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         async with barrier.mutation() as cut:
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
-        episode = group.gym_episode(0)
+        episode = group.environment_episode(0)
         actor = FakeGymActor(staging_keys_by_episode={episode: ("missing-call-row",)})
+        # TQ holds no staging rows, so the one Gym references is missing.
         controller = _controller_for(gym_coordinator(actor), ledger)
-        controller._dp_client = NoOpDataPlaneClient()
-        controller._master_config = SimpleNamespace(
-            token_capture=SimpleNamespace(staging_partition="rollout_staging")
-        )
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
-            async with controller._prepared_gym_checkpoint(
+            async with _gym_commit(
+                controller,
                 tmp_path,
                 checkpoint_id="save-1",
             ) as gym_commit:
                 assert gym_commit is not None
                 async with barrier.checkpoint() as cut:
-                    await controller._validate_gym_checkpoint_cut(
+                    await controller._environment_checkpoint.validate_cut(
                         cut, gym_commit, checkpoint_path=tmp_path
                     )
 
@@ -1571,18 +1658,19 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
-        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": payload_sha256,
-            "rollout_recovery_group_count": 1,
-        }
+        checkpoint = CheckpointToRestore(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": payload_sha256,
+                "rollout_recovery_group_count": 1,
+            },
+        )
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
@@ -1610,15 +1698,19 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        await controller._redispatch_restored_rollouts(_recover)
+        restorer = restorer_for(controller, checkpoint)
+        await restorer._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
 
         assert rollout_manager.recovered == [("batch-7-prompt-0", 7)]
         assert sampler.admit_calls == 0
         assert sampler.admission_commits == 0
         assert sampler.dispatch_index == 7
-        assert controller._batch_shortfall == {6: 1}
-        assert controller._sampler_stamps_target_steps is True
+        # The restorer reports these for the controller to take back.
+        assert restorer._batch_shortfall == {6: 1}
+        assert restorer._sampler_stamps_target_steps is True
         recovery_metrics = controller._logger.log_metrics.call_args.args[0]
         assert recovery_metrics["groups_unfinished_found"] == 1.0
         assert recovery_metrics["siblings_reused"] == 0.0
@@ -1666,7 +1758,7 @@ async def _turn_recovery_restart(
         saved_ledger.mark_group_dispatched(
             cut,
             saved_group.group_id,
-            gym_instance_id="tools/replica-0",
+            environment_instance_id="tools/replica-0",
         )
     saved_state = build_rollout_recovery_state(
         saved_ledger,
@@ -1685,20 +1777,12 @@ async def _turn_recovery_restart(
     controller._sampler = _CountingInOrderSampler()
     controller._rollout_manager = rollout_manager
     controller._rollout_recovery_ledger = rollout_manager.recovery_ledger
-    controller._restored_replay_groups_to_regenerate = []
-    controller._gym_checkpoint_coordinator = gym_coordinator(gym_actor)
+    controller._environment_checkpoint = _gym_environment_for(
+        controller, gym_coordinator(gym_actor)
+    )
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(enabled=False)
     )
-    controller._last_checkpoint_path = str(tmp_path)
-    # A rollout snapshot, which holds Gym state; a test of a trainer checkpoint
-    # clears this.
-    controller._restored_from_rollout_snapshot = True
-    controller._data_plane_checkpoint_metadata = {
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "rollout_recovery_payload_sha256": payload_sha256,
-        "rollout_recovery_group_count": 1,
-    }
     controller._async_cfg = SimpleNamespace(
         max_buffered_rollouts=4,
         max_inflight_prompts=2,
@@ -1717,7 +1801,32 @@ async def _turn_recovery_restart(
             "saved_capacity": saved_capacity,
         },
     )
-    return controller, rollout_manager, gym_actor, saved_group.gym_episode(0)
+    return controller, rollout_manager, gym_actor, saved_group.environment_episode(0)
+
+
+async def _restore_turn_recovery(
+    controller: Any, tmp_path: Path, *, from_rollout_snapshot: bool = True
+) -> RolloutRestorer:
+    """Restore the ledger ``_turn_recovery_restart`` saved under ``tmp_path``.
+
+    The default is a rollout snapshot, which holds Gym state; a test of a
+    trainer checkpoint passes ``from_rollout_snapshot=False``.
+    """
+    payload = (tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME).read_bytes()
+    restorer = restorer_for(
+        controller,
+        CheckpointToRestore(
+            path=str(tmp_path),
+            from_rollout_snapshot=from_rollout_snapshot,
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(payload).hexdigest(),
+                "rollout_recovery_group_count": 1,
+            },
+        ),
+    )
+    await restorer._maybe_restore_rollout_recovery(restored_replay_groups=0)
+    return restorer
 
 
 def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
@@ -1726,7 +1835,7 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
             tmp_path
         )
         manifest = _write_turn_manifest(tmp_path, episode)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await _restore_turn_recovery(controller, tmp_path)
         return rollout_manager, gym_actor, manifest
 
     rollout_manager, gym_actor, manifest = asyncio.run(exercise())
@@ -1734,8 +1843,8 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
     restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
     restored_attempt = restored_group.siblings[0].current_attempt
     assert restored_attempt.status is RolloutAttemptStatus.RESERVED
-    assert restored_attempt.gym_instance_id == "tools/replica-0"
-    assert restored_attempt.gym_attempt == 1
+    assert restored_attempt.environment_instance_id == "tools/replica-0"
+    assert restored_attempt.environment_attempt == 1
     assert gym_actor.operations() == ["restore", "resume"]
     (restore_id, checkpoint_root, episodes), restore_kwargs = gym_actor.calls[0][1:]
     assert restore_id.startswith("restore-")
@@ -1753,7 +1862,7 @@ def test_turn_recovery_starts_a_gym_restart_over_from_its_task(tmp_path: Path) -
             tmp_path
         )
         _write_turn_manifest(tmp_path, episode, restarted=True)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await _restore_turn_recovery(controller, tmp_path)
         return rollout_manager, gym_actor
 
     rollout_manager, gym_actor = asyncio.run(exercise())
@@ -1795,7 +1904,7 @@ def test_failure_after_gym_restore_retires_the_replacements_then_resumes(
         _write_turn_manifest(tmp_path, episode)
         controller._dataloader = SimpleNamespace(collate_fn=rl_collate_fn)
         with pytest.raises(RuntimeError, match="source dataset"):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            await _restore_turn_recovery(controller, tmp_path)
         return gym_actor, episode
 
     gym_actor, episode = asyncio.run(exercise())
@@ -1817,7 +1926,7 @@ def test_failed_gym_restore_is_cleaned_up_once(
         )
         _write_turn_manifest(tmp_path, episode)
         with pytest.raises(RuntimeError, match="gym restore failed"):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            await _restore_turn_recovery(controller, tmp_path)
         return gym_actor
 
     gym_actor = asyncio.run(exercise())
@@ -1837,7 +1946,7 @@ def test_manifest_that_disagrees_with_the_ledger_fails_before_any_gym_call(
             match=r"does not match the rollout recovery ledger for Gym instances "
             r"\['tools/replica-0'\]",
         ):
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            await _restore_turn_recovery(controller, tmp_path)
         return gym_actor
 
     assert asyncio.run(exercise()).calls == []
@@ -1846,11 +1955,11 @@ def test_manifest_that_disagrees_with_the_ledger_fails_before_any_gym_call(
 def test_turn_state_without_gym_coordination_is_refused(tmp_path: Path) -> None:
     async def exercise() -> None:
         controller, _, _, episode = await _turn_recovery_restart(tmp_path)
-        controller._gym_checkpoint_coordinator = None
+        controller._environment_checkpoint = NoEnvironmentCheckpoint()
         _write_turn_manifest(tmp_path, episode)
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await _restore_turn_recovery(controller, tmp_path)
 
-    with pytest.raises(RuntimeError, match="coordination is disabled"):
+    with pytest.raises(RuntimeError, match="keeps none to restore"):
         asyncio.run(exercise())
 
 
@@ -1863,8 +1972,7 @@ def test_turn_recovery_from_a_trainer_checkpoint_restarts_unfinished_turns(
         controller, rollout_manager, gym_actor, _ = await _turn_recovery_restart(
             tmp_path
         )
-        controller._restored_from_rollout_snapshot = False
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await _restore_turn_recovery(controller, tmp_path, from_rollout_snapshot=False)
         return rollout_manager, gym_actor
 
     rollout_manager, gym_actor = asyncio.run(exercise())
@@ -1890,9 +1998,9 @@ def test_turn_recovery_counts_continued_and_restarted_siblings(
         controller, rollout_manager, _, episode = await _turn_recovery_restart(tmp_path)
         if gym_state == "manifest":
             _write_turn_manifest(tmp_path, episode)
-        else:
-            controller._restored_from_rollout_snapshot = False
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        restorer = await _restore_turn_recovery(
+            controller, tmp_path, from_rollout_snapshot=gym_state == "manifest"
+        )
 
         async def _recover(
             _prompt: dict[str, Any], _target_step: int | None, group_id: str
@@ -1900,7 +2008,9 @@ def test_turn_recovery_counts_continued_and_restarted_siblings(
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._redispatch_restored_rollouts(_recover)
+        await restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
         return controller._logger.log_metrics.call_args.args[0]
 
     metrics = asyncio.run(exercise())
@@ -1918,7 +2028,7 @@ def test_turn_recovery_refuses_a_rollout_snapshot_without_its_gym_manifest(
     async def exercise() -> None:
         controller, _, gym_actor, _ = await _turn_recovery_restart(tmp_path)
         try:
-            await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
+            await _restore_turn_recovery(controller, tmp_path)
         finally:
             assert gym_actor.calls == []
 
@@ -1937,7 +2047,8 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
         actor = FakeGymActor()
         controller = _controller_for(gym_coordinator(actor), ledger)
 
-        async with controller._prepared_gym_checkpoint(
+        async with _gym_commit(
+            controller,
             tmp_path,
             checkpoint_id="save-1",
         ):
@@ -1946,7 +2057,11 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
 
         assert actor.operations() == ["prepare", "renew", "commit", "tq-cut", "resume"]
         (commit_call,) = [call for call in actor.calls if call[0] == "commit"]
-        assert commit_call[1] == ("save-1", str(tmp_path), (group.gym_episode(0),))
+        assert commit_call[1] == (
+            "save-1",
+            str(tmp_path),
+            (group.environment_episode(0),),
+        )
 
     asyncio.run(exercise())
 
@@ -1978,7 +2093,9 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
             RuntimeError,
             match=r"unrecognized rollout recovery phase.*future-group='future-phase'",
         ):
-            await controller._redispatch_restored_rollouts(_recover)
+            await restorer_for(controller).redispatch_restored(
+                _recover, controller._admit_reserved_prompt_groups
+            )
 
         assert not launched
 
@@ -2012,20 +2129,21 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         _init_recovery_telemetry(controller, train_steps=7)
-        controller._restored_replay_groups_to_regenerate = []
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-            "rollout_recovery_group_count": 2,
-        }
+        checkpoint = CheckpointToRestore(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": 2,
+            },
+        )
         controller._async_cfg = SimpleNamespace(
             max_buffered_rollouts=4,
             max_inflight_prompts=2,
@@ -2055,8 +2173,13 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
                 await rollout_manager.complete_recovery(cut, group_id)
 
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        await controller._redispatch_restored_rollouts(_recover)
+        restorer = restorer_for(controller, checkpoint)
+        # Re-admission reserves through the controller's ledger dispatch.
+        use_dispatch(controller, records_prompt_groups=True)
+        await restorer._maybe_restore_rollout_recovery(restored_replay_groups=0)
+        await restorer.redispatch_restored(
+            _recover, controller._admit_reserved_prompt_groups
+        )
 
         assert sampler.admit_calls == 0
         assert sampler.admission_commits == 1
@@ -2112,6 +2235,8 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
         )
+        # Re-admission reserves through the controller's ledger dispatch.
+        use_dispatch(controller, records_prompt_groups=True)
 
         launched: list[tuple[str, int | None]] = []
 
@@ -2129,7 +2254,9 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
                 controller._trainer_version = 7
 
         await asyncio.wait_for(
-            controller._redispatch_restored_rollouts(_recover),
+            restorer_for(controller).redispatch_restored(
+                _recover, controller._admit_reserved_prompt_groups
+            ),
             timeout=1.0,
         )
 
@@ -2171,19 +2298,20 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-        controller._restored_replay_groups_to_regenerate = []
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
             token_capture=SimpleNamespace(enabled=False)
         )
-        controller._last_checkpoint_path = str(tmp_path)
-        controller._data_plane_checkpoint_metadata = {
-            "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "rollout_recovery_payload_sha256": hashlib.sha256(
-                recovery_path.read_bytes()
-            ).hexdigest(),
-            "rollout_recovery_group_count": 2,
-        }
+        checkpoint = CheckpointToRestore(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": hashlib.sha256(
+                    recovery_path.read_bytes()
+                ).hexdigest(),
+                "rollout_recovery_group_count": 2,
+            },
+        )
         controller._async_cfg = SimpleNamespace(max_buffered_rollouts=4)
         controller._dataloader = SimpleNamespace(
             dataset={
@@ -2201,7 +2329,9 @@ def test_recovery_load_does_not_require_every_unfinished_group_to_fit_at_once(
         # Three canonical groups plus two unfinished groups exceed capacity four,
         # but only the canonical groups occupy slots at restore time. Recovery is
         # launched beside the train pump, which releases capacity as it consumes.
-        await controller._maybe_restore_rollout_recovery(restored_replay_groups=3)
+        await restorer_for(controller, checkpoint)._maybe_restore_rollout_recovery(
+            restored_replay_groups=3
+        )
 
         assert len(rollout_manager.recovery_ledger) == 2
 
@@ -2366,17 +2496,20 @@ def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._last_checkpoint_path = str(tmp_path)
-    controller._data_plane_checkpoint_metadata = {
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "rollout_recovery_payload_sha256": "0" * 64,
-        "rollout_recovery_group_count": 1,
-    }
+    restorer = restorer_for(
+        controller,
+        CheckpointToRestore(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": "0" * 64,
+                "rollout_recovery_group_count": 1,
+            },
+        ),
+    )
 
     with pytest.raises(ValueError, match="checksum mismatch"):
-        asyncio.run(
-            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        )
+        asyncio.run(restorer._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
 
 def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
@@ -2384,17 +2517,20 @@ def test_recovery_rejects_a_missing_advertised_ledger_sidecar(tmp_path) -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
-    controller._last_checkpoint_path = str(tmp_path)
-    controller._data_plane_checkpoint_metadata = {
-        "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-        "rollout_recovery_payload_sha256": "0" * 64,
-        "rollout_recovery_group_count": 1,
-    }
+    restorer = restorer_for(
+        controller,
+        CheckpointToRestore(
+            path=str(tmp_path),
+            data_plane_metadata={
+                "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+                "rollout_recovery_payload_sha256": "0" * 64,
+                "rollout_recovery_group_count": 1,
+            },
+        ),
+    )
 
     with pytest.raises(FileNotFoundError, match="sidecar is missing"):
-        asyncio.run(
-            controller._maybe_restore_rollout_recovery(restored_replay_groups=0)
-        )
+        asyncio.run(restorer._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
 
 class TestGymCheckpointPausesRolloutDeadlines:
@@ -2421,9 +2557,7 @@ class TestGymCheckpointPausesRolloutDeadlines:
 
             rollout = asyncio.create_task(parked_rollout())
             await entered.wait()
-            async with controller._prepared_gym_checkpoint(
-                tmp_path, checkpoint_id="save-1"
-            ):
+            async with _gym_commit(controller, tmp_path, checkpoint_id="save-1"):
                 assert registry.suspended
                 # Twice the rollout's whole budget.
                 await asyncio.sleep(0.4)
@@ -2446,9 +2580,7 @@ class TestGymCheckpointPausesRolloutDeadlines:
         async def exercise() -> None:
             # The colocated engine is training; its own pause must outlast ours.
             registry.suspend()
-            async with controller._prepared_gym_checkpoint(
-                tmp_path, checkpoint_id="save-1"
-            ):
+            async with _gym_commit(controller, tmp_path, checkpoint_id="save-1"):
                 pass
             assert registry.suspended
             registry.resume()
@@ -2467,9 +2599,7 @@ class TestGymCheckpointPausesRolloutDeadlines:
 
         async def exercise() -> None:
             with pytest.raises(GymCheckpointNotReady):
-                async with controller._prepared_gym_checkpoint(
-                    tmp_path, checkpoint_id="save-1"
-                ):
+                async with _gym_commit(controller, tmp_path, checkpoint_id="save-1"):
                     raise AssertionError("unreachable")
             assert not registry.suspended
 
@@ -2497,12 +2627,12 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
     async def _save(
         controller: Any, barrier: DataPlaneCheckpointBarrier, tmp_path: Path
     ) -> None:
-        async with controller._prepared_gym_checkpoint(
-            tmp_path, checkpoint_id="save-1"
+        async with _gym_commit(
+            controller, tmp_path, checkpoint_id="save-1"
         ) as gym_commit:
             assert gym_commit is not None
             async with barrier.checkpoint() as cut:
-                await controller._validate_gym_checkpoint_cut(
+                await controller._environment_checkpoint.validate_cut(
                     cut, gym_commit, checkpoint_path=tmp_path
                 )
 
@@ -2515,7 +2645,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
         kept: set[GymCheckpointEpisode],
     ) -> None:
         saved = load_gym_checkpoint_manifest(tmp_path).instances
-        assert saved == controller._gym_checkpoint_inventory(coordinator)
+        assert saved == controller._environment_checkpoint.inventory()
         assert set(saved["tools/replica-0"]) == kept
 
     def test_a_drop_after_the_pre_prepare_retire(self, tmp_path: Path) -> None:
@@ -2526,7 +2656,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
 
             coordinator = gym_coordinator(
                 FakeGymActor(
@@ -2542,7 +2672,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             )
 
             self._assert_restorable(controller, coordinator, tmp_path, kept=set())
-            assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            assert ledger.environment_retirements({"tools/replica-0"}) == {
                 "tools/replica-0": tuple(sorted((row_0, row_1)))
             }
 
@@ -2556,7 +2686,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             # Row 0 is parked in Gym and exported; row 1's reply is on the wire.
             actor = FakeGymActor(live={row_0})
             coordinator = gym_coordinator(actor)
@@ -2575,7 +2705,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             await asyncio.wait_for(failing, _ASYNC_TEST_TIMEOUT_S)
 
             self._assert_restorable(controller, coordinator, tmp_path, kept=set())
-            assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            assert ledger.environment_retirements({"tools/replica-0"}) == {
                 "tools/replica-0": tuple(sorted((row_0, row_1)))
             }
 
@@ -2591,7 +2721,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(
                 FakeGymActor(
                     live={row_0, row_1},
@@ -2602,18 +2732,15 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                     },
                 )
             )
-            controller = _controller_for(coordinator, ledger)
-            controller._data_plane_checkpoint_barrier = barrier
-            controller._master_config = SimpleNamespace(
-                token_capture=SimpleNamespace(staging_partition="rollout_staging")
-            )
 
-            async def list_sample_ids(method: str, *, partition_id: str) -> list[str]:
-                assert (method, partition_id) == ("list_sample_ids", "rollout_staging")
+            async def list_staging_keys() -> list[str]:
                 # The dropped group's staging is gone by the time the cut looks.
                 return []
 
-            controller._call_dp = list_sample_ids
+            controller = _controller_for(
+                coordinator, ledger, list_staging_keys=list_staging_keys
+            )
+            controller._data_plane_checkpoint_barrier = barrier
 
             await asyncio.wait_for(
                 self._save(controller, barrier, tmp_path), _ASYNC_TEST_TIMEOUT_S
@@ -2635,21 +2762,21 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(FakeGymActor(live={row_0, row_1}))
             controller = _controller_for(coordinator, ledger)
             controller._data_plane_checkpoint_barrier = barrier
 
-            async with controller._prepared_gym_checkpoint(
-                tmp_path, checkpoint_id="save-1"
+            async with _gym_commit(
+                controller, tmp_path, checkpoint_id="save-1"
             ) as gym_commit:
                 assert gym_commit is not None
                 await self._drop(ledger, barrier, group.group_id)
                 # As if the drop's retire had already been acknowledged.
-                ledger.mark_gym_retired({"tools/replica-0": [row_0]})
+                ledger.mark_environment_retired({"tools/replica-0": [row_0]})
                 async with barrier.checkpoint() as cut:
                     with pytest.raises(RuntimeError, match="ownership changed"):
-                        await controller._validate_gym_checkpoint_cut(
+                        await controller._environment_checkpoint.validate_cut(
                             cut, gym_commit, checkpoint_path=tmp_path
                         )
 
@@ -2660,9 +2787,8 @@ def _restart_only_check(
     restart_only_servers: tuple[str, ...], *, allowed: bool
 ) -> tuple[Any, FakeGymActor]:
     actor = FakeGymActor(restart_only_servers=restart_only_servers)
-    controller = _controller_for(gym_coordinator(actor))
-    controller._master_config = SimpleNamespace(
-        rollout_recovery=SimpleNamespace(allow_restart_only_gym_servers=allowed)
+    controller = _controller_for(
+        gym_coordinator(actor), allow_restart_only_servers=allowed
     )
     return controller, actor
 
@@ -2672,7 +2798,7 @@ def test_turn_recovery_refuses_a_restart_only_gym_server_by_default() -> None:
     controller, actor = _restart_only_check(("tools_resources",), allowed=False)
 
     with pytest.raises(ValueError, match="restart-only Gym servers") as raised:
-        asyncio.run(controller._check_restart_only_gym_servers())
+        asyncio.run(controller._environment_checkpoint.check_startup())
 
     assert "tools/replica-0" in str(raised.value)
     assert "tools_resources" in str(raised.value)
@@ -2684,14 +2810,14 @@ def test_an_allowed_restart_only_gym_server_is_named_in_a_warning() -> None:
     controller, _ = _restart_only_check(("tools_agent",), allowed=True)
 
     with pytest.warns(UserWarning, match="start over after a crash.*tools_agent"):
-        asyncio.run(controller._check_restart_only_gym_servers())
+        asyncio.run(controller._environment_checkpoint.check_startup())
 
 
 def test_allowing_restart_only_gym_servers_warns_when_there_are_none() -> None:
     controller, _ = _restart_only_check((), allowed=True)
 
     with pytest.warns(UserWarning, match="no Gym server is restart-only"):
-        asyncio.run(controller._check_restart_only_gym_servers())
+        asyncio.run(controller._environment_checkpoint.check_startup())
 
 
 def test_no_restart_only_gym_server_and_no_opt_in_passes_silently() -> None:
@@ -2699,11 +2825,11 @@ def test_no_restart_only_gym_server_and_no_opt_in_passes_silently() -> None:
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        asyncio.run(controller._check_restart_only_gym_servers())
+        asyncio.run(controller._environment_checkpoint.check_startup())
 
 
 def test_without_turn_recovery_there_are_no_gym_servers_to_check() -> None:
     controller = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    controller._gym_checkpoint_coordinator = None
+    controller._environment_checkpoint = NoEnvironmentCheckpoint()
 
-    asyncio.run(controller._check_restart_only_gym_servers())
+    asyncio.run(controller._environment_checkpoint.check_startup())
