@@ -1760,6 +1760,56 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_consume_rollout())
 
 
+def test_nemo_gym_context_limit_uses_active_sglang_backend():
+    policy_generation = type(
+        "_PolicyGeneration",
+        (),
+        {
+            "cfg": {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": 256},
+                # Inherited inactive blocks must not select another backend.
+                "vllm_cfg": {"max_model_len": 1},
+            }
+        },
+    )()
+
+    assert (
+        rollouts_mod._resolve_generation_context_limit(
+            policy_generation,
+            policy_max_seq_len=512,
+        )
+        == 256
+    )
+
+
+def test_nemo_gym_context_limit_falls_back_for_nullable_sglang_limit():
+    policy_generation = type(
+        "_PolicyGeneration",
+        (),
+        {
+            "cfg": {
+                "backend": "sglang",
+                "sglang_cfg": {"context_length": None},
+                "vllm_cfg": {"max_model_len": 1},
+            }
+        },
+    )()
+
+    assert (
+        rollouts_mod._resolve_generation_context_limit(
+            policy_generation,
+            policy_max_seq_len=512,
+        )
+        == 512
+    )
+    with pytest.raises(ValueError, match="SGLang NeMo-Gym rollouts require"):
+        rollouts_mod._resolve_generation_context_limit(
+            policy_generation,
+            policy_max_seq_len=None,
+        )
+
+
 def test_native_rollout_groups_match_whole_batch(monkeypatch):
     """One native batch can be split without changing data or metric semantics."""
 
@@ -2328,14 +2378,10 @@ def test_postprocess_nemo_gym_group_returns_task_index(
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,
+        max_total_tokens_per_sample=128,
         length_penalty_config={
             "default": {
                 "group_total_length_penalty_coeff": 0.1,
@@ -2418,14 +2464,10 @@ def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 3}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
+        max_total_tokens_per_sample=3,
     )
 
     metrics = rollout_result.rollout_metrics
@@ -2553,14 +2595,10 @@ def test_postprocess_nemo_gym_group_marks_context_overflow_truncated():
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=False,
+        max_total_tokens_per_sample=128,
     )
 
     # Both rollouts are 5 tokens, far below the limit: only the length-cut one
