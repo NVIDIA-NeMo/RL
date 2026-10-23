@@ -581,6 +581,8 @@ def validate_and_set_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            # Megatron generation samples top-p with FlashInfer, which keeps ties.
+            top_p_keep_ties=generation_cfg["backend"] == "megatron",
         )
 
     # Setup data types
