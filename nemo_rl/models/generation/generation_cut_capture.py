@@ -62,6 +62,21 @@ _CUT_CHUNKS_DIGEST = "nrl_generation_cut_chunks_sha256"
 _ROUTE_SNAPSHOT_GROUP_MAX_CALLS = 64
 
 
+def _failed_generation_cut_ack(prefix: Any, *, reason: str) -> Any:
+    """Count one failed acknowledgement using a fixed, payload-free category.
+
+    Callers supply category names, never exception messages or call identities.
+    These counters describe this cut attempt, not a failed training episode.
+    """
+    # Gym is optional outside the token-capture worker path.
+    from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
+
+    acknowledgement = GenerationCutPrefixAck.failure(prefix)
+    prefix_cut_count("failed_model_calls", 1)
+    prefix_cut_count(f"failed_model_calls_{reason}", 1)
+    return acknowledgement
+
+
 @dataclass(frozen=True)
 class _RouteSnapshotRequest:
     """A transaction paused after freezing, before reading engine routes."""
@@ -1114,6 +1129,7 @@ class GenerationCutCaptureMixin:
             and completed.effective_output_limit is not None
             and completed.terminal_finish_reason is not None
         ):
+            prefix_cut_count("completed_fallback_success", 1)
             return GenerationCutPrefixAck(
                 **prefix.model_dump(mode="json"),
                 disposition="durable_prefix",
@@ -1126,8 +1142,17 @@ class GenerationCutCaptureMixin:
                 terminal_finish_reason=completed.terminal_finish_reason,
                 terminal_stop_reason=completed.terminal_stop_reason,
             )
-        # Evidence for this completion aged out; restart it from its prior boundary.
-        return GenerationCutPrefixAck.failure(prefix)
+        # Absence does not establish that evidence aged out: Gym can name a
+        # request before preprocessing registers its capture state on this worker.
+        if completed is None:
+            reason = "no_capture_or_completed_state"
+        elif completed.coords.disposition != "staged":
+            reason = "completed_not_staged"
+        elif completed.effective_output_limit is None:
+            reason = "completed_missing_output_limit"
+        else:
+            reason = "completed_missing_finish_reason"
+        return _failed_generation_cut_ack(prefix, reason=reason)
 
     def _frozen_cut_engine_request_id(self, state: _RequestCaptureState) -> str | None:
         """Select a frozen call's live lookup without holding its token lock."""
@@ -1197,6 +1222,7 @@ class GenerationCutCaptureMixin:
             with self._capture_registry_lock:
                 current = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if current is not state or state.terminal_started:
+                prefix_cut_count("capture_lifecycle_races", 1)
                 return None
 
             expected_capture_key = EpisodeId(
@@ -1236,10 +1262,7 @@ class GenerationCutCaptureMixin:
                     prefix.model_call_id,
                     uncuttable_reason,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return _failed_generation_cut_ack(prefix, reason="uncuttable_request")
             if observation_error is not None:
                 # A dropped delta leaves the buffer short of what vLLM decoded.
                 # Only this call regenerates; the rest of the inventory is cut.
@@ -1248,10 +1271,7 @@ class GenerationCutCaptureMixin:
                     prefix.model_call_id,
                     observation_error,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return _failed_generation_cut_ack(prefix, reason="observation_error")
             if effective_output_limit is None:
                 # Checked before freezing, so the call's buffer is untouched.
                 LOGGER.warning(
@@ -1259,10 +1279,7 @@ class GenerationCutCaptureMixin:
                     "effective output limit",
                     prefix.model_call_id,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
-                )
+                return _failed_generation_cut_ack(prefix, reason="missing_output_limit")
             inherited_prefix_token_count = (
                 state.call.admission.generation_cut.prefix_token_count
                 if state.call.admission.generation_cut is not None
@@ -1282,9 +1299,11 @@ class GenerationCutCaptureMixin:
             if cannot_cut_boundary:
                 with state.lock:
                     state.rollback_frozen_cut(checkpoint_id)
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
+                return _failed_generation_cut_ack(
+                    prefix,
+                    reason="zero_generated_tokens"
+                    if total_generation_token_count == 0
+                    else "incomplete_utf8_boundary",
                 )
             try:
                 engine_routed_experts = None
@@ -1343,9 +1362,11 @@ class GenerationCutCaptureMixin:
                     type(error).__name__,
                     error,
                 )
-                return GenerationCutPrefixAck(
-                    **prefix.model_dump(mode="json"),
-                    disposition="durable_failure",
+                return _failed_generation_cut_ack(
+                    prefix,
+                    reason="route_snapshot_timeout"
+                    if isinstance(error, TimeoutError)
+                    else "route_validation_error",
                 )
 
             staged_key = None
@@ -1524,8 +1545,6 @@ class GenerationCutCaptureMixin:
         failed batch put is retried one row per put, so one bad row fails only
         its own call.
         """
-        from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
-
         max_rows = self._generation_prefix_batch_max_rows
         max_tokens = self._generation_prefix_batch_max_tokens
         call_ids = [prefix.model_call_id for prefix in inventory.active_prefixes]
@@ -1572,12 +1591,12 @@ class GenerationCutCaptureMixin:
             route_pending.clear()
             route_pending_tokens = 0
 
-        def fail(prefix: Any) -> None:
+        def fail(prefix: Any, *, reason: str) -> None:
             LOGGER.exception(
                 "cannot cut model call %s; it regenerates after a restore",
                 prefix.model_call_id,
             )
-            acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
+            acknowledgements.append(_failed_generation_cut_ack(prefix, reason=reason))
 
         def stage(
             batch: list[tuple[Any, Any, int, Any, RoutedExpertsStagingPayload | None]],
@@ -1598,7 +1617,7 @@ class GenerationCutCaptureMixin:
             except Exception:
                 # The sink has already discarded the batch's keys.
                 if len(batch) == 1:
-                    fail(batch[0][3])
+                    fail(batch[0][3], reason="staging_error")
                     return [None]
                 LOGGER.warning(
                     "generation-prefix batch of %d rows failed; writing each alone",
@@ -1623,7 +1642,7 @@ class GenerationCutCaptureMixin:
                         ],
                     )
                 except Exception:
-                    fail(prefix)
+                    fail(prefix, reason="staging_error")
                     keys.append(None)
             return keys
 
@@ -1669,7 +1688,7 @@ class GenerationCutCaptureMixin:
                         with prefix_cut_timing("transaction_acknowledge"):
                             ready.append((transaction, prefix, transaction.send(key)))
                     except Exception:
-                        fail(prefix)
+                        fail(prefix, reason="acknowledgement_error")
                 # Every acknowledgement in the batch is built before any call
                 # seals its frozen cut into its live request state.
                 for transaction, prefix, acknowledgement in ready:
@@ -1681,10 +1700,14 @@ class GenerationCutCaptureMixin:
                     except StopIteration:
                         acknowledgements.append(acknowledgement)
                     except Exception:
-                        fail(prefix)
+                        fail(prefix, reason="seal_error")
                     else:
                         transaction.close()
-                        acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
+                        acknowledgements.append(
+                            _failed_generation_cut_ack(
+                                prefix, reason="unexpected_seal_yield"
+                            )
+                        )
             finally:
                 # Only an interruption leaves written rows that no transaction
                 # received; nothing may advertise them.
@@ -1763,7 +1786,7 @@ class GenerationCutCaptureMixin:
                     except StopIteration as finished:
                         acknowledgements.append(finished.value)
                     except Exception:
-                        fail(prefix)
+                        fail(prefix, reason="route_resume_error")
                     finally:
                         if not transferred:
                             transaction.close()
@@ -1786,12 +1809,14 @@ class GenerationCutCaptureMixin:
                     )
                 try:
                     if state is None:
+                        prefix_cut_count("capture_lookup_missing", 1)
                         acknowledgements.append(
                             self._completed_generation_cut_ack(
                                 prefix, inventory.checkpoint_id
                             )
                         )
                         continue
+                    prefix_cut_count("capture_lookup_active", 1)
                     transaction = self._generation_cut_transaction(
                         prefix,
                         state,
@@ -1812,7 +1837,7 @@ class GenerationCutCaptureMixin:
                     acknowledgements.append(acknowledgement)
                     continue
                 except Exception:
-                    fail(prefix)
+                    fail(prefix, reason="transaction_prepare_error")
                     if state is not None:
                         # The transaction rolls back only failures from its
                         # route snapshot on; release a cut it froze earlier.
@@ -1868,7 +1893,8 @@ class GenerationCutCaptureMixin:
                 len(inventory.active_prefixes),
             )
             acknowledgements.extend(
-                GenerationCutPrefixAck.failure(prefix) for prefix in uncut
+                _failed_generation_cut_ack(prefix, reason="control_deadline")
+                for prefix in uncut
             )
         by_ticket = {ack.ticket_id: ack for ack in acknowledgements}
         return [by_ticket[prefix.ticket_id] for prefix in inventory.active_prefixes]
