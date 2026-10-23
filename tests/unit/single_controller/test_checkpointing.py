@@ -1162,6 +1162,51 @@ class TestCounterRestore:
 
 
 class TestSaveTrigger:
+    def test_idle_deadline_never_checkpoints_a_partial_streaming_step(
+        self, tmp_path: Path
+    ) -> None:
+        class PartialFollowingStep(_FakeSampler):
+            calls = 0
+            deadline_due = False
+
+            async def select(self, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    kwargs = {**kwargs, "max_prompt_groups": 1}
+                elif self.calls == 3:
+                    self.deadline_due = True
+                    return None, 0
+                return await super().select(**kwargs)
+
+        sampler = PartialFollowingStep()
+        trainer = _FakeTrainer()
+        trainer.train_microbatches_from_meta = MagicMock(
+            wraps=trainer.train_microbatches_from_meta
+        )
+        trainer.finish_train_step = MagicMock(wraps=trainer.finish_train_step)
+
+        def seed(actor):
+            actor._sampler = sampler
+            actor._timeout = SimpleNamespace(
+                mark_iteration=lambda: None,
+                check_save=lambda: sampler.deadline_due,
+            )
+
+        actor = _run_train_pump(
+            _actor_master_config(tmp_path, max_num_steps=200, save_period=10),
+            _make_actor_args(trainer=trainer),
+            seed=seed,
+        )
+
+        # Step one is complete; step two first has only one of its two groups
+        # when the deadline arrives. Finish the second group and its optimizer
+        # update instead of publishing step one's weights with partial claims.
+        assert actor._train_steps == actor._trainer_version == 2
+        assert trainer.train_microbatches_from_meta.call_count == 3
+        assert trainer.finish_train_step.call_count == 2
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_2"}
+        assert _training_info(tmp_path / "checkpoints", 2)["consumed_samples"] == 4
+
     @pytest.mark.parametrize("blocking", [False, True])
     @pytest.mark.parametrize("exit_reason", ["last_step", "timeout"])
     def test_terminal_save_does_not_depend_on_generation_refit(

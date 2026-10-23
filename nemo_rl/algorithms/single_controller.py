@@ -2827,6 +2827,7 @@ class SingleControllerActor:
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         context_compaction = self._master_config.token_capture.context_compaction
+        last_completed_step_metrics: Optional[dict[str, Any]] = None
 
         while self._train_steps < self._algo_cfg.max_num_steps:
             version_during_step = self._trainer_version
@@ -2958,6 +2959,41 @@ class SingleControllerActor:
 
                         # If no batch is selectable, sleep and retry
                         if train_meta is None:
+                            if (
+                                groups_dispatched == 0
+                                and not step_open
+                                and self._train_steps > self._save_state.current_step
+                                and self._master_config.checkpointing["enabled"]
+                                and self._timeout.check_save()
+                            ):
+                                # A following rollout can outlast the allocation's
+                                # save reserve. Preserve already committed updates
+                                # without opening or shortening another train step.
+                                assert last_completed_step_metrics is not None
+                                self._rollout_permitted.clear()
+                                if self._gen.blocks_training():
+                                    self._rollout_manager.suspend_request_deadlines()
+                                    await asyncio.to_thread(self._gen.finish_generation)
+                                await asyncio.to_thread(
+                                    self._trainer.sync_params_before_refit
+                                )
+                                if not self._is_ppo:
+                                    await asyncio.to_thread(
+                                        self._trainer.prepare_for_training
+                                    )
+                                await self._save_checkpoint(
+                                    last_completed_step_metrics,
+                                    is_policy_training_step=(
+                                        self._train_steps > policy_training_start_step
+                                    ),
+                                    is_final_checkpoint=False,
+                                )
+                                print(
+                                    "Checkpoint deadline reached while awaiting "
+                                    "rollouts; saved the last completed train step",
+                                    flush=True,
+                                )
+                                return
                             if self._rollout_exhausted.is_set():
                                 buffered_groups = len(self._buffer)
                                 if groups_dispatched == 0 and buffered_groups == 0:
@@ -3711,6 +3747,7 @@ class SingleControllerActor:
                 prefix="timing/train",
                 step_finished=True,
             )
+            last_completed_step_metrics = dict(step_metrics)
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
