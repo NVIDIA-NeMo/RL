@@ -5723,9 +5723,13 @@ class SingleControllerActor:
             AdvantageRequest(
                 meta=shard,
                 # Only the stage still holds the untruncated tensors, so it
-                # writes the dump and needs the step to name the file by.
+                # writes the dump and the trained/masked outcome log, and needs
+                # the step to label both by.
                 train_step=(
-                    self._train_steps if self._train_data_dump is not None else None
+                    self._train_steps
+                    if self._train_data_dump is not None
+                    or self._advantage_stage_config.outcome_log_dir is not None
+                    else None
                 ),
             )
             for shard in (shards if shards is not None else [meta])

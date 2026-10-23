@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -75,6 +76,14 @@ from nemo_rl.environments.nemo_gym_shards import (
     parse_shard_plan,
 )
 from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY,
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -96,6 +105,7 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.gym_results_log import GYM_RESULTS_PREFIX, JsonlAppender
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -264,18 +274,6 @@ class ExternalServiceReadinessConfig(BaseModel, extra="allow"):
         return self
 
 
-def should_dump_gym_results(master_config: Any) -> bool:
-    """Whether rows carry ``GYM_FULL_RESULT_FIELD`` for the training-data dump.
-
-    The row builders and the advantage stage both key on this, so the column a
-    producer writes is the column the stage fetches.
-    """
-    return bool(
-        master_config.async_rl.log_full_train_data
-        and should_use_nemo_gym(master_config)
-    )
-
-
 def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     """Determine whether NeMo Gym should handle rollouts and validation."""
     should_use_gym = bool(master_config.env.get("should_use_nemo_gym"))
@@ -312,6 +310,20 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     )
 
     return True
+
+
+def _gym_row_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The ids a Gym-results line carries so it joins RL's other logs."""
+    agent_ref = row.get("agent_ref")
+    return {
+        "rollout_id": row.get(NEMO_GYM_ROLLOUT_ID_KEY),
+        "group_id": row.get(NEMO_GYM_GROUP_ID_KEY),
+        "group_attempt": row.get(NEMO_GYM_GROUP_ATTEMPT_KEY),
+        "rollout_index": row.get(NEMO_GYM_ROLLOUT_INDEX_KEY),
+        "task_index": row.get(NEMO_GYM_TASK_INDEX_KEY),
+        "agent": agent_ref.get("name") if isinstance(agent_ref, Mapping) else None,
+        "dispatch_weight_version": row.get(NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY),
+    }
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -423,6 +435,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # async_rl.gym_results_log, resolved by the driver: "dir" (absolute output
+    # directory) plus the GymResultsLogConfig fields. None/absent = no log.
+    gym_results_log: NotRequired[Dict[str, Any] | None]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -430,7 +445,7 @@ class NemoGymConfig(TypedDict):
 # agent derives the id from the run body and stamps /ng-rollout/<id> on every
 # model call, so the TQ sample id IS the capture key end to end.
 _POLICY_SERVER_NAME = "policy_model"
-_NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
+_NG_ROLLOUT_ID_BODY_KEY = NEMO_GYM_ROLLOUT_ID_KEY
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # The generation server's bearer token travels to Gym's servers the same way as
@@ -688,6 +703,17 @@ class NemoGym(EnvironmentInterface):
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
+        # async_rl.gym_results_log: this actor's gym_results.<pid>.jsonl writer.
+        # The model-call capture it merges is resolved on first use, because it
+        # reads Gym's config helpers and Gym is imported lazily in this actor.
+        self._gym_results_cfg: Optional[Dict[str, Any]] = cfg.get("gym_results_log")
+        self._gym_results_log: Optional[JsonlAppender] = (
+            JsonlAppender(self._gym_results_cfg["dir"], GYM_RESULTS_PREFIX)
+            if self._gym_results_cfg
+            else None
+        )
+        self._gym_capture_dirs: Optional[list[Any]] = None
+        self._gym_observability_enabled = False
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -1097,6 +1123,11 @@ Depending on your data shape, you may want to change these values."""
         # Megatron's HTTP backend consumes the same normalized Responses payload.
         normalize_media_in_examples(nemo_gym_examples)
 
+        if self._gym_results_log is not None:
+            self._clear_model_call_captures(nemo_gym_examples)
+        # Rows not yet returned, so a failed /run can name the rollouts it may own.
+        pending_rows = {id(row): row for row in nemo_gym_examples}
+
         timer = Timer()
         timer.start("_run_rollouts_total")
         nemo_gym_result_iterator = self.rch.run_examples(
@@ -1113,6 +1144,10 @@ Depending on your data shape, you may want to change these values."""
                 try:
                     nemo_gym_row, nemo_gym_result = await task
                 except Exception as error:
+                    if self._gym_results_log is not None:
+                        self._log_gym_failure(
+                            list(pending_rows.values()), error, stage="run"
+                        )
                     if hasattr(error, "response_content"):
                         print(
                             "EXCEPTION RESULT",
@@ -1127,24 +1162,37 @@ Depending on your data shape, you may want to change these values."""
                         raise typed from None
                     raise
 
+            pending_rows.pop(id(nemo_gym_row), None)
+            if self._gym_results_log is not None:
+                # Before post-processing, which pops token arrays and fails rows
+                # that RL cannot train on: the log keeps what Gym returned.
+                await self._log_gym_result(nemo_gym_row, nemo_gym_result)
+
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
-                    )
-                else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
+                try:
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                except Exception as error:
+                    if self._gym_results_log is not None:
+                        self._log_gym_failure(
+                            [nemo_gym_row], error, stage="postprocess"
+                        )
+                    raise
             num_results += 1
             timing_metrics = None
             if num_results == len(nemo_gym_examples):
@@ -1182,6 +1230,102 @@ Depending on your data shape, you may want to change these values."""
                 nemo_rl_result,
                 timing_metrics,
             )
+
+    def _resolve_model_call_capture(self) -> list[Any]:
+        """Gym's model-call capture dirs for this actor; empty when not merged."""
+        if self._gym_capture_dirs is None:
+            self._gym_capture_dirs = []
+            assert self._gym_results_cfg is not None
+            if self._gym_results_cfg["include_model_calls"]:
+                from nemo_gym.base_responses_api_model import (
+                    model_call_capture_dirs_from_config,
+                    observability_enabled_from_config,
+                )
+
+                global_config = self.cfg["initial_global_config_dict"]
+                self._gym_capture_dirs = model_call_capture_dirs_from_config(
+                    global_config
+                )
+                self._gym_observability_enabled = observability_enabled_from_config(
+                    global_config
+                )
+        return self._gym_capture_dirs
+
+    def _clear_model_call_captures(self, nemo_gym_examples: list[dict]) -> None:
+        """Drop captures left under these rollout ids before they are dispatched.
+
+        A row re-dispatched after a transport failure keeps its rollout id, so
+        without this the failed dispatch's calls would merge into the retry's.
+        ``ng_collect_rollouts`` clears the same way before each dispatch.
+        """
+        capture_dirs = self._resolve_model_call_capture()
+        if not capture_dirs:
+            return
+        from nemo_gym.base_responses_api_model import (
+            clear_model_call_captures_for_rollouts,
+        )
+
+        clear_model_call_captures_for_rollouts(nemo_gym_examples, capture_dirs)
+
+    async def _log_gym_result(self, row: dict, result: Any) -> None:
+        """Append one Gym result, with the rollout's captured model calls merged in.
+
+        The merge runs on a shallow copy: Gym's ``enrich_run_result`` only adds or
+        replaces top-level keys, so the result handed to post-processing (and on to
+        RL over Ray) keeps its original size and contents.
+        """
+        assert self._gym_results_log is not None and self._gym_results_cfg is not None
+        logged = dict(result) if isinstance(result, dict) else result
+        capture_dirs = self._resolve_model_call_capture()
+        if isinstance(logged, dict) and (
+            capture_dirs or self._gym_results_cfg["include_model_calls"]
+        ):
+            from nemo_gym.rollout_collection import enrich_run_result
+
+            try:
+                await enrich_run_result(
+                    row,
+                    logged,
+                    capture_dirs=capture_dirs,
+                    observability_enabled=self._gym_observability_enabled,
+                    include_payloads=self._gym_results_cfg["include_payloads"],
+                    delete_capture=self._gym_results_cfg["delete_capture_after_merge"],
+                )
+            except (OSError, ValueError, RuntimeError) as error:
+                # A debug log must not fail the rollout it describes; say why the
+                # line has no merged calls instead.
+                logged["_nrl_enrich_error"] = f"{type(error).__name__}: {error}"
+        self._gym_results_log.append(
+            {
+                "event": "result",
+                **_gym_row_identity(row),
+                "token_capture": self._token_capture_enabled,
+                "logged_at": time.time(),
+                "full_result": logged,
+            }
+        )
+
+    def _log_gym_failure(
+        self, rows: list[dict], error: BaseException, *, stage: str
+    ) -> None:
+        """Append one ``error`` line naming the rollouts a failure may have lost.
+
+        ``stage`` is ``run`` when Gym's ``/run`` raised -- Gym does not say which
+        pending row it was, so every row still pending is named -- and
+        ``postprocess`` when RL could not turn the returned result into a row.
+        """
+        assert self._gym_results_log is not None
+        self._gym_results_log.append(
+            {
+                "event": "error",
+                "stage": stage,
+                "error_type": type(error).__name__,
+                "error": str(error)[:4000],
+                "token_capture": self._token_capture_enabled,
+                "logged_at": time.time(),
+                "rollouts": [_gym_row_identity(row) for row in rows],
+            }
+        )
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict
@@ -1675,6 +1819,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
             shutdown_telemetry()
+            # Same for queued Gym-results lines.
+            log, self._gym_results_log = self._gym_results_log, None
+            if log is not None:
+                log.close()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1806,6 +1954,7 @@ def build_nemo_gym_config(
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    gym_results_log: Optional[dict[str, Any]] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -1854,6 +2003,7 @@ def build_nemo_gym_config(
         use_fastokens=use_fastokens,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        gym_results_log=gym_results_log,
     )
 
 
@@ -1866,6 +2016,7 @@ def _build_gym_actor_config(
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    gym_results_log: Optional[dict[str, Any]] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -1928,6 +2079,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        gym_results_log=gym_results_log,
         **port_range,
         **multimodal_flags,
     )
@@ -2132,6 +2284,7 @@ def build_nemo_gym_actors(
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
+    gym_results_log: Optional[dict[str, Any]] = None,
 ) -> NemoGymShardSet:
     """Create and spin up every NeMo-Gym actor this job needs.
 
@@ -2166,6 +2319,7 @@ def build_nemo_gym_actors(
             use_fastokens=use_fastokens,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            gym_results_log=gym_results_log,
         )
 
     return _build_sharded_gym_actors(
@@ -2180,6 +2334,7 @@ def build_nemo_gym_actors(
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
+        gym_results_log=gym_results_log,
     )
 
 
@@ -2193,6 +2348,7 @@ def _build_single_gym_actor(
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    gym_results_log: Optional[dict[str, Any]] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -2207,6 +2363,7 @@ def _build_single_gym_actor(
         use_fastokens=use_fastokens,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        gym_results_log=gym_results_log,
     )
 
     actor_options: dict[str, Any] = {
@@ -2245,6 +2402,7 @@ def _build_sharded_gym_actors(
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
+    gym_results_log: Optional[dict[str, Any]] = None,
 ) -> NemoGymShardSet:
     instances = _shard_instances(plan)
 
@@ -2327,6 +2485,7 @@ def _build_sharded_gym_actors(
                     use_fastokens=use_fastokens,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
+                    gym_results_log=gym_results_log,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)

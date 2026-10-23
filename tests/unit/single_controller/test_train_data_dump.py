@@ -361,33 +361,3 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
     row = json.loads(text, parse_constant=reject_nonfinite)
     assert row["prev_logprobs"] == [[0.0, None, None, None]]
     assert torch.isneginf(values[0, 1])
-
-
-def test_object_columns_are_decoded_and_written_per_row(tmp_path: Path) -> None:
-    writer = TrainDataDump(str(tmp_path))
-    results = [{"reward": 1.0, "response": {"output": ["ok"]}}, None]
-    writer.add_chunk(
-        step=0,
-        sample_ids=["a", "b"],
-        tags=None,
-        input_lengths=torch.tensor([1, 1]),
-        sequences={"token_ids": torch.tensor([[7], [8]])},
-        scalars={},
-        objects={"gym_full_result": [json.dumps(result) for result in results]},
-    )
-    writer.finish_step(0)
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
-    assert [row["gym_full_result"] for row in rows] == [[results[0]], [None]]
-    with pytest.raises(ValueError, match="column lengths do not match"):
-        writer.add_chunk(
-            step=1,
-            sample_ids=["a", "b"],
-            tags=None,
-            input_lengths=torch.tensor([1, 1]),
-            sequences={"token_ids": torch.tensor([[7], [8]])},
-            scalars={},
-            objects={"gym_full_result": ["null"]},
-        )

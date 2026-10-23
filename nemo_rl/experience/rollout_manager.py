@@ -19,12 +19,11 @@ import copy
 import enum
 import json
 import math
-import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional, TextIO
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray.exceptions
 import torch
@@ -59,8 +58,10 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY,
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     Completion,
     PromptGroupRecord,
@@ -954,23 +955,20 @@ class AsyncNemoGymRolloutImpl:
         # Length-based reward shaping for low-effort prompts; None disables it.
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        dump_gym_results: bool = False,
-        # async_rl.log_gym_results: directory for every Gym result as it lands.
-        gym_results_dir: Optional[str] = None,
+        # Reads the trainer weight version at dispatch time; stamped on each row
+        # for the Gym-results log. None when constructed directly.
+        dispatch_weight_version: Optional[Callable[[], int]] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
         self._num_generations_per_prompt = num_generations_per_prompt
+        self._dispatch_weight_version = dispatch_weight_version
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
         self._log_full_result_tables = log_full_result_tables
-        self._dump_gym_results = dump_gym_results
-        self._gym_results_dir = gym_results_dir
-        # Opened on first write, in the process that runs the rollouts.
-        self._gym_results_file: Optional[TextIO] = None
         self._reward_penalty_config = reward_penalty_config
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._deadline_registry = deadline_registry
@@ -1127,6 +1125,11 @@ class AsyncNemoGymRolloutImpl:
             raise ValueError(
                 "generation_indices must be unique and within the prompt group"
             )
+        weight_version = (
+            self._dispatch_weight_version()
+            if self._dispatch_weight_version is not None
+            else None
+        )
         rows = []
         for i in indices:
             row = copy.deepcopy(template_row)
@@ -1134,11 +1137,19 @@ class AsyncNemoGymRolloutImpl:
             row[NEMO_GYM_GROUP_ID_KEY] = group_id
             row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempt
             row[NEMO_GYM_ROLLOUT_INDEX_KEY] = i
-            if rollout_ids is not None:
-                # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
-                # derives the id from the run body and stamps /ng-rollout/<id>
-                # on every model call, so the TQ sample id IS the capture key.
-                row["_ng_rollout_id"] = rollout_ids[i]
+            # Opaque run-body carrier (Gym's _ng_rollout_id key): the agent
+            # derives the id from the run body and stamps /ng-rollout/<id> on
+            # every model call. Token capture passes its gate ids, so the TQ
+            # sample id IS the capture key; otherwise derive one that is unique
+            # per group attempt, so Gym's model-call capture never falls back to
+            # its "{task}-{rollout}" key, which repeats across steps.
+            row[NEMO_GYM_ROLLOUT_ID_KEY] = (
+                rollout_ids[i]
+                if rollout_ids is not None
+                else f"{group_id}_g{i}_a{group_attempt}"
+            )
+            if weight_version is not None:
+                row[NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY] = weight_version
             rows.append(row)
         return rows
 
@@ -1203,9 +1214,14 @@ class AsyncNemoGymRolloutImpl:
                 result["reward_log_context"] = RewardLogContext(
                     agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
                     full_result_json=json.dumps(
-                        result["full_result"], separators=(",", ":")
+                        {
+                            key: value
+                            for key, value in result["full_result"].items()
+                            if key != "reward"
+                        },
+                        separators=(",", ":"),
                     )
-                    if self._log_full_result_tables or self._dump_gym_results
+                    if self._log_full_result_tables
                     else None,
                 )
             else:
@@ -1213,8 +1229,6 @@ class AsyncNemoGymRolloutImpl:
                     [result], [inputs_by_rowidx[rowidx]], self._effort_config
                 )
             results[rowidx] = result
-            if self._gym_results_dir is not None:
-                self._log_gym_result(inputs_by_rowidx[rowidx], result)
             if on_completion is not None:
                 # Use the same conversion path as completed groups so streamed
                 # recovery records inherit the current mask and reward semantics.
@@ -1226,23 +1240,6 @@ class AsyncNemoGymRolloutImpl:
                 env_timing_metrics = timing_metrics
 
         return env_timing_metrics
-
-    def _log_gym_result(self, row: dict, result: dict) -> None:
-        """Append one Gym result as a JSON line, before any RL filtering sees it."""
-        if self._gym_results_file is None:
-            os.makedirs(self._gym_results_dir, exist_ok=True)
-            path = os.path.join(
-                self._gym_results_dir, f"gym_results.{os.getpid()}.jsonl"
-            )
-            self._gym_results_file = open(path, "a", buffering=1)
-        record = {
-            "group_id": row[NEMO_GYM_GROUP_ID_KEY],
-            "group_attempt": row[NEMO_GYM_GROUP_ATTEMPT_KEY],
-            "rollout_index": row[NEMO_GYM_ROLLOUT_INDEX_KEY],
-            "rollout_id": row.get("_ng_rollout_id"),
-            "full_result": result["full_result"],
-        }
-        self._gym_results_file.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     async def _run_rollouts(
         self,
@@ -1695,8 +1692,6 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
-        dump_gym_results: bool = False,
-        gym_results_dir: Optional[str] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1736,8 +1731,6 @@ class RolloutManager:
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores these.
             mask_env_flagged_samples=mask_env_flagged_samples,
             log_full_result_tables=log_full_result_tables,
-            dump_gym_results=dump_gym_results,
-            gym_results_dir=gym_results_dir,
             reward_penalty_config=reward_penalty_config,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
@@ -1747,6 +1740,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            dispatch_weight_version=lambda: self._weight_version,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt

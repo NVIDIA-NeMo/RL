@@ -17,7 +17,6 @@
 import json
 import math
 import os
-from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -75,14 +74,7 @@ class TrainDataDump:
         input_lengths: torch.Tensor,
         sequences: dict[str, torch.Tensor],
         scalars: dict[str, torch.Tensor],
-        objects: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        """Append one chunk of rows to this shard's part file.
-
-        ``objects`` holds per-row JSON strings (such as a Gym result), decoded
-        here, off the caller's event loop, and written beside the tensor columns.
-        """
-        objects = objects or {}
         lengths = input_lengths.detach().cpu().reshape(-1).tolist()
         # unbind() splits dense and jagged columns alike into per-row tensors.
         columns = {
@@ -92,7 +84,6 @@ class TrainDataDump:
         if (
             len(lengths) != len(sample_ids)
             or any(len(v) != len(sample_ids) for v in columns.values())
-            or any(len(v) != len(sample_ids) for v in objects.values())
             or (tags is not None and len(tags) != len(sample_ids))
         ):
             raise ValueError("Training dump column lengths do not match sample ids")
@@ -119,8 +110,6 @@ class TrainDataDump:
                     row[key] = [columns[key][i][:length].tolist()]
                 for key in scalars:
                     row[key] = [columns[key][i].tolist()]
-                for key, values in objects.items():
-                    row[key] = [json.loads(values[i])]
                 stream.write(
                     json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
                 )

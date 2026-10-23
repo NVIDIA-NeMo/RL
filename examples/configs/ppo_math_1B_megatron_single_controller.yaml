@@ -52,9 +52,14 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
-  # NeMo-Gym runs: append every Gym rollout result, trained on or not, to
-  # gym_results/ in the log dir (debug).
-  log_gym_results: false
+  # NeMo-Gym runs: log every Gym rollout (with each model call it made) and
+  # RL's decision about it to gym_results/ in the log dir (debug).
+  gym_results_log:
+    enabled: false
+    # Needs env.nemo_gym.observability_enabled and model_call_capture_dir.
+    include_model_calls: true
+    include_payloads: true
+    delete_capture_after_merge: true
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

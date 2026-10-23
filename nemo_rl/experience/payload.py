@@ -14,7 +14,6 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-import json
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -31,7 +30,6 @@ from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
     GROUP_ID_TAG,
-    GYM_FULL_RESULT_FIELD,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -102,7 +100,6 @@ def record_to_train_batch(
     *,
     pad_value_dict: Mapping[str, int],
     include_message_violation_fields: bool,
-    include_gym_full_result: bool = False,
 ) -> BatchedDataDict[Any]:
     """Convert one prompt group's record into a packed BatchedDataDict of N rows.
 
@@ -111,9 +108,6 @@ def record_to_train_batch(
         pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
         include_message_violation_fields: Whether to tensorize message violation
             flags for configured advantage penalties.
-        include_gym_full_result: Whether to add each completion's NeMo-Gym
-            result (its ``env_extras``) as the ``GYM_FULL_RESULT_FIELD`` JSON
-            object column, for the training-data dump.
 
     Returns:
         BatchedDataDict with input IDs and lengths, generation log probabilities,
@@ -189,11 +183,6 @@ def record_to_train_batch(
     if include_message_violation_fields:
         train_data[INVALID_TOOL_CALL_MASK] = flat[INVALID_TOOL_CALL_MASK]
         train_data[MALFORMED_THINKING_MASK] = flat[MALFORMED_THINKING_MASK]
-    if include_gym_full_result:
-        train_data[GYM_FULL_RESULT_FIELD] = np.array(
-            [json.dumps(c.env_extras, separators=(",", ":")) for c in completions],
-            dtype=object,
-        )
     train_data.update(flat.get_multimodal_dict(as_tensors=False))
     return BatchedDataDict[Any](train_data)
 

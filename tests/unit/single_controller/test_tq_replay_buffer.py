@@ -57,10 +57,8 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
-    include_gym_full_result: bool,
 ) -> BatchedDataDict[Any]:
     del record, pad_value_dict, include_message_violation_fields
-    del include_gym_full_result
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
@@ -2010,3 +2008,49 @@ class TestTQReplayBufferEvictedCommit:
         # The written rows were un-written.
         assert dp.depth() == 0
         assert len(dp.clear_calls) == 1
+
+
+def test_outcome_log_maps_tq_groups_to_gym_groups_and_records_evictions(tmp_path):
+    import json
+    from pathlib import Path
+
+    from nemo_rl.experience.interfaces import (
+        NEMO_GYM_GROUP_ATTEMPT_KEY,
+        NEMO_GYM_GROUP_ID_KEY,
+    )
+    from nemo_rl.utils.gym_results_log import RL_OUTCOMES_PREFIX, JsonlAppender
+
+    log = JsonlAppender(str(tmp_path), RL_OUTCOMES_PREFIX)
+    buf = TQReplayBuffer(
+        FakeDataPlaneClient(),
+        partition_id="rollout_data",
+        pad_value_dict={"token_ids": 0},
+        include_message_violation_fields=False,
+        outcome_log=log,
+    )
+    buf.set_data_plane_checkpoint_barrier(DataPlaneCheckpointBarrier())
+    record = PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info={
+            NEMO_GYM_GROUP_ID_KEY: "gym-group",
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+        },
+        metadata={},
+        completions=[],
+        rollout_metrics={},
+    )
+    group_id = buf.reserve(weight_version=3)
+
+    _run(buf.commit(group_id, record, start_weight_version=3, end_weight_version=4))
+    _run(buf.remove([0], remove_in_dp=True))
+    log.flush()
+
+    buffered, evicted = [
+        json.loads(line) for line in Path(log.path).read_text().splitlines()
+    ]
+    assert (buffered["outcome"], buffered["group_id"]) == ("buffered", group_id)
+    assert (buffered["gym_group_id"], buffered["gym_group_attempt"]) == ("gym-group", 2)
+    assert (evicted["outcome"], evicted["group_id"]) == ("evicted", group_id)
+    assert evicted["weight_version"] == 3
+    log.close()

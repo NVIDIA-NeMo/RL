@@ -51,7 +51,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG, GYM_FULL_RESULT_FIELD
+from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -100,23 +100,6 @@ class TestInputFields:
         assert adv.values_field in fields
         assert adv.invalid_tool_call_mask_field in fields
         assert adv.malformed_thinking_mask_field in fields
-
-    def test_gym_result_column_is_fetched_only_for_a_gym_dump(self) -> None:
-        assert GYM_FULL_RESULT_FIELD not in _config().input_fields()
-        # Without the dump there is nothing to write it to.
-        assert GYM_FULL_RESULT_FIELD not in (
-            _config(dump_object_fields=(GYM_FULL_RESULT_FIELD,)).input_fields()
-        )
-        assert GYM_FULL_RESULT_FIELD not in (
-            _config(train_data_dump_dir="/tmp/dump").input_fields()
-        )
-        assert (
-            GYM_FULL_RESULT_FIELD
-            in _config(
-                train_data_dump_dir="/tmp/dump",
-                dump_object_fields=(GYM_FULL_RESULT_FIELD,),
-            ).input_fields()
-        )
 
     def test_repeated_batch_fields_do_not_duplicate_the_reward_column(self) -> None:
         adv = AdvantageConfig(repeated_batch_fields=["total_reward"])
@@ -607,6 +590,7 @@ def _controller(
     *,
     fail: bool = False,
     dump_dir: str | None = None,
+    outcome_dir: str | None = None,
     opd_full_enabled: bool = False,
     seq_logprob_error_threshold: float | None = None,
 ):
@@ -641,6 +625,7 @@ def _controller(
         message_level_advantage_penalties_enabled=False,
         shardable=estimator_name in SHARD_INVARIANT_ESTIMATORS,
         train_data_dump_dir=dump_dir,
+        outcome_log_dir=outcome_dir,
     )
     ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
     ctrl._advantage_estimator = estimator
@@ -804,6 +789,29 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     # The serialization is timed wherever it ran, and reported back as a
     # number so the controller's metric survives the move onto the pool.
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
+
+
+def test_every_trained_row_gets_an_outcome_line(tmp_path: Path) -> None:
+    """The stage records each row it trains or masks, labeled like the dump."""
+    store = _RowStore(_rows())
+    store.rows["s1"]["sample_mask"] = torch.tensor(0.0)
+    ctrl = _controller("grpo", 0, store, outcome_dir=str(tmp_path))
+    ctrl._train_steps = 4
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    ctrl._advantage_computer._outcome_log.flush()
+
+    [log_file] = tmp_path.glob("rl_outcomes.*.jsonl")
+    lines = {
+        line["sample_id"]: line
+        for line in map(json.loads, log_file.read_text().splitlines())
+    }
+    total = NUM_GROUPS * GROUP_SIZE
+    assert sorted(lines) == sorted(f"s{i}" for i in range(total))
+    assert {line["train_step"] for line in lines.values()} == {5}
+    assert lines["s1"]["outcome"] == "masked"
+    assert lines["s0"]["outcome"] == "trained"
+    assert lines["s0"]["group_id"] == "group-0"
+    assert lines["s0"]["final_reward"] == float(store.rows["s0"]["total_reward"])
 
 
 def test_unshardable_estimator_sends_the_whole_batch_to_one_actor() -> None:
