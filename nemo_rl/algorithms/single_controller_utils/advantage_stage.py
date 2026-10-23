@@ -101,6 +101,7 @@ class AdvantageStageConfig:
     policy_logprobs_required: bool
     reference_logprobs_required: bool
     teacher_logprobs_required: bool
+    opd_full_enabled: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
     # Where the per-step training dump writes, or None when it is disabled.
@@ -146,6 +147,7 @@ class AdvantageStageConfig:
             policy_logprobs_required=policy_logprobs,
             reference_logprobs_required=reference_logprobs,
             teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
+            opd_full_enabled=opd_module.get_opd_full_config(master_config) is not None,
             message_level_advantage_penalties_enabled=(
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
@@ -381,7 +383,19 @@ class AdvantageComputer:
         ).bool()
 
         num_mask_sample_filtered = int(mask_sample.sum().item())
-        final_sample_mask = sample_mask * (~mask_sample).to(sample_mask.dtype)
+        has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
+        # A context-only segment has no physical loss row, but its empty mask
+        # must not invalidate an owner whose other segments have training tokens.
+        owner_sample_mask = sample_mask
+        if logical:
+            owner_rows = sample_mask.new_tensor(
+                [not tag.get("is_execution_padding", True) for tag in meta.tags],
+                dtype=torch.bool,
+            )
+            owner_sample_mask = torch.where(
+                owner_rows & ~has_response_tokens, 1.0, sample_mask
+            )
+        final_sample_mask = owner_sample_mask * (~mask_sample).to(sample_mask.dtype)
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
@@ -411,6 +425,7 @@ class AdvantageComputer:
             # Environment and overlong filtering apply to the whole owner.
             final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
 
+        final_sample_mask = final_sample_mask * has_response_tokens
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
         seq_error_metrics: Optional[dict[str, float]] = None
@@ -418,6 +433,11 @@ class AdvantageComputer:
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
         if cfg.policy_logprobs_required:
+            # Full KL compares unfiltered policy with possibly filtered rollout
+            # logprobs. Their normalization gap remains diagnostic.
+            seq_logprob_error_threshold = (
+                None if cfg.opd_full_enabled else cfg.algo.seq_logprob_error_threshold
+            )
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
@@ -440,7 +460,7 @@ class AdvantageComputer:
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
-                seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
                 filtering_on=cfg.filtering_on,
                 row_owner=owner_batch.row_owner if owner_batch is not None else None,
             )
@@ -457,9 +477,15 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
         if owner_batch is not None:
+            owned_rows = owner_batch.row_owner >= 0
             owner_batch = replace(
                 owner_batch,
-                valid_mask=final_sample_mask[owner_batch.representative_rows],
+                valid_mask=torch.zeros_like(owner_batch.valid_mask).scatter_reduce_(
+                    0,
+                    owner_batch.row_owner[owned_rows],
+                    final_sample_mask[owned_rows],
+                    reduce="amax",
+                ),
             )
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
@@ -517,9 +543,9 @@ class AdvantageComputer:
             assert isinstance(cfg.algo, GRPOConfig)
             owner_advantages = _clip_grpo_advantages(owner_advantages, cfg.algo)
             owner_advantages = owner_advantages * owner_batch.valid_mask.unsqueeze(-1)
-            advantages = (
-                owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(-1).expand_as(mask)
-            )
+            advantages = owner_batch.fanout(owner_advantages[:, 0]).unsqueeze(
+                -1
+            ).expand_as(mask) * final_sample_mask.unsqueeze(-1)
         elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
@@ -565,7 +591,8 @@ class AdvantageComputer:
             owner_batch.representative_rows if owner_batch is not None else slice(None)
         )
         reward_partial = RewardPartial.from_rows(
-            rewards[metric_rows], final_sample_mask[metric_rows]
+            rewards[metric_rows],
+            owner_batch.valid_mask if owner_batch is not None else final_sample_mask,
         )
         opd_stat_sum = 0.0
         opd_stat_sumsq = 0.0

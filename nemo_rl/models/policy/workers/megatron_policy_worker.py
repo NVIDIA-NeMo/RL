@@ -161,6 +161,7 @@ from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.tensor_ops import pad_and_concat
 from nemo_rl.utils.timer import Timer
@@ -362,7 +363,7 @@ class _RefitSource:
     """Live parameter and its HF selector, before any precision conversion."""
 
     tensor: torch.Tensor
-    hf_view: LocalHFParamSpec
+    hf_spec: LocalHFParamSpec
 
 
 def _dequantize_refit_source_group(
@@ -497,6 +498,76 @@ def _get_refit_task_source(task: Any) -> Optional[torch.Tensor]:
     if original is not None and _is_quantized_refit_source(original):
         return original
     return source
+
+
+class MegatronReshardParamSpecCollection:
+    """Factories for Megatron's canonical HF refit source specifications."""
+
+    @staticmethod
+    def _default_param_spec(
+        tensor: torch.Tensor, hf_spec: LocalHFParamSpec
+    ) -> LocalParamSpec:
+        """Convert the current full parameter to logical weights before HF slicing."""
+
+        def pre(base: _RefitSource) -> RefitCtx:
+            logical = _dequantize_refit_source(base.tensor)
+            # Select this HF projection's local shard, splitting fused gate/up if needed.
+            return RefitCtx(buf=base.hf_spec.select(logical).contiguous())
+
+        wire_dtype = (
+            torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
+        )
+        return LocalParamSpec(
+            base=_RefitSource(tensor, hf_spec), pre=pre, wire_dtype=wire_dtype
+        )
+
+    @staticmethod
+    def _grouped_expert_spec(
+        proj: str,
+        grouped_name: str,
+        expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
+    ) -> LocalParamSpec:
+        """Prepare this rank's experts as ``[E_local, *hf_shard_shape]``.
+
+        ``pre`` decodes ``[E_local, *source_shard_shape]`` before selecting the
+        HF projection, including the gate/up split. Transfer metadata describes
+        ``[E_global, *hf_global_shape]`` so NCCL can reshard these local buffers.
+        """
+        prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
+        expert_specs = expert_groups.get((prefix, proj))
+        assert expert_specs, (
+            f"no local experts for {grouped_name!r} (proj={proj!r}); "
+            "PP-filter / expert-group-metadata inconsistency"
+        )
+        members = tuple(expert_specs)
+        wire_dtype = members[0].wire_dtype
+        sources = tuple(member.base for member in members)
+        shape = sources[0].tensor.shape
+
+        def grouped_spec(source: _RefitSource) -> LocalHFParamSpec:
+            spec = source.hf_spec
+            # Preserve the source axis when prepending the expert dimension,
+            # including mappings that describe the split with a positive axis.
+            if spec.split_dim is not None:
+                spec = replace(spec, split_dim=spec.split_dim % len(shape) + 1)
+            return replace(spec, name=grouped_name)
+
+        hf_spec = grouped_spec(sources[0])
+        if any(
+            source.tensor.shape != shape or grouped_spec(source) != hf_spec
+            for source in sources
+        ):
+            raise ValueError(
+                f"Grouped refit source {grouped_name!r} has incompatible HF views."
+            )
+
+        def pre(base: tuple[_RefitSource, ...]) -> RefitCtx:
+            logical = _dequantize_refit_source_group(
+                tuple(source.tensor for source in base)
+            )
+            return RefitCtx(buf=hf_spec.select(logical).contiguous())
+
+        return LocalParamSpec(base=sources, pre=pre, wire_dtype=wire_dtype)
 
 
 def _collect_mtp_hf_layer_names(conversion_tasks: Optional[list]) -> set[str]:
@@ -790,6 +861,9 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        maybe_enable_msc(weights_path, optimizer_path)
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -2596,9 +2670,13 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
+        sampling_params = self.sampling_params
+        if self._opd_full_enabled and sampling_params is not None:
+            # Full KL has no sampled-target support restriction; leave rollout unchanged.
+            sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
             use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
@@ -2618,7 +2696,7 @@ class MegatronPolicyWorkerImpl(
                 post_processing_fn=logprobs_post_processor,
                 forward_only=True,
                 defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
                 model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
                 use_fused_linear_logprobs=use_fused_linear_logprobs,
@@ -3612,6 +3690,7 @@ class MegatronPolicyWorkerImpl(
         # when pre-quantized refit is enabled for the parameter.
         for name, tensor in base_iter:
             yield from self._maybe_prequantize_param(name, tensor)
+            del tensor
 
         if include_draft and self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -3656,23 +3735,6 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _default_param_spec(
-        self, tensor: torch.Tensor, hf_spec: LocalHFParamSpec
-    ) -> LocalParamSpec:
-        """Convert the current full parameter to logical weights before HF slicing."""
-
-        def pre(base: _RefitSource) -> RefitCtx:
-            logical = _dequantize_refit_source(base.tensor)
-            # Select this HF projection's local shard, splitting fused gate/up if needed.
-            return RefitCtx(buf=base.hf_view.select(logical).contiguous())
-
-        wire_dtype = (
-            torch.bfloat16 if _is_quantized_refit_source(tensor) else tensor.dtype
-        )
-        return LocalParamSpec(
-            base=_RefitSource(tensor, hf_spec), pre=pre, wire_dtype=wire_dtype
-        )
-
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, LocalParamSpec]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
@@ -3698,7 +3760,9 @@ class MegatronPolicyWorkerImpl(
                 if is_nccl_reshard_param(hf_spec.name):
                     yield (
                         hf_spec.name,
-                        self._default_param_spec(local_tensor, hf_spec),
+                        MegatronReshardParamSpecCollection._default_param_spec(
+                            local_tensor, hf_spec
+                        ),
                     )
 
     # ------------------------------------------------------------------
@@ -3893,6 +3957,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication.
 
@@ -3913,6 +3978,7 @@ class MegatronPolicyWorkerImpl(
                 kv_scales=kv_scales,
                 buffer_size_bytes=buffer_size_bytes,
                 num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
             )
         if guard.fired:
             # The aborted collective returned cleanly, so this is the only signal there is.
@@ -3927,6 +3993,7 @@ class MegatronPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
@@ -3936,6 +4003,7 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
 
     def _build_layer_to_pp_stage(
@@ -4223,8 +4291,9 @@ class MegatronPolicyWorkerImpl(
         ``pre`` hook at each refit.
 
         Megatron exposes each expert's projection as a separate param; this bins
-        them so ``_group_experts`` can stack a layer's experts into one grouped
-        HF tensor per projection.  Called from ``build_hf_to_local_param_map``
+        them so ``MegatronReshardParamSpecCollection._grouped_expert_spec`` can
+        stack a layer's experts into one grouped HF tensor per projection.
+        Called from ``build_hf_to_local_param_map``
         with this rank's local ``param_map``.
 
         ``_INDIVIDUAL_EXPERT_RE`` captures three fields from a name like
@@ -4263,54 +4332,6 @@ class MegatronPolicyWorkerImpl(
             for key, idx_names in index_groups.items()
         }
 
-    def _group_experts(
-        self,
-        proj: str,
-        grouped_name: str,
-        expert_groups: dict[tuple[str, str], list[LocalParamSpec]],
-    ) -> LocalParamSpec:
-        """Prepare this rank's experts as ``[E_local, *hf_shard_shape]``.
-
-        ``pre`` decodes ``[E_local, *source_shard_shape]`` before selecting the
-        HF projection, including the gate/up split. Transfer metadata describes
-        ``[E_global, *hf_global_shape]`` so NCCL can reshard these local buffers.
-        """
-        prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
-        expert_specs = expert_groups.get((prefix, proj))
-        assert expert_specs, (
-            f"no local experts for {grouped_name!r} (proj={proj!r}); "
-            "PP-filter / expert-group-metadata inconsistency"
-        )
-        members = tuple(expert_specs)
-        wire_dtype = members[0].wire_dtype
-        sources = tuple(member.base for member in members)
-        shape = sources[0].tensor.shape
-
-        def grouped_view(source: _RefitSource) -> LocalHFParamSpec:
-            view = source.hf_view
-            # Preserve the source axis when prepending the expert dimension,
-            # including mappings that describe the split with a positive axis.
-            if view.split_dim is not None:
-                view = replace(view, split_dim=view.split_dim % len(shape) + 1)
-            return replace(view, name=grouped_name)
-
-        hf_view = grouped_view(sources[0])
-        if any(
-            source.tensor.shape != shape or grouped_view(source) != hf_view
-            for source in sources
-        ):
-            raise ValueError(
-                f"Grouped refit source {grouped_name!r} has incompatible HF views."
-            )
-
-        def pre(base: tuple[_RefitSource, ...]) -> RefitCtx:
-            logical = _dequantize_refit_source_group(
-                tuple(source.tensor for source in base)
-            )
-            return RefitCtx(buf=hf_view.select(logical).contiguous())
-
-        return LocalParamSpec(base=sources, pre=pre, wire_dtype=wire_dtype)
-
     def _build_source_hf_to_local_param_map(
         self, refit_info: dict[str, Any]
     ) -> HFToLocalParamMap:
@@ -4337,7 +4358,7 @@ class MegatronPolicyWorkerImpl(
                     continue
                 name = p["name"]
                 if p.get("grouped_expert_proj"):
-                    spec = self._group_experts(
+                    spec = MegatronReshardParamSpecCollection._grouped_expert_spec(
                         p["grouped_expert_proj"], name, expert_groups
                     )
                 else:
@@ -5037,6 +5058,8 @@ class MegatronPolicyWorkerImpl(
             raise RuntimeError(
                 "Megatron core state or model is not initialized. Cannot save checkpoint."
             )
+
+        maybe_enable_msc(weights_path)
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
         is_async = self.mcore_state.cfg.checkpoint.async_save

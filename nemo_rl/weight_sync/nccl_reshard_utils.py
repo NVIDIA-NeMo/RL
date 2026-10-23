@@ -778,36 +778,6 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                     "fp8_cfg.fp8_recipe must be 'mxfp8' or 'blockwise' when FP8 is enabled."
                 )
 
-            # MXFP8 inference quantizes through resolve_mxfp8_backend, which
-            # only accepts the 'torch' and 'flashinfer' grouped-GEMM backends.
-            # MCore does reject this pairing at model build, but only against its
-            # own field names; validating here fails at config time and names the
-            # NeMo-RL key the user actually sets.
-            #
-            # An omitted key is NOT safe: MCore's TransformerConfig default is
-            # "vllm", which resolve_mxfp8_backend rejects. Resolve the default
-            # here so the omitted case fails at config time like the explicit one.
-            gemm_backend = mcore_generation_cfg.get(
-                "inference_grouped_gemm_backend", "vllm"
-            )
-            if (
-                gen_fp8_cfg.get("enabled")
-                and gen_fp8_cfg.get("fp8_recipe") == "mxfp8"
-                and mcore_generation_cfg.get("transformer_impl")
-                == "inference_optimized"
-                and gemm_backend
-                not in (
-                    "torch",
-                    "flashinfer",
-                )
-            ):
-                violations.append(
-                    "MXFP8 Megatron generation requires policy.generation."
-                    "mcore_generation_config.inference_grouped_gemm_backend to be "
-                    f"'torch' or 'flashinfer' (got {gemm_backend!r}; MCore's "
-                    "default is 'vllm', so this key must be set explicitly)."
-                )
-
             if (
                 gen_fp8_cfg.get("enabled")
                 and gen_fp8_cfg.get("fp8_recipe") == "blockwise"
@@ -1045,8 +1015,8 @@ def build_nccl_reshard_refit_info(
 
         # Propagate the grouped-expert projection tag (gate_proj/up_proj/
         # down_proj) so the train side stacks the matching per-expert tensors
-        # (_group_experts) and the gen backend maps the grouped HF param into
-        # its own fused layout (w13/w2).
+        # (MegatronReshardParamSpecCollection._grouped_expert_spec) and the gen
+        # backend maps the grouped HF param into its own fused layout (w13/w2).
         if "grouped_expert_proj" in meta:
             info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 

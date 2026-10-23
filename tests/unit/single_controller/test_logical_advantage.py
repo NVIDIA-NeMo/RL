@@ -172,6 +172,7 @@ def _controller(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=False,
         teacher_logprobs_required=False,
+        opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
         train_data_dump_dir=None,
@@ -278,6 +279,35 @@ def test_logprob_filtering_pools_owned_tokens_independently_of_segmentation(
         # Diagnostics retain the short segment's error even though its owner passes.
         assert metrics["max_seq_mult_prob_error_after_mask"] == pytest.approx(1.2)
     assert ctrl._step_log_dict["reward_partials"][0].weight == 2
+
+
+@pytest.mark.parametrize("empty_rows", [[0], [1], [0, 1]])
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_tokenless_segments_do_not_remove_an_owner_with_training_tokens(
+    empty_rows: list[int], policy_logprobs_required: bool
+) -> None:
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1), (3.0, 1)])], padding=True)
+    data["token_mask"][empty_rows] = 0
+    data["prev_logprobs"] = torch.zeros(5, 3)
+    data["generation_logprobs"] = torch.zeros(5, 3)
+    ctrl = _controller(meta, data, policy_logprobs_required=policy_logprobs_required)
+    keep_owner_zero = len(empty_rows) < 2
+    baseline = 4 / 3 if keep_owner_zero else 2.0
+    for _ in range(2):
+        # Reusing already filtered physical rows must preserve logical validity.
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        for row, tag in enumerate(meta.tags):
+            slot = tag["logical_slot"]
+            keep = slot is not None and row not in empty_rows
+            assert data["sample_mask"][row].item() == float(keep)
+            expected = ([0.0, 1.0, 3.0][slot] - baseline) if keep else 0.0
+            torch.testing.assert_close(
+                data["advantages"][row], torch.full((3,), expected)
+            )
+        assert ctrl._step_log_dict["reward_partials"][-1].weight == (
+            3 if keep_owner_zero else 2
+        )
 
 
 @pytest.mark.parametrize("bounds", [(-0.2, 0.3), (0.2, 0.4), (-0.4, -0.2)])

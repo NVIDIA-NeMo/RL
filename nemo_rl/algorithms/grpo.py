@@ -83,7 +83,11 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -186,6 +190,12 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -234,7 +244,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         return None
 
     replay_buffer_path = os.path.join(checkpoint_path, "replay_buffer.pt")
-    if not os.path.exists(replay_buffer_path):
+    if not path_exists(replay_buffer_path):
         print(
             f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
             "Starting with an empty replay buffer."
@@ -434,6 +444,9 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
+    # off and on checkpoints that predate it.
+    cur_adaptive_ppo_clip_k: Optional[float] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -447,6 +460,7 @@ def _initial_grpo_save_state() -> GRPOSaveState:
         trainer_version=None,
         sampler_name=None,
         sampler_dispatch_index=None,
+        cur_adaptive_ppo_clip_k=None,
     )
 
 
@@ -463,6 +477,54 @@ def _get_grpo_save_state(
         {key: value for key, value in loaded_state.items() if key in known_fields}
     )
     return GRPOSaveState(**state_values)
+
+
+def _restore_adaptive_loss_state(
+    loss_fn: ClippedPGLossFn,
+    grpo_save_state: GRPOSaveState,
+) -> None:
+    """Restore adaptive-ppo-clip's k; checkpoints without it start from k=0."""
+    if grpo_save_state.cur_adaptive_ppo_clip_k is not None:
+        loss_fn.set_adaptive_ppo_clip_k(grpo_save_state.cur_adaptive_ppo_clip_k)
+
+
+def _update_adaptive_loss_state(
+    loss_fn: LossFunction,
+    metrics: dict[str, Any],
+) -> None:
+    """Advance the adaptive loss controller from a step's aggregated metrics.
+
+    Call once per completed training step, after the per-microbatch metrics
+    are reduced, so the controller sees the step's global entropy. Logs the
+    k this step trained with; the updated k is used by the next step.
+    """
+    if (
+        not isinstance(loss_fn, ClippedPGLossFn)
+        or not loss_fn.has_adaptive_loss_state()
+    ):
+        return
+
+    # metrics_level="full" always emits approx_entropy, so a missing key means a
+    # broken metrics path. Raise instead of silently freezing k for the run.
+    if "approx_entropy" not in metrics:
+        raise KeyError(
+            "adaptive-ppo-clip needs the step's approx_entropy, but the "
+            "aggregated training metrics do not contain it"
+        )
+    metrics["cur_adaptive_ppo_clip_k"] = loss_fn.cur_adaptive_ppo_clip_k
+    loss_fn.update_adaptive_loss_state(float(metrics["approx_entropy"]))
+
+
+def _save_adaptive_loss_state(
+    grpo_save_state: GRPOSaveState,
+    loss_fn: LossFunction,
+) -> None:
+    """Copy adaptive-ppo-clip's k into the save state; None when it is off."""
+    grpo_save_state.cur_adaptive_ppo_clip_k = (
+        loss_fn.cur_adaptive_ppo_clip_k
+        if isinstance(loss_fn, ClippedPGLossFn)
+        else None
+    )
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -895,6 +957,7 @@ def setup(
         use_fused_linear_logprobs=use_fused_linear_logprobs,
         seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
+    _restore_adaptive_loss_state(loss_fn, grpo_save_state)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -2681,12 +2744,12 @@ def _write_latest_checkpoint_status(
         str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
     )
     status: dict[str, Any] = {}
-    if os.path.exists(status_path):
-        with open(status_path) as f:
+    if path_exists(status_path):
+        with open_path(status_path) as f:
             status = json.load(f)
     status["last_successful_ckpt_save_completion"] = time.time()
     status["last_checkpoint_step"] = last_checkpoint_step
-    with open(status_path, "w") as f:
+    with open_path(status_path, "w") as f:
         json.dump(status, f)
 
 
@@ -3011,11 +3074,12 @@ def compute_and_apply_seq_logprob_error_masking(
 
     Args:
         train_data: Training data dict containing token_mask, sample_mask,
-                   prev_logprobs, and generation_logprobs. If masking is applied,
-                   sample_mask will be updated in-place.
+                   prev_logprobs, and generation_logprobs. Tokenless rows and
+                   sequences above the threshold are excluded from sample_mask.
         rewards: Reward tensor for computing statistics on masked sequences.
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
-                                    exceeding this threshold. If None, only compute metrics.
+                                    exceeding this threshold. None disables threshold
+                                    filtering, but token/sample validity still applies.
         filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
         row_owner: Optional logical owner index per row (-1 for padding). When
             supplied, threshold the token-weighted error across each owner's
@@ -3026,6 +3090,12 @@ def compute_and_apply_seq_logprob_error_masking(
         min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
         num_masked_seqs, masked_correct_pct
     """
+    # Rows without response loss tokens must not contribute to
+    # sequence-normalized losses or valid-sample counts.
+    train_data["sample_mask"] = train_data["sample_mask"] * train_data["token_mask"][
+        :, 1:
+    ].bool().any(dim=-1)
+
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
     sample_mask = train_data["sample_mask"]
@@ -4109,6 +4179,7 @@ def _grpo_train_impl(
                         print(f"Skipping aggregation for {k} ({type(v)})")
                 finalize_draft_ratio_metrics(metrics)
 
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -4151,6 +4222,7 @@ def _grpo_train_impl(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -4215,17 +4287,14 @@ def _grpo_train_impl(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            torch.save(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         # Finalize in the background. The directory rename is
                         # deferred until any async write completes (via wait_fn);
@@ -5005,9 +5074,9 @@ def async_grpo_train(
         )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
-        if os.path.exists(rollouts_path):
+        if path_exists(rollouts_path):
             # weights_only=False: this is a trusted same-job checkpoint artifact.
-            rollouts_state = torch.load(rollouts_path, weights_only=False)
+            rollouts_state = load_checkpoint_object(rollouts_path, weights_only=False)
 
     next_nemo_gym_task_index = max(
         int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
@@ -6027,6 +6096,7 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 finalize_draft_ratio_metrics(metrics)
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -6052,6 +6122,7 @@ def async_grpo_train(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -6121,9 +6192,8 @@ def async_grpo_train(
                         )
                         dataloader_snapshot = collector_checkpoint["dataloader"]
                         rollouts_state = collector_checkpoint["rollouts"]
-                        torch.save(
-                            dataloader_snapshot["dataloader_state"],
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            dataloader_snapshot["dataloader_state"], checkpoint_path
                         )
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
@@ -6149,7 +6219,7 @@ def async_grpo_train(
                             rollouts_state[TRAINED_TASK_INDICES_KEY] = sorted(
                                 recent_trained_task_indices
                             )
-                        torch.save(
+                        save_checkpoint_object(
                             rollouts_state,
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )
