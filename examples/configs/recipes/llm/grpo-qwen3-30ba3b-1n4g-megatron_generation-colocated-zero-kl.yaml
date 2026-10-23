@@ -1,0 +1,30 @@
+defaults: ./grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml
+
+# Requires MCore's graph-safe positional embedding cache (Megatron-LM #8358).
+grpo:
+  max_num_steps: 20
+  val_period: 100000
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl
+
+policy:
+  offload_optimizer_for_refit: false
+  generation:
+    colocated:
+      enabled: true
+
+cluster:
+  num_nodes: 1
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl

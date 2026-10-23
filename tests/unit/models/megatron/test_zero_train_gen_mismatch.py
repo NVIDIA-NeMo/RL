@@ -298,13 +298,6 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_colocated_generation():
-    config = _policy_config()
-    config["generation"]["colocated"] = {"enabled": True}
-    result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
-
-
 def test_validate_rejects_missing_generation_block():
     config = _policy_config()
     del config["generation"]
