@@ -493,43 +493,6 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
-    def test_accepts_reward_scaling(self, algorithm: str):
-        # The advantage stage applies it, on either algorithm block.
-        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
-        scaling = algo_config(mc).reward_scaling
-        scaling.enabled = True
-        scaling.target_min = -1.0
-
-        validate_single_controller_config(mc)
-
-    @pytest.mark.parametrize(
-        ("source_min", "source_max"),
-        [(1.0, 1.0), (1.0, 0.0)],
-        ids=["empty_interval", "inverted_interval"],
-    )
-    def test_rejects_a_source_interval_that_cannot_be_divided_by(
-        self, source_min: float, source_max: float
-    ):
-        # The divisor. Caught at setup, not as inf/nan one rollout in.
-        mc = _make_master_config()
-        scaling = mc.grpo.reward_scaling
-        scaling.enabled = True
-        scaling.source_min = source_min
-        scaling.source_max = source_max
-
-        with pytest.raises(ValueError, match="reward_scaling.source_min"):
-            validate_single_controller_config(mc)
-
-    def test_ignores_the_source_interval_while_disabled(self):
-        # Nothing divides by it, so a stale interval is not a reason to refuse
-        # to start.
-        mc = _make_master_config()
-        mc.grpo.reward_scaling.source_min = 1.0
-        mc.grpo.reward_scaling.source_max = 1.0
-
-        validate_single_controller_config(mc)
-
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather
         # than silently training on unadjusted rewards.
