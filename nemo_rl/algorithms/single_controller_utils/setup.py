@@ -54,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
+    _restore_adaptive_loss_state,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -145,6 +146,7 @@ from nemo_rl.utils.checkpoint import (
     validate_warm_start_checkpoint,
 )
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.path_utils import is_msc_path
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -1152,8 +1154,15 @@ def setup_single_controller(
         sampler_supports_replay_recovery = sampler_supports_buffer_checkpoint(
             master_config.async_rl.sampler
         )
-        if sampler_supports_replay_recovery and not master_config.checkpointing.get(
-            "save_data_plane"
+        # msc:// checkpoints cannot hold data-plane snapshots, so the replay-capable
+        # sampler falls back to the same cursor-only recovery as the others.
+        checkpoint_dir_is_msc = is_msc_path(
+            master_config.checkpointing["checkpoint_dir"]
+        )
+        if (
+            sampler_supports_replay_recovery
+            and not master_config.checkpointing.get("save_data_plane")
+            and not checkpoint_dir_is_msc
         ):
             error_message = (
                 "SingleController checkpointing with a replay-checkpoint-capable "
@@ -1168,11 +1177,12 @@ def setup_single_controller(
                     "checkpointing.enabled=false."
                 )
             raise ValueError(error_message)
-        if not sampler_supports_replay_recovery:
+        if not sampler_supports_replay_recovery or checkpoint_dir_is_msc:
+            reason = " with an msc:// checkpoint_dir" if checkpoint_dir_is_msc else ""
             warnings.warn(
                 f"Sampler {master_config.async_rl.sampler.name!r} cannot recover "
-                "completed buffered rollouts. On resume, the dataloader cursor "
-                "is restored while buffered prompt groups are discarded.",
+                f"completed buffered rollouts{reason}. On resume, the dataloader "
+                "cursor is restored while buffered prompt groups are discarded.",
                 UserWarning,
                 stacklevel=2,
             )
@@ -2101,10 +2111,11 @@ def setup_single_controller(
     # Setup Algorithm + Rollout Wiring
     # ==========================
     advantage_estimator = _build_advantage_estimator(master_config)
-    loss_fn: LossFunction = ClippedPGLossFn(
+    loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
     )
+    _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (
         MseValueLossFn(master_config.value_loss_fn)  # type: ignore
         if is_ppo_run(master_config)

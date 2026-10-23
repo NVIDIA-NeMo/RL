@@ -32,6 +32,7 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -64,9 +65,9 @@ class Value(ValueInterface):
             optimizer_path: Path to load optimizer state from
         """
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls: str
         tp_size = 1

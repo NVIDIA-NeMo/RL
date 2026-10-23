@@ -152,6 +152,7 @@ class DynamoRefitChannel:
             nccl_peer="vllm",
             buffer_size_bytes=VLLM_PACKED_BUFFER_SIZE_BYTES,
             num_buffers=VLLM_PACKED_NUM_BUFFERS,
+            use_legacy_packing=True,
         )
 
     def prepare(self, state_dict_info: dict[str, Any] | None) -> None:

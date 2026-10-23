@@ -70,6 +70,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -148,9 +149,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             get_actor_python_env(extension_fqn)
 
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls_fqn: str
         tp_size = 1
@@ -1420,6 +1421,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1428,6 +1430,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             refit_timeout_s=refit_timeout_s,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures

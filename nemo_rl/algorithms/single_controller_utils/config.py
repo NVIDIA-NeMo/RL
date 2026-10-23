@@ -41,6 +41,10 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     RewardPenaltyConfig,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
@@ -318,8 +322,9 @@ class FleetHealthConfig(BaseModel, extra="allow"):
     # with RefitAborted -- still far better than hanging forever inside NCCL, but choose
     # the deadline knowing there is no second chance.
     #
-    # None disarms it: no watchdog thread is started and the refit path is byte-identical
-    # to before. Set it well above a healthy refit, because the cost of firing early is
+    # None disables the collective watchdog and controller's transfer deadline.
+    # Generation pause/resume still have a 360s timeout. Set this well above a healthy
+    # refit, because the cost of firing early is
     # aborting a run that was merely slow, while the cost of firing late is only that a
     # wedge lasts longer before it is broken.
     #
@@ -493,7 +498,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
         default_factory=GenerationRouterConfig
     )
     # Recompute generation KV caches after each weight update.
-    recompute_kv_cache_after_weight_updates: bool = False
+    recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -969,6 +974,18 @@ def _validate_opd_full_config(
             "reconstructed from its hidden states would not, silently optimizing a "
             "mismatched objective. Use teacher_payload='logits', where both sides "
             "come from the same scaled tensor."
+        )
+
+    if generation_config is not None and need_top_k_or_top_p_filtering(
+        TrainingSamplingParams(
+            top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+        )
+    ):
+        warnings.warn(
+            "on_policy_distillation.full does not apply top-k/top-p filtering "
+            "to policy logprobs or the full-vocabulary KL. "
+            "policy.generation.top_k/top_p are still applied during rollout.",
+            stacklevel=2,
         )
 
     if full_cfg.teacher_payload == "logits":

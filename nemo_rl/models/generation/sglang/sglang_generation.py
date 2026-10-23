@@ -433,6 +433,31 @@ class SGLangGeneration(GenerationInterface):
             return
         ray.get([e.continue_generation.remote() for e in engines])
 
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Acknowledge the pause owned by the SGLang weight synchronizer.
+
+        Both SGLang transports pause and flush KV inside ``sync_weights`` before
+        transferring weights. This hook issues no RPC; returning True prevents
+        callers from flushing again after the synchronizer resumes generation.
+        The synchronizer always clears KV, including when ``clear_cache=False``.
+        ``timeout_s`` does not add a deadline to that existing lifecycle.
+        """
+        del clear_cache, timeout_s
+        return True
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Acknowledge that the SGLang synchronizer already resumed generation.
+
+        This hook issues no RPC and adds no deadline; ``sync_weights`` owns the
+        pause, cache flush, weight transfer, and resume as one lifecycle.
+        """
+        del timeout_s
+        return True
+
     def begin_weight_update(self) -> None:
         """Open a weight-update session on every node-0 engine."""
         engines = [e for e in self.engines if e is not None]
