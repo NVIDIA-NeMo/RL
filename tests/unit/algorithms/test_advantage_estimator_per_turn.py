@@ -288,20 +288,28 @@ def test_3c_one_short_turn_vs_ten_turns(counted):
     batch = build([short, long, *wrong], [1, 1, 0, 0])
     out, _ = run(batch, cfg(turns_counted=counted))
     w = [
-        (values_at(out, batch, r, "thinking") / values_at(batch["advantages"], batch, r, "thinking"))
+        (
+            values_at(out, batch, r, "thinking")
+            / values_at(batch["advantages"], batch, r, "thinking")
+        )
         for r in (0, 1)
     ]
     for r in (0, 1):
         assert torch.allclose(w[r], w[r][0].expand_as(w[r]), atol=1e-6)
     if counted == "with_spans":
-        assert float(w[0][0]) == pytest.approx(1.0) and float(w[1][0]) == pytest.approx(1.0)
+        assert float(w[0][0]) == pytest.approx(1.0) and float(w[1][0]) == pytest.approx(
+            1.0
+        )
     else:
         # u = (1, max(100 / 1000, 1/3)) = (1, 1/3); c = 1100 / (100 + 1000 / 3).
         c = 1100.0 / (100.0 + 1000.0 / 3.0)
         assert float(w[0][0]) == pytest.approx(c, rel=1e-5)
         assert float(w[1][0]) == pytest.approx(c / 3.0, rel=1e-5)
         # The group's positive credit on thinking tokens is unchanged.
-        before = sum(float(values_at(batch["advantages"], batch, r, "thinking").sum()) for r in (0, 1))
+        before = sum(
+            float(values_at(batch["advantages"], batch, r, "thinking").sum())
+            for r in (0, 1)
+        )
         after = sum(float(values_at(out, batch, r, "thinking").sum()) for r in (0, 1))
         assert after == pytest.approx(before, rel=1e-5)
     assert_actions_untouched(out, batch)

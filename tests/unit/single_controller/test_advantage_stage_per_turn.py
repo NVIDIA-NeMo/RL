@@ -30,6 +30,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     reweight_positive_text_per_turn,
 )
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -37,13 +38,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
-from nemo_rl.algorithms.single_controller_utils.masking_stats import (
-    new_masking_stats_accumulator,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
-    new_rollout_stats_accumulator,
-)
-from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ACTION_MASK,
@@ -180,8 +174,6 @@ def _controller(store, *, num_actors, reweight, penalties, clip_high=None):
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
-    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
-    ctrl._masking_stats_acc = new_masking_stats_accumulator()
     ctrl._length_reweight_stats = None
     ctrl._step_log_dict = {
         "reward_partials": [],

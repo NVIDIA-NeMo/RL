@@ -767,7 +767,9 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
 
     @pytest.mark.parametrize("scope", ["thinking_per_turn", "prose_per_turn"])
-    def test_per_turn_length_reweight_validates_with_token_capture(self, patched_factories, scope):
+    def test_per_turn_length_reweight_validates_with_token_capture(
+        self, patched_factories, scope
+    ):
         from nemo_rl.algorithms.advantage_estimator import PositiveLengthReweightConfig
         from nemo_rl.algorithms.single_controller_utils.config import (
             validate_single_controller_config,
@@ -775,7 +777,9 @@ class TestSetup:
 
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.token_capture.enabled = True
-        mc.policy["generation"].setdefault("vllm_cfg", {}).update(async_engine=True, expose_http_server=True)  # NeMo-Gym requires both
+        mc.policy["generation"].setdefault("vllm_cfg", {}).update(
+            async_engine=True, expose_http_server=True
+        )  # NeMo-Gym requires both
         mc.grpo.adv_estimator.positive_length_reweight = PositiveLengthReweightConfig(
             enabled=True, scope=scope
         )

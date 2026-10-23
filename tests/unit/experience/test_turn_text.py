@@ -20,7 +20,13 @@ from nemo_rl.experience.turn_text import turn_text_columns
 
 # Single-token tag ids, as in the Nemotron tokenizer; ordinary text is any id >= 100.
 IM_END, THINK, ETHINK, TC, ETC = 11, 12, 13, 14, 15
-IDS = dict(think_open_id=THINK, think_close_id=ETHINK, tool_call_open_id=TC, tool_call_close_id=ETC, end_of_turn_id=IM_END)
+IDS = dict(
+    think_open_id=THINK,
+    think_close_id=ETHINK,
+    tool_call_open_id=TC,
+    tool_call_close_id=ETC,
+    end_of_turn_id=IM_END,
+)
 
 
 def _seq(*segments):
@@ -46,7 +52,9 @@ PROMPT = [100, 101, THINK]  # generation prompt ends with <think>: thinking on
 
 
 def test_thinking_then_tool_call_then_end_of_turn():
-    ids, mask = _seq((False, PROMPT), (True, [200, 201, ETHINK, TC, 300, 301, ETC, IM_END]))
+    ids, mask = _seq(
+        (False, PROMPT), (True, [200, 201, ETHINK, TC, 300, 301, ETC, IM_END])
+    )
     classes, turn = _classes(ids, mask)
     assert classes == "---TTTAAAAA"
     assert turn == [-1, -1, -1] + [0] * 8
@@ -81,7 +89,9 @@ def test_thinking_without_content_and_no_closing_tag():
 
 
 def test_tool_call_markup_inside_thinking_stays_thinking():
-    ids, mask = _seq((False, PROMPT), (True, [200, TC, 300, ETC, ETHINK, TC, 301, ETC, IM_END]))
+    ids, mask = _seq(
+        (False, PROMPT), (True, [200, TC, 300, ETC, ETHINK, TC, 301, ETC, IM_END])
+    )
     assert _classes(ids, mask)[0] == "---TTTTTAAAA"
 
 
@@ -126,7 +136,9 @@ def test_cut_off_turn_has_no_end_of_turn_action():
 
 def test_thinking_off_turns_have_no_thinking_span():
     prompt_off = [100, THINK, ETHINK]  # template's empty thinking: thinking off
-    ids, mask = _seq((False, prompt_off), (True, [400, ETHINK, 401, TC, 300, ETC, IM_END]))
+    ids, mask = _seq(
+        (False, prompt_off), (True, [400, ETHINK, 401, TC, 300, ETC, IM_END])
+    )
     assert _classes(ids, mask)[0] == "---CCCAAAA"
     # Without thinking tags configured there is never a thinking span.
     ids, mask = _seq((False, PROMPT), (True, [200, ETHINK, 401, IM_END]))
@@ -134,7 +146,9 @@ def test_thinking_off_turns_have_no_thinking_span():
 
 
 def test_columns_align_with_token_positions_and_padding():
-    ids, mask = _seq((False, PROMPT), (True, [200, ETHINK, TC, 300, ETC, IM_END]), (False, [500]))
+    ids, mask = _seq(
+        (False, PROMPT), (True, [200, ETHINK, TC, 300, ETC, IM_END]), (False, [500])
+    )
     turn, think, act = turn_text_columns(ids, mask, **IDS)
     assert len(turn) == len(think) == len(act) == len(ids)
     assert turn[-1] == -1 and not think[-1] and not act[-1]
@@ -145,7 +159,10 @@ def test_columns_align_with_token_positions_and_padding():
 class _FakeTok:
     unk_token_id = 0
 
-    def __init__(self, single=("<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_end|>")):
+    def __init__(
+        self,
+        single=("<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_end|>"),
+    ):
         self.vocab = {tag: 10 + i for i, tag in enumerate(single)}
 
     def convert_tokens_to_ids(self, tag):
@@ -157,14 +174,25 @@ class _FakeTok:
 
 def _resolve(tok, require=False):
     return resolve_turn_text_ids(
-        tok, think_open="<think>", think_close="</think>", tool_call_open="<tool_call>",
-        tool_call_close="</tool_call>", end_of_turn="<|im_end|>", require_thinking_tags=require,
+        tok,
+        think_open="<think>",
+        think_close="</think>",
+        tool_call_open="<tool_call>",
+        tool_call_close="</tool_call>",
+        end_of_turn="<|im_end|>",
+        require_thinking_tags=require,
     )
 
 
 def test_resolve_turn_text_ids():
     ids = _resolve(_FakeTok())
-    assert ids == {"think_open": 10, "think_close": 11, "tool_call_open": 12, "tool_call_close": 13, "end_of_turn": 14}
+    assert ids == {
+        "think_open": 10,
+        "think_close": 11,
+        "tool_call_open": 12,
+        "tool_call_close": 13,
+        "end_of_turn": 14,
+    }
     # Thinking tags are optional for prose_per_turn, required for thinking_per_turn.
     no_think = _FakeTok(single=("<tool_call>", "</tool_call>", "<|im_end|>"))
     assert _resolve(no_think)["think_close"] is None

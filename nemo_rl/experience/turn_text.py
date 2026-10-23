@@ -84,11 +84,17 @@ def turn_text_columns(
         for k in range(i, j):
             turn_id[k] = turn
         ends_turn = token_ids[j - 1] == end_of_turn_id
-        body_end = j - 1 if ends_turn else j  # exclusive; the end-of-turn token is ACTION
+        body_end = (
+            j - 1 if ends_turn else j
+        )  # exclusive; the end-of-turn token is ACTION
         start = i
         if think_close_id is not None and (think_open_id is None or last_tag_open):
             close = next(
-                (k for k in range(body_end - 1, i - 1, -1) if token_ids[k] == think_close_id),
+                (
+                    k
+                    for k in range(body_end - 1, i - 1, -1)
+                    if token_ids[k] == think_close_id
+                ),
                 None,
             )
             stop = body_end if close is None else close + 1

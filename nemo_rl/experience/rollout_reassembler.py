@@ -371,7 +371,9 @@ class RolloutReassembler:
 
         from nemo_rl.experience.turn_text import END_OF_TURN, THINK_CLOSE, THINK_OPEN
 
-        tok = AutoTokenizer.from_pretrained(self._turn_text_tokenizer_name, trust_remote_code=True)
+        tok = AutoTokenizer.from_pretrained(
+            self._turn_text_tokenizer_name, trust_remote_code=True
+        )
         self._turn_text_ids = resolve_turn_text_ids(
             tok,
             think_open=THINK_OPEN,
@@ -384,7 +386,11 @@ class RolloutReassembler:
         return self._turn_text_ids
 
     def _turn_text_columns(
-        self, rows: list[FinalizedRollout], n: int, max_len: int, metrics: dict[str, float]
+        self,
+        rows: list[FinalizedRollout],
+        n: int,
+        max_len: int,
+        metrics: dict[str, float],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """[n, max_len] assistant_turn_id (int32, -1 outside turns) / thinking / action columns."""
         from nemo_rl.experience.turn_text import turn_text_columns
@@ -393,7 +399,12 @@ class RolloutReassembler:
         turn_id = torch.full((n, max_len), -1, dtype=torch.int32)
         thinking = torch.zeros((n, max_len), dtype=torch.bool)
         action = torch.zeros((n, max_len), dtype=torch.bool)
-        totals = {"turns": 0.0, "thinking_tokens": 0.0, "action_tokens": 0.0, "content_tokens": 0.0}
+        totals = {
+            "turns": 0.0,
+            "thinking_tokens": 0.0,
+            "action_tokens": 0.0,
+            "content_tokens": 0.0,
+        }
         for i, row in enumerate(rows):
             if not row.valid:
                 continue
