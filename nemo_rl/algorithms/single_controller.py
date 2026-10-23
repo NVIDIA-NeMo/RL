@@ -870,6 +870,7 @@ class SingleControllerActor:
 
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
+        await self._check_restart_only_gym_servers()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
@@ -4860,6 +4861,46 @@ class SingleControllerActor:
             return
         ledger.mark_gym_forgotten(forgets)
 
+    async def _check_restart_only_gym_servers(self) -> None:
+        """Refuse, or warn about, Gym servers whose rollouts start over after a crash.
+
+        Such a server's in-flight rollouts are reported as restarts at every
+        checkpoint, so turn-level recovery would quietly become
+        restart-from-task for them.
+        """
+        coordinator = self._gym_checkpoint_coordinator
+        if coordinator is None:
+            return
+        allowed = self._master_config.rollout_recovery.allow_restart_only_gym_servers
+        restart_only = {
+            instance_id: servers
+            for instance_id, servers in (
+                await coordinator.restart_only_servers()
+            ).items()
+            if servers
+        }
+        if restart_only and not allowed:
+            raise ValueError(
+                "rollout_recovery.target_level='turn' cannot continue rollouts on "
+                "these restart-only Gym servers, which start every in-flight "
+                f"rollout over after a crash: {restart_only!r}. Set "
+                "rollout_recovery.allow_restart_only_gym_servers=true to accept "
+                "that, or use target_level='sibling'."
+            )
+        if restart_only:
+            warnings.warn(
+                "rollout_recovery.allow_restart_only_gym_servers=true: in-flight "
+                "rollouts on these restart-only Gym servers start over after a "
+                f"crash: {restart_only!r}",
+                stacklevel=2,
+            )
+        elif allowed:
+            warnings.warn(
+                "rollout_recovery.allow_restart_only_gym_servers=true, but no Gym "
+                "server is restart-only; the setting has no effect",
+                stacklevel=2,
+            )
+
     async def _drain_non_exported_gym_candidates(
         self,
         coordinator: GymCheckpointCoordinator,
@@ -5350,8 +5391,15 @@ class SingleControllerActor:
                 ),
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
+            gym_restarts = (
+                sum(len(episodes) for episodes in gym_commit.manifest.restarts.values())
+                if gym_commit is not None
+                else 0
+            )
             if gym_commit is not None:
                 checkpoint_metrics["gym_parked_seconds"] = gym_parked_seconds
+                # Episodes Gym could not capture; they start over after a crash.
+                checkpoint_metrics["gym_restarted_episodes"] = float(gym_restarts)
                 self._warn_if_gym_parked_past_interval(gym_parked_seconds)
             self._log_telemetry_metrics(
                 checkpoint_metrics,
@@ -5363,6 +5411,7 @@ class SingleControllerActor:
                 f"{final_path} (step={expected_train_step}, "
                 f"trainer_version={expected_trainer_version}, "
                 f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
+                f"gym_restarted_episodes={gym_restarts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
                 f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",

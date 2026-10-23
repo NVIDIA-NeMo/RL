@@ -248,6 +248,11 @@ rollout_recovery:
   # environment steps; token_capture.control_timeout_s still bounds each
   # other Gym control call.
   gym_prepare_timeout_s: 300.0
+  # With "turn", setup fails if a Gym server is restart-only: an agent without
+  # checkpoint session support, or a resources server whose checkpoint mode is
+  # restart_only. Such a server's in-flight rollouts start over after a crash.
+  # Set true to accept that with a warning; only valid with target_level: turn.
+  allow_restart_only_gym_servers: false
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.

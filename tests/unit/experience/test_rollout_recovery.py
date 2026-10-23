@@ -560,6 +560,22 @@ def test_turn_recovery_rejects_target_overrides(overrides: dict[str, Any]) -> No
         RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN, **overrides)
 
 
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.SIBLING, RecoveryTargetLevel.PROMPT_GROUP]
+)
+def test_restart_only_gym_servers_opt_in_requires_turn_recovery(
+    target_level: RecoveryTargetLevel,
+) -> None:
+    """Below turn level every unfinished rollout starts over anyway."""
+    with pytest.raises(ValueError, match="applies only to target_level='turn'"):
+        RolloutRecoveryConfig(
+            target_level=target_level, allow_restart_only_gym_servers=True
+        )
+    RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.TURN, allow_restart_only_gym_servers=True
+    )
+
+
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0])
 def test_recovery_config_rejects_a_non_positive_gym_prepare_timeout(
     timeout_s: float,
