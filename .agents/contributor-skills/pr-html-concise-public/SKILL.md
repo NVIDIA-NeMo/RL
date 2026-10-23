@@ -37,7 +37,7 @@ one would a tired engineer rather open on their phone. If yours is not the
 winner, you are not done. Go back and cut, redraw, and rewrite until a critic
 who has never seen your PR looks at your page and is genuinely impressed.
 
-The critic you have to impress cares about exactly three things:
+The critic you have to impress cares about exactly four things:
 
 1. **Do I know whether this is broken, fixed, or only proposed?**
 2. **Did the figure teach me the thing before I read any prose?**
@@ -318,7 +318,7 @@ section, in one of three forms:
   loose snippets or pseudocode: seeing which lines go and which arrive is how a
   reader gets a feel for the size and shape of the change. Rules below.
 - **A second figure** — an illustration of the new mechanism, held to the same
-  rules as §5. Use this when the fix is a new component, or a changed order of
+  rules as §6. Use this when the fix is a new component, or a changed order of
   operations. It can sit above the diff.
 - **Pseudocode with a value trace** — 2–4 short blocks, one per step of the fix,
   each with inline comments carrying the **actual values** at that point, and a
@@ -378,8 +378,8 @@ to work it out from the diff. Put it in a box so it cannot be missed:
 .where{border-left:4px solid var(--accent);background:var(--surface);padding:6px 12px;margin:6px 0 10px}
 ```
 
-Whichever you pick, run it on the **same tiny numbers as the figure**, so §5 and
-§6 are one worked example and not two. Real arithmetic: 2 prompts, not 512. Pick
+Whichever you pick, run it on the **same tiny numbers as the figure**, so §6 and
+§7 are one worked example and not two. Real arithmetic: 2 prompts, not 512. Pick
 numbers that make the interesting case show up, and line the state up column by
 column at the moment that matters.
 
@@ -621,7 +621,7 @@ cleared for public release, **stop and ask** — do not upload.
    (`$DIR` and the one-time site setup are in "Site setup and upload" below.)
 
    Open each hit and read its `<h1>` — that is where its nav label comes from.
-   They go in the new page's link bar (§3), and each of them gets a link back to
+   They go in the new page's link bar (§4), and each of them gets a link back to
    the new page in step 6.
 2. Gather: `gh pr view $PRNUM --repo NVIDIA-NeMo/RL --json title,body,author,headRefOid,files`,
    the diff, and the review comments. Pin every permalink to `$HEAD_SHA`.
@@ -783,7 +783,7 @@ extracted script); a syntax error there blanks the whole page.
       is a code change (real `-`/`+` lines, context, verified hunk headers), a
       second figure for a new mechanism, or pseudocode with a value trace only
       when there is no single code change to show
-- [ ] The example uses tiny numbers and lines up column by column, and §5 and §6
+- [ ] The example uses tiny numbers and lines up column by column, and §6 and §7
       use the *same* numbers
 - [ ] No word from the banned list; no word a non-native reader would stop on
 - [ ] If the PR changes training math (a loss, a ratio, a flag that fixes or drops a term),
