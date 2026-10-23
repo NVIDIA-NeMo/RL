@@ -1395,6 +1395,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._length_reweight_stats = None
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1497,6 +1498,7 @@ def test_opd_advantage_stage_pools_raw_gap_separately_under_tropd() -> None:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._length_reweight_stats = None
     meta = KVBatchMeta(
         partition_id="rollout_data",
         task_name="train",
@@ -1888,6 +1890,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._opd_stat_sum = 0.0
     ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._length_reweight_stats = None
     ctrl._teacher_coordinator = None
     return ctrl
 

@@ -73,7 +73,10 @@ import torch
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+from nemo_rl.algorithms.advantage_estimator import (
+    GRPOAdvantageEstimator,
+    PositiveLengthReweightStats,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -170,6 +173,7 @@ from nemo_rl.algorithms.single_controller_utils.segment_stats import (
     new_segment_stats_accumulator,
     reduce_segment_stats,
     resolve_row_identity,
+    rollout_trained_lengths,
     rollout_vote_mask,
     subset_rows,
 )
@@ -894,6 +898,9 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
+        # This step's grpo.adv_estimator.positive_length_reweight statistics, merged from every
+        # advantage-stage call; None until a call reports some (the reweighting is off).
+        self._length_reweight_stats: Optional[PositiveLengthReweightStats] = None
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3801,6 +3808,9 @@ class SingleControllerActor:
                 self._opd_stat_sum = 0.0
                 self._opd_stat_sumsq = 0.0
                 self._opd_stat_count = 0
+                if self._length_reweight_stats is not None:
+                    step_metrics.update(self._length_reweight_stats.to_metrics())
+                    self._length_reweight_stats = None
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
@@ -6312,12 +6322,18 @@ class SingleControllerActor:
             rollout_votes = rollout_vote_mask(
                 baseline_mask, identity.rollout_key, canonical_index
             )
+            # positive_length_reweight measures a rollout by its trained tokens over all its
+            # rows, the loss mass its broadcast advantage multiplies.
+            rollout_lengths = rollout_trained_lengths(
+                mask, identity.row_to_canonical, int(canonical_index.numel())
+            )
             canonical_advantages = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids.index_select(0, canonical_index),
                 rewards=rewards.index_select(0, canonical_index),
                 mask=mask.index_select(0, canonical_index),
                 repeated_batch=subset_rows(repeated_batch, canonical_index),
                 valid_mask=rollout_votes,
+                response_lengths=rollout_lengths,
                 **subset_rows(kwargs, canonical_index),
             )
             advantages = broadcast_rollout_advantages(
@@ -6345,6 +6361,16 @@ class SingleControllerActor:
             advantages = torch.zeros_like(mask)
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
+        if (
+            has_valid_training_tokens
+            and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
+            and self._advantage_estimator.last_length_reweight_stats is not None
+        ):
+            if self._length_reweight_stats is None:
+                self._length_reweight_stats = PositiveLengthReweightStats.empty()
+            self._length_reweight_stats.merge(
+                self._advantage_estimator.last_length_reweight_stats
+            )
 
         if self._message_level_advantage_penalties_enabled:
             # Sequence-error filtering and the pre-existing sample mask remain

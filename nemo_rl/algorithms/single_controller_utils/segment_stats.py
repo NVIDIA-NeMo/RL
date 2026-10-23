@@ -446,6 +446,44 @@ def broadcast_rollout_advantages(
     return advantages_canonical.index_select(0, index)
 
 
+def rollout_trained_lengths(
+    mask: torch.Tensor,
+    row_to_canonical: torch.Tensor,
+    num_canonical: int,
+) -> torch.Tensor:
+    """Trained tokens of each rollout, summed over all its rows, at the canonical positions.
+
+    The loss mass a rollout's broadcast advantage multiplies: GRPO's
+    ``positive_length_reweight`` measures a rollout by it when the estimator sees the
+    canonical rows only. A row that does not train (``mask`` row all 0) adds nothing.
+
+    Args:
+        mask: ``(B, S)`` loss mask (``token_mask * final_sample_mask``); counted on
+            ``[:, 1:]`` like the loss.
+        row_to_canonical: ``(B,)`` long from :class:`RowIdentity`.
+        num_canonical: ``Rc``, the number of canonical rows.
+
+    Returns:
+        ``(Rc,)`` float64 tensor aligned with ``canonical_index``.
+    """
+    if row_to_canonical.dim() != 1 or row_to_canonical.numel() != mask.shape[0]:
+        raise ValueError(
+            "rollout_trained_lengths: row_to_canonical "
+            f"{tuple(row_to_canonical.shape)} must be 1-D and align with mask "
+            f"{tuple(mask.shape)}"
+        )
+    if bool((row_to_canonical < 0).any()):
+        raise ValueError(
+            "rollout_trained_lengths: a row has no canonical row in this chunk"
+        )
+    lengths = torch.zeros(num_canonical, dtype=torch.float64, device=mask.device)
+    return lengths.index_add_(
+        0,
+        row_to_canonical.to(device=mask.device, dtype=torch.long),
+        mask[:, 1:].sum(-1).to(torch.float64),
+    )
+
+
 def subset_rows(
     tensors: Mapping[str, torch.Tensor], index: torch.Tensor
 ) -> dict[str, torch.Tensor]:

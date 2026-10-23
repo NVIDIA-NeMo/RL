@@ -21,6 +21,7 @@ import torch
 from nemo_rl.algorithms.single_controller_utils.segment_stats import (
     broadcast_rollout_advantages,
     resolve_row_identity,
+    rollout_trained_lengths,
     subset_rows,
 )
 
@@ -263,3 +264,82 @@ def test_rollout_with_every_row_masked_still_does_not_vote():
     # Rollout 0 is out of its siblings' baselines: rollout 1 sees mean(0, 0).
     assert expected[1].item() == pytest.approx(1.0)
     assert expected[2].item() == pytest.approx(-0.5 / (0.707107 + 1e-6), abs=1e-4)
+
+
+def _row_mask(lengths: list[int]) -> torch.Tensor:
+    """Loss mask with ``lengths[i]`` trained tokens in ``[:, 1:]`` of row i."""
+    mask = torch.zeros(len(lengths), max(lengths) + 1)
+    for i, n in enumerate(lengths):
+        mask[i, 1 : n + 1] = 1.0
+    return mask
+
+
+def test_rollout_trained_lengths_sum_every_row_of_a_rollout():
+    ident = resolve_row_identity(["g_g0", "g_g1", "g_g2", "g_g0_t1", "g_g0_t2"])
+    mask = _row_mask([100, 300, 0, 500, 40])
+    lengths = rollout_trained_lengths(mask, ident.row_to_canonical, 3)
+    assert lengths.dtype == torch.float64
+    # Rollout 0 = canonical + two segments; rollout 2's only row does not train.
+    assert lengths.tolist() == [640.0, 300.0, 0.0]
+
+
+def test_rollout_trained_lengths_rejects_orphans_and_misaligned_rows():
+    with pytest.raises(ValueError, match="no canonical row"):
+        rollout_trained_lengths(_row_mask([3, 3]), torch.tensor([0, -1]), 1)
+    with pytest.raises(ValueError, match="align"):
+        rollout_trained_lengths(_row_mask([3, 3]), torch.tensor([0]), 1)
+
+
+def test_length_reweight_measures_whole_rollouts_and_keeps_row_mass():
+    """Canonical-only GRPO + positive_length_reweight, as the SingleController runs it.
+
+    Rollout 0 trains 100 canonical + 500 subagent-segment tokens, rollout 1 300 canonical tokens;
+    both are correct. Measured by the canonical row alone rollout 0 would look like the short
+    one; by its trained total it is the long one and must get the lower per-token weight.
+    """
+    estimator_module = pytest.importorskip(
+        "nemo_rl.algorithms.advantage_estimator",
+        reason="needs the trainer stack (nemo.lens) on this host",
+    )
+    loss_module = pytest.importorskip("nemo_rl.algorithms.loss")
+    ident = resolve_row_identity(["g_g0", "g_g1", "g_g2", "g_g3", "g_g0_t1"])
+    row_lengths = [100, 300, 300, 300, 500]
+    mask = _row_mask(row_lengths)
+    rewards = torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0])
+    c = ident.canonical_index
+    lengths = rollout_trained_lengths(mask, ident.row_to_canonical, int(c.numel()))
+    assert lengths.tolist() == [600.0, 300.0, 300.0, 300.0]
+
+    def run(**reweight):
+        estimator = estimator_module.GRPOAdvantageEstimator(
+            estimator_module.AdvEstimatorConfig(
+                normalize_rewards=True,
+                use_leave_one_out_baseline=True,
+                positive_length_reweight=reweight,
+            ),
+            loss_module.ClippedPGLossConfig(),
+        )
+        canonical = estimator.compute_advantage(
+            prompt_ids=torch.zeros(4, 2, dtype=torch.long),
+            rewards=rewards[c],
+            mask=mask.index_select(0, c),
+            valid_mask=torch.ones(4),
+            response_lengths=lengths,
+        )
+        return broadcast_rollout_advantages(canonical, ident.row_to_canonical)[:, 0]
+
+    plain = run()
+    shaped = run(enabled=True, alpha=1.0, max_ratio=None)
+    # Equal total credit per correct rollout: 600 x 0.75 a = 300 x 1.5 a.
+    a = plain[0].item()
+    assert plain[1].item() == pytest.approx(a)
+    assert shaped[0].item() == pytest.approx(0.75 * a, rel=1e-6)
+    assert shaped[1].item() == pytest.approx(1.5 * a, rel=1e-6)
+    # The segment row carries its rollout's weight; negatives are untouched.
+    assert shaped[4].item() == pytest.approx(shaped[0].item())
+    torch.testing.assert_close(shaped[2:4], plain[2:4])
+    # The step's loss mass over every row (sum |A| x trained tokens) is unchanged.
+    row_tokens = torch.tensor(row_lengths, dtype=torch.float32)
+    torch.testing.assert_close(
+        (shaped.abs() * row_tokens).sum(), (plain.abs() * row_tokens).sum()
+    )

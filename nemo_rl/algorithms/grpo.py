@@ -3709,6 +3709,9 @@ def _grpo_train_impl(
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
                     )
+                    if isinstance(adv_estimator, GRPOAdvantageEstimator):
+                        # Positive length reweighting metrics; empty while disabled.
+                        metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
 
                     # Log rewards and advantages information
