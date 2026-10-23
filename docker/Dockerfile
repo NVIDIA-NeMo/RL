@@ -243,6 +243,8 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+# Part of this recipe, not of the selected source: an older NRL_GIT_REF has no such script.
+COPY docker/prune_uv_cache.py /usr/local/bin/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -259,9 +261,20 @@ elif [ -n "$SEED_KEY" ]; then
     echo "Seeding uv cache (key=${CACHE_KEY})"
     mkdir -p "${UV_CACHE_DIR}"
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ "${UV_CACHE_DIR}/" 2>/dev/null || true
+    SEEDED=1
 fi
 
 uv venv --seed
+# Drop what the seed carried in that uv.lock no longer pins -- versions from older locks
+# (see docker/prune_uv_cache.py). It runs before any sync, so it only ever judges seed
+# content: build-isolation deps the syncs below resolve outside uv.lock (setuptools, a
+# build-time torch, ...) are kept. And it runs in this RUN because deleting files in a
+# later layer only hides them; the image would still ship every byte.
+if [[ -n "${SEEDED:-}" ]]; then
+    du -sh "${UV_CACHE_DIR}"
+    "${UV_PROJECT_ENVIRONMENT}/bin/python" /usr/local/bin/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+    du -sh "${UV_CACHE_DIR}"
+fi
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
@@ -630,7 +643,11 @@ if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
 fi
-bash docker/dynamo/install.sh
+# Dynamo syncs its own lock (Python 3.12) into a --link-mode copy venv that nothing re-syncs at
+# runtime, so its wheels are never needed from the shared cache. A throwaway cache keeps them
+# out of this layer instead of shipping them twice.
+UV_CACHE_DIR=/tmp/dynamo-uv-cache bash docker/dynamo/install.sh
+rm -rf /tmp/dynamo-uv-cache
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
@@ -700,6 +717,7 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
 # (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
 # and removing the jar doesn't affect ray.init(), remote tasks, actors, or
