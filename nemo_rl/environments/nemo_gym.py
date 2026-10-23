@@ -276,8 +276,8 @@ def _prepare_materialized_nemo_gym_rows(
     attach the agent reference that RL uses for metrics and teacher selection.
     """
     # Gym is an optional worker dependency, unavailable in the training driver.
+    from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
     from nemo_gym.episode_types import TaskId
-    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     for row in rows:
         if not is_nemo_gym_task(row):
@@ -329,8 +329,8 @@ def _normalize_nemo_gym_episode_result(row: dict, reply: Any) -> dict:
         return reply
 
     # Gym is only installed in the rollout worker's optional environment.
+    from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
     from nemo_gym.episode_types import BaseEpisodeResponse, EpisodeFailure
-    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
     # Environment protocols may extend EpisodeFailure (single_agent_turn adds
     # partial_response). Validate the common contract without rejecting those
@@ -1416,7 +1416,7 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
         if is_nemo_gym_task(nemo_gym_row):
-            from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+            from nemo_gym.base_responses_api_model import maybe_rollout_id_from_run_body
 
             # Episode replies were matched to this request identity during normalization.
             rollout_id = maybe_rollout_id_from_run_body(nemo_gym_row)
