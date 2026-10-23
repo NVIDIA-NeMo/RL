@@ -417,9 +417,16 @@ def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
     monkeypatch.setattr(
         transformers.AutoConfig, "from_pretrained", lambda *a, **k: MagicMock()
     )
+    monkeypatch.setattr(
+        transformers.GenerationConfig,
+        "from_pretrained",
+        lambda *a, **k: MagicMock(eos_token_id=None),
+    )
     rendered = {}
 
-    async def fake_build(messages, tools, tokenizer, model_config, template_kwargs):
+    async def fake_build(
+        messages, tools, tokenizer, model_config, template_kwargs, eos_token_ids
+    ):
         rendered["messages"] = messages
         return [1, 2, 3]
 

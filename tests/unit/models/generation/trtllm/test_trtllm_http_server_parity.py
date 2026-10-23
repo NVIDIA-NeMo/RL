@@ -45,6 +45,7 @@ from tests.unit.models.generation.chat_template_parity_common import (
     TOOL_PARSER_CONTRACT_CASES,
     TOOL_RESULT,
     USER_MSG,
+    golden_scenario_key,
     inclusive_token_span,
     prompt_suffix_after_turn,
     token_edit_similarity,
@@ -208,9 +209,10 @@ def _load_golden(reasoning_parser: str) -> dict[str, Any]:
     assert golden.get("model_revision") == MODEL_REVISION, (
         "Golden model revision does not match; regenerate it"
     )
-    for scenario_name, _ in PARSER_SCENARIOS[reasoning_parser]:
-        assert scenario_name in golden.get("scenarios", {}), (
-            f"Scenario {scenario_name!r} missing from golden; regenerate it"
+    for _, enable_thinking in PARSER_SCENARIOS[reasoning_parser]:
+        golden_key = golden_scenario_key(enable_thinking)
+        assert golden_key in golden.get("scenarios", {}), (
+            f"Scenario {golden_key!r} missing from golden; regenerate it"
         )
     return golden
 
@@ -450,7 +452,9 @@ def test_parity(
     for scenario_name, enable_thinking in PARSER_SCENARIOS[reasoning_parser]:
         actual_turns = _run_scenario(base_url, enable_thinking)
 
-        expected_turns = golden["scenarios"][scenario_name]["turns"]
+        expected_turns = golden["scenarios"][golden_scenario_key(enable_thinking)][
+            "turns"
+        ]
         assert len(actual_turns) == len(expected_turns)
 
         assert (

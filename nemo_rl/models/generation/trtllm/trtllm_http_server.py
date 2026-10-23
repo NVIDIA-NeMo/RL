@@ -286,10 +286,17 @@ def resolve_eos_token_ids(
 def _tokens_for_response_text(
     token_ids: list[int], stop_token_ids: Collection[int]
 ) -> list[int]:
+    """``token_ids`` without trailing stop tokens, as a new list."""
     text_token_end = len(token_ids)
     while text_token_end and token_ids[text_token_end - 1] in stop_token_ids:
         text_token_end -= 1
-    return token_ids if text_token_end == len(token_ids) else token_ids[:text_token_end]
+    return token_ids[:text_token_end]
+
+
+def _prompt_opens_reasoning(tokenizer: Any, token_ids: list[int]) -> bool:
+    """Whether the prompt ends inside an open ``<think>`` block."""
+    tail = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
+    return tail.rstrip().endswith("<think>")
 
 
 def _build_reasoning_parser(
@@ -342,7 +349,7 @@ def _build_sampling_params(
         top_k=int(top_k_cfg) if top_k_cfg is not None else 0,
         max_tokens=int(max_tokens),
         stop_token_ids=stop_ids or None,
-        # Include generated stop tokens so the adapter can trim tokens and logprobs together.
+        # Include generated stop tokens so generation_token_ids stays contiguous with the next turn's prompt.
         include_stop_str_in_output=True,
         logprobs=True,
         logprobs_simple_format=True,
@@ -382,10 +389,6 @@ def create_app(
 
     if reasoning_parser is not None:
         _build_reasoning_parser(reasoning_parser, _server_template_kwargs)
-
-    def _prompt_opens_reasoning(token_ids: list[int]) -> bool:
-        tail = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
-        return tail.rstrip().endswith("<think>")
 
     # Match TRT-LLM's effective EOS set. Stops are kept in the returned token
     # metadata but excluded from the parsed response text.
@@ -519,7 +522,7 @@ def create_app(
             _build_reasoning_parser(
                 reasoning_parser,
                 effective_template_kwargs,
-                reasoning_at_start=_prompt_opens_reasoning(adj_prompt),
+                reasoning_at_start=_prompt_opens_reasoning(tokenizer, adj_prompt),
             )
             if reasoning_parser is not None
             else None

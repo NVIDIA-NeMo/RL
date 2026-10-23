@@ -80,6 +80,10 @@ EXCLUDED_UNIT_TESTS=(
 
     --ignore=unit/models/generation/test_vllm_large_model.py
 
+    # Chat-completions parity — builds a real engine and loads Qwen3-0.6B
+    --ignore=unit/models/generation/test_vllm_http_server_parity.py
+    --ignore=unit/models/generation/trtllm/test_trtllm_http_server_parity.py
+
     # TRT-LLM — a real TP=2 engine under a Slurm launcher env (~1-4 min)
     --ignore=unit/models/generation/trtllm/test_trtllm_worker_startup.py
 
