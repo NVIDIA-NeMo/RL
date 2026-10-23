@@ -562,7 +562,9 @@ def test_fp8_load_uses_buffer_safe_model_loader(monkeypatch):
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
+    ext.model_runner = SimpleNamespace(
+        model=object(), vllm_config=SimpleNamespace(quant_config=object())
+    )
     weights = [("model.weight", torch.ones(2))]
     load_weights = MagicMock()
 
@@ -599,7 +601,9 @@ def test_fp8_layerwise_reload_passes_entire_quantized_generator(
     ext = vllm_backend.VllmInternalWorkerExtension.__new__(
         vllm_backend.VllmInternalWorkerExtension
     )
-    ext.model_runner = SimpleNamespace(model=model, vllm_config=object())
+    ext.model_runner = SimpleNamespace(
+        model=model, vllm_config=SimpleNamespace(quant_config=object())
+    )
     ext._nrl_layerwise_reload_active = native_reload
     source_weights = [("model.weight", torch.ones(2))]
     quantized_weights = [
@@ -1409,6 +1413,7 @@ def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
     from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext, _ = _make_collective_update_extension(vllm_backend)
+    ext.model_runner.vllm_config.quant_config = object()
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
     source_weights = iter([("model.weight", "weight-value")])
     quantized_weights = iter(

@@ -346,6 +346,37 @@ def forward_with_post_processing_fn(
     # Extract the processed components
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
+    if getattr(getattr(model, "config", None), "model_type", None) == "nemo_speechlm":
+        if prepared.cp_size > 1:
+            raise ValueError("Native SpeechLM logprobs require CP=1")
+        if not isinstance(
+            post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)
+        ):
+            raise ValueError(
+                "Native SpeechLM supports response logprobs and logprob losses"
+            )
+        if post_processing_fn.enable_seq_packing:
+            raise ValueError("Native SpeechLM requires unpacked sequences")
+        logprobs = model.next_token_logprobs(
+            {"input_ids": processed_inputs.input_ids, **processed_inputs.vlm_kwargs},
+            data_dict["token_mask"],
+            sampling_params,
+        )
+        if isinstance(post_processing_fn, LogprobsPostProcessor):
+            # The worker returns token i at position i, with token0 assigned
+            # zero. Loss functions instead consume next-token values [B,S-1].
+            logprobs = torch.cat([torch.zeros_like(logprobs[:, :1]), logprobs], dim=1)
+            return logprobs, {"logprobs": logprobs}, processed_mb
+        if post_processing_fn.loss_fn.input_type != LossInputType.LOGPROB:
+            raise ValueError("Native SpeechLM requires a logprob loss")
+        result, metrics = post_processing_fn.loss_fn(
+            data=data_dict,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            next_token_logprobs=logprobs,
+        )
+        return result, metrics, processed_mb
+
     cp_sharder = prepared.cp_sharder
     if prepared.cp_size > 1 and cp_sharder is None:
         raise RuntimeError(

@@ -1700,14 +1700,14 @@ def flatten_dict(
 ) -> dict[str, Any]:
     """Flatten a nested dictionary.
 
-    Handles nested dictionaries and lists by creating keys with separators.
-    For lists, the index is used as part of the key.
+    Handles nested dictionaries and sequences by creating keys with separators.
+    For lists and tuples, the index is used as part of the key.
 
     Args:
         d: Dictionary to flatten
         sep: Separator to use between nested keys
-        expand_lists: If True (default), expand list values into one key per
-            index. If False, keep each list intact under its stable key.
+        expand_lists: If True (default), expand list and tuple values into one
+            key per index. If False, keep each sequence intact under its stable key.
 
     Returns:
         Flattened dictionary with compound keys
@@ -1733,7 +1733,7 @@ def flatten_dict(
 
             if isinstance(value, dict):
                 _flatten(value, new_key)
-            elif isinstance(value, list) and expand_lists:
+            elif isinstance(value, (list, tuple)) and expand_lists:
                 for i, item in enumerate(value):
                     list_key = f"{new_key}{sep}{i}"
                     if isinstance(item, dict):

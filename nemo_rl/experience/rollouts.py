@@ -665,6 +665,15 @@ def generate_responses(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
     # Always use synchronous generation
+    metadata = batch.get("extra_env_info")
+    if metadata is not None:
+        caps = [
+            info.get("max_output_tokens") if isinstance(info, dict) else None
+            for info in metadata
+        ]
+        if any(cap is not None for cap in caps):
+            generation_input_data["max_output_tokens"] = caps
+
     generation_outputs = policy_generation.generate(
         generation_input_data, greedy=greedy
     )

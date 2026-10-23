@@ -366,3 +366,4 @@ tests/test_suites/llm/ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-control
 # native-rollout reward-weights nightly (that path is already covered on main; the
 # reward_weights math itself is covered by unit tests).
 tests/test_suites/llm/gdpo-qwen2.5-1.5b-1n8g-gym-multireward.sh
+vlm/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400.v1.sh

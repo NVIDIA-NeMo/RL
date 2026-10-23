@@ -66,6 +66,9 @@ class DatumSpec(TypedDict):
     extra_env_info: Optional[dict[str, Any]]
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
+    vllm_content: NotRequired[str]
+    vllm_multi_modal_data: NotRequired[dict[str, Any]]
+    prompt_group_ids: NotRequired[int]
     task_name: NotRequired[str]
     # One binary value per message; assistant turns only.
     message_loss_mask: NotRequired[list[int]]

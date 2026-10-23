@@ -14,7 +14,6 @@
 import importlib
 import math
 import os
-import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -587,9 +586,9 @@ class RayWorkerGroup:
         # resolve their generated modules have to travel with it.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
         initializer_env_vars = _get_initializer_env_vars(env_vars)
-        initializer_runtime_env = {}
-        if py_executable != sys.executable:
-            initializer_runtime_env["py_executable"] = py_executable
+        # The Ray daemon may use a different interpreter from the driver.
+        # Always pin the initializer before it imports the worker's module.
+        initializer_runtime_env = {"py_executable": py_executable}
         if initializer_env_vars:
             initializer_runtime_env["env_vars"] = initializer_env_vars
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}

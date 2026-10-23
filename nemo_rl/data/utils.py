@@ -198,7 +198,7 @@ def setup_response_data(
         env_name_list = extract_necessary_env_names(data_config)
         envs = {}
         for env_name in env_name_list:
-            registered_env_name = "vlm" if is_vlm else env_name
+            registered_env_name = "vlm" if is_vlm and env_name != "asr" else env_name
             envs[env_name] = create_env(
                 env_name=registered_env_name, env_config=env_configs[env_name]
             )
