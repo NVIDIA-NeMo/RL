@@ -446,7 +446,7 @@ def test_split_value_accepts_uneven_packed_dp_shard():
     assert not state.failed
 
 
-def test_finish_training_evals_before_model_offload(monkeypatch):
+def test_finish_training_preserves_model_move_contract(monkeypatch):
     """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,

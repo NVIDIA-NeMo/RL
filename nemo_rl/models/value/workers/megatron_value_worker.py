@@ -621,7 +621,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
-                        compute_mtp_loss=False,
                     )
 
                 # Empty unused memory
@@ -861,7 +860,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                         defer_fp32_logits=self.defer_fp32_logits,
                         global_valid_seqs=one,
                         global_valid_toks=one,
-                        compute_mtp_loss=False,
                     )
                     executed = True
                 if not executed:
@@ -1050,7 +1048,6 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 input_ids=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                compute_mtp_loss=False,
                 **additional_kwargs,
             )
 

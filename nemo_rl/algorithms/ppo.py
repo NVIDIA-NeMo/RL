@@ -218,7 +218,7 @@ class PPOConfig(BaseModel, extra="allow"):
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
     # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
-    value_training_mode: Literal["split", "whole_batch"] = "split"
+    value_training_mode: Literal["split", "whole_batch"] = "whole_batch"
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)

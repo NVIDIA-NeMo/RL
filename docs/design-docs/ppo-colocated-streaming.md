@@ -43,8 +43,11 @@ For a batch of 128, this occurs with a minimum of 86 through 127.
    offloading policy parameters and optimizer state. Normalize gradients by the
    full step's actual valid-token or sequence count, then perform one policy
    optimizer/scheduler update.
-3. Refit the policy before full-batch critic training. Every critic epoch
-   uses the assembled original batch and frozen GAE returns.
+3. Refit the policy before critic training. In the default `whole_batch` mode,
+   every critic epoch uses the assembled original batch. In `split` mode,
+   each epoch begins a critic step, replays the original chunks with frozen GAE
+   returns, then finishes with one optimizer update. Neither mode overlaps
+   critic training with the policy update here.
 4. Release consumed replay rows after both updates finish. Checkpoint exclusion
    covers the entire update; completed-step counters advance after critic training.
 
@@ -94,7 +97,9 @@ configuration, so parameter offload cannot preserve resident gradients.
 Keeping policy gradients on GPU avoids their CPU transfers between chunks but
 leaves less GPU memory for the value-inference batch.
 Chunks and the full batch must satisfy both models' data-parallel alignment and,
-without packing, static microbatch alignment. No samples are duplicated or dropped;
+without packing or dynamic batching, static training and inference microbatch
+alignment. `async_rl.min_groups_for_streaming_train` must be at least the
+policy/value prompt-group multiple computed at setup. No samples are duplicated or dropped;
 the existing no-short-batch PPO guard remains.
 
 Verify actual chunking in `train_pump: step ... chunk ...` and
