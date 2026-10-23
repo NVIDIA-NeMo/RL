@@ -46,7 +46,9 @@ Sources:
 - AutoModel: [main branch at `41f926247`](https://github.com/NVIDIA-NeMo/Automodel/commit/41f926247376f282bfe7c7e3a0a1e4d07229e0b3)
   — MiniMax-M3.1 checkpoint support
   ([PR #4491](https://github.com/NVIDIA-NeMo/Automodel/pull/4491)) is merged.
-- vLLM: `<vllm-repo-url>` at `<vllm-branch-or-commit>` — MiniMax-M3.1 support.
+- vLLM: [`minimax-m31-flash` branch](https://github.com/vllm-project/vllm/tree/minimax-m31-flash)
+  — MiniMax-M3.1-Flash support
+  ([PR #63232](https://github.com/vllm-project/vllm/pull/63232)) is not yet merged.
 
 From the NeMo-RL repository root, run:
 
@@ -57,9 +59,8 @@ git clone https://github.com/NVIDIA-NeMo/Automodel.git \
   3rdparty/Automodel-workspace/Automodel
 git -C 3rdparty/Automodel-workspace/Automodel checkout 41f926247376f282bfe7c7e3a0a1e4d07229e0b3
 
-git clone <vllm-repo-url> \
+git clone -b minimax-m31-flash https://github.com/vllm-project/vllm.git \
   3rdparty/vLLM-workspace/vllm
-git -C 3rdparty/vLLM-workspace/vllm checkout <vllm-branch-or-commit>
 ```
 
 Published NeMo-RL containers do not yet include the full MiniMax-M3.1 runtime
