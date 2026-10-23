@@ -745,11 +745,7 @@ class NemoGym(EnvironmentInterface):
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
-        from nemo_gym.server_utils import (
-            HEAD_SERVER_KEY_NAME,
-            BaseServerConfig,
-            ServerClient,
-        )
+        from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
@@ -898,12 +894,9 @@ Depending on your data shape, you may want to change these values."""
             host=self.node_ip,
             port=self.head_server_port,
         )
-        # Resolve once at startup; synchronous per-group config fetches block
-        # the actor event loop that also delivers capture receipts.
-        self._server_client = ServerClient.load_from_global_config(
-            self.head_server_config
-        )
-        self.rch = RolloutCollectionHelper(server_client=self._server_client)
+        # Repeated synchronous config loads can delay capture receipts past
+        # their deadline. A fresh helper per startup keeps its cache current.
+        self.rch = RolloutCollectionHelper(reuse_server_client=True)
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
