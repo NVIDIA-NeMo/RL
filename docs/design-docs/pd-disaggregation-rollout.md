@@ -1,7 +1,9 @@
 # NemoRL<>TRTLLM Disaggregation Rollout (Experimental)
 
 > **Experimental**: PD disaggregation is wired for the TensorRT-LLM backend on the
-> NeMo-Gym rollout path only.
+> NeMo-Gym rollout path only. The managed Dynamo backend reads the same
+> `generation.disaggregation` block with one fleet-wide frontend; see
+> [Managed Dynamo generation design](dynamo-integration.md).
 
 NeMo RL owns the *replica* (which engines exist, how they are placed, and their
 lifecycle) and the *refit safety* (what happens when weights change mid-request). It

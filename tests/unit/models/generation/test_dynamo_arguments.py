@@ -104,6 +104,20 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
             )
 
 
+def test_disaggregation_tiles_prefill_then_decode_engines_per_replica() -> None:
+    aggregated = DynamoConfig.model_validate(_config())
+    assert aggregated.replica_width == 2
+    assert aggregated.worker_roles(4) == ["aggregated", "aggregated"]
+
+    layout = {"enabled": True, "num_prefill_engines": 1, "num_decode_engines": 2}
+    disaggregated = DynamoConfig.model_validate(_config(disaggregation=layout))
+    # TP=2, so one replica is (1 + 2) engines x 2 GPUs.
+    assert disaggregated.replica_width == 6
+    assert disaggregated.worker_roles(12) == ["prefill", "decode", "decode"] * 2
+    with pytest.raises(ValueError, match="not a multiple of one replica's 6 GPUs"):
+        disaggregated.worker_roles(8)
+
+
 @pytest.mark.parametrize(
     ("override", "match"),
     [
@@ -123,6 +137,27 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
             "vllm_kwargs.speculative_config",
         ),
         ({"vllm_kwargs": {"worker_extension_cls": "x.Y"}}, "worker_extension_cls"),
+        (
+            {"disaggregation": {"enabled": True, "num_decode_engines": 0}},
+            "at least one prefill and one decode",
+        ),
+        (
+            {"disaggregation": {"enabled": True, "num_frontend_workers": 2}},
+            "num_frontend_workers must be 1",
+        ),
+        (
+            {"disaggregation": {"enabled": True, "frontend_tokenize": True}},
+            "frontend_tokenize false",
+        ),
+        (
+            {
+                "disaggregation": {"enabled": True},
+                "vllm_kwargs": {
+                    "speculative_config": {"method": "mtp", "num_speculative_tokens": 1}
+                },
+            },
+            "speculative_config is not supported with",
+        ),
     ],
 )
 def test_config_rejects_unsupported_modes(override, match) -> None:
@@ -229,8 +264,6 @@ def test_config_warns_only_for_active_unsupported_fields(field) -> None:
     [
         ({"bad_words": ["foo"]}, ["bad_words"]),
         ({"ignore_eos": True}, ["ignore_eos"]),
-        # The validator receives disaggregation as a DisaggConfig, not a dict.
-        ({"disaggregation": DisaggConfig(enabled=True)}, ["disaggregation"]),
         # Inherited shared-YAML settings the exemplars carry stay quiet.
         ({"disaggregation": DisaggConfig(enabled=False)}, []),
         ({"ignore_eos": False}, []),
@@ -365,6 +398,8 @@ def test_worker_argv_forwards_speculative_config_unless_disabled() -> None:
             vllm_cfg=_config()["vllm_cfg"],
             vllm_kwargs={"speculative_config": speculative_config},
             dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+            worker_role="aggregated",
+            kv_event_port=None,
         )
 
     enabled = {"method": "mtp", "num_speculative_tokens": 2}
@@ -392,6 +427,8 @@ def test_worker_argv_translates_structured_fields_and_warns_unclassified() -> No
         vllm_cfg=vllm_cfg,
         vllm_kwargs={"max_num_seqs": 16, "hf_overrides": {"rope_theta": 1e6}},
         dynamo_cfg=cfg,
+        worker_role="aggregated",
+        kv_event_port=None,
     )
 
     assert _flag_value(argv, "--model") == "model"
@@ -413,17 +450,61 @@ def test_worker_argv_rejects_replaced_and_managed_options() -> None:
     }
     with pytest.raises(ValueError, match="worker_args.custom_jinja_template"):
         DynamoConfig.model_validate(generation_config)
-    config = _dynamo_cfg()
-    config["worker_args"]["extra_cli_args"] = ["--model", "other"]
-    with pytest.raises(ValueError, match="--model is set by both"):
-        build_dynamo_vllm_argv(
+
+    def argv_for(extra_cli_args, worker_role="aggregated", kv_event_port=None):
+        config = _dynamo_cfg()
+        config["worker_args"]["extra_cli_args"] = extra_cli_args
+        return build_dynamo_vllm_argv(
             model_name="model",
             namespace="namespace",
             seed=0,
             vllm_cfg=_config()["vllm_cfg"],
             vllm_kwargs={},
             dynamo_cfg=DynamoCfg.model_validate(config),
+            worker_role=worker_role,
+            kv_event_port=kv_event_port,
         )
+
+    with pytest.raises(ValueError, match="--model is set by both"):
+        argv_for(["--model", "other"])
+    for flag in ("--disaggregation-mode", "--kv-transfer-config", "--kv-events-config"):
+        with pytest.raises(ValueError, match=f"may not override managed option {flag}"):
+            argv_for([flag, "x"], worker_role="prefill")
+    with pytest.raises(ValueError, match="decode workers do not publish KV events"):
+        argv_for([], worker_role="decode", kv_event_port=4200)
+
+
+@pytest.mark.parametrize(
+    ("role", "kv_event_port"),
+    [("aggregated", None), ("prefill", None), ("prefill", 4200), ("decode", None)],
+)
+def test_worker_argv_sets_the_disaggregation_role(role, kv_event_port) -> None:
+    argv = build_dynamo_vllm_argv(
+        model_name="model",
+        namespace="namespace",
+        seed=0,
+        vllm_cfg=_config()["vllm_cfg"],
+        vllm_kwargs={},
+        dynamo_cfg=DynamoCfg.model_validate(_dynamo_cfg()),
+        worker_role=role,
+        kv_event_port=kv_event_port,
+    )
+
+    if role == "aggregated":
+        assert "--disaggregation-mode" not in argv
+        assert "--kv-transfer-config" not in argv
+    else:
+        assert _flag_value(argv, "--disaggregation-mode") == role
+        assert json.loads(_flag_value(argv, "--kv-transfer-config")) == {
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_both",
+        }
+    if kv_event_port is None:
+        assert "--kv-events-config" not in argv
+    else:
+        events = json.loads(_flag_value(argv, "--kv-events-config"))
+        assert events["endpoint"] == "tcp://*:4200"
+        assert events["enable_kv_cache_events"] is True
 
 
 def test_config_accepts_inherited_unused_sections() -> None:
@@ -507,6 +588,8 @@ def test_every_worker_config_field_reaches_argv(monkeypatch) -> None:
         vllm_cfg=_config()["vllm_cfg"],
         vllm_kwargs={},
         dynamo_cfg=cfg,
+        worker_role="aggregated",
+        kv_event_port=None,
     )
 
     configured_fields = {

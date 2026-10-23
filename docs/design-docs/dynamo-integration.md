@@ -78,6 +78,47 @@ raise, so neither side hangs in NCCL.
 KV-cache invalidation stays outside the generic synchronizer because GRPO's
 cache mode determines where it runs.
 
+## Prefill/decode disaggregation
+
+`policy.generation.disaggregation` assigns each engine a role, `prefill` or
+`decode`, in launch order: replicas are tiled prefill engines first, as for
+TRT-LLM. Roles share one engine shape, so each engine is still a full `TP x PP`
+replica of the policy and both refit transports need no role-specific code.
+Launch order is also refit rank order.
+
+Each role runs `dynamo.vllm --disaggregation-mode <role>` with the NIXL
+connector, on a node-local NIXL side-channel port. Dynamo registers decode
+engines as the `backend` component and prefill engines as `prefill`. The
+frontend serves nothing until both are live and never falls back to
+aggregated serving, so startup waits for the expected count of each component.
+Unlike TRT-LLM's per-replica frontends, one Dynamo frontend routes across the
+whole fleet.
+
+A refit pause that clears caches cannot freeze a disaggregated fleet in place:
+vLLM's cache reset raises while a decode engine still holds a request waiting
+for remote KV, and a prefill engine still holds blocks it handed off. So with
+`clear_cache` the pause drains instead (`wait`), and without it the engines
+freeze (`keep`) in the same order.
+
+The drain is ordered. vLLM queues new requests on a paused engine. A
+prefill engine's `wait` drain also keeps stepping until decode has pulled every
+prompt KV it handed off. If decode were paused first, a request prefilled just
+before the drain would sit on the paused decode engine without pulling. The
+prefill engine's KV lease (30 s by default) would then expire and its blocks
+would be freed and cleared, and after resume decode would read those blocks;
+NIXL does not check a lease on a normal read. So prefill engines pause first,
+while decode is still running. vLLM's `wait` drain also counts only running
+requests and starts no waiting one, so a decode request still receiving its
+prompt KV would keep its blocks and fail the cache reset. Decode engines are
+therefore paused only once each reports `vllm:num_requests_waiting` of zero on
+its `/metrics`; with prefill paused, that queue only empties. Resume runs decode
+first, so no new handoff waits on a paused decode engine.
+
+Caches are cleared through `pause_generation(clear_cache=True)`, which fails
+loudly when vLLM cannot reset its prefix cache. Dynamo's `flush_cache` route
+and `reset_prefix_cache=True` on the update route ignore that failure, so
+neither is used.
+
 ## Dependencies
 
 `DynamoVllmWorker` runs in the `dynamo` extra's actor venv: the `vllm` extra

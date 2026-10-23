@@ -25,6 +25,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.dynamo import dynamo_generation as generation_module
+from nemo_rl.models.generation.dynamo import http_client as http_client_module
 from nemo_rl.models.generation.dynamo import metrics as metrics_module
 from nemo_rl.models.generation.dynamo import refit as refit_module
 from nemo_rl.models.generation.dynamo.metrics import (
@@ -101,7 +102,11 @@ def _patch_runtime(
     calls: list[str] | None = None,
 ) -> None:
     endpoints = workers or [
-        {"instance_id": "worker-0", "system_url": "http://10.0.0.2:4000"}
+        {
+            "instance_id": "worker-0",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        }
     ]
     events = calls if calls is not None else []
 
@@ -155,8 +160,16 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     _patch_runtime(
         monkeypatch,
         workers=[
-            {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-            {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://10.0.0.2:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://10.0.0.3:4000",
+                "role": "aggregated",
+            },
         ],
         calls=calls,
     )
@@ -369,7 +382,7 @@ def test_collective_refit_drives_the_worker_extension_and_survives_pickling(
 
     # The metrics sampler starts in the process that reads it: the driver starts
     # none, and the SingleController's telemetry pump starts it in the copy.
-    monkeypatch.setattr(metrics_module, "_http_get_text", lambda *args: None)
+    monkeypatch.setattr(metrics_module, "http_get_text", lambda *args: None)
     assert generation._metrics_sampler is None
     assert not any(restored.drain_latest_logger_metrics().values())
     assert restored._metrics_sampler is not None
@@ -418,8 +431,16 @@ def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
     monkeypatch.setattr(refit_module.ray, "get", get)
     channel = DynamoRefitChannel(
         [
-            {"instance_id": "a", "system_url": "http://worker-a:4000"},
-            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://worker-a:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://worker-b:4000",
+                "role": "aggregated",
+            },
         ],
         engine_world_size=1,
         control_timeout_s=10,
@@ -440,8 +461,16 @@ def test_refit_pause_freezes_every_worker_and_resume_restores_them(
     monkeypatch, clear_cache: bool
 ) -> None:
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {
+            "instance_id": "a",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        },
+        {
+            "instance_id": "b",
+            "system_url": "http://10.0.0.3:4000",
+            "role": "aggregated",
+        },
     ]
     _patch_runtime(monkeypatch, workers=workers)
     calls = []
@@ -489,8 +518,16 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     monkeypatch.setattr(refit_module.ray, "get", get)
     channel = DynamoRefitChannel(
         [
-            {"instance_id": "a", "system_url": "http://worker-a:4000"},
-            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+            {
+                "instance_id": "a",
+                "system_url": "http://worker-a:4000",
+                "role": "aggregated",
+            },
+            {
+                "instance_id": "b",
+                "system_url": "http://worker-b:4000",
+                "role": "aggregated",
+            },
         ],
         engine_world_size=1,
         control_timeout_s=10,
@@ -506,9 +543,110 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     ]
 
 
+def test_disaggregated_fleet_drains_prefill_then_started_decode(monkeypatch) -> None:
+    calls = []
+    pause_modes = []
+    failing_pause: set[str] = set()
+    # Requests each decode engine holds but has not started, poll by poll.
+    waiting = {"d0": [1, 0], "d1": [0]}
+
+    def remote(**kwargs):
+        calls.append((kwargs["route"], kwargs["system_url"]))
+        if kwargs["route"] == "pause_generation":
+            pause_modes.append(kwargs["payload"]["mode"])
+        return (kwargs["route"], kwargs["system_url"])
+
+    def get(ref):
+        if ref[0] == "pause_generation" and ref[1] in failing_pause:
+            raise RuntimeError("pause refused")
+        return True
+
+    def metrics_text(url, timeout_s):
+        engine = url.removesuffix("/metrics")
+        calls.append(("metrics", engine))
+        counts = waiting[engine]
+        count = counts.pop(0) if len(counts) > 1 else counts[0]
+        return f'vllm:num_requests_waiting{{engine="0"}} {count}\n'
+
+    monkeypatch.setattr(refit_module._post_worker_route, "remote", remote)
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    monkeypatch.setattr(refit_module, "http_get_text", metrics_text)
+    monkeypatch.setattr(refit_module.time, "sleep", lambda _: None)
+
+    def channel(control_timeout_s):
+        # Launch order tiles replicas prefill first: [p0, d0, p1, d1].
+        return DynamoRefitChannel(
+            [
+                {"instance_id": name, "system_url": name, "role": role}
+                for name, role in (
+                    ("p0", "prefill"),
+                    ("d0", "decode"),
+                    ("p1", "prefill"),
+                    ("d1", "decode"),
+                )
+            ],
+            engine_world_size=1,
+            control_timeout_s=control_timeout_s,
+        )
+
+    # A cache-clearing pause drains: decode is paused only once it has started
+    # every handed-off request, and resumes before prefill hands it anything new.
+    fleet = channel(10)
+    fleet.pause(clear_cache=True, timeout_s=None)
+    fleet.resume(timeout_s=None)
+    assert pause_modes == ["wait"] * 4
+    assert calls == [
+        ("pause_generation", "p0"),
+        ("pause_generation", "p1"),
+        ("metrics", "d0"),
+        ("metrics", "d1"),
+        ("metrics", "d0"),
+        ("metrics", "d1"),
+        ("pause_generation", "d0"),
+        ("pause_generation", "d1"),
+        ("resume_generation", "d0"),
+        ("resume_generation", "d1"),
+        ("resume_generation", "p0"),
+        ("resume_generation", "p1"),
+    ]
+
+    # A failed decode pause rolls back decode first, then prefill.
+    calls.clear()
+    failing_pause.add("d1")
+    with pytest.raises(RuntimeError, match="pause/clear failed for d1"):
+        fleet.pause(clear_cache=True, timeout_s=None)
+    assert calls[6:] == [
+        ("resume_generation", "d0"),
+        ("resume_generation", "p0"),
+        ("resume_generation", "p1"),
+    ]
+
+    # Decode that never starts its handoffs fails the drain, and prefill resumes.
+    calls.clear()
+    waiting["d0"] = [1]
+    with pytest.raises(RuntimeError, match="d0: vllm:num_requests_waiting=1.0"):
+        channel(0).pause(clear_cache=True, timeout_s=None)
+    assert calls[-2:] == [("resume_generation", "p0"), ("resume_generation", "p1")]
+
+    # Without a cache clear the fleet freezes in place, prefill first: no handoff
+    # wait, since frozen engines keep the KV they are still exchanging.
+    calls.clear()
+    pause_modes.clear()
+    failing_pause.clear()
+    fleet.pause(clear_cache=False, timeout_s=None)
+    assert calls == [("pause_generation", name) for name in ("p0", "p1", "d0", "d1")]
+    assert pause_modes == ["keep"] * 4
+
+
 def test_metrics_parser_and_sampler_aliases() -> None:
     sampler = DynamoMetricsSampler(
-        [{"instance_id": "a", "system_url": "http://worker:4000"}],
+        [
+            {
+                "instance_id": "a",
+                "system_url": "http://worker:4000",
+                "role": "aggregated",
+            }
+        ],
         interval_s=1,
         include_prefixes=None,
         exclude_prefixes=None,
@@ -540,13 +678,13 @@ def test_metrics_parser_and_sampler_aliases() -> None:
 
 def test_metrics_http_errors_are_ignored(monkeypatch) -> None:
     monkeypatch.setattr(
-        metrics_module.urllib.request,
+        http_client_module.urllib.request,
         "urlopen",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            metrics_module.urllib.error.URLError("refused")
+            http_client_module.urllib.error.URLError("refused")
         ),
     )
-    assert metrics_module._http_get_text("http://worker/metrics", 1) is None
+    assert http_client_module.http_get_text("http://worker/metrics", 1) is None
 
 
 def test_completion_parser_rejects_misaligned_logprobs() -> None:
@@ -679,10 +817,14 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
 
 
 def _reshard_generation(monkeypatch, *, refit_transport="nccl_reshard"):
-    """A two-engine, TP=2 DynamoGeneration whose engine RPCs are recorded, not sent."""
+    """A one-prefill, one-decode TP=2 DynamoGeneration whose engine RPCs are recorded.
+
+    Every engine is a full replica under disaggregation, so refit gives both
+    roles rank prefixes exactly as it would two aggregated engines.
+    """
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000", "role": "prefill"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000", "role": "decode"},
     ]
     _patch_runtime(monkeypatch, workers=workers)
     posts: list[dict[str, Any]] = []
@@ -698,6 +840,12 @@ def _reshard_generation(monkeypatch, *, refit_transport="nccl_reshard"):
         lambda **kwargs: staged.append(kwargs) or True,
     )
     monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    # The decode engine has started every handoff, so drains pause it at once.
+    monkeypatch.setattr(
+        refit_module,
+        "http_get_text",
+        lambda url, timeout_s: "vllm:num_requests_waiting 0\n",
+    )
     config = _config(tp=2)
     config["refit_transport"] = refit_transport
     generation = DynamoGeneration(cluster=object(), config=config)
@@ -980,8 +1128,16 @@ def test_mtp_drafter_is_configured_on_every_engine(
     monkeypatch, mtp_from_refit, load_format, expected_rpcs
 ) -> None:
     workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+        {
+            "instance_id": "a",
+            "system_url": "http://10.0.0.2:4000",
+            "role": "aggregated",
+        },
+        {
+            "instance_id": "b",
+            "system_url": "http://10.0.0.3:4000",
+            "role": "aggregated",
+        },
     ]
     _patch_runtime(monkeypatch, workers=workers)
     posts = []

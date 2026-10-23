@@ -21,6 +21,7 @@ methods through Dynamo's per-worker ``/engine/*`` RL routes, which forward an
 NCCL, exactly as for the vLLM backend.
 """
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -28,8 +29,10 @@ from typing import Any
 import ray
 
 from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
+from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
 from nemo_rl.models.generation.dynamo.http_client import (
     format_dynamo_error,
+    http_get_text,
     http_post_json,
 )
 from nemo_rl.utils.staged_payload import encode_staged_payload
@@ -45,6 +48,11 @@ _UPDATE_ROUTE = "update_weights_from_distributed"
 _INIT_ROUTE_CLIENT_MARGIN_S = 30.0
 # Margin past a refit's own deadline for the HTTP call that carries it.
 _REFIT_CLIENT_MARGIN_S = 60.0
+# vLLM's gauge of every request an engine holds but is not running, including
+# those still receiving prompt KV; Dynamo serves it on each worker's /metrics.
+_WAITING_REQUESTS_METRIC = "vllm:num_requests_waiting"
+_HANDOFF_POLL_INTERVAL_S = 0.2
+_METRICS_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -53,12 +61,14 @@ class DynamoWorkerEndpoint:
 
     instance_id: str
     system_url: str
+    role: DynamoWorkerRole
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any]) -> "DynamoWorkerEndpoint":
         return cls(
             instance_id=str(metadata["instance_id"]),
             system_url=str(metadata["system_url"]),
+            role=metadata["role"],
         )
 
 
@@ -122,6 +132,27 @@ def _stage_and_post_worker_route(  # pragma: no cover
         )
     _post_route(system_url, _INIT_ROUTE, payload, timeout_s)
     return True
+
+
+def _waiting_requests(
+    workers: Sequence[DynamoWorkerEndpoint],
+) -> dict[str, float | None]:
+    """Each engine's waiting requests by admin URL; None when it cannot be read."""
+    # metrics.py imports this module.
+    from nemo_rl.models.generation.dynamo.metrics import parse_prometheus_metrics
+
+    waiting: dict[str, float | None] = {}
+    for worker in workers:
+        text = http_get_text(f"{worker.system_url}/metrics", _METRICS_TIMEOUT_S)
+        metrics = (
+            {}
+            if text is None
+            else parse_prometheus_metrics(text, (_WAITING_REQUESTS_METRIC,))
+        )
+        waiting[worker.system_url] = metrics.get(
+            _WAITING_REQUESTS_METRIC.replace(":", "_")
+        )
+    return waiting
 
 
 class DynamoRefitChannel:
@@ -393,10 +424,29 @@ class DynamoRefitChannel:
         """Receive one nccl_reshard refit on every engine."""
         return self._refit_every_engine("nrl_nccl_reshard_refit", refit_timeout_s, {})
 
+    def _drain_phases(self) -> tuple[tuple[DynamoWorkerEndpoint, ...], ...]:
+        """Workers in pause order: prefill engines, then everything else.
+
+        A prefill engine's drain ends only once decode engines have pulled every
+        prompt KV it handed off, so decode must still be running then. Pausing
+        decode first would strand such a handoff until the prefill engine's KV
+        lease expires, and after resume decode would read the freed blocks.
+        Decode is then paused once it has started every handoff
+        (``_wait_for_handoffs``).
+        """
+        prefill = tuple(worker for worker in self._workers if worker.role == "prefill")
+        rest = tuple(worker for worker in self._workers if worker.role != "prefill")
+        return tuple(phase for phase in (prefill, rest) if phase)
+
     def _pause_workers(
-        self, *, mode: str, clear_cache: bool, timeout_s: float
+        self,
+        workers: Sequence[DynamoWorkerEndpoint],
+        *,
+        mode: str,
+        clear_cache: bool,
+        timeout_s: float,
     ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
-        """Pause every worker in vLLM's ``mode``; new requests wait for resume."""
+        """Pause workers in vLLM's ``mode``; new requests wait for resume."""
         pause_futures = [
             _post_worker_route.remote(
                 system_url=worker.system_url,
@@ -404,11 +454,11 @@ class DynamoRefitChannel:
                 payload={"mode": mode, "clear_cache": clear_cache},
                 timeout_s=timeout_s,
             )
-            for worker in self._workers
+            for worker in workers
         ]
         paused_workers: list[DynamoWorkerEndpoint] = []
         pause_errors: list[str] = []
-        for worker, future in zip(self._workers, pause_futures, strict=True):
+        for worker, future in zip(workers, pause_futures, strict=True):
             try:
                 ray.get(future)
             except Exception as error:
@@ -416,6 +466,51 @@ class DynamoRefitChannel:
             else:
                 paused_workers.append(worker)
         return paused_workers, pause_errors
+
+    def _wait_for_handoffs(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
+        """Wait until no decode engine holds a request it has not started.
+
+        vLLM's ``wait`` pause drains only running requests and starts no waiting
+        one, so a request still receiving its prompt KV keeps its blocks and the
+        cache reset that completes the pause fails. Once every prefill engine has
+        drained nothing new is handed off, so each waiting queue only empties.
+        """
+        deadline = time.monotonic() + self._control_timeout_s
+        waiting = _waiting_requests(workers)
+        while any(count != 0 for count in waiting.values()):
+            if time.monotonic() >= deadline:
+                return [
+                    f"{url}: {_WAITING_REQUESTS_METRIC}={count} after "
+                    f"{self._control_timeout_s}s"
+                    for url, count in waiting.items()
+                    if count != 0
+                ]
+            time.sleep(_HANDOFF_POLL_INTERVAL_S)
+            waiting = _waiting_requests(workers)
+        return []
+
+    def _pause_in_order(
+        self, *, mode: str, clear_cache: bool, timeout_s: float
+    ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
+        """Pause phase by phase, stopping at the first phase that fails.
+
+        A drain (``wait``) pauses decode only once it has started every prefill
+        handoff; a frozen (``keep``) prefill engine hands off nothing new, and a
+        frozen decode engine keeps any handoff it is still receiving.
+        """
+        paused_workers: list[DynamoWorkerEndpoint] = []
+        for index, phase in enumerate(self._drain_phases()):
+            if index > 0 and mode == "wait":
+                handoff_errors = self._wait_for_handoffs(phase)
+                if handoff_errors:
+                    return paused_workers, handoff_errors
+            phase_paused, pause_errors = self._pause_workers(
+                phase, mode=mode, clear_cache=clear_cache, timeout_s=timeout_s
+            )
+            paused_workers.extend(phase_paused)
+            if pause_errors:
+                return paused_workers, pause_errors
+        return paused_workers, []
 
     def _resume_workers(
         self, workers: Sequence[DynamoWorkerEndpoint], *, timeout_s: float
@@ -440,19 +535,39 @@ class DynamoRefitChannel:
                 resume_errors.append(f"{worker.system_url}: {error}")
         return resume_errors
 
+    def _resume_in_order(
+        self, workers: Sequence[DynamoWorkerEndpoint], *, timeout_s: float
+    ) -> list[str]:
+        """Resume in reverse pause order, so no handoff waits on a paused decode."""
+        resume_errors: list[str] = []
+        for phase in reversed(self._drain_phases()):
+            resume_errors += self._resume_workers(
+                [worker for worker in phase if worker in workers],
+                timeout_s=timeout_s,
+            )
+        return resume_errors
+
     def pause(self, *, clear_cache: bool, timeout_s: float | None) -> None:
         """Freeze every worker's requests in place ahead of a weight update.
 
         Frozen requests continue on the new weights after :meth:`resume`; with
-        ``clear_cache`` their KV is dropped now, so they recompute it. Workers
-        that confirmed the pause are resumed if any peer fails.
+        ``clear_cache`` their KV is dropped now, so they recompute it. vLLM cannot
+        drop KV that a decode engine is still receiving, so a disaggregated fleet
+        asked to clear its cache drains instead, as :meth:`flush_cache` does.
+        Workers that confirmed the pause are resumed if any peer fails.
         """
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
-        paused_workers, pause_errors = self._pause_workers(
-            mode="keep", clear_cache=clear_cache, timeout_s=timeout_s
+        if clear_cache and any(worker.role == "prefill" for worker in self._workers):
+            # The drain waits for running requests, which control_timeout_s bounds.
+            timeout_s = self._control_timeout_s
+            mode = "wait"
+        else:
+            mode = "keep"
+        paused_workers, pause_errors = self._pause_in_order(
+            mode=mode, clear_cache=clear_cache, timeout_s=timeout_s
         )
         if pause_errors:
-            resume_errors = self._resume_workers(paused_workers, timeout_s=timeout_s)
+            resume_errors = self._resume_in_order(paused_workers, timeout_s=timeout_s)
             details = "pause/clear failed for " + "; ".join(pause_errors)
             if resume_errors:
                 details += "; resume failed for " + "; ".join(resume_errors)
@@ -461,7 +576,7 @@ class DynamoRefitChannel:
     def resume(self, *, timeout_s: float | None) -> None:
         """Resume every worker after a weight update."""
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
-        resume_errors = self._resume_workers(self._workers, timeout_s=timeout_s)
+        resume_errors = self._resume_in_order(self._workers, timeout_s=timeout_s)
         if resume_errors:
             raise RuntimeError(
                 "Dynamo resume after weight update failed for "
@@ -473,10 +588,10 @@ class DynamoRefitChannel:
 
         Workers that confirmed the pause are resumed even if a peer fails.
         """
-        paused_workers, pause_errors = self._pause_workers(
+        paused_workers, pause_errors = self._pause_in_order(
             mode="wait", clear_cache=True, timeout_s=self._control_timeout_s
         )
-        resume_errors = self._resume_workers(
+        resume_errors = self._resume_in_order(
             paused_workers, timeout_s=self._control_timeout_s
         )
 

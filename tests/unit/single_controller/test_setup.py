@@ -178,6 +178,7 @@ def _make_master_config(
             "control_timeout_s": 900.0,
         }
         generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+        generation_config["disaggregation"] = {"enabled": False}
     master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
@@ -1710,6 +1711,16 @@ class TestSetup:
                 ),
                 "Dynamo frontend owns request routing",
                 id="fleet_health",
+            ),
+            pytest.param(
+                lambda mc: (
+                    mc.policy["generation"]["disaggregation"].update(enabled=True),
+                    mc.policy["generation"]["dynamo_cfg"].update(
+                        control_timeout_s=600.0
+                    ),
+                ),
+                "must be >= request_timeout_s",
+                id="disagg_drain_timeout",
             ),
             pytest.param(
                 lambda mc: mc.policy["generation"]["vllm_cfg"].update(

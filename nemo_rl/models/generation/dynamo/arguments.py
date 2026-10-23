@@ -21,6 +21,7 @@ from typing import Any
 from nemo_rl.models.generation.dynamo.config import (
     DYNAMO_VLLM_FLAGS,
     DynamoCfg,
+    DynamoWorkerRole,
 )
 
 _MANAGED_FLAGS = {
@@ -35,6 +36,11 @@ _MANAGED_FLAGS = {
     "--data-parallel-size",
     "--data-parallel-size-local",
     "--distributed-executor-backend",
+    # Prefill/decode roles, their KV handoff and the prefill KV-event stream
+    # follow policy.generation.disaggregation and NeMo RL's port bands.
+    "--disaggregation-mode",
+    "--kv-transfer-config",
+    "--kv-events-config",
 }
 
 # NeMo RL's vLLM worker extension, which every managed engine loads so the driver
@@ -130,8 +136,16 @@ def build_dynamo_vllm_argv(
     vllm_cfg: Mapping[str, Any],
     vllm_kwargs: Mapping[str, Any],
     dynamo_cfg: DynamoCfg,
+    worker_role: DynamoWorkerRole,
+    kv_event_port: int | None,
 ) -> list[str]:
-    """Build a conflict-free ``python -m dynamo.vllm`` argument list."""
+    """Build a conflict-free ``python -m dynamo.vllm`` argument list.
+
+    ``kv_event_port`` is the prefill worker's KV-event stream, set only when the
+    frontend routes prefill by KV; every other worker passes ``None``.
+    """
+    if kv_event_port is not None and worker_role != "prefill":
+        raise ValueError(f"Dynamo {worker_role} workers do not publish KV events.")
     builder = _ArgvBuilder()
     builder.add("--model", model_name, source="managed runtime")
     builder.add("--served-model-name", model_name, source="managed runtime")
@@ -147,6 +161,27 @@ def build_dynamo_vllm_argv(
     )
     builder.add("--trust-remote-code", source="managed runtime")
     builder.add("--seed", seed, source="managed runtime")
+    if worker_role != "aggregated":
+        builder.add("--disaggregation-mode", worker_role, source="managed runtime")
+        # Decode needs the connector too: without one vLLM ignores the handoff
+        # and silently recomputes the prompt. kv_both is Dynamo 1.5.1's
+        # documented P/D setting; vLLM 0.29 logs a deprecation warning for it.
+        builder.add(
+            "--kv-transfer-config",
+            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            source="managed runtime",
+        )
+    if kv_event_port is not None:
+        builder.add(
+            "--kv-events-config",
+            {
+                "enable_kv_cache_events": True,
+                "endpoint": f"tcp://*:{kv_event_port}",
+                "publisher": "zmq",
+                "topic": "kv-events",
+            },
+            source="managed runtime",
+        )
 
     for key, flag in DYNAMO_VLLM_FLAGS.items():
         value = vllm_cfg.get(key)
