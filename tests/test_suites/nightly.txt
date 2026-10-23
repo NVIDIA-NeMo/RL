@@ -356,6 +356,9 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pac
 # SingleController PPO with router replay (R3) and an MoE critic (Qwen3-30B-A3B, Megatron TP4+PP2+CP2+EP4)
 tests/test_suites/llm/ppo-qwen3-30ba3b-3n8g-megatron-cp2-r3-async-single-controller.sh
 
+# SingleController multimodal PPO with a Megatron VLM critic (Qwen2.5-VL-3B, Geometry3K)
+tests/test_suites/vlm/vlm_ppo-qwen2.5-vl-3b-geometry3k-1n8g-megatron-single-controller.v1.sh
+
 ########
 # GDPO #
 ########

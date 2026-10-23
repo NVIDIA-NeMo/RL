@@ -28,7 +28,6 @@ from megatron.bridge.training.checkpointing import (
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
     LinearForLastLayer,
-    create_value_head_hook,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
 )
@@ -53,6 +52,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -80,6 +80,7 @@ from nemo_rl.models.megatron.setup import (
 from nemo_rl.models.megatron.train import (
     LossPostProcessor,
     megatron_forward_backward,
+    model_forward,
     suspend_activation_offload_for_forward_only,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -99,8 +100,41 @@ from nemo_rl.utils.tensor_ops import pad_and_concat
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _install_value_head_load_skip(chunk: GPTModel) -> None:
-    """Give the chunk a ``hide_loss_modules`` context manager that drops ``output_layer.*``.
+def _report_multimodal_input_once(worker: Any, data: BatchedDataDict[Any]) -> None:
+    """Emit one rank-zero marker proving that media reached the value worker."""
+    if getattr(worker, "_reported_multimodal_input", False):
+        return
+    media_fields = sorted(field for field in PACKED_MULTIMODAL_FIELDS if field in data)
+    if not media_fields or getattr(worker, "rank", 0) != 0:
+        return
+    print(
+        "MegatronValueWorker multimodal input fields: " + ",".join(media_fields),
+        flush=True,
+    )
+    worker._reported_multimodal_input = True
+
+
+def _value_head_parent(chunk: GPTModel) -> tuple[Any, str]:
+    """Return the module and state-dict path that own a chunk's language head.
+
+    Plain GPT models expose ``output_layer`` directly. Megatron-Bridge VLM
+    wrappers (including Qwen2.5-VL) keep the causal-LM head under
+    ``language_model.output_layer``; installing a top-level head on those
+    wrappers leaves the real vocabulary head active and makes the critic emit
+    logits instead of scalar values.
+    """
+    language_model = getattr(chunk, "language_model", None)
+    if language_model is not None and hasattr(language_model, "output_layer"):
+        return language_model, "language_model.output_layer"
+    if hasattr(chunk, "output_layer"):
+        return chunk, "output_layer"
+    raise AttributeError(
+        f"Post-process model chunk {type(chunk).__name__} has no supported output layer"
+    )
+
+
+def _install_value_head_load_skip(chunk: GPTModel, output_layer_path: str) -> None:
+    """Install ``hide_loss_modules`` for the actual scalar-head state-dict path.
 
     The freshly-initialized value head is never in a base checkpoint, so Megatron-Bridge
     enters this context during finetune loads (and HF->Megatron conversion) to skip it.
@@ -117,7 +151,7 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
         )
         if chunk._skip_value_head_in_sharded_sd:
             for key in list(sharded_sd.keys()):
-                if key.startswith(f"{prefix}output_layer."):
+                if key.startswith(f"{prefix}{output_layer_path}."):
                     del sharded_sd[key]
         return sharded_sd
 
@@ -136,17 +170,25 @@ def _install_value_head_load_skip(chunk: GPTModel) -> None:
 
 
 def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
-    """Build the pre-wrap hook that installs the value head and lets it skip base loads."""
-    base_hook = create_value_head_hook(
-        hidden_size=hidden_size, sequence_parallel=sequence_parallel
-    )
+    """Build a pre-wrap scalar-head hook for both GPT and VLM model layouts."""
 
     def hook(model):
-        model = base_hook(model)
-        for chunk in model if isinstance(model, list) else [model]:
-            if isinstance(getattr(chunk, "output_layer", None), LinearForLastLayer):
-                _install_value_head_load_skip(chunk)
-        return model
+        chunks = model if isinstance(model, list) else [model]
+        for chunk in chunks:
+            if not getattr(chunk, "post_process", False):
+                continue
+            output_parent, output_layer_path = _value_head_parent(chunk)
+            output_parent.output_layer = LinearForLastLayer(
+                input_size=hidden_size,
+                output_size=1,
+                sequence_parallel=sequence_parallel,
+                bias=False,
+                dropout=0.0,
+                output_in_fp32=True,
+                tp_group=getattr(getattr(chunk, "pg_collection", None), "tp", None),
+            )
+            _install_value_head_load_skip(chunk, output_layer_path)
+        return chunks
 
     return hook
 
@@ -519,6 +561,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             Dictionary with training metrics (global_loss, grad_norm, etc.)
         """
+        _report_multimodal_input_once(self, data)
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -734,6 +777,7 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         Returns:
             BatchedDataDict with "values" key of shape [batch_size, seq_length].
         """
+        _report_multimodal_input_once(self, data)
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
@@ -770,15 +814,15 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             position_ids = processed_mb.position_ids
             packed_seq_params = processed_mb.packed_seq_params
 
-            additional_kwargs = {}
-            if packed_seq_params is not None:
-                additional_kwargs["packed_seq_params"] = packed_seq_params
-
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
+            output_tensor = model_forward(
+                model=model,
+                data_dict=data_dict,
+                input_ids_cp_sharded=input_ids_cp_sharded,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                **additional_kwargs,
+                packed_seq_params=packed_seq_params,
+                defer_fp32_logits=getattr(self, "defer_fp32_logits", False),
+                straggler_timer=self.mcore_state.straggler_timer,
             )
 
             def collection_fn(output_tensor):
