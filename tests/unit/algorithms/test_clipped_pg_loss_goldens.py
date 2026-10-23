@@ -163,6 +163,7 @@ def test_clipped_pg_full_eager_preserves_backward_compatibility(
             atol=1e-12,
         )
 
+    assert metrics.pop("policy_support_excluded_tokens") == 0
     assert metrics.keys() == expected["metrics"].keys()
     for name, value in metrics.items():
         _assert_scalar_close(value, expected["metrics"][name])
@@ -196,6 +197,7 @@ def test_clipped_pg_minimal_preserves_backward_compatible_loss_and_gradients(
         expected_metric_names.add("sampling_importance_ratio")
     if case["config"].get("truncated_importance_sampling_type") is not None:
         expected_metric_names.add("is_oob_ratio")
+    assert metrics.pop("policy_support_excluded_tokens") == 0
     assert metrics.keys() == expected_metric_names
     for name, value in metrics.items():
         _assert_scalar_close(value, expected["metrics"][name])

@@ -143,7 +143,7 @@ def test_all_config_files_have_required_keys(config_file):
         # ``distillation`` branch below. The multi-teacher cross-tokenizer config
         # is identified by its top-level ``teachers`` list (online distillation
         # uses a singular ``teacher``); the per-(student, teacher) projection path
-        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # now lives at ``teachers[i].aligner.projection_matrix_path`` rather than
         # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
         # as a fallback for any single-teacher config that still carries it.
         master_config_class = XTokenOffPolicyDistillationMasterConfig
@@ -308,8 +308,8 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
 def test_all_config_no_tp_size_accuracy_issues(config_file):
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
-    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
     """
 
     skip_config_files = [
@@ -317,8 +317,8 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
         "grpo-qwen3-32b-4n8g.yaml",
         "grpo-qwen3-32b-8n8g-async-1off.yaml",
-        "grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml",
-        "grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
     ]
     if os.path.basename(config_file) in skip_config_files:
         pytest.skip(
@@ -384,10 +384,10 @@ def test_no_shipped_config_is_outdated(config_file):
 
 # Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
 DEEPEP_FALLBACK_RECIPES = {
-    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2.yaml"),
-    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-fsdp2.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n8g-fsdp8ep8-automodel.yaml"),
-    Path("recipes/llm/sft-gpt-oss-20b-1n4g-fsdp4ep4-automodel.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
     Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
 }

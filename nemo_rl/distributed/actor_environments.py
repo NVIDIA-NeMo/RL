@@ -103,6 +103,8 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
         "nemo_gym"
     ],
+    # transfer_queue + mooncake are core dependencies: no extra venv.
+    "nemo_rl.data_plane.mooncake_storage_unit.MooncakeStorageUnit": None,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
     # ModelOpt quantization-aware workers

@@ -42,6 +42,10 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: false
+    # Move optimizer state to CPU when the refit offload lifecycle runs.
+    offload_optimizer_for_refit: true
 
     automodel_cfg: &AUTOMODEL_BASE
         enabled: true
@@ -54,6 +58,7 @@ policy: &POLICY_BASE
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
+        deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
         tensor_parallel_size: 2
         context_parallel_size: 2
         custom_parallel_plan: null
@@ -84,7 +89,7 @@ policy: &POLICY_BASE
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
-            # when using Dtensor, we need to set foreach
+            # when using Automodel, we need to set foreach
             # and fused to False
             foreach: False
             fused: False
@@ -140,6 +145,7 @@ policy: &POLICY_BASE
         moe_permute_fusion: true
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
+        flash_attention_version: 2
         bias_activation_fusion: True
         defer_fp32_logits: False
         fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
@@ -148,6 +154,9 @@ policy: &POLICY_BASE
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
         gradient_accumulation_fusion: false
         use_fused_weighted_squared_relu: false
         optimizer:

@@ -72,7 +72,7 @@ from nemo_rl.algorithms.grpo import (
     _get_grpo_save_state,
     _initial_grpo_save_state,
 )
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
@@ -308,6 +308,18 @@ class _ExhaustingSampler(_FakeSampler):
         return await super().select(**kwargs)
 
 
+class _EvictOnceSampler(_FakeSampler):
+    """Reports one stale group evicted on the first train step."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.evict_calls = 0
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        self.evict_calls += 1
+        return 1 if self.evict_calls == 1 else 0
+
+
 class _RestoredGroupsSampler(_FakeSampler):
     """Drain the exact groups represented by a restored replay metadata file."""
 
@@ -447,6 +459,20 @@ class _FakeGeneration:
 
     def get_step_metrics(self) -> dict[str, float]:
         return {}
+
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: float | None = None
+    ) -> bool:
+        # Model native pause/clear support; unsupported backends are covered in
+        # test_single_controller_actor.py rather than these checkpoint tests.
+        del clear_cache, timeout_s
+        return True
+
+    def resume_generation_after_refit(self, *, timeout_s: float | None = None) -> bool:
+        return True
+
+    def invalidate_kv_cache(self) -> bool:
+        return False
 
     def wake_carries_weight_updates(self) -> bool:
         return True
@@ -746,7 +772,12 @@ def _actor_master_config(
         policy={
             # One optimizer.step per RL step: prompts * generations == gbs.
             "train_global_batch_size": num_prompts_per_step * 2,
-            "generation": {"backend": "vllm", "colocated": {"enabled": False}},
+            "generation": {
+                "backend": "vllm",
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
         },
         loss_fn=ClippedPGLossConfig(),
         env={},
@@ -805,6 +836,7 @@ def _make_actor_args(
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None,
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None,
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None,
+    loss_fn: Optional[Any] = None,
 ) -> SingleControllerActorArgs:
     return SingleControllerActorArgs(
         gen_handle=gen if gen is not None else _FakeGeneration(),
@@ -820,7 +852,7 @@ def _make_actor_args(
             else _FakeWeightSynchronizer()
         ),
         advantage_estimator=None,
-        loss_fn=object(),  # type: ignore[arg-type]
+        loss_fn=loss_fn if loss_fn is not None else object(),  # type: ignore[arg-type]
         rollout_manager=(  # type: ignore[arg-type]
             rollout_manager if rollout_manager is not None else _FakeRolloutManager()
         ),
@@ -1180,6 +1212,8 @@ class TestSaveTrigger:
         assert info_2["consumed_samples"] == 4  # 2 prompts/step * 2 steps
         # No validation ran, so the default val_reward is dropped.
         assert "val_reward" not in info_2
+        # No adaptive loss, so its controller state is None.
+        assert info_2["cur_adaptive_ppo_clip_k"] is None
 
         info_4 = _training_info(ckpt_dir, 4)
         assert info_4["current_step"] == 4
@@ -1405,6 +1439,31 @@ class TestSaveTrigger:
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_2", "step_3"}
 
 
+class TestFinalizerStateRelease:
+    def test_evicted_group_releases_pending_finalizer_state(self, tmp_path: Path):
+        """Staleness eviction returns only a count; the pump prunes both maps."""
+        from nemo_rl.experience.reward_penalties import FinalizedReward
+
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=100)
+
+        def seed(actor) -> None:
+            actor._sampler = _EvictOnceSampler()
+            # A committed, never-consumed group that the sampler evicts as stale.
+            actor._finalizer_metrics_by_group["evicted-group"] = {
+                "finalize/invalid_row_rate": 0.0
+            }
+            actor._finalizer_rewards_by_group["evicted-group"] = [
+                FinalizedReward("evicted-group_g0", "attempt", 1.0, None)
+            ]
+
+        actor = _run_train_pump(mc, _make_actor_args(), seed=seed)
+
+        assert actor._train_steps == 2
+        assert actor._sampler.evict_calls >= 1
+        assert "evicted-group" not in actor._finalizer_metrics_by_group
+        assert "evicted-group" not in actor._finalizer_rewards_by_group
+
+
 class TestPeriodicRolloutCheckpoint:
     def test_restore_mode_rejects_removed_none_value(self):
         with pytest.raises(ValidationError, match="restore_mode"):
@@ -1439,7 +1498,12 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
-    def test_pre_step_snapshot_contains_only_rollout_state(self, tmp_path: Path):
+    @pytest.mark.parametrize(
+        "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
+    )
+    def test_pre_step_snapshot_contains_only_rollout_state(
+        self, tmp_path: Path, changed_setting
+    ):
         actor = self._actor(tmp_path)
         try:
             actor._sampler.restore_dispatch_index(5)
@@ -1466,6 +1530,45 @@ class TestPeriodicRolloutCheckpoint:
         assert (snapshot / REPLAY_BUFFER_METADATA_FILENAME).is_file()
         assert (snapshot / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
         assert not (snapshot / "policy").exists()
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["reward_settings"] == actor._capture_reward_settings().to_state()
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        if changed_setting == "penalty":
+            actor._master_config.reward_penalties.penalize_empty_final_answer = True
+        elif changed_setting == "effort":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {"low_weight": 1, "low_string": "budget"}
+            }
+        elif changed_setting == "extras":
+            actor._master_config.reward_penalties = (
+                actor._master_config.reward_penalties.model_validate(
+                    {
+                        "experiment_note": "resume",
+                        "token_ids": {"unwanted": [42], "note": "unused"},
+                    }
+                )
+            )
+            actor._master_config.env["nemo_gym"] = {"effort_levels": {"note": "unused"}}
+        elif changed_setting == "inactive":
+            actor._master_config.env["nemo_gym"] = {
+                "effort_levels": {
+                    "low_weight": 0,
+                    "low_ub": 10,
+                    "low_string": "different",
+                }
+            }
+        if changed_setting in ("penalty", "effort"):
+            with pytest.raises(ValueError, match="reward settings differ"):
+                asyncio.run(
+                    actor._maybe_restore_rollout_recovery(restored_replay_groups=0)
+                )
+        else:
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
 
     def test_logs_snapshot_phase_durations(self, tmp_path: Path) -> None:
         actor = self._actor(tmp_path)
@@ -1709,6 +1812,120 @@ class TestPeriodicRolloutCheckpoint:
         logged = actor._logger.log_metrics.call_args.args[0]
         assert logged["generation_counter_discontinuity"] == 1.0
         assert "generation_output_tokens_per_second" not in logged
+
+    def _saved_snapshot(self, actor, tmp_path: Path) -> Path:
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        return (
+            tmp_path
+            / "checkpoints"
+            / BOOTSTRAP_DIRNAME
+            / "rollout_snapshots"
+            / "snapshot_000001"
+        )
+
+    def test_restore_rejects_capture_disabled_sidecar_under_capture(
+        self, tmp_path: Path
+    ):
+        """A sidecar saved with capture off carries no reward settings to compare."""
+        actor = self._actor(tmp_path)
+        snapshot = self._saved_snapshot(actor, tmp_path)
+        recovery_path = snapshot / ROLLOUT_RECOVERY_STATE_FILENAME
+        state = torch.load(recovery_path, weights_only=True)
+        state["reward_settings"] = None
+        torch.save(state, recovery_path)
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = {
+            **actor._dp_client.save_calls[-1]["metadata"],
+            "rollout_recovery_payload_sha256": hashlib.sha256(
+                recovery_path.read_bytes()
+            ).hexdigest(),
+        }
+        with pytest.raises(ValueError, match="saved with token capture disabled"):
+            asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=0))
+
+    @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
+    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+        self, tmp_path: Path, checkpoint_kind: str
+    ):
+        """Only canonical groups' pending statistics are saved; restore keeps them."""
+        from nemo_rl.experience.reward_penalties import (
+            FinalizedReward,
+            RewardLogContext,
+        )
+        from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
+
+        actor = self._actor(tmp_path)
+        claimed_meta = KVBatchMeta(
+            partition_id=_PARTITION_ID,
+            task_name=None,
+            sample_ids=["claimed-group_g0"],
+            sequence_lengths=[16],
+            tags=[{"weight_version": 0}],
+        )
+        canonical_group = {
+            "meta": claimed_meta,
+            "start_weight": 0,
+            "end_weight": 0,
+            "target_step": 0,
+            "group_id": "claimed-group",
+        }
+        actor._buffer.training_claims = [canonical_group]
+        actor._dp_client.sample_ids = list(claimed_meta.sample_ids)
+        pending = {"finalize/reward_count": 1.0, "finalize/reward_sum": 2.0}
+        actor._finalizer_metrics_by_group = {
+            "claimed-group": dict(pending),
+            "unfinished-group": {"finalize/reward_count": 9.0},
+        }
+        observations = [
+            FinalizedReward(
+                "claimed-group_g0",
+                "physical-attempt",
+                2.0,
+                RewardLogContext("agent", '{"answer":"ok"}'),
+            )
+        ]
+        actor._finalizer_rewards_by_group = {
+            "claimed-group": observations,
+            "unfinished-group": [],
+        }
+        if checkpoint_kind == "snapshot":
+            snapshot = self._saved_snapshot(actor, tmp_path)
+        else:
+            actor._buffer.training_claims = []
+            actor._buffer._metadata_state["groups"] = [canonical_group]
+            actor._train_steps = 1
+            actor._trainer_version = 1
+            try:
+                asyncio.run(
+                    actor._save_checkpoint(
+                        {}, is_policy_training_step=True, is_final_checkpoint=False
+                    )
+                )
+            finally:
+                actor._checkpointer.shutdown()
+            snapshot = tmp_path / "checkpoints" / "step_1"
+        state = torch.load(
+            snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
+        )
+        assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
+        assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
+            "claimed-group": observations
+        }
+
+        actor._finalizer_metrics_by_group = {}
+        actor._finalizer_rewards_by_group = {}
+        actor._buffer.training_claims = []
+        actor._buffer._metadata_state["groups"] = [canonical_group]
+        actor._last_checkpoint_path = str(snapshot)
+        actor._data_plane_checkpoint_metadata = actor._dp_client.save_calls[-1][
+            "metadata"
+        ]
+        asyncio.run(actor._maybe_restore_rollout_recovery(restored_replay_groups=1))
+        assert actor._finalizer_metrics_by_group == {"claimed-group": pending}
+        assert actor._finalizer_rewards_by_group == {"claimed-group": observations}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -2359,6 +2576,8 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._replacement_reserve = []
+    actor._finalizer_metrics_by_group = {}
+    actor._finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
@@ -2374,6 +2593,7 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._checkpointer.save_optimizer = True
     actor._checkpointer.init_tmp_checkpoint.return_value = str(checkpoint_path)
     actor._is_ppo = True
+    actor._loss_fn = object()
     actor._trainer = _OrderRecordingPolicy(calls)
     actor._value = _OrderRecordingCritic(calls)
     return actor
@@ -2497,6 +2717,40 @@ class TestMetricName:
 
         info = _training_info(tmp_path / "checkpoints", 2)
         assert info["train:loss"] == 0.5
+
+    def test_adaptive_ppo_clip_state_advances_and_lands_in_training_info(
+        self, tmp_path
+    ):
+        # Checkpoint on the logged k to read back the value step 2 logged.
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=2,
+            save_period=2,
+            metric_name="train:cur_adaptive_ppo_clip_k",
+        )
+        loss_fn = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+                truncated_importance_sampling_adaptive_target_entropy=0.3,
+            )
+        )
+        # Entropy below target widens the bound by one step per train step.
+        trainer = _FakeTrainer(
+            step_metrics={"all_mb_metrics": {"approx_entropy": [0.04, 0.06]}}
+        )
+
+        _run_train_pump(mc, _make_actor_args(trainer=trainer, loss_fn=loss_fn))
+
+        assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+        info = _training_info(tmp_path / "checkpoints", 2)
+        assert info["cur_adaptive_ppo_clip_k"] == 0.5
+        # Step 2 logs the k it trained with; the saved k is the one step 3 uses.
+        assert info["train:cur_adaptive_ppo_clip_k"] == 0.25
+        assert "last_entropy" not in info
 
     def test_train_metric_missing_key_raises(self, tmp_path):
         mc = _actor_master_config(

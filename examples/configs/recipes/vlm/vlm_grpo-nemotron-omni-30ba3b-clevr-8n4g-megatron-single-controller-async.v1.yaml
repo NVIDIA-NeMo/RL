@@ -12,7 +12,7 @@ async_rl:
   sampler:
     name: in_order
     max_lookahead_versions: 1
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${mul:${grpo.num_prompts_per_step}, 2}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}

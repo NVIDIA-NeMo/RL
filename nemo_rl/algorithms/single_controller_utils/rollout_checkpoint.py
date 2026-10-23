@@ -26,7 +26,10 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal, Mapping, Optional, get_args
 
+from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.experience.reward_penalties import CaptureRewardSettings
+from nemo_rl.experience.rollouts import get_effort_config
 
 ROLLOUT_SNAPSHOT_SCHEMA_VERSION = 3
 BOOTSTRAP_COMPATIBILITY_SCHEMA_VERSION = 7
@@ -340,11 +343,35 @@ class BootstrapCompatibilityIdentity:
         return hashlib.sha256(payload).hexdigest()
 
 
+def _normalize_capture_reward_config(dumped: dict[str, Any]) -> None:
+    """Replace capture reward config with the projection sidecar restore compares.
+
+    Otherwise the bootstrap fingerprint would reject harmless reward-config
+    extras before the sidecar's semantic comparison ever ran.
+    """
+    capture = dumped.get("token_capture")
+    if capture is None or not capture["enabled"]:
+        return
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig.model_validate(dumped["reward_penalties"]),
+        get_effort_config(dumped["env"]),
+    ).to_state()
+    dumped["reward_penalties"] = settings["penalties"]
+    gym = dumped["env"].get("nemo_gym")
+    if gym is not None:
+        gym.pop("effort_levels", None)
+        if settings["effort"] is not None:
+            gym["effort_levels"] = settings["effort"]
+        if not gym:
+            dumped["env"].pop("nemo_gym")
+
+
 def bootstrap_compatibility_identity(
     master_config: MasterConfig,
 ) -> BootstrapCompatibilityIdentity:
     """Remove explicitly operational paths from the fail-closed run identity."""
     dumped = master_config.model_dump(mode="json")
+    _normalize_capture_reward_config(dumped)
     rollout_checkpointing = dumped.get("rollout_checkpointing", {})
     if not isinstance(rollout_checkpointing, Mapping):
         raise TypeError("rollout_checkpointing config must be a mapping")

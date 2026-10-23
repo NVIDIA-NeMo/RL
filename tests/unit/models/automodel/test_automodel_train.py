@@ -355,6 +355,74 @@ class TestModelForward:
 
         assert "num_frames" in model.forward_kwargs
 
+    @pytest.mark.parametrize(
+        "forward_kind, expects_mask",
+        [
+            ("var_kwargs", False),
+            ("explicit_without_mask", False),
+            ("explicit_with_mask", True),
+        ],
+    )
+    def test_explicit_only_kwargs_require_named_forward_arg(
+        self, processed_inputs_multimodal, forward_kind, expects_mask
+    ):
+        class RecordingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def _record(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        class VarKwargsModel(RecordingModel):
+            def forward(self, **kwargs):
+                return self._record(**kwargs)
+
+        class ExplicitWithoutMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                return self._record(pixel_values=pixel_values)
+
+        class ExplicitWithMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+                media_token_validity_mask=None,
+            ):
+                return self._record(
+                    pixel_values=pixel_values,
+                    media_token_validity_mask=media_token_validity_mask,
+                )
+
+        model = {
+            "var_kwargs": VarKwargsModel,
+            "explicit_without_mask": ExplicitWithoutMaskModel,
+            "explicit_with_mask": ExplicitWithMaskModel,
+        }[forward_kind]()
+        media_mask = torch.zeros(2, 64, dtype=torch.bool)
+        processed_inputs_multimodal.vlm_kwargs["media_token_validity_mask"] = media_mask
+
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
+
+        assert "pixel_values" in model.forward_kwargs
+        if expects_mask:
+            assert model.forward_kwargs["media_token_validity_mask"] is media_mask
+        else:
+            assert "media_token_validity_mask" not in model.forward_kwargs
+        assert "media_token_validity_mask" in processed_inputs_multimodal.vlm_kwargs
+
     def test_forward_reward_model_removes_flash_attn(
         self, mock_model, processed_inputs_with_flash
     ):
@@ -635,11 +703,15 @@ class TestScorePostProcessor:
 # =====================
 @pytest.mark.automodel
 class TestLogprobsPostProcessor:
+    @pytest.mark.parametrize(
+        "sampling_params", [None, TrainingSamplingParams(top_k=None, top_p=1.0)]
+    )
     def test_basic_logprobs_computation(
-        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh, sampling_params
     ):
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
+            sampling_params=sampling_params,
         )
 
         batch_size = 4
@@ -660,7 +732,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -670,6 +742,7 @@ class TestLogprobsPostProcessor:
         )
 
         assert result.shape == (batch_size, seq_len)
+        assert torch.isfinite(result).all()
 
     def test_logprobs_with_chunking(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
@@ -697,7 +770,7 @@ class TestLogprobsPostProcessor:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,
@@ -1348,6 +1421,83 @@ class TestAutomodelForwardBackward:
         ]
         assert len(results) == 1
 
+    @patch("nemo_rl.models.automodel.train.microbatch_replay_context")
+    @patch("nemo_rl.models.automodel.train.forward_with_post_processing_fn")
+    @patch("nemo_rl.models.automodel.train.prepare_model_forward")
+    def test_forward_backward_runs_backward_inside_replay_context(
+        self,
+        mock_prepare_model_forward,
+        mock_forward,
+        mock_replay_context,
+        mock_model,
+        mock_loss_fn,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+    ):
+        """R3: activation-checkpoint recompute in backward must still see the routes."""
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": torch.full((batch_size,), seq_len),
+                    "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+                }
+            ),
+            processed_inputs=ProcessedInputs(input_ids=input_ids, seq_len=seq_len),
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        events = []
+
+        class ReplayContext:
+            def __enter__(self):
+                events.append("replay_enter")
+
+            def __exit__(self, *args):
+                events.append("replay_exit")
+                return False
+
+        def forward(**kwargs):
+            events.append("forward")
+            leaf = torch.ones(1, requires_grad=True)
+            leaf.register_hook(lambda grad: events.append("backward"))
+            return (leaf * 2).sum(), {}, None
+
+        mock_replay_context.return_value = ReplayContext()
+        mock_forward.side_effect = forward
+        mock_prepare_model_forward.return_value = PreparedModelForward(
+            model_batch={"input_ids": input_ids},
+            cp_size=1,
+            cp_sharder=None,
+            model_context_factory=nullcontext,
+        )
+        gates = [object()]
+
+        automodel_forward_backward(
+            model=mock_model,
+            data_iterator=iter([processed_mb]),
+            post_processing_fn=LossPostProcessor(
+                loss_fn=mock_loss_fn,
+                cfg=base_cfg,
+                cp_mesh=mock_cp_mesh,
+                cp_size=1,
+                dp_size=1,
+            ),
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
+            forward_only=False,
+            global_valid_seqs=torch.tensor(batch_size),
+            global_valid_toks=torch.tensor(batch_size * seq_len),
+            router_replay_gates=gates,
+        )
+
+        mock_replay_context.assert_called_once_with(gates, processed_mb)
+        assert events == ["replay_enter", "forward", "backward", "replay_exit"]
+
     def test_forward_backward_with_on_microbatch_start(
         self,
         mock_model,
@@ -1810,7 +1960,7 @@ class TestLogprobsPostProcessorSeqPacking:
         with patch.object(
             torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
         ):
-            result, _ = processor(
+            result = processor(
                 logits=logits,
                 data_dict=data_dict,
                 processed_inputs=processed_inputs,
@@ -1857,7 +2007,7 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result, _ = processor(
+        result = processor(
             logits=logits,
             data_dict=data_dict,
             processed_inputs=processed_inputs,

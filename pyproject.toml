@@ -57,9 +57,9 @@ dependencies = [
   "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
-  # Keep the base range compatible with backend-specific pins while selecting 5.12.1
-  # for the base and compatible backend environments in uv.lock.
-  "transformers>=5.5.0,<=5.12.1",
+  # Keep the base range compatible with every backend-specific pin (5.5.4 through
+  # 5.16.1). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.16.1",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -74,17 +74,23 @@ dependencies = [
   "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
+  "multi-storage-client[boto3]>=0.50",                                                                        # for msc:// (S3) checkpoint storage; the driver's CheckpointManager runs in the base venv
   "zstandard",                                                                                                # for sparse refit body compression
   "fastokens>=0.2.0",                                                                                         # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   # OpenTelemetry instrumentation. Base (not extra) so it reaches every worker
   # venv; `telemetry.enabled` in the config is the on/off switch. Sourced from
   # git in [tool.uv.sources] — see the note there; the floor is above the
   # newest PyPI release so a dropped pin fails to resolve instead of silently
-  # falling back to 0.1.0. The aiohttp extra is what stamps a traceparent on
+  # falling back to 0.1.0. It reads 0.2.0 rather than 0.3.0 because the pinned
+  # rev is lens main past v0.3.0, which still declares 0.2.0 in its
+  # package_info, so a 0.3.0 floor would not resolve. The aiohttp extra is what stamps a traceparent on
   # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
   # run's trace rather than starting its own.
   "nemo-lens[sdk,aiohttp]>=0.2.0",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'", # for transformer-engine no build isolation
+  # Headers for transformer-engine's no-build-isolation install, and the runtime floor for
+  # TE 2.18 fused-attention backward with 256-wide heads on SM 10.x (cuDNN >= 9.23.0 for
+  # bshd/sbhd, >= 9.25.0 for thd; see TE fused_attn.cpp). Keep equal to the override below.
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   # tilelang — required by fused DSA TileLang kernels on Blackwell and by the
   # replacement Triton kernel mamba-ssm requires when Triton >= 3.4.0 on Hopper;
   # see https://github.com/state-spaces/mamba/issues/640.
@@ -98,10 +104,11 @@ dependencies = [
   # automatically include them. Removes the need for a `[data-plane]`
   # extra and the corresponding plumbing in the per-worker venv builder.
   "tensordict",
-  # TransferQueue v0.1.9 adds full-system checkpoint save/load APIs and
-  # retains the exact-key MooncakeStore clear behavior required by DAPO.
+  # TransferQueue v0.1.11 adds SimpleStorage SSD offload on top of v0.1.9's
+  # full-system checkpoint save/load APIs and exact-key MooncakeStore clear
+  # behavior required by DAPO.
   # Pin the immutable release commit rather than the mutable version tag.
-  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@c51614308b68c8d7a87c9b3ef62d59e14c69bde2",
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@05d4cc3377bee9b0f2897bbb90914ee20c0aea39",
   # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
   # (in-process), but the mooncake_cpu path needs the `mooncake_master`
   # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
@@ -211,12 +218,17 @@ mcore = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "transformers==5.12.1",
+  # Within Megatron-Bridge's supported range (>=5.15,<5.20); Megatron-Bridge itself locks 5.19.0.
+  "transformers==5.16.1",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
+  # FlashAttention-4 (CuTe DSL). Required by megatron_cfg.flash_attention_version=4, which
+  # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
+  # Pinned to b19: b20+ need apache-tvm-ffi>=0.1.12, but the shared override keeps 0.1.11.
+  "flash-attn-4==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -286,6 +298,7 @@ docs = [
   "sphinx-autodoc2",           # For documenting Python API
   "sphinx-copybutton",         # Adds a copy button for code blocks
   "sphinx-design",             # For design components in docs
+  "sphinx-reredirects",        # Preserves URLs when documentation pages move
   "myst_parser",               # For our markdown docs
   "nvidia-sphinx-theme",       # Our NVIDIA theme
   "gitpython>=3.1.45",         # To git-related information
@@ -329,7 +342,7 @@ nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2
 # actually reconciles the two revs; the floor in [dependencies] stays above the
 # newest PyPI release so dropping either one fails to resolve instead of
 # falling back to 0.1.0.
-nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "b0f977d414b2f89938604a0b7eaa78ee08bc8700" }
+nemo-lens = { git = "https://github.com/NVIDIA-NeMo/Lens.git", rev = "4d045c03186b90afdc815db46b671f6a21bc7e98" }
 sglang = { git = "https://github.com/sgl-project/sglang.git", rev = "3003d70f680d41c59d1b7acbf65cb47795dfd19e", subdirectory = "python" }
 # torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
@@ -436,7 +449,7 @@ link-mode = "copy"
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
@@ -498,11 +511,14 @@ override-dependencies = [
   "mamba-ssm==2.3.2.post1",
   # megatron-core still pins lens v0.2.0 in its own [tool.uv.sources]; without an
   # override the two git URLs are a hard conflict, since the workspace resolves a
-  # single nemo-lens. We need the newer rev for `SpanRegistry` (which replaced the
-  # shipped `SpanGroup` class) and the consumer-driven metric registry
-  # (`MetricSpec`/`register_metric_group`), both of which landed after v0.2.0. Drop
-  # this once Megatron-LM bumps to the same or newer rev.
-  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@b0f977d414b2f89938604a0b7eaa78ee08bc8700",
+  # single nemo-lens. The rev here is lens main past v0.3.0, which we need for
+  # `SpanRegistry` (which replaced the shipped `SpanGroup` class), the
+  # consumer-driven metric registry (`MetricSpec`/`register_metric_group`), the
+  # scoped span attributes behind `rl.iteration`, and the observable metric
+  # kinds behind `rl.host.memory.*` -- a rev rather than a tag because there is
+  # no release carrying the last of those yet. Drop this once Megatron-LM bumps
+  # to the same or newer rev.
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
 ]
 
 # CVE fixes

@@ -43,6 +43,10 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -54,7 +58,8 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import GROUP_ID_TAG, INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
+from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -88,6 +93,7 @@ class AdvantageStageConfig:
     policy_logprobs_required: bool
     reference_logprobs_required: bool
     teacher_logprobs_required: bool
+    opd_full_enabled: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
     # Where the per-step training dump writes, or None when it is disabled.
@@ -95,6 +101,7 @@ class AdvantageStageConfig:
     # the untruncated tensors: the controller stopped fetching them when the
     # computation moved here.
     train_data_dump_dir: Optional[str]
+    filtering_on: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -117,6 +124,12 @@ class AdvantageStageConfig:
         algo_cfg = algo_config(master_config)
         loss_cfg = master_config.loss_fn
         return cls(
+            filtering_on=need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=master_config.policy["generation"]["top_k"],
+                    top_p=master_config.policy["generation"]["top_p"],
+                )
+            ),
             advantage=AdvantageConfig(),
             algo=algo_cfg,
             is_ppo=is_ppo,
@@ -131,6 +144,7 @@ class AdvantageStageConfig:
                 and not algo_cfg.skip_reference_policy_logprobs_calculation
             ),
             teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
+            opd_full_enabled=opd_module.get_opd_full_config(master_config) is not None,
             message_level_advantage_penalties_enabled=(
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
@@ -199,44 +213,6 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
-
-
-def row_group_ids(meta: KVBatchMeta) -> list[str]:
-    """Return the prompt-group id of every row, in row order.
-
-    This is the key the group-relative estimators reduce over, so a missing
-    tag has to raise rather than fall back to prompt tokens: the token key is
-    what merged two same-text groups into one baseline in the first place, and
-    a silent fallback would reintroduce exactly that.
-    """
-    if meta.tags is None:
-        raise ValueError(
-            f"advantage stage: {len(meta.sample_ids)} row(s) of partition "
-            f"{meta.partition_id!r} carry no tags, so the {GROUP_ID_TAG!r} "
-            "baseline key is unavailable"
-        )
-    untagged = [
-        meta.sample_ids[i] for i, tag in enumerate(meta.tags) if GROUP_ID_TAG not in tag
-    ]
-    if untagged:
-        raise ValueError(
-            f"advantage stage: {len(untagged)} row(s) carry no {GROUP_ID_TAG!r} "
-            f"tag (first: {untagged[0]!r}); pack_payload stamps it on every row, "
-            "so this batch was written by a producer that predates it"
-        )
-    return [tag[GROUP_ID_TAG] for tag in meta.tags]
-
-
-def group_index_column(group_ids: list[str]) -> torch.Tensor:
-    """Turn per-row group ids into the ``[N, 1]`` column the baseline compares.
-
-    ``calculate_baseline_and_std_per_prompt`` only calls ``torch.unique(...,
-    dim=0)`` and compares rows for equality, so one integer per distinct group
-    carries everything it needs. The trailing dimension is load-bearing: the
-    helper does ``.all(1)``, so a flat ``[N]`` tensor would not work.
-    """
-    index = {group_id: i for i, group_id in enumerate(dict.fromkeys(group_ids))}
-    return torch.tensor([[index[group_id]] for group_id in group_ids])
 
 
 def split_meta_by_prompt_group(
@@ -384,6 +360,7 @@ class AdvantageComputer:
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        final_sample_mask = final_sample_mask * token_mask[:, 1:].bool().any(dim=-1)
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
         seq_error_metrics: Optional[dict[str, float]] = None
@@ -391,6 +368,11 @@ class AdvantageComputer:
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
         if cfg.policy_logprobs_required:
+            # Full KL compares unfiltered policy with possibly filtered rollout
+            # logprobs. Their normalization gap remains diagnostic.
+            seq_logprob_error_threshold = (
+                None if cfg.opd_full_enabled else cfg.algo.seq_logprob_error_threshold
+            )
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
@@ -413,7 +395,8 @@ class AdvantageComputer:
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
-                seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
+                filtering_on=cfg.filtering_on,
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(

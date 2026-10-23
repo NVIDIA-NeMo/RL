@@ -23,6 +23,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.automodel.data import (
     ProcessedInputs,
     ProcessedMicrobatch,
+    check_sequence_dim,
     get_microbatch_iterator,
     make_processed_microbatch_iterator,
     process_global_batch,
@@ -408,6 +409,26 @@ class TestProcessMicrobatch:
         # When multimodal inputs are present, position_ids should be None
         assert result.position_ids is None
 
+    def test_media_token_validity_mask_kept_in_vlm_kwargs(self, mock_tokenizer):
+        result = process_microbatch(
+            mb=BatchedDataDict(
+                {
+                    "input_ids": torch.randint(0, 1000, (2, 64)),
+                    "sample_mask": torch.ones(2, dtype=torch.bool),
+                    "pixel_values": PackedTensor(
+                        torch.randn(2, 3, 224, 224), dim_to_pack=0
+                    ),
+                    "media_token_validity_mask": torch.zeros(2, 64, dtype=torch.bool),
+                }
+            ),
+            tokenizer=mock_tokenizer,
+            enable_seq_packing=False,
+            cfg={"automodel_cfg": {"sequence_parallel": False}},
+        )
+
+        assert "pixel_values" in result.vlm_kwargs
+        assert "media_token_validity_mask" in result.vlm_kwargs
+
     def test_sequence_packing_with_multimodal_raises_error(self, mock_tokenizer):
         # Create test microbatch with multimodal data
         mb = BatchedDataDict(
@@ -609,6 +630,33 @@ class TestProcessedMicrobatch:
 
 @pytest.mark.automodel
 class TestMakeProcessedMicrobatchIterator:
+    def test_pads_jagged_routed_experts_per_microbatch(self, mock_tokenizer):
+        """Jagged routes from the data plane are padded with -1 to input_ids' width."""
+        rows = [torch.randint(0, 8, (n, 2, 4)) for n in (5, 3)]
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (2, 6)),
+                "input_lengths": torch.tensor([5, 3]),
+                "sample_mask": torch.ones(2, dtype=torch.bool),
+                "routed_experts": torch.nested.nested_tensor(rows, layout=torch.jagged),
+            }
+        )
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "automodel_cfg": {"sequence_parallel": False},
+        }
+
+        (processed_mb,) = make_processed_microbatch_iterator(
+            raw_iterator=iter([batch]), tokenizer=mock_tokenizer, cfg=cfg
+        )
+
+        routes = processed_mb.data_dict["routed_experts"]
+        assert not routes.is_nested
+        assert routes.shape == (2, 6, 2, 4)
+        assert torch.equal(routes[0, :5], rows[0])
+        assert torch.equal(routes[1, :3], rows[1])
+        assert (routes[0, 5:] == -1).all() and (routes[1, 3:] == -1).all()
+
     def test_basic_iteration(self, mock_tokenizer):
         """Test basic iteration over microbatches."""
         # Create test data
@@ -1247,3 +1295,16 @@ class TestIntegrationScenarios:
         assert all(mb.processed_inputs.input_ids.shape[0] == 2 for mb in processed_mbs)
         assert global_batch_result["global_valid_seqs"] == 8
         assert global_batch_result["global_valid_toks"] == 512
+
+
+@pytest.mark.automodel
+def test_check_sequence_dim_skips_jagged_routed_experts():
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 1000, (2, 6)),
+            "routed_experts": torch.nested.nested_tensor(
+                [torch.zeros(5, 2, 4), torch.zeros(3, 2, 4)], layout=torch.jagged
+            ),
+        }
+    )
+    assert check_sequence_dim(data) == (1, 6)
