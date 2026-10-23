@@ -23,6 +23,7 @@ checkpointing:
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
   # No validation, so no validation metric to rank checkpoints by.
   metric_name: null
+  save_data_plane: true
 
 # The gym family sets no data_plane block. TransferQueue is mandatory for the
 # SingleController path; only keys without a schema default are set here (see

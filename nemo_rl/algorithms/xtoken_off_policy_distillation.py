@@ -25,7 +25,7 @@ rollout, no generation). Per step:
     3. Pack alignment payload + teacher IPC handles into a student-side
        ``train_data`` dict.
     4. ``student_policy.train(train_data, loss_fn)`` — student forward +
-       loss + backward + optimizer step happens inside the dtensor v2
+       loss + backward + optimizer step happens inside the Automodel
        worker.
 
 The collator and aligner do all the CPU-side cross-tokenizer work; the
@@ -39,7 +39,6 @@ import os
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
-import torch
 from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -56,14 +55,16 @@ from nemo_rl.algorithms.x_token.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
+from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+    CrossTokenizerCollator,
+    CrossTokenizerCollatorConfig,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.models.policy.utils import reject_legacy_dtensor_key
 from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
@@ -79,13 +80,13 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 # pre-flight (which assumes [B, student_seq, ...] for every 2+D tensor) must
 # skip them. Sources:
 #   - teacher_full_logits_ipc: list[B] of CUDA IPC handle dicts produced by
-#     FullLogitsPostProcessor in dtensor_policy_worker_v2.get_full_logits_ipc.
+#     FullLogitsPostProcessor in automodel_policy_worker.get_full_logits_ipc.
 #     Not a tensor at all — list of dicts — but listed here so the worker's
 #     dict-level dim check skips it.
 #   - teacher_input_ids/teacher_token_mask + alignment_*: produced by
 #     CrossTokenizerCollator (in DataLoader workers).
-# alignment_student_chunk_id and alignment_student_exact_partition_mask are
-# [B, T_s] and DO follow the student-seq invariant, so they are NOT listed.
+# alignment_student_chunk_id is [B, T_s] and DOES follow the student-seq
+# invariant, so it is NOT listed.
 def xtoken_non_student_seq_keys(
     loss_fn: "CrossTokenizerDistillationLossFn",
 ) -> frozenset[str]:
@@ -100,8 +101,8 @@ def xtoken_non_student_seq_keys(
     dicts, not a tensor); a cross-tokenizer teacher additionally rides its
     teacher-seq tokenization (``teacher_{i}_input_ids`` / ``teacher_{i}_token_mask``,
     ``[B, T_t]``) and its teacher-seq / max_pairs ``alignment_{i}_*`` keys. The
-    ``alignment_{i}_student_*`` (``[B, T_s]``) and ``alignment_{i}_num_chunks``
-    (``[B]``) keys follow the student-seq invariant and are NOT skipped.
+    ``alignment_{i}_student_chunk_id`` (``[B, T_s]``) follows the student-seq
+    invariant and is NOT skipped.
     """
     keys: set[str] = set()
     for i in range(loss_fn.num_teachers):
@@ -111,7 +112,6 @@ def xtoken_non_student_seq_keys(
             keys.add(f"teacher_{i}_token_mask")
             keys.add(f"alignment_{i}_pair_valid")
             keys.add(f"alignment_{i}_pair_is_correct")
-            keys.add(f"alignment_{i}_teacher_exact_partition_mask")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
 
@@ -162,19 +162,33 @@ def _default_off_policy_distillation_save_state() -> OffPolicyDistillationSaveSt
     }
 
 
+class TeacherAlignerConfig(BaseModel, extra="allow"):
+    """Per-teacher token-alignment configuration.
+
+    Attributes:
+        projection_matrix_path: Path to this teacher's student-to-teacher
+            projection matrix. ``None`` marks a same-tokenizer teacher, which
+            bypasses projection and alignment and uses direct per-position KL.
+        drop_first_assistant_chunk_kl: Whether chat-mode alignment drops the
+            first content pair in each assistant message for this teacher. The
+            CE token mask is unaffected.
+    """
+
+    projection_matrix_path: Optional[str] = None
+    drop_first_assistant_chunk_kl: bool = False
+
+
 class TeacherConfig(BaseModel, extra="allow"):
     """Per-teacher config for multi-teacher cross-tokenizer distillation.
 
     Carries the full ``PolicyConfig`` content (``model_name``, ``tokenizer``,
-    ``dtensor_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
-    declared below. Use :meth:`policy_config` to recover the plain
-    ``PolicyConfig`` dict for ``Policy`` construction.
+    ``automodel_cfg``, …) as permitted extras, plus the cross-tokenizer knobs
+    declared below. Alignment-specific settings live in the typed ``aligner``
+    block. Use :meth:`policy_config` to recover the plain ``PolicyConfig`` dict
+    for ``Policy`` construction.
 
     Attributes:
-        projection_matrix_path: Path to this teacher's student->teacher
-            projection matrix. ``None`` marks a *same-tokenizer* teacher:
-            projection and alignment are skipped and the loss uses a direct
-            per-position KL on the shared vocab.
+        aligner: This teacher's projection and chat-alignment settings.
         weight: Static loss weight for this teacher when several teachers are
             aggregated (``kd_loss_mode="sum"`` / the convex ``"averaged_logits"``
             mix). Single-teacher runs leave it at ``1.0``.
@@ -185,7 +199,7 @@ class TeacherConfig(BaseModel, extra="allow"):
             same semantics as ``gold_loss``.
     """
 
-    projection_matrix_path: Optional[str] = None
+    aligner: TeacherAlignerConfig = Field(default_factory=TeacherAlignerConfig)
     weight: float = 1.0
     gold_loss: Optional[bool] = None
     xtoken_loss: Optional[bool] = None
@@ -194,9 +208,7 @@ class TeacherConfig(BaseModel, extra="allow"):
         """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
         return cast(
             PolicyConfig,
-            self.model_dump(
-                exclude={"projection_matrix_path", "weight", "gold_loss", "xtoken_loss"}
-            ),
+            self.model_dump(exclude={"aligner", "weight", "gold_loss", "xtoken_loss"}),
         )
 
 
@@ -205,6 +217,9 @@ class MasterConfig(BaseModel, extra="allow"):
     teachers: list[TeacherConfig] = Field(min_length=1)
     loss_fn: CrossTokenizerDistillationLossConfig
     data: DataConfig
+    collator: CrossTokenizerCollatorConfig = Field(
+        default_factory=CrossTokenizerCollatorConfig
+    )
     distillation: OffPolicyDistillationConfig
     logger: LoggerConfig
     cluster: ClusterConfig
@@ -248,19 +263,17 @@ def setup(
         f"tokenizers for {len(teachers)} teachers."
     )
 
-    # Backend gate: DTensor only, for the student and every teacher. Unlike
+    # Backend gate: Automodel only, for the student and every teacher. Unlike
     # the TP=CP=1 multi-teacher prototype, this path supports TP/CP/diff-DP
     # sharding (the loss is parallelism-invariant), so there is deliberately NO
     # tensor/context_parallel_size==1 assert.
-    assert policy_config["dtensor_cfg"]["enabled"], (
-        "xtoken distillation requires policy.dtensor_cfg.enabled=true."
+    assert (policy_config.get("automodel_cfg") or {}).get("enabled"), (
+        "xtoken distillation requires policy.automodel_cfg.enabled=true."
     )
-    reject_legacy_dtensor_key(policy_config["dtensor_cfg"], "policy.dtensor_cfg")
     for i, tc in enumerate(teacher_configs):
-        assert tc["dtensor_cfg"]["enabled"], (
-            f"xtoken distillation requires teachers.{i}.dtensor_cfg.enabled=true."
+        assert (tc.get("automodel_cfg") or {}).get("enabled"), (
+            f"xtoken distillation requires teachers.{i}.automodel_cfg.enabled=true."
         )
-        reject_legacy_dtensor_key(tc["dtensor_cfg"], f"teachers.{i}.dtensor_cfg")
 
     # A null projection path marks a same-vocab teacher (direct KL, no
     # projection/alignment); that only makes sense when it shares the student's
@@ -269,13 +282,14 @@ def setup(
     # validated against their projection matrix in the loss.
     student_vocab = len(student_tokenizer)
     for i, teacher in enumerate(teachers):
-        if teacher.projection_matrix_path is None:
+        if teacher.aligner.projection_matrix_path is None:
             assert len(teacher_tokenizers[i]) == student_vocab, (
-                f"teachers[{i}] has projection_matrix_path=null (same-vocab "
-                f"teacher) but its tokenizer vocab ({len(teacher_tokenizers[i])}) "
-                f"!= student vocab ({student_vocab}). A same-vocab teacher must "
-                "share the student tokenizer; set a projection_matrix_path to "
-                "run it as a cross-tokenizer teacher."
+                f"teachers[{i}].aligner.projection_matrix_path is null "
+                f"(same-vocab teacher) but its tokenizer vocab "
+                f"({len(teacher_tokenizers[i])}) != student vocab "
+                f"({student_vocab}). A same-vocab teacher must share the "
+                "student tokenizer; set aligner.projection_matrix_path to run "
+                "it as a cross-tokenizer teacher."
             )
 
     set_seed(distillation_config["seed"])
@@ -306,16 +320,17 @@ def setup(
     # no alignment — the loss does a direct per-position KL there).
     aligners: list[Optional[TokenAligner]] = [
         None
-        if teacher.projection_matrix_path is None
+        if teacher.aligner.projection_matrix_path is None
         else TokenAligner(
             student_tokenizer=student_tokenizer,
             teacher_tokenizer=teacher_tokenizers[i],
-            projection_matrix_path=teacher.projection_matrix_path,
+            projection_matrix_path=teacher.aligner.projection_matrix_path,
         )
         for i, teacher in enumerate(teachers)
     ]
 
     collator = CrossTokenizerCollator(
+        config=master_config.collator,
         student_tokenizer=student_tokenizer,
         teacher_tokenizers=list(teacher_tokenizers),
         aligners=aligners,
@@ -324,6 +339,9 @@ def setup(
         make_seq_div_by_student=policy_config["make_sequence_length_divisible_by"],
         make_seq_div_by_teachers=[
             tc["make_sequence_length_divisible_by"] for tc in teacher_configs
+        ],
+        drop_first_assistant_chunk_kl_by_teacher=[
+            teacher.aligner.drop_first_assistant_chunk_kl for teacher in teachers
         ],
     )
 
@@ -427,8 +445,8 @@ def setup(
     # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
-    student_tp = policy_config["dtensor_cfg"]["tensor_parallel_size"]
-    student_cp = policy_config["dtensor_cfg"]["context_parallel_size"]
+    student_tp = policy_config["automodel_cfg"]["tensor_parallel_size"]
+    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
     # Each teacher may differ from the student (and from each other) in
     # DP/MBS/TP/CP, so check the batch grid and node-local IPC layout per
     # teacher. Train and validation share the grid (the student reuses its train
@@ -453,8 +471,8 @@ def setup(
             gpus_per_node=cluster_config.gpus_per_node,
             student_tp=student_tp,
             student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
+            teacher_tp=tc["automodel_cfg"]["tensor_parallel_size"],
+            teacher_cp=tc["automodel_cfg"]["context_parallel_size"],
             student_dp=student_dp,
             teacher_dp=teacher_dp,
         )
@@ -476,7 +494,9 @@ def setup(
         **loss_config,
         "student_vocab_size": len(student_tokenizer),
         "teacher_vocab_sizes": [len(tok) for tok in teacher_tokenizers],
-        "projection_matrix_paths": [t.projection_matrix_path for t in teachers],
+        "projection_matrix_paths": [
+            teacher.aligner.projection_matrix_path for teacher in teachers
+        ],
         "teacher_weights": [t.weight for t in teachers],
         "teacher_gold_loss": [t.gold_loss for t in teachers],
         "teacher_xtoken_loss": [t.xtoken_loss for t in teachers],
@@ -556,11 +576,8 @@ def export_teacher_logits_and_pack(
             for field in (
                 "pair_valid",
                 "pair_is_correct",
-                "student_exact_partition_mask",
-                "teacher_exact_partition_mask",
                 "student_chunk_id",
                 "teacher_chunk_id",
-                "num_chunks",
             ):
                 train_data[f"alignment_{i}_{field}"] = batch[f"alignment_{i}_{field}"]
 
@@ -786,10 +803,7 @@ def xtoken_off_policy_distillation_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(ckpt_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), ckpt_path)
                         checkpointer.begin_finalization(
                             ckpt_path,
                             wait_fn=student_policy.finalize_async_save,

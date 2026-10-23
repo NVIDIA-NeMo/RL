@@ -26,9 +26,10 @@ from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
@@ -75,6 +76,14 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.reward_penalties import (
+    effort_shaping_enabled,
+    has_duplicated_reasoning,
+    has_empty_final_answer,
+    has_unwanted_tokens,
+    is_low_effort,
+    shape_effort_reward,
+)
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationConfig,
@@ -84,6 +93,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationSamplingParams,
 )
 from nemo_rl.telemetry.instrumentation import dispatch_with_trace_context
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties,
+)
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
@@ -107,6 +120,24 @@ _REWARD_PENALTY_METRICS = {
         "malformed_think_tag_rate",
     ),
 }
+
+_SHARED_GENRM_METRICS = (
+    "reward_score_raw",  # Selected score source before length/style shaping.
+    "reward_rubric_aggregate_valid",  # Valid rubric parses, including the tiebreaker; null on failure.
+    "reward_overall_score_raw",  # GenRM overall score before shaping.
+    "reward_overall_score",  # Overall score after length/style shaping.
+    "reward_length_adjustment",  # Difference between adjusted and raw scores.
+    "genrm_parse_failure_rate_per_group",
+    "genrm_rubric_parse_failure_rate_per_group",
+    "genrm_input_tokens_per_comparison_mean",
+    "genrm_input_tokens_per_comparison_p50",
+    "genrm_input_tokens_per_comparison_p95",
+    "genrm_output_tokens_per_comparison_mean",
+    "genrm_output_tokens_per_comparison_p50",
+    "genrm_output_tokens_per_comparison_p95",
+    "genrm_output_tokens_total_per_group",
+    "genrm_max_output_tokens_hit_rate_per_group",
+)
 
 
 def attach_initial_nemo_gym_image_payloads(
@@ -296,9 +327,45 @@ def attach_static_multimodal_payload(
             continue
         if tokenizer is not None:
             verify_static_video_media_alignment(source, target, tokenizer)
+        # Check if the source is empty or not.
+        source_token_ids = source.get("token_ids")
+        source_is_tokenized = (
+            isinstance(source_token_ids, torch.Tensor) and source_token_ids.numel() > 0
+        )
         for key, value in source.items():
+            # Reattach multimodal media to Gym output.
             if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
                 target[key] = value
+            elif key == "media_token_validity_mask" and source_is_tokenized:
+                # Skipped for generic Gym prompts, which are not tokenized before
+                # the rollout and source an empty mask. The target then keeps
+                # its own mask, or GRPO builds one below from the attached media.
+                target[key] = value
+
+        # Create a target media validity mask based on the media tokens
+        # specified by the source mask to ensure parity.
+        source_mask = source.get("media_token_validity_mask")
+        target_token_ids = target.get("token_ids")
+        if (
+            source_is_tokenized
+            and isinstance(source_token_ids, torch.Tensor)
+            and isinstance(source_mask, torch.Tensor)
+            and isinstance(target_token_ids, torch.Tensor)
+        ):
+            if source_mask.shape != source_token_ids.shape:
+                raise ValueError(
+                    "Source media_token_validity_mask must align with source token_ids "
+                    f"during static media reattachment: mask={tuple(source_mask.shape)}, "
+                    f"token_ids={tuple(source_token_ids.shape)}."
+                )
+            media_token_ids = torch.unique(source_token_ids[source_mask.bool()]).to(
+                target_token_ids.device
+            )
+            target["media_token_validity_mask"] = (
+                torch.isin(target_token_ids, media_token_ids)
+                if media_token_ids.numel()
+                else torch.zeros_like(target_token_ids, dtype=torch.bool)
+            )
 
 
 def _add_r3_fallback_metrics(
@@ -329,14 +396,23 @@ def _add_r3_fallback_metrics(
 
 
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
-    """Return True for samples the environment asks GRPO to mask from loss."""
-    return torch.tensor(
-        [
-            bool(((extra or {}).get("instance_config") or {}).get(MASK_SAMPLE, False))
-            for extra in extras
-        ],
-        dtype=torch.bool,
-    )
+    """Return True for samples the environment asks GRPO to mask from loss.
+
+    The flag is read from the verify response's first-class ``mask_sample``
+    field (NeMo-Gym ``BaseVerifyResponse``) or from the response-extras mapping
+    ``instance_config.mask_sample``. Both reads are consulted because Gym
+    serializes ``mask_sample: false`` on every response, so an environment that
+    flags only ``instance_config.mask_sample`` carries a false first-class
+    field beside the true nested one.
+    """
+
+    def flagged(extra: dict[str, Any] | None) -> bool:
+        extra = extra or {}
+        if extra.get(MASK_SAMPLE):
+            return True
+        return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
+
+    return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
 
 
 def _attach_routed_experts_to_message_log_prefix(
@@ -459,6 +535,19 @@ class EffortLevelsConfig(BaseModel, extra="allow"):
     low_string: str = ""
     """Substring that must appear in the user prompt to trigger shaping."""
 
+    @model_validator(mode="after")
+    def validate_length_bound(self) -> "EffortLevelsConfig":
+        if self.low_weight > 0 and self.low_string and self.low_ub <= 0:
+            raise ValueError("active effort shaping requires low_ub > 0")
+        return self
+
+
+def get_effort_config(env: dict[str, Any]) -> Optional[EffortLevelsConfig]:
+    """Resolve the optional Gym effort config using its centralized defaults."""
+    gym = env.get("nemo_gym")
+    effort = gym.get("effort_levels") if gym is not None else None
+    return EffortLevelsConfig.model_validate(effort) if effort is not None else None
+
 
 @dataclass
 class _EffortShapingMetrics:
@@ -469,44 +558,11 @@ class _EffortShapingMetrics:
 
 
 def _terminal_completion_length(result: dict) -> Optional[int]:
-    """Terminal assistant completion length for effort shaping, or None.
-
-    Legacy rollouts carry tokens inline: the last ``message_log`` entry is the
-    terminal turn, and its ``token_ids`` length is the completion length (0 if
-    that turn is not an assistant turn, matching the pre-receipt behavior).
-
-    Token-capture receipt rollouts carry ``message_log: []`` by design — the
-    tokens live in the capture ledger. The manifest's ``delta_len`` is NOT the
-    same quantity (a root call's delta stages prompt + generation, per the
-    ledger invariant ``parentless rows have prev_len == 0``), so the length
-    comes from the scored response's usage block instead: ``output_tokens``
-    is the terminal call's generation length, matching the legacy semantics.
-    A receipt row with no usable usage returns None so the caller skips
-    shaping rather than inventing a length.
-    """
+    """Return inline terminal assistant length; capture is shaped after verification."""
     message_log = result.get("message_log") or []
     if message_log:
         last = message_log[-1]
         return len(last["token_ids"]) if last["role"] == "assistant" else 0
-    # TODO(token-capture): the agent ACCUMULATES usage across model calls onto
-    # the scored response (simple_agent accumulate_response_usage), so
-    # output_tokens equals the terminal generation only for single-call
-    # rollouts; on multi-call rollouts this shapes on the accumulated total
-    # while the legacy path uses the final assistant turn only. All observed
-    # capture runs are single-call (finalize/calls_per_rollout == 1.0). The
-    # durable fix is upstream: per-call generation counts on the receipt
-    # (Gym preserving per-call usage, or CallRecord recording generation
-    # length distinct from staged delta_len).
-    full_result = result.get("full_result")
-    if isinstance(full_result, dict):
-        response = full_result.get("response")
-        if isinstance(response, dict):
-            usage = response.get("usage")
-            if isinstance(usage, dict):
-                for key in ("output_tokens", "completion_tokens"):
-                    tokens = usage.get(key)
-                    if isinstance(tokens, (int, float)):
-                        return int(tokens)
     return None
 
 
@@ -529,43 +585,23 @@ def _apply_effort_shaping(
     low_lengths: list[int] = []
     high_lengths: list[int] = []
 
-    if (
-        effort_config is None
-        or effort_config.low_weight <= 0
-        or not effort_config.low_string
-    ):
+    if not effort_shaping_enabled(effort_config):
         return _EffortShapingMetrics(
             length_rewards_low, rewards_low, low_lengths, high_lengths
         )
 
+    assert effort_config is not None
     lengths = [_terminal_completion_length(r) for r in results]
     orig_rewards = [r["full_result"]["reward"] for r in results]
     for i, result in enumerate(results):
-        # Token-capture receipt rows with no resolvable terminal length are
-        # skipped fail-closed: shaping a length we do not have would award the
-        # maximum shortness bonus to a row that may be arbitrarily long.
+        # Inline results with a missing or empty message log have no terminal
+        # length. Skip them to avoid awarding an unearned shortness bonus.
         length = lengths[i]
         if length is None:
             continue
-        prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(
-                    nemo_gym_rows[i]["responses_create_params"]["input"]
-                )
-                if msg.get("role") == "user" and "content" in msg
-            ),
-            "",
-        )
-        if effort_config.low_string in prompt:
-            length_reward = min(
-                1.0,
-                effort_config.low_weight * (1.0 - length / effort_config.low_ub),
-            )
-            new_reward = (
-                orig_rewards[i]
-                + orig_rewards[i] * max(length_reward, 0.0)
-                + effort_config.low_penalty * min(length_reward, 0.0)
+        if is_low_effort(nemo_gym_rows[i], effort_config):
+            new_reward, length_reward = shape_effort_reward(
+                orig_rewards[i], length=length, config=effort_config
             )
             result["full_result"]["reward"] = new_reward
             length_rewards_low.append(length_reward)
@@ -2225,25 +2261,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            is_duplicated = False
-            for item1, item2 in zip(output_items, output_items[1:]):
-                if item1.get("type") != "reasoning":
-                    continue
-                summary = item1.get("summary", [])
-                if not summary or "text" not in summary[0]:
-                    continue
-                reasoning_text = summary[0]["text"].strip()
-                content = item2.get("content", "")
-                if isinstance(content, list) and content and "text" in content[0]:
-                    chat_text = content[0]["text"].strip()
-                elif isinstance(content, str):
-                    chat_text = content.strip()
-                else:
-                    continue
-                if reasoning_text and chat_text and reasoning_text == chat_text:
-                    is_duplicated = True
-                    break
-            if is_duplicated:
+            if has_duplicated_reasoning(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["duplicated_reasoning"] += 1
@@ -2254,23 +2272,7 @@ def apply_reward_penalties(
     ):
         for result in results:
             output_items = result["full_result"].get("response", {}).get("output", [])
-            # Skip if the last output item is a function_call — it is legit for model to
-            # produce reasoning and then a function_call as the last output item in PivotRL
-            if output_items and output_items[-1].get("type") == "function_call":
-                continue
-            final_answer_text = None
-            for item in reversed(output_items):
-                # Skip items without content (function_call, function_call_output, etc.)
-                if "content" not in item:
-                    continue
-                content = item["content"]
-                if isinstance(content, list) and content and "text" in content[0]:
-                    final_answer_text = content[0]["text"].strip()
-                    break
-                elif isinstance(content, str):
-                    final_answer_text = content.strip()
-                    break
-            if final_answer_text is None or final_answer_text == "":
+            if has_empty_final_answer(output_items):
                 result["full_result"]["reward"] = 0.0
 
                 counts["empty_final_answer"] += 1
@@ -2283,15 +2285,14 @@ def apply_reward_penalties(
             reward_penalty_config, "unwanted"
         )
         for result in results:
-            has_unwanted_token = False
-            for msg in result["message_log"]:
-                if msg["role"] != "assistant":
-                    continue
-                # Penalize any configured unwanted token in the assistant generation,
-                # including the terminal position.
-                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
-                    has_unwanted_token = True
-                    break
+            has_unwanted_token = has_unwanted_tokens(
+                (
+                    msg["token_ids"]
+                    for msg in result["message_log"]
+                    if msg["role"] == "assistant"
+                ),
+                unwanted_token_ids,
+            )
             if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
 
@@ -2659,6 +2660,7 @@ async def run_async_nemo_gym_rollout(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
     returns_entire_batch: bool = False,
@@ -2692,6 +2694,8 @@ async def run_async_nemo_gym_rollout(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        length_penalty_config: Optional ``grpo.length_penalty`` block; applied per
+            prompt group of ``identity_num_generations`` rows.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
@@ -2881,8 +2885,10 @@ async def run_async_nemo_gym_rollout(
                         log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
+                        length_penalty_config=length_penalty_config,
                         thinking_tags=thinking_tags,
                         mask_env_flagged_samples=mask_env_flagged_samples,
+                        group_size=identity_num_generations,
                     )
                     if accumulator.is_complete:
                         final_rollout_result = rollout_result
@@ -2922,6 +2928,7 @@ def run_nemo_gym_rollout_sync(
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     sampling_params: Optional[GenerationSamplingParams] = None,
     mask_env_flagged_samples: bool = True,
@@ -2952,6 +2959,8 @@ def run_nemo_gym_rollout_sync(
         greedy: Must be ``False`` because this path does not support greedy mode.
         effort_config: Optional configuration for effort-based reward shaping.
         reward_penalty_config: Optional reward-penalty configuration.
+        length_penalty_config: Optional ``grpo.length_penalty`` block; applied per
+            prompt group of ``num_generations_per_prompt`` rows.
         thinking_tags: Optional opening and closing tags used by thinking penalties.
         num_generations_per_prompt: Number of contiguous rows produced from each
             original prompt. Each such group stays on one actor instance.
@@ -2994,6 +3003,7 @@ def run_nemo_gym_rollout_sync(
             greedy=greedy,
             effort_config=effort_config,
             reward_penalty_config=reward_penalty_config,
+            length_penalty_config=length_penalty_config,
             thinking_tags=thinking_tags,
             mask_env_flagged_samples=mask_env_flagged_samples,
             returns_entire_batch=True,
@@ -3009,6 +3019,183 @@ def run_nemo_gym_rollout_sync(
     return asyncio.run(_consume_rollout())
 
 
+def _single_group_reward_diagnostics(results: list[dict]) -> dict[str, float]:
+    """Summarize reward variation within one prompt's generations."""
+    metrics: dict[str, float] = {}
+    total_rewards = [float(result["full_result"]["reward"]) for result in results]
+    if total_rewards:
+        metrics["zero_advantage_group_pct"] = (
+            100.0 if len(set(total_rewards)) == 1 else 0.0
+        )
+        if len(total_rewards) > 1:
+            metrics["total_reward/std_in_group"] = statistics.stdev(total_rewards)
+
+    # Require every response to have a numeric raw score; parse failures must
+    # not be silently counted as zeros or ties.
+    for key in ("reward_score_raw", "reward_overall_score_raw"):
+        values = [result["full_result"].get(key) for result in results]
+        if not values or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            continue
+        numeric_values = [float(value) for value in values]
+        pair_count = len(numeric_values) * (len(numeric_values) - 1) // 2
+        tie_count = sum(
+            left == right
+            for index, left in enumerate(numeric_values)
+            for right in numeric_values[index + 1 :]
+        )
+        metrics[f"{key}/all_equal_in_group_pct"] = (
+            100.0 if len(set(numeric_values)) == 1 else 0.0
+        )
+        if pair_count:
+            metrics[f"{key}/pairwise_tie_pct"] = 100.0 * tie_count / pair_count
+            metrics[f"{key}/std_in_group"] = statistics.stdev(numeric_values)
+    return metrics
+
+
+def _group_reward_diagnostics(
+    results: list[dict], group_size: int | None = None
+) -> dict[str, float]:
+    """Compute diagnostics over the actual prompt groups in ``results``."""
+    if group_size is None or group_size == len(results):
+        return _single_group_reward_diagnostics(results)
+    if group_size <= 0 or len(results) % group_size:
+        raise ValueError("group_size must evenly divide results")
+
+    per_group = [
+        _single_group_reward_diagnostics(results[start : start + group_size])
+        for start in range(0, len(results), group_size)
+    ]
+    metrics: dict[str, float] = {}
+    for key in set().union(*(group.keys() for group in per_group)):
+        values = [group[key] for group in per_group if key in group]
+        if key.endswith("/std_in_group"):
+            metrics[f"{key}/mean"] = sum(values) / len(values)
+            metrics[f"{key}/p05"] = float(np.percentile(values, 5))
+            metrics[f"{key}/p95"] = float(np.percentile(values, 95))
+        else:
+            metrics[key] = sum(values) / len(values)
+    return metrics
+
+
+def _nemo_gym_group_metrics(
+    results: list[dict], group_size: int | None = None
+) -> dict[str, Any]:
+    """Compute metrics shared by both NeMo-Gym rollout implementations.
+
+    Used by the batched NeMo-Gym rollout path (``run_async_nemo_gym_rollout``)
+    and the single-controller path (``AsyncNemoGymRolloutImpl``). ``group_size``
+    identifies prompt-group boundaries; when omitted, all results are treated as
+    one group.
+    """
+    if not results:
+        return {}
+
+    metrics: dict[str, Any] = _group_reward_diagnostics(results, group_size)
+    valid_token_counts = [
+        result
+        for result in results
+        if result.get("token_extraction_valid") is True
+        and all(
+            isinstance(result.get(key), int)
+            and not isinstance(result.get(key), bool)
+            and result[key] >= 0
+            for key in ("reasoning_token_count", "response_token_count")
+        )
+    ]
+    # Fraction of samples where either the reasoning-token count or response-token
+    # count could not be extracted as a non-negative integer.
+    metrics["reasoning_response_token_extraction_failure_rate"] = 1 - len(
+        valid_token_counts
+    ) / len(results)
+    for key, values in (
+        (
+            "reasoning_tokens_per_sample",
+            [result["reasoning_token_count"] for result in valid_token_counts],
+        ),
+        (
+            "response_tokens_per_sample",
+            [result["response_token_count"] for result in valid_token_counts],
+        ),
+    ):
+        if values:
+            metrics.update(calculate_single_metric(values, len(values), key))
+            metrics[f"{key}/p05"] = pct(values, 5)
+            metrics[f"{key}/p95"] = pct(values, 95)
+
+    for key in _SHARED_GENRM_METRICS:
+        values = [
+            float(result["full_result"][key])
+            for result in results
+            if isinstance(result["full_result"].get(key), (bool, int, float))
+        ]
+        if values:
+            metrics.update(calculate_single_metric(values, len(values), key))
+    return metrics
+
+
+# Responses ``incomplete_details.reason`` values that mean the final model call
+# ran out of tokens. NeMo-Gym normalizes every length stop to
+# ``max_output_tokens``: a chat ``finish_reason="length"`` (including the empty
+# completion it returns when the prompt overflows the context window) and the
+# Anthropic ``max_tokens`` / ``model_context_window_exceeded`` stop reasons. The
+# Responses schema admits no other length reason, so ``length`` and
+# ``max_tokens`` are defensive aliases for non-Gym producers; the pinned Gym
+# cannot emit them.
+_LENGTH_LIMIT_INCOMPLETE_REASONS = frozenset(
+    {"max_output_tokens", "length", "max_tokens"}
+)
+
+
+def nemo_gym_rollout_hit_max_tokens(
+    full_result: dict[str, Any] | None,
+    *,
+    total_tokens: int,
+    max_total_tokens_per_sample: int,
+) -> bool:
+    """Return whether a NeMo-Gym rollout was cut off by the token budget.
+
+    An exact ``total_tokens == max_total_tokens_per_sample`` match almost never
+    fires for multi-turn rollouts: when the next prompt no longer fits, Gym's
+    vLLM model returns an empty ``finish_reason="length"`` completion that adds
+    no tokens, so the chain stops short of the limit. Count the rollout as
+    truncated if it reached the limit, or if the final response is incomplete
+    for a length reason.
+
+    The length reason is deliberately not restricted to context exhaustion: a
+    final response stopped by its per-turn ``max_output_tokens`` cap carries the
+    same ``incomplete_details.reason`` and also counts as truncated, even when
+    the accumulated token count is below ``max_total_tokens_per_sample``. Its
+    final generation was length-cut, so it belongs in ``truncation_rate`` and is
+    a valid ``overlong_filtering`` target. Responses that are incomplete for
+    another reason (e.g. ``content_filter``), responses without
+    ``incomplete_details``, and absent or malformed metadata are not truncation.
+
+    Args:
+        full_result: The Gym rollout result; its ``response`` key holds the
+            final Responses object when the agent produced one. Agents that
+            return the model's final Responses object carry
+            ``incomplete_details``; agents that synthesize their terminal
+            response do not, and fall back to the token-count check.
+        total_tokens: Token count of the rollout's full message log.
+        max_total_tokens_per_sample: The generation backend's context limit.
+
+    Returns:
+        True if the rollout was cut off by a token limit.
+    """
+    if total_tokens >= max_total_tokens_per_sample:
+        return True
+    response = (full_result or {}).get("response")
+    if not isinstance(response, dict):
+        return False
+    incomplete_details = response.get("incomplete_details")
+    if not isinstance(incomplete_details, dict):
+        return False
+    return incomplete_details.get("reason") in _LENGTH_LIMIT_INCOMPLETE_REASONS
+
+
 def _postprocess_single_nemo_gym_group(
     nemo_gym_rows: list[dict],
     results: list[dict],
@@ -3020,10 +3207,17 @@ def _postprocess_single_nemo_gym_group(
     log_full_result_tables: bool,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    length_penalty_config: LengthPenaltyConfig | dict[str, Any] | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
     mask_env_flagged_samples: bool = True,
+    group_size: Optional[int] = None,
 ) -> NemoGymRolloutResult:
-    """Postprocess one complete prompt group from the NeMo-Gym stream."""
+    """Postprocess one complete prompt group from the NeMo-Gym stream.
+
+    ``group_size`` is the number of contiguous rows sharing one prompt identity
+    (``identity_num_generations``); the synchronous path hands the whole batch
+    in as one call, so it may hold several prompt groups. Defaults to the batch.
+    """
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
 
@@ -3031,6 +3225,28 @@ def _postprocess_single_nemo_gym_group(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
     penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+
+    # Length penalties rewrite full_result["reward"] in place; keep the reward
+    # as handed to the hook (``env_reward``) so training can still report the
+    # env pass rate and how far rewards moved.
+    env_rewards: torch.Tensor | None = None
+    length_penalty_metrics: dict[str, float] = {}
+    if length_penalty_config is not None:
+        # Copy the per-row fields the length adjustments consume.
+        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+            result["agent_ref"] = nemo_gym_row["agent_ref"]
+            result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
+            result["profiled_output_lengths"] = nemo_gym_row.get(
+                "profiled_output_lengths"
+            )
+            result["profile_band"] = nemo_gym_row.get("profile_band")
+        env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
+        length_penalty_metrics = apply_group_length_penalties(
+            results,
+            length_penalty_config,
+            group_size if group_size is not None else len(results),
+            tokenizer=tokenizer,
+        )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -3051,7 +3267,7 @@ def _postprocess_single_nemo_gym_group(
             max_total_tokens_per_sample = policy_generation.cfg[
                 "max_total_sequence_length"
             ]
-        all_sample_metrics = [
+        all_sample_metrics: list[dict[str, Any]] = [
             {
                 "total_reward": r["full_result"]["reward"],
                 "assistant_tokens": sum(
@@ -3061,8 +3277,11 @@ def _postprocess_single_nemo_gym_group(
                 ),
                 "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
+                "hit_max_tokens": nemo_gym_rollout_hit_max_tokens(
+                    r["full_result"],
+                    total_tokens=sum(len(m["token_ids"]) for m in r["message_log"]),
+                    max_total_tokens_per_sample=max_total_tokens_per_sample,
+                ),
                 # max_gen_tokens_per_turn: Diagnostic for long single generations
                 "max_gen_tokens_per_turn": max(
                     (
@@ -3075,6 +3294,8 @@ def _postprocess_single_nemo_gym_group(
             }
             for r in results
         ]
+    # Report diagnostics for the final rewards after all training-time adjustments.
+    group_metrics = _nemo_gym_group_metrics(results, group_size)
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
@@ -3082,8 +3303,8 @@ def _postprocess_single_nemo_gym_group(
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
-
         rollout_metrics = {
+            **group_metrics,
             **calculate_single_metric(
                 turn_counts,
                 batch_size,
@@ -3125,20 +3346,31 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
-
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
+        agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
+        for nemo_gym_row, result, sample_metrics in zip(
+            nemo_gym_rows, results, all_sample_metrics
+        ):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
+            agent_to_sample_metrics[agent_name].append(sample_metrics)
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
-            keys = agent_results[0].keys()
+            agent_sample_metrics = agent_to_sample_metrics[agent_name]
+            agent_truncations = [m["hit_max_tokens"] for m in agent_sample_metrics]
+            per_agent_metrics[f"{agent_name}/truncation_rate"] = sum(
+                agent_truncations
+            ) / len(agent_truncations)
+
+            keys = set().union(*(result.keys() for result in agent_results))
             for key in keys:
+                if key in _SHARED_GENRM_METRICS:
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results
@@ -3150,6 +3382,23 @@ def _postprocess_single_nemo_gym_group(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
+
+            # Emit authoritative live token metrics after full-result metrics so
+            # similarly named environment metadata cannot overwrite them.
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["total_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/total_tokens_per_sample",
+                )
+            )
+            per_agent_metrics.update(
+                calculate_single_metric(
+                    [m["assistant_tokens"] for m in agent_sample_metrics],
+                    len(agent_sample_metrics),
+                    f"{agent_name}/gen_tokens_per_sample",
+                )
+            )
 
             if log_full_result_tables:
                 to_log = [
@@ -3206,8 +3455,11 @@ def _postprocess_single_nemo_gym_group(
         final_batch[MASK_SAMPLE] = _mask_sample_flags(
             result["full_result"] for result in results
         )
+    if env_rewards is not None:
+        final_batch["env_reward"] = env_rewards
 
     rollout_metrics.update(_effort_shaping_metrics(shaping))
+    rollout_metrics.update(length_penalty_metrics)
 
     rollout_metrics.update(
         compute_reward_penalty_metrics(

@@ -27,7 +27,7 @@ async_rl:
     # How far generation may run ahead of the trainer.
     max_lookahead_versions: 1
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.
@@ -181,7 +181,7 @@ rollout_checkpointing:
   extra_fingerprint_excluded_paths: []
 
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
@@ -189,7 +189,6 @@ policy:
   generation:
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null

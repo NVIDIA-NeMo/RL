@@ -1,6 +1,6 @@
 # Automodel v0.6.0 and Context-Parallel Integration
 
-This design note describes NeMo RL's Automodel DTensor v2 integration after the
+This design note describes NeMo RL's Automodel integration after the
 Automodel dependency was pinned to the official `v0.6.0` tag. It also explains the
 migration from NeMo RL's fixed context-parallel (CP) layout to Automodel's model-owned
 sharding protocol.
@@ -93,7 +93,7 @@ model = model_class.from_pretrained(
   `_should_write_hf_metadata(config)`.
 - `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
   modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
-  exposes these Automodel-only settings under `policy.dtensor_cfg`, delegates
+  exposes these Automodel-only settings under `policy.automodel_cfg`, delegates
   normalization to Automodel, explicitly marks terminal checkpoint saves, and
   supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
   intentionally exposes only canonical strings: use quoted `"false"` instead of
@@ -161,10 +161,10 @@ This matrix describes the NeMo RL tree at the before-upgrade baseline.
 | DPO | Supported | Restored full-sequence policy and reference logprobs before the DPO loss |
 | Same-tokenizer distillation | Supported | Teacher top-k export and student distillation loss were CP-aware |
 | X-token distillation | Conditional | Specialized heterogeneous teacher/student TP and CP path; no sequence packing |
-| PPO | Not supported end to end | Actor policy could use CP, but the Automodel DTensor critic/value path required `CP=1` |
-| Reward-model training | Not supported | The Automodel DTensor RM path rejected `CP>1` |
+| PPO | Not supported end to end | Actor policy could use CP, but the Automodel critic/value path required `CP=1` |
+| Reward-model training | Not supported | The Automodel RM path rejected `CP>1` |
 | CP with sequence packing | Not supported | Explicit NeMo RL guard |
-| CP with DTensor sequence parallel | Not supported | Explicit guard when TP sequence parallelism and CP were both active |
+| CP with Automodel sequence parallel | Not supported | Explicit guard when TP sequence parallelism and CP were both active |
 | Non-packed sequence length | Restricted | Legacy load-balanced sharding required divisibility by `2 * cp_size` |
 
 ### 3.3 Support Matrix After the Upgrade
@@ -180,10 +180,10 @@ This matrix describes the current NeMo RL integration pinned to Automodel `v0.6.
 | DPO | Supported | Full-sequence policy/reference logprobs are restored through the sharder before loss computation |
 | Same-tokenizer distillation | Supported | Top-k and student outputs are restored through the sharder; replicated loss uses `loss * DP` |
 | X-token distillation | Conditional | Specialized heterogeneous TP/CP path remains; no sequence packing, and each teacher/student sequence length must be divisible by its own CP size for the contiguous IPC windows |
-| PPO | Not supported end to end | Actor policy can use CP, but the Automodel DTensor critic/value path still requires `CP=1` |
+| PPO | Not supported end to end | Actor policy can use CP, but the Automodel critic/value path still requires `CP=1` |
 | Reward-model training and scoring | Not supported | RM setup and `ScorePostProcessor` reject `CP>1` |
 | CP with sequence packing | Not supported in NeMo RL | The integration still rejects it, even though the upstream sharder can represent packed/THD layouts |
-| CP with DTensor sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
+| CP with Automodel sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
 | Non-packed sequence length | Supported with padding | The generic sharder pads and trims automatically; x-token keeps the divisibility restriction described above |
 
 ### 3.4 GRPO Workflow Before and After

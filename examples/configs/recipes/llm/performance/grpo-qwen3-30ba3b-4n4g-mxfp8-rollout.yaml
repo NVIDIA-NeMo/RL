@@ -15,7 +15,7 @@ policy:
   max_total_sequence_length: 4096
   sequence_packing:
     fuse_loss: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   optimizer: null
   scheduler: null
@@ -49,6 +49,7 @@ policy:
       tensor_parallel_size: 1
       precision: "fp8"
       is_mx: true
+      refit_prequantize: true
       quantization_ignore_patterns:
         - model.layers.*.self_attn.*
         - model.layers.*.mlp.gate

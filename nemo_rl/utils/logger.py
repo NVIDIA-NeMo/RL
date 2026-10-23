@@ -45,7 +45,9 @@ from torch.utils.tensorboard import SummaryWriter
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
+from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+from nemo_rl.utils.train_data_dump import json_safe_nonfinite
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -229,6 +231,10 @@ class TensorboardLogger(LoggerInterface):
                 print(f"Warning: Failed to log metric '{name}' to TensorBoard: {e}")
                 continue
 
+    def finish(self) -> None:
+        """Flush queued TensorBoard events before a worker or actor exits."""
+        self.writer.close()
+
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to Tensorboard."""
         if len(histogram) > 0:
@@ -283,11 +289,45 @@ class WandbLogger(LoggerInterface):
             wandb.save("/tmp/ray/session_latest/logs/raylet.out", policy="live")
             wandb.save("/tmp/ray/session_latest/logs/raylet.err", policy="live")
 
-        self._log_code()
-        self._log_diffs()
+        skip_reason = self._git_artifacts_skip_reason()
+        if skip_reason is None:
+            self._log_code()
+            self._log_diffs()
+        else:
+            print(
+                f"{skip_reason}; skipping the wandb source-code and git-diff artifacts."
+            )
         print(
             f"Initialized WandbLogger for project {cfg.project}, run {cfg.name} at {log_dir}"
         )
+
+    @staticmethod
+    def _git_artifacts_skip_reason() -> Optional[str]:
+        """Why the git-based artifacts cannot be logged, or None when they can.
+
+        A job launched from an uploaded copy of the code tree has no ``.git``
+        directory there, so ``git ls-files`` and ``git diff`` would only fail.
+        The reason is reported as git states it, so a checkout git refuses
+        (``fatal: detected dubious ownership``) or a missing git binary is not
+        reported as "not a work tree".
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            return f"git is not available ({error})"
+        if result.returncode != 0:
+            first_line = result.stderr.strip().splitlines()
+            return (
+                first_line[0] if first_line else f"git exited with {result.returncode}"
+            )
+        if result.stdout.strip() != "true":
+            return "Not inside a git work tree"
+        return None
 
     def _log_diffs(self):
         """Log git diffs to wandb.
@@ -610,7 +650,12 @@ class WandbLogger(LoggerInterface):
     def log_table(
         self, columns: list[str], rows: list[list[Any]], step: int, name: str
     ) -> None:
-        """Log a table to wandb.
+        """Log one step's rows as a table, with a leading ``step`` column.
+
+        Each step logs its own table under ``name`` (like ``log_plot``), so the
+        per-step cost stays constant. The ``step`` column keeps rows
+        distinguishable when steps are viewed together, e.g. a query panel
+        concatenating the key's history.
 
         Args:
             columns: Column headers
@@ -619,8 +664,11 @@ class WandbLogger(LoggerInterface):
             name: Panel name
         """
         with self._log_lock:
+            table = wandb.Table(
+                columns=["step", *columns], data=[[step, *row] for row in rows]
+            )
             self._buffer_step_metrics_locked(
-                {name: wandb.Table(columns=columns, data=rows)},
+                {name: table},
                 step=step,
                 step_finished=False,
             )
@@ -858,10 +906,10 @@ class RayGpuMonitorLogger:
             metric_name = f"node.{node_idx}.gpu.{index}.mem_gb"
             # NOTE: It appears their docs say bytes, but it appears to be MB
             value /= 1024
-        elif metric_name == "ray_node_mem_used":
+        elif metric_name == RAY_NODE_MEM_USED:
             metric_name = f"node.{node_idx}.mem_gb"
             value /= 1024 * 1024 * 1024
-        elif metric_name == "ray_node_mem_total":
+        elif metric_name == RAY_NODE_MEM_TOTAL:
             metric_name = f"node.{node_idx}.mem_total_gb"
             value /= 1024 * 1024 * 1024
         else:
@@ -1378,7 +1426,14 @@ class Logger(LoggerInterface):
                     elif isinstance(value, np.ndarray):
                         sample[key] = value.tolist()
                 # default=str is a fallback for non-JSON-serializable types (e.g., datetime, custom objects)
-                f.write(json.dumps({**sample, "idx": i}, default=str) + "\n")
+                f.write(
+                    json.dumps(
+                        json_safe_nonfinite({**sample, "idx": i}),
+                        default=str,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
 
         print(f"Logged data to {filepath}")
 
@@ -1516,7 +1571,7 @@ class Logger(LoggerInterface):
             logger.log_plot(figure, step, name)
 
     def log_plot_token_mult_prob_error(
-        self, data: dict[str, Any], step: int, name: str
+        self, data: dict[str, Any], step: int, name: str, *, filtering_on: bool = False
     ) -> None:
         """Log a plot of log probability errors in samples.
 
@@ -1535,10 +1590,23 @@ class Logger(LoggerInterface):
         prev_logprobs = data["prev_logprobs"][:, 1:]
         mask = token_mask * sample_mask.unsqueeze(-1)
 
-        diff = (generation_logprobs - prev_logprobs).abs() * token_mask
-        mask = token_mask * sample_mask.unsqueeze(-1)
-
-        mult_prob_error = (torch.exp(diff) * mask).sum(dim=-1) / mask.sum(dim=-1)
+        valid = mask.bool()
+        if filtering_on:
+            valid = (
+                valid
+                & ~torch.isneginf(generation_logprobs)
+                & ~torch.isneginf(prev_logprobs)
+            )
+        counts = valid.sum(dim=-1)
+        if not counts.any():
+            return
+        generation_logprobs = torch.where(valid, generation_logprobs, 0.0)
+        prev_logprobs = torch.where(valid, prev_logprobs, 0.0)
+        diff = (generation_logprobs - prev_logprobs).abs()
+        mult_prob_error = torch.where(valid, torch.exp(diff), 0.0).sum(
+            dim=-1
+        ) / counts.clamp_min(1)
+        mult_prob_error = mult_prob_error.masked_fill(counts == 0, -torch.inf)
 
         sample_idx = torch.argmax(mult_prob_error)
         sample_error = mult_prob_error[sample_idx]
@@ -1559,23 +1627,30 @@ class Logger(LoggerInterface):
         generation_logprob = generation_logprobs[
             sample_idx, int(generation_start_idx) : int(generation_end_idx)
         ]
-        prev_logprob = (
-            prev_logprobs[
-                sample_idx, int(generation_start_idx) : int(generation_end_idx)
-            ]
-            * mask[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
-        )
+        prev_logprob = prev_logprobs[
+            sample_idx, int(generation_start_idx) : int(generation_end_idx)
+        ]
+        valid_i = valid[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        if not valid_i.any():
+            return
         diff_i = diff[sample_idx, int(generation_start_idx) : int(generation_end_idx)]
+        diff_i = diff_i.masked_fill(~valid_i, float("nan"))
+        generation_logprob = generation_logprob.masked_fill(~valid_i, float("nan"))
+        prev_logprob = prev_logprob.masked_fill(~valid_i, float("nan"))
 
         # Find max absolute error token
-        max_abs_error_idx = torch.argmax(diff_i).item()
+        max_abs_error_idx = torch.argmax(
+            diff_i.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_abs_error = diff_i[max_abs_error_idx].item()
 
         # Find max relative error token (ratio of probabilities)
         gen_prob = torch.exp(generation_logprob)
         prev_prob = torch.exp(prev_logprob)
         relative_error = torch.abs((gen_prob - prev_prob) / gen_prob)
-        max_rel_error_idx = torch.argmax(relative_error).item()
+        max_rel_error_idx = torch.argmax(
+            relative_error.masked_fill(~valid_i, -torch.inf)
+        ).item()
         max_rel_error = relative_error[max_rel_error_idx].item()
 
         fig = plt.figure()

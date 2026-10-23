@@ -26,6 +26,7 @@ import ray
 import torch
 
 import nemo_rl.experience.rollout_reassembler_actor as actor_module
+from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.actor_environments import ACTOR_ENVIRONMENTS
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -108,6 +109,8 @@ def test_finalize_forwards_loss_multiplier_to_reassembler() -> None:
         prompt_idx=17,
         loss_multiplier=0.25,
         canonical_sample_ids=["group_g0"],
+        reward_checks=None,
+        reward_log_contexts=None,
     )
 
 
@@ -143,11 +146,17 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
         capture_media=capture_media,
+        media_columns=(
+            MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)
+            if capture_media
+            else None
+        ),
     )
     actor = object.__new__(actor_cls)
     actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
     finalizer = actor._finalizer
     assert finalizer._capture_media is capture_media
+    assert finalizer._media_columns is config.media_columns
     assert finalizer._source._capture_media is capture_media
     assert finalizer._staging._capture_media is capture_media
 
@@ -183,6 +192,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "prompt_idx",
         "mask_sample",
         "loss_multiplier",
+        "reward_checks",
+        "reward_log_contexts",
     }
     assert {f.name for f in fields(FinalizedGroup)} == {
         "meta",
@@ -191,6 +202,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "staging_keys",
         "canonical_output_tokens",
         "metrics",
+        "reward_observations",
         "dropped",
         "drop_reason",
         "valid_row_count",
@@ -246,6 +258,7 @@ def test_factory_selects_gym_environment_and_waits_for_dependencies(
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
         capture_media=False,
+        media_columns=None,
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]
@@ -308,3 +321,18 @@ def test_dependency_check_propagates_import_error(
     with pytest.raises(ModuleNotFoundError) as exc_info:
         actor.check_dependencies()
     assert exc_info.value is import_error
+
+
+def test_reward_checks_remain_metadata_only_and_reach_finalizer():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+
+    checks = RewardChecks(True, True, True)
+    request = replace(_request(), reward_checks=(checks,))
+    assert_metadata_only(request)
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = MagicMock()
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        None, 4, 4, [], dropped=True
+    )
+    actor.finalize(request)
+    assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]

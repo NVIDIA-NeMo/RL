@@ -149,8 +149,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -388,6 +390,14 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true
   nemo_gym:
+    equivalence_llm_judge_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: equivalence_llm_judge_simple_agent
+
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
     num_gpu_nodes: 10
