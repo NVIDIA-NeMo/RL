@@ -62,6 +62,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    resolve_ppo_chunk_alignment,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
@@ -202,6 +203,8 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         partition_includes_multimodal_fields=False,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
+        ppo_group_multiple=1,
+        ppo_min_remaining_groups=0,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -214,6 +217,72 @@ def _init_controller(master_config, actor_args):
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
+
+
+@pytest.mark.parametrize(
+    ("packed", "dynamic", "expected_groups"),
+    [(False, False, 2), (True, False, 1), (False, True, 1)],
+)
+def test_ppo_group_multiple_requires_complete_microbatches(
+    packed: bool, dynamic: bool, expected_groups: int
+) -> None:
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "logprob_batch_size": 4,
+            "dynamic_batching": {"enabled": dynamic},
+            "sequence_packing": {"enabled": packed},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=expected_groups),
+    )
+    assert resolve_ppo_chunk_alignment(config, 8, 8)[0] == expected_groups
+
+
+@pytest.mark.parametrize(
+    ("num_prompts_per_step", "min_groups", "error"),
+    [(32, 1, "min_groups_for_streaming_train"), (3, 2, "num_prompts_per_step")],
+)
+def test_ppo_chunk_validation_rejects_incomplete_chunks(
+    num_prompts_per_step: int, min_groups: int, error: str
+) -> None:
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(
+            num_prompts_per_step=num_prompts_per_step,
+            num_generations_per_prompt=16,
+        ),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=min_groups),
+    )
+    with pytest.raises(ValueError, match=error):
+        resolve_ppo_chunk_alignment(config, 8, 8)
+
+
+def test_ppo_chunk_validation_accepts_complete_chunks() -> None:
+    config = MasterConfig.model_construct(
+        ppo=PPOConfig(num_prompts_per_step=32, num_generations_per_prompt=16),
+        policy={
+            "train_micro_batch_size": 4,
+            "dynamic_batching": {"enabled": False},
+        },
+        value={
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": True},
+        },
+        async_rl=AsyncRLConfig(min_groups_for_streaming_train=2),
+    )
+    assert resolve_ppo_chunk_alignment(config, 8, 8) == (2, 1)
 
 
 def _one_group_tags(count: int, *, weight_version: int = 0) -> list[dict[str, object]]:
@@ -2063,6 +2132,9 @@ class _EmptyBuffer:
 
 
 class _NoOpTrainer:
+    def abort_train_step(self) -> None:
+        pass
+
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
 
@@ -2863,6 +2935,7 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
@@ -2880,9 +2953,26 @@ class _NoOpValue:
     def prepare_for_training(self) -> None:
         self._record("prepare_for_training")
 
+    def begin_train_step(self, loss_fn) -> None:
+        self._record("begin_train_step")
+
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        self._record("train_microbatches_from_meta")
+
     def train_from_meta(self, meta: KVBatchMeta, loss_fn) -> dict:
-        del meta, loss_fn
+        self.trained_sample_ids.append(meta.sample_ids)
         self._record("train_from_meta")
+        return {
+            "loss": torch.tensor([0.25]),
+            "grad_norm": torch.tensor([1.5]),
+            "all_mb_metrics": {"vf_clipfrac": [0.0], "values_min": [-1.0]},
+        }
+
+    def abort_train_step(self) -> None:
+        self._record("abort_train_step")
+
+    def finish_train_step(self) -> dict:
+        self._record("finish_train_step")
         return {
             "loss": torch.tensor([0.25]),
             "grad_norm": torch.tensor([1.5]),
@@ -2900,6 +2990,7 @@ def _ppo_train_pump_controller(
     value: _NoOpValue | None = None,
     ppo_epochs: int = 1,
     critic_ppo_epochs: int | None = None,
+    value_training_mode: str = "whole_batch",
 ) -> tuple[object, _NoOpValue]:
     ctrl = _train_pump_controller(sampler=sampler)
     value = _NoOpValue() if value is None else value
@@ -2916,12 +3007,42 @@ def _ppo_train_pump_controller(
         max_num_steps=1,
         policy_training_start_step=policy_training_start_step,
         seq_logprob_error_threshold=None,
+        value_training_mode=value_training_mode,
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
     return ctrl, value
+
+
+def test_whole_batch_value_mode_replays_all_chunks_per_critic_epoch() -> None:
+    first_meta = _single_group_meta()
+    second_meta = _single_group_meta()
+    second_meta.sample_ids = ["sample-1"]
+    controller, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(first_meta),
+        value_training_mode="whole_batch",
+    )
+
+    asyncio.run(controller._value_train_epochs([first_meta, second_meta], num_epochs=2))
+
+    assert value.calls == [
+        "prepare_for_training",
+        "train_from_meta",
+        "train_from_meta",
+        "finish_training",
+    ]
+    assert value.trained_sample_ids == [
+        ["sample-0", "sample-1"],
+        ["sample-0", "sample-1"],
+    ]
+
+
+def test_ppo_value_training_mode_defaults_to_whole_batch_and_rejects_unknown() -> None:
+    assert PPOConfig().value_training_mode == "whole_batch"
+    with pytest.raises(ValueError, match="value_training_mode"):
+        PPOConfig(value_training_mode="unknown")
 
 
 def _single_group_meta() -> KVBatchMeta:
@@ -2948,6 +3069,7 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
     ctrl, _ = _ppo_train_pump_controller(
         sampler=_OneThenEmptySampler(meta),
         value=_NoOpValue(calls=calls, prefix="critic."),
+        value_training_mode="split",
     )
     ctrl._policy_logprobs_required = True
     ctrl._trainer = _OrderRecordingTrainer(calls)
@@ -2966,7 +3088,9 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "policy.prepare_for_training",
         "policy.offload_to_cpu",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
         "critic.finish_training",
     ]
 
@@ -3043,7 +3167,7 @@ def test_train_pump_skips_the_critic_on_an_empty_chunk(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="no valid response tokens after filtering"):
         asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert "train_from_meta" not in value.calls
+    assert "begin_train_step" not in value.calls
     # The forward still ran -- it is what the advantage stage consumes.
     assert "get_values_from_meta" in value.calls
 
@@ -3068,6 +3192,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
         policy_training_start_step=1,
         ppo_epochs=ppo_epochs,
         critic_ppo_epochs=critic_ppo_epochs,
+        value_training_mode="split",
     )
     stand_downs: list[bool] = []
     if engine_blocks_training:
@@ -3090,7 +3215,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert value.calls.count("train_from_meta") == critic_ppo_epochs
+    assert value.calls.count("finish_train_step") == critic_ppo_epochs
     trainer.prepare_for_training.assert_not_called()
     trainer.begin_train_step.assert_not_called()
     trainer.finish_train_step.assert_not_called()
@@ -3186,6 +3311,7 @@ def test_train_pump_runs_all_critic_epochs_after_actor_epochs(monkeypatch) -> No
         value=_NoOpValue(calls=calls, prefix="critic."),
         ppo_epochs=1,
         critic_ppo_epochs=3,
+        value_training_mode="split",
     )
     ctrl._trainer = _EpochRecordingTrainer(calls)
     ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
@@ -3205,9 +3331,15 @@ def test_train_pump_runs_all_critic_epochs_after_actor_epochs(monkeypatch) -> No
         "policy.finish_train_step",
         "policy.offload_to_cpu",
         "critic.prepare_for_training",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
-        "critic.train_from_meta",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
+        "critic.begin_train_step",
+        "critic.train_microbatches_from_meta",
+        "critic.finish_train_step",
         "critic.finish_training",
     ]
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
@@ -3333,6 +3465,8 @@ def _streaming_ppo_controller(
         policy_training_start_step=int(warmup),
     )
     ctrl._streaming_ppo = True
+    ctrl._ppo_group_multiple = 1
+    ctrl._ppo_min_remaining_groups = 1
     ctrl._algo_cfg.num_prompts_per_step = len(metas)
     ctrl._master_config.policy = {"dynamic_batching": {"enabled": True}}
     ctrl._master_config.value = {"dynamic_batching": {"enabled": True}}
@@ -3369,6 +3503,25 @@ def _full_batch_ppo_controller(
     full_meta = metas[0].concat(*metas[1:])
     ctrl._sampler.select = AsyncMock(return_value=(full_meta, len(metas)))
     return ctrl, metas, calls
+
+
+def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch, critic_epochs=2)
+    controller._algo_cfg.value_training_mode = "split"
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert calls.count("policy.finish_train_step") == 1
+    assert calls.count("critic.begin_train_step") == 2
+    assert calls.count("critic.train_microbatches_from_meta") == 2 * len(metas)
+    assert calls.count("critic.finish_train_step") == 2
+    assert "critic.abort_train_step" not in calls
+    assert "critic.train_from_meta" not in calls
+    assert calls.index("refit") < calls.index("critic.begin_train_step")
+    assert controller._trainer_version == controller._train_steps == 1
 
 
 @pytest.mark.parametrize("warmup", [False, True])
@@ -3487,6 +3640,7 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
     ctrl, _, calls = _streaming_ppo_controller(monkeypatch, valid_chunks=(True, True))
     ctrl._algo_cfg.num_prompts_per_step = 128
     ctrl._async_cfg.min_groups_for_streaming_train = minimum
+    ctrl._ppo_min_remaining_groups = (minimum + 1) // 2
     ctrl._rollout_exhausted.clear()
     metas = [
         KVBatchMeta(
@@ -3837,8 +3991,8 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
         # inference falls back to its 2*5 train microbatch size: LCM=120.
         (4, 2, 1, "static", "static", None, 120),
         (4, 2, 5, "static", "static", None, 24),
-        # Explicit value inference mbs=2 reduces the sample alignment to24.
-        (4, 2, 1, "static", "static", 2, 24),
+        # Value training mbs=5 still requires complete critic microbatches.
+        (4, 2, 1, "static", "static", 2, 120),
         # Packing only one model leaves the other model's static constraint.
         (4, 2, 1, "dynamic_batching", "static", None, 20),
         (4, 2, 1, "static", "sequence_packing", None, 24),
@@ -3872,6 +4026,19 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     }
     if value_inference_mbs is not None:
         ctrl._master_config.value["logprob_batch_size"] = value_inference_mbs
+    ctrl._async_cfg.min_groups_for_streaming_train = expected_multiple
+    ctrl._ppo_group_multiple, ctrl._ppo_min_remaining_groups = (
+        resolve_ppo_chunk_alignment(
+            SimpleNamespace(
+                ppo=ctrl._algo_cfg,
+                policy=ctrl._master_config.policy,
+                value=ctrl._master_config.value,
+                async_rl=ctrl._async_cfg,
+            ),
+            policy_dp,
+            value_dp,
+        )
+    )
     sample_count = expected_multiple * generations
     metas = [
         KVBatchMeta(
@@ -3901,18 +4068,12 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     assert ctrl._sampler.select.await_count == 2
     for selection in ctrl._sampler.select.await_args_list:
         assert selection.kwargs["group_multiple"] == expected_multiple
-    ctrl._trainer.sharding_annotations.get_axis_size.assert_called_once_with(
-        "data_parallel"
-    )
-    ctrl._value.sharding_annotations.get_axis_size.assert_called_once_with(
-        "data_parallel"
-    )
     for meta in ctrl._trainer.trained_metas:
         assert meta.size % policy_dp == meta.size % value_dp == 0
     assert all(meta.size == 2 * sample_count for meta in ctrl._value.trained_metas)
 
 
-def test_streaming_ppo_rejects_unshardable_full_batch_before_claiming_rows(
+def test_streaming_ppo_rejects_unshardable_full_batch_during_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctrl, _, calls = _streaming_ppo_controller(monkeypatch)
@@ -3920,12 +4081,18 @@ def test_streaming_ppo_rejects_unshardable_full_batch_before_claiming_rows(
     ctrl._value.sharding_annotations.get_axis_size = MagicMock(return_value=4)
     ctrl._algo_cfg.num_generations_per_prompt = 1
     ctrl._algo_cfg.num_prompts_per_step = 10
-    ctrl._sampler.select = AsyncMock()
-
     with pytest.raises(ValueError, match="multiple"):
-        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+        resolve_ppo_chunk_alignment(
+            SimpleNamespace(
+                ppo=ctrl._algo_cfg,
+                policy=ctrl._master_config.policy,
+                value=ctrl._master_config.value,
+                async_rl=ctrl._async_cfg,
+            ),
+            8,
+            4,
+        )
 
-    ctrl._sampler.select.assert_not_awaited()
     assert calls == []
 
 
