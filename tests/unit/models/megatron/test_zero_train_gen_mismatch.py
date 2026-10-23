@@ -235,10 +235,6 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
     [
         (lambda c: c["megatron_cfg"].update(context_parallel_size=2), "context"),
         (
-            lambda c: c.__setitem__("sequence_packing", {"enabled": True}),
-            "sequence_packing.enabled=False",
-        ),
-        (
             lambda c: c["megatron_cfg"].update(use_fused_linear_logprobs=True),
             "use_fused_linear_logprobs",
         ),
@@ -259,13 +255,19 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
             "precision='bfloat16'",
         ),
     ],
-    ids=["cp", "packing", "fused-logprobs", "attention", "fa-version", "gen", "dtype"],
+    ids=["cp", "fused-logprobs", "attention", "fa-version", "gen", "dtype"],
 )
 def test_batch_invariant_rejects_unsupported_settings(mutate, expected):
     config = _policy_config()
     mutate(config)
     result = zgm.validate_batch_invariant_mode(config)
     assert any(expected in v for v in result.violations), result.violations
+
+
+def test_batch_invariant_accepts_sequence_packing():
+    config = _policy_config()
+    config["sequence_packing"] = {"enabled": True}
+    assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
 def test_batch_invariant_requires_the_batch_invariant_fields():
@@ -403,6 +405,42 @@ def test_validate_provider_requires_hybrid_mamba_env_pair(_clean_mamba_env, miss
 
 def test_validate_provider_skips_mamba_env_for_non_hybrid(_clean_mamba_env):
     config = _policy_config()
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern=None)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+@pytest.mark.parametrize(
+    ("packing", "divisible_by", "tp", "accepted"),
+    [
+        (True, 64, 1, False),
+        (True, 128, 1, True),
+        (True, 256, 2, True),
+        (True, 192, 2, False),
+        (False, 64, 1, True),
+    ],
+    ids=["packed-64", "packed-128", "packed-256-tp2", "packed-192-tp2", "unpacked-64"],
+)
+def test_validate_provider_requires_mamba_chunk_aligned_packing(
+    _clean_mamba_env, packing, divisible_by, tp, accepted
+):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(_HYBRID_MAMBA_ENV_VARS)
+    config["megatron_cfg"]["tensor_model_parallel_size"] = tp
+    config["sequence_packing"] = {"enabled": packing}
+    config["make_sequence_length_divisible_by"] = divisible_by
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-", mamba_chunk_size=128)
+
+    if accepted:
+        zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+    else:
+        with pytest.raises(ValueError, match="multiple of 128 \\(mamba_chunk_size=128\\)"):
+            zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_allows_64_aligned_packing_for_non_hybrid(_clean_mamba_env):
+    config = _policy_config()
+    config["sequence_packing"] = {"enabled": True}
     model_cfg = types.SimpleNamespace(hybrid_layer_pattern=None)
 
     zgm.validate_zero_train_gen_model_provider(config, model_cfg)

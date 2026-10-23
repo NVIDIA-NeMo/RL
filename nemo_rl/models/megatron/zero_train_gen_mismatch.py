@@ -20,6 +20,7 @@ precisions are BF16 and MXFP8 (the same on train and generation).
 
 from __future__ import annotations
 
+import math
 import os
 import warnings
 from dataclasses import dataclass, field, fields
@@ -144,12 +145,6 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
         out.violations.append(
             "batch_invariant_mode=True currently requires training context "
             "parallel size 1."
-        )
-    if config["sequence_packing"]["enabled"]:
-        out.violations.append(
-            "batch_invariant_mode=True requires sequence_packing.enabled=False: "
-            "packing changes microbatch composition and the packed log-prob path "
-            "does not share generation's fused log-softmax."
         )
     token_multiple = batch_invariant_token_multiple(
         megatron_cfg["tensor_model_parallel_size"]
@@ -611,7 +606,8 @@ def validate_zero_train_gen_model_provider(
 
     Hybrid Mamba models are supported with MAMBA_DETERMINISTIC=1 and
     TRITON_CACHE_AUTOTUNING=1, from policy.megatron_cfg.env_vars or the launch
-    environment.
+    environment. With sequence packing, every packed sequence must also start on a
+    Mamba chunk boundary.
     """
     if not config["megatron_cfg"].get("zero_train_gen_mismatch"):
         return
@@ -635,6 +631,7 @@ def validate_zero_train_gen_model_provider(
                 f"{required} together in policy.megatron_cfg.env_vars or the launch "
                 f"environment (got {got})."
             )
+        _validate_mamba_packed_sequence_alignment(config, model_cfg)
 
     unsupported_fields = [
         field_name
@@ -648,6 +645,34 @@ def validate_zero_train_gen_model_provider(
         raise ValueError(
             "zero_train_gen_mismatch does not support the resolved model "
             f"architecture fields: {', '.join(unsupported_fields)}."
+        )
+
+
+def _validate_mamba_packed_sequence_alignment(
+    config: PolicyConfig, model_cfg: Any
+) -> None:
+    """Packed rows place each sequence at a multiple of make_sequence_length_divisible_by.
+
+    Training's SSM scan cuts fixed chunks from the start of the packed row, while
+    generation cuts them from each request's start; the two match only when every
+    sequence starts on a chunk boundary.
+    """
+    if not config["sequence_packing"]["enabled"]:
+        return
+    chunk_size = model_cfg.mamba_chunk_size
+    multiple = math.lcm(
+        batch_invariant_token_multiple(
+            config["megatron_cfg"]["tensor_model_parallel_size"]
+        ),
+        chunk_size,
+    )
+    divisor = config["make_sequence_length_divisible_by"]
+    if divisor % multiple:
+        raise ValueError(
+            "zero_train_gen_mismatch with sequence packing on a hybrid Mamba model "
+            f"requires policy.make_sequence_length_divisible_by to be a multiple of "
+            f"{multiple} (mamba_chunk_size={chunk_size}), so each packed sequence "
+            f"starts on a Mamba chunk boundary (got {divisor})."
         )
 
 
