@@ -386,18 +386,54 @@ class TestStatisticsParticipation:
 
     @pytest.mark.parametrize("policy", ["exclude", "include"])
     def test_advantage_valid_mask_is_binary_under_both_policies(self, policy):
+        # The final loss weights: row 2 was dropped by an in-trainer filter.
         sample_mask = torch.tensor([1.0, 0.5, 0.0])
+        dataset_weights = torch.ones(3)
         config = GRPOConfig(masked_reward_policy=policy)
 
-        valid_mask = _advantage_valid_mask(sample_mask, config)
+        valid_mask = _advantage_valid_mask(sample_mask, config, dataset_weights)
 
         expected = (
             torch.ones(3) if policy == "include" else torch.tensor([1.0, 1.0, 0.0])
         )
         assert torch.equal(valid_mask, expected)
         # The logprob pass uses the same statistics rows, not the loss weights.
-        assert torch.equal(_logprob_sample_mask(sample_mask, config), expected)
+        assert torch.equal(
+            _logprob_sample_mask(sample_mask, config, dataset_weights), expected
+        )
         assert torch.equal(sample_mask, torch.tensor([1.0, 0.5, 0.0]))
+
+    @pytest.mark.parametrize("policy", ["exclude", "include"])
+    def test_include_participation_is_the_dataset_weight(self, policy):
+        """An over-length prompt (dataset weight 0) never votes; a masked reward does under include."""
+        # Row 1: masked by an in-trainer filter. Row 2: loss_multiplier 0 from
+        # the dataset. Row 3: fractional dataset weight (still one vote).
+        dataset_weights = torch.tensor([1.0, 1.0, 0.0, 0.5])
+        sample_mask = torch.tensor([1.0, 0.0, 0.0, 0.5])
+        config = GRPOConfig(masked_reward_policy=policy)
+
+        valid_mask = _advantage_valid_mask(sample_mask, config, dataset_weights)
+
+        expected = (
+            torch.tensor([1.0, 1.0, 0.0, 1.0])
+            if policy == "include"
+            else torch.tensor([1.0, 0.0, 0.0, 1.0])
+        )
+        assert torch.equal(valid_mask, expected)
+        assert torch.equal(
+            _logprob_sample_mask(sample_mask, config, dataset_weights), expected
+        )
+        # A list-valued column and a batch without the column are accepted.
+        assert torch.equal(
+            _advantage_valid_mask(sample_mask, config, [1.0, 1.0, 0.0, 0.5]),
+            expected,
+        )
+        if policy == "include":
+            assert torch.equal(
+                _advantage_valid_mask(sample_mask, config, None), torch.ones(4)
+            )
+        assert torch.equal(dataset_weights, torch.tensor([1.0, 1.0, 0.0, 0.5]))
+        assert torch.equal(sample_mask, torch.tensor([1.0, 0.0, 0.0, 0.5]))
 
     @pytest.mark.parametrize("policy", ["exclude", "include"])
     def test_dynamic_sampling_valid_mask_follows_the_policy(self, policy):
@@ -415,8 +451,9 @@ class TestStatisticsParticipation:
 
         valid_mask = _dynamic_sampling_valid_mask(batch, config)
 
+        # The zero-weight row is an over-length prompt: out under both policies.
         expected = (
-            torch.ones(5)
+            torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0])
             if policy == "include"
             else torch.tensor([1.0, 1.0, 0.0, 0.0, 0.0])
         )
@@ -484,7 +521,7 @@ def test_masked_reward_policy_controls_group_signal(
         prompt_ids=torch.zeros(3, 2, dtype=torch.long),
         rewards=rewards,
         mask=loss_mask[:, None].expand(-1, 2),
-        valid_mask=_advantage_valid_mask(loss_mask, config),
+        valid_mask=_advantage_valid_mask(loss_mask, config, torch.ones(3)),
     )
     effective_advantages = advantages * loss_mask[:, None]
     assert torch.equal(loss_mask, original_loss_mask)
@@ -552,8 +589,11 @@ def test_dynamic_sampling_uses_masked_reward_policy(
         Timer(),
         is_trivial_prompt_distribution=is_trivial,
     )
-    assert complete == (policy == "include")
-    assert is_trivial.tolist() == [policy == "exclude"] * 3
+    # A pre-existing zero weight is the dataset's over-length mark: the row
+    # never votes, so the group is trivial under include as well.
+    excluded = policy == "exclude" or mask_source == "preexisting"
+    assert complete == (not excluded)
+    assert is_trivial.tolist() == [excluded] * 3
     if complete:
         assert result.size == 3
     assert torch.equal(batch["loss_multiplier"], original_loss_mask)
@@ -670,7 +710,12 @@ def test_trainers_dynamic_sampling_honors_masked_reward_policy(
                 _initial_grpo_save_state(),
                 cfg,
             )
-    admitted = policy == "include" or mask_source == "fractional"
+    # A fractional weight always votes; a pre-existing zero weight (the
+    # dataset's over-length mark) never does, so that group is trivial under
+    # include too.
+    admitted = mask_source == "fractional" or (
+        policy == "include" and mask_source != "preexisting"
+    )
     assert decisions == [(admitted, 4 if admitted else 0)]
     torch.testing.assert_close(batch["loss_multiplier"], original_loss_mask)
     if reward_shaping:
@@ -1552,12 +1597,16 @@ class StubReplayBuffer:
         mock_batch=None,
         mock_rollout_metrics=None,
         retained_task_indices=None,
+        trajectory_batches=None,
     ):
         self._size = initial_size
         self._trajectories = []
         self._mock_batch = mock_batch
         self._mock_rollout_metrics = mock_rollout_metrics or {}
         self._retained_task_indices = list(retained_task_indices or [])
+        # When given, ``sample`` returns these batches as consecutive prompt
+        # groups instead of ``num_prompt_groups`` copies of ``mock_batch``.
+        self._trajectory_batches = trajectory_batches
 
     @property
     def size(self):
@@ -1574,13 +1623,18 @@ class StubReplayBuffer:
             # Return proper trajectory structure expected by async GRPO. Each
             # group carries its stream ordinal, like real buffered groups, so
             # the driver's trained-frontier tracker is exercised.
+            if self._trajectory_batches is not None:
+                assert len(self._trajectory_batches) == num_prompt_groups
+                batches = self._trajectory_batches
+            else:
+                batches = [self._mock_batch] * num_prompt_groups
             trajectories = [
                 {
-                    "batch": self._mock_batch,
+                    "batch": group_batch,
                     "rollout_metrics": self._mock_rollout_metrics,
                     NEMO_GYM_TASK_INDEX_KEY: group_index,
                 }
-                for group_index in range(num_prompt_groups)
+                for group_index, group_batch in enumerate(batches)
             ]
             return {
                 "trajectories": trajectories,
@@ -1849,6 +1903,7 @@ def mock_async_grpo_infrastructure(
     checkpoint_frontier_aligned=False,
     retained_task_indices=None,
     checkpoint_cut_ordinal=None,
+    trajectory_batches=None,
 ):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
@@ -1865,6 +1920,7 @@ def mock_async_grpo_infrastructure(
         mock_batch=mock_batch,
         mock_rollout_metrics=mock_rollout_metrics,
         retained_task_indices=retained_task_indices,
+        trajectory_batches=trajectory_batches,
     )
     collector_remote_error_ref = object()
     stub_collector = StubAsyncTrajectoryCollector(
@@ -5799,10 +5855,10 @@ def test_grpo_train_passes_baseline_valid_mask_to_advantage_estimator(
     loss_multiplier,
     expected_valid,
 ):
-    """compute_advantage(valid_mask=...) is binary: exclude drops masked rows, include keeps every row."""
+    """compute_advantage(valid_mask=...) is binary: exclude drops masked rows, include keeps every row with a nonzero dataset weight."""
     mock_grpo_components["master_config"].grpo.masked_reward_policy = policy
     if policy == "include":
-        expected_valid = 1.0
+        expected_valid = 0.0 if loss_multiplier == 0 else 1.0
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_batch["mask_sample"] = torch.tensor([mask_sample])
     mock_batch["loss_multiplier"] = torch.tensor([loss_multiplier])
@@ -5906,8 +5962,14 @@ def _two_row_rollout_batch(mock_grpo_components, **columns):
     return batch
 
 
-def _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch):
-    """Run one step whose rollout returns ``batch``; the policy's logprob calls are the caller's."""
+def _run_grpo_train_step_on_batch(
+    mock_grpo_components, train_func, batch, *, num_generations_per_prompt=None
+):
+    """Run one step whose rollout returns ``batch``; the policy's logprob calls are the caller's.
+
+    ``batch`` is one prompt group unless ``num_generations_per_prompt`` splits it
+    into consecutive groups; the async loop then replays one trajectory per group.
+    """
     policy = mock_grpo_components["policy"]
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 1
@@ -5915,13 +5977,30 @@ def _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch):
     master_config.grpo.val_period = 0
     master_config.grpo.val_at_start = False
     master_config.grpo.use_dynamic_sampling = False
-    master_config.grpo.num_prompts_per_step = 1
-    master_config.grpo.num_generations_per_prompt = batch.size
+    group_size = num_generations_per_prompt or batch.size
+    assert batch.size % group_size == 0
+    master_config.grpo.num_prompts_per_step = batch.size // group_size
+    master_config.grpo.num_generations_per_prompt = group_size
+    trajectory_batches = None
+    train_dataloader = mock_grpo_components["train_dataloader"]
+    if num_generations_per_prompt is not None:
+        trajectory_batches = [
+            batch.slice(start, start + group_size)
+            for start in range(0, batch.size, group_size)
+        ]
+        # The sync loop names its groups from the input prompts, so the
+        # dataloader must yield one prompt per group.
+        prompts = next(iter(train_dataloader)).repeat_interleave(
+            batch.size // group_size
+        )
+        train_dataloader = MagicMock(spec=StatefulDataLoader)
+        train_dataloader.__iter__ = lambda _self: iter([prompts] * 10)
+        train_dataloader.__len__ = MagicMock(return_value=10)
     rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
     args = (
         policy,
         _mock_policy_generation(),
-        mock_grpo_components["train_dataloader"],
+        train_dataloader,
         mock_grpo_components["val_dataloader"],
         mock_grpo_components["tokenizer"],
         mock_grpo_components["loss_fn"],
@@ -5934,7 +6013,9 @@ def _run_grpo_train_step_on_batch(mock_grpo_components, train_func, batch):
     )
     if train_func is async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
-        with mock_async_grpo_infrastructure(batch, rollout_metrics):
+        with mock_async_grpo_infrastructure(
+            batch, rollout_metrics, trajectory_batches=trajectory_batches
+        ):
             train_func(*args)
     else:
         with (
@@ -8727,11 +8808,9 @@ def test_tq_rollout_and_trainer_masked_rewards(
     # The actor publishes the statistics participation mask for the worker
     # logprob passes (see grpo._logprob_sample_mask), never the loss weights.
     expected_actor_mask = torch.ones(4)
-    if reward_policy == "exclude" and filter_source in {
-        "environment",
-        "preexisting",
-        "overlong",
-    }:
+    if filter_source == "preexisting" or (
+        reward_policy == "exclude" and filter_source in {"environment", "overlong"}
+    ):
         expected_actor_mask[-1] = 0
     torch.testing.assert_close(actor_data["sample_mask"], expected_actor_mask)
     assert carry["mask_sample"].tolist() == batch["mask_sample"]
@@ -8789,7 +8868,11 @@ def test_tq_rollout_and_trainer_masked_rewards(
     )
     torch.testing.assert_close(fields["sample_mask"], loss_mask)
     args = estimator.compute_advantage.call_args.kwargs
-    excluded = reward_policy == "exclude" and filter_source != "fractional"
+    # A pre-existing zero weight is the dataset's over-length mark and never
+    # votes; the other filters are masked rewards, which vote under include.
+    excluded = filter_source == "preexisting" or (
+        reward_policy == "exclude" and filter_source != "fractional"
+    )
     valid_mask = torch.tensor([1.0, 1.0, 1.0, 0.0]) if excluded else torch.ones(4)
     torch.testing.assert_close(args["valid_mask"], valid_mask)
     torch.testing.assert_close(
@@ -8818,21 +8901,26 @@ def _tq_actor_rollout(
     cfg: MasterConfig,
     batch: BatchedDataDict[Any],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    group_size: int = 4,
+    append_response: bool = True,
 ) -> tuple[KVBatchMeta, BatchedDataDict[Any], dict[str, Any], BatchedDataDict[Any]]:
     """Run the real rollout actor on ``batch`` and read back what it published.
 
     Returns the TQ batch meta, the driver carry, the rollout metrics and the
-    columns the driver and the worker logprob passes fetch from TQ.
+    columns the driver and the worker logprob passes fetch from TQ. Each row
+    gets a two-token answer unless the caller already appended its responses.
     """
-    for row in batch["message_log"]:
-        row.append(
-            {
-                "role": "assistant",
-                "content": "answer",
-                "token_ids": torch.tensor([4, 5]),
-                "generation_logprobs": torch.zeros(2),
-            }
-        )
+    if append_response:
+        for row in batch["message_log"]:
+            row.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4, 5]),
+                    "generation_logprobs": torch.zeros(2),
+                }
+            )
     for rollout_fn in ("run_async_multi_turn_rollout", "run_multi_turn_rollout"):
         monkeypatch.setattr(
             sync_rollout_mod,
@@ -8848,7 +8936,7 @@ def _tq_actor_rollout(
     actor.task_to_env = components["task_to_env"]
     actor._dp_client = MagicMock()
     meta, carry, rollout_metrics, _ = actor.rollout_to_tq(
-        batch, partition_id="train", group_size=4
+        batch, partition_id="train", group_size=group_size
     )
     actor._dp_client.get_samples.side_effect = (
         lambda select_fields, **kwargs: actor._dp_client.put_samples.call_args.kwargs[
@@ -9156,3 +9244,115 @@ def test_tq_pct_diagnostics_use_the_statistics_mask(
         torch.tensor(captured["histogram"].tolist()),
         torch.tensor(expected_histogram),
     )
+
+
+def _two_group_rollout_batch(mock_grpo_components):
+    """A trainable prompt group followed by an over-length one.
+
+    Rows 0-1 answer in two tokens and score [1, 0]. Rows 2-3 are the rollouts
+    of a prompt the dataset could not fit into the sequence limit: the data
+    processor gave it ``loss_multiplier`` 0 before any rollout; they answer in
+    eight tokens and score 0.
+    """
+    batch = next(iter(mock_grpo_components["train_dataloader"])).repeat_interleave(4)
+    batch["total_reward"] = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    batch["loss_multiplier"] = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    batch["truncated"] = torch.zeros(4, dtype=torch.bool)
+    for row, length in zip(batch["message_log"], (2, 2, 8, 8)):
+        row.append(
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.arange(4, 4 + length),
+                "generation_logprobs": torch.zeros(length),
+            }
+        )
+    return batch
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_trainers_never_let_over_length_prompts_vote(
+    mock_grpo_components, monkeypatch: pytest.MonkeyPatch, train_func, policy: str
+) -> None:
+    """Dataset-zero-weight rows stay out of Reinforce++'s normalization on every trainer.
+
+    One trainable group (rewards ``[1, 0]``, two response tokens each) and one
+    over-length group (rewards ``[0, 0]``, eight response tokens each,
+    ``loss_multiplier`` 0 from the dataset). The legacy sync and async loops
+    and the TransferQueue driver must normalize over the trainable rows only
+    and give them advantages ``[1, -1]`` under either policy, as ``main`` did
+    (``token_mask * sample_mask``) and as the SingleController stage does
+    (``test_single_controller_actor.py`` pins the same example). Counting the
+    sixteen over-length tokens would give ``[2.24, -2.24]``.
+    """
+    components = mock_grpo_components
+    cfg = components["master_config"]
+    cfg.grpo.masked_reward_policy = policy
+    cfg.grpo.adv_estimator = AdvEstimatorConfig(
+        name="reinforce_plus_plus", minus_baseline=True
+    )
+    cfg.grpo.overlong_filtering = False
+    cfg.grpo.seq_logprob_error_threshold = None
+    cfg.loss_fn.use_kl_in_reward = False
+    batch = _two_group_rollout_batch(components)
+    estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
+    policy_mock = components["policy"]
+    if train_func is grpo_train_sync:
+        cfg.data_plane = {"enabled": True}
+        cfg.grpo.max_num_steps = 1
+        cfg.grpo.val_period = 0
+        cfg.grpo.num_generations_per_prompt = 2
+        meta, carry, rollout_metrics, actor_data = _tq_actor_rollout(
+            components, cfg, batch, monkeypatch, group_size=2, append_response=False
+        )
+        actor_data["prev_logprobs"] = torch.zeros_like(
+            actor_data["generation_logprobs"]
+        )
+        actor_data["reference_policy_logprobs"] = torch.zeros_like(
+            actor_data["generation_logprobs"]
+        )
+        fields = _run_tq_train_step(
+            components, cfg, meta, carry, rollout_metrics, actor_data, estimator
+        )
+        token_mask = actor_data["token_mask"].float()
+        advantages, sample_mask = fields["advantages"], fields["sample_mask"]
+    else:
+        monkeypatch.setattr(
+            grpo_mod, "_create_advantage_estimator", lambda _cfg: estimator
+        )
+        policy_mock.get_logprobs.side_effect = lambda data, **_kw: {
+            "logprobs": torch.zeros_like(data["token_mask"], dtype=torch.float32)
+        }
+        policy_mock.get_reference_policy_logprobs.side_effect = lambda data, **_kw: {
+            "reference_logprobs": torch.zeros_like(
+                data["token_mask"], dtype=torch.float32
+            )
+        }
+        train_data = _run_grpo_train_step_on_batch(
+            components, train_func, batch, num_generations_per_prompt=2
+        )
+        token_mask = train_data["token_mask"].float()
+        advantages, sample_mask = train_data["advantages"], train_data["sample_mask"]
+
+    participation = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    torch.testing.assert_close(sample_mask, participation)
+    assert token_mask.sum(dim=-1).tolist() == [2.0, 2.0, 8.0, 8.0]
+    estimator.compute_advantage.assert_called_once()
+    kwargs = estimator.compute_advantage.call_args.kwargs
+    torch.testing.assert_close(kwargs["valid_mask"], participation)
+    torch.testing.assert_close(
+        kwargs["normalization_mask"], token_mask * participation[:, None]
+    )
+    response = token_mask.bool()
+    for row, expected in enumerate((1.0, -1.0)):
+        torch.testing.assert_close(
+            advantages[row][response[row]], torch.full((2,), expected)
+        )
+    # The all-ones normalization of the earlier include population: 4 tokens at
+    # +-0.5 and 16 at 0 give a variance of 0.05, so the trainable rows would
+    # have been scaled to +-sqrt(0.25 / 0.05).
+    all_rows = torch.tensor([0.5, -0.5, 0.0, 0.0])[:, None].expand_as(token_mask)
+    counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
+    assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
+    assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])

@@ -25,9 +25,10 @@ This module provides different advantage estimation strategies:
 Every group-relative estimator (GRPO, GDPO, Reinforce++) accepts a binary
 ``valid_mask`` and must honor it. GRPO training selects this mask with
 ``grpo.masked_reward_policy`` independently of the sample loss mask: ``include``
-(the default) lets every usable row vote in the group statistics and the batch
-normalization, masked rewards too; ``exclude`` lets only rows with a nonzero
-loss weight vote. Token-capture placeholder rows never vote. Reinforce++ also
+(the default) lets every row with a nonzero dataset weight vote in the group
+statistics and the batch normalization, masked rewards too; ``exclude`` lets
+only rows with a nonzero loss weight vote. Token-capture placeholder rows and
+over-length prompts (dataset weight 0) never vote. Reinforce++ also
 receives a ``normalization_mask`` for its token-level statistics; the loss mask
 is unchanged.
 

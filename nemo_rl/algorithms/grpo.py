@@ -2707,7 +2707,8 @@ def _baseline_valid_mask(
     ``loss_multiplier == 0`` (it contributes no loss, and its reward, often a
     synthetic placeholder, is not a measurement of the policy); every other row
     is 1. ``grpo.masked_reward_policy`` decides whether the trainers use it
-    (``exclude``) or let every row vote (``include``); see
+    (``exclude``) or let every row with a nonzero dataset weight vote
+    (``include``, see ``_include_valid_mask``); see
     ``_dynamic_sampling_valid_mask`` and ``_advantage_valid_mask``.
 
     Participation is binary because ``calculate_baseline_and_std_per_prompt``
@@ -2773,24 +2774,57 @@ def _binary_participation(loss_weights: torch.Tensor) -> torch.Tensor:
     return (loss_weights != 0).to(dtype)
 
 
+def _include_valid_mask(
+    dataset_loss_multiplier: torch.Tensor | list[float] | None,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    """The ``include`` population: every row whose dataset weight is nonzero.
+
+    ``include`` keeps the rows the in-trainer filters drop from the loss voting
+    (``mask_sample``, truncated rows under ``overlong_filtering``, rows masked
+    by ``seq_logprob_error_threshold``): their rewards are measurements of the
+    policy. A prompt the dataset could not fit into the sequence limit is
+    different: ``nemo_rl/data/processors.py`` cuts it to a few tokens and gives
+    it ``loss_multiplier == 0`` before any rollout, so its rows are unusable,
+    not masked rewards, and no trainer lets them vote under either policy (the
+    SingleController stage reads the same weight from its data-plane
+    ``sample_mask``). ``dataset_loss_multiplier`` must therefore be the weight
+    before the in-trainer filters; every filter clones the column before
+    rewriting it, so a reference taken ahead of them stays the dataset weight.
+    ``None`` (a batch without the column) lets every row vote.
+    """
+    if dataset_loss_multiplier is None:
+        return torch.ones_like(like)
+    if isinstance(dataset_loss_multiplier, list):
+        dataset_loss_multiplier = torch.tensor(dataset_loss_multiplier)
+    return _binary_participation(dataset_loss_multiplier).to(
+        device=like.device, dtype=like.dtype
+    )
+
+
 def _advantage_valid_mask(
-    sample_mask: torch.Tensor, grpo_config: GRPOConfig
+    sample_mask: torch.Tensor,
+    grpo_config: GRPOConfig,
+    dataset_loss_multiplier: torch.Tensor | None,
 ) -> torch.Tensor:
     """Statistics participation at the estimator, per ``grpo.masked_reward_policy``.
 
-    ``include`` lets every row vote; ``exclude`` lets the rows with a nonzero
-    (final) loss weight vote. Both return a binary mask and leave
-    ``sample_mask`` unchanged. The legacy and TransferQueue trainers carry no
-    synthetic placeholder rows; the SingleController stage excludes its
-    token-capture placeholders itself (see ``advantage_stage.py``).
+    ``include`` lets every row with a nonzero dataset weight vote
+    (``_include_valid_mask``); ``exclude`` lets the rows with a nonzero (final)
+    loss weight vote. Both return a binary mask and leave ``sample_mask``
+    unchanged. The legacy and TransferQueue trainers carry no synthetic
+    placeholder rows; the SingleController stage excludes its token-capture
+    placeholders itself (see ``advantage_stage.py``).
     """
     if grpo_config.masked_reward_policy == "include":
-        return torch.ones_like(sample_mask)
+        return _include_valid_mask(dataset_loss_multiplier, sample_mask)
     return _binary_participation(sample_mask)
 
 
 def _logprob_sample_mask(
-    sample_mask: torch.Tensor, grpo_config: GRPOConfig
+    sample_mask: torch.Tensor,
+    grpo_config: GRPOConfig,
+    dataset_loss_multiplier: torch.Tensor | None,
 ) -> torch.Tensor:
     """Sample mask for the policy logprob pass (also handed to the reference pass).
 
@@ -2805,7 +2839,7 @@ def _logprob_sample_mask(
     ``sample_mask`` is left unchanged; under ``exclude`` both masks select the
     same rows.
     """
-    return _advantage_valid_mask(sample_mask, grpo_config)
+    return _advantage_valid_mask(sample_mask, grpo_config, dataset_loss_multiplier)
 
 
 def _dynamic_sampling_valid_mask(
@@ -2815,7 +2849,9 @@ def _dynamic_sampling_valid_mask(
 
     Dynamic-sampling admission, the group baseline/std and the ``env_baseline``
     all take this mask, so one policy decides which groups are admitted and
-    which rewards they are centred on. ``include`` lets every row vote.
+    which rewards they are centred on. It runs before the in-trainer filters,
+    so ``loss_multiplier`` is still the dataset weight here: ``include`` lets
+    every row with a nonzero dataset weight vote (``_include_valid_mask``).
     ``exclude`` starts from ``_baseline_valid_mask`` and, under
     ``overlong_filtering``, also drops truncated rows: the rows the loss drops
     later in the step. Sequence-logprob-error masking runs after this stage,
@@ -2823,7 +2859,12 @@ def _dynamic_sampling_valid_mask(
     """
     rewards = repeated_batch["total_reward"]
     if grpo_config.masked_reward_policy == "include":
-        return torch.ones_like(rewards)
+        return _include_valid_mask(
+            repeated_batch["loss_multiplier"]
+            if "loss_multiplier" in repeated_batch
+            else None,
+            rewards,
+        )
     valid_mask = _baseline_valid_mask(repeated_batch, rewards)
     if grpo_config.overlong_filtering and "truncated" in repeated_batch:
         truncated = torch.as_tensor(
@@ -3911,6 +3952,10 @@ def _grpo_train_impl(
                         tracer=_tracer,
                     ),
                 ):
+                    # The dataset weight, before the overlong and mask_sample
+                    # filters rewrite the column: the include population
+                    # (see _include_valid_mask).
+                    dataset_loss_multiplier = repeated_batch["loss_multiplier"]
                     use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
@@ -4009,7 +4054,9 @@ def _grpo_train_impl(
                             # _logprob_sample_mask): the worker keeps real
                             # logprobs only inside token_mask * sample_mask.
                             "sample_mask": _logprob_sample_mask(
-                                train_data["sample_mask"], master_config.grpo
+                                train_data["sample_mask"],
+                                master_config.grpo,
+                                dataset_loss_multiplier,
                             ),
                             **extra_multimodal_data,
                         }
@@ -4101,7 +4148,7 @@ def _grpo_train_impl(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
                     advantage_valid_mask = _advantage_valid_mask(
-                        sample_mask, master_config.grpo
+                        sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
@@ -5773,6 +5820,10 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
+                    # The dataset weight, before the overlong and mask_sample
+                    # filters rewrite the column: the include population
+                    # (see _include_valid_mask).
+                    dataset_loss_multiplier = repeated_batch["loss_multiplier"]
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
                         use_overlong_filtering = master_config.grpo.overlong_filtering
@@ -5859,7 +5910,9 @@ def async_grpo_train(
                         {
                             **train_data,
                             "sample_mask": _logprob_sample_mask(
-                                train_data["sample_mask"], master_config.grpo
+                                train_data["sample_mask"],
+                                master_config.grpo,
+                                dataset_loss_multiplier,
                             ),
                         }
                     )
@@ -5939,7 +5992,7 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
                     advantage_valid_mask = _advantage_valid_mask(
-                        sample_mask, master_config.grpo
+                        sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(

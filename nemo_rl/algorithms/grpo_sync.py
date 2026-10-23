@@ -916,6 +916,10 @@ def grpo_train_sync(
                         pending_meta = None
                         pending_carry = None
 
+                # The dataset weight, before the mask_sample and overlong
+                # filters rewrite the column: the include population (see
+                # grpo._include_valid_mask).
+                dataset_loss_multiplier = driver_carry["loss_multiplier"]
                 # Mirrors legacy ``grpo.py:1707-1716`` — applied on the
                 # post-DS survivors so dropped rows don't affect this set.
                 metrics["num_mask_sample_filtered"] = _apply_mask_sample_filter(
@@ -1052,7 +1056,7 @@ def grpo_train_sync(
                     print("▶ Computing advantages...", flush=True)
                     mask = token_mask * sample_mask.unsqueeze(-1)
                     advantage_valid_mask = _advantage_valid_mask(
-                        sample_mask, master_config.grpo
+                        sample_mask, master_config.grpo, dataset_loss_multiplier
                     )
 
                     # GRPO / Reinforce++ ignore ``repeated_batch`` (it's

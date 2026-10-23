@@ -416,9 +416,10 @@ class AdvantageComputer:
         # Statistics participation is binary and independent of the loss
         # weights (grpo._binary_participation). ``include`` lets every row with
         # a nonzero data-plane sample_mask vote, so token-capture placeholders
-        # and datums with a dataset-level loss_multiplier of 0 never do (the
-        # legacy and TransferQueue loops let the latter vote under include);
-        # ``exclude`` lets the rows with a nonzero final loss weight vote.
+        # and datums with a dataset-level loss_multiplier of 0 never do; the
+        # legacy and TransferQueue loops read the same dataset weight
+        # (grpo._include_valid_mask), so every trainer normalizes over the same
+        # rows. ``exclude`` lets the rows with a nonzero final loss weight vote.
         # PPO's GAE ignores valid_mask.
         participation = final_sample_mask
         if (

@@ -4443,6 +4443,105 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
+    """The same example as ``test_grpo.test_trainers_never_let_over_length_prompts_vote``.
+
+    An over-length prompt reaches the data plane with ``sample_mask`` 0 (the
+    dataset's ``loss_multiplier``). It never votes under either policy, so
+    Reinforce++ normalizes over the trainable rows only and gives them
+    ``[1, -1]``, as the legacy and TransferQueue trainers do.
+    """
+    cfg = GRPOConfig(
+        masked_reward_policy=policy,
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(
+            name="reinforce_plus_plus", minus_baseline=True
+        ),
+    )
+    master = SimpleNamespace(
+        grpo=cfg, loss_fn=ClippedPGLossConfig(use_kl_in_reward=False)
+    )
+    # One prompt token; rows 0-1 answer in two tokens, rows 2-3 in eight.
+    token_mask = torch.zeros(4, 9)
+    token_mask[:2, 1:3] = 1.0
+    token_mask[2:, 1:] = 1.0
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[0], [0], [1], [1]]),
+            "total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            "mask_sample": torch.zeros(4, dtype=torch.bool),
+            "truncated": torch.zeros(4, dtype=torch.bool),
+        },
+        batch_size=[4],
+    )
+
+    class _Recording:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.kwargs: dict[str, Any] | None = None
+
+        def compute_advantage(self, **kwargs):
+            self.kwargs = kwargs
+            return self.inner.compute_advantage(**kwargs)
+
+    plane = _AdvantageDataPlane(data)
+    estimator = _Recording(_create_advantage_estimator(master))
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._master_config = master
+    ctrl._algo_cfg = cfg
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(4)],
+        fields=list(data.keys()),
+        sequence_lengths=[3, 3, 9, 9],
+        tags=[
+            {GROUP_ID_TAG: "trainable" if i < 2 else "over-length"} for i in range(4)
+        ],
+    )
+
+    _, trainable = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert trainable
+    assert estimator.kwargs is not None
+    participation = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    torch.testing.assert_close(estimator.kwargs["valid_mask"], participation)
+    torch.testing.assert_close(
+        estimator.kwargs["normalization_mask"], token_mask * participation[:, None]
+    )
+    assert plane.written_fields is not None
+    advantages = plane.written_fields["advantages"]
+    assert torch.isfinite(advantages).all()
+    # Rows are written back trimmed to their sequence_lengths.
+    for row, expected in enumerate((1.0, -1.0)):
+        written = advantages[row]
+        response = token_mask[row, : written.shape[0]].bool()
+        torch.testing.assert_close(written[response], torch.full((2,), expected))
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
 @pytest.mark.parametrize("estimator_name", ["grpo", "gdpo", "reinforce_plus_plus"])
 def test_advantage_stage_placeholders_never_vote(
     policy: str, estimator_name: str

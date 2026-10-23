@@ -375,13 +375,17 @@ baseline/std and final batch normalization, Reinforce++'s optional group
 baseline and token-level batch normalization, the `env_baseline` behind the
 `baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
 
-- `include` (default): every row votes, including rows the environment flagged
-  with `mask_sample`, rows with a zero loss weight, truncated rows under
+- `include` (default): every row with a nonzero dataset weight votes, including
+  rows the environment flagged with `mask_sample`, truncated rows under
   `overlong_filtering`, and rows removed by sequence-logprob-error masking.
   Their rewards still shape their siblings' baselines although they contribute
-  no loss. For the legacy and TransferQueue loops this is the all-rows
-  behaviour of earlier releases; SingleController previously excluded these
-  rows (`valid_mask=final_sample_mask`) and now lets them vote under `include`.
+  no loss. Rows whose dataset-level `loss_multiplier` is `0` never vote, on any
+  trainer (see below). For the legacy and TransferQueue loops the GRPO and GDPO
+  group statistics are unchanged from earlier releases, which let every row
+  vote: a dataset-level weight is shared by a whole prompt group, so excluding
+  it moves no trainable row's baseline. SingleController previously excluded
+  all of these rows (`valid_mask=final_sample_mask`) and now lets the masked,
+  truncated and sequence-error rows vote under `include`.
 - `exclude`: only rows with a nonzero loss weight vote, using the masks known at
   each stage: the environment, pre-existing loss-weight and overlong masks
   before the logprob pass (dynamic-sampling admission, baseline/std,
@@ -396,18 +400,24 @@ baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
 and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
 policy.
 
-SingleController excludes rows whose data-plane `sample_mask` is `0` under both
-policies: token-capture placeholders (no usable tokens) and datums whose
-dataset-level `loss_multiplier` is `0`. An environment-masked row with a usable
-rollout is a masked reward, a placeholder is not. The legacy and TransferQueue
-trainers carry no placeholder rows and let dataset-zero-weight rows vote under
-`include`; a dataset-level weight is shared by the whole prompt group, so this
-does not move any trainable sibling's group baseline.
+Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer
+and under either policy. The data processors assign that weight to prompts
+that do not fit the sequence limit before any rollout happens, so their
+rollouts are unusable rows, not masked rewards; counting them would, for
+example, let their response tokens enter Reinforce++'s batch normalization,
+which earlier releases never did. SingleController reads the weight from its
+data-plane `sample_mask`, which also carries the token-capture placeholders
+(no usable tokens) that it excludes under both policies; the legacy and
+TransferQueue trainers take it from `loss_multiplier` before their own filters
+rewrite that column, and carry no placeholder rows. An environment-masked row
+with a usable rollout is a masked reward; a placeholder or an over-length
+prompt is not.
 
 The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
 diagnostics of the legacy and TransferQueue trainers count the rows that vote
 under the configured policy, the same mask the estimator receives: every row
-under `include`, the rows with a nonzero final loss weight under `exclude`. A
+with a nonzero dataset weight under `include`, the rows with a nonzero final
+loss weight under `exclude`. A
 non-voting row still receives a baseline entry (under the leave-one-out baseline
 it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
 counting it would report an all-correct group as mixed. When no row votes, the
