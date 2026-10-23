@@ -1902,7 +1902,46 @@ def test_load_weights_rejects_unnegotiated_mxfp8_payload(fp8_module, monkeypatch
         )
 
 
-def test_load_weights_rejects_prequantized_mxfp8_without_scale(fp8_module, monkeypatch):
+def test_load_weights_accepts_prequantized_mxfp8_split_across_batches(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    fp8.global_fp8_config = types.SimpleNamespace(
+        is_mx=True,
+        refit_prequantize=True,
+    )
+    weight = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(2, 1, dtype=torch.uint8)
+    fp8.set_refit_manifest_names({"model.weight", "model.weight_scale_from_checkpoint"})
+    loaded = []
+    monkeypatch.setattr(
+        fp8, "_is_fp8_weight", lambda name, _model: name.endswith(".weight")
+    )
+    model_runner = types.SimpleNamespace(
+        model=object(),
+        vllm_config=types.SimpleNamespace(additional_config={}),
+    )
+
+    fp8.load_weights(
+        [("model.weight", weight)],
+        model_runner,
+        model_load_weights=lambda weights: loaded.extend(weights),
+    )
+    fp8.load_weights(
+        [("model.weight_scale_from_checkpoint", scale)],
+        model_runner,
+        model_load_weights=lambda weights: loaded.extend(weights),
+    )
+
+    assert loaded == [
+        ("model.weight", weight),
+        ("model.weight_scale_from_checkpoint", scale),
+    ]
+
+
+def test_load_weights_rejects_prequantized_mxfp8_without_scale_or_manifest(
+    fp8_module, monkeypatch
+):
     fp8 = fp8_module
     fp8.global_fp8_config = types.SimpleNamespace(
         is_mx=True,
