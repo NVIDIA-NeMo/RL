@@ -74,34 +74,6 @@ NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_
 
 RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
 
-#### Example: SimpleAgent with `single_agent_turn`
-
-[`examples/nemo_gym/grpo-qwen2.5-1.5b-1n8g-megatron-weather.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/grpo-qwen2.5-1.5b-1n8g-megatron-weather.yaml) inherits the existing Gym GRPO recipe's Megatron training configuration (tensor parallelism 2) and uses Qwen2.5-1.5B on one node with eight GPUs, with vLLM for generation. The Environment Server's `resources_server` selects the weather tools and verifier; `agent_server` selects the existing SimpleAgent. `single_agent_turn` coordinates one complete agent turn, which can contain multiple model and tool calls.
-
-The recipe explicitly replaces the inherited `legacy_agent` implementation with `single_agent_turn`. Its route maps the `example_tool_call_multireward` taskset to that Environment Server. This verifier scores a predicted tool call, so the recipe sets SimpleAgent's `execute_tools: false` and grants no tool access. The agent returns the model's tool call without executing it or generating a follow-up answer. GRPO uses the verifier's scalar `reward`, the sum of its correctness, format, and schema-validity scores.
-
-First, prepare the five shipped weather prompts with Gym's dataset collator. Declaring `taskset` wraps each source row in `task_id` and `task_input`, preserving its messages, tools, and expected answer. This preparation step does not start servers or run inference. From the RL repository root:
-
-```bash
-cd 3rdparty/Gym-workspace/Gym
-uv run gym dataset collate \
-  --resources-server example_tool_call_multireward \
-  --mode example_validation \
-  --output-dir data/example_tool_call_multireward_single_agent_turn \
-  '++example_tool_call_multireward_simple_agent.responses_api_agents.simple_agent.datasets=[{name:example,type:example,taskset:example_tool_call_multireward,jsonl_fpath:resources_servers/example_tool_call_multireward/data/example.jsonl}]' \
-  ++environment_server_routes.example_tool_call_multireward=example_tool_call_multireward_environment_server
-cd ../../..
-```
-
-The dataset declaration is a list, so the override replaces the complete list. Training repeats these five examples 60 times to fill batches of eight prompts; validation uses one copy of the same examples. This example demonstrates the integration rather than a held-out evaluation.
-
-Run the recipe through the existing Gym training entrypoint:
-
-```bash
-uv run examples/nemo_gym/run_grpo_nemo_gym.py \
-  --config examples/nemo_gym/grpo-qwen2.5-1.5b-1n8g-megatron-weather.yaml
-```
-
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.

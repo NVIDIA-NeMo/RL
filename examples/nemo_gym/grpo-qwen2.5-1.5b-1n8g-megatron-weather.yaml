@@ -1,5 +1,4 @@
 # GRPO with Qwen2.5-1.5B, Megatron training, and Environment Server orchestration.
-# Prepare the taskset data as described in docs/design-docs/nemo-gym-integration.md.
 # The parent supplies Megatron TP=2, its optimizer, and the one-node/eight-GPU setup.
 defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
 
