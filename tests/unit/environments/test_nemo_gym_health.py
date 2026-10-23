@@ -26,7 +26,9 @@ state and previously surfaced it as an AttributeError from deep inside a rollout
 
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -92,6 +94,57 @@ async def _drain(async_generator: AsyncIterator[Any]) -> None:
 
 
 class TestHealthCheck:
+    @pytest.mark.nemo_gym
+    @pytest.mark.asyncio
+    async def test_spinup_reuses_rollout_client_and_refreshes_it_on_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import nemo_gym.cli
+        import nemo_gym.server_utils as gym_utils
+        import nemo_rl.environments.nemo_gym as env_module
+        from omegaconf import OmegaConf
+
+        monkeypatch.setattr(env_module, "_get_node_ip_local", lambda: "127.0.0.1")
+        ports = iter([11000, 11001])
+        monkeypatch.setattr(env_module, "_get_free_port_local", lambda *_: next(ports))
+        monkeypatch.setattr(env_module.ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            env_module.ray,
+            "get_runtime_context",
+            lambda: SimpleNamespace(gcs_address="127.0.0.1:1200"),
+        )
+        start = MagicMock()
+        monkeypatch.setattr(
+            nemo_gym.cli, "RunHelper", lambda: SimpleNamespace(start=start)
+        )
+        load = MagicMock(
+            side_effect=lambda head: gym_utils.ServerClient(
+                head_server_config=head, global_config_dict=OmegaConf.create({})
+            )
+        )
+        monkeypatch.setattr(gym_utils.ServerClient, "load_from_global_config", load)
+        # HTTP-session creation is covered by Gym's client-reuse test.
+        monkeypatch.setattr(gym_utils, "is_global_aiohttp_client_setup", lambda: True)
+
+        env = _unspun()
+        clients = []
+        for _ in range(2):
+            env._spinup()
+            assert load.call_count == len(clients) * 2
+            clients.append(env.rch.setup_server_client(env.head_server_config))
+            for _ in range(64):
+                assert (
+                    env.rch.setup_server_client(env.head_server_config) is clients[-1]
+                )
+            assert load.call_count == len(clients) * 2 - 1
+            # The existing control client remains independently cached.
+            control = env._control_client()
+            assert env._control_client() is control
+        assert start.call_count == 2
+        assert load.call_count == 4
+        assert clients[0] is not clients[1]
+        assert [client.head_server_config.port for client in clients] == [11000, 11001]
+
     def test_a_healthy_gym_polls_the_run_helper(self):
         env = _unspun()
         env.rh = _FakeRunHelper()

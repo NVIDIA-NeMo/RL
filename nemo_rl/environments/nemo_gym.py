@@ -894,7 +894,9 @@ Depending on your data shape, you may want to change these values."""
             host=self.node_ip,
             port=self.head_server_port,
         )
-        self.rch = RolloutCollectionHelper()
+        # Repeated synchronous config loads can delay capture receipts past
+        # their deadline. A fresh helper per startup keeps its cache current.
+        self.rch = RolloutCollectionHelper(reuse_server_client=True)
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
