@@ -233,6 +233,8 @@ class SequencePackingConfigDisabled(TypedDict):
 
 class SequencePackingConfig(TypedDict):
     enabled: Literal[True]
+    # Bin capacity in tokens. A sequence longer than this is not rejected; it
+    # trains alone in a bin of its own.
     train_mb_tokens: int
     # Not required because some algorithms like SFT don't calculate log probs
     logprob_mb_tokens: NotRequired[int]
