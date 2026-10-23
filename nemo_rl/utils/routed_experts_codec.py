@@ -29,6 +29,7 @@ depend on torch.
 """
 
 import base64
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 import torch
@@ -40,6 +41,45 @@ _WIRE_TORCH_DTYPES = {
     "int32": torch.int32,
 }
 _TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
+
+# Process-local staging attachment, never a wire field or digest input.
+ROUTED_EXPERTS_STAGING_ATTACHMENT = "nrl_routed_experts_staging"
+
+
+@dataclass(frozen=True, init=False)
+class RoutedExpertsStagingPayload:
+    """Own an immutable-by-contract CPU snapshot and its existing wire envelope.
+
+    The record still commits to the ordinary base64 envelope. A local staging
+    sink can reuse the exact tensor instead of decoding that envelope again.
+    This object is request-local and retained only until staging completes.
+    """
+
+    encoded: str = field(repr=False)
+    _routes: torch.Tensor = field(repr=False)
+    _version: int = field(repr=False)
+
+    def __init__(self, routes: torch.Tensor) -> None:
+        # Own the bytes so engine/cache mutations cannot change a staged row.
+        # Disable inference mode to retain a mutation counter for the snapshot.
+        with torch.inference_mode(False):
+            snapshot = routes.detach().to("cpu").clone().contiguous()
+        object.__setattr__(self, "encoded", encode_routed_experts(snapshot))
+        object.__setattr__(self, "_routes", snapshot)
+        object.__setattr__(self, "_version", snapshot._version)
+
+    def tensor_for_payload(self, encoded: object) -> torch.Tensor:
+        """Return read-only-by-contract routes after validating their binding.
+
+        Raises:
+            ValueError: The record names a different envelope or the owned
+                tensor was modified after encoding.
+        """
+        if not isinstance(encoded, str) or encoded != self.encoded:
+            raise ValueError("route staging attachment does not match record payload")
+        if self._routes._version != self._version:
+            raise ValueError("route staging attachment was modified after encoding")
+        return self._routes
 
 
 def encode_routed_experts(routed_experts: torch.Tensor) -> str:

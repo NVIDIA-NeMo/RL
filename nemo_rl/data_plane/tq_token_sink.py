@@ -69,6 +69,10 @@ from nemo_rl.data_plane.schema import (
     ROUTED_LEN_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+)
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -420,7 +424,8 @@ class TQTokenSink:
     ``capture_media`` mirrors the staging partition's schema: a media-enabled
     partition registers ``MEDIA_STAGING_FIELDS`` and every row written here
     carries them (flags False + sentinels for text calls); a text-only
-    partition rejects attachments outright.
+    partition rejects media attachments. A route staging attachment is local
+    encoding state, not media, and is accepted on either partition type.
     """
 
     def __init__(
@@ -463,6 +468,21 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
+            route_payload = None
+            if (
+                isinstance(attachments, Mapping)
+                and ROUTED_EXPERTS_STAGING_ATTACHMENT in attachments
+            ):
+                route_payload = attachments[ROUTED_EXPERTS_STAGING_ATTACHMENT]
+                if not isinstance(route_payload, RoutedExpertsStagingPayload):
+                    raise TypeError(
+                        "route staging attachment must be RoutedExpertsStagingPayload"
+                    )
+                attachments = {
+                    name: value
+                    for name, value in attachments.items()
+                    if name != ROUTED_EXPERTS_STAGING_ATTACHMENT
+                } or None
             if attachments is not None and not self._capture_media:
                 raise ValueError(
                     "media attachments require a media-enabled staging partition"
@@ -556,6 +576,8 @@ class TQTokenSink:
                 )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            if route_payload is not None and routed is None:
+                raise ValueError("route staging attachment has no record payload")
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
                 if isinstance(routed, str):
@@ -573,9 +595,17 @@ class TQTokenSink:
                         raise ValueError(
                             f"unsupported routed_experts dtype {dtype_name!r}"
                         )
-                    experts = decode_routed_experts(routed, dtype)
+                    experts = (
+                        decode_routed_experts(routed, dtype)
+                        if route_payload is None
+                        else route_payload.tensor_for_payload(routed)
+                    )
                     routed_encoding = ROUTE_ENCODING_ENVELOPE
                 else:
+                    if route_payload is not None:
+                        raise ValueError(
+                            "route staging attachment requires an envelope"
+                        )
                     experts = torch.tensor(routed, dtype=torch.int16)
                     routed_encoding = ROUTE_ENCODING_LIST
                 expected_len = delta_len + boundary_route_rows(record.prev_len)
