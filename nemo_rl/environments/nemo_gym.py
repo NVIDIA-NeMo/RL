@@ -1269,6 +1269,10 @@ Depending on your data shape, you may want to change these values."""
         )
         return GymCheckpointPrepareSummary.from_result(result)
 
+    async def checkpoint_restart_only_servers(self) -> list[str]:
+        """Return this actor's Gym participants whose rollouts start over after a crash."""
+        return await self._require_checkpoint_adapter().restart_only_servers()
+
     async def checkpoint_renew(
         self,
         checkpoint_id: str,
