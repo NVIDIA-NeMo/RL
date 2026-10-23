@@ -330,6 +330,39 @@ def test_basic_worker_creation_and_method_calls(register_test_actor, virtual_clu
     worker_group.shutdown(force=True)
 
 
+def test_initializer_pins_interpreter_even_when_it_matches_driver(
+    register_test_actor, virtual_cluster, monkeypatch
+):
+    """An external Ray daemon need not run the driver's interpreter."""
+    captured = []
+    original_options = RayWorkerBuilder.IsolatedWorkerInitializer.options
+
+    def capture_options(**kwargs):
+        captured.append(kwargs["runtime_env"])
+        return original_options(**kwargs)
+
+    monkeypatch.setattr(
+        RayWorkerBuilder.IsolatedWorkerInitializer, "options", capture_options
+    )
+    assert ACTOR_ENVIRONMENT_REGISTRY[register_test_actor] == sys.executable
+    group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=RayWorkerBuilder(register_test_actor),
+        workers_per_node=1,
+    )
+    try:
+        assert captured
+        assert all(env.get("py_executable") == sys.executable for env in captured)
+        assert (
+            os.path.abspath(
+                ray.get(group.workers[0].get_actual_python_executable_path.remote())
+            )
+            == os.path.abspath(sys.executable)
+        )
+    finally:
+        group.shutdown(force=True)
+
+
 def test_initializer_pool_is_per_node_single_node(worker_group_1d_sharding):
     """One IsolatedWorkerInitializer is pooled per node (pg_idx), not per worker.
 
