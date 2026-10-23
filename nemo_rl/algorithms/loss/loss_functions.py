@@ -859,6 +859,11 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = torch.exp(
                 prev_logprobs - generation_logprobs
             )
+            if self.truncated_importance_sampling_type == "seq-mask-tis":
+                # Keep numerical rejection distinct from zeroed, sanitized weights.
+                finite_active_is = (
+                    torch.isfinite(actor_importance_weights_expanded) | ~mask.bool()
+                ).all(dim=-1)
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -969,6 +974,7 @@ class ClippedPGLossFn(LossFunction):
                         >= self.truncated_importance_sampling_ratio_min
                     )
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
+                    & finite_active_is
                 ).float()  # [B]
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
