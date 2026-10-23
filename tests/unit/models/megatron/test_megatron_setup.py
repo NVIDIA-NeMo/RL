@@ -26,6 +26,7 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import datetime
 import os
+import pickle
 import warnings
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -235,6 +236,11 @@ class TestValidateModelPaths:
         iter_dir.mkdir(parents=True)
         if complete:
             (iter_dir / "run_config.yaml").write_text("{}\n")
+            (iter_dir / "__0_0.distcp").write_bytes(b"model shard")
+            metadata = SimpleNamespace(
+                storage_data={"weight": SimpleNamespace(relative_path="__0_0.distcp")}
+            )
+            (iter_dir / ".metadata").write_bytes(pickle.dumps(metadata))
 
         config = {"model_name": "test-model"}
 
@@ -958,6 +964,38 @@ class TestApplyMoeConfig:
         _apply_moe_config(model_cfg, config)
 
         assert model_cfg.inference_flashinfer_mxfp8_token_capacity == 512
+
+    @pytest.mark.parametrize(
+        ("transformer_impl", "num_moe_experts", "moe_router_dtype", "raises"),
+        [
+            ("inference_optimized", 128, "fp64", True),
+            ("inference_optimized", 128, None, True),
+            ("inference_optimized", 128, "fp32", False),
+            ("inference_optimized", None, "fp64", False),
+            ("transformer_engine", 128, "fp64", False),
+        ],
+    )
+    def test_inference_optimized_moe_requires_fp32_router(
+        self, transformer_impl, num_moe_experts, moe_router_dtype, raises
+    ):
+        """MCore's inference-optimized MoE layers accept only an fp32 router."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.num_moe_experts = num_moe_experts
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["transformer_impl"] = transformer_impl
+        megatron_cfg["moe_router_dtype"] = moe_router_dtype
+        config = {"megatron_cfg": megatron_cfg}
+
+        if raises:
+            with pytest.raises(
+                ValueError, match="mcore_generation_config.moe_router_dtype=fp32"
+            ):
+                _apply_moe_config(model_cfg, config)
+        else:
+            _apply_moe_config(model_cfg, config)
+            assert model_cfg.moe_router_dtype == moe_router_dtype
 
     def test_hybridep_input_prepadding_wins_after_bridge_validation(self):
         from nemo_rl.models.megatron import setup
@@ -5162,7 +5200,11 @@ class TestForceSyncOptimizerFp32FromModel:
         a = self._make_distrib_opt(_HybridDeviceOptimizer)
         b = self._make_distrib_opt(_HybridDeviceOptimizer)
 
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
 
@@ -5323,7 +5365,11 @@ class TestForceSyncModelFromOptimizerFp32:
         b = self._make_distrib_opt(
             _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
         )
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_model_from_optimizer_fp32(chained)
 

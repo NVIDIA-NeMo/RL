@@ -327,6 +327,7 @@ project-includes = [
   "nemo_rl/utils/checkpoint_engines/__init__.py",
   "nemo_rl/utils/checkpoint_engines/base.py",
   "nemo_rl/utils/checkpoint_engines/nixl.py",
+  "nemo_rl/utils/checkpoint_storage.py",
   "nemo_rl/utils/config.py",
   "nemo_rl/utils/cuda_ipc.py",
   "nemo_rl/utils/fastokens.py",
