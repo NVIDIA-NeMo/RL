@@ -229,6 +229,7 @@ def _controller(
         grpo=controller._algo_cfg,
         checkpointing={"load_replay_buffer": True},
         token_capture=SimpleNamespace(enabled=False),
+        data_plane={},
     )
     controller._dataloader = loader
     controller._rollout_permitted = asyncio.Event()

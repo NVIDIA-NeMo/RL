@@ -215,6 +215,9 @@ logger:
 
 data_plane:
   enabled: true
+  # Additional PackedTensor model inputs; native media needs no declaration.
+  # Immutable across clients and checkpoint resume. Token capture unsupported.
+  packed_multimodal_fields: []
 
 # Ledger-authoritative token capture via NeMo-Gym. Off by default; the
 # single-controller recovery options require it.
