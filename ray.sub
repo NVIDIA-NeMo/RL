@@ -312,6 +312,10 @@ COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+# Extra pyxis flags for the head/worker containers, e.g. "--container-writable
+# --container-remap-root" for images whose baked trees (Gym SWE setups) are
+# written at run time. Unset adds nothing.
+COMMON_SRUN_ARGS+=" ${NRL_CONTAINER_EXTRA_ARGS:-}"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -611,6 +615,17 @@ else
   if [[ -n "\$_hostname_digits" ]]; then
     TOPO_RANK=\$(( 10#\$_hostname_digits ))
   fi
+fi
+
+# NRL_HEAD_TOPO_RANK_LAST=1 (baked in when this script is written): rank the Ray
+# head node last within its NVLink domain. The head also runs the driver and the
+# single NeMo Gym actor, so this keeps rank 0 of the first engine (and with PD
+# disaggregation the context engines and frontends) on other nodes. The offset
+# exceeds any in-block node number (block * 10^10 + node), so the head sorts
+# after every node of its block and stays inside its domain's order. Off (0) by
+# default, so training keeps pure topology order.
+if [[ "${NRL_HEAD_TOPO_RANK_LAST:-0}" == "1" && "\$SLURMD_NODENAME" == "$head_node" && -n "\$TOPO_RANK" ]]; then
+  TOPO_RANK=\$(( TOPO_RANK + 1000000000000 ))
 fi
 
 # Write GPU→cpulist mapping for NUMA binding.
