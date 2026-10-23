@@ -55,6 +55,10 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.gpu_visibility import (
+    resolve_local_device_index,
+    single_gpu_worker_env_vars,
+)
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
@@ -328,7 +332,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         del bundle_indices  # one GPU per worker; no per-bundle seeding needed
         del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
-        env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        # See nemo_rl.distributed.gpu_visibility for NRL_NCCLEP_ONE_GPU_PER_RANK.
+        env_vars = single_gpu_worker_env_vars()
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
@@ -358,9 +363,12 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
         # Must be the first CUDA-touching call in this process.
-        # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        # Under the default `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by
+        # `configure_worker()`) the Ray GPU id is the device index; when Ray has
+        # narrowed CUDA_VISIBLE_DEVICES to this worker's GPU, the index is 0.
         gpu_ids = ray.get_gpu_ids()
-        local_rank = int(gpu_ids[0])
+        physical_gpu_id = int(gpu_ids[0])
+        local_rank = resolve_local_device_index(physical_gpu_id)
         os.environ["LOCAL_RANK"] = str(local_rank)
         torch.cuda.set_device(local_rank)
 
@@ -369,11 +377,10 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
         # Pin to this worker's GPU-local CPUs/memory before model load, matching
-        # the policy workers. local_rank (== ray.get_gpu_ids()[0]) is the physical
-        # GPU index that keys the affinity file. Pass it explicitly:
-        # CUDA_VISIBLE_DEVICES lists all node devices here
-        # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
-        bind_to_gpu_numa(local_rank)
+        # the policy workers. The physical GPU id keys the affinity file. Pass it
+        # explicitly: by default CUDA_VISIBLE_DEVICES lists all node devices here,
+        # and local_rank is 0 when Ray narrowed it.
+        bind_to_gpu_numa(physical_gpu_id)
 
         # OTel providers are process-global, so the driver's setup does not
         # reach this actor. No-op unless telemetry is enabled.
