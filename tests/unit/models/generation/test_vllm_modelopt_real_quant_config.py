@@ -348,9 +348,6 @@ def test_real_quant_worker_makes_shared_nvfp4_moe_scales_writable():
 )
 def test_real_quant_moe_scales_use_native_reload_copyback(backend):
     # Optional native dependencies are installed only in the vLLM test environment.
-    from nemo_rl.modelopt.models.generation import (
-        vllm_quant_patch as patch_mod,
-    )
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
         NvFp4MoeBackend,
         make_nvfp4_moe_quant_config,
@@ -361,6 +358,10 @@ def test_real_quant_moe_scales_use_native_reload_copyback(backend):
         get_layerwise_info,
         initialize_layerwise_reload,
         record_metadata_for_reloading,
+    )
+
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
     )
 
     layer = torch.nn.Module()
@@ -414,11 +415,12 @@ def test_real_quant_moe_scales_use_native_reload_copyback(backend):
 @pytest.mark.vllm
 def test_real_quant_moe_rejects_unhandled_reload_backends() -> None:
     # Optional native dependencies are installed only in the vLLM test environment.
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+
     from nemo_rl.modelopt.models.generation import (
         vllm_quant_patch as patch_mod,
     )
-    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
 
     supported = {
         NvFp4MoeBackend.VLLM_CUTLASS,
