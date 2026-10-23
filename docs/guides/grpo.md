@@ -718,6 +718,40 @@ grpo:
       alpha: 1.0             # inverse_length mode only, >= 0 (0 is a no-op)
       max_ratio: 3.0         # inverse_length mode only, > 1; null = unbounded
       rank_spread: 0.5       # rank mode only, 0 <= s < 1
+      scope: trajectory      # "trajectory" | "thinking_per_turn" | "prose_per_turn"
+      exclude_final_answer: false  # prose_per_turn only
+      turns_counted: with_spans    # per-turn scopes only: "with_spans" | "all" | "none"
+```
+
+Options at a glance (each is described in detail below):
+
+| Option | Default | Values | What it does |
+|---|---|---|---|
+| `enabled` | `false` | bool | Turns the reweighting on. Off, the advantages are bit-identical to plain GRPO. |
+| `mode` | `inverse_length` | `inverse_length`, `rank` | How a positive's length becomes a weight: in proportion to the length gap, or by length order only. |
+| `alpha` | `1.0` | float >= 0 | `inverse_length` only: strength, $w = (L/L_{\min})^{-\alpha}$. `1.0` gives equal total credit to correct answers within `max_ratio` of the shortest; `0` is a no-op. |
+| `max_ratio` | `3.0` | float > 1, or `null` | `inverse_length` only: the largest per-token weight ratio between two positives of a group, and the bound on every final weight. `null` removes the cap. |
+| `rank_spread` | `0.5` | 0 <= s < 1 | `rank` only: the shortest positive gets $1+s$, the longest $1-s$ (a 3x per-token ratio at 0.5), whatever the gaps. |
+| `scope` | `trajectory` | `trajectory`, `thinking_per_turn`, `prose_per_turn` | What is measured and scaled: the whole response (every trained token), the thinking tokens per turn, or the thinking + visible-text tokens per turn (tool calls and end-of-turn tokens untouched). |
+| `exclude_final_answer` | `false` | bool | `prose_per_turn` only: leaves the last turn's visible text (the answer) out of the measure and the scaling. |
+| `turns_counted` | `with_spans` | `with_spans`, `all`, `none` | Per-turn scopes only: the divisor $T$ in $V = P/T$. Turns with measured text, every trained turn, or no division ($V$ = the rollout's total measured tokens). |
+
+Examples:
+
+```yaml
+# Shorter correct answers get more credit, at most 3x per token (single-turn tasks).
+positive_length_reweight: {enabled: true, mode: inverse_length, alpha: 1.0, max_ratio: 3.0}
+
+# The same push by length order only: near-ties are split 75/25 (rank_spread 0.5).
+positive_length_reweight: {enabled: true, mode: rank, rank_spread: 0.5}
+
+# Agentic rollouts: reweight reasoning + visible text per turn; tool calls keep their credit,
+# and the number of turns carries no length pressure.
+positive_length_reweight: {enabled: true, scope: prose_per_turn}
+
+# Agentic rollouts: reweight reasoning + visible text by its total over the rollout, so a
+# rollout that writes the same per turn over more turns gets less credit.
+positive_length_reweight: {enabled: true, scope: prose_per_turn, turns_counted: none}
 ```
 
 It runs after the leave-one-out baseline and the reward normalization. For each prompt group,
@@ -802,13 +836,15 @@ grpo:
       enabled: true
       scope: prose_per_turn        # "trajectory" (default) | "thinking_per_turn" | "prose_per_turn"
       exclude_final_answer: false  # prose_per_turn only
-      turns_counted: with_spans    # "with_spans" | "all"
+      turns_counted: with_spans    # "with_spans" | "all" | "none"
 ```
 
 Every trained assistant token belongs to one class:
 
-- THINKING: from the start of the turn through the closing thinking tag, inclusive, so the
-  decision to stop thinking is reweighted too.
+- THINKING: from the start of the turn through the turn's last closing thinking tag, inclusive,
+  so the decision to stop thinking is reweighted too. Everything before that tag is thinking,
+  including tool-call markup and earlier closing tags. A thinking turn with no closing tag is all
+  thinking.
 - ACTION: each tool-call span (`<tool_call>` ... `</tool_call>`, inclusive) and the turn's final
   end-of-turn token. In the last turn that token is the decision to end the episode.
 - CONTENT: every other token of the turn, i.e. free text before, between or after tool calls,
@@ -816,14 +852,16 @@ Every trained assistant token belongs to one class:
 
 The measured set $M$ is the thinking tokens (`thinking_per_turn`) or the thinking and content
 tokens (`prose_per_turn`). For each row, $P_i$ is the number of measured trained tokens, $T_i$ the
-number of turns with at least one measured token (`with_spans`) or all trained turns (`all`), and
-$V_i = P_i / T_i$ the free text per turn. The weights are the same as above with $L$ replaced by
-$V$, over the positives with $P_i > 0$. The renormalization uses $\sum A_j P_j$, and only the
-measured tokens of positive rows are scaled. Every action token, every negative row and every
-excluded token keeps its exact advantage, and each group's share of the step is unchanged.
+number of turns with at least one measured token (`with_spans`), all trained turns (`all`), or 1
+(`none`), and $V_i = P_i / T_i$ the free text per turn (with `none`, the rollout's total free
+text). The weights are the same as above with $L$ replaced by $V$, over the positives with
+$P_i > 0$. The renormalization uses $\sum A_j P_j$, and only the measured tokens of positive rows
+are scaled. Every action token, every negative row and every excluded token keeps its exact
+advantage, and each group's share of the step is unchanged.
 
-- Turn invariance: a row with twice the turns and twice the text per row gets the same weight
-  as one with half of both.
+- Turn invariance (`with_spans`, `all`): a row with twice the turns and twice the text per row
+  gets the same weight as one with half of both. `turns_counted: none` drops this on purpose: the
+  row with more turns of text gets the lower weight.
 - Why `prose_per_turn` is recommended: the measured set and the reweighted set are the same
   tokens. If only thinking were reweighted, the model could move reasoning from the thinking
   block into visible text before the tool call and escape the reweighting; with prose, moving
@@ -835,7 +873,24 @@ excluded token keeps its exact advantage, and each group's share of the step is 
 - Turn padding: with $V = P/T$, adding a turn with little text lowers $V$ and raises the weight,
   so the per-turn measure pushes toward more, terser turns rather than fewer. `with_spans`
   counts only turns that contain measured text, so a turn that is just a tool call does not dilute
-  $V$; with `all` it does. Watch `net_turn_credit` and the turn counts below.
+  $V$; with `all` it does. `none` removes the incentive: every extra turn of text adds to $V$.
+  Watch `net_turn_credit` and the turn counts below.
+
+Worked example. Two correct rollouts of one group (binary reward, both with advantage $A$),
+`inverse_length` with $\alpha = 1$ and `max_ratio` 3. Rollout 1 makes one turn: 100 thinking
+tokens, a 30-token tool call and the end-of-turn token. Rollout 2 makes ten such turns: 1,000
+thinking tokens in all.
+
+| Setting | Measure of rollout 1 / 2 | Weight 1 / 2 | Tokens scaled |
+|---|---|---|---|
+| `scope: trajectory` | $L$ = 131 / 1,310 | 2.54 / 0.85 | every trained token, tool calls included |
+| `scope: prose_per_turn`, `turns_counted: with_spans` | $V$ = 100 / 100 | 1.0 / 1.0 | thinking + content |
+| `scope: prose_per_turn`, `turns_counted: none` | $V$ = 100 / 1,000 | 2.54 / 0.85 | thinking + content |
+
+With `none` the raw weights are $(1, \max(100/1000, 1/3)) = (1, 1/3)$ and the renormalization
+factor is $1100 / (100 + 1000/3) = 2.54$, so rollout 1's thinking tokens carry 3x the per-token
+credit of rollout 2's, and the two thinking totals keep their sum ($100 \cdot 2.54 + 1000 \cdot 0.85
+= 1100$). Under `with_spans` both write 100 tokens per turn, so neither is reweighted.
 
 The per-turn scopes run after the estimator, before message-level penalties and the
 advantage clip, so penalties keep precedence. They need the per-token
