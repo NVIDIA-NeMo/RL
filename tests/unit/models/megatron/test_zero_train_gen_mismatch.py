@@ -39,6 +39,7 @@ CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
+    "recipes/llm/grpo-qwen3-30ba3b-1n4g-megatron_generation-colocated-zero-kl.yaml",
 ]
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
@@ -296,13 +297,6 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     config["generation"]["backend"] = "vllm"
     result = _validate(config)
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
-
-
-def test_validate_rejects_colocated_generation():
-    config = _policy_config()
-    config["generation"]["colocated"] = {"enabled": True}
-    result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
 
 
 def test_validate_rejects_missing_generation_block():
