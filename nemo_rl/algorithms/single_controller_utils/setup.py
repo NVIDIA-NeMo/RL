@@ -98,6 +98,8 @@ from nemo_rl.data_plane import (
     build_data_plane_client,
     data_plane_supports_checkpointing,
 )
+from nemo_rl.data_plane.factory import declared_packed_fields
+from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.schema import (
     SC_ROLLOUT_SCHEMA_FIELDS,
     fields_with_optional_routed_experts,
@@ -223,7 +225,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     partition_id: str,
     sampler_name: str,
     opd_full_teacher_checkpoints: Optional[list[str]] = None,
-    packed_multimodal_fields: Optional[list[str]] = None,
+    data_plane_config: DataPlaneRuntimeConfig | None = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
 
@@ -305,7 +307,7 @@ def _maybe_restore_native_data_plane_checkpoint(
             f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
             f"number them {opd_full_teacher_checkpoints!r}."
         )
-    current_fields = sorted(set(packed_multimodal_fields or ()))
+    current_fields = declared_packed_fields(data_plane_config)
     saved_fields = metadata.get("packed_multimodal_fields")
     # Older native-media-only checkpoints carry no custom declaration.
     if saved_fields is None and not current_fields:
@@ -372,9 +374,7 @@ def _register_single_controller_partitions(
         )
         if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
-    if include_multimodal_fields or master_config.data_plane.get(
-        "packed_multimodal_fields"
-    ):
+    if include_multimodal_fields or declared_packed_fields(master_config.data_plane):
         partition_fields.extend(
             field
             for field in sorted(WIRE_MULTIMODAL_FIELDS)
@@ -1377,9 +1377,7 @@ def setup_single_controller(
             "Megatron router replay requires token_capture.enabled=true so "
             "MInf routing indices can be joined with Gym lineage"
         )
-    if token_capture_cfg.enabled and master_config.data_plane.get(
-        "packed_multimodal_fields"
-    ):
+    if token_capture_cfg.enabled and declared_packed_fields(master_config.data_plane):
         raise ValueError(
             "custom packed_multimodal_fields require token_capture.enabled=false"
         )
@@ -2147,9 +2145,7 @@ def setup_single_controller(
             save_state=save_state,
             partition_id=partition_id,
             sampler_name=master_config.async_rl.sampler.name,
-            packed_multimodal_fields=master_config.data_plane.get(
-                "packed_multimodal_fields"
-            ),
+            data_plane_config=master_config.data_plane,
             opd_full_teacher_checkpoints=(
                 opd_module.opd_full_teacher_checkpoints_by_index(master_config)
             ),

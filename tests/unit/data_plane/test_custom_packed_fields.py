@@ -29,25 +29,8 @@ from nemo_rl.data import multimodal_utils as mm
 from nemo_rl.data_plane.factory import (
     build_data_plane_client,
     configure_multimodal_fields,
+    declared_packed_fields,
 )
-
-
-@pytest.fixture(autouse=True)
-def isolated_packed_declaration():
-    packed = mm.PACKED_MULTIMODAL_FIELDS.copy()
-    wire = mm.WIRE_MULTIMODAL_FIELDS.copy()
-    declaration = mm.G_CUSTOM_PACKED_FIELDS
-    mm.PACKED_MULTIMODAL_FIELDS.difference_update(declaration or ())
-    mm.WIRE_MULTIMODAL_FIELDS.difference_update(declaration or ())
-    mm.G_CUSTOM_PACKED_FIELDS = None
-    try:
-        yield
-    finally:
-        mm.PACKED_MULTIMODAL_FIELDS.clear()
-        mm.PACKED_MULTIMODAL_FIELDS.update(packed)
-        mm.WIRE_MULTIMODAL_FIELDS.clear()
-        mm.WIRE_MULTIMODAL_FIELDS.update(wire)
-        mm.G_CUSTOM_PACKED_FIELDS = declaration
 
 
 @pytest.mark.parametrize(
@@ -55,6 +38,13 @@ def isolated_packed_declaration():
     [
         ["input_ids"],
         ["position_ids"],
+        ["extra_block_kwargs"],
+        ["mtp_input_mask"],
+        ["output_processor"],
+        ["output_processor_context"],
+        ["is_spec_decode"],
+        ["use_cache"],
+        ["flash_attn_kwargs"],
         ["attention_mask"],
         ["labels"],
         ["decoder_input"],
@@ -257,3 +247,56 @@ def test_single_controller_partition_includes_custom_fields_without_processor():
     assert "features" in fields
     assert "input_ids" in fields
     assert len(fields) == len(set(fields))
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_tq_from_wire_keeps_declared_custom_field_nested(declared: bool) -> None:
+    from tensordict import TensorDict
+
+    from nemo_rl.data_plane.adapters.transfer_queue import _from_wire
+
+    if declared:
+        mm.register_packed_multimodal_fields(["features"])
+    # Uniform segment shapes must not cause packed row boundaries to be lost.
+    features = mm.PackedTensor(
+        [torch.ones(2, 3), torch.zeros(2, 3), torch.full((2, 3), 2.0)], dim_to_pack=0
+    )
+    nested, tags = features.to_wire()
+    out = _from_wire(TensorDict({"features": nested}, batch_size=(3,)))
+    assert out["features"].is_nested is declared
+    if declared:
+        rebuilt = mm.PackedTensor.from_wire(out["features"], tags)
+        assert torch.equal(rebuilt.as_tensor(), features.as_tensor())
+
+
+def test_failed_client_init_keeps_existing_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as adapter
+
+    mm.register_packed_multimodal_fields(["features"])
+    monkeypatch.setattr(
+        adapter, "TQDataPlaneClient", MagicMock(side_effect=RuntimeError("boom"))
+    )
+    with pytest.raises(RuntimeError, match="boom"):
+        build_data_plane_client(
+            {
+                "enabled": True,
+                "impl": "transfer_queue",
+                "packed_multimodal_fields": ["features"],
+            }
+        )
+    assert mm.G_CUSTOM_PACKED_FIELDS == frozenset({"features"})
+    assert "features" in mm.PACKED_MULTIMODAL_FIELDS
+    assert "features" in mm.WIRE_MULTIMODAL_FIELDS
+
+
+@pytest.mark.parametrize(
+    "names,expected", [(None, []), ([], []), (["b", "a", "a"], ["a", "b"])]
+)
+def test_declared_packed_fields_normalizes(
+    names: list[str] | None, expected: list[str]
+) -> None:
+    assert declared_packed_fields({"packed_multimodal_fields": names}) == expected
+    assert declared_packed_fields({}) == []
+    assert declared_packed_fields(None) == []

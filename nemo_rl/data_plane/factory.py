@@ -120,15 +120,32 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
 
-def _declared_packed_fields(cfg: DataPlaneRuntimeConfig) -> list[str] | None:
-    """Return the packed-field declaration; typed local configs cannot declare one."""
-    if not isinstance(cfg, LocalDataPlaneConfig):
-        return cfg.get("packed_multimodal_fields")
-    if "packed_multimodal_fields" in (cfg.model_extra or {}):
-        raise ValueError(
-            "LocalDataPlaneConfig does not support packed_multimodal_fields"
-        )
-    return None
+def declared_packed_fields(cfg: DataPlaneRuntimeConfig | None) -> list[str]:
+    """Return the sorted unique custom packed-input names, or an empty list.
+
+    Args:
+        cfg: Data-plane config. Typed local configs cannot declare custom fields.
+
+    Raises:
+        ValueError: The declaration is not a list of identifiers, or a typed
+            local config contains the declaration key.
+    """
+    if cfg is None:
+        return []
+    if isinstance(cfg, LocalDataPlaneConfig):
+        if "packed_multimodal_fields" in (cfg.model_extra or {}):
+            raise ValueError(
+                "LocalDataPlaneConfig does not support packed_multimodal_fields"
+            )
+        return []
+    names = cfg.get("packed_multimodal_fields")
+    if names is None:
+        return []
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or not name.isidentifier() for name in names
+    ):
+        raise ValueError("packed_multimodal_fields must be a list of model-input names")
+    return sorted(set(names))
 
 
 def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
@@ -148,7 +165,7 @@ def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
     # Lazy: the native codec imports this package during data initialization.
     from nemo_rl.data.multimodal_utils import register_packed_multimodal_fields
 
-    names = _declared_packed_fields(cfg)
+    names = declared_packed_fields(cfg)
     register_packed_multimodal_fields(names)
 
 
@@ -209,7 +226,7 @@ def build_data_plane_client(
     # Lazy: the native codec imports this package during data initialization.
     from nemo_rl.data.multimodal_utils import packed_multimodal_field_registration
 
-    names = _declared_packed_fields(cfg)
+    names = declared_packed_fields(cfg)
     with packed_multimodal_field_registration(names):
         impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
         if impl == "transfer_queue":
