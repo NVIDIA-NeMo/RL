@@ -562,6 +562,178 @@ def _make_gym_impl(
     return impl
 
 
+class _RetireRecorder:
+    """Mimics `env.retire_rollout_ledgers.remote(...)`."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self._error = error
+
+    def remote(self, rollout_ids):
+        self.calls.append(rollout_ids)
+        if self._error is not None:
+            raise self._error
+
+
+def _capture_gym_impl(gym_method, retire: _RetireRecorder, **kwargs):
+    impl = _make_gym_impl(gym_method, **kwargs)
+    impl._task_to_env = {
+        "nemo_gym": type(
+            "Env",
+            (),
+            {"run_rollouts": gym_method, "retire_rollout_ledgers": retire},
+        )()
+    }
+    return impl
+
+
+def _capture_rows(count: int) -> list[dict]:
+    return [{**row, "_ng_rollout_id": f"r{row['_rowidx']}"} for row in _gym_rows(count)]
+
+
+class _ReceiveFailsOnce:
+    """Gym stream whose first result for row 0 cannot be received.
+
+    The actor finished the row, so its manifest was read, but fetching the result raised a retryable error.
+    The row is then re-dispatched under the same rollout ID.
+    """
+
+    def __init__(self, retire: "_RetireRecorder") -> None:
+        self._retire = retire
+        self.attempts = 0
+        self.dispatched: list[list[int]] = []
+        self.retired_before_redispatch: list[list[str]] | None = None
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        self.dispatched.append([row["_rowidx"] for row in inputs])
+        attempt = self.attempts
+        self.attempts += 1
+        if attempt > 0:
+            self.retired_before_redispatch = list(self._retire.calls)
+        return self._stream(inputs, attempt)
+
+    async def _stream(self, inputs, attempt):
+        for row in inputs:
+            if attempt == 0 and row["_rowidx"] == 0:
+                yield self._lost_result()
+            else:
+                yield _row_result(row["_rowidx"])
+
+    @staticmethod
+    async def _lost_result():
+        raise ray.exceptions.ObjectFetchTimedOutError("00" * 28, "", "")
+
+
+class TestCaptureLedgerRetirement:
+    """Every row of a dispatch is retired once, on the actor that ran it, when the dispatch ends."""
+
+    def test_a_completed_dispatch_retires_every_row(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=0)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire)
+
+        asyncio.run(impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout"))
+
+        assert retire.calls == [["r0", "r1"]]
+
+    def test_a_failed_dispatch_retires_every_row(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire, num_generations=4)
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(impl._run_rollouts(_capture_rows(4), Timer(), "timing/rollout"))
+
+        assert retire.calls == [["r0", "r1", "r2", "r3"]]
+
+    def test_a_timed_out_dispatch_retires_every_row(self):
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(
+            method, retire, timeouts=RolloutTimeouts(rollout_s=0.05)
+        )
+
+        with pytest.raises(RolloutTimeout):
+            asyncio.run(impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout"))
+
+        assert retire.calls == [["r0", "r1"]]
+
+    def test_rows_are_not_retired_while_they_can_be_re_dispatched(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire, num_generations=4, row_attempts=3)
+
+        asyncio.run(impl._run_rollouts(_capture_rows(4), Timer(), "timing/rollout"))
+
+        # Re-dispatched rows keep their rollout ID, so retirement waits for the last attempt.
+        assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        assert retire.calls == [["r0", "r1", "r2", "r3"]]
+
+    def test_a_result_that_could_not_be_received_keeps_its_ledger_for_the_retry(self):
+        retire = _RetireRecorder()
+        method = _ReceiveFailsOnce(retire)
+        impl = _capture_gym_impl(method, retire, num_generations=2, row_attempts=2)
+
+        asyncio.run(impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout"))
+
+        assert method.dispatched == [[0, 1], [0, 1]]
+        assert method.retired_before_redispatch == []
+        assert retire.calls == [["r0", "r1"]]
+
+    def test_a_retire_error_does_not_replace_the_dispatch_error(self):
+        method = _PartialGymMethod(fail_after_rows=0, failures_before_success=1)
+        retire = _RetireRecorder(error=ray.exceptions.RaySystemError("actor gone"))
+        impl = _capture_gym_impl(method, retire, num_generations=2)
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout"))
+        assert retire.calls == [["r0", "r1"]]
+
+    def test_a_cancelled_dispatch_retires_every_row(self):
+        """A staleness abort cancels the dispatch; CancelledError is not an Exception."""
+
+        class _HangAfterFirstRow(_FakeGymMethod):
+            async def _stream(self, num_inputs):
+                stream = super()._stream(num_inputs)
+                yield await anext(stream)
+                # Resumed only after row 0 has been recorded.
+                self.hanging.set()
+                async for item in stream:
+                    yield item
+
+        method = _HangAfterFirstRow(rows_to_yield=1, hang_after=True)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire)
+
+        async def _main():
+            method.hanging = asyncio.Event()
+            task = asyncio.ensure_future(
+                impl._run_rollouts(_capture_rows(2), Timer(), "timing/rollout")
+            )
+            await asyncio.wait_for(method.hanging.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
+
+        assert retire.calls == [["r0", "r1"]]
+
+    def test_rows_without_a_rollout_id_are_not_retired(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=0)
+        retire = _RetireRecorder()
+        impl = _capture_gym_impl(method, retire)
+
+        asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+        assert retire.calls == []
+
+
 class TestGymRolloutDeadline:
     """The gym path is where the silent wedge described in the resiliency report lives.
 

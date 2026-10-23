@@ -30,7 +30,12 @@ pytestmark = pytest.mark.nemo_gym
 
 def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
-    return object.__new__(env_cls)
+    env = object.__new__(env_cls)
+    env._token_capture_enabled = True
+    env._retire_pending = {}
+    env._retire_full = asyncio.Event()
+    env._retire_task = None
+    return env
 
 
 def _digest(label: str) -> str:
@@ -596,3 +601,170 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
     assert should_use_nemo_gym(config) is True
+
+
+class _ControlResponse:
+    def __init__(self, status: int, text: str = "") -> None:
+        self.status = status
+        self._text = text
+        self.released = False
+
+    async def text(self) -> str:
+        return self._text
+
+    def release(self) -> None:
+        self.released = True
+
+
+def _retired_batches(env) -> list[list[str]]:
+    return [
+        call.kwargs["json"]["rollout_ids"]
+        for call in env._control_response.await_args_list
+    ]
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"rollout_id": "r0", "records": [_manifest_record("c1")], "failures": []},
+        RuntimeError("control plane down"),
+    ],
+    ids=["fetched", "fetch_failed"],
+)
+def test_receipt_postprocess_leaves_retirement_to_the_dispatcher(manifest) -> None:
+    """The controller may still re-dispatch the row under this ID if receiving the result fails."""
+    env = _capture_env()
+    if isinstance(manifest, Exception):
+        env._control = AsyncMock(side_effect=manifest)
+    else:
+        env._control = AsyncMock(return_value=manifest)
+
+    asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "r0"}, {"reward": 1.0})
+    )
+
+    assert env._retire_pending == {}
+    assert env._retire_task is None
+
+
+def test_retire_is_a_no_op_without_token_capture() -> None:
+    env = _capture_env()
+    env._token_capture_enabled = False
+
+    asyncio.run(env.retire_rollout_ledgers(["r0"]))
+
+    assert env._retire_pending == {}
+    assert env._retire_task is None
+
+
+def test_retire_flush_sends_every_queued_rollout_in_one_request() -> None:
+    env = _capture_env()
+    env._retire_pending = dict.fromkeys(["r0", "r1", "r2"])
+    env._control_response = AsyncMock(return_value=_ControlResponse(200))
+
+    assert asyncio.run(env._flush_retired_rollouts()) is True
+
+    assert _retired_batches(env) == [["r0", "r1", "r2"]]
+    call = env._control_response.await_args
+    assert call.args == ("POST", "/training-token-capture/control/rollouts/retire")
+    # Cleanup rides Gym's reserved control pool, not the model-call pool.
+    assert call.kwargs["_control"] is True
+    assert env._retire_pending == {}
+
+
+def test_retire_flush_splits_at_the_gym_batch_limit(monkeypatch) -> None:
+    from nemo_gym.token_id_capture import control_routes
+
+    monkeypatch.setattr(control_routes, "MAX_LEDGER_BATCH", 2)
+    env = _capture_env()
+    env._retire_pending = dict.fromkeys(["r0", "r1", "r2", "r3", "r4"])
+    env._control_response = AsyncMock(return_value=_ControlResponse(200))
+
+    assert asyncio.run(env._flush_retired_rollouts()) is True
+
+    assert _retired_batches(env) == [["r0", "r1"], ["r2", "r3"], ["r4"]]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [RuntimeError("control plane down"), OSError("reset"), _ControlResponse(409)],
+    ids=["timeout", "transport", "refused_while_checkpointing"],
+)
+def test_retire_flush_keeps_rollouts_queued_on_a_retryable_failure(outcome) -> None:
+    env = _capture_env()
+    env._retire_pending = dict.fromkeys(["r0", "r1"])
+    if isinstance(outcome, Exception):
+        env._control_response = AsyncMock(side_effect=outcome)
+    else:
+        env._control_response = AsyncMock(return_value=outcome)
+
+    assert asyncio.run(env._flush_retired_rollouts()) is False
+
+    assert list(env._retire_pending) == ["r0", "r1"]
+
+
+def test_retire_flush_keeps_later_batches_after_an_earlier_one_succeeds(
+    monkeypatch,
+) -> None:
+    from nemo_gym.token_id_capture import control_routes
+
+    monkeypatch.setattr(control_routes, "MAX_LEDGER_BATCH", 2)
+    env = _capture_env()
+    env._retire_pending = dict.fromkeys(["r0", "r1", "r2"])
+    env._control_response = AsyncMock(
+        side_effect=[_ControlResponse(200), RuntimeError("control plane down")]
+    )
+
+    assert asyncio.run(env._flush_retired_rollouts()) is False
+
+    assert list(env._retire_pending) == ["r2"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 422])
+def test_retire_flush_drops_a_batch_a_retry_cannot_fix(status: int) -> None:
+    env = _capture_env()
+    env._retire_pending = dict.fromkeys(["r0"])
+    env._control_response = AsyncMock(return_value=_ControlResponse(status, "bad"))
+
+    assert asyncio.run(env._flush_retired_rollouts()) is True
+
+    assert env._retire_pending == {}
+
+
+def test_retire_loop_retries_with_backoff_until_the_queue_drains(monkeypatch) -> None:
+    from nemo_rl.environments import nemo_gym
+
+    monkeypatch.setattr(nemo_gym, "_RETIRE_FLUSH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(nemo_gym, "_RETIRE_MAX_BACKOFF_S", 0.001)
+    env = _capture_env()
+    env._control_response = AsyncMock(
+        side_effect=[RuntimeError("control plane down"), _ControlResponse(200)]
+    )
+
+    async def _scenario() -> None:
+        await env.retire_rollout_ledgers(["r0", "r0", "r1"])
+        await asyncio.wait_for(env._retire_task, timeout=5)
+
+    asyncio.run(_scenario())
+
+    # The failed batch was resent whole, and the duplicate ID was sent once.
+    assert _retired_batches(env) == [["r0", "r1"], ["r0", "r1"]]
+    assert env._retire_pending == {}
+
+
+def test_retire_loop_flushes_a_full_batch_without_waiting(monkeypatch) -> None:
+    from nemo_rl.environments import nemo_gym
+
+    monkeypatch.setattr(nemo_gym, "_RETIRE_BATCH_SIZE", 2)
+    monkeypatch.setattr(nemo_gym, "_RETIRE_FLUSH_INTERVAL_S", 60.0)
+    env = _capture_env()
+    env._control_response = AsyncMock(return_value=_ControlResponse(200))
+
+    async def _scenario() -> None:
+        await env.retire_rollout_ledgers(["r0"])
+        await env.retire_rollout_ledgers(["r1"])
+        await asyncio.wait_for(env._retire_task, timeout=5)
+
+    asyncio.run(_scenario())
+
+    assert _retired_batches(env) == [["r0", "r1"]]
