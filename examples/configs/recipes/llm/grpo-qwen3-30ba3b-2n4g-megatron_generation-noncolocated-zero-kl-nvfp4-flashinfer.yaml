@@ -1,0 +1,28 @@
+# Qwen3-30B-A3B zero train/generation KL with per-token NVFP4 routed experts on FlashInfer
+# (SwiGLU): the BF16 zero-KL recipe plus the Nano per-token NVFP4 FlashInfer knobs.
+defaults: grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+policy:
+  megatron_cfg:
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
+    moe_inference_training_forward: true
+    inference_moe_nvfp4_recipe: per_token
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - moe
+    te_precision_config_file: null
+    fp8_cfg:
+      enabled: false
+  generation:
+    mcore_generation_config:
+      inference_grouped_gemm_backend: flashinfer
+      fp8_cfg:
+        enabled: false
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  wandb:
+    name: grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
