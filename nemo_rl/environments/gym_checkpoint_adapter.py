@@ -63,6 +63,9 @@ class GymCheckpointCommitSummary:
 
     exported_episodes: tuple[GymCheckpointEpisode, ...]
     staging_keys: tuple[str, ...]
+    # The server names of every participant that committed state. Gym restores
+    # only live participants, so a restore must find each of these live.
+    participants: tuple[str, ...]
     # Each committed episode's staged rows, as Gym's records attribute them. A
     # row carried over from an earlier attempt belongs to both attempts.
     staging_keys_by_episode: Mapping[GymCheckpointEpisode, tuple[str, ...]] = field(
@@ -316,6 +319,9 @@ class GymCheckpointAdapter:
         owned_keys = exported_environment_keys | run_episode_keys
         return GymCheckpointCommitSummary(
             exported_episodes=_episodes(owned_keys),
+            participants=tuple(
+                sorted(member.server_name for member in participants.members)
+            ),
             staging_keys=tuple(sorted(staging_keys)),
             staging_keys_by_episode={
                 GymCheckpointEpisode(parsed.rollout_id, parsed.attempt): tuple(
@@ -391,11 +397,28 @@ class GymCheckpointAdapter:
         checkpoint_root: str | Path,
         episodes: Iterable[GymCheckpointEpisode],
         *,
+        participants: Iterable[str],
         source_checkpoint_id: str,
         deadline_ts: float,
     ) -> None:
+        """Restore ``episodes`` into this deployment.
+
+        ``participants`` are the server names that committed the checkpoint.
+        Gym restores only live participants, so one missing here would have its
+        state silently dropped; Gym itself fails a live participant that has no
+        saved state.
+        """
         from nemo_gym._checkpoint.coordination import restore
 
+        live = {member.server_name for member in self._require_participants().members}
+        missing = sorted(set(participants) - live)
+        if missing:
+            raise RuntimeError(
+                f"Gym deployment for instance {self._instance.instance_id!r} lacks "
+                f"participants this checkpoint saved state for: {missing!r}. Start "
+                "Gym with these servers to restore, or start without the Gym "
+                "checkpoint."
+            )
         with _reraise_as_gym_checkpoint_unavailable():
             replies = await restore(
                 self._require_participants(),

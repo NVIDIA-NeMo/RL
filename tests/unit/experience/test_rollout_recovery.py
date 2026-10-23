@@ -1920,3 +1920,118 @@ def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> No
         first.gym_episode(0)
         not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
     )
+
+
+def test_a_dropped_dispatch_is_queued_for_retirement_and_replaced() -> None:
+    """A broken stream leaves the row running in Gym; its re-send needs a new ID."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (group.gym_episode(1),)
+    }
+    replaced = ledger.get_group("g7")
+    assert replaced.siblings[1].attempts[0].status is RolloutAttemptStatus.ABANDONED
+    assert replaced.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
+    assert replaced.gate_rollout_id(1) != group.gate_rollout_id(1)
+    # The sibling that returned keeps its attempt and is not Gym-retired.
+    assert replaced.gate_rollout_id(0) == group.gate_rollout_id(0)
+    assert ledger.gym_checkpoint_inventory({"tools/replica-0"}) == {
+        "tools/replica-0": (group.gym_episode(0),)
+    }
+
+
+def test_a_dropped_attempt_that_never_reached_gym_keeps_its_identity() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=1))
+
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+
+    assert ledger.get_group("g7").gate_rollout_id(1) == group.gate_rollout_id(1)
+    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": ()
+    }
+
+
+def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
+        admitted=True,
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", gym_instance_id="tools/replica-0"
+        )
+    )
+
+    with pytest.raises(ValueError, match="replaces the whole cohort"):
+        _mutate(
+            lambda cut: ledger.replace_dropped_dispatch(
+                cut, "g7", generation_indices=[1]
+            )
+        )
+
+
+def test_gym_episodes_still_held_looks_up_only_live_current_attempts() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    first, second = group.gym_episode(0), group.gym_episode(1)
+    # Sibling 1's stream broke: its old attempt is abandoned and re-minted.
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+
+    held = ledger.gym_episodes_still_held(
+        {
+            "tools/replica-0": [
+                first,
+                second,
+                GymCheckpointEpisode("not-a-rollout-id", 0),
+            ],
+            "tools/replica-1": [first],
+        }
+    )
+
+    assert held == {"tools/replica-0": {first}, "tools/replica-1": set()}
+    # It agrees with the full inventory it stands in for.
+    inventory = ledger.gym_checkpoint_inventory({"tools/replica-0", "tools/replica-1"})
+    assert held["tools/replica-0"] == set(inventory["tools/replica-0"]) & {
+        first,
+        second,
+    }
+
+
+def test_an_abandoned_episode_is_not_held_by_its_redispatched_replacement() -> None:
+    """The on-wire reply drain must not wait on an episode a re-send replaced."""
+    ledger = RolloutRecoveryLedger()
+    group = _dispatched_turn_group(ledger)
+    old = group.gym_episode(1)
+    _mutate(
+        lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
+    )
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+        )
+    )
+    new = ledger.get_group("g7").gym_episode(1)
+
+    held = ledger.gym_episodes_still_held({"tools/replica-0": [old, new]})
+
+    assert held == {"tools/replica-0": {new}}

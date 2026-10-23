@@ -40,6 +40,7 @@ from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
     GymAdmissionClosed,
+    GymRowFailure,
     GymTransportError,
     RolloutDataFailure,
     RolloutFailure,
@@ -979,6 +980,147 @@ class _AdmissionClosedGymMethod:
 class TestGymAdmissionClosedRows:
     """A row Gym refuses at checkpoint admission never ran: unwind it, re-send it."""
 
+    def test_retry_failure_cancels_the_blocked_original_stream(self, monkeypatch):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+
+        async def exercise():
+            events = []
+            original_cancelled = asyncio.Event()
+
+            class FailingRetry(_AdmissionClosedGymMethod):
+                async def _stream(self, rows, first):
+                    if first:
+                        yield self._parked_item(1)
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            original_cancelled.set()
+                    else:
+                        assert rows == [1]
+                        raise GymTransportError("refused sibling retry broke")
+
+            method = FailingRetry({1}, events)
+            impl = _make_gym_impl(method)
+            with pytest.raises(GymTransportError, match="refused sibling retry broke"):
+                await asyncio.wait_for(
+                    impl._stream_rows(
+                        impl._task_to_env["nemo_gym"],
+                        _gym_rows(2),
+                        [None, None],
+                        [None, None],
+                        2,
+                        "timing/rollout",
+                        dispatch_recorder=_RecordingDispatchRecorder(events),
+                        admission_closed_rows=set(),
+                    ),
+                    timeout=2,
+                )
+            assert original_cancelled.is_set()
+            assert method.dispatched == [[0, 1], [1]]
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("parked", [{14, 15}, set(range(16))])
+    def test_cohort_can_finish_after_checkpoint_refuses_members(
+        self, monkeypatch, parked
+    ):
+        """Accepted rows cannot return until all refused siblings are admitted."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+
+        async def exercise():
+            events = []
+            gate = DataPlaneCheckpointBarrier()
+            checkpoint = gate.checkpoint()
+            all_refused = asyncio.Event()
+
+            class Recorder(_RecordingDispatchRecorder):
+                async def refused(self, index):
+                    if not any(event[0] == "refused" for event in events):
+                        await checkpoint.__aenter__()
+                    await super().refused(index)
+                    if sum(event[0] == "refused" for event in events) == len(parked):
+                        all_refused.set()
+
+            class Cohort(_AdmissionClosedGymMethod):
+                def __init__(self):
+                    super().__init__(parked, events)
+                    self.release_admitted.clear()
+                    self.members = set()
+
+                def remote(self, inputs, timer_prefix, per_prompt=False):
+                    first = not self.dispatched
+                    self.members.update(
+                        row["_rowidx"]
+                        for row in inputs
+                        if not first or row["_rowidx"] not in parked
+                    )
+                    if len(self.members) == 16:
+                        self.release_admitted.set()
+                    return super().remote(inputs, timer_prefix, per_prompt)
+
+            method = Cohort()
+            impl = _make_gym_impl(method, num_generations=16, row_attempts=1)
+            impl._dispatch_admission_gate = gate
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(16),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=Recorder(events),
+                )
+            )
+            await asyncio.wait_for(all_refused.wait(), timeout=2)
+            try:
+                await asyncio.sleep(0)
+                assert method.dispatched == [list(range(16))]
+                assert not task.done()
+            finally:
+                await checkpoint.__aexit__(None, None, None)
+            completions, _, _ = await asyncio.wait_for(task, timeout=2)
+            assert len(completions) == 16
+            resent = [index for batch in method.dispatched[1:] for index in batch]
+            assert sorted(resent) == sorted(parked)
+            assert impl._stats.gym_admission_closed_rows == len(parked)
+            assert impl._stats.gym_row_redispatches == 0
+
+        asyncio.run(exercise())
+
+    def test_cancellation_stops_queued_admission_retries(self, monkeypatch):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.01)
+
+        async def exercise():
+            events = []
+            method = _AdmissionClosedGymMethod({1}, events)
+            method.release_admitted.clear()
+            impl = _make_gym_impl(method, row_attempts=1)
+            gate = DataPlaneCheckpointBarrier()
+            impl._dispatch_admission_gate = gate
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(2),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=_RecordingDispatchRecorder(events),
+                )
+            )
+            while ("refused", 1) not in events:
+                await asyncio.sleep(0)
+            async with gate.checkpoint():
+                await asyncio.sleep(0.02)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await asyncio.sleep(0.02)
+            assert method.dispatched == [[0, 1]]
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=2))
+
     def test_refused_row_is_unwound_and_resent_without_spending_a_row_attempt(
         self, monkeypatch
     ):
@@ -1139,3 +1281,430 @@ class TestGymAdmissionClosedRows:
             assert method.dispatched == [[0, 1], [1]]
 
         asyncio.run(exercise())
+
+
+class _EarlyEndingGym:
+    """NemoGym actor whose first stream returns row 0, then dies with rows still running.
+
+    Gym runs every row of a dispatch as its own task, so the rows that never
+    came back are still executing there after the stream breaks. It has no
+    ``checkpoint_retire``: only the next checkpoint retires them.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.run_rollouts = self._RunRollouts(self)
+
+    class _RunRollouts:
+        def __init__(self, gym: "_EarlyEndingGym") -> None:
+            self._gym = gym
+
+        def options(self, **kwargs):
+            del kwargs
+            return self
+
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del timer_prefix, per_prompt
+            first = not self._gym.events
+            self._gym.events.append(
+                {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs}
+            )
+            return self._stream([row["_rowidx"] for row in inputs], first)
+
+        async def _stream(self, rows, first):
+            if first:
+                yield _row_result(rows[0])
+                raise ConnectionResetError("gym stream died mid-flight")
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+
+class _ShortCleanEndGym(_EarlyEndingGym):
+    """First stream returns row 0, refuses row 1 at admission, and ends cleanly without row 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield _AdmissionClosedGymMethod._parked_item(rows[1])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
+class _RowFailingGym(_EarlyEndingGym):
+    """First stream fails row 1 with ``error`` and still returns rows 0 and 2."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.streamed_past_the_failure = False
+
+        async def failed(rowidx):
+            return GymRowFailure(rowidx, error)
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                self.streamed_past_the_failure = True
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
+class TestGymEarlyStreamEnd:
+    """Rows still running in Gym when a stream breaks must not overlap their replacements."""
+
+    def test_stream_failure_replaces_a_refused_row_that_has_since_been_resent(
+        self, monkeypatch
+    ):
+        """A concurrent admission re-send is Gym-owned again before failure cleanup."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        retry_started = asyncio.Event()
+        cancelled = []
+
+        class OverlappingStreams(_EarlyEndingGym._RunRollouts):
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                rows = [row["_rowidx"] for row in inputs]
+                self._gym.events.append(
+                    {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs}
+                )
+                return self.respond(rows, len(self._gym.events))
+
+            async def respond(self, rows, dispatch_number):
+                if dispatch_number == 1:
+                    yield _AdmissionClosedGymMethod._parked_item(2)
+                    await retry_started.wait()
+                    raise GymTransportError("original stream broke")
+                if dispatch_number == 2:
+                    assert rows == [2]
+                    retry_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.append(2)
+                for index in rows:
+                    yield _row_result(index)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts = OverlappingStreams(gym)
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+        completions, _, _ = asyncio.run(asyncio.wait_for(run(), timeout=2))
+        assert len(completions) == 3
+        assert cancelled == [2]
+        first, refused_resend, replaced = gym.events
+        assert refused_resend == {2: first[2]}
+        # Row 2 was in Gym again when the stream broke, so it is replaced too.
+        assert set(replaced) == {0, 1, 2}
+        assert set(replaced.values()).isdisjoint(first.values())
+        assert self._queued(ledger) == set(episodes.values())
+        assert all(len(s.attempts) == 2 for s in ledger.get_group("g7").siblings)
+
+    @pytest.mark.parametrize("refused_index", [None, 2])
+    def test_full_cohort_retry_uses_the_durable_new_group_attempt(self, refused_index):
+        """A timed-out GenRM attempt stays failed even under new rollout IDs."""
+        attempts = []
+
+        class FailedCohortMethod(_EarlyEndingGym._RunRollouts):
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                coordinates = [row.get("_ng_group_attempt", 0) for row in inputs]
+                attempts.append(coordinates)
+                expected = 0 if len(attempts) == 1 else 1
+                assert coordinates == [expected] * 3
+                return super().remote(inputs, timer_prefix, per_prompt)
+
+            async def _stream(self, rows, first):
+                if first:
+                    if refused_index is not None:
+                        yield _AdmissionClosedGymMethod._parked_item(refused_index)
+                    raise GymTransportError("GenRM cohort attempt 0 timed out")
+                for index in rows:
+                    yield _row_result(index)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts = FailedCohortMethod(gym)
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+        completions, _, _ = asyncio.run(run())
+        assert len(completions) == 3
+        assert attempts == [[0, 0, 0], [1, 1, 1]]
+        group = ledger.get_group("g7")
+        assert max(len(sibling.attempts) for sibling in group.siblings) - 1 == 1
+        # A refused row never reached Gym, so only the others wait for retirement.
+        assert self._queued(ledger) == {
+            episode for index, episode in episodes.items() if index != refused_index
+        }
+
+    @staticmethod
+    def _dispatch(
+        gym: _EarlyEndingGym,
+        granularity: RecoveryGranularity,
+        row_attempts: int,
+    ):
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutRecoveryLedger,
+        )
+
+        impl = _make_gym_impl(None, num_generations=3, row_attempts=row_attempts)
+        impl._task_to_env = {"nemo_gym": gym}
+        impl._dispatch_admission_gate = DataPlaneCheckpointBarrier()
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        manager = object.__new__(RolloutManager)
+        manager._recovery_ledger = ledger
+        manager._data_plane_checkpoint_barrier = barrier
+
+        async def reserve():
+            async with barrier.mutation() as cut:
+                return ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=3,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=(
+                        RecoveryTargetLevel.PROMPT_GROUP
+                        if granularity is RecoveryGranularity.PROMPT_GROUP
+                        else RecoveryTargetLevel.TURN
+                    ),
+                    admitted=True,
+                )
+
+        group = asyncio.run(reserve())
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "workplace_assistant",
+                "_ng_rollout_id": group.gate_rollout_id(index),
+            }
+            for index in range(3)
+        ]
+        recorder = _LedgerDispatchRecorder(
+            manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+        )
+        episodes = {index: group.gym_episode(index) for index in range(3)}
+
+        async def run():
+            return await impl._run_rollouts(
+                rows,
+                Timer(),
+                "timing/rollout",
+                recovery_granularity=granularity,
+                dispatch_recorder=recorder,
+            )
+
+        async def abandon():
+            # What the group task does once _run_rollouts raises.
+            async with barrier.mutation() as cut:
+                ledger.abandon_unsealed(cut, "g7")
+
+        return run, abandon, episodes, ledger
+
+    @staticmethod
+    def _queued(ledger) -> set:
+        return set(
+            ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+        )
+
+    def test_rows_still_running_are_queued_for_retirement_and_resent_under_new_ids(
+        self,
+    ):
+        from nemo_rl.experience.rollout_recovery import RolloutAttemptStatus
+
+        gym = _EarlyEndingGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1, 2}
+        assert set(resent.values()).isdisjoint(first.values())
+        group = ledger.get_group("g7")
+        for index in (1, 2):
+            sibling = group.siblings[index]
+            assert sibling.attempts[0].status is RolloutAttemptStatus.ABANDONED
+            assert sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            assert group.gate_rollout_id(index) == resent[index]
+        # Rows 1 and 2 never came back, so Gym may still be running them.
+        assert self._queued(ledger) == {episodes[1], episodes[2]}
+
+    @pytest.mark.parametrize(
+        "granularity", [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP]
+    )
+    def test_a_short_clean_end_on_the_last_attempt_is_missing_rows_not_a_reused_id(
+        self, granularity: RecoveryGranularity, monkeypatch
+    ):
+        """The refused row's re-send must not take the lost row along under the
+        rollout ID Gym may still be running."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        gym = _ShortCleanEndGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, granularity, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="missing rows"):
+            asyncio.run(run())
+
+        first, refused_resend = gym.events
+        assert refused_resend == {1: first[1]}
+        asyncio.run(abandon())
+        assert episodes[2] in self._queued(ledger)
+
+    def test_a_short_clean_end_with_attempts_left_resends_the_lost_row_under_a_new_id(
+        self, monkeypatch
+    ):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        gym = _ShortCleanEndGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, refused_resend, replaced = gym.events
+        # The refused row never ran, so it keeps its ID; the lost row gets a new one.
+        assert refused_resend == {1: first[1]}
+        assert set(replaced) == {2}
+        assert replaced[2] != first[2]
+        assert ledger.get_group("g7").gate_rollout_id(2) == replaced[2]
+        assert self._queued(ledger) == {episodes[2]}
+
+    def test_a_prompt_group_leaves_its_running_siblings_for_the_group_abandon(self):
+        gym = _EarlyEndingGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        asyncio.run(abandon())
+        # The prompt retry dispatches fresh attempts next; none may overlap these.
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
+    def test_a_failed_row_is_resent_alone_while_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        # Rows 0 and 2 streamed back on the first dispatch; only row 1 goes again.
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_on_the_last_attempt_raises_once_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=1)
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert gym.streamed_past_the_failure
+
+    def test_a_failed_row_stops_counting_as_gym_owned_before_its_siblings_return(
+        self,
+    ):
+        """A checkpoint drain waits on every dispatched attempt Gym did not
+        export, and the siblings that would end the stream stay parked until
+        the checkpoint resumes, so a failed row must not wait for the stream."""
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failed(rowidx):
+            return GymRowFailure(
+                rowidx, GymTransportError("gym /run failed with broken pipe")
+            )
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                parked.set()
+                await resume.wait()
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts._stream = stream
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        async def exercise():
+            task = asyncio.create_task(run())
+            await asyncio.wait_for(parked.wait(), timeout=2)
+            held = ledger.gym_episodes_still_held(
+                {"tools/replica-0": list(episodes.values())}
+            )["tools/replica-0"]
+            resume.set()
+            completions, _, _ = await asyncio.wait_for(task, timeout=2)
+            return held, completions
+
+        held, completions = asyncio.run(exercise())
+
+        assert episodes[1] not in held
+        assert episodes[2] in held
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        # Replaced once on arrival; the cleanup after the stream reuses it.
+        assert len(ledger.get_group("g7").siblings[1].attempts) == 2
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_ends_a_prompt_group_stream_at_once(self):
+        """The whole cohort is replaced, so its other rows cannot save it."""
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert not gym.streamed_past_the_failure
+        asyncio.run(abandon())
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
+    def test_a_data_failure_ends_the_group_at_once(self):
+        gym = _RowFailingGym(RolloutDataFailure("prompt exceeds max_model_len"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=3)
+
+        with pytest.raises(RolloutDataFailure, match="max_model_len"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert not gym.streamed_past_the_failure
