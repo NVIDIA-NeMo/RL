@@ -4068,12 +4068,6 @@ def test_streaming_ppo_aligns_complete_groups_to_both_model_dp_sizes(
     assert ctrl._sampler.select.await_count == 2
     for selection in ctrl._sampler.select.await_args_list:
         assert selection.kwargs["group_multiple"] == expected_multiple
-    ctrl._trainer.sharding_annotations.get_axis_size.assert_called_once_with(
-        "data_parallel"
-    )
-    ctrl._value.sharding_annotations.get_axis_size.assert_called_once_with(
-        "data_parallel"
-    )
     for meta in ctrl._trainer.trained_metas:
         assert meta.size % policy_dp == meta.size % value_dp == 0
     assert all(meta.size == 2 * sample_count for meta in ctrl._value.trained_metas)

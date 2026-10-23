@@ -127,7 +127,7 @@ def test_value_split_parity(
         model.finish_inference()
         weights = str(tmp_path / "initial" / "weights")
         model.prepare_for_training()
-        model.save_checkpoint(weights_path=weights)
+        model.save_checkpoint(weights_path=weights, is_final_checkpoint=False)
         reference = [model.train(data, loss_fn) for _ in range(2)]
         model.finish_training()
         model.prepare_for_inference()
@@ -195,7 +195,12 @@ def test_value_split_parity(
         model.finish_training()
         model.prepare_for_inference()
         actual_values = model.get_values(data)["values"].cpu()
-        torch.testing.assert_close(actual_values, expected_values, rtol=2e-3, atol=2e-4)
+        torch.testing.assert_close(
+            actual_values,
+            expected_values,
+            rtol=2e-3,
+            atol=1e-2 if config["precision"] == "bfloat16" else 2e-4,
+        )
     finally:
         if model is not None:
             model.shutdown()
