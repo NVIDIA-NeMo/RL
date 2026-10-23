@@ -810,7 +810,11 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
 
         assert actor.operations() == ["prepare", "renew", "commit", "tq-cut", "resume"]
         (commit_call,) = [call for call in actor.calls if call[0] == "commit"]
-        assert commit_call[1] == ("save-1", str(tmp_path), (group.gym_episode(0),))
+        assert commit_call[1] == (
+            "save-1",
+            str(tmp_path),
+            (group.environment_episode(0),),
+        )
 
     asyncio.run(exercise())
 
@@ -1002,7 +1006,7 @@ def test_turn_checkpoint_fails_fast_on_parked_session_without_an_owner(
         async with DataPlaneCheckpointBarrier().mutation() as cut:
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
-        (stranded,) = ledger.gym_checkpoint_inventory(frozenset({"tools/replica-0"}))[
+        (stranded,) = ledger.environment_inventory(frozenset({"tools/replica-0"}))[
             "tools/replica-0"
         ]
         actor = FakeGymActor(exported_episodes=(), unowned_live_episodes=(stranded,))
@@ -1045,12 +1049,17 @@ def _dispatched_turn_group(
         restore_level=RecoveryTargetLevel.TURN,
         admitted=True,
     )
-    ledger.mark_group_dispatched(cut, group.group_id, gym_instance_id="tools/replica-0")
+    ledger.mark_group_dispatched(
+        cut, group.group_id, environment_instance_id="tools/replica-0"
+    )
     return ledger.get_group(group.group_id)
 
 
 def _gym_episodes(group: PromptGroupRecoveryRecord) -> set[GymCheckpointEpisode]:
-    return {group.gym_episode(sibling.generation_index) for sibling in group.siblings}
+    return {
+        group.environment_episode(sibling.generation_index)
+        for sibling in group.siblings
+    }
 
 
 def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
@@ -1098,7 +1107,7 @@ def test_turn_checkpoint_retires_abandoned_attempts_gym_is_still_running(
             sorted(episode.rollout_id for episode in abandoned)
         )
         assert actor.live == set()
-        assert ledger.gym_checkpoint_forgets({"tools/replica-0"}) == {
+        assert ledger.environment_forgets({"tools/replica-0"}) == {
             "tools/replica-0": ()
         }
 
@@ -1129,7 +1138,7 @@ def test_turn_checkpoint_retires_each_dropped_attempt_only_once(
             ):
                 pass
 
-        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        assert ledger.environment_retirements({"tools/replica-0"}) == {
             "tools/replica-0": ()
         }
         retires = [call for call in actor.calls if call[0] == "retire"]
@@ -1174,7 +1183,7 @@ def test_turn_checkpoint_retires_again_and_forgets_a_rollout_gym_refused_to_forg
         assert operations[:4] == ["retire", "forget", "retire", "forget"]
         assert operations[4] == "prepare"
         assert frozenset(actor.calls[2][1][1]) == frozenset(abandoned)
-        pending = ledger.gym_checkpoint_forgets({"tools/replica-0"})
+        pending = ledger.environment_forgets({"tools/replica-0"})
         forgot_warnings = [w for w in caught if "could not forget" in str(w.message)]
         if forget_failures == 1:
             assert pending == {"tools/replica-0": ()}
@@ -1201,7 +1210,7 @@ def test_turn_checkpoint_retires_only_the_abandoned_attempts_of_a_retried_group(
             ledger.abandon_unsealed(cut, group.group_id)
             ledger.prepare_incomplete_retry(cut, group.group_id)
             ledger.mark_group_dispatched(
-                cut, group.group_id, gym_instance_id="tools/replica-0"
+                cut, group.group_id, environment_instance_id="tools/replica-0"
             )
         replacements = _gym_episodes(ledger.get_group(group.group_id))
         assert replacements.isdisjoint(abandoned)
@@ -1272,7 +1281,7 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         async with barrier.mutation() as cut:
             group = _dispatched_turn_group(ledger, cut, generations=1)
 
-        episode = group.gym_episode(0)
+        episode = group.environment_episode(0)
         actor = FakeGymActor(staging_keys_by_episode={episode: ("missing-call-row",)})
         # TQ holds no staging rows, so the one Gym references is missing.
         controller = _controller_for(gym_coordinator(actor), ledger)
@@ -1706,7 +1715,7 @@ async def _turn_recovery_restart(
         saved_ledger.mark_group_dispatched(
             cut,
             saved_group.group_id,
-            gym_instance_id="tools/replica-0",
+            environment_instance_id="tools/replica-0",
         )
     saved_state = build_rollout_recovery_state(
         saved_ledger,
@@ -1759,7 +1768,7 @@ async def _turn_recovery_restart(
             "saved_capacity": saved_capacity,
         },
     )
-    return controller, rollout_manager, gym_actor, saved_group.gym_episode(0)
+    return controller, rollout_manager, gym_actor, saved_group.environment_episode(0)
 
 
 def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
@@ -1776,8 +1785,8 @@ def test_turn_recovery_restores_gym_before_redispatch(tmp_path: Path) -> None:
     restored_group = rollout_manager.recovery_ledger.get_group("batch-7-prompt-0")
     restored_attempt = restored_group.siblings[0].current_attempt
     assert restored_attempt.status is RolloutAttemptStatus.RESERVED
-    assert restored_attempt.gym_instance_id == "tools/replica-0"
-    assert restored_attempt.gym_attempt == 1
+    assert restored_attempt.environment_instance_id == "tools/replica-0"
+    assert restored_attempt.environment_attempt == 1
     assert gym_actor.operations() == ["restore", "resume"]
     (restore_id, checkpoint_root, episodes), restore_kwargs = gym_actor.calls[0][1:]
     assert restore_id.startswith("restore-")
@@ -1989,7 +1998,11 @@ def test_turn_checkpoint_commits_owned_gym_episode_before_tq_cut(
 
         assert actor.operations() == ["prepare", "renew", "commit", "tq-cut", "resume"]
         (commit_call,) = [call for call in actor.calls if call[0] == "commit"]
-        assert commit_call[1] == ("save-1", str(tmp_path), (group.gym_episode(0),))
+        assert commit_call[1] == (
+            "save-1",
+            str(tmp_path),
+            (group.environment_episode(0),),
+        )
 
     asyncio.run(exercise())
 
@@ -2563,7 +2576,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
 
             coordinator = gym_coordinator(
                 FakeGymActor(
@@ -2579,7 +2592,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             )
 
             self._assert_restorable(controller, coordinator, tmp_path, kept=set())
-            assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            assert ledger.environment_retirements({"tools/replica-0"}) == {
                 "tools/replica-0": tuple(sorted((row_0, row_1)))
             }
 
@@ -2593,7 +2606,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             # Row 0 is parked in Gym and exported; row 1's reply is on the wire.
             actor = FakeGymActor(live={row_0})
             coordinator = gym_coordinator(actor)
@@ -2612,7 +2625,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             await asyncio.wait_for(failing, _ASYNC_TEST_TIMEOUT_S)
 
             self._assert_restorable(controller, coordinator, tmp_path, kept=set())
-            assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+            assert ledger.environment_retirements({"tools/replica-0"}) == {
                 "tools/replica-0": tuple(sorted((row_0, row_1)))
             }
 
@@ -2628,7 +2641,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(
                 FakeGymActor(
                     live={row_0, row_1},
@@ -2669,7 +2682,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             ledger = RolloutRecoveryLedger()
             async with barrier.mutation() as cut:
                 group = _dispatched_turn_group(ledger, cut)
-            row_0, row_1 = (group.gym_episode(index) for index in (0, 1))
+            row_0, row_1 = (group.environment_episode(index) for index in (0, 1))
             coordinator = gym_coordinator(FakeGymActor(live={row_0, row_1}))
             controller = _controller_for(coordinator, ledger)
             controller._data_plane_checkpoint_barrier = barrier
@@ -2680,7 +2693,7 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                 assert gym_commit is not None
                 await self._drop(ledger, barrier, group.group_id)
                 # As if the drop's retire had already been acknowledged.
-                ledger.mark_gym_retired({"tools/replica-0": [row_0]})
+                ledger.mark_environment_retired({"tools/replica-0": [row_0]})
                 async with barrier.checkpoint() as cut:
                     with pytest.raises(RuntimeError, match="ownership changed"):
                         await controller._environment_checkpoint.validate_cut(

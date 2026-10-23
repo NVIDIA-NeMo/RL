@@ -4,7 +4,7 @@
 [Migration Plan](#migration-plan):
 
 1. Move the Gym checkpoint code behind an `EnvironmentCheckpoint` interface. **Done in this PR.**
-2. Give the ledger and rollout manager backend-neutral names. *Proposed.*
+2. Give the ledger and rollout manager backend-neutral names, and make the interfaces ABCs. **Done in this PR.**
 3. Move the snapshot writer into one `RolloutCheckpointing` component. *Proposed.*
 4. Move the restore chain into that component. *Proposed.*
 5. Collapse the rollout pump's two dispatch loops into one. *Proposed.*
@@ -64,7 +64,9 @@ SingleControllerActor            train pump + rollout pump
 ### The Controller-Facing API (Target)
 
 ```python
-class RolloutCheckpointing(Protocol):
+class RolloutCheckpointing(abc.ABC):
+    # Every member is an @abc.abstractmethod; an implementation subclasses this.
+
     # Startup.
     async def check_startup(self) -> None: ...
     async def restore(self, state: ControllerRolloutState) -> RestoreReport: ...
@@ -98,9 +100,11 @@ private controller fields by hand.
 tasks. With it, the rollout pump runs a single dispatch loop, and the plain path is the
 same code with nothing recorded.
 
-### The Environment API (Implemented in Step 1)
+### The Environment API (Implemented in Steps 1 and 2)
 
-`nemo_rl/experience/environment_checkpoint.py`:
+`nemo_rl/experience/environment_checkpoint.py` defines `EnvironmentCheckpoint` and
+`EnvironmentSnapshot` as `abc.ABC` classes. A backend subclasses them, and every member is an
+`@abc.abstractmethod`, so a backend that misses one fails when it is built, not mid-run.
 
 | Member | Purpose |
 |---|---|
@@ -123,10 +127,13 @@ Each step is one PR that keeps behavior the same. Each one moves code and the te
 1. **Environment seam (done).**
    - All Gym-specific checkpoint code leaves the controller for `GymEnvironmentCheckpoint`: eight methods (inventory, queued retirements, retire, forget, restart-only check, drain, cut validation, prepared commit), plus the inline Gym restore block and the Gym metrics.
    - The controller goes from 6,446 to 6,032 lines. Its only remaining checkpoint-related Gym name is the ledger argument `restored_gym_episodes`.
-2. **Neutral names below the controller.**
-   - The ledger's Gym API gets backend-neutral names: `gym_checkpoint_inventory` and the retire/forget queues become `environment_*`; `restored_gym_episodes` becomes `continued_attempts`; the record fields `gym_instance_id` and `gym_attempt` become `environment_*` (needs a schema bump or a read alias).
-   - Rollout-ID formats tied to Gym's `EpisodeId` move behind the backend.
-   - `_summarize_gym_episodes`, which #4501 adds to the controller, moves to the Gym module.
+2. **Neutral names below the controller (done).**
+   - The ledger's Gym API has backend-neutral names: `environment_inventory`, `environment_retirements` / `mark_environment_retired`, `environment_forgets` / `mark_environment_forgotten`; `prepare_for_restart` takes `continued_attempts`; the record fields are `environment_instance_id`, `environment_attempt` and `holds_environment_state`; `environment_episode()` returns an `EnvironmentEpisode`, which Gym's `GymCheckpointEpisode` now aliases.
+   - The on-disk ledger keys keep their old names (`gym_instance_id`, `gym_attempt`) and the schema version is unchanged, so older checkpoints still restore.
+   - The rollout manager's checkpoint-owner argument is `environment_instance_id`.
+   - `EnvironmentCheckpoint` and `EnvironmentSnapshot` are `abc.ABC` classes instead of `Protocol`s.
+   - The controller has no Gym checkpoint names left.
+   - Still open: the attempt-qualified key format (`<rollout_id>-a<attempt>`) lives in `EnvironmentEpisode`, not behind the backend. `_summarize_gym_episodes`, which #4501 adds to the controller, moves to the Gym module once #4501 lands.
 3. **Snapshot writer out.** These move into `RolloutCheckpointing`, about 800 lines:
    - `_save_rollout_checkpoint`, `_capture_rollout_checkpoint_cut`, `_write_rollout_checkpoint_sidecars`
    - `_save_data_plane_checkpoint`, `_validate_replay_inventory`, `_validate_rollout_recovery_inventory`
