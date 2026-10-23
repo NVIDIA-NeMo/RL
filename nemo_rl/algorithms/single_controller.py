@@ -4930,8 +4930,8 @@ class SingleControllerActor:
         }
         if any(stranded.values()):
             raise RuntimeError(
-                "Gym checkpoint holds parked agent sessions that are neither an "
-                "agent's own /run episode nor exported by their environment server, "
+                "Gym checkpoint holds parked agent sessions that are not an "
+                "agent's own /run episode, "
                 "so they can neither be restored nor finish while the deployment is "
                 f"prepared: stranded={stranded!r}"
             )
