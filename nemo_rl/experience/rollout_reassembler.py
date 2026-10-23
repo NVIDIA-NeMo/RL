@@ -186,15 +186,15 @@ class FinalizedGroup:
     reward_observations: list[FinalizedReward] = field(default_factory=list)
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
-    # Policy decisions like a low valid-row fraction are no longer made here --
-    # the caller reads valid_row_count/total_row_count and decides whether to
-    # replace the group, since only the caller can source a replacement.
+    # Policy decisions like a low valid-rollout fraction are made by the caller,
+    # using logical-owner metrics for forests or row counts for ordinary capture.
+    # Only the caller can source a replacement.
     dropped: bool = False
     # Which policy dropped the group, for the caller's log line.
     drop_reason: Optional[str] = None
-    # Real rows that verified vs. real rows in the group; execution padding
-    # does not enter failure-rate decisions. 0/0 on a dropped group
-    # (the caller does not read these when dropped is True).
+    # Real rows that verified vs. real rows in the group; padding is excluded.
+    # Forest admission uses logical-owner metrics instead. 0/0 on a dropped
+    # group (the caller does not read these when dropped is True).
     valid_row_count: int = 0
     total_row_count: int = 0
 
@@ -929,6 +929,15 @@ class RolloutReassembler:
                 1
                 for receipt in receipts
                 if isinstance(receipt, dict) and receipt.get("capture_poisoned")
+            )
+        )
+        # Logical placeholders share a rejection bucket; retain the ingestion cause.
+        metrics["finalize/selection_not_closed_rollouts"] = float(
+            sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("failure_reason") == "selection_not_closed"
             )
         )
         # Per-method terminal-selection breakdown. Witness methods

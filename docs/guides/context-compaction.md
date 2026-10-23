@@ -105,8 +105,13 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   to capture records. It preserves the existing evidence requirements and excludes
   calls absent from that history.
 - `all_captured` includes recorded calls across abandoned retries and independent
-  branches, excluding failed unscored leaves that no later call uses. It does not
-  require the full execution history, but still requires an attributable scored
+  branches. Unscored leaves with `failed` or `unknown` status, or an `incomplete`
+  status with a non-length finish reason such as `content_filter`, are excluded.
+  These calls remain selected if they have children or are the scored call, so
+  completion checks can mask the rollout. Missing required completion metadata
+  remains an error. Length-limited calls remain eligible, subject to the existing
+  logical-rollout `overlong_filtering` policy. This policy does not require the
+  full execution history, but still requires an attributable scored
   terminal through `terminal_response_id` or the
   returned response's identity/content. Capture order is not a terminal witness.
   For `A → B` and `A → C`, both branches train; it does not choose the latest
@@ -120,6 +125,12 @@ record does not acknowledge a pending worker's writes or transfer them to cleanu
 Failed parents and failed scored calls remain invalid. Neither policy infers
 agent roles. `all_captured` requires `forest_training: true`; it does not enable
 per-agent rewards or remove the execution restrictions below.
+
+A cancellation recorded as `request_finished_without_staged_coordinates` does
+not mask the rollout when the call already has a committed capture, no calls
+remain pending, and the failed call is outside the selected calls. A failure on
+a selected call, a missing capture, or any other capture-failure reason still
+masks the rollout. This exception does not add calls to training.
 
 Custom policies use the same setting, for example
 `selection_policy: my_harness.training:select_calls`. The module must be importable
@@ -138,6 +149,12 @@ the adapter rejects a missing terminal rather than guessing one. Custom selector
 own membership and reward attribution, not segment definitions. They use the same
 completion checks, failure masking, and reconstruction as built-ins. Non-default
 policies require `forest_training: true`.
+
+Every selected continuation must also have its captured parent selected. If
+returned history or a custom policy omits a required parent, only that logical
+rollout is masked with `selection_not_closed`; omitted calls are not added to
+training. `finalize/selection_not_closed_rollouts` counts these outcomes. Capture
+records remain available for cleanup, and healthy siblings can still train.
 
 For a SingleController configuration that otherwise supports Gym token capture, set these overrides together:
 
@@ -183,14 +200,23 @@ logical rollout's advantage before it is broadcast to its rows. Filtered owners
 and execution padding retain zero advantages, even when zero lies outside the
 configured clipping interval.
 
-Optional `grpo.seq_logprob_error_threshold` evaluates logprob error separately
-on each segment's owned generated tokens. If any segment exceeds the threshold,
-all rows of that logical rollout are excluded from loss and its reward is excluded
-from the GRPO baseline. This is an any-segment rule, not a rollout-wide average.
-Replayed prefix tokens and execution padding do not participate. With the threshold
-unset, errors are diagnostic only. Sequence-error metrics describe the per-row
-check before whole-rollout mask propagation; they do not count all rows excluded
-by that propagation.
+Optional `grpo.seq_logprob_error_threshold` thresholds the mean multiplicative
+absolute probability error across all uniquely owned generated tokens in a logical
+rollout. Each token has equal weight, so splitting the same generations into more
+segments does not change the decision. If the pooled error exceeds the threshold,
+all rows of that rollout are excluded from loss and its reward is excluded from
+the GRPO baseline. Replayed prefix tokens and execution padding do not participate;
+with top-k/top-p filtering enabled, unsupported negative-infinity tokens are also
+excluded from this diagnostic. With the threshold unset, errors are diagnostic
+only. Sequence-error metrics remain per physical row, so a retained segment can
+have error above the threshold when its rollout's pooled error is below it.
+The masked-sequence count includes every row excluded by the rollout decision.
+
+Optional `token_capture.min_valid_fraction_per_group` compares the fraction of
+verified logical rollouts with the configured minimum. Each rollout counts once,
+regardless of segment count, and execution padding is excluded. A group below the
+minimum is discarded and the controller seeks a replacement within its existing
+replacement budget. The default, `None`, disables this group-level filter.
 
 Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 

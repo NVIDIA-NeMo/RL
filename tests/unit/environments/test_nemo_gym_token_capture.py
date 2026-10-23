@@ -17,11 +17,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-from unittest.mock import AsyncMock
+from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from nemo_rl.environments.nemo_gym import NemoGym, _external_staging_backend
+from nemo_rl.experience.failures import GymTransportError
 
 # Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
 # these tests must run in the Nemo_Gym shard, not the base-env Environments one.
@@ -37,6 +40,147 @@ def _capture_env() -> NemoGym:
 
 def _digest(label: str) -> str:
     return hashlib.sha256(label.encode()).hexdigest()
+
+
+def _capture_stream_env(
+    forest_training: bool,
+    completed: Callable[[dict], Awaitable[tuple[dict, dict]]],
+) -> tuple[NemoGym, list[dict]]:
+    env = _capture_env()
+    env._forest_training = forest_training
+    env._token_capture_enabled = True
+    env._tokenizer = object()
+    env.cfg = {}
+    env.head_server_config = object()
+    env._require_spinup = lambda: None
+    rows = [
+        {
+            "_rowidx": index,
+            "agent_ref": {"name": "agent"},
+            "responses_create_params": {"input": []},
+        }
+        for index in range(2)
+    ]
+    env.rch = SimpleNamespace(
+        run_examples=lambda **kwargs: [completed(row) for row in kwargs["examples"]]
+    )
+    return env, rows
+
+
+@pytest.mark.parametrize("forest_training", [False, True])
+def test_capture_stream_yields_ready_sibling_before_slow_drain(
+    forest_training: bool,
+) -> None:
+    async def run() -> None:
+        drain_started = asyncio.Event()
+        release_drain = asyncio.Event()
+
+        async def completed(row: dict) -> tuple[dict, dict]:
+            # The second Gym result arrives after the first starts draining.
+            if row["_rowidx"] == 1:
+                await drain_started.wait()
+            return row, {"reward": 1.0}
+
+        env, rows = _capture_stream_env(forest_training, completed)
+
+        async def postprocess(row: dict, result: dict) -> dict:
+            if row["_rowidx"] == 0:
+                drain_started.set()
+                await release_drain.wait()
+            return {"owner": row["_rowidx"], **result}
+
+        env._postprocess_receipt_mode = postprocess
+        stream = env.run_rollouts(rows, "test")
+        first = asyncio.create_task(anext(stream))
+        try:
+            await asyncio.wait_for(drain_started.wait(), timeout=1)
+            ready = await asyncio.wait_for(first, timeout=1)
+            assert ready[:3] == (1, {"name": "agent"}, {"owner": 1, "reward": 1.0})
+            assert ready[3] is None
+            assert not release_drain.is_set()
+            release_drain.set()
+            last = await asyncio.wait_for(anext(stream), timeout=1)
+            assert last[:3] == (0, {"name": "agent"}, {"owner": 0, "reward": 1.0})
+            assert 0 <= last[3]["test/postprocess_results_pct"] <= 100
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+        finally:
+            release_drain.set()
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            await stream.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("forest_training", [False, True])
+@pytest.mark.parametrize("stop", ["close", "cancel", "gym_error", "receipt_error"])
+def test_capture_stream_stops_receipt_waits_and_closes_collection(
+    forest_training: bool, stop: str
+) -> None:
+    async def run() -> None:
+        drain_started = asyncio.Event()
+        drain_cancelled = asyncio.Event()
+        client_started = asyncio.Event()
+        client_cancelled = asyncio.Event()
+
+        async def completed(row: dict) -> tuple[dict, dict]:
+            if row["_rowidx"] == 1:
+                await drain_started.wait()
+                client_started.set()
+                if stop == "cancel":
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        client_cancelled.set()
+                if stop == "gym_error":
+                    error = RuntimeError("injected HTTP failure")
+                    error.status = 503
+                    raise error
+            return row, {"reward": 1.0}
+
+        env, rows = _capture_stream_env(forest_training, completed)
+        collection = MagicMock()
+        collection.__iter__.return_value = iter(completed(row) for row in rows)
+        collection.aclose = AsyncMock()
+        env.rch.run_examples = lambda **kwargs: collection
+
+        async def postprocess(row: dict, result: dict) -> dict:
+            if row["_rowidx"] == 0:
+                drain_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    drain_cancelled.set()
+            if stop == "receipt_error":
+                raise ValueError("injected receipt failure")
+            return result
+
+        env._postprocess_receipt_mode = postprocess
+        stream = env.run_rollouts(rows, "test")
+        first = asyncio.create_task(anext(stream))
+        try:
+            await asyncio.wait_for(client_started.wait(), timeout=1)
+            if stop == "close":
+                assert (await asyncio.wait_for(first, timeout=1))[0] == 1
+                await stream.aclose()
+            elif stop == "cancel":
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+                assert client_cancelled.is_set()
+            else:
+                expected = GymTransportError if stop == "gym_error" else ValueError
+                with pytest.raises(expected, match="HTTP 503|receipt failure"):
+                    await asyncio.wait_for(first, timeout=1)
+            assert drain_cancelled.is_set()
+            collection.aclose.assert_awaited_once()
+        finally:
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            await stream.aclose()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(

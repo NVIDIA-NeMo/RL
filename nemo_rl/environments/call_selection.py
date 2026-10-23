@@ -284,7 +284,7 @@ def select_captured_calls(
 def select_all_captured(
     records: list[CallRecord], result: dict[str, Any]
 ) -> tuple[list[CallRecord], str | None]:
-    """Include all calls except failed, unscored leaves, retaining attribution."""
+    """Include all calls except unusable, unscored leaves, retaining attribution."""
     # Defer the optional Gym dependency until the policy is executed.
     from nemo_gym.token_id_capture.staging import resolve_terminal
 
@@ -303,15 +303,22 @@ def select_all_captured(
         for record in records
         if record.model_call_id == attribution.model_call_id
     )
-    # Failed parents or the scored call still invalidate the owner downstream.
+    # Unusable parents or the scored call still invalidate the owner downstream.
     parents = {record.parent_call_id for record in records}
-    selected = [
-        record
-        for record in records
-        if record.response_status != "failed"
-        or record.model_call_id == attribution.model_call_id
-        or record.model_call_id in parents
-    ]
+    selected = []
+    for record in records:
+        unusable = record.response_status in ("failed", "unknown") or (
+            record.response_status == "incomplete"
+            and bool(record.finish_reason)
+            and record.finish_reason
+            not in ("length", "max_tokens", "max_output_tokens")
+        )
+        if (
+            not unusable
+            or record.model_call_id == attribution.model_call_id
+            or record.model_call_id in parents
+        ):
+            selected.append(record)
     return selected, terminal_response_id
 
 

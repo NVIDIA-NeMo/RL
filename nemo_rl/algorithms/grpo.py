@@ -3001,6 +3001,7 @@ def compute_and_apply_seq_logprob_error_masking(
     seq_logprob_error_threshold: Optional[float],
     *,
     filtering_on: bool = False,
+    row_owner: Optional[torch.Tensor] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -3016,6 +3017,9 @@ def compute_and_apply_seq_logprob_error_masking(
         seq_logprob_error_threshold: If set, mask sequences with mult_prob_error
                                     exceeding this threshold. If None, only compute metrics.
         filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
+        row_owner: Optional logical owner index per row (-1 for padding). When
+            supplied, threshold the token-weighted error across each owner's
+            rows and mask them together. Diagnostics remain per physical row.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -3065,9 +3069,29 @@ def compute_and_apply_seq_logprob_error_masking(
 
         original_sample_mask = sample_mask.clone()
 
-        # Create mask for sequences below threshold
+        threshold_errors = seq_mult_prob_error
+        if row_owner is not None:
+            if row_owner.shape != sample_mask.shape or row_owner.dtype != torch.long:
+                raise ValueError("row_owner must be an int64 index per sample")
+            # Only generated tokens owned by this rollout contribute. Use the
+            # narrowed diagnostic mask above so unsupported tokens cannot dilute
+            # the pooled error when top-k/top-p filtering is enabled.
+            counts = (token_mask * sample_mask.unsqueeze(-1)).sum(dim=-1)
+            counts = torch.where(row_owner >= 0, counts, 0.0)
+            owners, inverse = torch.unique(row_owner, return_inverse=True)
+            error_sums = counts.new_zeros(owners.numel()).scatter_add_(
+                0,
+                inverse,
+                torch.where(counts > 0, seq_mult_prob_error * counts, 0.0),
+            )
+            token_counts = counts.new_zeros(owners.numel()).scatter_add_(
+                0, inverse, counts
+            )
+            threshold_errors = (error_sums / token_counts.clamp_min(1))[inverse]
+
+        # Create mask for sequences whose owner (or row) passes the threshold.
         seq_error_mask = (
-            seq_mult_prob_error <= seq_logprob_error_threshold
+            threshold_errors <= seq_logprob_error_threshold
         ).float() * original_sample_mask
 
         diff_mask = original_sample_mask - seq_error_mask
@@ -3097,7 +3121,7 @@ def compute_and_apply_seq_logprob_error_masking(
         train_data["sample_mask"] = seq_error_mask
 
         print(
-            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+            f"  Masked {num_masked_seqs} sequences by logprob error (threshold={seq_logprob_error_threshold})",
             flush=True,
         )
         if num_masked_seqs > 0:

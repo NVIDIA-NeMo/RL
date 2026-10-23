@@ -8,6 +8,7 @@ import pytest
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
+from nemo_gym.token_id_capture.completion import output_validation_item
 from responses_api_models.vllm_model.tests import test_framework_context as gym_harness
 from tensordict import TensorDict
 
@@ -503,6 +504,8 @@ def test_twenty_calls_have_one_trace_per_context(monkeypatch, tmp_path, compact_
         )
         assert result.valid_row_count == expected_segments
         assert result.total_row_count == expected_segments
+        assert result.metrics["finalize/logical_owner_count"] == 1
+        assert result.metrics["finalize/valid_logical_owner_count"] == 1
         assert tuple(result.meta.sample_ids) == request.cleanup_sample_ids
         assert result.meta.sequence_lengths == (
             [60] if compact_after is None else [30, 30]
@@ -583,7 +586,9 @@ def test_existing_detectors_mask_only_selected_generation_spans(monkeypatch, tmp
                 manifest["records"], actions, strict=True
             ):
                 if action["last_output_item"] is not None:
-                    captured_record["last_output_item"] = action["last_output_item"]
+                    captured_record["last_output_item"] = output_validation_item(
+                        action["last_output_item"]
+                    )
             return manifest
 
         env._control.side_effect = captured_metadata

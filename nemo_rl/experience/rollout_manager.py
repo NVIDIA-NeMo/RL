@@ -932,6 +932,8 @@ class AsyncNemoGymRolloutImpl:
     batched through a single NeMo-Gym run_rollouts call.
     """
 
+    _forest_training: bool = False
+
     def __init__(
         self,
         tokenizer: TokenizerType,

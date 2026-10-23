@@ -28,6 +28,10 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutSelection,
     SegmentReceipt,
 )
+from nemo_rl.experience.rollout_reassembler_actor import (
+    ReassemblyRequest,
+    RolloutReassemblerActor,
+)
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.capture_context import decide_capture_input
 from tests.unit.experience.test_forest_dispatch import _env
@@ -188,11 +192,22 @@ def test_selection_policy_reuses_forest_publication(forest, policy, reverse_mani
     [
         "none",
         "failed_leaf",
+        "unknown_leaf",
+        "filtered_leaf",
+        "length_leaf",
+        "max_tokens_leaf",
+        "max_output_tokens_leaf",
         "failed_parent",
         "failed_terminal",
         "uncommitted",
         "capture_lost",
         "pending",
+        "cancel_after_commit",
+        "selected_parent_capture_failure",
+        "selected_terminal_capture_failure",
+        "uncommitted_without_record",
+        "settled_capture_lost",
+        "refused",
     ],
 )
 def test_subagent_failures_reach_final_training_rows(
@@ -207,9 +222,16 @@ def test_subagent_failures_reach_final_training_rows(
     # Main A -> B / retry C; worker D -> E / H;
     # main compacts into F -> scored G. H completes after G.
     records, replies = forest.capture([None, 0, 0, None, 3, None, 5, 3])
-    failed_index = {"failed_leaf": 2, "failed_parent": 3, "failed_terminal": 6}.get(
-        failure
-    )
+    completion_failure = {
+        "failed_leaf": (2, "failed", "stop"),
+        "unknown_leaf": (2, "unknown", None),
+        "filtered_leaf": (2, "incomplete", "content_filter"),
+        "length_leaf": (2, "incomplete", "length"),
+        "max_tokens_leaf": (2, "incomplete", "max_tokens"),
+        "max_output_tokens_leaf": (2, "incomplete", "max_output_tokens"),
+        "failed_parent": (3, "failed", "stop"),
+        "failed_terminal": (6, "failed", "stop"),
+    }.get(failure)
     pending = failure in ("uncommitted", "capture_lost", "pending")
     if pending:
         asyncio.run(forest.harness.ledger.begin_call("attempt", "lost"))
@@ -228,6 +250,55 @@ def test_subagent_failures_reach_final_training_rows(
         forest.plane.rows["staged", "attempt/lost"] = forest.plane.rows[
             "staged", records[0].staging_key
         ].clone()
+    if failure == "cancel_after_commit":
+        record_commit = forest.harness.ledger.record
+
+        async def commit_then_cancel(commit: Any) -> None:
+            # Cancel after the durable write, before the request observes success.
+            await record_commit(commit)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(forest.harness.ledger, "record", commit_then_cancel)
+        assert (
+            forest.harness.post(
+                "attempt", [{"role": "user", "content": "cancelled auxiliary task"}]
+            ).status_code
+            == 500
+        )
+        settled = forest.harness.manifest("attempt")
+        records = list(settled.records)
+        assert len(records) == 9 and not settled.pending_call_ids
+        assert settled.failures and all(
+            f.model_call_id == records[-1].model_call_id
+            and f.reason == UNCOMMITTED_CALL_REASON
+            for f in settled.failures
+        )
+    elif failure in (
+        "selected_parent_capture_failure",
+        "selected_terminal_capture_failure",
+        "uncommitted_without_record",
+        "settled_capture_lost",
+    ):
+        failed_call = {
+            "selected_parent_capture_failure": records[3].model_call_id,
+            "selected_terminal_capture_failure": records[6].model_call_id,
+            "uncommitted_without_record": "untracked",
+            "settled_capture_lost": records[2].model_call_id,
+        }[failure]
+        asyncio.run(
+            forest.harness.ledger.record_failure(
+                "attempt",
+                failed_call,
+                "capture_lost"
+                if failure == "settled_capture_lost"
+                else UNCOMMITTED_CALL_REASON,
+            )
+        )
+        assert not forest.harness.manifest("attempt").pending_call_ids
+    elif failure == "refused":
+        asyncio.run(forest.harness.ledger.begin_call("attempt", "refused"))
+        asyncio.run(forest.harness.ledger.refuse_call("attempt", "refused"))
+        assert not forest.harness.manifest("attempt").pending_call_ids
     if failure == "pending":
         monkeypatch.setattr("nemo_rl.environments.nemo_gym._CAPTURE_DRAIN_TIMEOUT_S", 0)
     env = _env(forest.harness)
@@ -236,10 +307,13 @@ def test_subagent_failures_reach_final_training_rows(
 
     async def capture_control(method: str, path: str) -> dict:
         manifest = await control(method, path)
-        if failed_index is not None:
+        if completion_failure is not None:
+            index, status, reason = completion_failure
             for record in manifest["records"]:
-                if record["model_call_id"] == records[failed_index].model_call_id:
-                    record["response_status"] = "failed"
+                if record["model_call_id"] == records[index].model_call_id:
+                    record.update(response_status=status, finish_reason=reason)
+                    if failure in ("unknown_leaf", "filtered_leaf"):
+                        record["last_output_item"] = None
         if reverse_manifest:
             manifest["records"].reverse()
         return manifest
@@ -251,8 +325,26 @@ def test_subagent_failures_reach_final_training_rows(
     processed = asyncio.run(
         env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
     )
-    masked = pending or failure in ("failed_parent", "failed_terminal")
+    masked = (
+        pending
+        or failure
+        in (
+            "failed_parent",
+            "failed_terminal",
+            "selected_parent_capture_failure",
+            "selected_terminal_capture_failure",
+            "uncommitted_without_record",
+            "settled_capture_lost",
+        )
+        or (failure == "cancel_after_commit" and policy == "all_captured")
+    )
     assert processed["receipt"]["capture_poisoned"] is masked
+    truncated = policy == "all_captured" and failure in (
+        "length_leaf",
+        "max_tokens_leaf",
+        "max_output_tokens_leaf",
+    )
+    assert processed["truncated"] is truncated
     result = forest.finalizer.finalize_group(
         "group",
         ["attempt"],
@@ -267,11 +359,18 @@ def test_subagent_failures_reach_final_training_rows(
     )
     selected = (
         records
-        if policy == "all_captured" and failure != "failed_leaf"
+        if policy == "all_captured"
+        and failure not in ("failed_leaf", "unknown_leaf", "filtered_leaf")
         else [records[i] for i in accepted_indices]
     )
     assert_loss_once(forest, [] if masked else selected, records)
     assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    if result.meta is not None:
+        for key, tag in zip(result.meta.sample_ids, result.meta.tags, strict=True):
+            row = forest.plane.rows["canonical", key]
+            assert row["truncated"].item() == (
+                truncated and not tag["is_execution_padding"]
+            )
     assert {key for partition, key in forest.plane.rows if partition == "staged"} == (
         {"attempt/lost"} if pending else set()
     )
@@ -293,17 +392,27 @@ def test_all_captured_does_not_require_returned_execution_history(forest):
 
 
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
-@pytest.mark.parametrize("status", ["failed", "unknown"])
-@pytest.mark.parametrize("empty_output", [False, True])
+@pytest.mark.parametrize(
+    "status,reason,empty_output",
+    [
+        ("failed", "stop", False),
+        ("failed", "stop", True),
+        ("unknown", None, False),
+        ("unknown", None, True),
+        ("incomplete", "content_filter", False),
+        ("incomplete", "content_filter", True),
+    ],
+)
 @pytest.mark.parametrize("failure_index", [0, -1])
 def test_unsuccessful_selected_completion_masks_the_owner(
-    forest, policy, status, empty_output, failure_index
+    forest, policy, status, reason, empty_output, failure_index
 ):
     records, replies = forest.capture([None, 0, None, 2])
     env = _env(forest.harness)
     env._selection_policy = policy
     manifest = forest.harness.manifest("attempt").model_dump(mode="json")
     manifest["records"][failure_index]["response_status"] = status
+    manifest["records"][failure_index]["finish_reason"] = reason
     if empty_output:
         manifest["records"][failure_index]["last_output_item"] = None
     env._control = AsyncMock(return_value=manifest)
@@ -328,6 +437,37 @@ def test_unsuccessful_selected_completion_masks_the_owner(
     )
     assert result.valid_row_count == 0
     assert_loss_once(forest, [], records)
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("response_status", None, "completion metadata"),
+        ("last_output_item", None, "output validation evidence"),
+        ("response_status", "incomplete", "finish reason"),
+        ("finish_reason", "", "finish reason"),
+    ],
+)
+def test_all_captured_does_not_hide_missing_leaf_completion_evidence(
+    forest: ForestCapture, field: str, value: Any, error: str
+) -> None:
+    _, replies = forest.capture([None, 0, None])
+    manifest = forest.harness.manifest("attempt").model_dump(mode="json")
+    leaf = manifest["records"][-1]
+    leaf[field] = value
+    if field == "finish_reason":
+        leaf["response_status"] = "incomplete"
+    if field == "response_status" and value == "incomplete":
+        leaf["finish_reason"] = None
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    env._control = AsyncMock(return_value=manifest)
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(
+            env._postprocess_receipt_mode(
+                {"_ng_rollout_id": "attempt"}, ordinary(replies[:2]) | {"reward": 1.0}
+            )
+        )
 
 
 def test_ordinary_capture_reconstructs_without_framework_output_metadata(
@@ -660,6 +800,107 @@ def test_omitted_ancestor_stays_rejected(forest: ForestCapture) -> None:
     with pytest.raises(ValueError, match="selected predecessor"):
         publish(forest, records, selected)
     assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
+
+
+@pytest.mark.parametrize("indices", [(2,), (0, 2), (0, 1, 2)])
+@pytest.mark.parametrize("custom_policy", [False, True])
+def test_incomplete_history_masks_only_its_owner(
+    forest: ForestCapture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    indices: tuple[int, ...],
+    custom_policy: bool,
+) -> None:
+    records, replies = forest.capture([None, 0, 1])
+    healthy = [gym.assert_clean(forest.harness.post("healthy", gym.HISTORY))]
+    healthy.append(
+        gym.assert_clean(
+            forest.harness.post(
+                "healthy",
+                gym.HISTORY
+                + healthy[0]["output"]
+                + [{"role": "user", "content": "next observation"}],
+            )
+        )
+    )
+    healthy_records = list(forest.harness.manifest("healthy").records)
+    env = _env(forest.harness)
+    if custom_policy:
+        (tmp_path / "closure_selection.py").write_text(
+            "def choose(records, result):\n"
+            "    ids = result['selected_response_ids']\n"
+            "    return [r for r in records if r.response_id in ids], result['response']['id']\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        env._selection_policy = "closure_selection:choose"
+    processed = []
+    for owner, history, expected, reward in (
+        ("attempt", [replies[i] for i in indices], [records[i] for i in indices], 1.0),
+        ("healthy", healthy, healthy_records, 0.75),
+    ):
+        output = ordinary(history) | {
+            "reward": reward,
+            "selected_response_ids": [r.response_id for r in expected],
+        }
+        item = asyncio.run(
+            env._postprocess_receipt_mode({"_ng_rollout_id": owner}, output)
+        )
+        assert item["logical_selection"].response_ids == tuple(
+            r.response_id for r in expected
+        )
+        processed.append(item)
+    incomplete = len(indices) < len(records)
+    assert processed[0]["receipt"]["capture_poisoned"] is incomplete
+    if incomplete:
+        assert processed[0]["receipt"]["failure_reason"] == "selection_not_closed"
+    assert not processed[1]["receipt"]["capture_poisoned"]
+    reference = forest.finalizer.finalize_rollout(
+        "healthy", processed[1]["receipt"], reward=0.75, forest_training=True
+    )
+    assert reference.valid
+    request = ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("attempt", "healthy"),
+        canonical_sample_ids=("group_g0", "group_g1"),
+        receipts=tuple(item["receipt"] for item in processed),
+        rewards=(1.0, 0.75),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False, False),
+        logical_selections=tuple(item["logical_selection"] for item in processed),
+        execution_row_multiple=4,
+    )
+    cleanup_ids = request.cleanup_sample_ids
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = forest.finalizer
+    result = actor.finalize(request)
+    assert result.meta is not None and not result.dropped
+    assert result.meta.size == 4
+    assert tuple(result.meta.sample_ids) == cleanup_ids
+    assert result.valid_row_count == (1 if incomplete else 2)
+    assert result.metrics["finalize/selection_not_closed_rollouts"] == int(incomplete)
+    assert result.metrics["finalize/logical_owner_count"] == 2
+    assert result.metrics["finalize/valid_logical_owner_count"] == (
+        1 if incomplete else 2
+    )
+    for key, tag in zip(result.meta.sample_ids, result.meta.tags, strict=True):
+        row = forest.plane.rows["canonical", key]
+        if tag["logical_slot"] == 1:
+            length = row["input_lengths"].item()
+            assert row["input_ids"][0, :length].tolist() == reference.token_ids
+            assert row["token_mask"][0, :length].tolist() == reference.token_mask
+            assert row["generation_logprobs"][0, :length].tolist() == reference.logprobs
+            assert row["total_reward"].item() == 0.75
+            assert row["sample_mask"].item() == 1
+        elif incomplete or tag["is_execution_padding"]:
+            assert row["sample_mask"].item() == 0
+            assert row["token_mask"].count_nonzero().item() == 0
+    assert_loss_once(
+        forest,
+        healthy_records if incomplete else records + healthy_records,
+        records + healthy_records,
+    )
+    assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
 
 def test_excluded_leaf_preserves_selected_ancestor(forest: ForestCapture) -> None:

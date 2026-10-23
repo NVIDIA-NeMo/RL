@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -385,6 +385,32 @@ class AdvantageComputer:
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        owner_batch = None
+        if logical:
+            original_prompts = tensor_field(data, adv_cfg.prompt_ids_field)
+            # Preserve equality when padding would alias [x] and [x, 0].
+            prompt_lengths = original_prompts.new_tensor(
+                [row.numel() for row in data[adv_cfg.prompt_ids_field].unbind()]
+            )
+            original_prompts = torch.cat(
+                (prompt_lengths.unsqueeze(-1), original_prompts), dim=1
+            )
+            owner_batch = build_logical_owner_batch(
+                meta,
+                prompt_ids=original_prompts,
+                rewards=rewards,
+                sample_mask=final_sample_mask,
+                expected_group_size=cfg.algo.num_generations_per_prompt,
+            )
+            # Any flagged segment filters its owner; padding has no owner.
+            num_mask_sample_filtered = (
+                owner_batch.row_owner[mask_sample & (owner_batch.row_owner >= 0)]
+                .unique()
+                .numel()
+            )
+            # Environment and overlong filtering apply to the whole owner.
+            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
+
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
         seq_error_metrics: Optional[dict[str, float]] = None
@@ -416,6 +442,7 @@ class AdvantageComputer:
                 rewards=rewards,
                 seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
                 filtering_on=cfg.filtering_on,
+                row_owner=owner_batch.row_owner if owner_batch is not None else None,
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(
@@ -429,32 +456,11 @@ class AdvantageComputer:
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
 
-        owner_batch = None
-        if logical:
-            original_prompts = tensor_field(data, adv_cfg.prompt_ids_field)
-            # Preserve equality when padding would alias [x] and [x, 0].
-            prompt_lengths = original_prompts.new_tensor(
-                [row.numel() for row in data[adv_cfg.prompt_ids_field].unbind()]
+        if owner_batch is not None:
+            owner_batch = replace(
+                owner_batch,
+                valid_mask=final_sample_mask[owner_batch.representative_rows],
             )
-            original_prompts = torch.cat(
-                (prompt_lengths.unsqueeze(-1), original_prompts), dim=1
-            )
-            owner_batch = build_logical_owner_batch(
-                meta,
-                prompt_ids=original_prompts,
-                rewards=rewards,
-                sample_mask=final_sample_mask,
-                expected_group_size=cfg.algo.num_generations_per_prompt,
-            )
-            # Any flagged segment filters its owner; padding has no owner.
-            num_mask_sample_filtered = (
-                owner_batch.row_owner[mask_sample & (owner_batch.row_owner >= 0)]
-                .unique()
-                .numel()
-            )
-            # Includes sequence-logprob filtering: one failing segment masks
-            # every row of its owner, not just that physical sequence.
-            final_sample_mask = owner_batch.fanout(owner_batch.valid_mask)
         mask = token_mask * final_sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {

@@ -343,7 +343,10 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
         # still write them; leave those rows for staging-partition teardown,
         # as on the existing abandoned-dispatch path.
         if call_id not in pending:
-            staging_keys.append(f"{owner}/{call_id}")
+            # Gym is optional for legacy receipts without attempted call IDs.
+            from nemo_gym.token_id_capture.staging.records import staging_key
+
+            staging_keys.append(staging_key(owner, call_id))
     return list(dict.fromkeys(staging_keys))
 
 
