@@ -390,6 +390,19 @@ def test_non_deepseek_async_1off_recipes_pass_nccl_reshard_validation(
     nccl_reshard_utils.check_nccl_reshard_refit_support(master_config)
 
 
+def test_qwen235_async_refit_buffer_size_matches_on_both_sides() -> None:
+    config = _load_resolved_yaml(
+        PERF_CONFIG_DIR / "grpo-qwen3-235b-32n8g-async-1off.yaml"
+    )
+    policy = config["policy"]
+    train_ratio = policy["megatron_cfg"]["env_vars"]["NRL_REFIT_BUFFER_MEMORY_RATIO"]
+    generation_ratio = policy["generation"]["vllm_cfg"]["env_vars"][
+        "NRL_REFIT_BUFFER_MEMORY_RATIO"
+    ]
+
+    assert train_ratio == generation_ratio == "0.005"
+
+
 def test_async_mxfp8_recipe_discovery_is_not_empty() -> None:
     # An empty parametrize list collects as a silent SKIP, which would leave
     # the nccl_reshard guard dead if the recipe directory or naming changes.
