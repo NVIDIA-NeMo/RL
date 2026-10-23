@@ -55,8 +55,8 @@ import time
 import uuid
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, replace
+from collections.abc import Iterator
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -167,19 +167,12 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
-from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
-from nemo_rl.environments.gym_checkpoint_coordinator import (
-    GymCheckpointCommitResult,
-    GymCheckpointCoordinator,
-    GymCheckpointOperationError,
-    is_transient_gym_checkpoint_failure,
-    load_gym_checkpoint_manifest,
-    staging_keys_of,
-    write_gym_checkpoint_manifest,
-)
-from nemo_rl.environments.nemo_gym import (
-    as_nemo_gym_shard_set,
-    should_use_nemo_gym,
+from nemo_rl.environments.checkpointing import build_environment_checkpoint
+from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.experience.environment_checkpoint import (
+    EnvironmentCheckpoint,
+    EnvironmentSnapshot,
+    RestoredEnvironmentRollouts,
 )
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
@@ -262,9 +255,6 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
-
-# Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
-_GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
 
 
 @dataclass(frozen=True)
@@ -550,24 +540,16 @@ class SingleControllerActor:
         # exists to remove. A missing field should break loudly at construction, where
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
-        self._gym_checkpoint_coordinator: Optional[GymCheckpointCoordinator] = None
-        # Separate from the data-plane barrier: it pauses only Gym /run
-        # submissions while a Gym checkpoint is prepared.
-        self._rollout_dispatch_admission_gate: Optional[DataPlaneCheckpointBarrier] = (
-            None
+        # Rollout state the environment backend holds between turns. Only
+        # turn-level recovery keeps any; otherwise this is a no-op.
+        self._environment_checkpoint: EnvironmentCheckpoint = (
+            build_environment_checkpoint(
+                master_config,
+                env_handles=self._env_handles,
+                rollout_manager=self._rollout_manager,
+                dp_client=self._dp_client,
+            )
         )
-        if self._master_config.rollout_recovery.turn_checkpointing_enabled:
-            self._gym_checkpoint_coordinator = GymCheckpointCoordinator(
-                as_nemo_gym_shard_set(self._env_handles["nemo_gym"]),
-                control_timeout_s=(self._master_config.token_capture.control_timeout_s),
-                prepare_timeout_s=(
-                    self._master_config.rollout_recovery.gym_prepare_timeout_s
-                ),
-            )
-            self._rollout_dispatch_admission_gate = DataPlaneCheckpointBarrier()
-            self._rollout_manager.set_rollout_dispatch_admission_gate(
-                self._rollout_dispatch_admission_gate
-            )
         # These two keep the getattr for a genuinely different reason: None is a
         # meaningful value meaning "feature off", and it is also their default. Absence
         # therefore degrades to the documented off state rather than to a broken one.
@@ -738,8 +720,8 @@ class SingleControllerActor:
             actor_args.bootstrap_identity
         )
         self._rollout_checkpoint_stop_requested = asyncio.Event()
-        # Set by a turn-level trainer checkpoint, which holds no Gym state, so
-        # the next rollout snapshot captures Gym soon after it.
+        # Set by a trainer checkpoint, which holds no environment state, so the
+        # next rollout snapshot captures the environment soon after it.
         self._rollout_checkpoint_wakeup = asyncio.Event()
         # Narrow unsafe window after an optimizer mutates model state and before
         # SC publishes the matching TQ cleanup and trainer counters. Gradient
@@ -747,8 +729,8 @@ class SingleControllerActor:
         # the replay buffer and are re-indexed in periodic snapshots.
         self._optimizer_commit_in_progress = False
         # Set whenever a step starts committing. A rollout snapshot clears it when
-        # it starts and stops its Gym phase once it is set, since the snapshot
-        # can no longer be kept.
+        # it starts and stops its environment phase once it is set, since the
+        # snapshot can no longer be kept.
         self._optimizer_commit_started = asyncio.Event()
 
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -870,7 +852,7 @@ class SingleControllerActor:
 
     async def _run_pumps(self) -> dict[str, Any]:
         """Start the rollout / train / watchdog pumps and run until one finishes."""
-        await self._check_restart_only_gym_servers()
+        await self._environment_checkpoint.check_startup()
         # Synchronize weights before starting the pumps, unless setup already delivered them.
         if self._weight_synchronizer.is_stale:
             await self._sync_weights()
@@ -1282,75 +1264,29 @@ class SingleControllerActor:
                 for group in recovery_ledger.groups()
                 if group.restore_level is RecoveryTargetLevel.TURN
             ]
-            restored_gym_episodes: set[tuple[str, str, int]] = set()
-            restored_gym_staging_keys: set[str] = set()
-            # Gym stays restored until the rest of this restore succeeds; on any
-            # failure its replacement attempts are retired before it reopens.
-            async with contextlib.AsyncExitStack() as gym_restore:
+            restored = RestoredEnvironmentRollouts()
+            # The environment stays restored until the rest of this restore
+            # succeeds; on any failure it drops what it restored before it reopens.
+            async with contextlib.AsyncExitStack() as environment_restore:
                 if turn_groups and not self._restored_from_rollout_snapshot:
-                    # A trainer checkpoint never holds Gym state; with no later
-                    # rollout snapshot, its unfinished turns start over below.
+                    # A trainer checkpoint never holds environment state; with no
+                    # later rollout snapshot, its unfinished turns start over below.
                     print(
-                        "📦 Restoring a trainer checkpoint without Gym state: "
-                        f"{len(turn_groups)} unfinished turn-level group(s) "
+                        "📦 Restoring a trainer checkpoint without environment "
+                        f"state: {len(turn_groups)} unfinished turn-level group(s) "
                         "restart from their tasks",
                         flush=True,
                     )
                 elif turn_groups:
-                    coordinator = self._gym_checkpoint_coordinator
-                    if coordinator is None:
-                        raise RuntimeError(
-                            "rollout checkpoint contains turn-level Gym state, but "
-                            "Gym checkpoint coordination is disabled"
-                        )
-                    manifest = await asyncio.to_thread(
-                        load_gym_checkpoint_manifest,
-                        self._last_checkpoint_path,
-                    )
-                    expected_inventory = {
-                        instance_id: set(episodes)
-                        for instance_id, episodes in self._gym_checkpoint_inventory(
-                            coordinator
-                        ).items()
-                    }
-                    # Restarts are not restored: prepare_for_restart starts every
-                    # episode Gym did not restore over from its task.
-                    saved_inventory = {
-                        instance_id: set(episodes)
-                        | set(manifest.restarts.get(instance_id, ()))
-                        for instance_id, episodes in manifest.instances.items()
-                    }
-                    if saved_inventory != expected_inventory:
-                        differing = sorted(
-                            instance_id
-                            for instance_id in saved_inventory.keys()
-                            | expected_inventory.keys()
-                            if saved_inventory.get(instance_id)
-                            != expected_inventory.get(instance_id)
-                        )
-                        raise ValueError(
-                            "Gym checkpoint manifest does not match the rollout "
-                            f"recovery ledger for Gym instances {differing!r}"
-                        )
-                    await gym_restore.enter_async_context(
-                        coordinator.restored(
-                            f"restore-{uuid.uuid4().hex}",
-                            self._last_checkpoint_path,
-                            manifest,
+                    restored = await environment_restore.enter_async_context(
+                        self._environment_checkpoint.restored(
+                            Path(self._last_checkpoint_path)
                         )
                     )
-                    restored_gym_episodes = {
-                        (instance_id, episode.rollout_id, episode.attempt)
-                        for instance_id, episodes in manifest.instances.items()
-                        for episode in episodes
-                    }
-                    restored_gym_staging_keys = {
-                        key for keys in manifest.staging_keys.values() for key in keys
-                    }
 
                 recovery_ledger.prepare_for_restart(
                     cut,
-                    restored_gym_episodes=restored_gym_episodes,
+                    restored_gym_episodes=set(restored.continued_attempts),
                 )
                 self._batch_shortfall = parsed_state.batch_shortfall
                 canonical_state = self._buffer.metadata_state_dict(
@@ -1375,7 +1311,7 @@ class SingleControllerActor:
                         cut,
                         replay_metadata=canonical_state,
                         clear_unreferenced=True,
-                        additional_expected_staging_keys=restored_gym_staging_keys,
+                        additional_expected_staging_keys=set(restored.staging_keys),
                     )
                 await self._rehydrate_rollout_recovery_prompts(cut)
                 await self._queue_restored_replay_groups_for_regeneration(cut)
@@ -1717,8 +1653,8 @@ class SingleControllerActor:
                 "groups_unfinished_found": float(len(groups_to_recover)),
                 "siblings_reused": float(reused_siblings),
                 "siblings_rerun": float(redispatched_siblings),
-                # The re-run siblings split by where they resume: restored Gym
-                # state (turn level) or their prompt.
+                # The re-run siblings split by where they resume: restored
+                # environment state (turn level) or their prompt.
                 "siblings_continued": float(continued_siblings),
                 "siblings_restarted": float(redispatched_siblings - continued_siblings),
             },
@@ -1729,7 +1665,7 @@ class SingleControllerActor:
         print(
             f"📦 Redispatched {len(groups_to_recover)} unfinished rollout "
             f"group(s) before new dataloader work: {reused_siblings} sibling(s) "
-            f"reused, {continued_siblings} continued from Gym state, "
+            f"reused, {continued_siblings} continued from environment state, "
             f"{redispatched_siblings - continued_siblings} restarted from their prompt",
             flush=True,
         )
@@ -4765,352 +4701,6 @@ class SingleControllerActor:
             tq_save_seconds=tq_save_seconds,
         )
 
-    def _gym_checkpoint_inventory(
-        self, coordinator: GymCheckpointCoordinator
-    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
-        """Return the Gym-owned episode attempts of every live deployment."""
-        return self._rollout_recovery_ledger.gym_checkpoint_inventory(
-            coordinator.instance_ids
-        )
-
-    def _queued_gym_retirements(
-        self, coordinator: GymCheckpointCoordinator
-    ) -> dict[str, frozenset[GymCheckpointEpisode]]:
-        """Return dropped episodes Gym may still hold, awaiting their retire."""
-        return {
-            instance_id: frozenset(episodes)
-            for instance_id, episodes in (
-                self._rollout_recovery_ledger.gym_checkpoint_retirements(
-                    coordinator.instance_ids
-                ).items()
-            )
-        }
-
-    async def _retire_dropped_gym_episodes(
-        self,
-        coordinator: GymCheckpointCoordinator,
-        checkpoint_id: str,
-    ) -> None:
-        """Retire episodes RL dropped while Gym may still be running them.
-
-        Abandoning or discarding a group leaves an admitted episode running in
-        Gym, which would export it at commit, outside the candidate set. Gym
-        accepts a retire only while idle, so this runs before prepare. A drop
-        recorded after it stays queued: this checkpoint commits it in scope but
-        leaves it out of the saved manifest, and a later retire stops it.
-        """
-        ledger = self._rollout_recovery_ledger
-        retirements = ledger.gym_checkpoint_retirements(coordinator.instance_ids)
-        if any(retirements.values()):
-            await coordinator.retire(checkpoint_id, retirements)
-            # Only what was retired: a drop recorded meanwhile stays for next time.
-            ledger.mark_gym_retired(retirements)
-        await self._forget_finished_gym_rollouts(coordinator, checkpoint_id)
-
-    async def _forget_finished_gym_rollouts(
-        self,
-        coordinator: GymCheckpointCoordinator,
-        checkpoint_id: str,
-    ) -> None:
-        """Let Gym drop its marks for rollouts RL will never send again.
-
-        Gym refuses a retired or restored rollout by ID until it is forgotten,
-        so each finished one would otherwise stay on every participant for the
-        rest of the run. Gym refuses a forget while a checkpoint is open, so this
-        runs right after the retire. A deployment that refuses, for example
-        because a retire has not finished freeing a rollout, gets the retire
-        again and then the forget. Forget is best effort: a mark costs one small
-        entry, so a deployment that still refuses keeps its rollouts queued for
-        the next snapshot instead of failing this one.
-        """
-        ledger = self._rollout_recovery_ledger
-        forgets = ledger.gym_checkpoint_forgets(coordinator.instance_ids)
-        if not any(forgets.values()):
-            return
-        try:
-            await coordinator.forget(checkpoint_id, forgets)
-        except GymCheckpointOperationError as error:
-            refused = {
-                instance_id: forgets[instance_id] for instance_id in error.failures
-            }
-            ledger.mark_gym_forgotten(
-                {
-                    instance_id: episodes
-                    for instance_id, episodes in forgets.items()
-                    if instance_id not in refused
-                }
-            )
-            try:
-                await coordinator.retire(
-                    checkpoint_id,
-                    {
-                        instance_id: refused.get(instance_id, ())
-                        for instance_id in coordinator.instance_ids
-                    },
-                )
-                await coordinator.forget(checkpoint_id, refused)
-            except GymCheckpointOperationError as retry_error:
-                warnings.warn(
-                    "Gym could not forget finished rollouts on "
-                    f"{sorted(retry_error.failures)!r}; they stay queued for the next "
-                    f"snapshot: {retry_error}",
-                    stacklevel=2,
-                )
-                return
-            ledger.mark_gym_forgotten(refused)
-            return
-        ledger.mark_gym_forgotten(forgets)
-
-    async def _check_restart_only_gym_servers(self) -> None:
-        """Refuse, or warn about, Gym servers whose rollouts start over after a crash.
-
-        Such a server's in-flight rollouts are reported as restarts at every
-        checkpoint, so turn-level recovery would quietly become
-        restart-from-task for them.
-        """
-        coordinator = self._gym_checkpoint_coordinator
-        if coordinator is None:
-            return
-        allowed = self._master_config.rollout_recovery.allow_restart_only_gym_servers
-        restart_only = {
-            instance_id: servers
-            for instance_id, servers in (
-                await coordinator.restart_only_servers()
-            ).items()
-            if servers
-        }
-        if restart_only and not allowed:
-            raise ValueError(
-                "rollout_recovery.target_level='turn' cannot continue rollouts on "
-                "these restart-only Gym servers, which start every in-flight "
-                f"rollout over after a crash: {restart_only!r}. Set "
-                "rollout_recovery.allow_restart_only_gym_servers=true to accept "
-                "that, or use target_level='sibling'."
-            )
-        if restart_only:
-            warnings.warn(
-                "rollout_recovery.allow_restart_only_gym_servers=true: in-flight "
-                "rollouts on these restart-only Gym servers start over after a "
-                f"crash: {restart_only!r}",
-                stacklevel=2,
-            )
-        elif allowed:
-            warnings.warn(
-                "rollout_recovery.allow_restart_only_gym_servers=true, but no Gym "
-                "server is restart-only; the setting has no effect",
-                stacklevel=2,
-            )
-
-    async def _drain_non_exported_gym_candidates(
-        self,
-        coordinator: GymCheckpointCoordinator,
-        candidates: dict[str, tuple[GymCheckpointEpisode, ...]],
-        commit: GymCheckpointCommitResult,
-    ) -> None:
-        """Wait for on-wire replies that Gym did not retain in its checkpoint.
-
-        A restart is still running in Gym, parked until resume, so it is not
-        waited for: the snapshot records it as starting over.
-        """
-        pending = {
-            instance_id: set(candidates[instance_id])
-            - set(commit.manifest.instances[instance_id])
-            - set(commit.manifest.restarts[instance_id])
-            for instance_id in coordinator.instance_ids
-        }
-        if not any(pending.values()):
-            return
-        # Only an episode whose reply is already on the wire can resolve here. A
-        # session Gym still holds is parked by prepare, so waiting would only time out.
-        stranded = {
-            instance_id: pending[instance_id].intersection(
-                commit.instances[instance_id].unowned_live_episodes
-            )
-            for instance_id in coordinator.instance_ids
-        }
-        if any(stranded.values()):
-            raise RuntimeError(
-                "Gym checkpoint holds parked agent sessions that are not an "
-                "agent's own /run episode, "
-                "so they can neither be restored nor finish while the deployment is "
-                f"prepared: stranded={stranded!r}"
-            )
-
-        deadline = time.monotonic() + coordinator.control_timeout_s
-        while True:
-            live = self._gym_checkpoint_inventory(coordinator)
-            unresolved = {
-                instance_id: pending[instance_id].intersection(live[instance_id])
-                for instance_id in coordinator.instance_ids
-            }
-            if not any(unresolved.values()):
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    "Gym checkpoint could not classify every candidate before the "
-                    f"drain deadline: unresolved={unresolved!r}"
-                )
-            await asyncio.sleep(min(0.05, remaining))
-
-    async def _validate_gym_checkpoint_cut(
-        self,
-        cut: DataPlaneMutationCut,
-        commit: GymCheckpointCommitResult,
-        *,
-        checkpoint_path: PathLike,
-    ) -> None:
-        """Require Gym ownership and referenced staging rows to match this cut.
-
-        Gym may have exported episodes RL dropped while it was prepared: it
-        refuses their retire until resume, so they are still queued for one.
-        They and their staged rows are left out of the saved manifest, since
-        restore requires it to match RL's inventory and RL no longer continues
-        them; a dropped group may already have cleaned those rows up.
-        """
-        cut.require_live()
-        coordinator = self._gym_checkpoint_coordinator
-        if coordinator is None:
-            raise RuntimeError("Gym commit exists without a live Gym coordinator")
-
-        actual = self._gym_checkpoint_inventory(coordinator)
-        expected = commit.manifest.instances
-        dropped = self._queued_gym_retirements(coordinator)
-        mismatches = {}
-        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-        kept_restarts: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-        for instance_id in coordinator.instance_ids:
-            owned = set(actual[instance_id])
-            exported = set(expected[instance_id])
-            restarted = set(commit.manifest.restarts[instance_id])
-            if (
-                owned - exported - restarted
-                or not exported - owned <= dropped[instance_id]
-            ):
-                mismatches[instance_id] = {
-                    "expected": sorted(exported, key=repr),
-                    "restarts": sorted(restarted, key=repr),
-                    "actual": sorted(owned, key=repr),
-                }
-            kept[instance_id] = tuple(
-                episode for episode in expected[instance_id] if episode in owned
-            )
-            # A restart that finished during the snapshot is no longer RL's.
-            kept_restarts[instance_id] = tuple(
-                episode
-                for episode in commit.manifest.restarts[instance_id]
-                if episode in owned
-            )
-        if mismatches:
-            raise RuntimeError(
-                "Gym episode ownership changed after commit and before the TQ cut: "
-                f"{mismatches!r}"
-            )
-        staging_keys = {
-            instance_id: staging_keys_of(
-                commit.instances[instance_id], kept[instance_id]
-            )
-            for instance_id in coordinator.instance_ids
-        }
-        if kept != expected or kept_restarts != commit.manifest.restarts:
-            await asyncio.to_thread(
-                write_gym_checkpoint_manifest,
-                Path(checkpoint_path),
-                replace(
-                    commit.manifest,
-                    instances=kept,
-                    staging_keys=staging_keys,
-                    restarts=kept_restarts,
-                ),
-            )
-
-        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
-        if not expected_staging_keys:
-            return
-        actual_staging_keys = set(
-            await self._call_dp(
-                "list_sample_ids",
-                partition_id=self._master_config.token_capture.staging_partition,
-            )
-        )
-        missing = sorted(expected_staging_keys - actual_staging_keys)
-        if missing:
-            raise RuntimeError(
-                "Gym checkpoint references staging rows missing from live TQ state: "
-                f"missing={missing[:10]!r} (total={len(missing)})"
-            )
-
-    @contextlib.asynccontextmanager
-    async def _prepared_gym_checkpoint(
-        self,
-        checkpoint_path: PathLike,
-        *,
-        checkpoint_id: str,
-    ) -> AsyncIterator[GymCheckpointCommitResult | None]:
-        """Close Gym admission, commit owned episodes, and drain on-wire replies."""
-        coordinator = self._gym_checkpoint_coordinator
-        if coordinator is None:
-            yield None
-            return
-        gate = self._rollout_dispatch_admission_gate
-        if gate is None:
-            raise RuntimeError(
-                "Gym checkpoint coordinator has no dispatch admission gate"
-            )
-
-        async with gate.checkpoint():
-            # Gym parks every live rollout until resume, so the wait must not
-            # count against their deadlines. A separate holder keeps a
-            # colocated engine's own pause intact when this one ends.
-            self._rollout_manager.suspend_request_deadlines(
-                _GYM_CHECKPOINT_DEADLINE_HOLDER
-            )
-            try:
-                # Gym refuses a retire once a checkpoint is open, so retire while
-                # it is still idle; dispatch is already closed, so nothing new
-                # races in.
-                await self._retire_dropped_gym_episodes(coordinator, checkpoint_id)
-                async with coordinator.prepared(checkpoint_id) as restarts:
-                    candidates = self._gym_checkpoint_inventory(coordinator)
-                    # A row dropped since that retire is still running in Gym,
-                    # which exports it; naming it keeps the export in scope, and
-                    # the cut leaves it out of the saved manifest.
-                    dropped = self._queued_gym_retirements(coordinator)
-                    # Gym refuses a commit that names an episode it cannot
-                    # capture; those start over after a crash instead.
-                    scope = {
-                        instance_id: tuple(
-                            episode
-                            for episode in episodes
-                            + tuple(sorted(dropped[instance_id] - set(episodes)))
-                            if episode not in restarts[instance_id]
-                        )
-                        for instance_id, episodes in candidates.items()
-                    }
-                    commit = await coordinator.commit(
-                        checkpoint_id,
-                        Path(checkpoint_path),
-                        scope,
-                        restarts={
-                            instance_id: tuple(
-                                episode
-                                for episode in episodes
-                                if episode in restarts[instance_id]
-                            )
-                            for instance_id, episodes in candidates.items()
-                        },
-                    )
-                    await self._drain_non_exported_gym_candidates(
-                        coordinator,
-                        candidates,
-                        commit,
-                    )
-                    yield commit
-            finally:
-                self._rollout_manager.resume_request_deadlines(
-                    _GYM_CHECKPOINT_DEADLINE_HOLDER
-                )
-
     async def _write_rollout_checkpoint_sidecars(
         self,
         checkpoint_path: Path,
@@ -5169,23 +4759,23 @@ class SingleControllerActor:
         self._optimizer_commit_in_progress = True
         self._optimizer_commit_started.set()
 
-    async def _enter_gym_phase_unless_a_step_commits(
+    async def _enter_environment_phase_unless_a_step_commits(
         self,
         stack: contextlib.AsyncExitStack,
-        gym_phase: contextlib.AbstractAsyncContextManager[
-            GymCheckpointCommitResult | None
+        environment_phase: contextlib.AbstractAsyncContextManager[
+            Optional[EnvironmentSnapshot]
         ],
-    ) -> tuple[bool, GymCheckpointCommitResult | None]:
-        """Enter the Gym phase on ``stack``, or stop it once a train step commits.
+    ) -> tuple[bool, Optional[EnvironmentSnapshot]]:
+        """Enter the environment phase on ``stack``, or stop it once a step commits.
 
         The snapshot would be thrown away at the trainer-state check anyway, so
-        Gym is not kept parked through prepare, commit and drain for it.
-        Cancelling the entry leaves no cleanup: the phase resumes Gym and reopens
+        the environment is not kept paused while it saves for it. Cancelling the
+        entry leaves no cleanup: the phase resumes the environment and reopens
         dispatch on any exception. Returns whether the phase was entered; a phase
         that finished entering is on ``stack``, and the trainer-state check
         decides whether its snapshot is kept.
         """
-        enter = asyncio.ensure_future(stack.enter_async_context(gym_phase))
+        enter = asyncio.ensure_future(stack.enter_async_context(environment_phase))
         commit_started = asyncio.ensure_future(self._optimizer_commit_started.wait())
         try:
             await asyncio.wait(
@@ -5280,17 +4870,14 @@ class SingleControllerActor:
                 prepare_snapshot_paths, anchor
             )
             try:
-                gym_park_started = time.monotonic()
-                async with contextlib.AsyncExitStack() as gym_phase:
+                environment_pause_started = time.monotonic()
+                async with contextlib.AsyncExitStack() as environment_phase:
                     (
                         entered,
-                        gym_commit,
-                    ) = await self._enter_gym_phase_unless_a_step_commits(
-                        gym_phase,
-                        self._prepared_gym_checkpoint(
-                            tmp_path,
-                            checkpoint_id=f"rollout-{uuid.uuid4().hex}",
-                        ),
+                        environment_snapshot,
+                    ) = await self._enter_environment_phase_unless_a_step_commits(
+                        environment_phase,
+                        self._environment_checkpoint.snapshot(tmp_path),
                     )
                     if not entered:
                         await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
@@ -5312,17 +4899,17 @@ class SingleControllerActor:
                                 reason="trainer_state_changed",
                             )
                         snapshot_epoch = self._current_epoch
-                        if gym_commit is not None:
-                            await self._validate_gym_checkpoint_cut(
-                                cut, gym_commit, checkpoint_path=tmp_path
-                            )
+                        if environment_snapshot is not None:
+                            await environment_snapshot.check_against_cut(cut)
                         snapshot_cut = await self._capture_rollout_checkpoint_cut(
                             cut, tmp_path
                         )
                     barrier_released = time.monotonic()
-                # Dispatch reopens and Gym resumes when that block exits, so this
-                # spans every second new rollouts could not start.
-                gym_parked_seconds = time.monotonic() - gym_park_started
+                # Dispatch reopens and the environment resumes when that block
+                # exits, so this spans every second new rollouts could not start.
+                environment_paused_seconds = (
+                    time.monotonic() - environment_pause_started
+                )
 
                 sidecar_save_started = time.monotonic()
                 controller_sidecar_bytes = (
@@ -5391,16 +4978,15 @@ class SingleControllerActor:
                 ),
                 "controller_sidecar_bytes": float(controller_sidecar_bytes),
             }
-            gym_restarts = (
-                sum(len(episodes) for episodes in gym_commit.manifest.restarts.values())
-                if gym_commit is not None
-                else 0
-            )
-            if gym_commit is not None:
-                checkpoint_metrics["gym_parked_seconds"] = gym_parked_seconds
-                # Episodes Gym could not capture; they start over after a crash.
-                checkpoint_metrics["gym_restarted_episodes"] = float(gym_restarts)
-                self._warn_if_gym_parked_past_interval(gym_parked_seconds)
+            restarted_rollouts = 0
+            if environment_snapshot is not None:
+                restarted_rollouts = environment_snapshot.restarted_rollouts
+                checkpoint_metrics.update(
+                    environment_snapshot.metrics(environment_paused_seconds)
+                )
+                self._warn_if_environment_paused_past_interval(
+                    environment_paused_seconds
+                )
             self._log_telemetry_metrics(
                 checkpoint_metrics,
                 step=expected_train_step,
@@ -5411,7 +4997,7 @@ class SingleControllerActor:
                 f"{final_path} (step={expected_train_step}, "
                 f"trainer_version={expected_trainer_version}, "
                 f"ledger_groups={snapshot_cut.rollout_recovery_group_count or 0}, "
-                f"gym_restarted_episodes={gym_restarts}, "
+                f"restarted_rollouts={restarted_rollouts}, "
                 f"total_save_seconds={checkpoint_metrics['total_save_seconds']:.2f}, "
                 "exclusive_hold_seconds="
                 f"{checkpoint_metrics['exclusive_hold_seconds']:.2f})",
@@ -5419,39 +5005,39 @@ class SingleControllerActor:
             )
             return _RolloutCheckpointSaveResult(saved=True, reason="completed")
 
-    def _warn_if_gym_snapshots_keep_losing_to_train_steps(
+    def _warn_if_snapshots_keep_losing_to_train_steps(
         self, consecutive_discards: int
     ) -> None:
-        """Warn once per streak when train steps keep discarding Gym snapshots."""
-        if self._gym_checkpoint_coordinator is None:
+        """Warn once per streak when train steps keep discarding turn snapshots."""
+        if not self._environment_checkpoint.holds_rollout_state:
             return
         limit = self._master_config.rollout_checkpointing.max_consecutive_failures
         if consecutive_discards != limit:
             return
         warnings.warn(
             f"{consecutive_discards} turn snapshots in a row were thrown away "
-            "because a train step finished during the Gym phase; turn-level "
-            "recovery is saving no Gym state. Shorten Gym steps or use "
-            "rollout_recovery.target_level: sibling.",
+            "because a train step finished while the environment was saving; "
+            "turn-level recovery is saving no environment state. Shorten "
+            "environment steps or use rollout_recovery.target_level: sibling.",
             stacklevel=2,
         )
 
-    def _warn_if_gym_parked_past_interval(self, gym_parked_seconds: float) -> None:
+    def _warn_if_environment_paused_past_interval(self, paused_seconds: float) -> None:
         """Warn when a snapshot held rollouts longer than the snapshot interval.
 
-        Rollouts then spend more time parked than running between snapshots.
+        Rollouts then spend more time paused than running between snapshots.
         """
         interval_s = (
             self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
         )
-        if interval_s is None or gym_parked_seconds <= interval_s:
+        if interval_s is None or paused_seconds <= interval_s:
             return
         warnings.warn(
-            f"Gym rollout snapshot held new rollout dispatch for "
-            f"{gym_parked_seconds:.1f}s, longer than "
+            f"Environment rollout snapshot held new rollout dispatch for "
+            f"{paused_seconds:.1f}s, longer than "
             f"rollout_checkpointing.snapshot_attempt_interval_s={interval_s:g}s; "
-            "rollouts spend more time parked than running between snapshots. "
-            "Raise the interval or check timing/rollout_checkpoint/gym_parked_seconds.",
+            "rollouts spend more time paused than running between snapshots. "
+            "Raise the interval or check the timing/rollout_checkpoint metrics.",
             stacklevel=2,
         )
 
@@ -5523,10 +5109,9 @@ class SingleControllerActor:
                     failure_reason: RolloutCheckpointAttemptReason = "timeout"
                 elif isinstance(error, OSError):
                     failure_reason = "io_error"
-                elif is_transient_gym_checkpoint_failure(error):
-                    # Gym was resumed, or its lease reopens it; nothing RL
-                    # holds changed, so the next attempt can simply retry.
-                    failure_reason = "gym_unavailable"
+                elif self._environment_checkpoint.is_unavailable(error):
+                    # Nothing RL holds changed, so the next attempt can retry.
+                    failure_reason = "environment_unavailable"
                 else:
                     failure_reason = "invariant_error"
                 self._log_rollout_checkpoint_outcome(
@@ -5568,7 +5153,7 @@ class SingleControllerActor:
                 if result.reason == "trainer_state_changed"
                 else 0
             )
-            self._warn_if_gym_snapshots_keep_losing_to_train_steps(consecutive_discards)
+            self._warn_if_snapshots_keep_losing_to_train_steps(consecutive_discards)
             if deadline_due and result.saved and self._timeout.check_save():
                 print(
                     "Checkpoint deadline reached before the first train step; "
@@ -5814,8 +5399,8 @@ class SingleControllerActor:
         # all take the mutation side of this barrier. Capture every restart-facing
         # controller artifact under the exclusive side so the checkpoint cannot
         # contain a cursor without its prompt owner, or two durable owners for one
-        # canonical group. Gym keeps running: its state lives only in rollout
-        # snapshots taken after this checkpoint.
+        # canonical group. The environment keeps running: its state lives only
+        # in rollout snapshots taken after this checkpoint.
         async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
             save_state.current_step = self._train_steps
             save_state.total_steps = self._train_steps
@@ -5897,9 +5482,10 @@ class SingleControllerActor:
                         else None
                     ),
                 )
-                # A turn-level trainer checkpoint holds no Gym state, so it
-                # does not stand in for the next rollout snapshot.
-                if self._gym_checkpoint_coordinator is None:
+                # A trainer checkpoint holds no environment state, so when the
+                # environment keeps some it does not stand in for the next
+                # rollout snapshot.
+                if not self._environment_checkpoint.holds_rollout_state:
                     self._last_rollout_snapshot_mutation_version = (
                         self._data_plane_checkpoint_barrier.mutation_version
                     )
@@ -5979,9 +5565,9 @@ class SingleControllerActor:
             self._checkpointer,
             last_checkpoint_step=self._train_steps,
         )
-        if self._gym_checkpoint_coordinator is not None:
+        if self._environment_checkpoint.holds_rollout_state:
             # The rollout snapshot waits for this checkpoint to be durable, off
-            # the training loop, and then captures Gym anchored to it.
+            # the training loop, and then captures the environment anchored to it.
             self._rollout_checkpoint_wakeup.set()
 
     # Grace on top of the workers' own refit deadline, so their attributable error wins
