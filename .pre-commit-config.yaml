@@ -16,11 +16,55 @@ repos:
       args: ["check", "--select", "I", "--fix"]
     - id: ruff-format
 
-  - repo: https://github.com/ComPWA/mirrors-taplo
-    rev: v0.9.3
+  - repo: local
     hooks:
     - id: taplo-format
+      alias: taplo
       name: Format TOML files with taplo
+      # PyPI's Taplo 0.9.3 has no Linux ARM64 wheel; use official release binaries.
+      entry: bash
+      args:
+        - -c
+        - |
+          set -euo pipefail
+          version=0.9.3
+          os=$(uname -s)
+          arch=$(uname -m)
+          case "$os" in
+            Linux) os=linux ;;
+            Darwin) os=darwin ;;
+            *) echo "Unsupported Taplo platform: $os" >&2; exit 1 ;;
+          esac
+          case "$arch" in
+            x86_64|aarch64) ;;
+            arm64) arch=aarch64 ;;
+            *) echo "Unsupported Taplo architecture: $arch" >&2; exit 1 ;;
+          esac
+
+          cache="${PRE_COMMIT_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/pre-commit}"
+          cache="$cache/taplo/$version/$os-$arch"
+          taplo="$cache/taplo"
+          if [[ ! -x "$taplo" ]]; then
+            mkdir -p "$cache"
+            download=$(mktemp "$cache/taplo.XXXXXX")
+            trap 'rm -f "$download" "$download.gz"' EXIT
+            echo "Downloading Taplo $version for $os-$arch..." >&2
+            curl --fail --location --silent --show-error --retry 3 --max-time 120 \
+              "https://github.com/tamasfe/taplo/releases/download/$version/taplo-$os-$arch.gz" \
+              --output "$download.gz"
+            gzip -dc "$download.gz" > "$download"
+            chmod 755 "$download"
+
+            # Publish only a complete binary, including when multiple hooks start together.
+            mv -f "$download" "$taplo"
+            rm -f "$download.gz"
+            trap - EXIT
+          fi
+
+          exec "$taplo" format "$@"
+        - taplo # bash -c takes this as $0, leaving all filenames in "$@".
+      language: system
+      types: [toml]
 
   - repo: local
     hooks:
