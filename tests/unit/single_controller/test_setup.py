@@ -3657,6 +3657,53 @@ class TestOPDFullValidation:
             _validate_opd_full_config(config, config.on_policy_distillation)
 
 
+class TestRewardScalingValidation:
+    """The source interval is a divisor, so setup checks it is one.
+
+    ``scale_rewards`` divides by ``source_max - source_min`` without guarding
+    it, and the advantage stage calls that on every batch. An empty or
+    inverted interval would surface as inf/nan or sign-flipped advantages a
+    whole rollout later, with nothing naming the config key that caused it.
+
+    The check reads the shaping block off whichever algorithm block is
+    present, so GRPO alone covers it.
+    """
+
+    def test_accepts_the_recipe_interval(self):
+        # [0, 1] -> [-1, 1], what every dapo-* recipe sets.
+        config = _make_master_config()
+        scaling = config.grpo.reward_scaling
+        scaling.enabled = True
+        scaling.target_min = -1.0
+
+        validate_single_controller_config(config)
+
+    @pytest.mark.parametrize(
+        ("source_min", "source_max"),
+        [(1.0, 1.0), (1.0, 0.0)],
+        ids=["empty_interval", "inverted_interval"],
+    )
+    def test_rejects_a_source_interval_that_cannot_be_divided_by(
+        self, source_min: float, source_max: float
+    ):
+        config = _make_master_config()
+        scaling = config.grpo.reward_scaling
+        scaling.enabled = True
+        scaling.source_min = source_min
+        scaling.source_max = source_max
+
+        with pytest.raises(ValueError, match="reward_scaling.source_min"):
+            validate_single_controller_config(config)
+
+    def test_ignores_the_source_interval_while_disabled(self):
+        """Nothing divides by it, so a stale interval is not a reason to stop."""
+        config = _make_master_config()
+        config.grpo.reward_scaling.source_min = 1.0
+        config.grpo.reward_scaling.source_max = 1.0
+
+        validate_single_controller_config(config)
+
+
 class _FakeTeacherGroup:
     def __init__(
         self,
