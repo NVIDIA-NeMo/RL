@@ -476,6 +476,9 @@ policy:
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
+      # Opt into vLLM sleep level 2 at safe lifecycle boundaries. Keep false
+      # unless host-memory pressure from level-1 weight backups is measured.
+      discard_weights_on_sleep: false
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
