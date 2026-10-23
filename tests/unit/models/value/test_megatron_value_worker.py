@@ -334,6 +334,7 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
         events.append("optimizer_cpu")
 
     worker = SimpleNamespace(
+        _train_step_state=None,
         model=model,
         optimizer=object(),
         optimizer_cpu_offload=optimizer_cpu_offload,
