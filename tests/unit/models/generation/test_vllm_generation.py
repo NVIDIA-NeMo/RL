@@ -604,7 +604,9 @@ def test_async_vllm_http_client_checks_it_can_read_vllm_route_state(
         renderer=None,
         input_processor=None,
         vllm_config=None,
-        output_processor=types.SimpleNamespace(**output_processor),
+        output_processor=types.SimpleNamespace(
+            _finish_request=lambda state: None, **output_processor
+        ),
     )
     # The check runs at setup, off the engine loop.
     client = _AsyncLLMHTTPClient(engine, MagicMock(name="engine_loop"))
@@ -692,6 +694,7 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.server_thread = ServerThread()
+    worker._http_engine_client = None
     worker.http_server = MagicMock()
     worker._sparse_refit_receiver = SparseRefitReceiver()
     worker.llm = Engine()

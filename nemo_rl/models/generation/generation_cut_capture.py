@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import hashlib
 import logging
 import threading
@@ -24,14 +25,24 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, cast
 
+import numpy as np
 import torch
 
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     verify_route_fragment_integrity,
 )
-from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase, checkpoint_phase_sync
+from nemo_rl.utils.prefix_cut_diagnostics import (
+    prefix_cut_count,
+    prefix_cut_timing,
+    prefix_cut_wait,
+)
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+    encode_routed_experts,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +51,42 @@ LOGGER = logging.getLogger(__name__)
 # evicting fresh evidence merely because a large deployment completed more
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
+
+# First-row extras identify the route-digest layout. Version 2 commits to the
+# ordered chunk digests instead of re-encoding all cumulative route bytes.
+_CUT_DIGEST_LAYOUT = "nrl_generation_cut_digest_layout"
+_CUT_CHUNKS_DIGEST = "nrl_generation_cut_chunks_sha256"
+
+# Bound owner-loop work and the number of live-route requests per lookup.
+# Transport batching retains its independent row/token limits.
+_ROUTE_SNAPSHOT_GROUP_MAX_CALLS = 64
+
+
+@dataclass(frozen=True)
+class _RouteSnapshotRequest:
+    """A transaction paused after freezing, before reading engine routes."""
+
+    engine_request_id: str
+    token_positions: int
+
+
+@dataclass(frozen=True)
+class _EngineRouteSnapshot:
+    """Local route references or a per-request error; never sent over the wire."""
+
+    routes: Any | None = None
+    error: Exception | None = None
+
+
+def _cut_chunk_digest(digests: list[str]) -> str:
+    """Commit to an ordered sequence of fixed-width, route-covered digests."""
+    digest = hashlib.sha256(b"nrl-generation-cut-chunks-v2\0")
+    for value in digests:
+        raw = bytes.fromhex(value)
+        if len(raw) != 32:
+            raise ValueError("generation-cut chunk digest must be SHA-256")
+        digest.update(raw)
+    return digest.hexdigest()
 
 
 def _final_route_placeholder(
@@ -125,6 +172,14 @@ class _RequestCaptureState:
     # Tokens already written to TQ by sealed cuts.
     staged_token_count: int = 0
     generation_cut_staging_keys: list[str] = field(default_factory=list)
+    # None retains the legacy cumulative-route digest when extending an old
+    # checkpoint. Only sealed rows enter this list; observed route cache state
+    # below is independent of durability and survives a failed cut.
+    generation_cut_chunk_digests: list[str] | None = field(default_factory=list)
+    engine_route_piece_count: int = 0
+    engine_route_rows: int = 0
+    engine_route_buffer: np.ndarray | None = None
+    engine_route_last_piece: Any | None = None
     # The cut in progress: its checkpoint and the token count it froze.
     frozen_cut: tuple[str, int] | None = None
     # Names each frozen chunk, so a rolled-back cut never reuses a TQ key.
@@ -183,6 +238,64 @@ class _RequestCaptureState:
             self.generated_token_ids[:frozen],
             self.generated_logprobs[:frozen],
         )
+
+    def absorb_engine_route_pieces(self, pieces: list[Any]) -> torch.Tensor:
+        """Join only newly published pieces into an amortized-growth CPU cache.
+
+        Called by the serial cut executor for this physical request. Published
+        pieces must be immutable and append-only. Cache progress is observed
+        engine state, not a successful cut, so rollback does not rewind it.
+        """
+        if not pieces:
+            raise ValueError("vLLM has not routed any token of the request yet")
+        covered = self.engine_route_piece_count
+        if len(pieces) < covered:
+            raise ValueError("vLLM route-piece list became shorter")
+        if covered and pieces[covered - 1] is not self.engine_route_last_piece:
+            raise ValueError("vLLM replaced a published route piece")
+        if len(pieces) > covered:
+            with prefix_cut_timing("route_history_concat"):
+                arrays = [np.asarray(piece) for piece in pieces[covered:]]
+                shape = tuple(arrays[0].shape[1:])
+                if (
+                    any(
+                        array.ndim != 3
+                        or tuple(array.shape[1:]) != shape
+                        or array.dtype.kind not in "iu"
+                        for array in arrays
+                    )
+                    or not shape
+                    or min(shape) < 1
+                ):
+                    raise ValueError(
+                        "vLLM route chunks must share shape [*, layers, topk]"
+                    )
+                buffer = self.engine_route_buffer
+                if buffer is not None and tuple(buffer.shape[1:]) != shape:
+                    raise ValueError("vLLM route model dimensions changed between cuts")
+                added = np.concatenate(arrays, axis=0)
+                rows = self.engine_route_rows + len(added)
+                if buffer is None or rows > len(buffer):
+                    capacity = max(rows, 2 * len(buffer) if buffer is not None else 1)
+                    dtype = (
+                        torch.empty((), dtype=self.routed_experts_dtype).numpy().dtype
+                    )
+                    grown = np.empty((capacity, *shape), dtype=dtype)
+                    if buffer is not None:
+                        grown[: self.engine_route_rows] = buffer[
+                            : self.engine_route_rows
+                        ]
+                    buffer = grown
+                buffer[self.engine_route_rows : rows] = added
+                # Publish cache metadata only after validation and copying succeed.
+                self.engine_route_buffer = buffer
+                self.engine_route_rows = rows
+                self.engine_route_piece_count = len(pieces)
+                self.engine_route_last_piece = pieces[-1]
+            prefix_cut_count("route_history_chunks", len(arrays))
+            prefix_cut_count("route_history_bytes", added.nbytes)
+        assert self.engine_route_buffer is not None
+        return torch.from_numpy(self.engine_route_buffer[: self.engine_route_rows])
 
     def frozen_cut_routed_experts(
         self, engine_routed_experts: Any | None
@@ -291,6 +404,7 @@ class _ResolvedGenerationCut:
     snapshot: Any
     media: Any | None = None
     routed_experts: torch.Tensor | None = None
+    chunk_digests: tuple[str, ...] | None = None
 
 
 def _remaining_generation_limits_after_prefix(
@@ -420,6 +534,31 @@ class GenerationCutCaptureMixin:
         del engine_request_id, timeout_s
         raise NotImplementedError("this backend cannot read routes for a cut")
 
+    def _snapshot_engine_routed_experts_many(
+        self, engine_request_ids: list[str], *, deadline: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Compatibility path for backends with only a single-request lookup.
+
+        vLLM overrides this with one owner-loop handoff. Keep the absolute
+        deadline here so a fallback never gives each request a fresh timeout.
+        """
+        results = {}
+        for request_id in engine_request_ids:
+            try:
+                timeout_s = (
+                    None if deadline is None else max(deadline - time.monotonic(), 0.0)
+                )
+                if timeout_s is not None and timeout_s <= 0:
+                    raise TimeoutError("generation route snapshot deadline passed")
+                results[request_id] = _EngineRouteSnapshot(
+                    routes=self._snapshot_engine_routed_experts(
+                        request_id, timeout_s=timeout_s
+                    )
+                )
+            except (TimeoutError, TypeError, ValueError) as error:
+                results[request_id] = _EngineRouteSnapshot(error=error)
+        return results
+
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
             state = self._capture_calls.pop(id(request), None)
@@ -495,9 +634,9 @@ class GenerationCutCaptureMixin:
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         return chunks
 
-    def _generation_cut_route_extras(
+    def _generation_cut_routes(
         self, chunks: list[Any], snapshots: list[Any]
-    ) -> tuple[dict[str, Any] | None, torch.Tensor | None]:
+    ) -> torch.Tensor | None:
         """Verify and join the route fragments carried by cut chunks.
 
         The first chunk stores a normal full, delta-aligned route tensor whose
@@ -511,7 +650,7 @@ class GenerationCutCaptureMixin:
                 raise RuntimeError(
                     "generation-cut checkpoint has no router-replay payload"
                 )
-            return None, None
+            return None
         if any(fragment is None for fragment in fragments):
             raise RuntimeError("generation-cut route fragments are incomplete")
 
@@ -552,7 +691,7 @@ class GenerationCutCaptureMixin:
             raise RuntimeError(
                 "rebuilt generation-cut routes do not match cumulative token delta"
             )
-        return {"routed_experts": encode_routed_experts(routes)}, routes
+        return routes
 
     @checkpoint_phase_sync("prefix_restore_reconstruct", detail=True)
     def _rebuild_generation_cut_snapshot(
@@ -568,6 +707,9 @@ class GenerationCutCaptureMixin:
                 "only the first generation-cut chunk may carry call extras"
             )
         call_extras = extras_by_chunk[0]
+        layout = (call_extras or {}).get(_CUT_DIGEST_LAYOUT)
+        if layout is not None and (type(layout) is not int or layout != 2):
+            raise RuntimeError("unsupported generation-cut digest layout")
         continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
@@ -619,14 +761,24 @@ class GenerationCutCaptureMixin:
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
         weight_version = weight_versions[0]
-        route_extras, routed_experts = self._generation_cut_route_extras(
-            chunks, snapshots
-        )
-        extras = (
-            call_extras
-            if route_extras is None
-            else {**(call_extras or {}), **route_extras}
-        )
+        routed_experts = self._generation_cut_routes(chunks, snapshots)
+        chunk_digests = None
+        extras = call_extras
+        if layout == 2:
+            if routed_experts is None:
+                raise RuntimeError("route-digest layout requires route fragments")
+            chunk_digests = tuple(snapshot.digest for snapshot in snapshots)
+            extras = {
+                **(call_extras or {}),
+                _CUT_CHUNKS_DIGEST: _cut_chunk_digest(list(chunk_digests)),
+            }
+        elif routed_experts is not None:
+            # Backward-compatible reader for active-prefix and canonical
+            # terminal-completion rows written before layout 2.
+            extras = {
+                **(call_extras or {}),
+                "routed_experts": encode_routed_experts(routed_experts),
+            }
         extras_digest = compute_extras_digest(extras)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
@@ -695,7 +847,11 @@ class GenerationCutCaptureMixin:
                 routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
             ),
         )
-        return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
+        return _ResolvedGenerationCut(
+            snapshot=snapshot,
+            routed_experts=routed_experts,
+            chunk_digests=chunk_digests,
+        )
 
     def _resolve_generation_cut(
         self,
@@ -865,17 +1021,72 @@ class GenerationCutCaptureMixin:
         self,
         operation: Callable[..., Any],
         *args: Any,
+        submitted_at: float | None = None,
     ) -> Any:
         """Run cut control independently of blocked terminal capture writes."""
         with checkpoint_phase("prefix_control"):
             context = contextvars.copy_context()
+            if submitted_at is None:
+                submitted_at = time.perf_counter()
+            completed_at: float | None = None
 
             def execute() -> Any:
-                return context.run(operation, *args)
+                def run() -> Any:
+                    nonlocal completed_at
+                    prefix_cut_wait(
+                        "control_queue_wait", time.perf_counter() - submitted_at
+                    )
+                    try:
+                        with prefix_cut_timing("control_execution"):
+                            return operation(*args)
+                    finally:
+                        completed_at = time.perf_counter()
 
-            return await asyncio.get_running_loop().run_in_executor(
-                self._generation_cut_control_executor, cast(Callable[..., Any], execute)
+                return context.run(run)
+
+            try:
+                return await asyncio.get_running_loop().run_in_executor(
+                    self._generation_cut_control_executor,
+                    cast(Callable[..., Any], execute),
+                )
+            finally:
+                if completed_at is not None:
+                    prefix_cut_wait(
+                        "control_result_delivery", time.perf_counter() - completed_at
+                    )
+
+    async def _checkpoint_generation_cut_control(
+        self, inventory: Any, *, deadline: float | None
+    ) -> Any:
+        """Admit independent inventories without abandoning cancelled cut threads."""
+        with self._capture_registry_lock:
+            cached = self._generation_cut_receipts.get(
+                (inventory.checkpoint_id, inventory.inventory_digest)
             )
+        if cached is not None:
+            return cached
+        submitted_at = time.perf_counter()
+
+        async def execute() -> Any:
+            prefix_cut_wait(
+                "control_admission_wait", time.perf_counter() - submitted_at
+            )
+            return await self._run_generation_cut_control(
+                functools.partial(
+                    self._checkpoint_generation_cut, inventory, deadline=deadline
+                ),
+                submitted_at=submitted_at,
+            )
+
+        return await self._generation_cut_control.run(
+            checkpoint_id=inventory.checkpoint_id,
+            inventory_digest=inventory.inventory_digest,
+            call_ids=frozenset(
+                prefix.model_call_id for prefix in inventory.active_prefixes
+            ),
+            deadline=deadline,
+            operation=execute,
+        )
 
     def _completed_generation_cut_ack(self, prefix: Any, checkpoint_id: str) -> Any:
         """Describe a call whose terminal path won the cut/abort race."""
@@ -918,17 +1129,8 @@ class GenerationCutCaptureMixin:
         # Evidence for this completion aged out; restart it from its prior boundary.
         return GenerationCutPrefixAck.failure(prefix)
 
-    def _frozen_cut_engine_routed_experts(
-        self, state: _RequestCaptureState, *, deadline: float | None
-    ) -> Any | None:
-        """Read the engine's routes for a frozen cut that needs them.
-
-        Runs after the freeze, without ``state.lock``, so decoding continues.
-
-        Raises:
-            TimeoutError: the engine did not answer before ``deadline``.
-            ValueError: the engine cannot name the request's routes.
-        """
+    def _frozen_cut_engine_request_id(self, state: _RequestCaptureState) -> str | None:
+        """Select a frozen call's live lookup without holding its token lock."""
         with state.lock:
             needs_engine_routes = (
                 state.capture_routed_experts
@@ -941,6 +1143,15 @@ class GenerationCutCaptureMixin:
             return None
         if engine_request_id is None:
             raise ValueError("no vLLM output has named the request yet")
+        return engine_request_id
+
+    def _frozen_cut_engine_routed_experts(
+        self, state: _RequestCaptureState, *, deadline: float | None
+    ) -> Any | None:
+        """Read engine routes after freezing, without blocking token observation."""
+        engine_request_id = self._frozen_cut_engine_request_id(state)
+        if engine_request_id is None:
+            return None
         timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
         return self._snapshot_engine_routed_experts(
             engine_request_id, timeout_s=timeout_s
@@ -953,13 +1164,16 @@ class GenerationCutCaptureMixin:
         checkpoint_id: str,
         *,
         deadline: float | None = None,
+        batch_route_lookup: bool = False,
     ) -> Generator[Any, Any, Any]:
         """Keep a live call frozen until transport and acknowledgement validate.
 
-        The generator yields ``(record, sequence)``, receives the staged key,
-        then yields its validated acknowledgement; the caller resumes it once
-        more to seal. A call with nothing to stage returns its acknowledgement
-        (or ``None`` if abort won the race) without yielding. Closing before the
+        With batched lookups it first yields a ``_RouteSnapshotRequest`` and
+        receives an ``_EngineRouteSnapshot``. It then yields
+        ``(record, sequence, route_payload)``, receives the staged key, then yields its
+        validated acknowledgement; the caller resumes it once more to seal.
+        A call with nothing to stage returns its acknowledgement (or ``None``
+        if abort won the race) without yielding a record. Closing before the
         seal rolls the frozen cut back.
         """
         from nemo_gym._checkpoint.generation_cut import (
@@ -975,7 +1189,11 @@ class GenerationCutCaptureMixin:
         # Abort and terminal completion use the same lifecycle lock. Once the
         # cut owns it, the call cannot be removed until its detached buffer is
         # staged or rolled back. If abort won first, use its terminal evidence.
+        lock_started_at = time.perf_counter()
         with state.lifecycle_lock:
+            prefix_cut_wait(
+                "call_lifecycle_lock_wait", time.perf_counter() - lock_started_at
+            )
             with self._capture_registry_lock:
                 current = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if current is not state or state.terminal_started:
@@ -992,7 +1210,7 @@ class GenerationCutCaptureMixin:
                     f"worker_rollout_id={state.call.rollout_id!r}"
                 )
 
-            with state.lock:
+            with prefix_cut_timing("capture_freeze"), state.lock:
                 uncuttable_reason = state.uncuttable_reason
                 observation_error = state.observation_error
                 effective_output_limit = state.effective_output_limit
@@ -1053,13 +1271,15 @@ class GenerationCutCaptureMixin:
             total_generation_token_count = inherited_prefix_token_count + len(
                 generated_token_ids
             )
-            if total_generation_token_count == 0 or (
-                generated_token_ids
-                and _ends_inside_character(
-                    self._generation_cut_tokenizer,
-                    state.resumed_generation_token_ids + generated_token_ids,
+            with prefix_cut_timing("utf8_boundary_check"):
+                cannot_cut_boundary = total_generation_token_count == 0 or (
+                    generated_token_ids
+                    and _ends_inside_character(
+                        self._generation_cut_tokenizer,
+                        state.resumed_generation_token_ids + generated_token_ids,
+                    )
                 )
-            ):
+            if cannot_cut_boundary:
                 with state.lock:
                     state.rollback_frozen_cut(checkpoint_id)
                 return GenerationCutPrefixAck(
@@ -1067,10 +1287,46 @@ class GenerationCutCaptureMixin:
                     disposition="durable_failure",
                 )
             try:
-                engine_routed_experts = self._frozen_cut_engine_routed_experts(
-                    state, deadline=deadline
-                )
-                with state.lock:
+                engine_routed_experts = None
+                if batch_route_lookup:
+                    request_id = self._frozen_cut_engine_request_id(state)
+                    if request_id is not None:
+                        positions = len(chunk_token_ids)
+                        if not state.generation_cut_staging_keys:
+                            positions += (
+                                len(state.prompt_token_ids)
+                                - state.call.admission.prev_len
+                            )
+                        try:
+                            snapshot = yield _RouteSnapshotRequest(
+                                request_id, positions
+                            )
+                            if not isinstance(snapshot, _EngineRouteSnapshot):
+                                raise TypeError(
+                                    "cut requires an engine route snapshot result"
+                                )
+                            if snapshot.error is not None:
+                                raise snapshot.error
+                            engine_routed_experts = snapshot.routes
+                        except BaseException:
+                            # Includes GeneratorExit when a queued group is
+                            # closed before lookup/resume. No TQ row exists yet.
+                            with state.lock:
+                                state.rollback_frozen_cut(checkpoint_id)
+                            raise
+                with prefix_cut_timing("route_fetch_total"):
+                    if not batch_route_lookup:
+                        engine_routed_experts = self._frozen_cut_engine_routed_experts(
+                            state, deadline=deadline
+                        )
+                    if isinstance(engine_routed_experts, list):
+                        # Only the cut executor mutates this cache. Do the
+                        # potentially large copy without blocking HTTP token
+                        # observation on state.lock.
+                        engine_routed_experts = state.absorb_engine_route_pieces(
+                            engine_routed_experts
+                        )
+                with state.lock, prefix_cut_timing("route_prefix_assembly"):
                     (
                         chunk_routed_experts,
                         cumulative_routed_experts,
@@ -1079,7 +1335,8 @@ class GenerationCutCaptureMixin:
                 # Only this call regenerates; the rest of the inventory is cut,
                 # and the next checkpoint tries this call again.
                 with state.lock:
-                    state.rollback_frozen_cut(checkpoint_id)
+                    if state.frozen_cut is not None:
+                        state.rollback_frozen_cut(checkpoint_id)
                 LOGGER.warning(
                     "cannot cut model call %s: routed experts: %s: %s",
                     prefix.model_call_id,
@@ -1094,41 +1351,117 @@ class GenerationCutCaptureMixin:
             staged_key = None
             try:
                 cumulative_extras = self._generation_cut_record_payload(state)
-                if cumulative_routed_experts is not None:
+                chunk_record = None
+                route_payload = None
+                chunk_digests = state.generation_cut_chunk_digests
+                new_layout = state.capture_routed_experts and chunk_digests is not None
+                if new_layout:
                     cumulative_extras = {
                         **(cumulative_extras or {}),
-                        "routed_experts": encode_routed_experts(
-                            cumulative_routed_experts
-                        ),
+                        _CUT_DIGEST_LAYOUT: 2,
                     }
-                cumulative_record = capture.build_prefix_record(
-                    state.call,
-                    prompt_token_ids=state.prompt_token_ids,
-                    generated_token_ids=generated_token_ids,
-                    generated_logprobs=generated_logprobs,
-                    extras=cumulative_extras,
-                )
-                if chunk_token_ids:
-                    chunk_record = (
-                        cumulative_record
-                        if not state.generation_cut_staging_keys
-                        else capture.build_generation_chunk_record(
-                            state.call,
-                            generated_token_ids=chunk_token_ids,
-                            generated_logprobs=chunk_logprobs,
-                            extras=(
-                                None
-                                if chunk_routed_experts is None
-                                else {
-                                    "routed_experts": encode_routed_experts(
-                                        chunk_routed_experts
-                                    )
-                                }
-                            ),
+                    candidate_digests = list(chunk_digests)
+                    if len(candidate_digests) != len(state.generation_cut_staging_keys):
+                        raise RuntimeError(
+                            "generation-cut chunk digests and keys differ"
                         )
+                    if chunk_token_ids:
+                        if chunk_routed_experts is None:
+                            raise ValueError(
+                                "router-replay cut has no new route fragment"
+                            )
+                        with prefix_cut_timing("delta_route_encode"):
+                            route_payload = RoutedExpertsStagingPayload(
+                                chunk_routed_experts
+                            )
+                            chunk_extras = {"routed_experts": route_payload.encoded}
+                        with prefix_cut_timing("delta_record_build_and_digest"):
+                            if not state.generation_cut_staging_keys:
+                                # The first persisted row carries prompt/call
+                                # extras and full routes, but is distinct from
+                                # the small cumulative digest record below.
+                                chunk_record = capture.build_prefix_record(
+                                    state.call,
+                                    prompt_token_ids=state.prompt_token_ids,
+                                    generated_token_ids=generated_token_ids,
+                                    generated_logprobs=generated_logprobs,
+                                    extras={**cumulative_extras, **chunk_extras},
+                                )
+                            else:
+                                chunk_record = capture.build_generation_chunk_record(
+                                    state.call,
+                                    generated_token_ids=chunk_token_ids,
+                                    generated_logprobs=chunk_logprobs,
+                                    extras=chunk_extras,
+                                )
+                        candidate_digests.append(chunk_record.digest)
+                    cumulative_extras[_CUT_CHUNKS_DIGEST] = _cut_chunk_digest(
+                        candidate_digests
                     )
-                    staged_key = yield chunk_record, chunk_sequence
-                with state.lock:
+                if cumulative_routed_experts is not None:
+                    route_bytes = (
+                        cumulative_routed_experts.numel()
+                        * cumulative_routed_experts.element_size()
+                    )
+                    prefix_cut_count("cumulative_route_bytes", route_bytes)
+                    prefix_cut_count(
+                        "max_cumulative_route_bytes", route_bytes, maximum=True
+                    )
+                    if not new_layout:
+                        with prefix_cut_timing("cumulative_route_encode"):
+                            if not state.generation_cut_staging_keys:
+                                route_payload = RoutedExpertsStagingPayload(
+                                    cumulative_routed_experts
+                                )
+                                encoded_routes = route_payload.encoded
+                            else:
+                                encoded_routes = encode_routed_experts(
+                                    cumulative_routed_experts
+                                )
+                        cumulative_extras = {
+                            **(cumulative_extras or {}),
+                            "routed_experts": encoded_routes,
+                        }
+                prefix_cut_count(
+                    "cumulative_generation_tokens", len(generated_token_ids)
+                )
+                prefix_cut_count("new_chunk_tokens", len(chunk_token_ids))
+                with prefix_cut_timing("cumulative_record_build_and_digest"):
+                    cumulative_record = capture.build_prefix_record(
+                        state.call,
+                        prompt_token_ids=state.prompt_token_ids,
+                        generated_token_ids=generated_token_ids,
+                        generated_logprobs=generated_logprobs,
+                        extras=cumulative_extras,
+                    )
+                if chunk_token_ids:
+                    if chunk_routed_experts is not None:
+                        prefix_cut_count(
+                            "delta_route_bytes",
+                            chunk_routed_experts.numel()
+                            * chunk_routed_experts.element_size(),
+                        )
+                    if new_layout:
+                        assert chunk_record is not None
+                    elif not state.generation_cut_staging_keys:
+                        chunk_record = cumulative_record
+                    else:
+                        chunk_extras = None
+                        if chunk_routed_experts is not None:
+                            with prefix_cut_timing("delta_route_encode"):
+                                route_payload = RoutedExpertsStagingPayload(
+                                    chunk_routed_experts
+                                )
+                                chunk_extras = {"routed_experts": route_payload.encoded}
+                        with prefix_cut_timing("delta_record_build_and_digest"):
+                            chunk_record = capture.build_generation_chunk_record(
+                                state.call,
+                                generated_token_ids=chunk_token_ids,
+                                generated_logprobs=chunk_logprobs,
+                                extras=chunk_extras,
+                            )
+                    staged_key = yield chunk_record, chunk_sequence, route_payload
+                with prefix_cut_timing("acknowledgement_build"), state.lock:
                     candidate_staging_keys = tuple(state.generation_cut_staging_keys)
                     if staged_key is not None:
                         candidate_staging_keys += (staged_key,)
@@ -1149,10 +1482,15 @@ class GenerationCutCaptureMixin:
                     # any frozen cut into its live request state. A failed
                     # acknowledgement leaves the cut available for rollback.
                     yield acknowledgement
-                with state.lock:
+                with prefix_cut_timing("cut_seal"), state.lock:
                     state.seal_frozen_cut(checkpoint_id)
                     if staged_key is not None:
                         state.generation_cut_staging_keys.append(staged_key)
+                        if new_layout:
+                            assert (
+                                chunk_record is not None and chunk_digests is not None
+                            )
+                            chunk_digests.append(chunk_record.digest)
             except BaseException:
                 # Generator.close() injects GeneratorExit when another row in
                 # the batch fails. Roll back without hiding the root failure.
@@ -1198,8 +1536,21 @@ class GenerationCutCaptureMixin:
 
         sink = self._capture_sink
         acknowledgements: list[Any] = []
-        pending: list[tuple[Generator[Any, Any, Any], Any, int, Any]] = []
+        pending: list[
+            tuple[
+                Generator[Any, Any, Any],
+                Any,
+                int,
+                Any,
+                RoutedExpertsStagingPayload | None,
+            ]
+        ] = []
         pending_tokens = 0
+        route_pending: list[
+            tuple[Generator[Any, Any, Any], Any, _RouteSnapshotRequest]
+        ] = []
+        route_pending_tokens = 0
+        route_group_limit = min(max_rows, _ROUTE_SNAPSHOT_GROUP_MAX_CALLS)
         uncut: list[Any] = []
 
         def past_deadline() -> bool:
@@ -1207,11 +1558,19 @@ class GenerationCutCaptureMixin:
 
         def release_pending() -> None:
             nonlocal pending_tokens
-            for transaction, _, _, prefix in pending:
+            for transaction, _, _, prefix, _ in pending:
                 transaction.close()
                 uncut.append(prefix)
             pending.clear()
             pending_tokens = 0
+
+        def release_route_pending() -> None:
+            nonlocal route_pending_tokens
+            for transaction, prefix, _ in route_pending:
+                transaction.close()
+                uncut.append(prefix)
+            route_pending.clear()
+            route_pending_tokens = 0
 
         def fail(prefix: Any) -> None:
             LOGGER.exception(
@@ -1220,13 +1579,21 @@ class GenerationCutCaptureMixin:
             )
             acknowledgements.append(GenerationCutPrefixAck.failure(prefix))
 
-        def stage(batch: list[tuple[Any, Any, int, Any]]) -> list[str | None]:
+        def stage(
+            batch: list[tuple[Any, Any, int, Any, RoutedExpertsStagingPayload | None]],
+        ) -> list[str | None]:
             """Write a batch; if its put fails, write each row alone."""
             try:
                 return sink.stage_generation_prefix_batch(
-                    [record for _, record, _, _ in batch],
+                    [record for _, record, _, _, _ in batch],
                     checkpoint_id=inventory.checkpoint_id,
-                    chunk_sequences=[sequence for _, _, sequence, _ in batch],
+                    chunk_sequences=[sequence for _, _, sequence, _, _ in batch],
+                    attachments=[
+                        {ROUTED_EXPERTS_STAGING_ATTACHMENT: routes}
+                        if routes is not None
+                        else None
+                        for _, _, _, _, routes in batch
+                    ],
                 )
             except Exception:
                 # The sink has already discarded the batch's keys.
@@ -1239,7 +1606,7 @@ class GenerationCutCaptureMixin:
                     exc_info=True,
                 )
             keys: list[str | None] = []
-            for _, record, sequence, prefix in batch:
+            for _, record, sequence, prefix, routes in batch:
                 if past_deadline():
                     uncut.append(prefix)
                     keys.append(None)
@@ -1249,6 +1616,11 @@ class GenerationCutCaptureMixin:
                         [record],
                         checkpoint_id=inventory.checkpoint_id,
                         chunk_sequences=[sequence],
+                        attachments=[
+                            {ROUTED_EXPERTS_STAGING_ATTACHMENT: routes}
+                            if routes is not None
+                            else None
+                        ],
                     )
                 except Exception:
                     fail(prefix)
@@ -1268,12 +1640,25 @@ class GenerationCutCaptureMixin:
             keys: list[str | None] = []
             handed = 0
             try:
-                with checkpoint_phase(
-                    "prefix_batch_put", attributes={"rl.checkpoint.rows": len(batch)}
+                prefix_cut_count("batches", 1)
+                prefix_cut_count("batch_rows", len(batch))
+                prefix_cut_count(
+                    "batch_token_positions",
+                    sum(len(record.token_ids_delta) for _, record, _, _, _ in batch),
+                )
+                prefix_cut_count("max_batch_rows", len(batch), maximum=True)
+                with (
+                    prefix_cut_timing("batch_stage_total"),
+                    checkpoint_phase(
+                        "prefix_batch_put",
+                        attributes={"rl.checkpoint.rows": len(batch)},
+                    ),
                 ):
                     keys = stage(batch)
                 ready = []
-                for (transaction, _, _, prefix), key in zip(batch, keys, strict=True):
+                for (transaction, _, _, prefix, _), key in zip(
+                    batch, keys, strict=True
+                ):
                     handed += 1
                     if key is None:
                         # Closing rolls the frozen cut back.
@@ -1281,14 +1666,18 @@ class GenerationCutCaptureMixin:
                         continue
                     try:
                         # A failure here rolls the call back and clears its row.
-                        ready.append((transaction, prefix, transaction.send(key)))
+                        with prefix_cut_timing("transaction_acknowledge"):
+                            ready.append((transaction, prefix, transaction.send(key)))
                     except Exception:
                         fail(prefix)
                 # Every acknowledgement in the batch is built before any call
                 # seals its frozen cut into its live request state.
                 for transaction, prefix, acknowledgement in ready:
                     try:
-                        transaction.send(None)
+                        with prefix_cut_timing(
+                            "transaction_seal", expected_stop_iteration=True
+                        ):
+                            transaction.send(None)
                     except StopIteration:
                         acknowledgements.append(acknowledgement)
                     except Exception:
@@ -1307,16 +1696,91 @@ class GenerationCutCaptureMixin:
                         LOGGER.exception(
                             "Failed to clear interrupted generation-prefix batch"
                         )
-                for transaction, _, _, _ in batch:
+                with prefix_cut_timing("transaction_release"):
+                    for transaction, _, _, _, _ in batch:
+                        transaction.close()
+
+        def queue_record(
+            transaction: Generator[Any, Any, Any],
+            prefix: Any,
+            record: Any,
+            sequence: int,
+            routes: RoutedExpertsStagingPayload | None,
+        ) -> None:
+            nonlocal pending_tokens
+            tokens = len(record.token_ids_delta)
+            if pending and pending_tokens + tokens > max_tokens:
+                flush()
+            pending.append((transaction, record, sequence, prefix, routes))
+            pending_tokens += tokens
+            if len(pending) >= max_rows or pending_tokens >= max_tokens:
+                # An oversized single row is written alone, never split.
+                flush()
+
+        def resolve_route_pending() -> None:
+            """Fetch a frozen group's routes, then transfer records to TQ batching."""
+            nonlocal route_pending_tokens
+            if not route_pending:
+                return
+            if past_deadline():
+                release_route_pending()
+                return
+            group = list(route_pending)
+            route_pending.clear()
+            route_pending_tokens = 0
+            handed = 0
+            try:
+                request_ids = list(
+                    dict.fromkeys(request.engine_request_id for _, _, request in group)
+                )
+                try:
+                    snapshots = self._snapshot_engine_routed_experts_many(
+                        request_ids, deadline=deadline
+                    )
+                except Exception as error:
+                    # A transport/owner failure affects this bounded group.
+                    # Never retry each request with a fresh control timeout.
+                    LOGGER.exception("generation route snapshot group failed")
+                    snapshots = {
+                        request_id: _EngineRouteSnapshot(error=error)
+                        for request_id in request_ids
+                    }
+                for transaction, prefix, request in group:
+                    handed += 1
+                    transferred = False
+                    try:
+                        if past_deadline():
+                            uncut.append(prefix)
+                            continue
+                        with prefix_cut_timing(
+                            "transaction_route_resume", expected_stop_iteration=True
+                        ):
+                            record, sequence, routes = transaction.send(
+                                snapshots[request.engine_request_id]
+                            )
+                        queue_record(transaction, prefix, record, sequence, routes)
+                        transferred = True
+                    except StopIteration as finished:
+                        acknowledgements.append(finished.value)
+                    except Exception:
+                        fail(prefix)
+                    finally:
+                        if not transferred:
+                            transaction.close()
+            finally:
+                # Transactions handed to pending belong to flush(); only this
+                # group's not-yet-resumed transactions remain ours to close.
+                for transaction, _, _ in group[handed:]:
                     transaction.close()
 
         try:
             for index, prefix in enumerate(inventory.active_prefixes):
                 if past_deadline():
+                    release_route_pending()
                     release_pending()
                     uncut.extend(inventory.active_prefixes[index:])
                     break
-                with self._capture_registry_lock:
+                with prefix_cut_timing("registry_lookup"), self._capture_registry_lock:
                     state = self._capture_calls_by_model_call_id.get(
                         prefix.model_call_id
                     )
@@ -1329,9 +1793,16 @@ class GenerationCutCaptureMixin:
                         )
                         continue
                     transaction = self._generation_cut_transaction(
-                        prefix, state, inventory.checkpoint_id, deadline=deadline
+                        prefix,
+                        state,
+                        inventory.checkpoint_id,
+                        deadline=deadline,
+                        batch_route_lookup=True,
                     )
-                    record, sequence = next(transaction)
+                    with prefix_cut_timing(
+                        "transaction_prepare_total", expected_stop_iteration=True
+                    ):
+                        prepared = next(transaction)
                 except StopIteration as finished:
                     acknowledgement = finished.value
                     if acknowledgement is None:
@@ -1353,19 +1824,42 @@ class GenerationCutCaptureMixin:
                             ):
                                 state.rollback_frozen_cut(inventory.checkpoint_id)
                     continue
-                tokens = len(record.token_ids_delta)
-                if pending and pending_tokens + tokens > max_tokens:
-                    flush()
-                pending.append((transaction, record, sequence, prefix))
-                pending_tokens += tokens
-                if len(pending) >= max_rows or pending_tokens >= max_tokens:
-                    # An oversized single row is written alone, never split.
-                    flush()
+                if isinstance(prepared, _RouteSnapshotRequest):
+                    # Check before adding this call. It is already frozen, so
+                    # close it too if resolving the previous group interrupts.
+                    try:
+                        if (
+                            route_pending
+                            and route_pending_tokens + prepared.token_positions
+                            > max_tokens
+                        ):
+                            resolve_route_pending()
+                    except BaseException:
+                        transaction.close()
+                        raise
+                    route_pending.append((transaction, prefix, prepared))
+                    route_pending_tokens += prepared.token_positions
+                    if (
+                        len(route_pending) >= route_group_limit
+                        or route_pending_tokens >= max_tokens
+                    ):
+                        resolve_route_pending()
+                else:
+                    try:
+                        record, sequence, routes = prepared
+                        queue_record(transaction, prefix, record, sequence, routes)
+                    except BaseException:
+                        transaction.close()
+                        raise
+            resolve_route_pending()
             flush()
         finally:
-            for transaction, _, _, _ in pending:
+            for transaction, _, _ in route_pending:
+                transaction.close()
+            for transaction, _, _, _, _ in pending:
                 transaction.close()
         if uncut:
+            prefix_cut_count("deadline_skipped_calls", len(uncut))
             LOGGER.warning(
                 "generation cut passed its control deadline: checkpoint_id=%s "
                 "uncut=%d of %d",

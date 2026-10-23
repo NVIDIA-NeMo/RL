@@ -415,6 +415,7 @@ class GymCheckpointCoordinator:
                     handle.checkpoint_prepare,
                     checkpoint_id,
                     deadline_ts=deadline_ts,
+                    submitted_unix_s=time.time(),
                 )
                 for instance_id, handle in self._handles.items()
             },

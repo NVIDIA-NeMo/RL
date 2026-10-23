@@ -70,7 +70,16 @@ from nemo_rl.data_plane.schema import (
     ROUTED_LEN_FIELD,
 )
 from nemo_rl.experience.route_assembly import RouteFragment, boundary_route_rows
-from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+from nemo_rl.utils.prefix_cut_diagnostics import (
+    prefix_cut_count,
+    prefix_cut_probe_active,
+    prefix_cut_timing,
+)
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+    decode_routed_experts,
+)
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -438,14 +447,15 @@ class TQStagingStore:
         row_count = int(fields.batch_size[0]) if fields.batch_size else 0
         if len(keys) != len(tags) or row_count != len(keys):
             raise ValueError("batch keys, fields, and tags must have equal lengths")
-        _call_dp(
-            self._dp_client,
-            "put_samples",
-            sample_ids=list(keys),
-            partition_id=self._staging_partition,
-            fields=fields,
-            tags=list(tags),
-        )
+        with prefix_cut_timing("tq_put_ack"):
+            _call_dp(
+                self._dp_client,
+                "put_samples",
+                sample_ids=list(keys),
+                partition_id=self._staging_partition,
+                fields=fields,
+                tags=list(tags),
+            )
 
     def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
         return _call_dp(
@@ -577,6 +587,18 @@ class TQTokenSink:
         boundary row: only the resume path reads it back, and the resumed
         call's canonical row supplies the boundary route the reassembler uses.
         """
+        route_payload = None
+        if attachments is not None and ROUTED_EXPERTS_STAGING_ATTACHMENT in attachments:
+            route_payload = attachments[ROUTED_EXPERTS_STAGING_ATTACHMENT]
+            if not isinstance(route_payload, RoutedExpertsStagingPayload):
+                raise TypeError(
+                    "route staging attachment must be RoutedExpertsStagingPayload"
+                )
+            attachments = {
+                key: value
+                for key, value in attachments.items()
+                if key != ROUTED_EXPERTS_STAGING_ATTACHMENT
+            } or None
         if attachments is not None and not self._capture_media:
             raise ValueError(
                 "media attachments require a media-enabled staging partition"
@@ -660,9 +682,20 @@ class TQTokenSink:
             )
         routed_len = 0
         routed_encoding = ROUTE_ENCODING_NONE
+        if route_payload is not None and routed is None:
+            raise ValueError("route staging attachment has no record payload")
         if routed is not None:
             delta_len = len(record.token_ids_delta)
-            experts = decode_routed_experts(routed)
+            if route_payload is None:
+                with prefix_cut_timing("sink_route_decode"):
+                    experts = decode_routed_experts(routed)
+            else:
+                with prefix_cut_timing("sink_route_reuse"):
+                    experts = route_payload.tensor_for_payload(routed)
+                prefix_cut_count("sink_route_reuse_rows", 1)
+                prefix_cut_count(
+                    "sink_route_reuse_bytes", experts.numel() * experts.element_size()
+                )
             routed_encoding = (
                 ROUTE_ENCODING_ENVELOPE
                 if isinstance(routed, str)
@@ -740,9 +773,10 @@ class TQTokenSink:
         for index, (record, row_attachments) in enumerate(
             zip(records, attachments, strict=True)
         ):
-            fields, tags = self._encode_record(
-                record, attachments=row_attachments, generation_cut_chunk=True
-            )
+            with prefix_cut_timing("sink_record_encode"):
+                fields, tags = self._encode_record(
+                    record, attachments=row_attachments, generation_cut_chunk=True
+                )
             signature = tuple(
                 (name, fields[name].dtype, tuple(fields[name].shape[2:]))
                 for name in sorted(fields)
@@ -751,13 +785,25 @@ class TQTokenSink:
 
         try:
             for group in groups.values():
-                fields = TensorDict(
-                    {
-                        name: stack_or_nest([item[1][name][0] for item in group])
-                        for name in group[0][1]
-                    },
-                    batch_size=[len(group)],
-                )
+                if prefix_cut_probe_active():
+                    payload_bytes = sum(
+                        tensor.numel() * tensor.element_size()
+                        for _, row, _ in group
+                        for tensor in row.values()
+                    )
+                    prefix_cut_count("tq_batches", 1)
+                    prefix_cut_count("tensor_payload_bytes", payload_bytes)
+                    prefix_cut_count(
+                        "max_batch_tensor_payload_bytes", payload_bytes, maximum=True
+                    )
+                with prefix_cut_timing("sink_batch_construct"):
+                    fields = TensorDict(
+                        {
+                            name: stack_or_nest([item[1][name][0] for item in group])
+                            for name in group[0][1]
+                        },
+                        batch_size=[len(group)],
+                    )
                 self._store.put_many(
                     [keys[item[0]] for item in group],
                     fields,

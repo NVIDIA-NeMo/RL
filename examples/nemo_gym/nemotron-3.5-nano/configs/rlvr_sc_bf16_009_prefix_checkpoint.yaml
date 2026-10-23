@@ -1,0 +1,106 @@
+# Reference: W&B joc/bits/u7lao4f0 (bf16_009), not the FP32/MTP-off smoke.
+# 86 nodes: 32 training + 32 generation + 2 Gym + 20 external judges.
+# See ../README.md for the explicit reference differences.
+defaults: rlvr_sc.yaml
+
+cluster:
+  num_nodes: 64
+  gpus_per_node: 4
+  segment_size: 2
+
+grpo:
+  max_num_steps: 100
+  # Capture batches do not emit the invalid-tool-call advantage mask.
+  # This is an additional objective difference from the reference's -5.0.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+reward_penalties:
+  # These three penalties are supported by capture reward finalization.
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  # Explicitly disabled for this experiment; capture does not support it yet.
+  penalize_malformed_think_tag: false
+
+policy:
+  precision: bfloat16
+  is_vlm: false
+  # The reference did not enable router replay. Do not inherit the smoke's R3.
+  router_replay:
+    enabled: false
+  # Keep the HF architecture intact, including its MTP definition.
+  hf_config_overrides: {}
+  megatron_cfg:
+    fp32_lm_head: false
+    mtp_num_layers: 5
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.3
+  generation:
+    colocated:
+      resources:
+        num_nodes: 32
+    vllm_cfg:
+      fp32_lm_head: false
+    generation_cut_control:
+      max_workers: 2
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 2
+    # Match the resolved reference, rather than rlvr_sc.yaml's newer 65536.
+    global_aiohttp_connector_limit: 16384
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 2
+    # Retain all 33 inherited Gym configs and the original, unfiltered blend.
+    telemetry:
+      enabled: true
+      exporter: console
+      span_groups: "default,checkpoint"
+      traces_enabled: true
+      metrics_enabled: true
+
+checkpointing:
+  enabled: true
+  save_data_plane: true
+  save_optimizer: true
+  metric_name: null
+  # Preserve reference trainer retention: periodic every 10, rolling every 1.
+  save_period: 10
+  keep_top_k: 1000000
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  # 75-minute stop/save deadline within each 90-minute allocation.
+  checkpoint_must_save_by: "00:01:15:00"
+
+rollout_checkpointing:
+  snapshot_attempt_interval_s: 120.0
+  telemetry_interval_s: 30.0
+  max_consecutive_failures: 3
+  keep_latest_k: 2
+  restore_mode: latest
+
+token_capture:
+  enabled: true
+  capture_dir: /tmp/nemo_rl/token_capture/${oc.env:SLURM_JOB_ID}
+  staging_partition: rollout_staging
+  defer_routed_experts_to_policy: false
+  control_timeout_s: 120.0
+
+rollout_recovery:
+  target_level: prefix
+  generation_prefix_batch_size: 256
+  generation_prefix_batch_max_tokens: 4194304
+  gym_prepare_timeout_s: 300.0
+
+telemetry:
+  enabled: true
+  exporter: console
+  span_groups: "default,checkpoint"
+  traces_enabled: true
+  metrics_enabled: true
+  vllm_native_tracing: false

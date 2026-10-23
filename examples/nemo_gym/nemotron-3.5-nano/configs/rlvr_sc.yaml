@@ -1,0 +1,339 @@
+# =============================================================================
+# Nemotron 3.5 Nano — Amplified Dolphin RLVR on the SingleController path
+# =============================================================================
+# Overlay on rlvr.yaml that swaps the async-GRPO driver for SingleController:
+# streaming forward/backward, the TransferQueue data plane, gated ready-first
+# rollout sampling, and shard-to-shard NCCL-reshard weight refit.
+#
+# Model, parallelism, batch shape, sequence length, node split, MTP settings and
+# the Gym blend are all inherited unchanged, so a run of this config is directly
+# comparable against a rlvr.yaml run on the same 86 nodes.
+#
+# Entrypoint: examples/run_grpo_single_controller.py, NOT run_grpo_nemo_gym.py.
+# launch_nano35_rlvr_v2_86n.sh sets that; the v1 launcher does not.
+#
+# Group vs sample units: async_rl counts PROMPT GROUPS, not generations. One
+# optimizer cohort here is num_prompts_per_step = 512 groups, which at
+# num_generations_per_prompt=16 is 8192 sequences.
+# =============================================================================
+defaults: rlvr.yaml
+
+# =============================================================================
+# Checkpointing — ENABLED, which is what forces the simple data plane below
+# =============================================================================
+# The choice between the two is not free on this build. _CHECKPOINTABLE_BACKENDS
+# in data_plane/interfaces.py is frozenset({"simple"}); ready_first declares
+# supports_buffer_checkpoint = True; single_controller_utils/setup.py then
+# raises ValueError for any enabled-checkpointing run whose sampler can recover
+# buffered rollouts unless save_data_plane=true, which mooncake_cpu cannot
+# provide. So enabling checkpointing here REQUIRES data_plane.backend: simple;
+# the pair is a hard failure at setup, before any GPU work, not a degraded run.
+#
+# What that costs: rollout payloads move through the Ray object store instead of
+# host-to-host over the fabric, so this arm stops exercising the CPU RDMA path,
+# which is the faster transport. That is the trade being made for eval rungs and
+# crash recovery over a 100-step run on 86 nodes. Reverting is two lines --
+# enabled: false here and backend: mooncake_cpu below -- and the mooncake_cpu
+# sizing is left in place and inert rather than deleted.
+checkpointing:
+  enabled: true
+  # Required by the guard above rather than optional: ready_first can recover
+  # completed-but-unconsumed rollouts, so the native TQ snapshot and
+  # replay-buffer metadata have to travel with the checkpoint or a resume would
+  # silently drop them. NotRequired in the schema, so absent reads as off.
+  save_data_plane: true
+  # SC has no validation loop, so a "val:" metric is never collected and
+  # validate_single_controller_config rejects the inherited
+  # "val:total_reward/mean" outright. null makes retention recency-based.
+  metric_name: null
+  # Two cadences run at once, and remove_old_checkpoints applies its rules as a
+  # union -- a checkpoint survives if ANY rule retains it -- which is what lets
+  # them coexist without one pruning the other.
+  #
+  # Periodic: save_period-aligned steps are "always retained", so these are the
+  # rungs that persist for later evals -- steps 10, 20, ..., 100. keep_top_k
+  # bounds them, and far above the step count it keeps every one; with
+  # metric_name null the ordering would be recency, which never binds here.
+  save_period: 10
+  keep_top_k: 1000000
+  # Rolling: a full checkpoint every step, with only the newest non-rung kept,
+  # so each step's save deletes the previous one and a crash or the 4h WALLTIME
+  # costs at most one step. ft_keep_latest_k is recency-only and applies to all
+  # checkpoints, but because retention is a union it cannot evict a periodic
+  # rung -- the rung survives on the periodic rule alone.
+  ft_save_period: 1
+  ft_keep_latest_k: 1
+  save_optimizer: true
+
+# =============================================================================
+# GRPO
+# =============================================================================
+grpo:
+  # Whole-campaign target: compared against the RESTORED step count, so a
+  # requeued job continues toward 100 rather than running 100 more steps.
+  max_num_steps: 100
+  # SC has no validation loop.
+  val_period: 0
+  # The legacy async-GRPO driver is not used on this path.
+  async_grpo: null
+
+policy:
+  generation:
+    refit_transport: nccl_reshard
+    vllm_kwargs:
+      # The base pins max_num_seqs: 64. That is an ADMISSION ceiling per
+      # engine, not a memory limit, and it is the binding constraint on this
+      # arm. With 32 generation nodes at TP=4 there is one engine per node, so
+      # 32 x 64 = 2048 sequence slots against a demand of
+      # max_inflight_prompts x num_generations_per_prompt = 992 x 16 = 15872.
+      # The surplus is not dropped, it queues, so per-group latency becomes
+      # queue residency rather than decode time. Job 3694018 measured a 1006s
+      # mean group latency with a 2686s tail, and by step 13 was spending
+      # 50.8% of a 1090s step in exposed_generation with the trainer idle
+      # while policy_training itself stayed flat at ~350s.
+      #
+      # 768, matching the 208-node gymscale arm. 32 x 768 = 24576 slots against
+      # a 15872 demand, so admission stops being a constraint at all rather
+      # than being relaxed to 2.6x oversubscribed, which is what 192 would
+      # leave. Deliberately past the point where 3588920 validated this tier at
+      # 192: the open question is whether the binding limit moves to the KV
+      # cache, and if it does the symptom changes from queue residency to
+      # preemption and recompute, visible as rising
+      # vllm:num_preemptions rather than as exposed_generation. Revert to 192 if
+      # that shows up. max_num_batched_tokens below still bounds each step, so
+      # this raises how many sequences may be resident, not how much work one
+      # engine step admits.
+      max_num_seqs: 768
+      # Unset in the base, which leaves vLLM's own much smaller default, so a
+      # step's prefill is split across far more batches than it needs.
+      max_num_batched_tokens: 16384
+      compilation_config:
+        # OmegaConf.merge replaces lists wholesale rather than merging them,
+        # so the base's sizes are restated here instead of appended to. The
+        # new ceiling has to appear in this list: without it every batch
+        # above 64 falls off the captured-graph path and runs eager, which
+        # gives back much of what raising max_num_seqs buys. Sibling keys
+        # (cudagraph_mode, pass_config) deep-merge and are left alone.
+        #
+        # The steps above 192 are coarse on purpose. Every entry is a separate
+        # graph capture, paid in startup time and in memory held for the life
+        # of the engine, and batches land on the next size up, so the spacing
+        # only has to be tight enough that rounding up is cheap.
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64,128,192,256,384,512,768]
+
+# =============================================================================
+# Loss — forced by the sampler choice below
+# =============================================================================
+loss_fn:
+  # false, overriding the true this recipe's base sets, because ready_first
+  # requires it: validate_single_controller_config raises
+  #   "the ready_first sampler requires loss_fn.force_on_policy_ratio=false
+  #    so prev_logprobs are used"
+  # and the run dies there, ~2 minutes in with 86 nodes held (job 3671057).
+  #
+  # The requirement is not arbitrary. force_on_policy_ratio=true pins the
+  # importance ratio to 1.0, which is only defensible when a batch is
+  # single-version. ready_first exists precisely to mix weight versions in one
+  # batch -- late stragglers from older versions stay selectable rather than
+  # being discarded -- so the samples are off-policy by varying amounts and the
+  # ratio has to be computed from prev_logprobs. in_order tolerates true only
+  # because it drains one cohort at a time.
+  #
+  # ready_first also requires use_importance_sampling_correction=true, which
+  # the base already sets, so nothing is needed for that here.
+  #
+  # This is a real difference from arm A, which keeps
+  # force_on_policy_ratio=true: the two arms now differ in the loss and not
+  # only in the driver, so a reward gap between them is partly this. Note the
+  # base's value carries its own precondition anyway
+  # (train_global_batch_size == num_prompts_per_step * num_generations_per_prompt).
+  # The README writes this up under "Forced by the sampler:
+  # force_on_policy_ratio", and no longer as an open question: the validator
+  # settles it, because ready_first will not start with true.
+  force_on_policy_ratio: false
+
+# =============================================================================
+# SingleController async RL
+# =============================================================================
+async_rl:
+  # ready_first at lag 1: admission still limits generation to one dispatch
+  # batch ahead of the trainer, but selection is ready-first across weight
+  # versions rather than draining one version at a time. Every ready group from
+  # a version no newer than the trainer stays selectable, including late
+  # stragglers outside the admission window, so no rollout is discarded and a
+  # slow group cannot hold a step closed. That is the difference from in_order,
+  # which only closes a step on the cohort stamped for it.
+  #
+  # ready_first reads max_staleness_versions; max_lookahead_versions is
+  # in_order's key. SamplerConfig is extra="allow", so leaving the wrong key
+  # here would be silently inert rather than a validation error -- hence only
+  # the correct key is set.
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  recompute_kv_cache_after_weight_updates: false
+  # 512 / 32 = 16 streaming chunks per optimizer step. This relies on gradients
+  # being reduced and finalized once per step rather than per chunk:
+  # begin_train_step nulls finalize_model_grads_func for the whole step, and the
+  # train pump passes keep_train_buffers=step_open so the per-chunk logprob
+  # detour does not free accumulated gradients.
+  min_groups_for_streaming_train: 32
+  # num_prompts_per_step * (lag + 1) = 512 * 2 = 1024 is the fan-in this lag
+  # implies, but 992 is the most that can actually be admitted. Every in-flight
+  # prompt is one run_rollouts call holding a slot on the single NemoGym actor,
+  # which is created without max_concurrency, so Ray's async-actor default of
+  # 1000 applies. Past it the surplus parks inside the actor process as fibers on
+  # its concurrency semaphore, where no backpressure valve can see it; the
+  # submitter logs "tasks pending submission to actor NemoGym" and the run makes
+  # no steps. 992 leaves 8 slots so the actor's own health_check and shutdown are
+  # still admitted.
+  #
+  # Raise this to 1024 and set env.nemo_gym.max_concurrency instead, once the
+  # actor is sized from the rollout fan-in.
+  max_inflight_prompts: 992
+  max_buffered_rollouts: 1024
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5
+    max_data_attempts_per_prompt: 2
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    # Both zero, and that is forced by ready_first rather than chosen. A drop
+    # budget is only honourable under a sampler that stamps each group with the
+    # step it is owed to; ready_first stamps nothing, so a dropped prompt is
+    # never subtracted from the step waiting on it. The shortfall then migrates
+    # from batch to batch until the last one, which has nothing left to borrow,
+    # and the run dies there hours in -- or stalls with no error at all.
+    # validate_single_controller_config makes this a hard error rather than a
+    # warning for that reason, and exempts a zero budget because nothing then
+    # reaches the shortfall path. The alternative it offers is in_order, which
+    # would also let force_on_policy_ratio go back to true.
+    #
+    # The practical cost is smaller than it reads: on_dropped_prompt=replace
+    # means a failed prompt is retried once before the budget is consulted at
+    # all, so only an unreplaceable failure ends the run. The 10-node smoke
+    # logged dropped_prompt_groups: 0. Still, this is the arm's main fragility
+    # over 100 steps x 512 prompt groups against four external judges.
+    max_consecutive_dropped_prompts: 0
+    max_skipped_prompts: 0
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: 1
+    min_step_batch_fraction: 0.9
+    nemo_gym:
+      # 1800 is below this workload's own tail, so it was not bounding a hung
+      # rollout, it was misclassifying a slow one. Job 3694018's completed
+      # groups average 1006s with a max of 2686s, and 31.6% of them exceed
+      # 1200s -- every group past 1800s was being reported as an infra failure
+      # and redispatched, which both wastes the work already done and walks
+      # max_infra_attempts_per_prompt toward RolloutRedispatchExhausted.
+      #
+      # 9000 is the gymscale value and sits ~3.3x above the observed max, so a
+      # genuinely wedged group still trips it.
+      rollout_timeout_s: 9000.0
+  stall_watchdog:
+    interval_s: 30.0
+    # Must stay ABOVE rollout_timeout_s. MasterConfig validation enforces the
+    # ordering, and job 3597411 died on it at 15 minutes when rollout_timeout_s
+    # was raised here and this was left at 2400. Semantically the rollout
+    # deadline has to be allowed to fire first: it names the offending prompt
+    # group, whereas the watchdog only reports that the run stopped advancing.
+    stall_timeout_s: 10800.0
+    stall_action: warn
+    gym_subprocess_check: true
+
+# =============================================================================
+# Environment — NeMo Gym serving capacity
+# =============================================================================
+# Nothing here changes the Gym blend, any agent, or any verifier. These are
+# serving-side ceilings inherited from rlvr.yaml that were set once at
+# conservative values and never revisited for this fan-in, so they cap
+# utilization below what the allocation already pays for.
+env:
+  nemo_gym:
+    # num_workers is unset in the base, and Gym's
+    # get_nemo_gym_fastapi_num_workers reads unset as 1, so every Gym server
+    # answers its whole share of the fan-in from ONE uvicorn process.
+    # policy_model is the proxy all rollout model traffic passes through, so
+    # at 992 in-flight prompts that is the narrowest point in the path.
+    #
+    # Only servers whose module defines a module-level `app` can fan out. At
+    # num_workers > 1 Gym stops passing an app object and hands uvicorn the
+    # string target "<module>:app" (server_utils.py), which aborts with
+    # 'Error loading ASGI app. Attribute "app" not found' when the module has
+    # no such attribute. The attribute comes from an
+    # is_nemo_gym_fastapi_entrypoint branch that exists in only 9 of the 178
+    # app.py modules in the pinned Gym. responses_api_models/vllm_model/app.py
+    # -- the module policy_model uses -- is one of them, so this needs no Gym
+    # change. The judge modules (simple_agent, equivalence_llm_judge,
+    # math_with_judge, multichallenge, jailbreak_detection) are NOT, and must
+    # stay at 1 worker until that branch is upstreamed.
+    #
+    # This lands on two servers, not one: the base defines
+    # policy_model_reasoning_off with `_copy: policy_model`, and Gym resolves
+    # a copy as OmegaConf.merge(source, local_overrides), so the twin inherits
+    # this count and the pair costs 16 uvicorn processes.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+    # 4096 total connections spread over a 992-group fan-in is about four per
+    # group, and the per-host cap applies to the one policy-model endpoint
+    # every rollout talks to, so the client pool throttles before the engines
+    # are saturated. Raised to the values the gymscale arm ran with.
+    global_aiohttp_connector_limit: 65536
+    global_aiohttp_connector_limit_per_host: 16384
+
+# =============================================================================
+# TransferQueue data plane
+# =============================================================================
+# Every key below is required by DataPlaneConfig, and rlvr.yaml carries no
+# data_plane block to inherit them from, so the whole schema is spelled out
+# here rather than overriding a base like the in-tree SC recipes do.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  # The only checkpointable backend: _CHECKPOINTABLE_BACKENDS is
+  # frozenset({"simple"}), so this is what checkpointing.enabled=true above
+  # requires. Rollout payloads move through the Ray object store rather than
+  # host-to-host over the fabric, so this arm does not exercise CPU RDMA.
+  #
+  # mooncake_cpu is the faster transport and is what a throughput-focused arm
+  # should use, but it cannot satisfy the save_data_plane guard, so the two are
+  # mutually exclusive and the conflict is fatal at setup rather than a silent
+  # downgrade. Note the guard is on save_data_plane, not on the backend name, so
+  # `simple` with save_data_plane unset fails in exactly the same way.
+  backend: "simple"
+  claim_meta_poll_interval_s: 0.5
+  # Backend sizing lives in per-backend blocks: only the block named by
+  # `backend` is read. This one is active. SimpleStorageConfig.num_storage_units
+  # has no default, so omitting it fails validation rather than picking a size.
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    # Pinned rather than the exemplar's ${mul:2, ${cluster.num_nodes}}, which
+    # would be 128 at this cluster size.
+    num_storage_units: 16
+  # Inert while backend is `simple`, and kept sized rather than deleted so
+  # switching back needs no resizing pass. The reasoning is preserved because
+  # it was paid for once already, at the cost of a dead job.
+  #
+  # These are PER CLIENT PROCESS (one per GPU), not per node, and under RDMA
+  # the memory is pinned and resident from setup. A node therefore pays
+  # gpus_per_node x (global_segment_size + local_buffer_size).
+  #
+  # The upstream defaults (512 GiB / 64 GiB) are unusable here: at
+  # gpus_per_node=4 that is 4 x 576 GiB = 2304 GiB against the 900 GiB these
+  # Grace-Blackwell NVL72 nodes report (Slurm RealMemory 921600 MB). Job 3667709
+  # died exactly there, OOM-killed the instant the ranks logged "Mounting
+  # segment: 549755813888 bytes".
+  #
+  # 32 + 8 GiB keeps the node at 4 x 40 = 160 GiB, ~18% of RAM, leaving the
+  # rest for Megatron host state and the Ray object store. The global pool is
+  # the sum across ranks, so even at this smoke's 16 ranks it is 512 GiB, far
+  # above the payload: ~1.5 MB per rollout at 73728 tokens, so a 992-rollout
+  # step is a couple of GiB.
+  #
+  # Under-sizing surfaces as "batch_get_tensor returned None", so that error
+  # rather than an OOM is the signal to raise these.
+  mooncake_cpu:
+    global_segment_size: 34359738368   # 32 GiB per process -> 128 GiB per node
+    local_buffer_size: 8589934592      # 8 GiB per process -> 32 GiB per node

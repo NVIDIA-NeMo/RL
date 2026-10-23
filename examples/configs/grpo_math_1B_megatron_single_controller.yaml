@@ -187,6 +187,14 @@ policy:
     enabled: true
 
   generation:
+    # Diagnostic A/B switch: true forces engine-loop route reads during cuts.
+    # False keeps guarded direct-reference reads on verified vLLM runtimes.
+    disable_direct_route_snapshot: false
+    # Opt-in checkpoint experiment: 2 overlaps independent inventories while
+    # deduplicating retries and serializing overlapping calls/checkpoint epochs.
+    # Valid values: 1 (recommended baseline/default) or 2.
+    generation_cut_control:
+      max_workers: 1
     # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
     mcore_generation_config:
       unified_memory_level: 0

@@ -211,9 +211,21 @@ class VllmRefitConfig(BaseModel, extra="allow"):
     nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
 
 
+class GenerationCutControlConfig(BaseModel, extra="forbid"):
+    """Bound concurrent independent checkpoint inventories per generation worker."""
+
+    max_workers: Annotated[int, Field(ge=1, le=2, strict=True)] = 1
+
+
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Optional diagnostic opt-out: true forces owner-loop route snapshots.
+    # False/absent retains the guarded direct-reference path (recommended).
+    disable_direct_route_snapshot: NotRequired[bool]
+    # Absent uses GenerationCutControlConfig defaults. Two overlaps independent
+    # inventories only; duplicate/overlapping calls and checkpoint epochs serialize.
+    generation_cut_control: NotRequired[GenerationCutControlConfig]
     # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
     # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
     # live in NvFp4PerTokenRolloutConfig.

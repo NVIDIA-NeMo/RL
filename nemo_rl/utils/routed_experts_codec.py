@@ -29,6 +29,7 @@ depend on torch.
 """
 
 import base64
+from dataclasses import dataclass, field
 from typing import Any, Union
 
 import torch
@@ -40,6 +41,46 @@ _WIRE_TORCH_DTYPES = {
     "int32": torch.int32,
 }
 _TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
+
+# Opaque framework attachment; never part of capture extras or the wire format.
+ROUTED_EXPERTS_STAGING_ATTACHMENT = "nrl_routed_experts_staging"
+
+
+@dataclass(frozen=True, init=False)
+class RoutedExpertsStagingPayload:
+    """Own a CPU route snapshot and the exact envelope committed by its record.
+
+    The capture record still digests the ordinary envelope. The local sink can
+    reuse its tensor instead of decoding that envelope. No global cache or
+    request lookup is involved; the attachment lives only through staging.
+    """
+
+    encoded: str = field(repr=False)
+    _routes: torch.Tensor = field(repr=False)
+    _version: int = field(repr=False)
+
+    def __init__(self, routes: torch.Tensor) -> None:
+        # Own the bytes: later engine/cache mutations cannot change a staged
+        # record. Disable inference mode so mutation checks also work when the
+        # source tensor was created under inference_mode().
+        with torch.inference_mode(False):
+            snapshot = routes.detach().to("cpu").clone().contiguous()
+        object.__setattr__(self, "encoded", encode_routed_experts(snapshot))
+        object.__setattr__(self, "_routes", snapshot)
+        object.__setattr__(self, "_version", snapshot._version)
+
+    def tensor_for_payload(self, encoded: object) -> torch.Tensor:
+        """Return read-only-by-contract routes bound to this record's envelope.
+
+        Raises:
+            ValueError: The record names another envelope, or a consumer has
+                modified the owned tensor since its envelope was computed.
+        """
+        if not isinstance(encoded, str) or encoded != self.encoded:
+            raise ValueError("route staging attachment does not match record payload")
+        if self._routes._version != self._version:
+            raise ValueError("route staging attachment was modified after encoding")
+        return self._routes
 
 
 def encode_routed_experts(routed_experts: torch.Tensor) -> str:

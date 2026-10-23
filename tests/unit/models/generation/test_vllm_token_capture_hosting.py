@@ -80,6 +80,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
 )
 from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
+    GenerationCutCaptureMixin,
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
     _ResolvedGenerationCut,
@@ -1210,7 +1211,9 @@ def test_worker_batch_past_deadline_fails_calls_not_yet_written(monkeypatch):
     worker, sink, requests, inventory = _batch_worker_fixture([2, 3, 4], batch_size=2)
     clock = {"now": 0.0}
     monkeypatch.setattr(
-        generation_cut_capture, "time", SimpleNamespace(monotonic=lambda: clock["now"])
+        generation_cut_capture,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"], perf_counter=time.perf_counter),
     )
 
     def expire_during_first_write():
@@ -1242,7 +1245,9 @@ def test_worker_batch_past_deadline_rolls_back_pending_calls(monkeypatch):
     monkeypatch.setattr(
         generation_cut_capture,
         "time",
-        SimpleNamespace(monotonic=lambda: next(readings, 10.0)),
+        SimpleNamespace(
+            monotonic=lambda: next(readings, 10.0), perf_counter=time.perf_counter
+        ),
     )
 
     receipt = worker._checkpoint_generation_cut(inventory, deadline=5.0)
@@ -2589,6 +2594,15 @@ def _router_replay_worker(
     worker._return_routed_experts_enabled = lambda: True
     worker.routed_experts_dtype = torch.int16
     worker._rollout_weight_version = weight_version
+    # These tests inject the single-call engine fake. Exercise the mixin's
+    # compatibility adapter; grouped vLLM owner handoffs have separate tests.
+    worker._snapshot_engine_routed_experts_many = (
+        lambda request_ids,
+        *,
+        deadline: GenerationCutCaptureMixin._snapshot_engine_routed_experts_many(
+            worker, request_ids, deadline=deadline
+        )
+    )
     return worker
 
 
@@ -2701,6 +2715,7 @@ def _resume(
         prefix_token_ids=list(prefix_token_ids),
         generation_cut=cut,
         generation_cut_routed_experts=resolved.routed_experts,
+        generation_cut_chunk_digests=resolved.chunk_digests,
         resumed_generation_token_ids=[
             token_id
             for token_id, mask in zip(
@@ -2877,8 +2892,10 @@ def test_vllm_route_chunks_with_mismatched_shapes_are_a_route_error() -> None:
         ]
     )
 
+    pieces = worker._snapshot_engine_routed_experts("request", timeout_s=1.0)
+    state = _RequestCaptureState(call=None, prompt_token_ids=[])
     with pytest.raises(ValueError, match="must share shape"):
-        worker._snapshot_engine_routed_experts("request", timeout_s=1.0)
+        state.absorb_engine_route_pieces(pieces)
 
 
 def test_router_replay_short_engine_routes_fail_the_cut_instead_of_padding() -> None:

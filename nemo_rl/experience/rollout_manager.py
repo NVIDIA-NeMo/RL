@@ -18,7 +18,9 @@ import asyncio
 import copy
 import enum
 import json
+import logging
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
@@ -100,10 +102,12 @@ from nemo_rl.telemetry.instrumentation import (
     dispatch_with_trace_context,
     in_per_prompt_scope,
 )
+from nemo_rl.telemetry.setup import telemetry_enabled_in_env
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+_LOGGER = logging.getLogger(__name__)
 RolloutCompletionCallback = Callable[[int, Completion], Awaitable[None]]
 
 if TYPE_CHECKING:
@@ -1369,6 +1373,23 @@ class AsyncNemoGymRolloutImpl:
                             f"outstanding row of this attempt ({sorted(dispatched)})"
                         )
                     received.add(rowidx)
+                    if telemetry_enabled_in_env():
+                        _LOGGER.warning(
+                            "gym_row_ownership %s",
+                            json.dumps(
+                                {
+                                    "event": "row_failure_received",
+                                    "unix_s": time.time(),
+                                    "rollout_id": inputs_by_rowidx[rowidx].get(
+                                        "_ng_rollout_id"
+                                    ),
+                                    "rowidx": rowidx,
+                                    "error_type": type(item.error).__name__,
+                                    "stream_rows": len(dispatched),
+                                    "stream_rows_received": len(received),
+                                }
+                            ),
+                        )
                     if classify_rollout_failure(item.error) is not FailureClass.INFRA:
                         # The prompt fails as a whole; its other rows cannot save it.
                         raise item.error
@@ -1478,6 +1499,20 @@ class AsyncNemoGymRolloutImpl:
         ]
         if not unreturned:
             return
+        if telemetry_enabled_in_env():
+            _LOGGER.warning(
+                "gym_row_ownership %s",
+                json.dumps(
+                    {
+                        "event": "replace_unreturned_begin",
+                        "unix_s": time.time(),
+                        "rollout_ids": [
+                            row.get("_ng_rollout_id") for row in unreturned[:32]
+                        ],
+                        "rows": len(unreturned),
+                    }
+                ),
+            )
         replaced = await dispatch_recorder.replace_dropped(
             [row["_rowidx"] for row in unreturned]
         )

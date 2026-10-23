@@ -20,10 +20,12 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -105,6 +107,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     instrument_aiohttp_client,
     shutdown_telemetry,
+    telemetry_enabled_in_env,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
@@ -764,6 +767,7 @@ class NemoGym(EnvironmentInterface):
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
         self._checkpoint_adapter: Optional[GymCheckpointAdapter] = None
+        self._actor_diagnostics: Any = None
         self._server_client: Any = None
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
@@ -833,6 +837,7 @@ class NemoGym(EnvironmentInterface):
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
+        from nemo_gym.telemetry.actor_diagnostics import ActorDiagnostics
         from omegaconf import DictConfig
 
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
@@ -981,7 +986,10 @@ Depending on your data shape, you may want to change these values."""
             host=self.node_ip,
             port=self.head_server_port,
         )
-        self.rch = RolloutCollectionHelper()
+        # This actor owns one fixed deployment for its lifetime. Avoid fetching
+        # and reconstructing its resolved config once per prompt group.
+        self.rch = RolloutCollectionHelper(reuse_server_client=True)
+        self._actor_diagnostics = ActorDiagnostics(enabled=telemetry_enabled_in_env())
 
     def set_tokenizer(self, tokenizer: PreTrainedTokenizerBase) -> None:
         """Install the tokenizer run_rollouts postprocesses with.
@@ -1022,6 +1030,8 @@ Depending on your data shape, you may want to change these values."""
     async def initialize_checkpoint_adapter(self) -> None:
         """Discover this actor's Gym v2 checkpoint participants once."""
         self._require_spinup()
+        if self._actor_diagnostics is not None:
+            self._actor_diagnostics.start()
         if not self.cfg["turn_checkpointing_enabled"]:
             raise RuntimeError("Gym checkpoint coordination is not enabled")
         if self._checkpoint_adapter is None:
@@ -1047,13 +1057,38 @@ Depending on your data shape, you may want to change these values."""
         checkpoint_id: str,
         *,
         deadline_ts: float,
+        submitted_unix_s: float | None = None,
     ) -> GymCheckpointPrepareSummary:
         """Park this actor's Gym deployment at one recoverable boundary."""
-        result = await self._require_checkpoint_adapter().prepare(
-            checkpoint_id,
-            deadline_ts=deadline_ts,
-        )
-        return GymCheckpointPrepareSummary.from_result(result)
+        entered = time.time()
+        started = monotonic()
+        probe = self._actor_diagnostics
+        if probe is not None:
+            probe.event(
+                "prepare_enter",
+                checkpoint_id=checkpoint_id,
+                submitted_unix_s=submitted_unix_s,
+                submit_to_entry_s=None
+                if submitted_unix_s is None
+                else entered - submitted_unix_s,
+            )
+        outcome = "failed"
+        try:
+            result = await self._require_checkpoint_adapter().prepare(
+                checkpoint_id,
+                deadline_ts=deadline_ts,
+            )
+            summary = GymCheckpointPrepareSummary.from_result(result)
+            outcome = "completed"
+            return summary
+        finally:
+            if probe is not None:
+                probe.event(
+                    "prepare_return",
+                    checkpoint_id=checkpoint_id,
+                    handler_elapsed_s=monotonic() - started,
+                    outcome=outcome,
+                )
 
     @accepts_trace_context
     async def checkpoint_renew(
@@ -1277,7 +1312,8 @@ Depending on your data shape, you may want to change these values."""
             span = streaming_umbrella_span(
                 RLSpanGroup.U_ROLLOUT, "rl.gym.run_rollouts", **attributes
             )
-        with span as activate:
+        probe = getattr(self, "_actor_diagnostics", None)
+        with probe.rollout() if probe is not None else nullcontext(), span as activate:
             inner = self._stream_rollouts(
                 nemo_gym_examples,
                 timer_prefix,
@@ -1325,11 +1361,13 @@ Depending on your data shape, you may want to change these values."""
         timer.start("_run_rollouts_total")
         # Sidecar mode resolves a failed /run to its row rather than an exception
         # that names no row; see _gym_failure_row_error.
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples,
-            head_server_config=self.head_server_config,
-            route_failures_to_sidecar=True,
-        )
+        probe = getattr(self, "_actor_diagnostics", None)
+        with probe.startup() if probe is not None else nullcontext():
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+                route_failures_to_sidecar=True,
+            )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
         _require_resolved_agent_refs(nemo_gym_examples)
@@ -1915,6 +1953,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         cleanup attempt invokes again.
         """
         try:
+            if self._actor_diagnostics is not None:
+                self._actor_diagnostics.close()
             rh, self.rh = self.rh, None
             if rh is not None:
                 rh.shutdown()

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+from collections import defaultdict
 from collections.abc import Callable
 import contextvars
 import copy
@@ -21,11 +22,12 @@ import gc
 import importlib.metadata
 import logging
 import secrets
+import sys
 import threading
 import time
 import uuid
 import warnings
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
@@ -74,6 +76,7 @@ from nemo_rl.experience.route_assembly import (
 )
 from nemo_rl.models.generation.generation_cut_capture import (
     GenerationCutCaptureMixin,
+    _EngineRouteSnapshot,
     _prefix_routes_sha256,
     _CompletedCaptureState,
     _remaining_generation_limits_after_prefix,
@@ -95,7 +98,11 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
-from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.config import (
+    GenerationCutControlConfig,
+    parse_nvfp4_pertoken_rollout,
+)
+from nemo_rl.models.generation.generation_cut_control import GenerationCutControl
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -111,11 +118,20 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.runtime import monitor_app_event_loop, run_in_thread
-from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.telemetry.setup import shutdown_telemetry, telemetry_metrics_exporting
+from nemo_rl.utils.prefix_cut_diagnostics import (
+    prefix_cut_count,
+    prefix_cut_probe,
+    prefix_cut_timing,
+    run_engine_snapshot,
+)
 from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
     decode_routed_experts,
     encode_routed_experts,
 )
+from nemo_rl.utils.vllm_engine_diagnostics import EngineLoopDiagnostics
 
 LOGGER = logging.getLogger(__name__)
 _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
@@ -523,9 +539,22 @@ class _AsyncLLMHTTPClient:
     Add each new member here and decide whether it must run on the engine loop.
     """
 
-    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        engine_client: Any,
+        engine_loop: asyncio.AbstractEventLoop,
+        *,
+        disable_direct_route_snapshot: bool | None = None,
+    ):
         self._engine_client = engine_client
         self._engine_loop = engine_loop
+        self._route_snapshot_state_verified = False
+        self._disable_direct_route_snapshot = disable_direct_route_snapshot
+        self._route_retention_lock = threading.Lock()
+        self._route_retention_requests: set[str] = set()
+        self._completed_route_pieces: dict[str, dict[str, list[Any]]] = {}
+        self._route_finish_original: Callable[..., Any] | None = None
+        self._route_finish_wrapper: Callable[..., Any] | None = None
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -569,6 +598,12 @@ class _AsyncLLMHTTPClient:
 
         iterator = None
         completed = False
+        retain_routes = self._route_finish_original is not None
+        if retain_routes:
+            with self._route_retention_lock:
+                if request_id in self._route_retention_requests:
+                    raise ValueError(f"duplicate active route request {request_id!r}")
+                self._route_retention_requests.add(request_id)
 
         async def next_output() -> Any:
             nonlocal iterator
@@ -586,13 +621,25 @@ class _AsyncLLMHTTPClient:
                     completed = True
                     return
         finally:
-            if not completed:
-                try:
-                    await self._run_on_engine_loop(
-                        lambda: self._engine_client.abort(request_id)
-                    )
-                except Exception:
-                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+            try:
+                if not completed:
+                    try:
+                        await self._run_on_engine_loop(
+                            lambda: self._engine_client.abort(request_id)
+                        )
+                    except Exception:
+                        LOGGER.exception("Failed to abort vLLM request %s", request_id)
+            finally:
+                if retain_routes:
+                    # The HTTP consumer observes the yielded output before
+                    # asking for the next one. On normal exhaustion its capture
+                    # state therefore owns the terminal routes already.
+                    with self._route_retention_lock:
+                        self._route_retention_requests.discard(request_id)
+                        released = self._completed_route_pieces.pop(request_id, None)
+                    # Freeing thousands of arrays must not hold the lock the
+                    # engine's synchronous completion hook needs.
+                    del released
 
     # These members only read engine status or immutable configuration. Running
     # them on the engine loop added a cross-thread wait to each HTTP request.
@@ -630,6 +677,7 @@ class _AsyncLLMHTTPClient:
             RuntimeError: vLLM is not the release that state was verified on,
                 or its output processor lacks the fields read.
         """
+        self._route_snapshot_state_verified = False
         installed = importlib.metadata.version("vllm")
         if Version(installed).release[:3] != _ROUTE_SNAPSHOT_VLLM_RELEASE:
             expected = ".".join(map(str, _ROUTE_SNAPSHOT_VLLM_RELEASE))
@@ -641,7 +689,7 @@ class _AsyncLLMHTTPClient:
         output_processor = self._engine_client.output_processor
         missing = [
             name
-            for name in ("external_req_ids", "request_states")
+            for name in ("external_req_ids", "request_states", "_finish_request")
             if not hasattr(output_processor, name)
         ]
         if missing:
@@ -649,11 +697,82 @@ class _AsyncLLMHTTPClient:
                 "router-replay prefix recovery needs vLLM's "
                 f"OutputProcessor.{', '.join(missing)}, which this vLLM lacks"
             )
+        self._install_route_retention()
+        self._route_snapshot_state_verified = True
+        LOGGER.info(
+            "generation_route_snapshot mode=%s vllm=%s completion_retention=enabled",
+            "direct_refs" if self._direct_route_snapshot_enabled() else "engine_loop",
+            installed,
+        )
+
+    def _install_route_retention(self) -> None:
+        """Retain route lists before vLLM removes a completed request's lookup.
+
+        The verified vLLM 0.29 completion path enqueues its final output then
+        calls this synchronous hook. Retain references only for this adapter's
+        active consumers, without joining, cloning or encoding any route data.
+        Both direct and owner-loop readers use the same completion fallback.
+        """
+        if self._route_finish_original is not None:
+            return
+        processor = self._engine_client.output_processor
+        original = processor._finish_request
+        if not callable(original):
+            raise RuntimeError("vLLM OutputProcessor._finish_request must be callable")
+
+        def finish(state: Any) -> Any:
+            with self._route_retention_lock:
+                if state.external_req_id in self._route_retention_requests:
+                    pieces = getattr(state, "routed_experts_chunks", None)
+                    if type(pieces) is list:
+                        retained = self._completed_route_pieces.setdefault(
+                            state.external_req_id, {}
+                        )
+                        retained[state.request_id] = pieces
+            return original(state)
+
+        self._route_finish_original = original
+        self._route_finish_wrapper = finish
+        processor._finish_request = finish
+
+    def close_route_snapshots(self) -> None:
+        """Remove the instance-local completion hook and release retained lists."""
+        processor = self._engine_client.output_processor
+        with self._route_retention_lock:
+            if (
+                self._route_finish_original is not None
+                and processor._finish_request is self._route_finish_wrapper
+            ):
+                processor._finish_request = self._route_finish_original
+            self._route_retention_requests.clear()
+            released = self._completed_route_pieces
+            self._completed_route_pieces = {}
+            self._route_finish_original = None
+            self._route_finish_wrapper = None
+            self._route_snapshot_state_verified = False
+        released.clear()
+
+    def _direct_route_snapshot_enabled(self) -> bool:
+        """Allow reference-only reads for the verified GIL-owned state layout."""
+        if (
+            not self._route_snapshot_state_verified
+            or self._disable_direct_route_snapshot
+        ):
+            return False
+        gil_enabled = getattr(sys, "_is_gil_enabled", None)
+        processor = self._engine_client.output_processor
+        return (
+            sys.implementation.name == "cpython"
+            and gil_enabled is not None
+            and gil_enabled()
+            and type(processor.external_req_ids) in (dict, defaultdict)
+            and type(processor.request_states) is dict
+        )
 
     def snapshot_routed_experts(
         self, request_id: str, *, timeout_s: float | None
     ) -> list[Any] | None:
-        """Copy an active request's route chunks on the engine loop.
+        """Copy route references directly when safe, otherwise on the engine loop.
 
         vLLM 0.29 keeps routed experts in ``OutputProcessor.RequestState``
         while decoding, only ever appends to them, and publishes them in
@@ -661,47 +780,108 @@ class _AsyncLLMHTTPClient:
         them here, from its own thread, after freezing the call's tokens.
 
         Returns:
-            The request's route chunks in order, or ``None`` once the request
-            has left vLLM.
+            The live or retained completed route chunks in order, or ``None``
+            once neither source owns the request's routes.
 
         Raises:
-            TimeoutError: the engine loop did not answer within ``timeout_s``.
+            TimeoutError: the deadline passed or the fallback engine loop did not answer.
             ValueError: more than one vLLM request serves ``request_id``, or its
                 state has no route chunks.
         """
 
-        async def snapshot() -> list[Any] | None:
-            return self._routed_expert_chunks_on_owner(request_id)
+        if timeout_s is not None and timeout_s <= 0:
+            raise TimeoutError("generation route snapshot deadline passed")
+        if self._direct_route_snapshot_enabled():
+            prefix_cut_count("engine_snapshot_direct_reads", 1)
+            with prefix_cut_timing("engine_snapshot_direct_read"):
+                return self._routed_expert_chunks(request_id)
+        return run_engine_snapshot(
+            lambda: self._routed_expert_chunks(request_id),
+            loop=self._engine_loop,
+            timeout_s=timeout_s,
+        )
 
-        future = asyncio.run_coroutine_threadsafe(snapshot(), self._engine_loop)
-        try:
-            return future.result(timeout=timeout_s)
-        except TimeoutError:
-            future.cancel()
-            raise
+    def _routed_expert_chunks(self, request_id: str) -> list[Any] | None:
+        """Copy published route references on the owner or verified GIL path.
 
-    def _routed_expert_chunks_on_owner(self, request_id: str) -> list[Any] | None:
-        """List one request's route chunks while on the engine loop.
-
-        A shallow copy: vLLM appends new chunks but never rewrites one.
+        Completed route lists remain available until the HTTP consumer has
+        observed the final output. In the verified vLLM release, chunks are appended
+        but never rewritten. CPython copies a plain list while holding the GIL,
+        so the result is a stable prefix of references, not a tensor-byte copy.
+        The caller still validates coverage of its already-frozen token prefix.
         """
         output_processor = self._engine_client.output_processor
-        internal_ids = list(output_processor.external_req_ids.get(request_id, ()))
-        if not internal_ids:
+        internal_ids = output_processor.external_req_ids.get(request_id, ())
+        if self._direct_route_snapshot_enabled() and type(internal_ids) not in (
+            list,
+            tuple,
+        ):
+            raise ValueError("direct route snapshot needs a built-in request-ID list")
+        internal_ids = list(internal_ids)
+        state = (
+            output_processor.request_states.get(internal_ids[0])
+            if len(internal_ids) == 1
+            else None
+        )
+        # Read retained entries AFTER the live lookup: completion publishes
+        # them before removing the engine entry, so removal during the lookup
+        # cannot leave a gap. Cleanup follows HTTP terminal-route publication.
+        with self._route_retention_lock:
+            retained = dict(self._completed_route_pieces.get(request_id, {}))
+        all_ids = set(internal_ids) | retained.keys()
+        if not all_ids:
             return None
-        if len(internal_ids) != 1:
+        if len(all_ids) != 1:
             raise ValueError(
                 "router-replay prefix capture requires exactly one active "
-                f"vLLM request for {request_id!r}; found {len(internal_ids)}"
+                f"vLLM request for {request_id!r}; found {len(all_ids)}"
             )
-        state = output_processor.request_states.get(internal_ids[0])
         if state is None:
+            pieces = retained.get(next(iter(all_ids)))
+            if pieces is not None:
+                prefix_cut_count("engine_snapshot_retained_reads", 1)
+                return list(pieces)
             return None
         # Checked per call, not at setup: only a live request has this field.
         chunks = getattr(state, "routed_experts_chunks", None)
         if chunks is None:
             raise ValueError("vLLM's request state has no routed_experts_chunks")
+        if self._direct_route_snapshot_enabled() and type(chunks) is not list:
+            raise ValueError("direct route snapshot needs a built-in route-piece list")
         return list(chunks)
+
+    def snapshot_routed_experts_many(
+        self, request_ids: list[str], *, timeout_s: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Copy a bounded group's references directly or in one owner-loop handoff.
+
+        All token boundaries must already be frozen. The callback does no
+        tensor assembly or encoding. A bad request fails only its own lookup;
+        a timeout applies to the whole handoff, not separately to every call.
+        """
+        if not request_ids:
+            return {}
+        if timeout_s is not None and timeout_s <= 0:
+            raise TimeoutError("generation route snapshot deadline passed")
+
+        def read_many() -> dict[str, _EngineRouteSnapshot]:
+            results = {}
+            for request_id in request_ids:
+                try:
+                    results[request_id] = _EngineRouteSnapshot(
+                        routes=self._routed_expert_chunks(request_id)
+                    )
+                except (TypeError, ValueError) as error:
+                    results[request_id] = _EngineRouteSnapshot(error=error)
+            return results
+
+        if self._direct_route_snapshot_enabled():
+            prefix_cut_count("engine_snapshot_direct_reads", 1)
+            with prefix_cut_timing("engine_snapshot_direct_read"):
+                return read_many()
+        return run_engine_snapshot(
+            read_many, loop=self._engine_loop, timeout_s=timeout_s
+        )
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -776,9 +956,21 @@ class VllmAsyncGenerationWorkerImpl(
         self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
         # A dedicated executor prevents completions waiting on the closed gate
         # from consuming all threads needed to create the checkpoint cut.
+        cut_control_config = (
+            GenerationCutControlConfig.model_validate(config["generation_cut_control"])
+            if "generation_cut_control" in config
+            else GenerationCutControlConfig()
+        )
+        self._generation_cut_control = GenerationCutControl(
+            max_workers=cut_control_config.max_workers
+        )
         self._generation_cut_control_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=cut_control_config.max_workers,
             thread_name_prefix="nrl-generation-cut-control",
+        )
+        LOGGER.info(
+            "generation_cut_control max_workers=%d guarded_admission=enabled",
+            cut_control_config.max_workers,
         )
         # Fence closes get their own thread so a stale cut still staging rows
         # cannot delay the next checkpoint's fence past the driver's timeout.
@@ -800,6 +992,7 @@ class VllmAsyncGenerationWorkerImpl(
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
         self._generation_prefix_reader: PrefixReadBatcher | None = None
+        self._engine_loop_diagnostics: EngineLoopDiagnostics | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -1052,6 +1245,26 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def post_init_async(self):
         self._engine_loop = asyncio.get_running_loop()
+        if self.llm is not None and telemetry_metrics_exporting():
+            # vLLM is optional outside its worker environment. Observe its
+            # existing output processor, without replacing the engine loop.
+            try:
+                from vllm import envs as vllm_envs
+                from vllm.v1.engine.output_processor import RequestState
+
+                diagnostics = EngineLoopDiagnostics(
+                    self.llm.output_processor,
+                    RequestState,
+                    chunk_size=vllm_envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE,
+                    torch_threads=torch.get_num_threads(),
+                )
+                diagnostics.start()
+                self._engine_loop_diagnostics = diagnostics
+            except Exception:
+                # Optional diagnostics must never stop generation startup.
+                LOGGER.warning(
+                    "Could not start engine-owner-loop diagnostics", exc_info=True
+                )
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
@@ -1081,7 +1294,13 @@ class VllmAsyncGenerationWorkerImpl(
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
         if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self._http_engine_client = _AsyncLLMHTTPClient(
+                self.llm,
+                self._engine_loop,
+                disable_direct_route_snapshot=self.cfg.get(
+                    "disable_direct_route_snapshot"
+                ),
+            )
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
@@ -1266,6 +1485,7 @@ class VllmAsyncGenerationWorkerImpl(
         media: CapturedMedia | None = None,
         generation_cut: Any | None = None,
         generation_cut_routed_experts: torch.Tensor | None = None,
+        generation_cut_chunk_digests: tuple[str, ...] | None = None,
         resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
@@ -1315,6 +1535,11 @@ class VllmAsyncGenerationWorkerImpl(
                 list(admission.generation_cut.staging_keys)
                 if admission.generation_cut is not None
                 else []
+            ),
+            generation_cut_chunk_digests=(
+                list(generation_cut_chunk_digests)
+                if generation_cut_chunk_digests is not None
+                else (None if admission.generation_cut is not None else [])
             ),
         )
         with self._capture_registry_lock:
@@ -1409,24 +1634,29 @@ class VllmAsyncGenerationWorkerImpl(
 
     def _snapshot_engine_routed_experts(
         self, engine_request_id: str, *, timeout_s: float | None
-    ) -> torch.Tensor | None:
-        """Return an active request's full-sequence routes from vLLM."""
+    ) -> list[Any] | None:
+        """Return immutable route-piece references; the cut owns assembly."""
         assert self._http_engine_client is not None  # setup_token_capture checks
-        chunks = self._http_engine_client.snapshot_routed_experts(
-            engine_request_id, timeout_s=timeout_s
+        with prefix_cut_timing("engine_snapshot_wait"):
+            return self._http_engine_client.snapshot_routed_experts(
+                engine_request_id, timeout_s=timeout_s
+            )
+
+    def _snapshot_engine_routed_experts_many(
+        self, engine_request_ids: list[str], *, deadline: float | None
+    ) -> dict[str, _EngineRouteSnapshot]:
+        """Read one frozen group using one engine-owner scheduling round trip."""
+        assert self._http_engine_client is not None  # setup_token_capture checks
+        timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        prefix_cut_count("engine_snapshot_groups", 1)
+        prefix_cut_count("engine_snapshot_requests", len(engine_request_ids))
+        prefix_cut_count(
+            "max_engine_snapshot_group_calls", len(engine_request_ids), maximum=True
         )
-        if chunks is None:
-            return None
-        if not chunks:
-            raise ValueError("vLLM has not routed any token of the request yet")
-        tensors = [torch.as_tensor(chunk) for chunk in chunks]
-        model_shape = tuple(tensors[0].shape[1:])
-        if any(
-            tensor.dim() != 3 or tuple(tensor.shape[1:]) != model_shape
-            for tensor in tensors
-        ):
-            raise ValueError("vLLM route chunks must share shape [*, layers, topk]")
-        return torch.cat(tensors, dim=0)
+        with prefix_cut_timing("engine_snapshot_wait"):
+            return self._http_engine_client.snapshot_routed_experts_many(
+                engine_request_ids, timeout_s=timeout_s
+            )
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -1684,16 +1914,17 @@ class VllmAsyncGenerationWorkerImpl(
     @staticmethod
     def _delta_align_routed_experts(
         payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
-    ) -> None:
-        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
+    ) -> RoutedExpertsStagingPayload | None:
+        """Align routes and retain the tensor behind the staged envelope."""
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
-            return
+            return None
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
         if routed is None:
-            return
+            return None
+        route_payload = None
         try:
             experts = decode_routed_experts(routed)
             expected_full_len = prompt_len + generated_len
@@ -1703,7 +1934,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             start = prev_len - boundary_route_rows(prev_len)
-            message["routed_experts"] = encode_routed_experts(experts[start:])
+            route_payload = RoutedExpertsStagingPayload(experts[start:])
+            message["routed_experts"] = route_payload.encoded
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping invalid routed_experts from staged capture: %s", error
@@ -1711,6 +1943,7 @@ class VllmAsyncGenerationWorkerImpl(
             message.pop("routed_experts", None)
         choice["message"] = message
         payload["choices"] = [choice]
+        return route_payload
 
     def _merge_generation_cut_routed_experts(
         self,
@@ -1719,7 +1952,8 @@ class VllmAsyncGenerationWorkerImpl(
         restored: torch.Tensor | None,
         prev_len: int,
         generated_len: int,
-    ) -> torch.Tensor | None:
+        route_payload: RoutedExpertsStagingPayload | None = None,
+    ) -> tuple[torch.Tensor | None, RoutedExpertsStagingPayload | None]:
         """Keep old prefix routes and current-policy boundary/suffix routes.
 
         A resumed row trains with the saved routes for the restored prefix, and
@@ -1738,14 +1972,14 @@ class VllmAsyncGenerationWorkerImpl(
         it.
 
         Returns:
-            The restored prefix's rows of the staged routes (one per prefix
-            delta token), or ``None`` when no routes were merged.
+            The restored prefix's rows (or ``None``), and the local tensor
+            attachment matching the final envelope in the response payload.
         """
         if restored is None:
-            return None
+            return None, route_payload
         choices = payload.get("choices") or []
         if len(choices) != 1 or not isinstance(choices[0], dict):
-            return None
+            return None, None
         choice = dict(choices[0])
         message = dict(choice.get("message") or {})
         routed = message.get("routed_experts")
@@ -1755,9 +1989,13 @@ class VllmAsyncGenerationWorkerImpl(
                 "resumed generation staged no routed_experts to restore its "
                 "prefix's routes into"
             )
-            return None
+            return None, None
         try:
-            current = decode_routed_experts(routed)
+            current = (
+                decode_routed_experts(routed)
+                if route_payload is None
+                else route_payload.tensor_for_payload(routed).clone()
+            )
             restored = restored.to(dtype=current.dtype)
             if current.dim() != 3 or tuple(current.shape[1:]) != tuple(
                 restored.shape[1:]
@@ -1773,17 +2011,21 @@ class VllmAsyncGenerationWorkerImpl(
             current[boundary_rows : boundary_rows + replace_len] = restored[
                 :replace_len
             ]
-            message["routed_experts"] = encode_routed_experts(current)
-            merged = current[boundary_rows : boundary_rows + restored.shape[0]]
+            route_payload = RoutedExpertsStagingPayload(current)
+            message["routed_experts"] = route_payload.encoded
+            merged = route_payload.tensor_for_payload(route_payload.encoded)[
+                boundary_rows : boundary_rows + restored.shape[0]
+            ]
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
                 "dropping routed_experts the restored prefix does not fit: %s", error
             )
             message.pop("routed_experts", None)
             merged = None
+            route_payload = None
         choice["message"] = message
         payload["choices"] = [choice]
-        return merged
+        return merged, route_payload
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Run terminal token staging outside an active checkpoint cut."""
@@ -1854,27 +2096,39 @@ class VllmAsyncGenerationWorkerImpl(
         adapter = self.token_capture.adapter
         generated_token_ids: list[int] = []
         staged_prefix_routes = None
+        route_payload = None
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
             except Exception:  # capture core will report the authoritative failure
                 generated_token_ids = []
-            self._delta_align_routed_experts(
+            route_payload = self._delta_align_routed_experts(
                 payload,
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-            staged_prefix_routes = self._merge_generation_cut_routed_experts(
-                payload,
-                restored=state.restored_routed_experts,
-                prev_len=call.admission.prev_len,
-                generated_len=len(generated_token_ids),
+            staged_prefix_routes, route_payload = (
+                self._merge_generation_cut_routed_experts(
+                    payload,
+                    restored=state.restored_routed_experts,
+                    prev_len=call.admission.prev_len,
+                    generated_len=len(generated_token_ids),
+                    route_payload=route_payload,
+                )
             )
+        attachments: Mapping[str, Any] | None = (
+            state.media.tensors if state.media is not None else None
+        )
+        if route_payload is not None:
+            attachments = {
+                **(attachments or {}),
+                ROUTED_EXPERTS_STAGING_ATTACHMENT: route_payload,
+            }
         coords = self.token_capture.complete_call_from_response(
             call,
             payload,
-            attachments=state.media.tensors if state.media is not None else None,
+            attachments=attachments or None,
         )
         total_generation_token_count = len(generated_token_ids)
         if call.generation_cut is not None:
@@ -2138,6 +2392,7 @@ class VllmAsyncGenerationWorkerImpl(
                 generation_cut = None
                 restored_generation_media = None
                 generation_cut_routed_experts = None
+                generation_cut_chunk_digests = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if admission is not None:
@@ -2174,6 +2429,7 @@ class VllmAsyncGenerationWorkerImpl(
                         generation_cut = resolved_cut.snapshot
                         restored_generation_media = resolved_cut.media
                         generation_cut_routed_experts = resolved_cut.routed_experts
+                        generation_cut_chunk_digests = resolved_cut.chunk_digests
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
                         restored_request_output_tokens = (
@@ -2242,6 +2498,7 @@ class VllmAsyncGenerationWorkerImpl(
                         media=media,
                         generation_cut=generation_cut,
                         generation_cut_routed_experts=generation_cut_routed_experts,
+                        generation_cut_chunk_digests=generation_cut_chunk_digests,
                         resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
@@ -2386,6 +2643,7 @@ class VllmAsyncGenerationWorkerImpl(
                     media=media,
                     generation_cut=generation_cut,
                     generation_cut_routed_experts=generation_cut_routed_experts,
+                    generation_cut_chunk_digests=generation_cut_chunk_digests,
                     resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 
@@ -2478,13 +2736,18 @@ class VllmAsyncGenerationWorkerImpl(
             # Measured from arrival so time queued behind a stale cut counts.
             timeout_s = worker_self._generation_cut_control_timeout_s
             deadline = None if timeout_s is None else time.monotonic() + timeout_s
-            receipt = await worker_self._run_generation_cut_control(
-                functools.partial(
-                    worker_self._checkpoint_generation_cut,
-                    typed_inventory,
-                    deadline=deadline,
+            with prefix_cut_probe(
+                enabled=telemetry_metrics_exporting(),
+                checkpoint_id=typed_inventory.checkpoint_id,
+                inventory_digest=typed_inventory.inventory_digest,
+                calls=len(typed_inventory.active_prefixes),
+                deadline=deadline,
+            ):
+                receipt = await worker_self._checkpoint_generation_cut_control(
+                    typed_inventory, deadline=deadline
                 )
-            )
+                for acknowledgement in receipt.prefixes:
+                    prefix_cut_count(f"ack_{acknowledgement.disposition}", 1)
             return receipt.model_dump(mode="json")
 
         class NeMoRLOpenAIServingChatMixin:
@@ -3815,6 +4078,9 @@ class VllmAsyncGenerationWorkerImpl(
             )
             if token_capture_snapshot_gate is not None:
                 token_capture_snapshot_gate.reopen()
+            cut_control = getattr(self, "_generation_cut_control", None)
+            if cut_control is not None:
+                cut_control.close()
             for executor_name in (
                 "_generation_cut_control_executor",
                 "_token_capture_fence_executor",
@@ -3827,6 +4093,9 @@ class VllmAsyncGenerationWorkerImpl(
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
                 self.server_thread = None
+
+            if self._http_engine_client is not None:
+                self._http_engine_client.close_route_snapshots()
 
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
@@ -3854,6 +4123,16 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
+            diagnostics = getattr(self, "_engine_loop_diagnostics", None)
+            if diagnostics is not None:
+                try:
+                    await diagnostics.aclose()
+                except Exception:
+                    LOGGER.warning(
+                        "Could not close engine-owner-loop diagnostics", exc_info=True
+                    )
+                finally:
+                    self._engine_loop_diagnostics = None
             # Flush buffered spans before the actor goes away, off the event
             # loop: the export blocks for up to 5s and this async actor's
             # in-flight generate requests share the loop. Shielded because a

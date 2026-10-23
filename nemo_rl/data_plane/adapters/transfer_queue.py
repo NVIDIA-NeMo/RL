@@ -59,6 +59,7 @@ from nemo_rl.data_plane.interfaces import (
     data_plane_supports_checkpointing,
     storage_unit_placement,
 )
+from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase_sync
 
@@ -1060,6 +1061,11 @@ def _from_wire(td: TensorDict) -> TensorDict:
     the dense value then fails the ``is_nested`` check in
     ``codec.materialize`` and reaches ``get_multimodal_dict`` unreassembled.
     ``codec.materialize`` applies the same exclusion.
+
+    Fields padded per microbatch also stay nested, even for a single row.
+    The worker intentionally skips their batch-wide padding; densifying
+    them here would expose a short dense sequence to Megatron's batch
+    validation before microbatch padding can run.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
     # not keys(leaves_only=True) -- iterating the latter would silently drop
@@ -1080,6 +1086,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
                 isinstance(v, torch.Tensor)
                 and v.is_nested
                 and field_name not in PACKED_MULTIMODAL_FIELDS
+                and field_name not in MICROBATCH_PADDED_FIELDS
             ):
                 rows = list(v.unbind())
                 if rows and all(row.shape == rows[0].shape for row in rows[1:]):
