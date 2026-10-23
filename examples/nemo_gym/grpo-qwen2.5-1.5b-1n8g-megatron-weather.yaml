@@ -1,5 +1,6 @@
-# GRPO with Qwen2.5-1.5B and episodes coordinated by an Environment Server.
+# GRPO with Qwen2.5-1.5B, Megatron training, and Environment Server orchestration.
 # Prepare the taskset data as described in docs/design-docs/nemo-gym-integration.md.
+# The parent supplies Megatron TP=2, its optimizer, and the one-node/eight-GPU setup.
 defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
 
 grpo:
@@ -9,19 +10,6 @@ grpo:
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   max_total_sequence_length: 2048
-  automodel_cfg:
-    enabled: true
-    tensor_parallel_size: 1
-  megatron_cfg:
-    _override_: true
-    enabled: false
-  optimizer:
-    name: torch.optim.AdamW
-    kwargs:
-      lr: 5.0e-06
-      weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1.0e-08
   generation:
     vllm_cfg:
       http_server_serving_chat_kwargs:
@@ -59,9 +47,9 @@ env:
           resources_tool_transports: [direct_http]
 
 checkpointing:
-  checkpoint_dir: results/grpo-single-agent-turn
+  checkpoint_dir: results/grpo-qwen2.5-1.5b-megatron-weather
 logger:
-  log_dir: logs/grpo-single-agent-turn
+  log_dir: logs/grpo-qwen2.5-1.5b-megatron-weather
   wandb:
     project: nemo-rl
-    name: grpo-single-agent-turn
+    name: grpo-qwen2.5-1.5b-megatron-weather
