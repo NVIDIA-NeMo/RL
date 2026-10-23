@@ -46,6 +46,25 @@ MEGATRON_LM_PYPROJECT = (
 MEGATRON_LM_ENERGON_SPEC = "~=7.0"
 
 
+@pytest.mark.parametrize("name", ["mamba-ssm", "causal-conv1d"])
+def test_vllm_remote_ssm_models_use_pinned_dependencies(name):
+    """FP8 parameter enumeration imports the remote Nemotron-H model code."""
+    requirement = _requirement(ROOT_PYPROJECT, "vllm", name)
+    assert requirement.marker is None
+    project = tomllib.loads(ROOT_PYPROJECT.read_text())
+    source = project["tool"]["uv"]["sources"][name]
+    assert source["git"]
+    assert len(source["rev"]) == 40
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text())
+    root = next(package for package in lock["package"] if package["name"] == "nemo-rl")
+    assert {"name": name} in root["optional-dependencies"]["vllm"]
+    locked = [package for package in lock["package"] if package["name"] == name]
+    assert len(locked) == 1
+    assert locked[0]["source"]["git"] == (
+        f"{source['git']}?rev={source['rev']}#{source['rev']}"
+    )
+
+
 def _requirement(pyproject: Path, extra: str, name: str) -> Requirement:
     """The lone requirement for `name` in `pyproject`'s `extra` optional-dependency list."""
     project = tomllib.loads(pyproject.read_text())["project"]
