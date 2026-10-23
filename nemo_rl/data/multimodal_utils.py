@@ -271,6 +271,14 @@ def register_packed_multimodal_fields(names: list[str] | None) -> None:
         "max_seqlen",
         "seq_idx",
         "padding_mask",
+        # Model forward arguments and kwargs supplied by the trainers.
+        "extra_block_kwargs",
+        "mtp_input_mask",
+        "output_processor",
+        "output_processor_context",
+        "is_spec_decode",
+        "use_cache",
+        "flash_attn_kwargs",
     }
     with G_PACKED_FIELDS_LOCK:
         # Native packed fields remain valid transport inputs, but are not custom.

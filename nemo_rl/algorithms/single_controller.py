@@ -153,7 +153,10 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.factory import configure_multimodal_fields
+from nemo_rl.data_plane.factory import (
+    configure_multimodal_fields,
+    declared_packed_fields,
+)
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     is_metrics_client,
@@ -473,9 +476,7 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
-                    packed_multimodal_fields=master_config.data_plane.get(
-                        "packed_multimodal_fields"
-                    ),
+                    data_plane_config=master_config.data_plane,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
@@ -1782,10 +1783,8 @@ class SingleControllerActor:
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
-            "packed_multimodal_fields": sorted(
-                set(
-                    self._master_config.data_plane.get("packed_multimodal_fields") or ()
-                )
+            "packed_multimodal_fields": declared_packed_fields(
+                self._master_config.data_plane
             ),
         }
         if replay_metadata is not None:

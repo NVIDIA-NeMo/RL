@@ -3321,7 +3321,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
-            packed_multimodal_fields=current,
+            data_plane_config={"packed_multimodal_fields": current},
         )
         if accepted:
             assert (
