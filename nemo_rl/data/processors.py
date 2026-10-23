@@ -723,7 +723,9 @@ def vlm_hf_data_processor(
             vllm_modality_items.setdefault(content_type, []).append(vllm_value)
     else:
         # conversation consists of a text-only message
-        user_message["content"] = task_data_spec.prompt.format(problem)
+        user_message["content"] = (
+            task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+        )
 
     images = vllm_modality_items.get("image", [])
     # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
@@ -753,8 +755,17 @@ def vlm_hf_data_processor(
     else:
         user_message_for_chat_template = user_message_for_tokenize
 
+    # Render the full conversation together, as in math_hf_data_processor. A
+    # one-element list has nowhere to put task_data_spec.system_prompt, so
+    # data.*.system_prompt_file never reached the model on this path.
+    system_message = (
+        [{"role": "system", "content": task_data_spec.system_prompt}]
+        if task_data_spec.system_prompt
+        else []
+    )
+
     string_formatted_dialog = processor.apply_chat_template(
-        [user_message_for_chat_template],
+        system_message + [user_message_for_chat_template],
         tokenize=False,
         add_generation_prompt=True,
     )
@@ -772,7 +783,7 @@ def vlm_hf_data_processor(
         )
     else:
         message = processor.apply_chat_template(
-            [user_message_for_tokenize],
+            system_message + [user_message_for_tokenize],
             tokenize=True,
             add_generation_prompt=True,
             return_tensors="pt",
