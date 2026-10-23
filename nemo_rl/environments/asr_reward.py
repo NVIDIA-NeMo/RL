@@ -63,9 +63,18 @@ def asr_reward(reference: str, hypothesis: str, metadata: dict[str, Any]) -> flo
             raise ValueError(
                 f"Unsupported reward metric {metric!r} for {language!r}/{metadata.get('task')!r}"
             )
-        # rapidfuzz is provided by the speech scoring dependency jiwer.
-        from rapidfuzz.distance import Levenshtein
-
         ref, hyp = normalize_asr_tokens(reference), normalize_asr_tokens(hypothesis)
-        error = Levenshtein.distance(ref, hyp) / len(ref) if ref else len(hyp)
+        error = _edit_distance(ref, hyp) / len(ref) if ref else len(hyp)
     return 1.0 - error
+
+
+def _edit_distance(ref: list[str], hyp: list[str]) -> int:
+    row = list(range(len(hyp) + 1))
+    for i, ref_token in enumerate(ref, 1):
+        diagonal, row[0] = row[0], i
+        for j, hyp_token in enumerate(hyp, 1):
+            diagonal, row[j] = (
+                row[j],
+                min(row[j] + 1, row[j - 1] + 1, diagonal + (ref_token != hyp_token)),
+            )
+    return row[-1]

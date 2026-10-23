@@ -353,12 +353,9 @@ def test_initializer_pins_interpreter_even_when_it_matches_driver(
     try:
         assert captured
         assert all(env.get("py_executable") == sys.executable for env in captured)
-        assert (
-            os.path.abspath(
-                ray.get(group.workers[0].get_actual_python_executable_path.remote())
-            )
-            == os.path.abspath(sys.executable)
-        )
+        assert os.path.abspath(
+            ray.get(group.workers[0].get_actual_python_executable_path.remote())
+        ) == os.path.abspath(sys.executable)
     finally:
         group.shutdown(force=True)
 

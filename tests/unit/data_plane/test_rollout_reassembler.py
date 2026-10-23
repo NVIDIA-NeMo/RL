@@ -1488,6 +1488,7 @@ def test_penalized_rewards_reach_grpo_advantages_without_token_changes(
     estimator = object.__new__(GRPOAdvantageEstimator)
     estimator.use_leave_one_out_baseline = False
     estimator.normalize_rewards = False
+    estimator.full_group_std = False
     advantages = estimator.compute_advantage(
         torch.stack(
             [torch.as_tensor(prompt).flatten() for prompt in rows["prompt_ids_for_adv"]]

@@ -21,13 +21,13 @@ loss_fn:
   token_level_loss: false
   reference_policy_kl_penalty: 0.0
 checkpointing:
-  checkpoint_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR}/checkpoints
+  checkpoint_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR,results/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400}/checkpoints
   metric_name: null
   keep_top_k: 20
   save_period: 20
   checkpoint_must_save_by: 00:03:20:00
 policy:
-  model_name: ${oc.env:SPEECHLM_GSPO_MODEL}
+  model_name: ${oc.env:SPEECHLM_GSPO_MODEL,nvidia/Nemotron-3.5-Transcribe-30B-A4B}
   tokenizer:
     chat_template: default
     chat_template_kwargs:
@@ -329,7 +329,6 @@ policy:
   automodel_cfg:
     checkpoint:
       model_save_format: torch_save
-      save_consolidated: 'false'
     activation_checkpointing: true
     expert_parallel_size: 8
     moe_parallelizer:
@@ -384,7 +383,7 @@ data:
     env_name: asr
   train:
     dataset_name: ResponseDataset
-    data_path: ${oc.env:SPEECHLM_GSPO_DATA}
+    data_path: ${oc.env:SPEECHLM_GSPO_DATA,/path/to/consumer.parquet}
     input_key: prompt
     output_key: expected_answer
     processor: asr
@@ -396,7 +395,7 @@ env:
   asr:
     num_workers: 1
 logger:
-  log_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR}/logs
+  log_dir: ${oc.env:SPEECHLM_GSPO_OUTPUT_DIR,results/vlm_grpo-nemotron-speechlm-30ba3b-4n8g-automodel-ep8-gspo-cer400}/logs
   tensorboard_enabled: true
 cluster:
   num_nodes: 4
