@@ -76,6 +76,8 @@ from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     PositiveLengthReweightStats,
+    per_turn_length_reweight_config,
+    reweight_positive_text_per_turn,
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
@@ -6361,16 +6363,34 @@ class SingleControllerActor:
             advantages = torch.zeros_like(mask)
             if self._is_ppo:
                 returns = torch.zeros_like(mask)
-        if (
-            has_valid_training_tokens
-            and isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-            and self._advantage_estimator.last_length_reweight_stats is not None
+        # grpo.adv_estimator.positive_length_reweight: the trajectory scope ran inside the
+        # estimator; the per-turn scopes run here, on every row after the rollout broadcast and
+        # before message penalties, a rollout's rows measured and weighted together.
+        reweight_stats: Optional[PositiveLengthReweightStats] = None
+        if has_valid_training_tokens and isinstance(
+            self._advantage_estimator, GRPOAdvantageEstimator
         ):
+            reweight_stats = self._advantage_estimator.last_length_reweight_stats
+        per_turn_reweight = per_turn_length_reweight_config(self._algo_cfg)
+        if per_turn_reweight is not None and has_valid_training_tokens:
+            advantages, reweight_stats = reweight_positive_text_per_turn(
+                advantages,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                mask=mask,
+                assistant_turn_id=tensor_field(data, adv_cfg.assistant_turn_id_field),
+                thinking_mask=tensor_field(data, adv_cfg.thinking_mask_field),
+                action_mask=tensor_field(data, adv_cfg.action_mask_field),
+                valid=final_sample_mask > 0,
+                config=per_turn_reweight,
+                row_to_rollout=identity.row_to_canonical if has_extra_rows else None,
+                # The final answer is in the canonical (terminal) row's last turn.
+                final_answer_rows=identity.is_canonical if has_extra_rows else None,
+            )
+        if reweight_stats is not None:
             if self._length_reweight_stats is None:
                 self._length_reweight_stats = PositiveLengthReweightStats.empty()
-            self._length_reweight_stats.merge(
-                self._advantage_estimator.last_length_reweight_stats
-            )
+            self._length_reweight_stats.merge(reweight_stats)
 
         if self._message_level_advantage_penalties_enabled:
             # Sequence-error filtering and the pre-existing sample mask remain
@@ -6593,6 +6613,14 @@ class SingleControllerActor:
                 [
                     adv_cfg.invalid_tool_call_mask_field,
                     adv_cfg.malformed_thinking_mask_field,
+                ]
+            )
+        if per_turn_length_reweight_config(self._algo_cfg) is not None:
+            fields.extend(
+                [
+                    adv_cfg.assistant_turn_id_field,
+                    adv_cfg.thinking_mask_field,
+                    adv_cfg.action_mask_field,
                 ]
             )
         if self._policy_logprobs_required:

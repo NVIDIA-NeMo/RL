@@ -102,6 +102,11 @@ class RolloutReassemblerActorConfig:
     tokenizer_config: Optional[dict[str, Any]] = None
     # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
     top_logprobs: int = 0
+    # grpo.adv_estimator.positive_length_reweight with a per-turn scope: finalized groups carry
+    # assistant_turn_id / thinking_mask / action_mask (turn_text.turn_text_columns), classified
+    # with tokenizer_config's tokenizer. require_thinking_tags: scope thinking_per_turn.
+    turn_text_columns: bool = False
+    require_thinking_tags: bool = False
 
 
 def assert_metadata_only(value: Any, *, path: str = "rpc") -> None:
@@ -164,6 +169,8 @@ class RolloutReassemblerActor:  # pragma: no cover
             reward_penalty_config=config.reward_penalty_config,
             tokenizer_config=config.tokenizer_config,
             top_logprobs=config.top_logprobs,
+            turn_text_columns=config.turn_text_columns,
+            require_thinking_tags=config.require_thinking_tags,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

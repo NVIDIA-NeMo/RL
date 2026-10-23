@@ -48,9 +48,9 @@ grpo:
       rank_spread: 0.5  # rank mode: shortest/longest per-token ratio (1+s)/(1-s); 0 <= s < 1
       alpha: 1.0  # inverse_length mode: exponent >= 0 (0 is a no-op)
       max_ratio: 3.0  # inverse_length mode: largest per-token weight ratio within a group (> 1); null = unbounded
-      scope: trajectory  # "trajectory" (whole response); upstream's per-turn scopes are not on this branch
-      exclude_final_answer: false  # upstream per-turn option; only the default is accepted here
-      turns_counted: with_spans  # upstream per-turn option; ignored with scope "trajectory"
+      scope: trajectory  # "trajectory" (whole response) | "thinking_per_turn" | "prose_per_turn" (agentic: free text per turn; tool calls keep their credit)
+      exclude_final_answer: false  # prose_per_turn only: the last turn's content is neither measured nor reweighted
+      turns_counted: with_spans  # per-turn scopes: T in V = P / T counts turns with measured tokens ("with_spans"), all turns ("all"), or 1 ("none": V = the rollout's total)
   reward_scaling:
     enabled: false
     source_min: 0.0

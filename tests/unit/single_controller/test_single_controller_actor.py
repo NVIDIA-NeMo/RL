@@ -2898,3 +2898,119 @@ def test_multi_trace_rows_already_on_the_multiple_are_not_padded():
     padded, pad_meta = asyncio.run(ctrl._pad_rows_to_dp_multiple(_rows_meta(8)))
 
     assert pad_meta is None and len(padded.sample_ids) == 8 and not puts
+
+
+def test_grpo_advantage_stage_reweights_prose_per_turn_over_segment_rows() -> None:
+    """positive_length_reweight prose_per_turn on the SC path: a rollout's canonical and segment
+    rows are measured together, only thinking / content tokens are scaled, metrics are merged."""
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        GRPOAdvantageEstimator,
+    )
+
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    # Rows: g_g0 (canonical) + g_g0_t1 (its subagent segment), g_g1, g_g2, g_g3. One turn each:
+    # THINKING tokens then one end-of-turn ACTION token, after a one-token prompt.
+    sample_ids = ["g_g0", "g_g1", "g_g2", "g_g3", "g_g0_t1"]
+    thinking_len = [2, 2, 2, 2, 6]
+    width = 1 + max(thinking_len) + 1
+    token_mask = torch.zeros(5, width)
+    turn_id = torch.full((5, width), -1, dtype=torch.int32)
+    thinking = torch.zeros(5, width, dtype=torch.bool)
+    action = torch.zeros(5, width, dtype=torch.bool)
+    for row, n in enumerate(thinking_len):
+        token_mask[row, 1 : n + 2] = 1.0
+        turn_id[row, 1 : n + 2] = 0
+        thinking[row, 1 : n + 1] = True
+        action[row, n + 1] = True
+    rewards = torch.tensor([1.0, 1.0, 0.0, 0.0, 1.0])
+    requested: list[list[str]] = []
+
+    class FakeDataPlane:
+        def __init__(self):
+            self.put_fields = None
+
+        def get_samples(self, sample_ids, partition_id, select_fields):
+            del sample_ids, partition_id
+            requested.append(list(select_fields))
+            return TensorDict(
+                {
+                    "prompt_ids_for_adv": torch.zeros(5, 1, dtype=torch.long),
+                    "total_reward": rewards,
+                    "token_mask": token_mask,
+                    "sample_mask": torch.ones(5),
+                    "mask_sample": torch.zeros(5, dtype=torch.bool),
+                    "truncated": torch.zeros(5, dtype=torch.bool),
+                    "assistant_turn_id": turn_id,
+                    "thinking_mask": thinking,
+                    "action_mask": action,
+                    "input_lengths": torch.full((5,), width),
+                },
+                batch_size=(5,),
+            )
+
+        def put_samples(self, sample_ids, partition_id, fields):
+            del sample_ids, partition_id
+            self.put_fields = fields
+
+    estimator_cfg = AdvEstimatorConfig(
+        positive_length_reweight=dict(
+            enabled=True, scope="prose_per_turn", alpha=1.0, max_ratio=3.0
+        )
+    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = GRPOAdvantageEstimator(estimator_cfg, None)
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._dp_client = FakeDataPlane()
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=None, adv_estimator=estimator_cfg)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        "rewards": [],
+        "sample_masks": [],
+        "masked_advantages": [],
+        "sequence_lengths": [],
+        "seq_logprob_error_metrics": [],
+        "num_mask_sample_filtered": [],
+    }
+    ctrl._opd_gap_sum = 0.0
+    ctrl._opd_stat_sum = 0.0
+    ctrl._opd_stat_sumsq = 0.0
+    ctrl._opd_stat_count = 0
+    ctrl._length_reweight_stats = None
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=sample_ids,
+        fields=[],
+        sequence_lengths=[width] * 5,
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert has_valid_training_tokens
+    assert {"assistant_turn_id", "thinking_mask", "action_mask"} <= set(requested[0])
+    adv = ctrl._dp_client.put_fields["advantages"]
+    a = adv[1, thinking_len[1] + 1].item()  # g_g1's end-of-turn token: unweighted
+    assert a > 0
+    # Rollout 0 = 8 thinking tokens over 2 turns (V 4), rollout 1 = 2 over 1 (V 2): raw weights
+    # 0.5 / 1, renormalized by (8 + 2) / (8 x 0.5 + 2 x 1) -> 0.8333 / 1.6667.
+    for row in (0, 4):
+        torch.testing.assert_close(
+            adv[row][thinking[row]], torch.full((thinking_len[row],), a * 5 / 6)
+        )
+    torch.testing.assert_close(adv[1][thinking[1]], torch.full((2,), a * 5 / 3))
+    for row in (0, 1, 4):
+        assert adv[row][action[row]].item() == a
+    assert (adv[2][token_mask[2].bool()] < 0).all()
+    stats = ctrl._length_reweight_stats
+    assert stats is not None and stats.groups_reweighted == 1
+    assert stats.per_turn_rows == [2, 2]
+    assert stats.per_turn_turns[0] == 3.0

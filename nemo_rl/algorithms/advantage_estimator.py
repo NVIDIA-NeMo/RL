@@ -36,7 +36,7 @@ Reference papers:
 
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional
 
 import torch
@@ -60,9 +60,9 @@ class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
     (``extra="forbid"``): a new block has no older configs to stay compatible with, and a typo
     such as ``rank_sprad`` would otherwise run silently at the default.
 
-    Ported from upstream NeMo RL PR #4747 (scope="trajectory" only). The schema keeps the
-    upstream per-turn keys so upstream config blocks load, but this branch builds none of the
-    token-class columns they need, so the per-turn scopes are rejected.
+    Ported from upstream NeMo RL PR #4747. On the SingleController path with token-capture
+    segment rows, a rollout (its canonical row plus its subagent / compaction segment rows) is
+    measured and weighted as one response.
     """
 
     # Off by default; disabled, the GRPO advantages are bit-identical to not having this block.
@@ -81,30 +81,41 @@ class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
     # Inverse-length mode: the largest per-token weight ratio within a group (> 1), which also
     # bounds every final weight; None leaves the weights unbounded.
     max_ratio: Optional[Annotated[float, Field(gt=1.0)]] = 3.0
-    # What is measured and reweighted. "trajectory": the whole response, every trained token of
-    # a positive rollout is scaled. On the SingleController path with segment rows the length is
-    # the rollout's trained tokens over all its rows (canonical + subagent / compaction
-    # segments), and every row of the rollout takes the rollout's weight.
-    # "thinking_per_turn" / "prose_per_turn" (upstream only): rejected on this branch.
+    # What is measured and reweighted:
+    # "trajectory": the whole response length; every trained token of a positive rollout is
+    #   scaled. With segment rows the length is the rollout's trained tokens over all its rows.
+    # "thinking_per_turn": thinking tokens per assistant turn; only thinking tokens are scaled.
+    # "prose_per_turn": free text (thinking + visible content) per assistant turn; only those
+    #   tokens are scaled, so moving text between thinking and content changes nothing.
+    # The per-turn scopes (reweight_positive_text_per_turn) leave tool calls and end-of-turn
+    # tokens at the unweighted advantage, so the number of turns carries no length pressure
+    # (unless turns_counted is "none", which measures the rollout's total).
+    # They read the assistant_turn_id / thinking_mask / action_mask columns, which the
+    # SingleController token-capture path builds.
     scope: Literal["trajectory", "thinking_per_turn", "prose_per_turn"] = "trajectory"
-    # Upstream per-turn options; only their defaults are accepted here.
+    # prose_per_turn only: the final assistant turn's content (the answer) is neither measured
+    # nor reweighted. For tasks where the answer's length is part of the job (reports, code
+    # delivered as text). With segment rows only the canonical (terminal) row holds the answer.
     exclude_final_answer: bool = False
+    # Per-turn scopes: the turn count T in V = P / T. "with_spans" counts the turns that have at
+    # least one measured token; "all" counts every trained assistant turn, so a turn holding
+    # only a tool call lowers V; "none" does not divide (V = P, the rollout's total measured
+    # tokens), so of two rollouts equally verbose per turn the one with more turns weighs less.
     turns_counted: Literal["with_spans", "all", "none"] = "with_spans"
 
     @model_validator(mode="after")
     def _check_scope_options(self) -> "PositiveLengthReweightConfig":
-        if self.scope != "trajectory":
-            raise ValueError(
-                f"positive_length_reweight.scope={self.scope!r} needs the per-turn token-class "
-                "columns (assistant_turn_id / thinking_mask / action_mask) of upstream PR #4747, "
-                "which this branch does not build; use scope='trajectory'"
-            )
-        if self.exclude_final_answer:
+        if self.exclude_final_answer and self.scope != "prose_per_turn":
             raise ValueError(
                 "positive_length_reweight.exclude_final_answer applies only to "
                 f"scope='prose_per_turn', got scope={self.scope!r}"
             )
         return self
+
+    @property
+    def per_turn(self) -> bool:
+        """Enabled with a per-turn scope, which runs after the GRPO estimator, not inside it."""
+        return self.enabled and self.scope != "trajectory"
 
 
 class AdvEstimatorConfig(BaseModel, extra="allow"):
@@ -141,6 +152,21 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
         return self
 
 
+def per_turn_length_reweight_config(
+    algo_cfg: object,
+) -> Optional[PositiveLengthReweightConfig]:
+    """The algorithm block's positive_length_reweight when it is enabled with a per-turn scope.
+
+    None otherwise, including for algorithm blocks whose estimator has no such block (PPO).
+    """
+    reweight = getattr(
+        getattr(algo_cfg, "adv_estimator", None), "positive_length_reweight", None
+    )
+    if isinstance(reweight, PositiveLengthReweightConfig) and reweight.per_turn:
+        return reweight
+    return None
+
+
 # Group pass-rate buckets for the step-share metrics: <= 0.25, (0.25, 0.75), >= 0.75.
 _PASS_RATE_BUCKET_NAMES = ("le_0.25", "0.25_0.75", "ge_0.75")
 
@@ -170,8 +196,28 @@ class PositiveLengthReweightStats:
     weight_min: float
     weight_max: float
     # sum(|A_i| * L_i) over valid rows, per group pass-rate bucket, before and after reweighting.
+    # Per-turn scopes: sum(|advantage|) over the valid rows' trained tokens.
     mass_before: list[float]
     mass_after: list[float]
+    # Per-turn scopes only; all zero for scope="trajectory", whose metrics are then unchanged.
+    # Valid rollouts with at least one trained assistant turn, split [reward > 0, reward <= 0].
+    per_turn_rows: list[int] = field(default_factory=lambda: [0, 0])
+    per_turn_turns: list[float] = field(default_factory=lambda: [0.0, 0.0])
+    # Correct (reward > 0) rollouts: trained thinking / content / action tokens.
+    per_turn_thinking_tokens: float = 0.0
+    per_turn_content_tokens: float = 0.0
+    per_turn_action_tokens: float = 0.0
+    # Correct rollouts with any prose: sum of thinking / (thinking + content).
+    per_turn_thinking_share_sum: float = 0.0
+    per_turn_thinking_share_rows: int = 0
+    # net_turn_credit = sum(A_i * T_i) / sum(|A_i| * T_i) per pass-rate bucket (T_i = trained
+    # turns, A_i = the rollout's advantage before reweighting).
+    net_turn_credit_num: list[float] = field(
+        default_factory=lambda: [0.0] * len(_PASS_RATE_BUCKET_NAMES)
+    )
+    net_turn_credit_den: list[float] = field(
+        default_factory=lambda: [0.0] * len(_PASS_RATE_BUCKET_NAMES)
+    )
 
     @classmethod
     def empty(cls) -> "PositiveLengthReweightStats":
@@ -196,6 +242,23 @@ class PositiveLengthReweightStats:
         self.weight_max = max(self.weight_max, other.weight_max)
         self.mass_before = [a + b for a, b in zip(self.mass_before, other.mass_before)]
         self.mass_after = [a + b for a, b in zip(self.mass_after, other.mass_after)]
+        self.per_turn_rows = [
+            a + b for a, b in zip(self.per_turn_rows, other.per_turn_rows)
+        ]
+        self.per_turn_turns = [
+            a + b for a, b in zip(self.per_turn_turns, other.per_turn_turns)
+        ]
+        self.per_turn_thinking_tokens += other.per_turn_thinking_tokens
+        self.per_turn_content_tokens += other.per_turn_content_tokens
+        self.per_turn_action_tokens += other.per_turn_action_tokens
+        self.per_turn_thinking_share_sum += other.per_turn_thinking_share_sum
+        self.per_turn_thinking_share_rows += other.per_turn_thinking_share_rows
+        self.net_turn_credit_num = [
+            a + b for a, b in zip(self.net_turn_credit_num, other.net_turn_credit_num)
+        ]
+        self.net_turn_credit_den = [
+            a + b for a, b in zip(self.net_turn_credit_den, other.net_turn_credit_den)
+        ]
 
     def to_metrics(self) -> dict[str, float]:
         """Logging metrics under ``adv_len_reweight/``.
@@ -225,6 +288,40 @@ class PositiveLengthReweightStats:
                 metrics[f"{prefix}share_bucket_{name}"] = after / total_after
                 diffs.append(abs(after / total_after - before / total_before))
             metrics[f"{prefix}share_max_abs_diff"] = max(diffs)
+        # Per-turn scopes (absent for scope="trajectory").
+        correct_rows, incorrect_rows = self.per_turn_rows
+        if correct_rows:
+            turns = self.per_turn_turns[0]
+            metrics[f"{prefix}turns_mean_correct"] = turns / correct_rows
+            if turns > 0:
+                metrics[f"{prefix}thinking_per_turn_mean_correct"] = (
+                    self.per_turn_thinking_tokens / turns
+                )
+                metrics[f"{prefix}content_per_turn_mean_correct"] = (
+                    self.per_turn_content_tokens / turns
+                )
+                metrics[f"{prefix}action_tokens_per_turn_mean_correct"] = (
+                    self.per_turn_action_tokens / turns
+                )
+        if incorrect_rows:
+            metrics[f"{prefix}turns_mean_incorrect"] = (
+                self.per_turn_turns[1] / incorrect_rows
+            )
+        if self.per_turn_thinking_share_rows:
+            metrics[f"{prefix}thinking_share_of_prose_mean_correct"] = (
+                self.per_turn_thinking_share_sum / self.per_turn_thinking_share_rows
+            )
+        if sum(self.net_turn_credit_den) > 0:
+            metrics[f"{prefix}net_turn_credit"] = sum(self.net_turn_credit_num) / sum(
+                self.net_turn_credit_den
+            )
+            for name, num, den in zip(
+                _PASS_RATE_BUCKET_NAMES,
+                self.net_turn_credit_num,
+                self.net_turn_credit_den,
+            ):
+                if den > 0:
+                    metrics[f"{prefix}net_turn_credit_bucket_{name}"] = num / den
         return metrics
 
 
@@ -345,6 +442,271 @@ def reweight_positive_advantages_by_length(
     return out, stats
 
 
+def _distinct_turns(turn_id: torch.Tensor, select: torch.Tensor) -> torch.Tensor:
+    """``[B]`` number of distinct non-negative ``turn_id`` values at the ``select`` positions."""
+    num_turns = int(turn_id.max().item()) + 1 if turn_id.numel() else 0
+    if num_turns <= 0:
+        return torch.zeros(turn_id.shape[0], dtype=torch.float64, device=turn_id.device)
+    hit = torch.zeros(
+        (turn_id.shape[0], num_turns), dtype=torch.float64, device=turn_id.device
+    )
+    keep = select & (turn_id >= 0)
+    hit.scatter_add_(1, turn_id.clamp(min=0), keep.to(torch.float64))
+    return (hit > 0).sum(dim=1).to(torch.float64)
+
+
+def reweight_positive_text_per_turn(
+    advantages: torch.Tensor,
+    *,
+    prompt_ids: torch.Tensor,
+    rewards: torch.Tensor,
+    mask: torch.Tensor,
+    assistant_turn_id: torch.Tensor,
+    thinking_mask: torch.Tensor,
+    action_mask: torch.Tensor,
+    valid: torch.Tensor,
+    config: PositiveLengthReweightConfig,
+    row_to_rollout: Optional[torch.Tensor] = None,
+    final_answer_rows: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, PositiveLengthReweightStats]:
+    """Per-turn scopes of ``positive_length_reweight``: rescale the free text of positive rollouts.
+
+    Every trained assistant token is one of THINKING (``thinking_mask``), ACTION
+    (``action_mask``: tool-call spans and the end-of-turn token) or CONTENT (the rest of its
+    turn, ``assistant_turn_id >= 0``). The measured set M is the thinking tokens
+    (``thinking_per_turn``) or the thinking and content tokens (``prose_per_turn``; with
+    ``exclude_final_answer`` minus the final answer: the last turn's content of the rows in
+    ``final_answer_rows``), restricted to trained tokens.
+
+    A rollout is the rows that ``row_to_rollout`` maps to one index (default: every row is its
+    own rollout). On the SingleController path with token-capture segment rows, a rollout's
+    canonical row and its subagent / compaction segment rows share one advantage, and turns in
+    different rows are different model calls, so the rollout's measured tokens and turns are
+    the sums over its rows. Per group (rollouts with equal ``prompt_ids``), counted on
+    ``[:, 1:]`` like the loss:
+
+    * ``P_r`` = measured tokens, ``T_r`` = distinct turns with a measured token (``with_spans``)
+      or with any trained token (``all``), or 1 (``none``: V is the total), ``V_r = P_r / T_r``;
+    * positives ``S = {r : A_r > 0, valid_r, P_r > 0, T_r > 0}``; groups with ``|S| < 2`` are
+      left unchanged;
+    * raw weights ``u_r`` from ``V`` with the same function as ``scope="trajectory"`` uses for
+      the length (inverse-length or rank);
+    * ``c = sum_S(A_j P_j) / sum_S(A_j P_j u_j)`` and every measured token of every row of
+      rollout ``r`` in S is multiplied by ``c * u_r``.
+
+    Every other token (actions, excluded final content, negative / zero-advantage / invalid
+    rollouts) is returned bit-identical. The sum of the group's positive advantages over measured
+    tokens is unchanged, so with actions untouched each group keeps its share of the step. A
+    rollout of the same per-turn verbosity gets the same weight whatever its turn count, so turns
+    carry no length pressure, except under ``turns_counted="none"``, where more turns of measured
+    text mean a larger V. Only within-group statistics are used (shard and row-order invariant).
+
+    Must run on the estimator's output (after the rollout broadcast), before message-level
+    penalties and advantage clipping: ``A_r`` is read as the single value over its rows' trained
+    tokens, and a rollout whose trained tokens disagree raises.
+
+    Args:
+        advantages: ``[B, T]`` token-level advantages, constant over each rollout's trained tokens.
+        prompt_ids: ``[B]`` or ``[B, S]`` rows; rollouts with equal ids form a group.
+        rewards: ``[B]`` rewards (pass-rate buckets and the correct / incorrect metrics); the rows
+            of a rollout carry its reward.
+        mask: ``[B, T]`` trained-token mask (token mask times sample mask).
+        assistant_turn_id: ``[B, T]`` 0-based assistant turn of each token within its row, -1
+            elsewhere.
+        thinking_mask: ``[B, T]`` bool, THINKING tokens.
+        action_mask: ``[B, T]`` bool, ACTION tokens.
+        valid: ``[B]`` bool, rows that may be reweighted and count in the metrics; a rollout is
+            valid when any of its rows is.
+        config: the ``positive_length_reweight`` block (a per-turn scope).
+        row_to_rollout: optional ``[B]`` long, the rollout (``0..R-1``) of each row.
+        final_answer_rows: optional ``[B]`` bool, the rows whose last turn's content is the final
+            answer for ``exclude_final_answer`` (default: every row).
+
+    Returns:
+        The reweighted ``[B, T]`` advantages (a new tensor, same dtype and device) and this
+        call's statistics.
+    """
+    if config.scope == "trajectory":
+        raise ValueError("reweight_positive_text_per_turn needs a per-turn scope")
+    device = advantages.device
+    out = advantages.clone()
+    stats = PositiveLengthReweightStats.empty()
+    n_rows = out.shape[0]
+    if n_rows == 0:
+        return out, stats
+    shape = tuple(advantages.shape)
+    for name, tensor in (
+        ("mask", mask),
+        ("assistant_turn_id", assistant_turn_id),
+        ("thinking_mask", thinking_mask),
+        ("action_mask", action_mask),
+    ):
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} shape {tuple(tensor.shape)} does not match advantages {shape}"
+            )
+    if row_to_rollout is None:
+        rollout = torch.arange(n_rows, device=device)
+    else:
+        rollout = row_to_rollout.to(device=device, dtype=torch.long).reshape(-1)
+        if rollout.numel() != n_rows or bool((rollout < 0).any()):
+            raise ValueError(
+                "row_to_rollout must map every one of the "
+                f"{n_rows} rows to a rollout index >= 0"
+            )
+    n_rollouts = int(rollout.max().item()) + 1
+
+    trained = mask.to(device=device).bool()
+    turn = assistant_turn_id.to(device=device, dtype=torch.int64)
+    in_turn = (turn >= 0) & trained
+    thinking = thinking_mask.to(device=device).bool() & in_turn
+    action = action_mask.to(device=device).bool() & in_turn
+    if bool((thinking & action).any()):
+        raise ValueError("thinking_mask and action_mask overlap")
+    content = in_turn & ~thinking & ~action
+    if config.scope == "thinking_per_turn":
+        measured = thinking.clone()
+    else:
+        measured = thinking | content
+        if config.exclude_final_answer:
+            last_turn = turn.masked_fill(~in_turn, -1).max(dim=1, keepdim=True).values
+            final_content = content & (turn == last_turn)
+            if final_answer_rows is not None:
+                final_content &= final_answer_rows.to(
+                    device=device, dtype=torch.bool
+                ).reshape(-1, 1)
+            measured &= ~final_content
+    valid = valid.to(device=device, dtype=torch.bool)
+    rewards = rewards.to(device=device, dtype=torch.float64)
+
+    # Loss-aligned per-row counts: token t is trained from position t - 1, so [:, 1:].
+    loss_trained = trained[:, 1:]
+    loss_measured = measured[:, 1:]
+    loss_turn = turn[:, 1:]
+    row_measured = loss_measured.sum(dim=1).to(torch.float64)
+    row_all_turns = _distinct_turns(loss_turn, in_turn[:, 1:])
+    if config.turns_counted == "with_spans":
+        row_counted_turns = _distinct_turns(loss_turn, loss_measured)
+    else:
+        row_counted_turns = row_all_turns
+    row_trained = loss_trained.sum(dim=1).to(torch.float64)
+    row_thinking = thinking[:, 1:].sum(dim=1).to(torch.float64)
+    row_content = content[:, 1:].sum(dim=1).to(torch.float64)
+    row_action = action[:, 1:].sum(dim=1).to(torch.float64)
+
+    # A_r: the rollout's single value over its rows' trained tokens.
+    adv64 = advantages.to(torch.float64)
+    big = torch.finfo(torch.float64).max
+    row_hi = adv64.masked_fill(~trained, -big).max(dim=1).values
+    row_lo = adv64.masked_fill(~trained, big).min(dim=1).values
+    has_tokens = trained.any(dim=1)
+    roll_hi = torch.full((n_rollouts,), -big, dtype=torch.float64, device=device)
+    roll_lo = torch.full((n_rollouts,), big, dtype=torch.float64, device=device)
+    roll_hi = roll_hi.scatter_reduce(
+        0, rollout[has_tokens], row_hi[has_tokens], reduce="amax"
+    )
+    roll_lo = roll_lo.scatter_reduce(
+        0, rollout[has_tokens], row_lo[has_tokens], reduce="amin"
+    )
+    roll_has_tokens = torch.zeros(n_rollouts, dtype=torch.bool, device=device)
+    roll_has_tokens[rollout[has_tokens]] = True
+    if bool((roll_has_tokens & (roll_hi != roll_lo)).any()):
+        bad = torch.nonzero(roll_has_tokens & (roll_hi != roll_lo), as_tuple=True)[0]
+        raise ValueError(
+            "per-turn length reweighting expects one advantage per row and per rollout over "
+            "its trained tokens (apply it before message penalties and clipping); rollouts "
+            f"{bad[:8].tolist()} vary"
+        )
+    roll_adv = torch.where(roll_has_tokens, roll_hi, torch.zeros_like(roll_hi))
+
+    def per_rollout(values: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(n_rollouts, dtype=torch.float64, device=device).index_add_(
+            0, rollout, values.to(torch.float64)
+        )
+
+    measured_len = per_rollout(row_measured)
+    all_turns = per_rollout(row_all_turns)
+    if config.turns_counted == "none":  # V is the rollout's total measured tokens
+        counted_turns = torch.ones_like(measured_len)
+    else:
+        counted_turns = per_rollout(row_counted_turns)
+    trained_len = per_rollout(row_trained)
+    thinking_len = per_rollout(row_thinking)
+    content_len = per_rollout(row_content)
+    action_len = per_rollout(row_action)
+    roll_valid = per_rollout(valid.to(torch.float64)) > 0
+    # A rollout's rows carry its reward and group; read both at its first row.
+    first_row = torch.full((n_rollouts,), n_rows, dtype=torch.long, device=device)
+    first_row = first_row.scatter_reduce(
+        0, rollout, torch.arange(n_rows, device=device), reduce="amin"
+    )
+    if bool((first_row >= n_rows).any()):
+        raise ValueError("row_to_rollout must use every rollout index 0..R-1")
+    roll_reward = rewards[first_row]
+    roll_prompt = prompt_ids.to(device=device).index_select(0, first_row)
+
+    weight = torch.ones(n_rollouts, dtype=torch.float64, device=device)
+    bucket_of = torch.full((n_rollouts,), -1, dtype=torch.long, device=device)
+    _, group_index = torch.unique(roll_prompt, dim=0, return_inverse=True)
+    group_index = group_index.to(device)
+    for group in range(int(group_index.max().item()) + 1):
+        members = torch.nonzero((group_index == group) & roll_valid, as_tuple=True)[0]
+        if members.numel() == 0:
+            continue
+        stats.groups_with_valid_rows += 1
+        bucket = _pass_rate_bucket(float(roll_reward[members].mean()))
+        bucket_of[members] = bucket
+        a = roll_adv[members]
+        stats.mass_before[bucket] += float((a.abs() * trained_len[members]).sum())
+        for k, r in enumerate(members.tolist()):
+            turns_r = float(all_turns[r])
+            if turns_r <= 0:
+                continue
+            correct = float(roll_reward[r]) > 0
+            stats.per_turn_rows[0 if correct else 1] += 1
+            stats.per_turn_turns[0 if correct else 1] += turns_r
+            stats.net_turn_credit_num[bucket] += float(a[k]) * turns_r
+            stats.net_turn_credit_den[bucket] += abs(float(a[k])) * turns_r
+            if correct:
+                think_n, content_n = float(thinking_len[r]), float(content_len[r])
+                stats.per_turn_thinking_tokens += think_n
+                stats.per_turn_content_tokens += content_n
+                stats.per_turn_action_tokens += float(action_len[r])
+                if think_n + content_n > 0:
+                    stats.per_turn_thinking_share_sum += think_n / (think_n + content_n)
+                    stats.per_turn_thinking_share_rows += 1
+        p, t = measured_len[members], counted_turns[members]
+        positive = (a > 0) & (p > 0) & (t > 0)
+        if int(positive.sum()) >= 2:
+            pos_members = members[positive]
+            pos_adv, pos_p = a[positive], p[positive]
+            per_turn = pos_p / t[positive]
+            if config.mode == "rank":
+                raw = rank_length_weights(per_turn, config.rank_spread)
+            else:
+                raw = inverse_length_weights(per_turn, config.alpha, config.max_ratio)
+            pos_mass = pos_adv * pos_p
+            weights = raw * (pos_mass.sum() / (pos_mass * raw).sum())
+            weight[pos_members] = weights
+            stats.groups_reweighted += 1
+            stats.weight_sum += float(weights.sum())
+            stats.weight_count += int(weights.numel())
+            stats.weight_min = min(stats.weight_min, float(weights.min()))
+            stats.weight_max = max(stats.weight_max, float(weights.max()))
+
+    row_weight = weight[rollout]
+    scaled = measured & (row_weight != 1.0).unsqueeze(1)
+    if bool(scaled.any()):
+        out[scaled] = (adv64 * row_weight.unsqueeze(1))[scaled].to(out.dtype)
+    row_mass_after = (
+        out[:, 1:].to(torch.float64).abs() * loss_trained.to(torch.float64)
+    ).sum(dim=1)
+    roll_mass_after = per_rollout(row_mass_after)
+    for bucket in range(len(_PASS_RATE_BUCKET_NAMES)):
+        stats.mass_after[bucket] += float(roll_mass_after[bucket_of == bucket].sum())
+    return out, stats
+
+
 class GAEConfig(BaseModel, extra="allow"):
     """Configuration for the value-model advantage estimators (PPO)."""
 
@@ -451,7 +813,12 @@ class GRPOAdvantageEstimator:
                 std.unsqueeze(-1)[normalize_mask] + epsilon
             )
 
-        if self.positive_length_reweight.enabled:
+        # The per-turn scopes need token-class columns the estimator does not see; the caller
+        # applies reweight_positive_text_per_turn to this output instead.
+        if (
+            self.positive_length_reweight.enabled
+            and self.positive_length_reweight.scope == "trajectory"
+        ):
             advantages, stats = reweight_positive_advantages_by_length(
                 advantages,
                 prompt_ids=prompt_ids,

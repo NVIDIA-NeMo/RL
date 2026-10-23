@@ -37,6 +37,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.advantage_estimator import per_turn_length_reweight_config
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     DATA_PLANE_CHECKPOINT_DIR,
     LEGACY_REPLAY_BUFFER_FILENAME,
@@ -340,7 +341,11 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+            GENERATION_TOPK_FIELDS,
+            TURN_TEXT_FIELDS,
+        )
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
@@ -348,6 +353,10 @@ def _register_single_controller_partitions(
         )
         if token_capture_cfg.top_logprobs > 0:
             partition_fields.extend(GENERATION_TOPK_FIELDS)
+        if per_turn_length_reweight_config(algo_cfg) is not None:
+            # Written by the RolloutReassembler with every group; registered up front like the
+            # top-k columns.
+            partition_fields.extend(TURN_TEXT_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -2069,6 +2078,12 @@ def setup_single_controller(
                 reward_penalty_config=resolved_reward_penalty_config,
                 tokenizer_config=dict(master_config.policy["tokenizer"]),
                 top_logprobs=token_capture_cfg.top_logprobs,
+                # Per-turn token-class columns for positive_length_reweight's per-turn scopes.
+                turn_text_columns=per_turn_length_reweight_config(algo_cfg) is not None,
+                require_thinking_tags=(
+                    getattr(per_turn_length_reweight_config(algo_cfg), "scope", None)
+                    == "thinking_per_turn"
+                ),
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )

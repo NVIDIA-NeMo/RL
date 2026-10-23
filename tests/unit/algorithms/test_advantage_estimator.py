@@ -721,21 +721,6 @@ def test_length_reweight_config_disabled_is_allowed_with_any_estimator():
     )
 
 
-@pytest.mark.parametrize(
-    "reweight",
-    [
-        {"enabled": True, "scope": "prose_per_turn"},
-        {"enabled": True, "scope": "thinking_per_turn"},
-        # Rejected even while disabled: the block would silently run as "trajectory" once enabled.
-        {"enabled": False, "scope": "prose_per_turn"},
-        {"enabled": True, "exclude_final_answer": True},
-    ],
-)
-def test_length_reweight_per_turn_scopes_are_rejected_on_this_branch(reweight):
-    with pytest.raises(ValueError, match="scope"):
-        AdvEstimatorConfig(positive_length_reweight=reweight)
-
-
 def test_length_reweight_accepts_the_upstream_default_block():
     upstream_block = dict(
         enabled=True,

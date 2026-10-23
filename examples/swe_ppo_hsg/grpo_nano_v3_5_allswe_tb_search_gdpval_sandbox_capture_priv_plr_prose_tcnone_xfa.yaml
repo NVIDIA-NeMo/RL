@@ -1,0 +1,25 @@
+# =============================================================================
+# GRPO arm of the 4-env ablation (grpo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml) plus positive
+# length reweighting of the advantages (grpo.adv_estimator.positive_length_reweight, upstream NeMo RL PR #4747).
+# Within each prompt group, the correct rollouts' credit moves from verbose to concise ones:
+# - measured: a rollout's free text, thinking + visible content, summed over its canonical row and its subagent /
+#   compaction segment rows (prose_per_turn), without dividing by the number of turns (turns_counted: none), so the
+#   measure is the rollout's total prose. The final answer (the canonical row's last-turn visible text) is neither
+#   measured nor scaled (exclude_final_answer);
+# - weight (L / L_min)^-1 among the group's correct rollouts, capped at a 3x per-token ratio, then one factor per
+#   group so the group's credit over the scaled tokens is unchanged;
+# - scaled: only the prose tokens of correct rollouts. Tool calls, end-of-turn tokens, failed rollouts and masked rows
+#   keep their GRPO advantage.
+# Needs the token-capture path (the RolloutReassembler builds the per-token turn / thinking / action columns).
+# =============================================================================
+defaults: grpo_nano_v3_5_allswe_tb_search_gdpval_sandbox_capture_priv.yaml
+grpo:
+  adv_estimator:
+    positive_length_reweight:
+      enabled: true
+      mode: inverse_length
+      alpha: 1.0
+      max_ratio: 3.0
+      scope: prose_per_turn
+      exclude_final_answer: true
+      turns_counted: none
