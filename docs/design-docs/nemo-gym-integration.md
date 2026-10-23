@@ -68,8 +68,6 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
-See Gym's [NeMo RL setup guide](https://docs.nvidia.com/nemo/gym/main/tutorials/training-tutorials/nemo-rl-grpo/setup) for the training environment and submodule setup. Dataset paths are relative to the RL repository root; `env.nemo_gym.config_paths` are relative to the Gym checkout. Other values under `env.nemo_gym` override Gym configuration using the same key paths as its YAML files.
-
 ### Environment Server tasksets
 
 NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
