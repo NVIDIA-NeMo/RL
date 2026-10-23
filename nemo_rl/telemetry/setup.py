@@ -470,6 +470,13 @@ def init_telemetry_driver(
     # lens, and setup_telemetry below resolves span_groups against them.
     from nemo_rl.telemetry import span_groups as _rl_span_groups  # noqa: F401
 
+    # Here rather than where it is started: importing it declares its series,
+    # which has to happen before the first registration closes the vocabulary.
+    from nemo_rl.telemetry.process_memory import (
+        DRIVER_WORKER_GROUP,
+        start_process_memory_reporting,
+    )
+
     config = NemoLensConfig.from_env(
         prefix=_OTEL_PREFIX,
         fallback_prefix=_OTEL_FALLBACK_PREFIX,
@@ -517,6 +524,8 @@ def init_telemetry_driver(
         setup_logging_bridge()
 
     if handle.is_exporting:
+        start_process_memory_reporting(rank=0, worker_group=DRIVER_WORKER_GROUP)
+
         # Deferred to break the cycle: host_memory reads get_telemetry_handle
         # from this module.
         from nemo_rl.telemetry.host_memory import (
@@ -640,6 +649,10 @@ def init_telemetry_worker(
         # the spec in the config below resolves against.
         import nemo_rl.telemetry.span_groups  # noqa: F401
 
+        # Before setup, for the same reason as on the driver: the import
+        # declares the series, and declaration closes at first registration.
+        from nemo_rl.telemetry.process_memory import start_process_memory_reporting
+
         if rank is None:
             rank = int(os.environ.get("RANK", "0"))
         if world_size is None:
@@ -658,6 +671,12 @@ def init_telemetry_worker(
         )
 
         handle = setup_telemetry(config, resource_attributes=attrs)
+        if handle.is_exporting:
+            # The group the resource carries, so an explicit worker_group wins
+            # over the environment here too.
+            start_process_memory_reporting(
+                rank=rank, worker_group=attrs.get(_WORKER_GROUP_ATTR)
+            )
         logger.info(
             "nemo-lens worker telemetry initialised (group=%s, rank=%s/%s, exporting=%s)",
             os.environ.get(WORKER_GROUP_ENV, "?"),
@@ -813,12 +832,14 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     # Deferred to break the cycle: host_memory reads get_telemetry_handle from
     # this module.
     from nemo_rl.telemetry.host_memory import stop_host_memory_monitoring
+    from nemo_rl.telemetry.process_memory import stop_process_memory_reporting
 
     # Called before the early return below, and before the flush: the monitor
     # records through the providers this is about to shut down, so leaving it
     # sampling would have it writing into a closed meter for a whole interval.
 
     stop_host_memory_monitoring()
+    stop_process_memory_reporting()
 
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
