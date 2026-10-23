@@ -549,6 +549,14 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
 
+### Training batch metrics
+
+Every optimizer step logs `train/staleness_min`, `train/staleness_mean`, and
+`train/staleness_max`: the trainer's weight version before the update minus
+each consumed trajectory's `weight_version` tag. The mean counts trajectories
+across all streaming chunks. Token-capture tags conservatively use the oldest
+generation weight version in the trajectory's prompt group.
+
 ### Full training-data dumps
 
 Set `async_rl.log_full_train_data: true` to stream every consumed sample to
