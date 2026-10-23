@@ -193,6 +193,7 @@ from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.policy import get_shared_prefix_training_config
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.telemetry.instrumentation import (
@@ -368,6 +369,11 @@ class SingleControllerActor:
     # rather than raising out of the training loop.
     _tracer: Any = None
 
+    # Declared on the class so an instance built without __init__ keeps the dense
+    # path. Resolved from the policy config rather than read off the trainer, so
+    # a trainer without shared-prefix attributes cannot turn the feature on.
+    _shared_prefix_logprobs_enabled: bool = False
+
     def __init__(
         self,
         master_config: MasterConfig,
@@ -402,6 +408,9 @@ class SingleControllerActor:
             )
         )
         self._algo_cfg = algo_config(master_config)
+        self._shared_prefix_logprobs_enabled = get_shared_prefix_training_config(
+            master_config.policy
+        ).enabled_for(stage="logprobs")
         self._async_cfg = master_config.async_rl
         self._is_ppo: bool = is_ppo_run(master_config)
         self._streaming_ppo: bool = (
@@ -2836,6 +2845,29 @@ class SingleControllerActor:
             )
         return target
 
+    def _shared_prefix_dp_world(self) -> Optional[int]:
+        """DP size each shared-prefix chunk must be a multiple of; None when off.
+
+        Checked before the first chunk trains. The pump otherwise discovers an
+        unaligned step target mid-step, after earlier chunks already ran
+        forward/backward.
+
+        Raises:
+            ValueError: ``num_prompts_per_step`` is not a multiple of the
+                trainer's data-parallel size.
+        """
+        if not self._shared_prefix_logprobs_enabled:
+            return None
+        dp_world = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        num_prompts_per_step = self._algo_cfg.num_prompts_per_step
+        if num_prompts_per_step % dp_world:
+            raise ValueError(
+                "Shared-prefix execution assigns complete prompt groups to DP "
+                f"ranks, so num_prompts_per_step={num_prompts_per_step} must be "
+                f"a multiple of the policy data-parallel size {dp_world}"
+            )
+        return dp_world
+
     def _streaming_ppo_selection_kwargs(self) -> dict[str, int]:
         """Derive aligned chunks and the tail floor without changing other samplers.
 
@@ -2946,6 +2978,7 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
+        shared_prefix_dp_world = self._shared_prefix_dp_world()
         selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
@@ -3037,6 +3070,22 @@ class SingleControllerActor:
                         target_groups = self._target_groups_for_step(
                             version_during_step
                         )
+                        if (
+                            shared_prefix_dp_world is not None
+                            and target_groups % shared_prefix_dp_world
+                        ):
+                            # Setup rejects the configurable drops, but a structural
+                            # finalizer drop or a restored shortfall can still shrink
+                            # the step. Fail before another chunk trains.
+                            raise ValueError(
+                                f"Shared-prefix training step {version_during_step} "
+                                "lost "
+                                f"{self._algo_cfg.num_prompts_per_step - target_groups} "
+                                f"prompt group(s), leaving {target_groups}, which is not "
+                                "a multiple of the data-parallel size "
+                                f"{shared_prefix_dp_world}; shared-prefix training "
+                                "cannot close a step short"
+                            )
                         max_prompt_groups = target_groups - groups_dispatched
                         if max_prompt_groups <= 0:
                             break
@@ -3045,6 +3094,26 @@ class SingleControllerActor:
                             self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
+                        chunk_selection_kwargs = selection_kwargs
+                        if shared_prefix_dp_world is not None:
+                            dp_world = shared_prefix_dp_world
+                            dispatch_groups = (
+                                (min_prompt_groups + dp_world - 1) // dp_world
+                            ) * dp_world
+                            # Invariant only: the entry DP check and the step-target
+                            # check above keep every remainder aligned.
+                            if dispatch_groups > max_prompt_groups:
+                                raise ValueError(
+                                    "Shared-prefix step remainder must contain complete DP groups: "
+                                    f"remaining={max_prompt_groups}, dp={dp_world}"
+                                )
+                            min_prompt_groups = dispatch_groups
+                            # Round the actual ready count inside the sampler; a
+                            # rounded upper bound alone cannot align a partially
+                            # filled buffer. Setup rejects streaming PPO, the other
+                            # user of group_multiple.
+                            max_prompt_groups -= max_prompt_groups % dp_world
+                            chunk_selection_kwargs = {"group_multiple": dp_world}
                         selected_group_ids: list[str] = []
                         selected_training_claim_ids: list[str] = []
                         training_claim_ids_before = (
@@ -3054,8 +3123,18 @@ class SingleControllerActor:
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
-                            **selection_kwargs,
+                            **chunk_selection_kwargs,
                         )
+                        if (
+                            shared_prefix_dp_world is not None
+                            and num_groups % shared_prefix_dp_world
+                        ):
+                            raise RuntimeError(
+                                f"{type(self._sampler).__name__}.select returned "
+                                f"{num_groups} prompt group(s), not a multiple of "
+                                f"group_multiple={shared_prefix_dp_world}; shared-prefix "
+                                "training needs complete data-parallel groups"
+                            )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
                         )

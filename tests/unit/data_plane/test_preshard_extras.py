@@ -27,13 +27,14 @@ identity preserved across shards).
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 from ._rollout_shapes import (
@@ -173,17 +174,70 @@ def test_shard_meta_for_dp_leaves_tags_none_when_absent():
 
 
 def test_shard_meta_for_dp_unsorted_round_trip():
-    """unsorted_indices must reconstruct the input order from DP-rank concat."""
-    n, dp = 8, 4
-    metas, unsorted = shard_meta_for_dp(_meta(n), dp_world=dp, batch_size=n)
-    if unsorted is None:
-        # No reorder happened — DP-rank concat IS the original order.
-        return
-    # Build a tensor whose row i is i; permute via dispatch order; reorder back.
+    """``reorder_data(unsorted)`` must restore input order from the DP-rank concat.
+
+    Sequence packing reorders rows across ranks, so ``unsorted`` is non-None
+    here; without packing it is None and the round trip would assert nothing.
+    """
+    n, dp = 16, 4
+    meta = _meta(n)
+    meta.sequence_lengths = [5 + (37 * i) % 113 for i in range(n)]
+    metas, unsorted = shard_meta_for_dp(
+        meta,
+        dp_world=dp,
+        sequence_packing_args={
+            "max_tokens_per_microbatch": 256,
+            "algorithm": "modified_first_fit_decreasing",
+            "sequence_length_pad_multiple": 1,
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+        },
+    )
+    assert unsorted is not None
     flat = [k for m in metas for k in m.sample_ids]
-    aggregated = torch.tensor([_meta(n).sample_ids.index(k) for k in flat])
-    restored = aggregated[torch.tensor(unsorted)]
-    assert restored.tolist() == list(range(n))
+    aggregated = BatchedDataDict(
+        {
+            "ids": flat,
+            "rows": torch.tensor([meta.sample_ids.index(k) for k in flat]),
+        }
+    )
+    aggregated.reorder_data(unsorted)
+    assert aggregated["ids"] == meta.sample_ids
+    assert aggregated["rows"].tolist() == list(range(n))
+
+
+def _tagged_group_meta(group_sizes: list[int]) -> KVBatchMeta:
+    """Rows grouped only by ``GROUP_ID_TAG``; sample ids carry no ``_g`` suffix."""
+    sample_ids: list[str] = []
+    tags: list[dict] = []
+    lengths: list[int] = []
+    for group, size in enumerate(group_sizes):
+        for index in range(size):
+            sample_ids.append(f"row{len(sample_ids)}")
+            tags.append({GROUP_ID_TAG: f"group{group}"})
+            lengths.append(8 + index)
+    return KVBatchMeta(
+        partition_id="train",
+        task_name="logprobs",
+        sample_ids=sample_ids,
+        fields=["input_ids"],
+        sequence_lengths=lengths,
+        extra_info={},
+        tags=tags,
+    )
+
+
+def test_shard_meta_for_dp_shared_prefix_requires_group_id_tags():
+    meta = _tagged_group_meta([2, 2])
+    meta.tags[1] = {}
+
+    with pytest.raises(ValueError, match="carry no 'group_id' tag"):
+        shard_meta_for_dp(
+            meta,
+            dp_world=2,
+            sequence_packing_args={"max_tokens_per_microbatch": 256},
+            shared_prefix_groups=True,
+        )
 
 
 # ── meta utility helpers ──────────────────────────────────────────────

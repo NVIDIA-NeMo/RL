@@ -309,6 +309,38 @@ def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None
 
 
 @pytest.mark.mcore
+def test_refit_destination_policy_runs_with_shared_prefix_disabled(monkeypatch):
+    """The inference-only policy of non-colocated generation never trains.
+
+    The trainer's shared-prefix mode and its validation would otherwise run against the
+    generation layout (inference TP/SP, generation CUDA graphs) and fail at setup.
+    """
+    config = deepcopy(basic_megatron_test_config)
+    config["generation"]["colocated"]["enabled"] = False
+    config["shared_prefix_training"] = {"mode": "train"}
+    created = {}
+
+    class RecordingPolicy:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    monkeypatch.setattr(lm_policy, "Policy", RecordingPolicy)
+    monkeypatch.setattr(
+        MegatronGeneration,
+        "init_cluster_placement_groups",
+        lambda self, cluster, cfg: None,
+    )
+    monkeypatch.setattr(MegatronGeneration, "prepare_for_generation", lambda self: None)
+
+    MegatronGeneration(config=config, tokenizer=MagicMock(), cluster=MagicMock())
+
+    assert created["is_refit_destination"] is True
+    assert created["config"]["shared_prefix_training"] == {"mode": "disabled"}
+    # The caller's (trainer's) config is untouched.
+    assert config["shared_prefix_training"] == {"mode": "train"}
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize("refit_transport", [None, "mcore"])
 def test_megatron_generation_dispatches_refit_transport(refit_transport):
     generation = object.__new__(MegatronGeneration)
