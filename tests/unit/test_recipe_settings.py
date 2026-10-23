@@ -225,3 +225,16 @@ def test_non_deepseek_async_1off_recipes_use_nccl_reshard(
     assert config.policy.megatron_cfg.enabled is True
     assert config.policy.generation.colocated.enabled is False
     assert config.policy.generation.refit_transport == "nccl_reshard"
+
+
+def test_qwen235_async_refit_buffer_size_matches_on_both_sides() -> None:
+    register_omegaconf_resolvers()
+    config = load_config(
+        RECIPE_ROOT / "llm/performance/grpo-qwen3-235b-32n8g-async-1off.yaml"
+    )
+    train_ratio = config.policy.megatron_cfg.env_vars.NRL_REFIT_BUFFER_MEMORY_RATIO
+    generation_ratio = (
+        config.policy.generation.vllm_cfg.env_vars.NRL_REFIT_BUFFER_MEMORY_RATIO
+    )
+
+    assert train_ratio == generation_ratio == "0.005"
