@@ -94,6 +94,7 @@ async def _drain(async_generator: AsyncIterator[Any]) -> None:
 
 
 class TestHealthCheck:
+    @pytest.mark.nemo_gym
     @pytest.mark.asyncio
     async def test_spinup_reuses_rollout_client_and_refreshes_it_on_restart(
         self, monkeypatch: pytest.MonkeyPatch
