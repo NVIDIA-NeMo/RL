@@ -1,13 +1,13 @@
 # Rollout Checkpointing as One Component of the Single Controller
 
-**Status:** proposal. The move happens in five steps, detailed under
+**Status:** all five steps are done in this PR. They are detailed under
 [Migration Plan](#migration-plan):
 
 1. Move the Gym checkpoint code behind an `EnvironmentCheckpoint` interface. **Done in this PR.**
 2. Give the ledger and rollout manager backend-neutral names, and make the interfaces ABCs. **Done in this PR.**
 3. Move the snapshot writer into one `RolloutCheckpointing` component. **Done in this PR.**
 4. Move the restore chain into that component. **Done in this PR.**
-5. Collapse the rollout pump's two dispatch loops into one. *Proposed.*
+5. Collapse the rollout pump's two dispatch loops into one. **Done in this PR.**
 
 ## The Problem
 
@@ -56,7 +56,7 @@ SingleControllerActor            train pump + rollout pump
        ├─ snapshot writer         TQ cut, sidecars, manifest, retention (step 3, done)
        ├─ snapshot pump           periodic attempts, outcome telemetry  (step 3, done)
        ├─ restorer                replay buffer, ledger, reserve, cursor checks (step 4, done)
-       ├─ data-plane barrier      still owned by the controller until step 5
+       ├─ prompt dispatch         ledger or unrecorded reservations   (step 5, done)
        └─ EnvironmentCheckpoint   backend plug-in                     (step 1, done)
             ├─ GymEnvironmentCheckpoint   nemo_rl/environments/
             └─ NoEnvironmentCheckpoint    backends that keep no rollout state
@@ -66,8 +66,7 @@ SingleControllerActor            train pump + rollout pump
 
 ### The Controller-Facing API
 
-What steps 3 and 4 built is in `nemo_rl/algorithms/rollout_checkpointing/interface.py`.
-The member marked "step 5" is still the target.
+What steps 3 to 5 built is in `nemo_rl/algorithms/rollout_checkpointing/interface.py`.
 
 ```python
 class RolloutCheckpointing(abc.ABC):
@@ -107,8 +106,29 @@ class RolloutCheckpointing(abc.ABC):
     # groups saved before their batch was admitted.
     async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None: ...
 
-    # Rollout pump (step 5). Replaces `if enabled: async with barrier.mutation(...)`.
-    def reservation(self, kind: str) -> AsyncContextManager[Reservation]: ...
+    # Rollout pump (step 5). Replaces `if enabled: async with barrier.mutation(...)`
+    # and the plain-path copies of the dispatch loop. With ledger dispatch the
+    # reservation holds a data-plane mutation slot counted as `kind`; without it,
+    # it holds nothing.
+    @property
+    def records_prompt_groups(self) -> bool: ...
+    def reservation(
+        self, kind: CheckpointMutationKind
+    ) -> AbstractAsyncContextManager[PromptReservation]: ...
+
+
+class PromptReservation(abc.ABC):
+    # What the rollout pump changes in one step. LedgerReservation records each
+    # call in the recovery ledger under the reservation's cut; UnrecordedReservation
+    # does nothing, and reserve_prompt_group returns None so the rollout manager
+    # mints the group ID, as the plain path always did.
+    def reserve_prompt_group(
+        self, prompt, *, target_step, admitted=True, admission_id=None
+    ) -> Optional[str]: ...
+    async def admit(self, sampler, *, trainer_version_fn) -> Optional[int]: ...
+    def mark_prompt_group_admitted(self, group_id, *, target_step) -> None: ...
+    def discard_prompt_group(self, group_id) -> None: ...
+    async def discard_recovery_group(self, group_id: str) -> None: ...
 
 
 class RolloutCheckpointingHost(abc.ABC):
@@ -151,9 +171,20 @@ The controller gets `NoRolloutCheckpointing` when it takes no rollout snapshots
 (`snapshot_attempt_interval_s` unset) and its trainer checkpoints skip the data plane
 (checkpointing off, or `save_data_plane` off). It has no background tasks, no lock and no
 commit window. Its `save_with_trainer_checkpoint` returns only the dataloader state and
-spare prompts, which every trainer checkpoint needs. In step 5 it also gets a reservation
-that mints group IDs without a ledger. With it, the rollout pump runs a single dispatch
-loop, and the plain path is the same code with nothing recorded.
+spare prompts, which every trainer checkpoint needs. With unrecorded dispatch, its
+`reservation` takes no mutation slot and records nothing, and the rollout manager mints
+group IDs as before. So the rollout pump runs a single dispatch loop, and the plain path
+is the same code with nothing recorded.
+
+Whether dispatch records prompt groups in the ledger does not follow from which
+implementation was built. Both hold one `PromptDispatch` (`dispatch.py`).
+`_build_rollout_checkpointing` turns it on when the run saves recovery state
+(`checkpointing.enabled`, `save_data_plane` and a sampler that restores buffered groups)
+or when the resumed checkpoint carried a recovery payload. `restore()` also turns it on
+when the report says restore queued groups only ledger dispatch can launch, such as a
+replay-free resume. A run with `NoRolloutCheckpointing` can therefore still dispatch
+through the ledger. `redispatch_restored` does nothing while ledger dispatch is off,
+because then there is nothing restored to launch.
 
 Restore is the one thing `NoRolloutCheckpointing` does not skip. The checkpoint a run
 resumes from can hold buffered rollouts, unfinished groups and spare prompts even when the
@@ -211,7 +242,7 @@ Each step is one PR that keeps behavior the same. Each one moves code and the te
    - `_validate_replay_inventory`, `_validate_rollout_recovery_inventory` and `_capture_reward_settings` became plain functions in `inventory.py`, because restore calls them too.
    - `_save_checkpoint_impl` calls `save_with_trainer_checkpoint` and `write_controller_sidecars` instead of its own TQ capture and sidecar writes. It went from 223 to 130 lines.
    - The controller goes from 6,032 to 5,270 lines. The package is 1,454 lines in five files.
-   - Still open: the controller still owns the data-plane barrier and opens the trainer checkpoint's exclusive cut itself.
+   - Still open: the controller still owns the data-plane barrier and opens the trainer checkpoint's exclusive cut itself. Step 5 keeps it there; see below.
 4. **Restorer out (done).**
    - These moved into `RolloutRestorer` (`nemo_rl/algorithms/rollout_checkpointing/restore.py`): `_maybe_restore_replay_buffer`, `_maybe_restore_rollout_recovery`, `_maybe_restore_replacement_reserve`, `_queue_restored_replay_groups_for_regeneration`, `_load_recovery_prompt`, `_rehydrate_rollout_recovery_prompts`, `_validate_restored_sampler_cursor`, `_log_rollout_restore_metrics` and `_redispatch_restored_rollouts`. `_load_recovery_prompt` had no caller outside restore, so it moved too.
    - `restore()` runs them in the old order and returns a `RestoreReport`. `redispatch_restored(launch, admit)` replaces `_redispatch_restored_rollouts`; the rollout pump passes its `_launch` and `_admit_reserved_prompt_groups`.
@@ -219,12 +250,19 @@ Each step is one PR that keeps behavior the same. Each one moves code and the te
    - The replay-capacity permits for restored groups are now taken in `_apply_restore_report`, right after `restore()` returns, instead of inside the replay restore. Nothing reads the semaphore before the pumps start, so the order change has no effect.
    - The controller goes from 5,270 to 4,656 lines. The package is 2,394 lines in six files.
    - Still in the controller, for step 5: `_admit_reserved_prompt_groups` and `_require_unoccupied_target_step`. Both are live dispatch: the rollout pump and `_drain_reserve_into_steps` admit every new batch through them. The sampler cursor restore and the `restoring_rollout_recovery` check also stay in `__init__`: the first is part of building the sampler, and the second decides the dispatch mode, which step 5 reworks.
-5. **One dispatch loop.** The rollout pump always reserves through `reservation()`. This removes the second loop copies and the ten `_rollout_recovery_enabled` branches.
+5. **One dispatch loop (done).**
+   - The rollout pump, `_drain_reserve_into_steps`, `_abort_stale_inflight` and the finalizer's drop path reserve, admit and discard through `reservation(kind)`. `PromptDispatch` (`dispatch.py`) hands out a `LedgerReservation` (one mutation cut, every call recorded in the ledger) or an `UnrecordedReservation` (no cut, nothing recorded).
+   - The plain-path copies of the dataloader loop and the spare-pool drain are gone, and so are the `if self._rollout_recovery_enabled:` branches: nine in the pump, drain and abort, plus the one in `_apply_restore_report` that turned the flag on. One check is left: `_launch` refuses a launch without a group ID while `records_prompt_groups` is on.
+   - The dispatch-mode decision moved from `__init__` into `_build_rollout_checkpointing`, and the restore-time switch moved from `_apply_restore_report` into the component's `restore()`. `ControllerRolloutState.rollout_recovery_enabled` now reads `records_prompt_groups`.
+   - `_admit_reserved_prompt_groups` and `_require_unoccupied_target_step` stay in the controller. They are the rollout pump's sampler admission in both modes, and they read and write controller state (the sampler, `_sampler_stamps_target_steps`, the trainer version, the replay buffer). The ledger part of admission (the cut, the sampler's `commit_admission`, `mark_prompt_group_admitted`) is in the reservation.
+   - The data-plane barrier stays in the controller. Every run uses it, including runs with `NoRolloutCheckpointing`: the replay buffer and rollout manager hold it, finalizer commits, known-outcome cleanup, consumed-row cleanup and advantage writeback take mutation slots, and the trainer checkpoint's exclusive cut also covers the controller's own `GRPOSaveState`. The component receives it; moving it would only make the component hand it back.
+   - Small differences on the plain path, none of which changes what is trained: `_drain_reserve_into_steps` now sets `_sampler_stamps_target_steps` when the sampler stamps, as the ledger path did; a transactional sampler's gate is checked once before the reservation and again (immediately) inside `admit`; and the "substituting a spare prompt" log names the step the group was dropped from in both modes (the ledger path used to print the lender step).
+   - The controller goes from 4,656 to 4,593 lines. The package is 2,717 lines in seven files.
 
 **End state:**
-- The controller loses about 1,800 lines.
-- Rollout checkpointing lives in one package with its own tests.
-- Turning it off is one setting that hands the controller `NoRolloutCheckpointing`.
+- The controller went from 6,446 lines at #4500's head to 4,593 lines.
+- Rollout checkpointing lives in one package, `nemo_rl/algorithms/rollout_checkpointing/` (2,717 lines in seven files), with its own tests.
+- Turning it off is one setting that hands the controller `NoRolloutCheckpointing`. The rollout pump runs the same dispatch loop either way.
 
 ## Rules for New Code
 

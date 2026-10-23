@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a ``RolloutRestorer`` over a test's controller."""
+"""Build a ``RolloutRestorer`` and dispatch mode over a test's controller."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from typing import Any
 
 from nemo_rl.algorithms.rollout_checkpointing import (
     CheckpointToRestore,
+    NoRolloutCheckpointing,
+    PromptDispatch,
     RolloutRestorer,
 )
 from nemo_rl.algorithms.single_controller import _ControllerRolloutHost
@@ -60,3 +62,31 @@ def restorer_for(
         ),
         checkpoint=checkpoint,
     )
+
+
+def dispatch_for(controller: Any, *, records_prompt_groups: bool) -> PromptDispatch:
+    """The dispatch mode over ``controller``'s barrier and rollout manager.
+
+    Ledger dispatch reads both, so set them on the controller first.
+    """
+    return PromptDispatch(
+        data_plane_barrier=getattr(controller, "_data_plane_checkpoint_barrier", None),  # type: ignore[arg-type]
+        rollout_manager=getattr(controller, "_rollout_manager", None),  # type: ignore[arg-type]
+        records_prompt_groups=records_prompt_groups,
+    )
+
+
+def use_dispatch(
+    controller: Any, *, records_prompt_groups: bool
+) -> NoRolloutCheckpointing:
+    """Give ``controller`` a ``NoRolloutCheckpointing`` with this dispatch mode.
+
+    Ledger dispatch reads the controller's barrier and rollout manager, so set
+    them first.
+    """
+    component = NoRolloutCheckpointing(
+        restorer=restorer_for(controller),
+        dispatch=dispatch_for(controller, records_prompt_groups=records_prompt_groups),
+    )
+    controller._rollout_checkpointing = component
+    return component

@@ -59,7 +59,10 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
-from tests.unit.single_controller._restore_helpers import restorer_for
+from tests.unit.single_controller._restore_helpers import (
+    dispatch_for,
+    restorer_for,
+)
 
 _GROUP_SIZE = 2
 _PROMPTS_PER_STEP = 3
@@ -249,7 +252,6 @@ def _controller(
     controller._train_steps = 0
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False
-    controller._rollout_recovery_enabled = True
     controller._batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
@@ -294,6 +296,7 @@ def _rollout_checkpointing(
         bootstrap_identity=None,
         teacher_coordinator=controller._teacher_coordinator,
         restorer=restorer_for(controller, checkpoint),
+        dispatch=dispatch_for(controller, records_prompt_groups=True),
     )
 
 

@@ -90,6 +90,7 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+from tests.unit.single_controller._restore_helpers import use_dispatch
 
 
 class FakeWeightSynchronizer:
@@ -845,7 +846,7 @@ async def test_sync_weights_honors_recompute_kv_cache_config(
             )
         ),
     )
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(
         env={"should_use_nemo_gym": use_nemo_gym},
         policy={
@@ -979,7 +980,7 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     ctrl._timer = Timer()
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
@@ -1009,7 +1010,7 @@ def test_sync_weights_rejects_unconfirmed_inflight_kv_recomputation() -> None:
         resume_generation_after_refit=MagicMock(return_value=False),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(NotImplementedError, match="active-request KV state"):
@@ -1042,7 +1043,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     )
     ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
@@ -1083,7 +1084,7 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
         resume_generation_after_refit=MagicMock(return_value=False),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="successful refit pause"):
@@ -1111,7 +1112,7 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_pause_fails() -> Non
         resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="pause every async vLLM engine"):
@@ -1140,7 +1141,7 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
         resume_generation_after_refit=MagicMock(return_value=True),
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._master_config = SimpleNamespace(env={})
 
     with pytest.raises(RuntimeError, match="refit failed"):
@@ -2258,6 +2259,7 @@ def _commit_window_checkpointing() -> DataPlaneRolloutCheckpointing:
         bootstrap_identity=None,
         teacher_coordinator=None,
         restorer=None,  # type: ignore[arg-type]
+        dispatch=None,  # type: ignore[arg-type]
     )
 
 

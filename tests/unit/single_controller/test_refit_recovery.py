@@ -49,6 +49,7 @@ from nemo_rl.models.generation.fleet_health import (
     ShardState,
 )
 from nemo_rl.utils.timer import Timer
+from tests.unit.single_controller._restore_helpers import use_dispatch
 
 
 async def _completed(value=None):
@@ -157,7 +158,7 @@ def _make_controller(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
     ctrl._inflight_by_group_id = {}
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
     ctrl._timer = Timer()
     return ctrl, monitor, sync

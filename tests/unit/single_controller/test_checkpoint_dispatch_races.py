@@ -93,7 +93,10 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
 )
 from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
-from tests.unit.single_controller._restore_helpers import restorer_for
+from tests.unit.single_controller._restore_helpers import (
+    restorer_for,
+    use_dispatch,
+)
 from tests.unit.single_controller._checkpoint_scenarios import (
     _record,
     patch_converter,
@@ -348,6 +351,7 @@ def _environment_phase_checkpointing(
         bootstrap_identity=None,
         teacher_coordinator=None,
         restorer=None,  # type: ignore[arg-type]
+        dispatch=None,  # type: ignore[arg-type]
     )
 
 
@@ -636,7 +640,6 @@ def _reserve_controller() -> Any:
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._replacement_reserve = deque()
     controller._sampler_stamps_target_steps = True
-    controller._rollout_recovery_enabled = True
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
@@ -646,6 +649,7 @@ def _reserve_controller() -> Any:
     )
     controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
     controller._rollout_manager = _LedgerFacade()
+    use_dispatch(controller, records_prompt_groups=True)
     return controller
 
 
@@ -2170,6 +2174,8 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
                 await rollout_manager.complete_recovery(cut, group_id)
 
         restorer = restorer_for(controller, checkpoint)
+        # Re-admission reserves through the controller's ledger dispatch.
+        use_dispatch(controller, records_prompt_groups=True)
         await restorer._maybe_restore_rollout_recovery(restored_replay_groups=0)
         await restorer.redispatch_restored(
             _recover, controller._admit_reserved_prompt_groups
@@ -2229,6 +2235,8 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
         )
+        # Re-admission reserves through the controller's ledger dispatch.
+        use_dispatch(controller, records_prompt_groups=True)
 
         launched: list[tuple[str, int | None]] = []
 

@@ -31,7 +31,7 @@ import hashlib
 import io
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -81,7 +81,7 @@ if TYPE_CHECKING:
 LaunchFn = Callable[[DatumSpec, Optional[int], str], Awaitable[None]]
 """Dispatch one restored group: its prompt, target step and group ID."""
 
-AdmitFn = Callable[[list[str]], Awaitable[Optional[int]]]
+AdmitFn = Callable[[Sequence[Optional[str]]], Awaitable[Optional[int]]]
 """Commit one sampler admission for reserved groups; return their target step."""
 
 

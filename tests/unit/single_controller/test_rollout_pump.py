@@ -43,7 +43,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.rollout_checkpointing import NoRolloutCheckpointing
+from nemo_rl.algorithms.rollout_checkpointing import (
+    NoRolloutCheckpointing,
+    RestoreReport,
+)
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -70,7 +73,11 @@ from tests.unit.experience.test_rollouts import (
     rollout_cluster,  # noqa: F401
     rollout_tokenizer,  # noqa: F401
 )
-from tests.unit.single_controller._restore_helpers import restorer_for
+from tests.unit.single_controller._restore_helpers import (
+    dispatch_for,
+    restorer_for,
+    use_dispatch,
+)
 from tests.unit.single_controller._dp_fakes import (
     _BULK_FIELDS,
     _PARTITION_ID,
@@ -109,7 +116,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
     ctrl._replacement_reserve = deque()
-    ctrl._rollout_recovery_enabled = False
+    # Plain dispatch: no ledger, so it reads no barrier or rollout manager.
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
@@ -233,6 +241,141 @@ def test_rollout_pump_stamps_target_steps(
     assert ctrl._rollout_exhausted.is_set()
 
 
+class _LedgerRecordingRolloutManager(_RecordingRolloutManager):
+    """Records the ledger calls ledger dispatch makes and the IDs it launches."""
+
+    def __init__(self, buffer: _RecordingBuffer) -> None:
+        super().__init__(buffer)
+        self.reserved: list[tuple[Any, bool]] = []
+        self.admitted: list[tuple[str, int | None]] = []
+        self.launched_group_ids: list[str | None] = []
+
+    def reserve_prompt_group(
+        self,
+        cut: Any,
+        prompt: Any,
+        *,
+        target_step: Any,
+        admitted: bool = True,
+        admission_id: Any = None,
+    ) -> str:
+        del target_step, admission_id
+        cut.require_live()
+        self.reserved.append((prompt["idx"], admitted))
+        return f"group-{len(self.reserved)}"
+
+    def mark_prompt_group_admitted(
+        self, cut: Any, group_id: str, *, target_step: int | None
+    ) -> None:
+        cut.require_live()
+        self.admitted.append((group_id, target_step))
+
+    async def generate_and_push(
+        self,
+        prompt: Any,
+        *,
+        target_step: int | None = None,
+        inflight_registry: dict[str, tuple[asyncio.Task[None], int]] | None = None,
+        lineage_group_id: str | None = None,
+    ) -> None:
+        self.launched_group_ids.append(lineage_group_id)
+        await super().generate_and_push(
+            prompt, target_step=target_step, inflight_registry=inflight_registry
+        )
+
+
+class _ReportingRestorer:
+    """Stands in for the restorer: reports whether ledger dispatch is needed."""
+
+    def __init__(self, requires_recovery_dispatch: bool) -> None:
+        self.report = RestoreReport(
+            requires_recovery_dispatch=requires_recovery_dispatch
+        )
+        self.redispatched = False
+
+    async def restore(self) -> RestoreReport:
+        return self.report
+
+    async def redispatch_restored(self, launch: Any, admit: Any) -> None:
+        del launch, admit
+        self.redispatched = True
+
+
+@pytest.mark.parametrize("checkpoint_needs_ledger", [False, True])
+def test_restore_decides_ledger_dispatch_for_a_run_that_saves_no_rollout_state(
+    checkpoint_needs_ledger: bool,
+) -> None:
+    """``NoRolloutCheckpointing`` still dispatches through the ledger after restore.
+
+    A replay-free resume queues groups that only ledger dispatch can launch,
+    even when this run saves nothing. Without that, the one loop dispatches
+    exactly as the plain path did: no ledger records, and group IDs minted by
+    the rollout manager.
+    """
+    buffer = _RecordingBuffer()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._buffer = buffer
+    ctrl._async_cfg = SimpleNamespace(
+        max_inflight_prompts=2,
+        diagnostics=False,
+        rollout_failure=_failure_cfg(),
+    )
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig.model_construct(max_num_epochs=1)
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    manager = _LedgerRecordingRolloutManager(buffer)
+    ctrl._rollout_manager = manager
+    ctrl._finalizer_actors = []
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+    ctrl._dataloader = [
+        BatchedDataDict(
+            {"idx": [index], "message_log": [[{"role": "user", "content": "p"}]]}
+        )
+        for index in (10, 11)
+    ]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._rollout_exhausted = asyncio.Event()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._inflight_by_group_id = {}
+    ctrl._dispatched_rollouts = set()
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    _init_pump_ledgers(ctrl)
+    ctrl._finalizer_metrics_by_group = {}
+    ctrl._finalizer_rewards_by_group = {}
+    restorer = _ReportingRestorer(checkpoint_needs_ledger)
+    # This run saves no rollout state, so it gets NoRolloutCheckpointing with
+    # plain dispatch to start with.
+    ctrl._rollout_checkpointing = NoRolloutCheckpointing(
+        restorer=restorer,  # type: ignore[arg-type]
+        dispatch=dispatch_for(ctrl, records_prompt_groups=False),
+    )
+
+    async def exercise() -> None:
+        await ctrl._apply_restore_report(await ctrl._rollout_checkpointing.restore())
+        await ctrl._rollout_pump()
+
+    asyncio.run(exercise())
+
+    assert ctrl._rollout_checkpointing.records_prompt_groups is checkpoint_needs_ledger
+    assert restorer.redispatched is checkpoint_needs_ledger
+    assert buffer.target_step_list == [0, 1]
+    if checkpoint_needs_ledger:
+        assert manager.reserved == [(10, False), (11, False)]
+        assert manager.admitted == [("group-1", 0), ("group-2", 1)]
+        assert manager.launched_group_ids == ["group-1", "group-2"]
+    else:
+        assert manager.reserved == []
+        assert manager.admitted == []
+        assert manager.launched_group_ids == [None, None]
+    assert ctrl._rollout_exhausted.is_set()
+
+
 @pytest.mark.parametrize(
     ("outcome", "expect_permit_released"),
     [
@@ -306,6 +449,7 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
     ctrl._trainer_version = 0
     ctrl._sampler_stamps_target_steps = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    use_dispatch(ctrl, records_prompt_groups=True)
 
     with pytest.raises(RuntimeError, match="already contains 1 group"):
         asyncio.run(ctrl._admit_reserved_prompt_groups(["new-group"]))
@@ -323,7 +467,7 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=1)
     ctrl._buffer = buffer
     ctrl._replacement_reserve = deque([{"idx": 0}])
-    ctrl._rollout_recovery_enabled = False
+    use_dispatch(ctrl, records_prompt_groups=False)
     ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
     launched: list[Any] = []
@@ -815,12 +959,12 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
-        ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
         ctrl._rollout_manager = SimpleNamespace(
             recovery_ledger=ledger,
             discard_prompt_group=ledger.discard_group,
         )
+        use_dispatch(ctrl, records_prompt_groups=True)
 
         aborted = await ctrl._abort_stale_inflight()
 
@@ -861,12 +1005,12 @@ def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"completed": (completed, 1)}
-        ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
         ctrl._rollout_manager = SimpleNamespace(
             recovery_ledger=ledger,
             discard_prompt_group=ledger.discard_group,
         )
+        use_dispatch(ctrl, records_prompt_groups=True)
 
         async with ctrl._data_plane_checkpoint_barrier.checkpoint() as cut:
             abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
@@ -910,12 +1054,12 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"stale": (stale, 1)}
-        ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
         ctrl._rollout_manager = SimpleNamespace(
             recovery_ledger=ledger,
             discard_prompt_group=ledger.discard_group,
         )
+        use_dispatch(ctrl, records_prompt_groups=True)
 
         abort_task = asyncio.create_task(ctrl._abort_stale_inflight())
         await asyncio.wait_for(barrier.mutation_applied.wait(), timeout=1.0)
@@ -956,7 +1100,7 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
         ctrl._inflight_by_group_id = {"g": (task, 0)}
-        ctrl._rollout_recovery_enabled = False
+        use_dispatch(ctrl, records_prompt_groups=False)
 
         with pytest.raises(BaseExceptionGroup) as exc_info:
             await ctrl._abort_stale_inflight()
@@ -1316,10 +1460,10 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
-        ctrl._rollout_recovery_enabled = True
         # Nothing was restored, so the pump has nothing to redispatch.
         ctrl._rollout_checkpointing = NoRolloutCheckpointing(
-            restorer=restorer_for(ctrl)
+            restorer=restorer_for(ctrl),
+            dispatch=dispatch_for(ctrl, records_prompt_groups=True),
         )
 
         async def _finalize(
