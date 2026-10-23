@@ -94,7 +94,9 @@ def commands(events):
     return [(role, command) for role, command, _ in events]
 
 
-@pytest.mark.parametrize("required", [POLICY_PROFILER_METHODS, ROLLOUT_PROFILER_METHODS])
+@pytest.mark.parametrize(
+    "required", [POLICY_PROFILER_METHODS, ROLLOUT_PROFILER_METHODS]
+)
 def test_loader_constructs_profiler_with_rank(plugin_module, required):
     profiler = load_profiler(
         "fake_profiler_plugin.Plugin", rank=7, required_methods=required
@@ -112,7 +114,11 @@ def test_loader_constructs_profiler_with_rank(plugin_module, required):
         ("missing_profiler_plugin.Plugin", RuntimeError, "Could not import"),
         ("fake_profiler_plugin.Missing", RuntimeError, "does not resolve"),
         ("fake_profiler_plugin.not_a_class", RuntimeError, "does not resolve"),
-        ("fake_profiler_plugin.Incomplete", RuntimeError, "begin_engine_initialization"),
+        (
+            "fake_profiler_plugin.Incomplete",
+            RuntimeError,
+            "begin_engine_initialization",
+        ),
         ("fake_profiler_plugin.Broken", RuntimeError, "for rank 3"),
     ],
 )
@@ -362,7 +368,10 @@ def test_capture_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("NRL_NTRACE_FOUR_PHASE", raising=False)
     events = []
     capture = GrpoCapture(
-        Target("policy", events), Target("rollout", events), schedule="sync", colocated=True
+        Target("policy", events),
+        Target("rollout", events),
+        schedule="sync",
+        colocated=True,
     )
 
     with capture.step(step_id=1, weight_version=0):
@@ -426,7 +435,10 @@ def test_sync_step_owns_both_roles(four_phase, fail_on):
 def test_async_policy_step_retains_bootstrap_window(four_phase):
     events = []
     capture = GrpoCapture(
-        Target("policy", events), Target("rollout", events), schedule="async", colocated=False
+        Target("policy", events),
+        Target("rollout", events),
+        schedule="async",
+        colocated=False,
     )
     events.clear()
 

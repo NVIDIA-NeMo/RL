@@ -138,13 +138,6 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
     TeacherFullPayloadOutputSpec,
 )
-from nemo_rl.models.profiling import (
-    POLICY_PROFILER_CLASS_ENV,
-    POLICY_PROFILER_METHODS,
-    WorkerCapture,
-    load_profiler,
-    selected_profiler_class,
-)
 from nemo_rl.models.policy.utils import (
     broadcast_hf_buckets_via_distributed_impl,
     connect_rollout_engines_from_distributed,
@@ -159,6 +152,13 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.models.profiling import (
+    POLICY_PROFILER_CLASS_ENV,
+    POLICY_PROFILER_METHODS,
+    WorkerCapture,
+    load_profiler,
+    selected_profiler_class,
+)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,

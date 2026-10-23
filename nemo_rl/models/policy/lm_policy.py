@@ -55,13 +55,13 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
-from nemo_rl.models.profiling import profile_policy_method
 from nemo_rl.models.policy.utils import (
     DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
+from nemo_rl.models.profiling import profile_policy_method
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
