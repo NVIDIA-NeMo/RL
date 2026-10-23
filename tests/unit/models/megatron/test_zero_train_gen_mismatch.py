@@ -39,6 +39,7 @@ CONFIGS_DIR = Path(__file__).resolve().parents[4] / "examples" / "configs"
 
 ZERO_KL_EXEMPLARS = [
     "recipes/llm/grpo-qwen3-30ba3b-2n4g-megatron_generation-noncolocated-zero-kl.yaml",
+    "recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-zero-kl-mxfp8.yaml",
 ]
 
 # Installed-package versions that satisfy every gate in `_validate_packages`.
@@ -179,11 +180,10 @@ def test_validate_rejects_a_missing_required_megatron_value():
     assert any("moe_permute_fusion must be False" in v for v in result.violations)
 
 
-def test_validate_rejects_chunked_prefill():
+def test_validate_allows_chunked_prefill():
     config = _policy_config()
     config["generation"]["mcore_generation_config"]["enable_chunked_prefill"] = True
-    result = _validate(config)
-    assert any("enable_chunked_prefill must be False" in v for v in result.violations)
+    assert _validate(config).violations == []
 
 
 # --------------------------------------------------------------------------- #
@@ -204,11 +204,19 @@ def test_batch_invariant_off_reports_nothing():
     assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
-def test_batch_invariant_rejects_tensor_parallel():
+def test_batch_invariant_allows_matched_tensor_parallel():
     config = _policy_config()
     config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 2
+    assert zgm.validate_batch_invariant_mode(config).violations == []
+
+
+def test_batch_invariant_rejects_tensor_parallel_above_two():
+    config = _policy_config()
+    config["megatron_cfg"]["tensor_model_parallel_size"] = 4
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 4
     result = zgm.validate_batch_invariant_mode(config)
-    assert any("tensor_model_parallel_size=1" in v for v in result.violations)
+    assert any("tensor_model_parallel_size <= 2" in v for v in result.violations)
 
 
 def test_batch_invariant_reports_a_train_generation_tp_mismatch():
@@ -226,10 +234,6 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
     ("mutate", "expected"),
     [
         (lambda c: c["megatron_cfg"].update(context_parallel_size=2), "context"),
-        (
-            lambda c: c.__setitem__("sequence_packing", {"enabled": True}),
-            "sequence_packing.enabled=False",
-        ),
         (
             lambda c: c["megatron_cfg"].update(use_fused_linear_logprobs=True),
             "use_fused_linear_logprobs",
@@ -251,13 +255,19 @@ def test_batch_invariant_reports_a_train_generation_tp_mismatch():
             "precision='bfloat16'",
         ),
     ],
-    ids=["cp", "packing", "fused-logprobs", "attention", "fa-version", "gen", "dtype"],
+    ids=["cp", "fused-logprobs", "attention", "fa-version", "gen", "dtype"],
 )
 def test_batch_invariant_rejects_unsupported_settings(mutate, expected):
     config = _policy_config()
     mutate(config)
     result = zgm.validate_batch_invariant_mode(config)
     assert any(expected in v for v in result.violations), result.violations
+
+
+def test_batch_invariant_accepts_sequence_packing():
+    config = _policy_config()
+    config["sequence_packing"] = {"enabled": True}
+    assert zgm.validate_batch_invariant_mode(config).violations == []
 
 
 def test_batch_invariant_requires_the_batch_invariant_fields():
@@ -336,7 +346,6 @@ def test_validate_requires_flash_attention_4(version):
     ("key", "value"),
     [
         ("multi_latent_attention", True),
-        ("hybrid_layer_pattern", "M*L"),
         ("experimental_attention_variant", "some_variant"),
     ],
 )
@@ -346,6 +355,95 @@ def test_validate_provider_rejects_unsupported_architecture(key, value):
 
     with pytest.raises(ValueError, match=key):
         zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+_HYBRID_MAMBA_ENV_VARS = {"MAMBA_DETERMINISTIC": "1", "TRITON_CACHE_AUTOTUNING": "1"}
+
+
+@pytest.fixture
+def _clean_mamba_env(monkeypatch):
+    for key in _HYBRID_MAMBA_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.mark.parametrize(
+    "model_cfg",
+    [
+        types.SimpleNamespace(hybrid_layer_pattern="M*-"),
+        types.SimpleNamespace(is_hybrid_model=True),
+    ],
+)
+def test_validate_provider_accepts_hybrid_mamba(_clean_mamba_env, model_cfg):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(_HYBRID_MAMBA_ENV_VARS)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_accepts_hybrid_mamba_env_from_launch(
+    _clean_mamba_env, monkeypatch
+):
+    for key, value in _HYBRID_MAMBA_ENV_VARS.items():
+        monkeypatch.setenv(key, value)
+    config = _policy_config()
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-")
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+@pytest.mark.parametrize("missing", sorted(_HYBRID_MAMBA_ENV_VARS))
+def test_validate_provider_requires_hybrid_mamba_env_pair(_clean_mamba_env, missing):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(
+        {k: v for k, v in _HYBRID_MAMBA_ENV_VARS.items() if k != missing}
+    )
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-")
+
+    with pytest.raises(ValueError, match=f"got {missing}=None"):
+        zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_skips_mamba_env_for_non_hybrid(_clean_mamba_env):
+    config = _policy_config()
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern=None)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+@pytest.mark.parametrize(
+    ("packing", "divisible_by", "tp", "accepted"),
+    [
+        (True, 64, 1, False),
+        (True, 128, 1, True),
+        (True, 256, 2, True),
+        (True, 192, 2, False),
+        (False, 64, 1, True),
+    ],
+    ids=["packed-64", "packed-128", "packed-256-tp2", "packed-192-tp2", "unpacked-64"],
+)
+def test_validate_provider_requires_mamba_chunk_aligned_packing(
+    _clean_mamba_env, packing, divisible_by, tp, accepted
+):
+    config = _policy_config()
+    config["megatron_cfg"]["env_vars"].update(_HYBRID_MAMBA_ENV_VARS)
+    config["megatron_cfg"]["tensor_model_parallel_size"] = tp
+    config["sequence_packing"] = {"enabled": packing}
+    config["make_sequence_length_divisible_by"] = divisible_by
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern="M*-", mamba_chunk_size=128)
+
+    if accepted:
+        zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+    else:
+        with pytest.raises(ValueError, match="multiple of 128 \\(mamba_chunk_size=128\\)"):
+            zgm.validate_zero_train_gen_model_provider(config, model_cfg)
+
+
+def test_validate_provider_allows_64_aligned_packing_for_non_hybrid(_clean_mamba_env):
+    config = _policy_config()
+    config["sequence_packing"] = {"enabled": True}
+    model_cfg = types.SimpleNamespace(hybrid_layer_pattern=None)
+
+    zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
 def test_validate_provider_is_noop_when_the_preset_is_off():
@@ -362,14 +460,43 @@ def test_validate_rejects_non_bf16_precision():
     assert any("precision='bfloat16'" in v for v in _validate(config).violations)
 
 
+_MXFP8 = {"enabled": True, "fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True}
+
+
+def test_validate_accepts_mxfp8_on_both_sides():
+    # The generation side inherits policy.megatron_cfg.fp8_cfg.
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+    config["generation"]["mcore_generation_config"][
+        "inference_grouped_gemm_backend"
+    ] = "torch"
+    assert _validate(config).violations == []
+
+
 @pytest.mark.parametrize("side", ["train", "generation"])
-def test_validate_rejects_fp8_on_either_side(side):
+def test_validate_rejects_mxfp8_on_one_side_only(side):
     config = _policy_config()
     if side == "train":
-        config["megatron_cfg"]["fp8_cfg"] = {"enabled": True}
+        config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+        config["generation"]["mcore_generation_config"]["fp8_cfg"] = {"enabled": False}
     else:
-        config["generation"]["mcore_generation_config"]["fp8_cfg"] = {"enabled": True}
-    assert any("FP8" in v for v in _validate(config).violations)
+        config["generation"]["mcore_generation_config"]["fp8_cfg"] = dict(_MXFP8)
+    assert any("same precision" in v for v in _validate(config).violations)
+
+
+def test_validate_rejects_a_non_mxfp8_fp8_recipe():
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = {**_MXFP8, "fp8_recipe": "blockwise"}
+    assert any("fp8_recipe='mxfp8'" in v for v in _validate(config).violations)
+
+
+def test_validate_rejects_flashinfer_grouped_gemm_with_mxfp8():
+    config = _policy_config()
+    config["megatron_cfg"]["fp8_cfg"] = dict(_MXFP8)
+    config["generation"]["mcore_generation_config"][
+        "inference_grouped_gemm_backend"
+    ] = "flashinfer"
+    assert any("flashinfer" in v for v in _validate(config).violations)
 
 
 # --------------------------------------------------------------------------- #
@@ -585,17 +712,60 @@ def test_enable_batch_invariant_kernels_passes_the_recipe_settings(monkeypatch):
         zgm, "allow_installed_flash_attn_4", lambda: opened.append(True)
     )
     monkeypatch.setattr(
-        zgm, "_use_fused_log_softmax_at_tp1", lambda: shimmed.append(True)
+        zgm, "_use_full_vocab_log_softmax", lambda: shimmed.append(True)
+    )
+    tuned: list[bool] = []
+    monkeypatch.setattr(
+        zgm, "_enable_mcore_deterministic_tuning", lambda: tuned.append(True)
     )
 
     zgm.enable_batch_invariant_kernels(_policy_config())
 
     assert opened == [True]
     assert shimmed == [True]
+    assert tuned == [True]
     assert calls == [
         ("assert_te", (), {}),
         ("enable", (), {"backend": "te_native", "collective": "ordered"}),
     ]
+
+
+def _fake_tuning(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    calls: list[tuple] = []
+    tuning = types.ModuleType("megatron.core.tuning")
+    tuning.set_deterministic_mode = lambda value: calls.append(("set", value))  # type: ignore[attr-defined]
+    tuning.install = lambda *a, **k: calls.append(("install", a, k))  # type: ignore[attr-defined]
+    _install_fake_module(monkeypatch, tuning.__name__, tuning)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("1", [("set", True), ("install", (), {"deterministic": True})]),
+        ("0", []),
+        (None, []),
+    ],
+)
+def test_mamba_deterministic_turns_on_mcore_deterministic_tuning(
+    monkeypatch, value, expected
+):
+    calls = _fake_tuning(monkeypatch)
+    if value is None:
+        monkeypatch.delenv("MAMBA_DETERMINISTIC", raising=False)
+    else:
+        monkeypatch.setenv("MAMBA_DETERMINISTIC", value)
+
+    zgm._enable_mcore_deterministic_tuning()
+
+    assert calls == expected
+
+
+def test_mcore_without_tuning_relies_on_mamba_deterministic(monkeypatch):
+    monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    monkeypatch.setitem(sys.modules, "megatron.core.tuning", None)
+
+    zgm._enable_mcore_deterministic_tuning()
 
 
 def test_validate_kl_is_a_noop_when_everything_is_off():
@@ -650,7 +820,7 @@ def test_validate_kl_raises_on_an_invalid_preset():
 
 def test_validate_kl_raises_when_batch_invariant_checks_fail():
     config = _policy_config()
-    config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["megatron_cfg"]["context_parallel_size"] = 2
     with pytest.raises(ValueError, match="batch_invariant_mode=True failed"):
         zgm.validate_zero_train_gen_kl(config, check_environment=False)
 
@@ -817,18 +987,33 @@ def test_token_rounder_matches_megatron_core():
     assert MCORE_TOKEN_ROUNDER == batch_dimensions_utils.TOKEN_ROUNDER
 
 
-def test_tp1_logprob_shim_only_replaces_size_one_groups(monkeypatch):
+def test_logprob_shim_uses_full_vocab_log_softmax_at_any_tp(monkeypatch):
     import torch
 
     from nemo_rl.distributed import model_utils
 
     for name in ("DistributedLogprob", "ChunkedDistributedLogprob"):
         monkeypatch.setattr(model_utils, name, getattr(model_utils, name))
-    zgm._use_fused_log_softmax_at_tp1()
-    zgm._use_fused_log_softmax_at_tp1()  # idempotent: must not wrap twice
+    zgm._use_full_vocab_log_softmax()
+    zgm._use_full_vocab_log_softmax()  # idempotent: must not wrap twice
 
-    sizes = {"tp1": 1, "tp2": 2}
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: sizes[group])
+    # TP 2, rank 1: rank 0's half is a function of rank 1's, so any sequence
+    # slice of the shard gathers to the matching slice of the full row. MCore's
+    # gather returns its input unchanged at TP 1.
+    def full_row(shard):
+        return torch.cat([shard.flip(-1) * 0.5, shard], dim=-1)
+
+    gathered = []
+
+    def fake_gather(shard, group):
+        gathered.append((shard.shape[1], group))
+        return shard if group == "tp1" else full_row(shard)
+
+    mappings = types.SimpleNamespace(
+        gather_from_tensor_model_parallel_region=fake_gather
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
+
     logits = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     target = torch.randint(0, 16, (2, 5))
     expected = (
@@ -838,13 +1023,77 @@ def test_tp1_logprob_shim_only_replaces_size_one_groups(monkeypatch):
     )
 
     shim = model_utils.DistributedLogprob
-    assert isinstance(shim, zgm._Tp1LocalLogprob)
-    assert not isinstance(shim._original, zgm._Tp1LocalLogprob)
+    assert isinstance(shim, zgm._FullVocabLogprob)
+    assert not isinstance(shim._original, zgm._FullVocabLogprob)
     assert torch.equal(shim.apply(logits, target, 0, 16, "tp1", True), expected)
 
     chunked = model_utils.ChunkedDistributedLogprob
     assert torch.equal(chunked.apply(logits, target, 0, 16, 2, "tp1", True), expected)
+    gathered.clear()
+
+    shard = logits[..., 8:]
+    expected_tp2 = (
+        torch.log_softmax(full_row(shard).float(), dim=-1)
+        .gather(-1, target.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    assert torch.equal(shim.apply(shard, target, 8, 16, "tp2", True), expected_tp2)
+    assert gathered == [(5, "tp2")]
+    gathered.clear()
+    assert torch.equal(
+        chunked.apply(shard, target, 8, 16, 2, "tp2", True), expected_tp2
+    )
+    assert gathered == [(2, "tp2"), (2, "tp2"), (1, "tp2")]
 
     original = types.SimpleNamespace(apply=lambda *a: "orig")
     monkeypatch.setattr(shim, "_original", original)
-    assert shim.apply(logits, target, 0, 16, "tp2", True) == "orig"
+    assert shim.apply(logits, target, 0, 16, None, True) == "orig"
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_logprob_shim_backward_is_the_replaced_functions_backward(monkeypatch, chunked):
+    import torch
+
+    def full_row(shard):
+        return torch.cat([shard.flip(-1) * 0.5, shard], dim=-1)
+
+    mappings = types.SimpleNamespace(
+        gather_from_tensor_model_parallel_region=lambda shard, group: full_row(shard)
+    )
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel.mappings", mappings)
+
+    calls = []
+
+    class Original(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits, target, *rest):
+            calls.append(rest)
+            ctx.save_for_backward(logits)
+            return logits.float().sin().sum(-1)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (logits,) = ctx.saved_tensors
+            grad = logits.float().cos() * grad_output.unsqueeze(-1) * 3.0
+            return (grad,) + (None,) * (len(calls[-1]) + 1)
+
+    original_args = (8, 16, 2, "tp2") if chunked else (8, 16, "tp2")
+    shard = torch.randn(2, 5, 8, dtype=torch.bfloat16)
+    target = torch.randint(0, 16, (2, 5))
+    grad_output = torch.randn(2, 5)
+
+    reference_logits = shard.clone().requires_grad_()
+    Original.apply(reference_logits, target, *original_args, False).backward(
+        grad_output
+    )
+
+    calls.clear()
+    logits = shard.clone().requires_grad_()
+    shim = zgm._FullVocabLogprob(Original, chunked=chunked)
+    out = shim.apply(logits, target, *original_args, False)
+    assert calls == []  # the forward does not call the replaced function
+    out.backward(grad_output)
+
+    assert calls == [(*original_args, False)]
+    assert logits.grad.dtype == torch.bfloat16
+    assert torch.equal(logits.grad, reference_logits.grad)

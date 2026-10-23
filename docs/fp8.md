@@ -209,9 +209,10 @@ does not enable FP8 compute in the usual training path, so keep
 When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
 the recipe's per-module quantization config. NeMo RL still derives sequence
 padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
-the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
-`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
-are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
+the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Per-module
+`fp8_param: true` is supported only when both `fp8_cfg.enabled` and
+`fp8_cfg.fp8_param` are true. Per-module `fp4_param: true` remains unsupported.
+Matched BF16 blocks may leave both parameter-storage flags unset.
 
 ## Compatibility Note for DeepSeek-Style FP8 Training
 
