@@ -70,6 +70,7 @@ DP_TRAIN_FIELDS = (
     "token_mask",
     "sample_mask",
 )
+SCORE_CENTERING_FIELDS = ("score_centering_ids", "score_centering_logprobs")
 
 # Full-vocabulary MOPD teacher payload columns; exactly one is written per run,
 # selected by ``on_policy_distillation.full.teacher_payload``. Both are jagged-
@@ -93,6 +94,7 @@ OPD_FULL_TEACHER_INDEX_FIELD = "opd_full_teacher_index"
 # TransferQueue's lazy field-name registration race.
 SC_ROLLOUT_SCHEMA_FIELDS = (
     *DP_TRAIN_FIELDS,
+    *SCORE_CENTERING_FIELDS,
     MASK_SAMPLE,
     TRUNCATED,
     "prompt_ids_for_adv",

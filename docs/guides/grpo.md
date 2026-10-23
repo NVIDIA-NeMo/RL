@@ -556,7 +556,32 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
-##### Adaptive PPO clip
+#### Score centering
+
+[Score Centering](https://huggingface.co/papers/2609.20807) subtracts the expected policy score under the rollout sampler from each sampled policy gradient. For full-vocabulary sampling, NeMo RL requests the sampler's top log probabilities from vLLM. The transported head is exact; the remaining sampler mass is modeled as proportional to the training policy. The training loss gathers only the head token log probabilities, using the existing tensor-parallel gather for Megatron and DTensor/FSDP2. Expert routing for MoE models follows the usual policy forward and does not need a separate score-centering path.
+
+```yaml
+loss_fn:
+  score_centering_top_k: 128
+  disable_ppo_ratio: true
+  token_level_loss: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: icepop
+  truncated_importance_sampling_ratio_min: 0.5
+  truncated_importance_sampling_ratio: 5.0
+policy:
+  generation:
+    backend: vllm
+    temperature: 1.0
+    top_k: 128
+    top_p: 0.9
+```
+
+Setting `score_centering_top_k` to `0` disables the method. It works with direct synchronous or asynchronous vLLM rollouts and NeMo-Gym rollouts without token capture, using the bundled Gym version, with un-packed, unfused policy logits. For full-vocabulary sampling (`top_k: null`, `top_p: 1.0`), the recorded head approximates the sampler tail with one constant ratio. For filtered sampling, set a positive generation `top_k` no greater than `score_centering_top_k`; vLLM records the complete realized support, and the trainer renormalizes its probabilities over those same IDs. A support larger than the configured width fails rather than silently dropping tokens. This path requires vLLM's Model Runner V2. vLLM uses `processed_logprobs` so the head and sampled-token probabilities describe the same sampler distribution. Sequence-level importance ratios and fused linear log probabilities are not supported. With importance correction enabled, score centering applies token-level IS, TIS, or ICE-POP coefficients to the sampled token and the transported head; the unobserved tail uses one constant ratio only for full-vocabulary sampling. The `score_centering_head_mass` and `score_centering_magnitude` metrics report the captured sampler probability mass and the size of the head correction over valid tokens.
+
+The training policy uses its ordinary unscaled logits as the target distribution. If rollout temperature differs from `1.0`, vLLM's processed probabilities still represent the actual sampling distribution, so the ratio includes that temperature difference.
+
+#### Adaptive PPO clip
 
 `truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:
 

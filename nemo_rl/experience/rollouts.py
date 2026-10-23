@@ -702,6 +702,13 @@ def generate_responses(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "score_centering_ids" in generation_outputs:
+            assistant_message["score_centering_ids"] = generation_outputs[
+                "score_centering_ids"
+            ][i, input_length:total_length]
+            assistant_message["score_centering_logprobs"] = generation_outputs[
+                "score_centering_logprobs"
+            ][i, input_length:total_length]
         if "routed_experts" in generation_outputs:
             routed_experts = generation_outputs["routed_experts"][i]
             prefix_length = _attach_routed_experts_to_message_log_prefix(
@@ -807,7 +814,11 @@ async def generate_responses_async(
 
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
-        pad_value_dict={"output_ids": tokenizer.pad_token_id, "logprobs": 0.0},
+        pad_value_dict={
+            "output_ids": tokenizer.pad_token_id,
+            "logprobs": 0.0,
+            "score_centering_logprobs": float("-inf"),
+        },
     )
 
     # Extract everything we need from the generation outputs
@@ -843,6 +854,13 @@ async def generate_responses_async(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "score_centering_ids" in generation_outputs:
+            assistant_message["score_centering_ids"] = generation_outputs[
+                "score_centering_ids"
+            ][i, input_length:total_length]
+            assistant_message["score_centering_logprobs"] = generation_outputs[
+                "score_centering_logprobs"
+            ][i, input_length:total_length]
         if "routed_experts" in generation_outputs:
             routed_experts = generation_outputs["routed_experts"][i]
             prefix_length = _attach_routed_experts_to_message_log_prefix(

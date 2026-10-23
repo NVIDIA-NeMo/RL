@@ -119,6 +119,8 @@ loss_fn:
   # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
   # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
   disable_ppo_ratio: false
+  # Set to 128 to enable top-k score centering with direct vLLM rollouts.
+  score_centering_top_k: 0
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0

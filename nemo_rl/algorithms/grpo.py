@@ -925,6 +925,55 @@ def setup(
     use_fused_linear_logprobs = bool(
         megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
     )
+    if loss_config.score_centering_top_k:
+        if generation_config["backend"] != "vllm":
+            raise ValueError("Score centering requires vLLM generation")
+        if should_use_nemo_gym(master_config):
+            master_config.env["nemo_gym"]["score_centering_top_k"] = (
+                loss_config.score_centering_top_k
+            )
+        support_replay = need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(
+                top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+            )
+        )
+        if support_replay and (
+            generation_config["top_k"] is None
+            or generation_config["top_k"] <= 0
+            or generation_config["top_k"] > loss_config.score_centering_top_k
+        ):
+            raise ValueError(
+                "Score centering with filtered sampling requires top_k <= score_centering_top_k"
+            )
+        if use_fused_linear_logprobs or policy_config["sequence_packing"]["enabled"]:
+            raise ValueError("Score centering requires unfused, unpacked policy logits")
+        if not loss_config.token_level_loss or not loss_config.disable_ppo_ratio:
+            raise ValueError(
+                "Score centering requires token_level_loss and disable_ppo_ratio"
+            )
+        if loss_config.sequence_level_importance_ratios or loss_config.use_cispo:
+            raise ValueError("Score centering requires token-level REINFORCE weights")
+        if loss_config.truncated_importance_sampling_type not in (
+            None,
+            "tis",
+            "icepop",
+        ):
+            raise ValueError("Score centering supports token-level TIS and ICE-POP")
+        vllm_cfg = generation_config["vllm_cfg"]
+        if vllm_cfg.get("logprobs_mode", "processed_logprobs") != "processed_logprobs":
+            raise ValueError("Score centering requires processed_logprobs from vLLM")
+        vllm_cfg["logprobs_mode"] = "processed_logprobs"
+        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        max_logprobs = vllm_kwargs.get("max_logprobs", 0)
+        if max_logprobs is not None:
+            vllm_kwargs["max_logprobs"] = max(
+                max_logprobs, loss_config.score_centering_top_k
+            )
+        if support_replay:
+            vllm_kwargs["return_sampling_mask"] = True
+        loss_config.score_centering_support_replay = support_replay
+        generation_config["score_centering_top_k"] = loss_config.score_centering_top_k
+        generation_config["score_centering_support_replay"] = support_replay
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
@@ -2380,6 +2429,15 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             ``generation_logprobs`` are treated as rollout-generated messages.
     """
     backfill_missing_routed_experts(message_logs)
+    score_centering_top_k = next(
+        (
+            message["score_centering_ids"].shape[-1]
+            for message_log in message_logs
+            for message in message_log
+            if "score_centering_ids" in message
+        ),
+        0,
+    )
 
     def _owns_media(message: dict[str, Any]) -> bool:
         return any(
@@ -2408,6 +2466,15 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
             if "generation_logprobs" not in message:
                 message["generation_logprobs"] = torch.zeros_like(
                     token_ids, dtype=torch.float32
+                )
+            if score_centering_top_k and "score_centering_ids" not in message:
+                message["score_centering_ids"] = torch.zeros(
+                    (*token_ids.shape, score_centering_top_k), dtype=torch.long
+                )
+                message["score_centering_logprobs"] = torch.full(
+                    (*token_ids.shape, score_centering_top_k),
+                    float("-inf"),
+                    dtype=torch.float32,
                 )
 
             if not has_media:
@@ -2645,6 +2712,11 @@ def _build_async_grpo_train_data(
             "sample_mask": repeated_batch["loss_multiplier"],
         }
     )
+    if "score_centering_ids" in flat_messages:
+        train_data["score_centering_ids"] = flat_messages["score_centering_ids"]
+        train_data["score_centering_logprobs"] = flat_messages[
+            "score_centering_logprobs"
+        ]
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3797,6 +3869,13 @@ def _grpo_train_impl(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if "score_centering_ids" in flat_messages:
+                        train_data["score_centering_ids"] = flat_messages[
+                            "score_centering_ids"
+                        ]
+                        train_data["score_centering_logprobs"] = flat_messages[
+                            "score_centering_logprobs"
+                        ]
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(

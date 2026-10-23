@@ -1036,6 +1036,13 @@ class VllmAsyncGenerationWorkerImpl(
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
+                if self.logprobs and self.return_tokens_as_token_ids:
+                    score_centering_top_k = worker_self.cfg.get(
+                        "score_centering_top_k", 0
+                    )
+                    if score_centering_top_k:
+                        # Gym requests only the sampled token; training also needs its head.
+                        self.top_logprobs = score_centering_top_k
                 # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
                 if self.required_prefix_token_ids is None:
                     for message in reversed(self.messages):
@@ -1334,14 +1341,17 @@ class VllmAsyncGenerationWorkerImpl(
                         cancelled = True
                         raise
 
-                # Capture stages the raw arrays below and strips OpenAI logprobs
-                # after the terminal PUT. Skip only their object construction;
-                # changing request.logprobs would also change engine sampling.
+                # Capture and score centering use the raw arrays below. Skip
+                # OpenAI logprob objects; changing request.logprobs would also
+                # change engine sampling.
                 bypass_logprobs = bool(
                     not request.stream
                     and request.logprobs
                     and return_as_token_id
-                    and id(request) in worker_self._capture_calls
+                    and (
+                        id(request) in worker_self._capture_calls
+                        or worker_self.cfg.get("score_centering_top_k", 0)
+                    )
                 )
                 with self._bypass_chat_logprobs(enabled=bypass_logprobs):
                     response = await super().chat_completion_full_generator(
@@ -1370,6 +1380,12 @@ class VllmAsyncGenerationWorkerImpl(
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
+                        score_centering_top_k=worker_self.cfg.get(
+                            "score_centering_top_k", 0
+                        ),
+                        score_centering_support_replay=worker_self.cfg.get(
+                            "score_centering_support_replay", False
+                        ),
                     )
 
                 if worker_self._return_routed_experts_enabled():
@@ -1473,13 +1489,6 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training
             # stability. Validation rollouts are the one exception: they are stamped with
@@ -1513,6 +1522,14 @@ class VllmAsyncGenerationWorkerImpl(
                 f"params (val_temperature={generation_config['val_temperature']}, "
                 f"val_top_p={generation_config['val_top_p']})"
             )
+            expected_top_k = generation_config[
+                "top_k" if is_train_sampling else "val_top_k"
+            ]
+            expected_top_k = expected_top_k if expected_top_k is not None else -1
+            assert request.top_k in (None, -1, expected_top_k), (
+                f"Top k sampling parameter must be unset or {expected_top_k}. Got `{request.top_k}`"
+            )
+            request.top_k = expected_top_k
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -1915,15 +1932,27 @@ class VllmAsyncGenerationWorkerImpl(
                     [False], dtype=torch.bool, device=input_ids_single_row.device
                 )
 
-                result_batch = BatchedDataDict[GenerationOutputSpec](
-                    {
-                        "output_ids": output_ids_single_item_batched,
-                        "logprobs": logprobs_single_item,
-                        "generation_lengths": generation_lengths_tensor,
-                        "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                        "truncated": truncated_tensor,
-                    }
-                )
+                result_dict = {
+                    "output_ids": output_ids_single_item_batched,
+                    "logprobs": logprobs_single_item,
+                    "generation_lengths": generation_lengths_tensor,
+                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    "truncated": truncated_tensor,
+                }
+                top_k = self.cfg.get("score_centering_top_k", 0)
+                if top_k:
+                    result_dict["score_centering_ids"] = torch.zeros(
+                        (1, current_input_actual_length, top_k),
+                        dtype=torch.long,
+                        device=input_ids_single_row.device,
+                    )
+                    result_dict["score_centering_logprobs"] = torch.full(
+                        (1, current_input_actual_length, top_k),
+                        float("-inf"),
+                        dtype=torch.float32,
+                        device=input_ids_single_row.device,
+                    )
+                result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
                 return (sample_idx, result_batch)
 
@@ -2042,6 +2071,39 @@ class VllmAsyncGenerationWorkerImpl(
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
             }
+            top_k = self.cfg.get("score_centering_top_k", 0)
+            if top_k:
+                sampling_mask = None
+                if self.cfg.get("score_centering_support_replay", False):
+                    if generation_details.sampling_mask is None:
+                        raise RuntimeError("vLLM did not return the sampling support")
+                    sampling_mask = generation_details.sampling_mask.token_ids
+                head_ids, head_logprobs = self._score_centering_head(
+                    generation_details.logprobs,
+                    num_generated_tokens,
+                    top_k,
+                    device=original_input_ids_single_row.device,
+                    sampling_mask=sampling_mask,
+                    sampled_tokens=generated_token_ids,
+                )
+                full_head_ids = torch.zeros(
+                    (1, final_output_tensor_len, top_k),
+                    dtype=torch.long,
+                    device=head_ids.device,
+                )
+                full_head_logprobs = torch.full(
+                    (1, final_output_tensor_len, top_k),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=head_ids.device,
+                )
+                token_slice = slice(
+                    current_input_actual_length, final_output_tensor_len
+                )
+                full_head_ids[0, token_slice] = head_ids
+                full_head_logprobs[0, token_slice] = head_logprobs
+                result_dict["score_centering_ids"] = full_head_ids
+                result_dict["score_centering_logprobs"] = full_head_logprobs
             routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 final_request_output,
                 generation_details,

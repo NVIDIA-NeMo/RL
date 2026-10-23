@@ -246,6 +246,8 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    score_centering_top_k: NotRequired[int]
+    score_centering_support_replay: NotRequired[bool]
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
     # samples exactly like training unless overridden. Only honored on the
@@ -425,6 +427,8 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    score_centering_ids: NotRequired[torch.Tensor]
+    score_centering_logprobs: NotRequired[torch.Tensor]
     routed_experts: NotRequired[torch.Tensor]
     r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
     r3_routed_experts_expected_routes: NotRequired[torch.Tensor]

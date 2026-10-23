@@ -825,6 +825,13 @@ class AsyncRolloutImpl:
             assistant_message["generation_logprobs"] = output["logprobs"][
                 0, input_len:total_len
             ]
+        if "score_centering_ids" in output:
+            assistant_message["score_centering_ids"] = output["score_centering_ids"][
+                0, input_len:total_len
+            ]
+            assistant_message["score_centering_logprobs"] = output[
+                "score_centering_logprobs"
+            ][0, input_len:total_len]
         if "routed_experts" in output:
             routed_experts = output["routed_experts"][0]
             prefix_length = _attach_routed_experts_to_message_log_prefix(

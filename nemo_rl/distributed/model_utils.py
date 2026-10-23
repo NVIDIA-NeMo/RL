@@ -1871,6 +1871,7 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    chunk_size: Optional[int] = None,
 ):
     """Compute top-k log probabilities from logits."""
     if teacher_topk_indices.shape[-1] <= 0:
@@ -1946,7 +1947,7 @@ def get_distillation_topk_logprobs_from_logits(
                 )
 
             seq_len_local = int(student_logits.shape[1])
-            chunk_size = max(1, min(seq_len_local, 1024))
+            chunk_size = max(1, min(seq_len_local, chunk_size or 1024))
             student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
                 student_logits,
                 indices_local,

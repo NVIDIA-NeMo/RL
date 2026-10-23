@@ -54,6 +54,7 @@ from nemo_rl.data_plane.interfaces import DataPlaneRuntimeConfig
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
+    SCORE_CENTERING_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
     MICRO_BATCH_INDICES,
@@ -225,11 +226,14 @@ class TQPolicy(TQDriverMixin, Policy):
             num_samples: Expected total samples this step.
             group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
         """
+        fields = list(DP_TRAIN_FIELDS)
+        if self.cfg["generation"].get("score_centering_top_k", 0):
+            fields.extend(SCORE_CENTERING_FIELDS)
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
             fields=fields_with_optional_opd_full(
                 fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    fields, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
                 teacher_index_field=self._opd_full_teacher_index_field,
@@ -248,11 +252,14 @@ class TQPolicy(TQDriverMixin, Policy):
         Distinct from :meth:`prepare_step` because val has its own
         partition id and a single consumer task.
         """
+        fields = list(DP_TRAIN_FIELDS)
+        if self.cfg["generation"].get("score_centering_top_k", 0):
+            fields.extend(SCORE_CENTERING_FIELDS)
         self.dp_client.register_partition(
             partition_id=partition_id,
             fields=fields_with_optional_opd_full(
                 fields_with_optional_routed_experts(
-                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                    fields, enabled=self._router_replay_enabled
                 ),
                 field=self._opd_full_field,
                 teacher_index_field=self._opd_full_teacher_index_field,

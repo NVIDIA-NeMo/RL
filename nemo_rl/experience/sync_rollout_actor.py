@@ -318,6 +318,9 @@ class SyncRolloutActor:
                 "sample_mask": fb["loss_multiplier"],
             }
         )
+        if "score_centering_ids" in flat:
+            bulk_batch["score_centering_ids"] = flat["score_centering_ids"]
+            bulk_batch["score_centering_logprobs"] = flat["score_centering_logprobs"]
         if ROUTED_EXPERTS_FIELD in flat:
             bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``

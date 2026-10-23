@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Avoid constructing OpenAI logprob objects discarded by terminal capture."""
+"""Avoid constructing OpenAI logprob objects when raw token data is attached."""
 
 import asyncio
 import threading
@@ -39,7 +39,7 @@ class CapturedChatLogprobsMixin:
 
     @contextmanager
     def _bypass_chat_logprobs(self, *, enabled: bool) -> Iterator[None]:
-        """Enable only around full-response formatting for admitted raw capture."""
+        """Enable only around full-response formatting for raw token data."""
         owner = (
             (self, asyncio.current_task(), threading.get_ident()) if enabled else None
         )

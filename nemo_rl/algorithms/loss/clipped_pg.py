@@ -35,6 +35,86 @@ def materialize_scalar_metrics(
     return dict(zip(metrics, values, strict=True))
 
 
+def score_centered_actor_objective(
+    curr_logprobs: torch.Tensor,
+    head_logprobs: torch.Tensor,
+    sampler_logprobs: torch.Tensor,
+    sampler_head_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    global_valid_toks: torch.Tensor,
+    *,
+    use_importance_sampling_correction: bool,
+    truncated_importance_sampling_type: Optional[str],
+    truncated_importance_sampling_ratio: Optional[float],
+    truncated_importance_sampling_ratio_min: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-k score centering with the sampler tail modeled as proportional to the policy.
+
+    The detached head correction has the same gradient as the full baseline:
+    the omitted full-vocabulary score has zero expectation under the policy.
+    """
+    head_logprobs = head_logprobs.float()
+    sampler_head_logprobs = sampler_head_logprobs.float()
+    valid_head = torch.isfinite(sampler_head_logprobs)
+    q_head = torch.where(valid_head, sampler_head_logprobs.exp(), 0.0)
+    p_head = torch.where(valid_head, head_logprobs.exp(), 0.0)
+    q_tail = (1.0 - q_head.sum(-1)).clamp_min(0.0)
+    p_tail = (1.0 - p_head.sum(-1)).clamp_min(1e-6)
+    rho = q_tail / p_tail
+
+    if use_importance_sampling_correction:
+        high = truncated_importance_sampling_ratio
+        low = truncated_importance_sampling_ratio_min or 0.0
+        head_ratio = torch.where(
+            valid_head, (head_logprobs - sampler_head_logprobs).clamp(-20, 20), 0.0
+        ).exp()
+        sample_ratio = (
+            (curr_logprobs.float() - sampler_logprobs.float()).clamp(-20, 20).exp()
+        )
+        tail_ratio = rho.clamp_min(1e-12).reciprocal()
+        if truncated_importance_sampling_type == "tis" and high is not None:
+            head_weight = head_ratio.clamp(min=low, max=high)
+            sample_weight = sample_ratio.clamp(min=low, max=high)
+            tail_weight = tail_ratio.clamp(min=low, max=high)
+        elif truncated_importance_sampling_type == "icepop" and high is not None:
+            head_weight = head_ratio * ((head_ratio >= low) & (head_ratio <= high))
+            sample_weight = sample_ratio * (
+                (sample_ratio >= low) & (sample_ratio <= high)
+            )
+            tail_weight = tail_ratio * ((tail_ratio >= low) & (tail_ratio <= high))
+        else:
+            head_weight = head_ratio
+            sample_weight = sample_ratio
+            tail_weight = tail_ratio
+        alpha = rho * tail_weight
+        head_mass = q_head * head_weight
+    else:
+        sample_weight = torch.ones_like(curr_logprobs)
+        alpha = rho
+        head_mass = q_head
+
+    # The policy-weighted full-vocabulary score has zero gradient. Removing it
+    # leaves only the transported head's deviation from the modeled tail.
+    head_delta = (head_mass - alpha.unsqueeze(-1) * p_head).detach()
+    safe_head_logprobs = torch.where(valid_head, head_logprobs, 0.0)
+    score = sample_weight.detach() * curr_logprobs - (
+        head_delta * safe_head_logprobs
+    ).sum(-1)
+    actor_loss = masked_mean(
+        -advantages * score, mask, global_normalization_factor=global_valid_toks
+    )
+    sampler_head_mass = masked_mean(
+        q_head.sum(-1), mask, global_normalization_factor=global_valid_toks
+    )
+    center_magnitude = masked_mean(
+        (head_delta * safe_head_logprobs).sum(-1).abs(),
+        mask,
+        global_normalization_factor=global_valid_toks,
+    )
+    return actor_loss, sampler_head_mass, center_magnitude
+
+
 @torch.no_grad()
 def clipped_pg_diagnostic_metrics(
     *,

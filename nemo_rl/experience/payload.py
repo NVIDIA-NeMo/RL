@@ -178,6 +178,9 @@ def record_to_train_batch(
         "total_reward": total_reward,
         _VIOLATION_COUNTS_KEY: violation_counts,
     }
+    if "score_centering_ids" in flat:
+        train_data["score_centering_ids"] = flat["score_centering_ids"]
+        train_data["score_centering_logprobs"] = flat["score_centering_logprobs"]
     if ROUTED_EXPERTS_FIELD in flat:
         train_data[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
     if include_message_violation_fields:

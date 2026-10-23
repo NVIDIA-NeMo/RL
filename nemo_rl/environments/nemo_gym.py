@@ -401,6 +401,7 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    score_centering_top_k: NotRequired[int]
     routed_experts_dtype: NotRequired[
         str
     ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
@@ -1540,6 +1541,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
+            score_centering_ids = output_item_dict.pop("score_centering_ids", None)
+            score_centering_logprobs = output_item_dict.pop(
+                "score_centering_logprobs", None
+            )
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
@@ -1668,6 +1673,33 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "is_invalid_tool_call": is_invalid_tool_call,
                 "has_malformed_thinking": has_malformed_thinking,
             }
+            if self.cfg.get("score_centering_top_k", 0):
+                if score_centering_ids is None or score_centering_logprobs is None:
+                    raise ValueError("NeMo Gym did not return score-centering logprobs")
+                top_k = self.cfg["score_centering_top_k"]
+                if len(score_centering_ids) != len(generation_token_ids) or len(
+                    score_centering_logprobs
+                ) != len(generation_token_ids):
+                    raise ValueError(
+                        "NeMo Gym returned misaligned score-centering logprobs"
+                    )
+                ids = torch.zeros((len(generation_token_ids), top_k), dtype=torch.long)
+                logprobs = torch.full((len(generation_token_ids), top_k), float("-inf"))
+                for position, (row_ids, row_logprobs) in enumerate(
+                    zip(score_centering_ids, score_centering_logprobs)
+                ):
+                    if (
+                        not row_ids
+                        or len(row_ids) > top_k
+                        or len(row_ids) != len(row_logprobs)
+                    ):
+                        raise ValueError(
+                            "NeMo Gym returned misaligned score-centering logprobs"
+                        )
+                    ids[position, : len(row_ids)] = torch.tensor(row_ids)
+                    logprobs[position, : len(row_logprobs)] = torch.tensor(row_logprobs)
+                assistant_message["score_centering_ids"] = ids
+                assistant_message["score_centering_logprobs"] = logprobs
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
@@ -1991,6 +2023,7 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    score_centering_top_k = nemo_gym_dict.pop("score_centering_top_k", 0)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value
@@ -2029,6 +2062,7 @@ def _build_gym_actor_config(
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
         require_routed_experts=enable_router_replay,
+        score_centering_top_k=score_centering_top_k,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
         external_service_readiness=external_service_readiness,

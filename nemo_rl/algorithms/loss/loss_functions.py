@@ -30,6 +30,7 @@ from nemo_rl.algorithms.loss.clipped_pg import (
     clipped_pg_actor_objective,
     clipped_pg_diagnostic_metrics,
     materialize_scalar_metrics,
+    score_centered_actor_objective,
 )
 from nemo_rl.algorithms.loss.draft import (
     DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
@@ -171,6 +172,8 @@ class DraftCrossEntropyLossFn(LossFunction):
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
+    score_centering_top_k: int = Field(default=0, ge=0)
+    score_centering_support_replay: bool = False
     token_level_loss: bool = True
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
@@ -365,6 +368,14 @@ class ClippedPGLossFn(LossFunction):
         if self.opd_full is not None:
             _validate_opd_full_loss_config(cfg, use_fused_linear_logprobs)
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
+        self.score_centering_top_k = cfg.score_centering_top_k
+        self.score_centering_support_replay = cfg.score_centering_support_replay
+        if self.score_centering_top_k and not cfg.disable_ppo_ratio:
+            raise ValueError("Score centering requires disable_ppo_ratio=true")
+        if self.score_centering_top_k and use_fused_linear_logprobs:
+            raise ValueError(
+                "Score centering requires model logits; disable fused linear logprobs"
+            )
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
@@ -543,6 +554,9 @@ class ClippedPGLossFn(LossFunction):
             # Normalized by the microbatch's own correct-token count, not a
             # global factor — already a per-microbatch mean.
             "positive_nll_loss": MetricNormalizer.NONE,
+            "score_centering_head_mass": MetricNormalizer.TOKENS,
+            "score_centering_magnitude": MetricNormalizer.TOKENS,
+            "score_centering_sample_ratio": MetricNormalizer.TOKENS,
             # Extrema — combined downstream with min/max, never scaled.
             "probs_ratio_min": MetricNormalizer.NONE,
             "probs_ratio_max": MetricNormalizer.NONE,
@@ -560,6 +574,14 @@ class ClippedPGLossFn(LossFunction):
             }
             if self.use_importance_sampling_correction:
                 minimal_metrics.add("sampling_importance_ratio")
+            if self.score_centering_top_k:
+                minimal_metrics.update(
+                    {
+                        "score_centering_head_mass",
+                        "score_centering_magnitude",
+                        "score_centering_sample_ratio",
+                    }
+                )
             if self.seq_logprob_error_in_loss:
                 minimal_metrics.update(
                     {
@@ -992,33 +1014,70 @@ class ClippedPGLossFn(LossFunction):
         else:
             importance_weights_to_use = None
 
-        if self.enable_torch_compile and self._compiled_actor_objective is None:
-            self._compiled_actor_objective = torch.compile(
-                clipped_pg_actor_objective,
-                dynamic=True,
-                fullgraph=True,
-                mode="max-autotune-no-cudagraphs",
+        if self.score_centering_top_k:
+            actor_loss, head_mass, center_magnitude = score_centered_actor_objective(
+                curr_logprobs,
+                data["score_centering_policy_logprobs"],
+                generation_logprobs,
+                data["score_centering_logprobs"][:, 1:],
+                advantages,
+                mask,
+                global_valid_toks,
+                use_importance_sampling_correction=self.use_importance_sampling_correction,
+                truncated_importance_sampling_type=self.truncated_importance_sampling_type,
+                truncated_importance_sampling_ratio=self.truncated_importance_sampling_ratio,
+                truncated_importance_sampling_ratio_min=self.truncated_importance_sampling_ratio_min,
             )
-        actor_objective = self._compiled_actor_objective or clipped_pg_actor_objective
-        actor_loss, ratios, ratios_clamped = actor_objective(
-            curr_logprobs,
-            prev_logprobs=prev_logprobs,
-            advantages=advantages,
-            token_mask=token_mask,
-            mask=mask,
-            sample_mask=sample_mask,
-            importance_weights=importance_weights_to_use,
-            global_valid_toks=global_valid_toks,
-            global_valid_seqs=global_valid_seqs,
-            ratio_clip_min=self.ratio_clip_min,
-            ratio_clip_max=self.ratio_clip_max,
-            ratio_clip_c=(self.ratio_clip_c if self.ratio_clip_c is not None else -1.0),
-            disable_ppo_ratio=self.disable_ppo_ratio,
-            force_on_policy_ratio=self.force_on_policy_ratio,
-            sequence_level_importance_ratios=self.sequence_level_importance_ratios,
-            use_cispo=self.use_cispo,
-            token_level_loss=self.loss_type == LossType.TOKEN_LEVEL,
-        )
+            score_centering_sample_ratio = (
+                (curr_logprobs.detach() - generation_logprobs).clamp(-20, 20).exp()
+            )
+            ratios = (curr_logprobs.detach() - prev_logprobs).clamp(-20, 20).exp()
+            ratios_clamped = ratios.clamp(self.ratio_clip_min, self.ratio_clip_max)
+            if self.truncated_importance_sampling_ratio is not None:
+                low = self.truncated_importance_sampling_ratio_min or 0.0
+                _is_filter_metrics["is_oob_ratio"] = masked_mean(
+                    (
+                        (score_centering_sample_ratio < low)
+                        | (
+                            score_centering_sample_ratio
+                            > self.truncated_importance_sampling_ratio
+                        )
+                    ).float(),
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+        else:
+            if self.enable_torch_compile and self._compiled_actor_objective is None:
+                self._compiled_actor_objective = torch.compile(
+                    clipped_pg_actor_objective,
+                    dynamic=True,
+                    fullgraph=True,
+                    mode="max-autotune-no-cudagraphs",
+                )
+            actor_objective = (
+                self._compiled_actor_objective or clipped_pg_actor_objective
+            )
+            actor_loss, ratios, ratios_clamped = actor_objective(
+                curr_logprobs,
+                prev_logprobs=prev_logprobs,
+                advantages=advantages,
+                token_mask=token_mask,
+                mask=mask,
+                sample_mask=sample_mask,
+                importance_weights=importance_weights_to_use,
+                global_valid_toks=global_valid_toks,
+                global_valid_seqs=global_valid_seqs,
+                ratio_clip_min=self.ratio_clip_min,
+                ratio_clip_max=self.ratio_clip_max,
+                ratio_clip_c=(
+                    self.ratio_clip_c if self.ratio_clip_c is not None else -1.0
+                ),
+                disable_ppo_ratio=self.disable_ppo_ratio,
+                force_on_policy_ratio=self.force_on_policy_ratio,
+                sequence_level_importance_ratios=self.sequence_level_importance_ratios,
+                use_cispo=self.use_cispo,
+                token_level_loss=self.loss_type == LossType.TOKEN_LEVEL,
+            )
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio
@@ -1064,6 +1123,14 @@ class ClippedPGLossFn(LossFunction):
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
         metric_tensors = {"loss": loss.detach()}
+        if self.score_centering_top_k:
+            metric_tensors["score_centering_head_mass"] = head_mass
+            metric_tensors["score_centering_magnitude"] = center_magnitude
+            metric_tensors["score_centering_sample_ratio"] = masked_mean(
+                score_centering_sample_ratio,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
         with torch.no_grad():
             lp_error = torch.abs(generation_logprobs - prev_logprobs)
             metric_tensors["token_mult_prob_error"] = masked_mean(
@@ -1315,6 +1382,8 @@ def _validate_opd_full_loss_config(
             "full-vocabulary reverse KL is an exact expectation and carries no "
             "sampled-token score-function term to correct."
         )
+    if cfg.score_centering_top_k:
+        raise ValueError("opd_full is incompatible with score_centering_top_k.")
     if cfg.truncated_importance_sampling_type is not None:
         raise ValueError(
             "opd_full is incompatible with truncated_importance_sampling_type."

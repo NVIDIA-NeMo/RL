@@ -55,6 +55,8 @@ _TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
     {
         "input_ids",
         "generation_logprobs",
+        "score_centering_ids",
+        "score_centering_logprobs",
         "prev_logprobs",
         "reference_policy_logprobs",
         "teacher_reference_logprobs",

@@ -200,7 +200,7 @@ def detected_uv_dirs(monkeypatch):
 
 def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
     """NeMo-RL-only knobs become top-level fields; the rest is Gym's global config."""
-    env_configs = _env_configs()
+    env_configs = _env_configs(score_centering_top_k=3)
     env_configs_before = copy.deepcopy(env_configs)
 
     cfg = build_nemo_gym_config(
@@ -217,6 +217,7 @@ def test_build_nemo_gym_config_splits_nemo_rl_keys(detected_uv_dirs):
     assert cfg["thinking_tags"] == ["<think>"]
     assert cfg["tokenizer_config"] == {"name": "test-tokenizer"}
     assert cfg["pad_dynamic_image_shapes"] is True
+    assert cfg["score_centering_top_k"] == 3
     assert cfg["initial_global_config_dict"] == {
         "num_gpu_nodes": 1,
         "config_paths": ["gym.yaml"],

@@ -98,7 +98,11 @@ from nemo_rl.data_plane.observability import (
     log_step_metrics,
     metrics_never_fail_the_step,
 )
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import (
+    DP_CALIB_INPUT_FIELDS,
+    DP_TRAIN_FIELDS,
+    SCORE_CENTERING_FIELDS,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -144,11 +148,14 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
-def _train_fields_for_step(skip_prev_logprobs: bool) -> tuple[str, ...]:
+def _train_fields_for_step(
+    skip_prev_logprobs: bool, score_centering: bool = False
+) -> tuple[str, ...]:
     """Fields workers fetch this step; ``prev_logprobs`` is dropped when skipped."""
-    return tuple(
+    fields = tuple(
         f for f in DP_TRAIN_FIELDS if not (skip_prev_logprobs and f == "prev_logprobs")
     )
+    return fields + SCORE_CENTERING_FIELDS if score_centering else fields
 
 
 # ── DAPO non-trivial-reward dynamic sampling, slice-only ───────────────
@@ -951,7 +958,10 @@ def grpo_train_sync(
                 # Worker-side fetch schema for this step. Same skip decision
                 # as ``select_fields`` below, but consumed only by
                 # ``train_from_meta`` (driver read uses ``select_fields``).
-                train_fields = _train_fields_for_step(skip_prev_logprobs)
+                train_fields = _train_fields_for_step(
+                    skip_prev_logprobs,
+                    score_centering=bool(master_config.loss_fn.score_centering_top_k),
+                )
 
                 if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)

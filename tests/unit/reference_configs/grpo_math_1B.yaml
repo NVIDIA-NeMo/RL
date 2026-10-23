@@ -127,6 +127,7 @@ loss_fn:
   # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
   # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
   disable_ppo_ratio: false
+  score_centering_top_k: 0
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.

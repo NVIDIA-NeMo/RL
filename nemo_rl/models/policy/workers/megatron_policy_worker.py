@@ -2640,7 +2640,11 @@ class MegatronPolicyWorkerImpl(
         use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
             "use_fused_linear_logprobs", False
         )
-        sampling_params = self.sampling_params
+        sampling_params = (
+            None
+            if self.cfg["generation"].get("score_centering_top_k", 0)
+            else self.sampling_params
+        )
         if self._opd_full_enabled and sampling_params is not None:
             # Full KL has no sampled-target support restriction; leave rollout unchanged.
             sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
