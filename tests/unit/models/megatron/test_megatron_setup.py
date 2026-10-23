@@ -4737,12 +4737,98 @@ class TestFinalizeMegatronSetup:
 
         # Verify function calls
         mock_update_model_config.assert_called_once()
-        mock_get_model_config.assert_called_once_with(mock_model)
+        # Read once to install the callbacks and once to check them.
+        assert mock_get_model_config.call_args_list == [call(mock_model)] * 2
         assert mock_update_model_config.call_args.args[1] is runtime_model_config
         mock_build_tokenizer.assert_called_once()
         mock_auto_bridge.from_hf_pretrained.assert_called_once_with(
             "test-model", trust_remote_code=True
         )
+
+    @staticmethod
+    def _callback_config() -> SimpleNamespace:
+        return SimpleNamespace(
+            no_sync_func=None,
+            grad_sync_func=None,
+            param_sync_func=None,
+            finalize_model_grads_func=None,
+            grad_scale_func=None,
+        )
+
+    @staticmethod
+    def _megatron_cfg(provider_config: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            model=provider_config,
+            ddp=SimpleNamespace(
+                overlap_grad_reduce=False,
+                overlap_param_gather=False,
+                align_param_gather=False,
+            ),
+            dist=SimpleNamespace(align_grad_reduce=True),
+        )
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    def test_install_binds_callbacks_to_copied_runtime_config(self, _mock_pg):
+        """A provider that copies its config (Nemotron Omni) must not get the callbacks."""
+        from nemo_rl.models.megatron.setup import install_grad_sync_callbacks
+
+        provider_config = self._callback_config()
+        runtime_config = self._callback_config()
+        model = SimpleNamespace(config=runtime_config)
+        optimizer = SimpleNamespace(scale_loss=MagicMock())
+
+        install_grad_sync_callbacks(
+            model, self._megatron_cfg(provider_config), optimizer
+        )
+
+        assert runtime_config.finalize_model_grads_func is not None
+        assert runtime_config.grad_scale_func is optimizer.scale_loss
+        assert provider_config.finalize_model_grads_func is None
+        assert provider_config.grad_scale_func is None
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup._update_model_config_funcs")
+    def test_install_fails_fast_when_runtime_config_lacks_callbacks(
+        self, _mock_update, _mock_pg
+    ):
+        """An installer that writes anywhere but the runtime config fails at setup."""
+        from nemo_rl.models.megatron.setup import install_grad_sync_callbacks
+
+        model = SimpleNamespace(config=self._callback_config())
+        with pytest.raises(
+            RuntimeError, match="finalize_model_grads_func and grad_scale_func"
+        ):
+            install_grad_sync_callbacks(
+                model,
+                self._megatron_cfg(self._callback_config()),
+                SimpleNamespace(scale_loss=MagicMock()),
+            )
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    def test_install_without_optimizer_skips_check(self, _mock_pg):
+        """Forward-only workers (no optimizer) have no callbacks to check."""
+        from nemo_rl.models.megatron.setup import install_grad_sync_callbacks
+
+        runtime_config = self._callback_config()
+        install_grad_sync_callbacks(
+            SimpleNamespace(config=runtime_config),
+            self._megatron_cfg(self._callback_config()),
+            None,
+        )
+
+        assert runtime_config.finalize_model_grads_func is None
+
+    def test_check_names_only_the_missing_callback(self):
+        from nemo_rl.models.megatron.setup import check_grad_sync_callbacks
+
+        config = self._callback_config()
+        config.grad_scale_func = MagicMock()
+        with pytest.raises(RuntimeError) as excinfo:
+            check_grad_sync_callbacks(SimpleNamespace(config=config))
+        assert str(excinfo.value).startswith("finalize_model_grads_func not set")
+
+        config.finalize_model_grads_func = MagicMock()
+        check_grad_sync_callbacks(SimpleNamespace(config=config))
 
 
 @pytest.mark.mcore
