@@ -63,6 +63,7 @@ def _make_ext(vllm_params):
     model = SimpleNamespace(
         named_parameters=lambda: list(vllm_params.items()),
         named_modules=lambda: [],
+        modules=lambda: [],
     )
     ext.model_runner = SimpleNamespace(model=model)
     ext._unquantized_flashinfer_trtllm_param_ids = lambda: set()
