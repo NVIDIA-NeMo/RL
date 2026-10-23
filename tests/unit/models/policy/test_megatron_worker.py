@@ -3472,6 +3472,8 @@ def test_worker_initialization_preserves_only_restored_rng(
         name: MagicMock(return_value=None)
         for name in (
             "log_gpu_memory_diagnostics",
+            "maybe_enable_msc",
+            "enable_batch_invariant_mode",
             "apply_transformer_engine_patch",
             "init_telemetry_worker",
             "router_replay_enabled",
@@ -3481,6 +3483,8 @@ def test_worker_initialization_preserves_only_restored_rng(
             "handle_model_import",
             "validate_megatron_config",
             "_model_self_packs_for_cp",
+            "_model_has_chunkwise_cp",
+            "_model_needs_router_padding_mask",
             "_model_self_packs_mtp_loss_mask",
             "_model_slices_context_parallel_inputs",
             "_model_accepts_media_token_validity_mask",
@@ -3543,7 +3547,7 @@ def test_worker_initialization_preserves_only_restored_rng(
         torch.set_rng_state(before)
         namespace["__init__"](
             worker,
-            {"megatron_cfg": {}},
+            {"megatron_cfg": {}, "sequence_packing": {"enabled": False}},
             SimpleNamespace(pad_token="pad"),
             weights_path="weights" if load_rng else None,
             optimizer_path=optimizer_path,
