@@ -254,6 +254,7 @@ def _capture_ready_worker() -> MegatronGenerationMixin:
         is_mp_coordinator=True,
     )
     worker._token_capture_enabled = False
+    worker._router_replay_enabled = False
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
     return worker
