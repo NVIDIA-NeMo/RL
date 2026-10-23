@@ -19,12 +19,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.megatron.draft.training import resolve_draft_speculator
-from nemo_rl.models.policy.draft_config import (
+# The worker module imports megatron.bridge, which only the mcore extra installs.
+# Skip collection on other shards instead of failing it.
+pytest.importorskip("megatron.bridge")
+
+from nemo_rl.models.megatron.draft.training import (  # noqa: E402
+    resolve_draft_speculator,
+)
+from nemo_rl.models.policy.draft_config import (  # noqa: E402
     MegatronDFlashDraftConfig,
     MegatronDSparkDraftConfig,
 )
-from nemo_rl.models.policy.workers.megatron_policy_worker import (
+from nemo_rl.models.policy.workers.megatron_policy_worker import (  # noqa: E402
     MegatronPolicyWorkerImpl,
     _all_reduce_draft_normalization_counts,
     _validate_draft_training_entrypoint,
