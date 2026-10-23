@@ -95,6 +95,25 @@ wins, so a scope cannot make a parent double-count its children. See
 When adding a **new** span group, update `_DEFAULT_GROUP_BUCKET` /
 `UMBRELLA_GROUPS` in `instrumentation.py` and extend `test_instrumentation.py`.
 
+## Thread offloads and loop scheduling
+
+For a selected synchronous offload, use
+`await nemo_rl.telemetry.runtime.run_in_thread("bounded_site_name", function, ...)`.
+It preserves `asyncio.to_thread` context propagation and cancellation semantics,
+and separates queue wait, function execution, and successful result delivery.
+The label is a static call site, never a rollout ID or path. It does not select or
+resize an executor. Awaiting a returned coroutine, if any, remains the caller's
+responsibility, as with `asyncio.to_thread`.
+
+Wrap an async owner's lifetime in
+`async with nemo_rl.telemetry.runtime.monitor_event_loop("bounded_loop_name"):`
+to observe scheduling lag. Exit the context **before** flushing/shutting down
+telemetry. For a FastAPI server, call
+`nemo_rl.telemetry.runtime.monitor_app_event_loop(app, "bounded_loop_name")` after
+every other lifespan registration, so the probe runs on the HTTP loop rather than
+the Ray actor loop. These helpers are inactive when metric export is disabled; see
+[Runtime diagnostics](metrics.md#async-runtime-diagnostics).
+
 ## Instrumenting inside a Ray actor
 
 Two things that are easy to get wrong, because both fail silently as no-ops
