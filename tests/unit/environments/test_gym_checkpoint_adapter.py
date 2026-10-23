@@ -93,28 +93,10 @@ def _participants(client: object, label: str) -> SimpleNamespace:
     return SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name=f"{label}-environment", kind="environment"),
+            SimpleNamespace(server_name=f"{label}-agent", kind="agent"),
             SimpleNamespace(server_name=f"{label}-model", kind="model"),
         ),
     )
-
-
-def _participant_manifest(
-    label: str,
-    kind: str,
-    *,
-    checkpoint_id: str = "save-1",
-    record_count: int = 1,
-) -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "kind": kind,
-        "instance": f"{label}-{kind}",
-        "checkpoint_id": checkpoint_id,
-        "records_file": "records.jsonl",
-        "records_sha256": "0" * 64,
-        "record_count": record_count,
-    }
 
 
 def _commit_reply(
@@ -124,16 +106,13 @@ def _commit_reply(
     *,
     staging_keys: list[str] | None = None,
     staging_keys_by_episode: dict[str, list[str]] | None = None,
+    run_episode_ids: list[str] | None = None,
 ) -> dict[str, object]:
-    reply: dict[str, object] = {
-        "phase": "committed",
-        "manifest": _participant_manifest(
-            label,
-            kind,
-            record_count=len(episode_ids),
-        ),
-        "episode_ids": episode_ids,
-    }
+    """A participant's commit reply, for states real Gym participants never produce."""
+    del label, kind
+    reply: dict[str, object] = {"phase": "committed", "episode_ids": episode_ids}
+    if run_episode_ids is not None:
+        reply["run_episode_ids"] = run_episode_ids
     if staging_keys is not None:
         reply["staging_keys"] = staging_keys
     if staging_keys_by_episode is not None:
@@ -184,6 +163,12 @@ class _NoResourceSessions:
 
     async def retire_session_state(self, session_id):
         return None
+
+
+def _stateless_resources() -> dict[str, Any]:
+    from nemo_gym._checkpoint.resources import ResourcesParticipant
+
+    return {"tools": ResourcesParticipant(_NoResourceSessions(), "stateless")}
 
 
 def _in_process_gym(
@@ -299,7 +284,11 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
     checkpoint_root = tmp_path / "checkpoint"
 
     async def exercise() -> None:
-        source, agent, _ = _in_process_gym(tmp_path / "ledger-before")
+        # A stateless resources server exports no episode state; the commit
+        # must not need any from it.
+        source, agent, _ = _in_process_gym(
+            tmp_path / "ledger-before", resources=_stateless_resources()
+        )
         await source.discover()
 
         # The agent's own /run episode, inside a replayable verify step: parked for
@@ -334,7 +323,9 @@ def test_adapter_drives_gyms_real_participants_through_save_and_restore(
         assert summary.staging_keys == ()
 
         # A fresh deployment, as after a crash.
-        restored, restored_agent, hooks = _in_process_gym(tmp_path / "ledger-after")
+        restored, restored_agent, hooks = _in_process_gym(
+            tmp_path / "ledger-after", resources=_stateless_resources()
+        )
         await restored.discover()
         await restored.restore(
             "restore-1",
@@ -469,130 +460,27 @@ def test_two_adapters_keep_their_clients_and_participants_isolated(monkeypatch) 
     assert prepare.await_args_list[1].args[0] is participants_b
 
 
-def test_adapter_reports_candidates_not_exported_by_the_environment(
-    monkeypatch,
-) -> None:
-    from nemo_gym._checkpoint import coordination
-
-    client = object()
-    participants = _participants(client, "actor-a")
-    monkeypatch.setattr(
-        coordination,
-        "discover",
-        AsyncMock(return_value=participants),
-    )
-    monkeypatch.setattr(
-        coordination,
-        "commit",
-        AsyncMock(
-            return_value={
-                "actor-a-environment": _commit_reply("actor-a", "environment", []),
-                "actor-a-model": _commit_reply(
-                    "actor-a", "model", [], staging_keys=[], staging_keys_by_episode={}
-                ),
-            }
-        ),
-    )
-    adapter = GymCheckpointAdapter(
-        instance=GymCheckpointInstance("actor-a", 0),
-        client=client,
-        auth_token="secret",
-    )
-
-    async def exercise() -> None:
-        await adapter.discover()
-        summary = await adapter.commit(
-            "save-1",
-            "/checkpoints/step-1",
-            [GymCheckpointEpisode("rollout-1", 0)],
-            deadline_ts=10.0,
-        )
-        assert summary.exported_episodes == ()
-        assert summary.staging_keys == ()
-
-    asyncio.run(exercise())
-
-
-def test_adapter_does_not_require_optional_agent_or_resource_episode_state(
-    monkeypatch,
-) -> None:
-    from nemo_gym._checkpoint import coordination
-
-    client = object()
-    participants = SimpleNamespace(
-        client=client,
-        members=(
-            SimpleNamespace(server_name="environment", kind="environment"),
-            SimpleNamespace(server_name="model", kind="model"),
-            SimpleNamespace(server_name="agent", kind="agent"),
-            SimpleNamespace(server_name="resources", kind="resources"),
-        ),
-    )
-    monkeypatch.setattr(
-        coordination,
-        "discover",
-        AsyncMock(return_value=participants),
-    )
-    monkeypatch.setattr(
-        coordination,
-        "commit",
-        AsyncMock(
-            return_value={
-                "environment": _commit_reply(
-                    "deployment", "environment", ["rollout-1"]
-                ),
-                "model": _commit_reply(
-                    "deployment",
-                    "model",
-                    ["rollout-1"],
-                    staging_keys=["rollout-1/call-1"],
-                    staging_keys_by_episode={"rollout-1": ["rollout-1/call-1"]},
-                ),
-                "agent": _commit_reply("deployment", "agent", []),
-                "resources": _commit_reply("deployment", "resources", []),
-            }
-        ),
-    )
-    adapter = GymCheckpointAdapter(
-        instance=GymCheckpointInstance("deployment", 0),
-        client=client,
-        auth_token="secret",
-    )
-
-    async def exercise() -> None:
-        await adapter.discover()
-        summary = await adapter.commit(
-            "save-1",
-            "/checkpoints/step-1",
-            [GymCheckpointEpisode("rollout-1", 0)],
-            deadline_ts=10.0,
-        )
-        assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
-        assert summary.staging_keys == ("rollout-1/call-1",)
-
-    asyncio.run(exercise())
-
-
 def _commit_model_reply(monkeypatch, model_reply: dict[str, object]):
-    """Commit two episodes with an environment and the given policy-model reply."""
+    """Commit two agent /run episodes with the given policy-model reply."""
     from nemo_gym._checkpoint import coordination
 
     client = object()
     participants = SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name="environment", kind="environment"),
+            SimpleNamespace(server_name="agent", kind="agent"),
             SimpleNamespace(server_name="model", kind="model"),
         ),
     )
+    episodes = ["rollout-1", "rollout-2-a1"]
     monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
     monkeypatch.setattr(
         coordination,
         "commit",
         AsyncMock(
             return_value={
-                "environment": _commit_reply(
-                    "deployment", "environment", ["rollout-1", "rollout-2-a1"]
+                "agent": _commit_reply(
+                    "deployment", "agent", episodes, run_episode_ids=episodes
                 ),
                 "model": model_reply,
             }
@@ -669,12 +557,7 @@ def test_staging_keys_gym_does_not_attribute_fail_the_commit(
         )
 
 
-def _commit_with_agent_session(
-    monkeypatch,
-    *,
-    environment_keys: list[str],
-    own_run_episode_ids: list[str],
-):
+def _commit_with_agent_session(monkeypatch, *, own_run_episode_ids: list[str]):
     """Commit one agent session, as Gym's agent participant replies for it."""
     from nemo_gym._checkpoint import coordination
 
@@ -682,7 +565,6 @@ def _commit_with_agent_session(
     participants = SimpleNamespace(
         client=client,
         members=(
-            SimpleNamespace(server_name="environment", kind="environment"),
             SimpleNamespace(server_name="model", kind="model"),
             SimpleNamespace(server_name="agent", kind="agent"),
         ),
@@ -693,9 +575,6 @@ def _commit_with_agent_session(
         "commit",
         AsyncMock(
             return_value={
-                "environment": _commit_reply(
-                    "deployment", "environment", environment_keys
-                ),
                 "model": _commit_reply(
                     "deployment",
                     "model",
@@ -730,32 +609,17 @@ def _commit_with_agent_session(
 
 def test_adapter_assigns_a_relayed_run_episode_to_its_agent(monkeypatch) -> None:
     """A legacy_agent environment server relays /run: the agent's own episode."""
-    summary = _commit_with_agent_session(
-        monkeypatch, environment_keys=[], own_run_episode_ids=["rollout-1"]
-    )
+    summary = _commit_with_agent_session(monkeypatch, own_run_episode_ids=["rollout-1"])
 
     assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
     assert summary.unowned_live_episodes == ()
 
 
-def test_adapter_keeps_environment_server_ownership_of_its_agent_session(
-    monkeypatch,
-) -> None:
-    summary = _commit_with_agent_session(
-        monkeypatch, environment_keys=["rollout-1"], own_run_episode_ids=[]
-    )
-
-    assert summary.exported_episodes == (GymCheckpointEpisode("rollout-1", 0),)
-    assert summary.unowned_live_episodes == ()
-
-
-def test_adapter_reports_an_environment_server_agent_session_without_an_owner(
+def test_adapter_reports_an_agent_session_that_is_not_its_own_run_episode(
     monkeypatch,
 ) -> None:
     """A parked session nobody can restore must not be mistaken for an export."""
-    summary = _commit_with_agent_session(
-        monkeypatch, environment_keys=[], own_run_episode_ids=[]
-    )
+    summary = _commit_with_agent_session(monkeypatch, own_run_episode_ids=[])
 
     assert summary.exported_episodes == ()
     assert summary.unowned_live_episodes == (GymCheckpointEpisode("rollout-1", 0),)
@@ -764,10 +628,113 @@ def test_adapter_reports_an_environment_server_agent_session_without_an_owner(
 def test_adapter_rejects_a_run_episode_the_agent_did_not_export(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="names /run episodes it did not export"):
         _commit_with_agent_session(
-            monkeypatch,
-            environment_keys=[],
-            own_run_episode_ids=["rollout-1", "rollout-2"],
+            monkeypatch, own_run_episode_ids=["rollout-1", "rollout-2"]
         )
+
+
+def _commit_replies(monkeypatch, members: list[tuple[str, str]], replies: dict):
+    """Commit ``rollout-1`` against hand-written replies from ``members``."""
+    from nemo_gym._checkpoint import coordination
+
+    client = object()
+    participants = SimpleNamespace(
+        client=client,
+        members=tuple(
+            SimpleNamespace(server_name=name, kind=kind) for name, kind in members
+        ),
+    )
+    monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
+    monkeypatch.setattr(coordination, "commit", AsyncMock(return_value=replies))
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance("deployment", 0),
+        client=client,
+        auth_token="secret",
+    )
+
+    async def exercise():
+        await adapter.discover()
+        return await adapter.commit(
+            "save-1",
+            "/unused",
+            [GymCheckpointEpisode("rollout-1", 0)],
+            deadline_ts=10.0,
+        )
+
+    return asyncio.run(exercise())
+
+
+_EMPTY_MODEL_REPLY = _commit_reply(
+    "deployment", "model", [], staging_keys=[], staging_keys_by_episode={}
+)
+
+
+def test_adapter_rejects_a_commit_from_an_unexpected_participant_set(
+    monkeypatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="unexpected participant set"):
+        _commit_replies(
+            monkeypatch,
+            [("agent", "agent"), ("model", "model")],
+            {"model": _EMPTY_MODEL_REPLY, "stranger": _EMPTY_MODEL_REPLY},
+        )
+
+
+def test_adapter_rejects_an_export_outside_the_requested_scope(monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match="outside the requested scope"):
+        _commit_replies(
+            monkeypatch,
+            [("agent", "agent"), ("model", "model")],
+            {
+                "agent": _commit_reply(
+                    "deployment",
+                    "agent",
+                    ["rollout-1", "rollout-9"],
+                    run_episode_ids=["rollout-1"],
+                ),
+                "model": _EMPTY_MODEL_REPLY,
+            },
+        )
+
+
+def test_adapter_rejects_a_run_episode_two_agents_claim(monkeypatch) -> None:
+    """Restoring it on either agent would leave the other's session behind."""
+    claim = _commit_reply(
+        "deployment", "agent", ["rollout-1"], run_episode_ids=["rollout-1"]
+    )
+    with pytest.raises(RuntimeError, match="multiple agent participants"):
+        _commit_replies(
+            monkeypatch,
+            [("agent-a", "agent"), ("agent-b", "agent"), ("model", "model")],
+            {"agent-a": claim, "agent-b": claim, "model": _EMPTY_MODEL_REPLY},
+        )
+
+
+def test_adapter_refuses_environment_server_participants(monkeypatch) -> None:
+    """Commits assume an agent owns every episode; an environment server would own its own."""
+    from nemo_gym._checkpoint import coordination
+
+    client = object()
+    participants = SimpleNamespace(
+        client=client,
+        members=(
+            SimpleNamespace(server_name="episodes", kind="environment"),
+            SimpleNamespace(server_name="model", kind="model"),
+        ),
+    )
+    monkeypatch.setattr(coordination, "discover", AsyncMock(return_value=participants))
+    adapter = GymCheckpointAdapter(
+        instance=GymCheckpointInstance("deployment", 0),
+        client=client,
+        auth_token="secret",
+    )
+
+    with pytest.raises(
+        RuntimeError, match="environment-server checkpoint participants"
+    ):
+        asyncio.run(adapter.discover())
+    # Nothing was discovered, so no later checkpoint can run against it.
+    with pytest.raises(RuntimeError, match="has not discovered"):
+        asyncio.run(adapter.prepare("save-1", deadline_ts=10.0))
 
 
 def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
@@ -785,7 +752,7 @@ def test_adapter_rejects_restore_from_another_checkpoint(monkeypatch) -> None:
         "restore",
         AsyncMock(
             return_value={
-                "actor-a-environment": {"source_checkpoint_id": "save-other"},
+                "actor-a-agent": {"source_checkpoint_id": "save-other"},
                 "actor-a-model": {"source_checkpoint_id": "save-other"},
             }
         ),

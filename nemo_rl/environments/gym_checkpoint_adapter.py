@@ -82,9 +82,8 @@ class GymCheckpointCommitSummary:
                 f"unlisted={sorted(attributed - set(self.staging_keys))[:10]!r}"
             )
 
-    # Parked agent sessions that are neither an agent's own /run episode nor
-    # exported by their environment server. They cannot be restored and cannot
-    # finish while the deployment is prepared.
+    # Parked agent sessions that are not an agent's own /run episode. They
+    # cannot be restored and cannot finish while the deployment is prepared.
     unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = ()
 
 
@@ -192,11 +191,27 @@ class GymCheckpointAdapter:
     async def discover(self) -> None:
         from nemo_gym._checkpoint.coordination import discover
 
-        if self._participants is None:
-            with _reraise_as_gym_checkpoint_unavailable():
-                self._participants = await discover(
-                    self._client, auth_token=self._auth_token
-                )
+        if self._participants is not None:
+            return
+        with _reraise_as_gym_checkpoint_unavailable():
+            participants = await discover(self._client, auth_token=self._auth_token)
+        # Only typed environment servers take part in checkpoints, and turn
+        # recovery refuses them at setup; the legacy_agent relay is not a
+        # participant. Commits therefore assume every episode is an agent's own
+        # /run episode, so fail rather than misattribute one an environment
+        # server owns.
+        environment_servers = sorted(
+            member.server_name
+            for member in participants.members
+            if member.kind == "environment"
+        )
+        if environment_servers:
+            raise RuntimeError(
+                "Gym turn recovery does not support environment-server checkpoint "
+                f"participants yet: {environment_servers!r}. Route these rows through "
+                "a legacy_agent environment server or use target_level='sibling'."
+            )
+        self._participants = participants
 
     async def restart_only_servers(self) -> list[str]:
         """Return the participants whose rollouts start over after a crash.
@@ -290,7 +305,6 @@ class GymCheckpointAdapter:
             )
 
         requested_keys = {episode_id.capture_key for episode_id in episode_ids}
-        exported_environment_keys: set[str] = set()
         # A legacy_agent environment server only relays /run, so it never holds
         # the episode: it is the agent's own /run episode instead.
         run_episode_keys: set[str] = set()
@@ -327,14 +341,6 @@ class GymCheckpointAdapter:
                         f"by multiple agent participants: {sorted(duplicate_owners)!r}"
                     )
                 run_episode_keys.update(own_keys)
-            if member.kind == "environment":
-                duplicate_owners = exported_environment_keys.intersection(capture_keys)
-                if duplicate_owners:
-                    raise RuntimeError(
-                        "Gym checkpoint episode was exported by multiple environment "
-                        f"participants: {sorted(duplicate_owners)!r}"
-                    )
-                exported_environment_keys.update(capture_keys)
             if member.kind == "model":
                 staging_keys.update(reply["staging_keys"])
                 for capture_key, keys in reply["staging_keys_by_episode"].items():
@@ -351,9 +357,9 @@ class GymCheckpointAdapter:
                 )
             )
 
-        # An environment server owns every episode it exported, including its
-        # agent sessions; an agent owns only its own /run episodes.
-        owned_keys = exported_environment_keys | run_episode_keys
+        # An agent owns only its own /run episodes; discover refuses
+        # environment servers, the other kind of owner.
+        owned_keys = run_episode_keys
         return GymCheckpointCommitSummary(
             exported_episodes=_episodes(owned_keys),
             staging_keys=tuple(sorted(staging_keys)),
