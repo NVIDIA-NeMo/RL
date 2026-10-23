@@ -5,8 +5,6 @@ grpo:
   adv_estimator:
     name: reinforce_plus_plus
     minus_baseline: false
-  async_grpo:
-    in_flight_weight_updates: true
   val_period: 1000
   val_at_start: false
 checkpointing:
@@ -26,15 +24,6 @@ policy:
     apply_rope_fusion: false
     defer_fp32_logits: true
     moe_per_layer_logging: false
-  optimizer:
-    name: torch.optim.AdamW
-    kwargs:
-      lr: 5.0e-06
-      weight_decay: 0.01
-      betas:
-      - 0.9
-      - 0.999
-      eps: 1.0e-08
   generation:
     backend: trtllm
     max_new_tokens: 512
@@ -56,7 +45,7 @@ policy:
       expose_http_server: true
       default_chat_template_kwargs:
         enable_thinking: false
-      tool_parser: qwen3_coder
+      tool_parser: qwen3
       reasoning_parser: qwen3
     trtllm_kwargs:
       batch_wait_timeout_iters: 32

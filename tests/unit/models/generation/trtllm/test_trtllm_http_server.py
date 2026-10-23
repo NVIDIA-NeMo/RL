@@ -30,6 +30,7 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _context_leg_response,
     _decode_request_body,
     _make_parse_tool_calls,
+    _prompt_opens_reasoning,
     _parse_disaggregated_params,
     _resolve_tool_parser_name,
     _tokens_for_response_text,
@@ -117,12 +118,34 @@ def test_response_text_excludes_stops_without_mutating_training_tokens():
     assert generation_token_ids == [10, 20, 2, 3]
 
 
-def test_response_text_reuses_unterminated_generation_tokens():
+def test_response_text_returns_all_tokens_when_unterminated():
     generation_token_ids = [10, 20]
 
-    assert (
-        _tokens_for_response_text(generation_token_ids, {2, 3}) is generation_token_ids
-    )
+    assert _tokens_for_response_text(generation_token_ids, {2, 3}) == [10, 20]
+
+
+def test_response_text_is_empty_when_generation_is_all_stops():
+    assert _tokens_for_response_text([2, 3], {2, 3}) == []
+
+
+class _FakeTokenizer:
+    def decode(self, token_ids, skip_special_tokens=False):
+        return "".join(
+            {1: "assistant\n", 2: "<think>\n", 3: "\n\n</think>\n\n"}[t]
+            for t in token_ids
+        )
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "expected"),
+    [
+        ([1], False),
+        ([1, 2], True),
+        ([1, 2, 3], False),
+    ],
+)
+def test_prompt_opens_reasoning(token_ids, expected):
+    assert _prompt_opens_reasoning(_FakeTokenizer(), token_ids) is expected
 
 
 def test_explicit_tool_parser_overrides_model_auto_resolution():
@@ -426,7 +449,9 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
 
     rendered = {}
 
-    async def fake_build(messages, tools, tokenizer, model_config, template_kwargs):
+    async def fake_build(
+        messages, tools, tokenizer, model_config, template_kwargs, eos_token_ids
+    ):
         rendered["tools"] = tools
         # Stop before generation; the route answers a ValueError with a 400.
         raise ValueError("rendered")

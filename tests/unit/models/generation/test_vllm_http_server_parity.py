@@ -22,6 +22,7 @@ Regenerate the shared golden from vLLM on one GPU with::
 
 import json
 import os
+import re
 import time
 from collections.abc import Iterator
 from copy import deepcopy
@@ -45,6 +46,7 @@ from tests.unit.models.generation.chat_template_parity_common import (
     TOOL_PARSER_CONTRACT_CASES,
     TOOL_RESULT,
     USER_MSG,
+    golden_scenario_key,
     prompt_suffix_after_turn,
 )
 
@@ -241,6 +243,18 @@ def _should_generate_golden() -> bool:
     )
 
 
+def _dump_golden(golden: dict[str, Any]) -> str:
+    """Serialize with token arrays inline, like the other token-ID fixtures here."""
+    return (
+        re.sub(
+            r"\[[\d,\s]+\]",
+            lambda m: "[" + " ".join(m.group()[1:-1].split()) + "]",
+            json.dumps(golden, indent=2),
+        )
+        + "\n"
+    )
+
+
 def _load_golden(reasoning_parser: str) -> dict[str, Any]:
     assert GOLDEN_PATH.exists(), (
         "Golden missing; regenerate it with NEMO_RL_GENERATE_PARITY_GOLDEN=1 "
@@ -256,9 +270,10 @@ def _load_golden(reasoning_parser: str) -> dict[str, Any]:
     assert golden.get("model_revision") == MODEL_REVISION, (
         "Golden model revision does not match; regenerate it"
     )
-    for scenario_name, _ in PARSER_SCENARIOS[reasoning_parser]:
-        assert scenario_name in golden.get("scenarios", {}), (
-            f"Scenario {scenario_name!r} missing from golden; regenerate it"
+    for _, enable_thinking in PARSER_SCENARIOS[reasoning_parser]:
+        golden_key = golden_scenario_key(enable_thinking)
+        assert golden_key in golden.get("scenarios", {}), (
+            f"Scenario {golden_key!r} missing from golden; regenerate it"
         )
     return golden
 
@@ -427,12 +442,22 @@ def test_parity(vllm_server: tuple[str, str]) -> None:
                     "scenarios": {},
                 }
             golden.setdefault("scenarios", {})
-            golden["scenarios"][scenario_name] = {"turns": actual_turns}
+            golden["scenarios"][golden_scenario_key(enable_thinking)] = {
+                "turns": [
+                    {
+                        "prompt_token_ids": turn["prompt_token_ids"],
+                        "generation_token_ids": turn["generation_token_ids"],
+                    }
+                    for turn in actual_turns
+                ]
+            }
             GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-            GOLDEN_PATH.write_text(json.dumps(golden, indent=2) + "\n")
+            GOLDEN_PATH.write_text(_dump_golden(golden))
             continue
 
-        expected_turns = golden["scenarios"][scenario_name]["turns"]
+        expected_turns = golden["scenarios"][golden_scenario_key(enable_thinking)][
+            "turns"
+        ]
         assert len(actual_turns) == len(expected_turns)
 
         actual_turn_one, expected_turn_one = actual_turns[0], expected_turns[0]
@@ -447,7 +472,7 @@ def test_parity(vllm_server: tuple[str, str]) -> None:
                 suffix_mismatches.append(
                     f"scenario={scenario_name!r}: transition {turn_index + 1}->"
                     f"{turn_index + 2} appended prompt suffix mismatch "
-                    f"(vLLM={actual_suffix!r}, TRT-LLM={expected_suffix!r})"
+                    f"(actual={actual_suffix!r}, golden={expected_suffix!r})"
                 )
 
         if enable_thinking:

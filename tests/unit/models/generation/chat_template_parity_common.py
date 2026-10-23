@@ -45,6 +45,12 @@ PARSER_SCENARIOS = {
     "deepseek_r1": (("deepseek_r1_with_thinking", True),),
 }
 
+
+def golden_scenario_key(enable_thinking: bool) -> str:
+    """Golden entry for a scenario; the engine output only depends on thinking."""
+    return "with_thinking" if enable_thinking else "without_thinking"
+
+
 GENERATION_TOKEN_IDS_FIELD = "generation_token_ids"
 
 # Normalize serving-generated tool-call IDs.
