@@ -34,16 +34,24 @@ from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
+from nemo_rl.algorithms.rollout_checkpointing.restore import (
+    CheckpointToRestore,
+    RestoreReport,
+    RolloutRestorer,
+)
 
 __all__ = [
+    "CheckpointToRestore",
     "ControllerRolloutState",
     "ControllerSidecars",
     "DataPlaneRolloutCheckpointing",
     "NoRolloutCheckpointing",
+    "RestoreReport",
     "RolloutCheckpointCut",
     "RolloutCheckpointSaveResult",
     "RolloutCheckpointing",
     "RolloutCheckpointingHost",
+    "RolloutRestorer",
     "capture_reward_settings",
     "validate_replay_inventory",
     "validate_rollout_recovery_inventory",

@@ -59,6 +59,12 @@ from nemo_rl.algorithms.rollout_checkpointing.inventory import (
     validate_replay_inventory,
     validate_rollout_recovery_inventory,
 )
+from nemo_rl.algorithms.rollout_checkpointing.restore import (
+    AdmitFn,
+    LaunchFn,
+    RestoreReport,
+    RolloutRestorer,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
     ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
@@ -147,6 +153,7 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
         environment_checkpoint: EnvironmentCheckpoint,
         bootstrap_identity: Optional[BootstrapCompatibilityIdentity],
         teacher_coordinator: Optional[TQTeacherLogprobCoordinator],
+        restorer: RolloutRestorer,
     ) -> None:
         """Store the parts this component saves and coordinates with.
 
@@ -164,6 +171,7 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
             bootstrap_identity: Identifies the run before its first trainer
                 checkpoint; needed for snapshots taken before step 1.
             teacher_coordinator: Records which teacher tagged the rows, if any.
+            restorer: Restores what the resumed checkpoint saved.
         """
         self._host = host
         self._master_config = master_config
@@ -177,6 +185,7 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
         self._environment_checkpoint = environment_checkpoint
         self._bootstrap_identity = bootstrap_identity
         self._teacher_coordinator = teacher_coordinator
+        self._restorer = restorer
 
         # Full trainer checkpoints and lightweight rollout snapshots share one
         # namespace and must never publish concurrently.
@@ -271,6 +280,12 @@ class DataPlaneRolloutCheckpointing(RolloutCheckpointing):
             replay_metadata=replay_metadata,
             rollout_recovery_payload=rollout_recovery_payload,
         )
+
+    async def restore(self) -> RestoreReport:
+        return await self._restorer.restore()
+
+    async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None:
+        await self._restorer.redispatch_restored(launch, admit)
 
     # ── data-plane save ────────────────────────────────────────────────────
 

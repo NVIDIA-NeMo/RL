@@ -6,7 +6,7 @@
 1. Move the Gym checkpoint code behind an `EnvironmentCheckpoint` interface. **Done in this PR.**
 2. Give the ledger and rollout manager backend-neutral names, and make the interfaces ABCs. **Done in this PR.**
 3. Move the snapshot writer into one `RolloutCheckpointing` component. **Done in this PR.**
-4. Move the restore chain into that component. *Proposed.*
+4. Move the restore chain into that component. **Done in this PR.**
 5. Collapse the rollout pump's two dispatch loops into one. *Proposed.*
 
 ## The Problem
@@ -55,18 +55,19 @@ SingleControllerActor            train pump + rollout pump
        ├─ save lock, optimizer-commit window, wakeup and stop events  (step 3, done)
        ├─ snapshot writer         TQ cut, sidecars, manifest, retention (step 3, done)
        ├─ snapshot pump           periodic attempts, outcome telemetry  (step 3, done)
-       ├─ restorer                replay buffer, ledger, reserve, cursor checks (step 4)
+       ├─ restorer                replay buffer, ledger, reserve, cursor checks (step 4, done)
        ├─ data-plane barrier      still owned by the controller until step 5
        └─ EnvironmentCheckpoint   backend plug-in                     (step 1, done)
             ├─ GymEnvironmentCheckpoint   nemo_rl/environments/
             └─ NoEnvironmentCheckpoint    backends that keep no rollout state
-  └─ NoRolloutCheckpointing      no pump, no lock, no TQ, when nothing is saved
+  └─ NoRolloutCheckpointing      no pump, no lock, no TQ, when nothing is saved;
+                                 still restores through the same restorer
 ```
 
 ### The Controller-Facing API
 
-What step 3 built is in `nemo_rl/algorithms/rollout_checkpointing/interface.py`. The
-members marked "steps 4-5" are still the target.
+What steps 3 and 4 built is in `nemo_rl/algorithms/rollout_checkpointing/interface.py`.
+The member marked "step 5" is still the target.
 
 ```python
 class RolloutCheckpointing(abc.ABC):
@@ -97,13 +98,17 @@ class RolloutCheckpointing(abc.ABC):
         state: ControllerRolloutState,
     ) -> ControllerSidecars: ...
 
-    # Startup (step 4).
-    async def check_startup(self) -> None: ...
-    async def restore(self, state: ControllerRolloutState) -> RestoreReport: ...
+    # Startup (step 4). Called once in _run_pumps, after the weight sync and before
+    # the pumps start. The controller applies the report to its own fields.
+    async def restore(self) -> RestoreReport: ...
+
+    # Rollout pump (step 4). Launches the unfinished groups restore loaded, before
+    # the pump reads the dataloader. `admit` is the pump's sampler admission for
+    # groups saved before their batch was admitted.
+    async def redispatch_restored(self, launch: LaunchFn, admit: AdmitFn) -> None: ...
 
     # Rollout pump (step 5). Replaces `if enabled: async with barrier.mutation(...)`.
     def reservation(self, kind: str) -> AsyncContextManager[Reservation]: ...
-    async def redispatch_restored(self, launch: LaunchFn) -> None: ...
 
 
 class RolloutCheckpointingHost(abc.ABC):
@@ -147,9 +152,25 @@ The controller gets `NoRolloutCheckpointing` when it takes no rollout snapshots
 (checkpointing off, or `save_data_plane` off). It has no background tasks, no lock and no
 commit window. Its `save_with_trainer_checkpoint` returns only the dataloader state and
 spare prompts, which every trainer checkpoint needs. In step 5 it also gets a reservation
-that mints group IDs without a ledger, and in step 4 a `restore` that restores nothing.
-With it, the rollout pump runs a single dispatch loop, and the plain path is the same code
-with nothing recorded.
+that mints group IDs without a ledger. With it, the rollout pump runs a single dispatch
+loop, and the plain path is the same code with nothing recorded.
+
+Restore is the one thing `NoRolloutCheckpointing` does not skip. The checkpoint a run
+resumes from can hold buffered rollouts, unfinished groups and spare prompts even when the
+resumed run saves none, and the restore-time checks must still run. So both
+implementations hand `restore` and `redispatch_restored` to one `RolloutRestorer`
+(`restore.py`), which the controller builds with the same parts. Its input is a
+`CheckpointToRestore` (path, whether it is a rollout snapshot, the native TQ metadata and
+the setup timers), built in `__init__` from what setup restored. Its output is a
+`RestoreReport` the controller applies in `_apply_restore_report`: replay-capacity permits
+for the restored groups, spare prompts, batch shortfall, finalizer metrics and rewards,
+`sampler_stamps_target_steps`, and whether restore queued groups that only ledger-tracked
+dispatch can launch. A `None` field means the checkpoint had nothing for it. The restorer
+never writes controller fields.
+
+The environment's `check_startup()` is not a component member: the controller calls it
+on `EnvironmentCheckpoint` directly at the top of `_run_pumps`, as before. It runs for
+every run, saving or not, and needs nothing from the component.
 
 ### The Environment API (Implemented in Steps 1 and 2)
 
@@ -190,11 +211,14 @@ Each step is one PR that keeps behavior the same. Each one moves code and the te
    - `_validate_replay_inventory`, `_validate_rollout_recovery_inventory` and `_capture_reward_settings` became plain functions in `inventory.py`, because restore calls them too.
    - `_save_checkpoint_impl` calls `save_with_trainer_checkpoint` and `write_controller_sidecars` instead of its own TQ capture and sidecar writes. It went from 223 to 130 lines.
    - The controller goes from 6,032 to 5,270 lines. The package is 1,454 lines in five files.
-   - Still open: the controller still owns the data-plane barrier and opens the trainer checkpoint's exclusive cut itself. Restore reads no component state yet; it moves in step 4.
-4. **Restorer out.** These become `restore()`, about 600 lines:
-   - the `_maybe_restore_*` chain
-   - `_load_recovery_prompt`, `_rehydrate_rollout_recovery_prompts`, `_queue_restored_replay_groups_for_regeneration`
-   - `_validate_restored_sampler_cursor`, `_log_rollout_restore_metrics`
+   - Still open: the controller still owns the data-plane barrier and opens the trainer checkpoint's exclusive cut itself.
+4. **Restorer out (done).**
+   - These moved into `RolloutRestorer` (`nemo_rl/algorithms/rollout_checkpointing/restore.py`): `_maybe_restore_replay_buffer`, `_maybe_restore_rollout_recovery`, `_maybe_restore_replacement_reserve`, `_queue_restored_replay_groups_for_regeneration`, `_load_recovery_prompt`, `_rehydrate_rollout_recovery_prompts`, `_validate_restored_sampler_cursor`, `_log_rollout_restore_metrics` and `_redispatch_restored_rollouts`. `_load_recovery_prompt` had no caller outside restore, so it moved too.
+   - `restore()` runs them in the old order and returns a `RestoreReport`. `redispatch_restored(launch, admit)` replaces `_redispatch_restored_rollouts`; the rollout pump passes its `_launch` and `_admit_reserved_prompt_groups`.
+   - The four restore-only controller fields (`_last_checkpoint_path`, `_restored_from_rollout_snapshot`, `_data_plane_checkpoint_metadata`, `_rollout_checkpoint_load_metrics`) and `_restored_replay_groups_to_regenerate` are gone. `__init__` builds a `CheckpointToRestore` instead, and `_run_pumps` calls `restore()` and `_apply_restore_report()` in place of the five-call chain.
+   - The replay-capacity permits for restored groups are now taken in `_apply_restore_report`, right after `restore()` returns, instead of inside the replay restore. Nothing reads the semaphore before the pumps start, so the order change has no effect.
+   - The controller goes from 5,270 to 4,656 lines. The package is 2,394 lines in six files.
+   - Still in the controller, for step 5: `_admit_reserved_prompt_groups` and `_require_unoccupied_target_step`. Both are live dispatch: the rollout pump and `_drain_reserve_into_steps` admit every new batch through them. The sampler cursor restore and the `restoring_rollout_recovery` check also stay in `__init__`: the first is part of building the sampler, and the second decides the dispatch mode, which step 5 reworks.
 5. **One dispatch loop.** The rollout pump always reserves through `reservation()`. This removes the second loop copies and the ten `_rollout_recovery_enabled` branches.
 
 **End state:**

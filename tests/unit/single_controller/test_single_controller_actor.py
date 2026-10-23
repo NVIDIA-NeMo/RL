@@ -323,8 +323,10 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
     single_controller.configure_checkpoint_workers.assert_called_once_with([])
     dp_client.register_partition.assert_not_called()
-    assert controller._data_plane_checkpoint_metadata == metadata
-    assert controller._rollout_checkpoint_load_metrics == {
+    # Restore, which runs later in _run_pumps, gets what this load produced.
+    checkpoint = controller._rollout_checkpointing._restorer.checkpoint
+    assert checkpoint.data_plane_metadata == metadata
+    assert checkpoint.load_metrics == {
         "snapshot_resolution_seconds": 1.0,
         "tq_load_seconds": 5.0,
     }
@@ -357,7 +359,10 @@ def test_fresh_mooncake_init_registers_partition(
         configure.assert_not_called()
     dp_client.load_checkpoint.assert_not_called()
     dp_client.register_partition.assert_called_once()
-    assert controller._data_plane_checkpoint_metadata is None
+    assert (
+        controller._rollout_checkpointing._restorer.checkpoint.data_plane_metadata
+        is None
+    )
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
@@ -2252,6 +2257,7 @@ def _commit_window_checkpointing() -> DataPlaneRolloutCheckpointing:
         environment_checkpoint=NoEnvironmentCheckpoint(),
         bootstrap_identity=None,
         teacher_coordinator=None,
+        restorer=None,  # type: ignore[arg-type]
     )
 
 
