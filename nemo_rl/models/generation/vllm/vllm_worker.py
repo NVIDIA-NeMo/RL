@@ -88,6 +88,18 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 
+def _set_mm_normalization_default(vllm_kwargs: dict[str, Any]) -> None:
+    """Keep CPU image normalization when the engine exposes the device option.
+
+    Older vLLM releases already normalize on the CPU and reject this keyword.
+    Preserve explicit caller options so unsupported requests still fail visibly.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    if "mm_device_do_normalize" in inspect.signature(EngineArgs).parameters:
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+
+
 def _context_capped_max_new_tokens(
     *, configured_max_new_tokens: int, input_length: int, max_model_len: int
 ) -> int:
@@ -573,7 +585,7 @@ class BaseVllmGenerationWorker:
         # already shipped one silent-corruption fix for the device path
         # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
         # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
-        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+        _set_mm_normalization_default(vllm_kwargs)
         checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
