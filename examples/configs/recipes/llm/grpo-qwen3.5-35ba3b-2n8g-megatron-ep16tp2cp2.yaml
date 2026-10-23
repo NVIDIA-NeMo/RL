@@ -15,6 +15,10 @@ policy:
     context_parallel_size: 2
     sequence_parallel: true
     expert_model_parallel_size: 16
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
     apply_rope_fusion: false
     activation_checkpointing: true
     defer_fp32_logits: true
