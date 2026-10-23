@@ -234,7 +234,8 @@ class _PollingTrainer(_FakeTrainer):
         self._poll_answers = list(poll_answers)
         self._checkpoint_dir = checkpoint_dir
         self.poll_calls = 0
-        # Published step dirs at each save_checkpoint call, in call order.
+        # Published step_N dirs at each save_checkpoint call, in call order. The
+        # tmp_step_N of the save in progress already exists then, so it's excluded.
         self.published_at_save: list[set[str]] = []
 
     def poll_async_save(self) -> bool:
@@ -242,7 +243,13 @@ class _PollingTrainer(_FakeTrainer):
         return self._poll_answers.pop(0) if self._poll_answers else False
 
     def save_checkpoint(self, **kwargs: Any) -> None:
-        self.published_at_save.append(_step_dir_names(self._checkpoint_dir))
+        self.published_at_save.append(
+            {
+                name
+                for name in _step_dir_names(self._checkpoint_dir)
+                if name.startswith("step_")
+            }
+        )
         super().save_checkpoint(**kwargs)
 
 
