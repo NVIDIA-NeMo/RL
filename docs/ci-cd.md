@@ -8,7 +8,7 @@ Tests are organized into levels of increasing scope and cost:
 
 | Level | What runs | When |
 |-------|-----------|------|
-| **docs** | Doctests only | `CI:docs` label |
+| **docs** | Doctests only, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, same as Lfast | `CI:docs` label |
 | **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
 | **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
 | **L2** | Full suite including convergence tests | `CI:L2` label |

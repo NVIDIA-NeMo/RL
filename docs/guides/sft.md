@@ -239,7 +239,7 @@ sft:
 
 policy:
   train_micro_batch_size: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false
@@ -330,7 +330,8 @@ data:
     num_workers: 8
     shuffle_buffer_size: 1000
     processor_adapter: hf_multimodal
-    packing_buffer_size: null
+    task_encoder:
+      name: generic_sft
   train:
     path: /path/to/prepared/energon/dataset
     split: train
@@ -349,34 +350,49 @@ rejects `val_period`, `val_at_start` or `val_at_end` left at their exemplar
 values, and `data.validation` must be null — the loader is always built with
 `split_role="train"`.
 
-The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path, including model inputs such as Qwen3-VL grid metadata or Nano Omni image sizes and frame counts. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
+The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
 
 The v1 `SFTProcessorAdapter` and `HFMultimodalSFTProcessorAdapter` are narrow integration interfaces. They are planned to be replaced by a more comprehensive modular processor implementation; dataset loading and the policy-facing batch shape should remain stable through that change.
 
-To let Energon form model-ready multimodal packs, set the packing buffer and
-enable fused sequence packing:
+Optional controls under `data.energon` preserve Energon's defaults when unset:
+
+| Field | Behavior |
+| --- | --- |
+| `gc_collect_every_n_steps` | Steps between garbage collections; `0` disables GC and `null` uses Energon's default. |
+| `cache_pool_num_workers` | Positive number of cache-copy threads; `null` uses Energon's default. |
+| `cache_pool_max_gbytes` | Positive cache-size limit in GiB; `null` uses Energon's limit. |
+| `nvdataset_cache_dir` | DSS cache root exported as `NVDATASET_CACHE_DIR`; `null` leaves the environment setting unchanged. |
+
+To let Energon form model-ready multimodal packs, configure packing on the
+task encoder and enable fused sequence packing:
 
 ```yaml
 policy:
   sequence_packing:
     enabled: true
     fuse_loss: true
-    algorithm: balanced_greedy_knapsack
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    max_sequences_per_bin: 16  # optional conversation limit per physical pack
 data:
   energon:
-    packing_buffer_size: 64    # enables Energon-owned packing
+    task_encoder:
+      name: generic_sft
+      packing:
+        name: balanced_greedy_knapsack
+        buffer_size: 64
+        options:
+          max_sequences_per_bin: 16   # optional cap on source conversations per pack
+          balanced_knapsack_delta: 0 # optional extra initial bins for this algorithm
     max_samples_per_sequence: null  # optional shard read-order control
 ```
 
-Both config blocks are required because Energon builds the packs while the
-policy block selects and configures the packer. `max_sequences_per_bin` limits
-the conversations placed in one pack. The similarly named
-`max_samples_per_sequence` controls how many consecutive samples Energon reads
-from one shard; it does not affect pack layout.
-
-Without an Energon packing buffer, SFTv2 currently requires fixed batching.
+The task encoder owns the packer selection and buffer size; the policy block
+enables packed fused loss. `max_samples_per_sequence` only controls how many
+consecutive samples Energon reads from one shard; it does not affect pack
+layout. Without an Energon packing configuration, SFTv2 requires fixed
+batching.
+`max_sequences_per_bin` defaults to no cap. `balanced_knapsack_delta` defaults
+to zero and is supported only by `balanced_greedy_knapsack`. Pack capacity is taken from
+`data.max_input_seq_length`, and its padding multiple comes from
+`policy.make_sequence_length_divisible_by`.
 Dynamic batching and HybridEP flex dispatch are not supported with
 Energon-owned packs.
 
@@ -386,6 +402,60 @@ conversations. NLL loss scaling is unchanged because it is normalized by
 `global_valid_toks`.
 
 Training dataloader checkpoints include the Energon worker state plus a fingerprint of the source, loader, and processor settings. Restore must occur before the first iteration, and a changed fingerprint fails instead of silently continuing with a different stream. SFTv2 accepts a single train source; use an Energon metadataset to blend prepared sources.
+
+To use an application-specific task encoder or cooker without adding it to
+NeMo-RL, select an exported object from an absolute Python file path. The file
+must be available at the same path in every loader-owning worker environment.
+The task encoder must subclass `BaseSFTTaskEncoder`; cookers must be callable;
+both must declare supported model families with `@supports_model_families`.
+
+```yaml
+data:
+  energon:
+    model_family: nemotron
+    task_encoder:
+      python_file: /workspace/plugins/nemotron_energon/__init__.py
+      object_name: NemotronMultiModalTaskEncoder
+      options:
+        prompt_format: nemotron6-moe
+    cookers:
+      - python_file: /workspace/plugins/nemotron_energon/__init__.py
+        object_name: cook_nemotron_conversation
+```
+
+Use `object_name` to select the exported class or function.
+
+For `GenericSFTTaskEncoder`, `loss_mask_mode=None` (the default) creates masks
+from assistant roles. With `loss_mask_mode="precomputed"`, each message must
+provide a binary, one-dimensional `token_loss_mask` tensor with the same shape
+as `token_ids`. This mode preserves the supplied mask for packed and unpacked
+conversations and rejects `only_unmask_final=true`. Packed batches also mask
+padding and the first token of each source, which has no preceding prediction
+within that source.
+
+The selected file's SHA-256 digest is included in the loader checkpoint
+identity. When the selected file is a package `__init__.py`, the digest covers
+every Python source file in that package, so resuming after changing plugin
+code fails safely.
+
+#### Preformatted text sources
+
+For the generic Energon cooker, set the boolean dataset subflavor
+`skip_chat_template: true` when each message's text already contains the chat
+format. The cooker maps this to `CanonicalSFTSample.chat_template_preapplied`,
+which the generic processor adapter forwards to `get_formatted_message_log`.
+This is a per-source setting: normal and preformatted sources can share an
+adapter and blend. Missing or false values use the normal template path;
+non-boolean values are rejected.
+
+The preformatted path supports text-only turns and encodes each turn
+independently. The source owns the rendered template, BOS/EOS, assistant
+end-of-turn markers, and the division of text between roles for loss masking.
+Use the same format expected at generation time. In a blend with normal
+sources, include BOS exactly when `data.add_bos` is enabled. The path does not
+insert BOS/EOS and rejects tools, generation prompts, and task prompts.
+Independent encoding may differ from encoding the joined conversation at
+boundaries, including tokenizer-specific leading spaces.
 
 ### OpenAI Format Datasets (with Tool Calling Support)
 
@@ -476,18 +546,18 @@ This corrupts your training data and can lead to models generating invalid tool 
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.
 
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning of SFT models, including Nano‑v3 models, on both the DTensor and Megatron backends. To enable LoRA for SFT on the default DTensor backend:
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning of SFT models, including Nano‑v3 models, on both the Automodel and Megatron backends. To enable LoRA for SFT on the default Automodel backend:
 
 ```bash
 uv run examples/run_sft.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
 

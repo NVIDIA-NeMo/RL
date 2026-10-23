@@ -1,0 +1,10 @@
+defaults: ./sft-llama3.2-1b-1n8g-automodel.v3.yaml
+checkpointing:
+  checkpoint_dir: results/sft-llama3.2-1b-1n4g-automodel
+logger:
+  log_dir: logs/sft-llama3.2-1b-1n4g-automodel
+  wandb:
+    name: sft-llama3.2-1b-1n4g-automodel
+cluster:
+  gpus_per_node: 4
+
