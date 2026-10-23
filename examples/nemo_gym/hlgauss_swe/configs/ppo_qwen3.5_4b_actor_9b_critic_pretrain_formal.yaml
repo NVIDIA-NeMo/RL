@@ -1,0 +1,30 @@
+# Freeze the original 4B actor and pretrain a 9B critic on E2E SWE rollouts.
+defaults: ppo_qwen3.5_4b_swe_e2e_critic_pretrain_formal.yaml
+
+ppo:
+  initial_value_weights_path: null
+  max_num_steps: 171
+  async_ppo:
+    warmup_max_trajectory_age_steps: 4
+
+value:
+  model_name: /lustre/fsw/portfolios/coreai/users/bihu/hf_models/Qwen3.5-9B
+  tokenizer:
+    name: ${policy.tokenizer.name}
+  materialize_causal_attention_mask: false
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+
+cluster:
+  num_nodes: 8
+
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4b-actor-9b-critic-pretrain/checkpoints
+
+logger:
+  log_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/ppo-qwen35-4b-actor-9b-critic-pretrain/logs
+  wandb:
+    project: binhu-swe-rl-multiturn
+    name: ppo-qwen35-4b-actor-9b-critic-pretrain

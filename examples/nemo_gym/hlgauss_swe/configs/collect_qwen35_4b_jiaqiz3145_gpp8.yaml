@@ -1,0 +1,45 @@
+# Generation-only OpenHands collection. Inherits the production actor/Gym recipe.
+defaults: ppo_qwen3.5_4b_actor_9b_critic_pretrain_formal.yaml
+
+ppo:
+  num_generations_per_prompt: 8
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1
+        gpus_per_node: 8
+    vllm_cfg:
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+
+data:
+  train:
+    data_path: /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/data/jiaqiz_intersection_openhands_images/train.jsonl
+  validation:
+    data_path: /lustre/fsw/portfolios/coreai/users/bihu/repos/multi-turn-swe/data/jiaqiz_intersection_openhands_images/train.jsonl
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 1
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+            - /lustre/fsw/portfolios/llmservice/users/sdevare/images/swerebench/{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif
+            - /lustre/fsw/portfolios/llmservice/users/jiaqiz/swe/singularity_images/swe-gym/xingyaoww_sweb.eval.x86_64.{instance_id}.sif
+
+cluster:
+  num_nodes: 1
+
+collection:
+  out_dir: /lustre/fsw/portfolios/coreai/users/bihu/rl-results/qwen35-4b-jiaqiz3145-openhands-gpp8-rollouts
+  shard_id: 0
+  num_shards: 1
+  gens_per_prompt: 8
+  max_inflight_samples: 32
+  max_consecutive_failures: 10
+  log_every: 5
