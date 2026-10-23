@@ -722,6 +722,215 @@ Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ ove
 so a prompt group is kept or dropped together, independently of leave-one-out baseline
 semantics.
 
+### Length-aware reweighting of positive advantages
+
+With `token_level_loss: true` every trained token gets weight $A_i / N_{\text{step}}$, so a
+response's total credit grows with its length. That penalizes long wrong answers in full, but it
+also gives long, verbose correct answers the largest share of the positive credit.
+`grpo.adv_estimator.positive_length_reweight` rescales only the positive advantages inside each
+prompt group, so shorter correct responses get more credit per token and longer ones less:
+
+```yaml
+grpo:
+  adv_estimator:
+    name: grpo
+    positive_length_reweight:
+      enabled: false
+      mode: inverse_length   # "inverse_length" | "rank"
+      alpha: 1.0             # inverse_length mode only, >= 0 (0 is a no-op)
+      max_ratio: 3.0         # inverse_length mode only, > 1; null = unbounded
+      rank_spread: 0.5       # rank mode only, 0 <= s < 1
+      scope: trajectory      # "trajectory" | "thinking_per_turn" | "prose_per_turn"
+      exclude_final_answer: false  # prose_per_turn only
+      turns_counted: with_spans    # per-turn scopes only: "with_spans" | "all" | "none"
+```
+
+Options at a glance (each is described in detail below):
+
+| Option | Default | Values | What it does |
+|---|---|---|---|
+| `enabled` | `false` | bool | Turns the reweighting on. Off, the advantages are bit-identical to plain GRPO. |
+| `mode` | `inverse_length` | `inverse_length`, `rank` | How a positive's length becomes a weight: in proportion to the length gap, or by length order only. |
+| `alpha` | `1.0` | float >= 0 | `inverse_length` only: strength, $w = (L/L_{\min})^{-\alpha}$. `1.0` gives equal total credit to correct answers within `max_ratio` of the shortest; `0` is a no-op. |
+| `max_ratio` | `3.0` | float > 1, or `null` | `inverse_length` only: the largest per-token weight ratio between two positives of a group, and the bound on every final weight. `null` removes the cap. |
+| `rank_spread` | `0.5` | 0 <= s < 1 | `rank` only: the shortest positive gets $1+s$, the longest $1-s$ (a 3x per-token ratio at 0.5), whatever the gaps. |
+| `scope` | `trajectory` | `trajectory`, `thinking_per_turn`, `prose_per_turn` | What is measured and scaled: the whole response (every trained token), the thinking tokens per turn, or the thinking + visible-text tokens per turn (tool calls and end-of-turn tokens untouched). |
+| `exclude_final_answer` | `false` | bool | `prose_per_turn` only: leaves the last turn's visible text (the answer) out of the measure and the scaling. |
+| `turns_counted` | `with_spans` | `with_spans`, `all`, `none` | Per-turn scopes only: the divisor $T$ in $V = P/T$. Turns with measured text, every trained turn, or no division ($V$ = the rollout's total measured tokens). |
+
+Examples:
+
+```yaml
+# Shorter correct answers get more credit, at most 3x per token (single-turn tasks).
+positive_length_reweight: {enabled: true, mode: inverse_length, alpha: 1.0, max_ratio: 3.0}
+
+# The same push by length order only: near-ties are split 75/25 (rank_spread 0.5).
+positive_length_reweight: {enabled: true, mode: rank, rank_spread: 0.5}
+
+# Agentic rollouts: reweight reasoning + visible text per turn; tool calls keep their credit,
+# and the number of turns carries no length pressure.
+positive_length_reweight: {enabled: true, scope: prose_per_turn}
+
+# Agentic rollouts: reweight reasoning + visible text by its total over the rollout, so a
+# rollout that writes the same per turn over more turns gets less credit.
+positive_length_reweight: {enabled: true, scope: prose_per_turn, turns_counted: none}
+```
+
+It runs after the leave-one-out baseline and the reward normalization. For each prompt group,
+let $L_i$ be the number of trained response tokens (`mask[:, 1:].sum(-1)`) and
+$P = \{ i : A_i > 0,\ \text{valid}_i,\ L_i > 0 \}$ the group's positives. Groups with
+$|P| < 2$ are left unchanged. Otherwise each $i \in P$ gets a raw weight:
+
+- `inverse_length` (default): $w_i = \max\left( (L_i / L_{\min})^{-\alpha},\ 1/r \right)$, where
+  $L_{\min}$ is the shortest length in $P$ and $r$ is `max_ratio`.
+  - The weights follow the size of the length gaps: two correct answers of 500 and 501 tokens get
+    per-token weights 1.001 and 0.999, so each keeps about half of the credit.
+  - The floor caps the per-token ratio between any two positives at $r$ (3x by default); a 100-
+    and a 1000-token answer get exactly 3x, not 10x. `max_ratio: null` removes the cap.
+  - Dividing by $L_{\min}$ keeps every raw weight in $(0, 1]$, so a large $\alpha$ cannot
+    underflow; the factor cancels in the renormalization below.
+  - At $\alpha = 1$ with binary rewards, correct responses whose lengths are within $r$ of the
+    shortest one end up with the same total credit.
+- `rank`: $w_i = 1 + s \left(1 - \dfrac{2 r_i}{|P| - 1}\right)$, where $r_i$ is the rank of $L_i$
+  within $P$ (0 = shortest; tied lengths share the mean of their ranks) and $s$ is `rank_spread`.
+  - The weights are linear in the rank, so adjacent ranks are evenly spaced.
+  - The shortest positive gets $1 + s$ and the longest $1 - s$. The per-token ratio
+    $(1 + s)/(1 - s)$ (3x at $s = 0.5$) does not depend on $|P|$.
+  - Only the length order matters, not the size of the gaps, so near-ties get the full spread.
+    With $G = 16$, two correct answers of 500 and 501 tokens ($A = +3.615$ each) become
+    $+5.425$ and $+1.808$ at $s = 0.5$: their total credits go from an even split to 75/25.
+
+One common factor per group then restores the group's token-weighted positive mass, and the
+positives are rescaled:
+
+$$
+w_i \leftarrow w_i \, \frac{\sum_{j \in P} A_j L_j}{\sum_{j \in P} A_j L_j w_j}, \qquad
+A_i \leftarrow A_i \, w_i \quad (i \in P)
+$$
+
+Properties:
+
+- It is a length-aware rescaling of the positive advantages only. Negative advantages are
+  untouched, and no sign ever flips: long correct answers are still reinforced, just less.
+- Each group's $\sum_i |A_i| L_i$ is preserved exactly, so each prompt's share of the
+  optimizer step under token-level loss is identical to the baseline. Credit moves only within a
+  group, from long to short correct responses, never between prompts; easy prompts cannot gain
+  share from it.
+- It only acts on groups with at least 2 correct responses, so a larger
+  `num_generations_per_prompt` strengthens it.
+- It uses within-group statistics only, so the SingleController can shard the advantage stage
+  by prompt group, and it does not depend on the row order within a group.
+- `grpo.advantage_clip_low/high` is applied after the estimator and can cap the boosted
+  advantages of short correct responses.
+
+Risks:
+
+- Necessary long reasoning on hard prompts may be under-reinforced.
+- Short lucky guesses get boosted. Every final weight is bounded: in `inverse_length` mode every
+  raw weight is at least $1/r$, so the renormalization factor and every final weight are at most
+  $r$; in `rank` mode the bound is $(1 + s)/(1 - s)$. With `max_ratio: null`, `inverse_length`
+  has no bound and a very short correct response can take most of the group's positive credit.
+- Final weights up to the bound multiply the largest positive advantages (a group's rare correct
+  answers), so `grpo.advantage_clip_high` can be reached at large `max_ratio` or `rank_spread`.
+
+Suggested sweep: `inverse_length` with $\alpha \in \{0.5, 1.0\}$ and `max_ratio` $\in \{2, 3\}$,
+and `rank` with $s \in \{0.25, 0.5\}$ for comparison.
+
+Logged metrics (`adv_len_reweight/`): `frac_groups_reweighted` (groups with $|P| \ge 2$ over
+groups with any valid row), `weight_min` / `weight_mean` / `weight_max` (final weights applied),
+and the step share of $\sum_i |A_i| L_i$ by group pass rate (`share_bucket_le_0.25`,
+`share_bucket_0.25_0.75`, `share_bucket_ge_0.75`), which by construction equals the share before
+reweighting; `share_max_abs_diff` reports the largest difference and should be about 0.
+
+#### Agentic rollouts: per-turn scopes
+
+In a multi-turn agentic rollout the response length $L_i$ counts every turn. A correct answer
+reached in 8 tool calls has more tokens than one reached in 4, even when each turn is just as
+terse, so the default `scope: trajectory` pushes on the number of turns as well as on verbosity.
+Fewer turns often means fewer checks of the work: less reproducing, less re-running tests. The
+per-turn scopes reweight only the model's free text, measured per turn, and leave tool calls and
+the decision to end a turn at their unweighted credit:
+
+```yaml
+grpo:
+  adv_estimator:
+    positive_length_reweight:
+      enabled: true
+      scope: prose_per_turn        # "trajectory" (default) | "thinking_per_turn" | "prose_per_turn"
+      exclude_final_answer: false  # prose_per_turn only
+      turns_counted: with_spans    # "with_spans" | "all" | "none"
+```
+
+Every trained assistant token belongs to one class:
+
+- THINKING: from the start of the turn through the turn's last closing thinking tag, inclusive,
+  so the decision to stop thinking is reweighted too. Everything before that tag is thinking,
+  including tool-call markup and earlier closing tags. A thinking turn with no closing tag is all
+  thinking.
+- ACTION: each tool-call span (`<tool_call>` ... `</tool_call>`, inclusive) and the turn's final
+  end-of-turn token. In the last turn that token is the decision to end the episode.
+- CONTENT: every other token of the turn, i.e. free text before, between or after tool calls,
+  including the final answer.
+
+The measured set $M$ is the thinking tokens (`thinking_per_turn`) or the thinking and content
+tokens (`prose_per_turn`). For each row, $P_i$ is the number of measured trained tokens, $T_i$ the
+number of turns with at least one measured token (`with_spans`), all trained turns (`all`), or 1
+(`none`), and $V_i = P_i / T_i$ the free text per turn (with `none`, the rollout's total free
+text). The weights are the same as above with $L$ replaced by $V$, over the positives with
+$P_i > 0$. The renormalization uses $\sum A_j P_j$, and only the measured tokens of positive rows
+are scaled. Every action token, every negative row and every excluded token keeps its exact
+advantage, and each group's share of the step is unchanged.
+
+- Turn invariance (`with_spans`, `all`): a row with twice the turns and twice the text per row
+  gets the same weight as one with half of both. `turns_counted: none` drops this on purpose: the
+  row with more turns of text gets the lower weight.
+- Why `prose_per_turn` is recommended: the measured set and the reweighted set are the same
+  tokens. If only thinking were reweighted, the model could move reasoning from the thinking
+  block into visible text before the tool call and escape the reweighting; with prose, moving
+  text between the two changes nothing.
+- The remaining leak is the tool calls themselves. A tool whose arguments are free text (a
+  "think" or "notes" tool, a free-text schema field) should be counted as prose if one exists.
+- `exclude_final_answer: true` removes the last turn's content from both $M$ and the scaling, for
+  tasks where the answer's length is part of the job (reports, code delivered as text).
+- Turn padding: with $V = P/T$, adding a turn with little text lowers $V$ and raises the weight,
+  so the per-turn measure pushes toward more, terser turns rather than fewer. `with_spans`
+  counts only turns that contain measured text, so a turn that is just a tool call does not dilute
+  $V$; with `all` it does. `none` removes the incentive: every extra turn of text adds to $V$.
+  Watch `net_turn_credit` and the turn counts below.
+
+Worked example. Two correct rollouts of one group (binary reward, both with advantage $A$),
+`inverse_length` with $\alpha = 1$ and `max_ratio` 3. Rollout 1 makes one turn: 100 thinking
+tokens, a 30-token tool call and the end-of-turn token. Rollout 2 makes ten such turns: 1,000
+thinking tokens in all.
+
+| Setting | Measure of rollout 1 / 2 | Weight 1 / 2 | Tokens scaled |
+|---|---|---|---|
+| `scope: trajectory` | $L$ = 131 / 1,310 | 2.54 / 0.85 | every trained token, tool calls included |
+| `scope: prose_per_turn`, `turns_counted: with_spans` | $V$ = 100 / 100 | 1.0 / 1.0 | thinking + content |
+| `scope: prose_per_turn`, `turns_counted: none` | $V$ = 100 / 1,000 | 2.54 / 0.85 | thinking + content |
+
+With `none` the raw weights are $(1, \max(100/1000, 1/3)) = (1, 1/3)$ and the renormalization
+factor is $1100 / (100 + 1000/3) = 2.54$, so rollout 1's thinking tokens carry 3x the per-token
+credit of rollout 2's, and the two thinking totals keep their sum ($100 \cdot 2.54 + 1000 \cdot 0.85
+= 1100$). Under `with_spans` both write 100 tokens per turn, so neither is reweighted.
+
+The per-turn scopes run after the estimator, before message-level penalties and the
+advantage clip, so penalties keep precedence. They need the per-token
+`assistant_turn_id` / `thinking_mask` / `action_mask` columns. On the SingleController
+token-capture path the RolloutReassembler builds them from the sampled token ids. Every run of
+generated tokens is one turn, and the tags must be single tokens of the policy tokenizer, as
+they are for the Nemotron and Qwen chat formats; setup fails otherwise. A thinking turn with no
+closing tag is all thinking, matching the reasoning parser. The legacy GRPO trainers reject the
+per-turn scopes for now.
+
+Additional metrics for the per-turn scopes: `turns_mean_correct` / `turns_mean_incorrect`,
+`thinking_per_turn_mean_correct`, `content_per_turn_mean_correct`,
+`action_tokens_per_turn_mean_correct`, `thinking_share_of_prose_mean_correct` (whether text
+is moving between thinking and content), and
+`net_turn_credit` $= \sum_i A_i T_i / \sum_i |A_i| T_i$ over all trained turns, overall and per
+pass-rate bucket (`net_turn_credit_bucket_*`). It is the net push on the number of turns that
+GRPO itself applies, which the per-turn reweighting leaves unchanged.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 

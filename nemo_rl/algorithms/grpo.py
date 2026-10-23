@@ -36,6 +36,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
+    per_turn_length_reweight_config,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -2780,6 +2781,23 @@ def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch
     return teacher_logprobs
 
 
+def _raise_if_per_turn_length_reweight(master_config: MasterConfig) -> None:
+    """Reject the per-turn scopes of positive_length_reweight on the legacy GRPO trainers.
+
+    They need the assistant_turn_id / thinking_mask / action_mask columns, which only the
+    SingleController token-capture path builds so far; running without them would silently
+    train without the reweighting.
+    """
+    reweight = per_turn_length_reweight_config(master_config.grpo)
+    if reweight is not None:
+        raise NotImplementedError(
+            "grpo.adv_estimator.positive_length_reweight.scope="
+            f"{reweight.scope!r} needs the per-turn token-class columns, which only the "
+            "SingleController token-capture path builds. Use scope='trajectory' with this "
+            "trainer."
+        )
+
+
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
@@ -3289,6 +3307,7 @@ def _grpo_train_impl(
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
     # Initialize advantage estimator
+    _raise_if_per_turn_length_reweight(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
@@ -3963,6 +3982,9 @@ def _grpo_train_impl(
                         advantages=train_data["advantages"],
                         env_baseline=env_baseline_for_log,
                     )
+                    if isinstance(adv_estimator, GRPOAdvantageEstimator):
+                        # Positive length reweighting metrics; empty while disabled.
+                        metrics.update(adv_estimator.last_metrics)
                     del baseline_for_log, env_baseline_for_log
 
                     penalty_metrics = (
@@ -5000,6 +5022,7 @@ def async_grpo_train(
     ), "Colocated async GRPO is only supported for the Megatron generation backend."
 
     # Initialize advantage estimator
+    _raise_if_per_turn_length_reweight(master_config)
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Calculate minimum buffer size from training requirements
