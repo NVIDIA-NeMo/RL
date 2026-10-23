@@ -1465,7 +1465,11 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
-            ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
+            (
+                "gym_on_sglang",
+                NotImplementedError,
+                "vllm, remote_vllm, and megatron",
+            ),
             (
                 "deferred_routes_without_capture",
                 ValueError,
@@ -2747,7 +2751,7 @@ class TestSetup:
 
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
-        """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
+        """SC Gym supports vllm, remote_vllm, and megatron; reject other backends."""
         mc = _make_master_config(backend=backend)
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
