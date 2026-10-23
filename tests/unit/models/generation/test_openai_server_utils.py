@@ -17,6 +17,7 @@ import pytest
 
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
+    derive_prefix_eos_count,
     replace_prefix_tokens,
     splice_prefix_tokens,
 )
@@ -160,6 +161,97 @@ def test_splice_prefix_tokens_without_tokenizer_honors_explicit_eos_ids(
     )
     assert result == expected
     assert result.token_ids[: len(model_prefix)] == model_prefix
+    # A host without the messages (managed Dynamo's engine) passes the EOS count
+    # derived from the prefix instead of the template prefix render.
+    assert (
+        splice_prefix_tokens(
+            tokenizer=None,
+            model_prefix_token_ids=model_prefix,
+            template_token_ids=template,
+            eos_token_id=eos_token_id,
+            template_prefix_eos_count=derive_prefix_eos_count(
+                model_prefix, eos_token_id=eos_token_id
+            ),
+        )
+        == expected
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        splice_prefix_tokens(
+            tokenizer=None,
+            model_prefix_token_ids=model_prefix,
+            template_prefix_token_ids=template_prefix,
+            template_token_ids=template,
+            eos_token_id=eos_token_id,
+            template_prefix_eos_count=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "model_name", ["Qwen/Qwen3-0.6B", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"]
+)
+def test_derived_prefix_eos_count_matches_real_template_renders(model_name):
+    """Across tool-calling turns with reasoning, the EOS count derived from the
+    exact prefix equals the count in the template's render of the same history."""
+    transformers = pytest.importorskip("transformers")
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
+    except OSError as error:
+        pytest.skip(f"{model_name} tokenizer unavailable: {error}")
+    eos = tokenizer.eos_token_id
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+
+    def render(messages, *, add_generation_prompt):
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=True,
+        )
+        return list(getattr(rendered, "input_ids", rendered))
+
+    def generate(text):
+        return tokenizer.encode(text, add_special_tokens=False) + [eos]
+
+    messages = [
+        {"role": "system", "content": "You are a weather assistant."},
+        {"role": "user", "content": "Weather in Paris?"},
+    ]
+    replies = [
+        "<think>\nI should look it up.\n</think>\n\nChecking the forecast.",
+        "<think>\nIt is sunny.\n</think>\n\nIt is sunny in Paris.",
+    ]
+    follow_ups = [
+        {"role": "tool", "content": "sunny, 22C"},
+        {"role": "user", "content": "And London?"},
+    ]
+    chain = render(messages, add_generation_prompt=True) + generate(replies[0])
+    for reply, follow_up, next_reply in zip(replies, follow_ups, replies[1:] + ["ok"]):
+        messages = [*messages, {"role": "assistant", "content": reply}, follow_up]
+        template_prefix = render(messages[:-1], add_generation_prompt=False)
+        template = render(messages, add_generation_prompt=True)
+        assert derive_prefix_eos_count(chain, eos_token_id=eos) == sum(
+            token == eos for token in template_prefix
+        )
+        spliced = splice_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=chain,
+            template_prefix_token_ids=template_prefix,
+            template_token_ids=template,
+        ).token_ids
+        chain = spliced + generate(next_reply)
 
 
 def test_replace_prefix_tokens_without_tokenizer_reports_missing_eos_without_decoding():

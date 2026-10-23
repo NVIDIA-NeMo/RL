@@ -35,6 +35,11 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_environment,
 )
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.engine_host import (
+    RAY_ADDRESS_ENV,
+    SAMPLING_PROFILE_ENV,
+    sampling_profile_env,
+)
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     draft_module_sharing_disable_required,
@@ -226,6 +231,11 @@ class DynamoVllmWorker:  # pragma: no cover
                 **fp8_env,
                 **draft_env,
                 **fp32_lm_head_env,
+                # NeMo RL's engine host (engine_main): the on-policy sampling it
+                # enforces on rollouts, and the cluster its token capture attaches
+                # to. The engine is a plain subprocess, not a Ray worker.
+                SAMPLING_PROFILE_ENV: sampling_profile_env(config),
+                RAY_ADDRESS_ENV: ray.get_runtime_context().gcs_address,
                 "CUDA_VISIBLE_DEVICES": ",".join(str(gpu) for gpu in cuda_devices),
                 "DYN_SYSTEM_PORT": str(system_port),
                 "PYTHONHASHSEED": "0",
@@ -250,7 +260,12 @@ class DynamoVllmWorker:  # pragma: no cover
             timeout_s=startup_timeout_s,
         )
 
-        command = [dynamo_python, "-m", "dynamo.vllm", *argv]
+        command = [
+            dynamo_python,
+            "-m",
+            "nemo_rl.models.generation.dynamo.engine_main",
+            *argv,
+        ]
         relevant_env = {
             key: value
             for key, value in worker_env.items()

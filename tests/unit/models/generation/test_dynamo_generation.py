@@ -254,31 +254,41 @@ def test_merged_stop_strings_enforce_dynamo_limit(monkeypatch) -> None:
         generation._merge_stop_strings([[f"request-{index}" for index in range(17)]])
 
 
-def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
-    _patch_runtime(monkeypatch)
-    wrappers = []
-
-    class FakeWrapper:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            wrappers.append(self)
-
-        def start(self):
-            return "http://127.0.0.1:3001/v1"
-
-        def shutdown(self):
-            pass
-
-    monkeypatch.setattr(generation_module, "DynamoTokenWrapperServer", FakeWrapper)
-    tokenizer = object()
-    generation = DynamoGeneration(
-        cluster=object(),
-        config=_config(expose_http_server=True),
-        tokenizer=tokenizer,
-        tokenizer_config={"chat_template_kwargs": {"enable_thinking": False}},
+def test_nemo_gym_and_token_capture_reach_every_engine(monkeypatch) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    posts: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
     )
-    assert generation.dp_openai_server_base_urls == ["http://127.0.0.1:3001/v1"]
-    assert wrappers[0].kwargs["tokenizer"] is tokenizer
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    generation = DynamoGeneration(
+        cluster=object(), config=_config(expose_http_server=True)
+    )
+    # Gym's policy model calls the frontend directly.
+    assert generation.dp_openai_server_base_urls == ["http://10.0.0.1:3000/v1"]
+
+    assert generation.setup_token_capture({"backend": "simple"}, "staging") is None
+    # The SingleController rotates the version on its pickled copy.
+    pickle.loads(pickle.dumps(generation)).set_rollout_weight_version(3)
+    assert [(post["system_url"], post["route"], post["payload"]) for post in posts] == [
+        (
+            url,
+            "nrl_setup_token_capture",
+            {"dp_cfg": {"backend": "simple"}, "staging_partition": "staging"},
+        )
+        for url in ("http://10.0.0.2:4000", "http://10.0.0.3:4000")
+    ] + [
+        (url, "nrl_set_rollout_weight_version", {"version": 3})
+        for url in ("http://10.0.0.2:4000", "http://10.0.0.3:4000")
+    ]
+    with pytest.raises(NotImplementedError, match="Media token capture"):
+        generation.setup_token_capture({}, "staging", capture_media=True)
 
 
 def test_collective_refit_drives_the_worker_extension_and_survives_pickling(

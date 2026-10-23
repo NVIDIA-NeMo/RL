@@ -392,15 +392,19 @@ def test_fresh_mooncake_init_preserves_token_capture_and_multimodal_partitions(
     assert staging_call.kwargs["fields"] == list(STAGING_FIELDS) + expected_media
 
 
-@pytest.mark.parametrize("token_capture", [False, True])
+@pytest.mark.parametrize(
+    ("token_capture", "backend"),
+    [(False, "vllm"), (True, "vllm"), (True, "dynamo")],
+)
 def test_mooncake_checkpoint_workers_configured_before_restore(
-    monkeypatch, tmp_path, token_capture
+    monkeypatch, tmp_path, token_capture, backend
 ) -> None:
     configure = MagicMock()
     monkeypatch.setattr(single_controller, "configure_checkpoint_workers", configure)
     master_config = _grpo_master_config(tmp_path)
     master_config.data_plane = _data_plane_config("mooncake_cpu")
     master_config.token_capture.enabled = token_capture
+    master_config.policy["generation"]["backend"] = backend
     master_config.checkpointing.update(enabled=True, save_data_plane=True)
     workers = [object() for _ in range(10)]
 
@@ -424,7 +428,9 @@ def test_mooncake_checkpoint_workers_configured_before_restore(
     )
 
     def stop_after_restore(**kwargs):
-        expected = workers[:4] + (workers[4:8:2] if token_capture else []) + workers[8:]
+        # Dynamo engines stage through segment-less clients and are not Ray actors.
+        gen_leaders = workers[4:8:2] if token_capture and backend != "dynamo" else []
+        expected = workers[:4] + gen_leaders + workers[8:]
         configure.assert_called_once_with(expected)
         raise RuntimeError("stop after checkpoint worker configuration")
 

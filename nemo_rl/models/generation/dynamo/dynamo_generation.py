@@ -15,6 +15,7 @@
 
 import asyncio
 import logging
+import warnings
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -24,6 +25,10 @@ from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.engine_host import (
+    SET_ROLLOUT_WEIGHT_VERSION_ROUTE,
+    SETUP_TOKEN_CAPTURE_ROUTE,
+)
 from nemo_rl.models.generation.dynamo.http_client import (
     async_http_post_json,
     format_dynamo_error,
@@ -31,7 +36,6 @@ from nemo_rl.models.generation.dynamo.http_client import (
 from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
-from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -50,6 +54,8 @@ from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -180,6 +186,14 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
+        if master_config.async_rl.generation_router.enabled:
+            # The router spreads NeMo-Gym traffic over a backend's servers; Dynamo
+            # serves one frontend URL and its frontend routes the whole fleet.
+            raise ValueError(
+                "async_rl.generation_router.enabled=true is not supported with "
+                "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
+                "routing. Set async_rl.generation_router.enabled=false."
+            )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         if (
@@ -194,13 +208,26 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo' under the SingleController; "
                 "the rollout telemetry pump is what reports Dynamo's metrics."
             )
+        if (
+            master_config.token_capture.enabled
+            and generation["dynamo_cfg"]["frontend_args"]["session_affinity_ttl_secs"]
+            is None
+        ):
+            # Correct either way, but each turn's spliced prefix is cached on the
+            # engine that served the previous turn, and the KV router only sees
+            # the frontend's pre-splice render.
+            warnings.warn(
+                "token_capture.enabled with policy.generation.backend='dynamo' "
+                "works best with dynamo_cfg.frontend_args.session_affinity_ttl_secs "
+                "set, so each rollout stays on the engine that caches its prefix.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
         config: dict[str, Any],
-        tokenizer: Any | None = None,
-        tokenizer_config: Optional[dict[str, Any]] = None,
     ):
         validated_config = DynamoConfig.model_validate(config)
         self.cfg = validated_config.model_dump()
@@ -210,25 +237,6 @@ class DynamoGeneration(GenerationInterface):
         self._dynamo_cfg = validated_config.dynamo_cfg
         dynamo_cfg = self._dynamo_cfg
         vllm_cfg = validated_config.vllm_cfg
-        expose_http_server = vllm_cfg.expose_http_server
-        tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
-        if expose_http_server:
-            if tokenizer is None:
-                raise RuntimeError(
-                    "DynamoGeneration requires a tokenizer when exposing an "
-                    "OpenAI-compatible rollout server."
-                )
-            if (
-                tokenizer_config is not None
-                and "chat_template_kwargs" in tokenizer_config
-                and tokenizer_config["chat_template_kwargs"] is not None
-            ):
-                chat_template_kwargs = tokenizer_config["chat_template_kwargs"]
-                if not isinstance(chat_template_kwargs, dict):
-                    raise RuntimeError(
-                        "policy.tokenizer.chat_template_kwargs must be a dictionary."
-                    )
-                tokenizer_chat_template_kwargs = dict(chat_template_kwargs)
         if cluster is None:
             raise RuntimeError(
                 "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
@@ -237,7 +245,6 @@ class DynamoGeneration(GenerationInterface):
             cluster=cluster,
             config=self.cfg,
         )
-        self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
         self._dynamo_frontend_base_url = ""
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         self._refit_channel: DynamoRefitChannel | None = None
@@ -255,26 +262,12 @@ class DynamoGeneration(GenerationInterface):
             )
             self._configure_mtp_drafter()
 
-            if expose_http_server:
-                self._token_wrapper_server = DynamoTokenWrapperServer(
-                    dynamo_frontend_base_url=url,
-                    tokenizer=tokenizer,
-                    tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-                    exclude_tools_when_tool_choice_none=(
-                        dynamo_cfg.worker_args.exclude_tools_when_tool_choice_none
-                    ),
-                    request_timeout_s=dynamo_cfg.request_timeout_s,
-                )
-                wrapper_url = self._token_wrapper_server.start()
-                self.dp_openai_server_base_urls = [wrapper_url]
-                print(
-                    "  [Dynamo] Forwarding rollout chat requests through token "
-                    f"wrapper {wrapper_url} -> {url}",
-                    flush=True,
-                )
-            else:
-                self.dp_openai_server_base_urls = [None]
-                print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
+            # NeMo-Gym talks to the frontend directly; NeMo RL's engine host
+            # (engine_main) applies the rollout hooks inside each engine.
+            self.dp_openai_server_base_urls = [
+                url if vllm_cfg.expose_http_server else None
+            ]
+            print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
         except Exception:
             self.shutdown()
             raise
@@ -366,13 +359,6 @@ class DynamoGeneration(GenerationInterface):
                 sampler.shutdown()
             except Exception:
                 LOGGER.exception("Failed to stop the Dynamo metrics sampler")
-        token_wrapper_server = self._token_wrapper_server
-        self._token_wrapper_server = None
-        if token_wrapper_server is not None:
-            try:
-                token_wrapper_server.shutdown()
-            except Exception:
-                LOGGER.exception("Failed to stop the Dynamo token wrapper")
         managed_runtime = self._managed_runtime
         self._managed_runtime = None
         if managed_runtime is not None:
@@ -415,7 +401,6 @@ class DynamoGeneration(GenerationInterface):
         if not isinstance(frontend_url, str) or not frontend_url:
             raise RuntimeError("Pickled DynamoGeneration has no frontend URL.")
         self._dynamo_frontend_base_url = frontend_url
-        self._token_wrapper_server = None
         self._managed_runtime = None
         self._metrics_sampler = None
         self._refit_channel = state["_refit_channel"]
@@ -842,3 +827,42 @@ class DynamoGeneration(GenerationInterface):
         """Resume every engine paused by :meth:`pause_generation_for_refit`."""
         self._require_refit_channel().resume(timeout_s=timeout_s)
         return True
+
+    # ------------------------------------------------------------------
+    # Token capture — hosted by NeMo RL's engine host in every dynamo.vllm
+    # ------------------------------------------------------------------
+
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+    ) -> Optional["MediaColumnSpec"]:
+        """Install token capture in every engine; each stages its own calls to TQ.
+
+        Text-only: Dynamo hands the engine raw media rather than the processed
+        inputs media capture stages.
+        """
+        if capture_media:
+            raise NotImplementedError(
+                "Media token capture is not supported with "
+                "policy.generation.backend='dynamo'"
+            )
+        if not self.cfg["vllm_cfg"]["expose_http_server"]:
+            raise ValueError(
+                "token_capture.enabled with policy.generation.backend='dynamo' "
+                "requires policy.generation.vllm_cfg.expose_http_server=true: "
+                "NeMo-Gym's captured calls reach the engines through the frontend"
+            )
+        self._require_refit_channel().post_to_every_engine(
+            SETUP_TOKEN_CAPTURE_ROUTE,
+            {"dp_cfg": dict(dp_cfg), "staging_partition": staging_partition},
+        )
+        return None
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version every engine stamps on captured calls."""
+        self._require_refit_channel().post_to_every_engine(
+            SET_ROLLOUT_WEIGHT_VERSION_ROUTE, {"version": int(version)}
+        )

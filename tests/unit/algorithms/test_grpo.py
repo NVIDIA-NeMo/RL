@@ -2216,7 +2216,7 @@ def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> N
         )
 
 
-def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
+def test_should_use_nemo_gym_requires_dynamo_http_server() -> None:
     master_config = MagicMock()
     master_config.env = {"should_use_nemo_gym": True}
     master_config.policy = {

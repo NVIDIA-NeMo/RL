@@ -190,6 +190,12 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ]
+    # Router session affinity: idle TTL in seconds for keeping one session on one
+    # engine, or None to disable it. Token capture keys sessions by rollout, and the
+    # engine splices each turn's staged prefix after routing, so without affinity
+    # the KV router loses track of where a rollout's prefix is cached. The binding
+    # mode (hard by default) is Dynamo's --router-session-affinity-mode.
+    session_affinity_ttl_secs: PositiveInt | None = None
     extra_cli_args: list[str]
 
 

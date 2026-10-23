@@ -445,7 +445,13 @@ class SingleControllerActor:
                     )
                 for teacher in (actor_args.teacher_worker_groups or {}).values():
                     checkpoint_workers.extend(teacher.worker_group.workers)
-                if master_config.token_capture.enabled:
+                # Managed Dynamo stages from its engine processes, whose capture
+                # clients own no segment; configure_checkpoint_workers would drop
+                # them, and the engines are not Ray actors anyway.
+                if (
+                    master_config.token_capture.enabled
+                    and master_config.policy["generation"]["backend"] != "dynamo"
+                ):
                     generation_workers = actor_args.gen_handle.worker_group
                     checkpoint_workers.extend(
                         generation_workers.workers[index]

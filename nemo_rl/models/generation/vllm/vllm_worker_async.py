@@ -22,8 +22,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -48,7 +47,6 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -64,10 +62,12 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.token_capture_host import TokenCaptureHostMixin
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    off_policy_sampling_error,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -81,19 +81,6 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from nemo_gym.token_id_capture.staging.capture import ActiveCall
-
-
-@dataclass
-class CapturedRequest:
-    """Request-local ownership of tokens and processed-media snapshots."""
-
-    call: "ActiveCall"
-    prompt_token_ids: list[int]
-    media: CapturedMedia | None
-
 
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
 # registers, which NeMo-Gym's model server calls. The sparse-refit routes the
@@ -232,7 +219,7 @@ class _AsyncLLMHTTPClient:
 
 
 class VllmAsyncGenerationWorkerImpl(
-    VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
+    TokenCaptureHostMixin, VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
 ):
     def __init__(
         self,
@@ -274,29 +261,12 @@ class VllmAsyncGenerationWorkerImpl(
         self._engine_loop = None
         self._http_engine_client = None
 
-        # Ledger-authoritative token capture (dormant until the
-        # setup_token_capture fan-out runs). The weight
-        # version is stamped per model call at begin_call time and rotated by
-        # the set_rollout_weight_version fan-out from the SC's _sync_weights.
-        self.token_capture = None
-        self._rollout_weight_version = 0
-        # In-flight captured calls keyed by id(request): the ActiveCall, the
-        # exact engine prompt ids recorded at preprocess time, and the media
-        # snapshot the engine ran on (see CapturedRequest).
-        self._capture_calls: dict[int, CapturedRequest] = {}
+        # Shared capture state (TokenCaptureHostMixin); the media fields below
+        # are this worker's own.
+        self._init_token_capture_host()
         self._capture_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
-        # TQTokenSource installed by setup_token_capture. The media path reads
-        # parent-chain rows through it directly; prefix resolution goes through
-        # the shared ChainPrefixCache below.
-        self._staging_source: Any | None = None
-        # Resolved staging-chain prefixes, shared implementation with the Megatron
-        # preparer. Installed by setup_token_capture; fetch runs on executor threads.
-        # Deferred import: tq_token_sink pulls in the data-plane stack.
-        from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
-
-        self._chain_prefix = ChainPrefixCache()
 
         super().__init__(
             config,
@@ -586,10 +556,6 @@ class VllmAsyncGenerationWorkerImpl(
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
-    def install_token_capture(self, capture: Any) -> None:
-        """Gym's ``install_capture`` seam (the ``CaptureHost`` contract)."""
-        self.token_capture = capture
-
     async def setup_token_capture(
         self,
         dp_cfg: dict[str, Any],
@@ -608,26 +574,10 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
-        from nemo_gym.token_id_capture.staging import install_capture
-
-        from nemo_rl.data_plane import build_data_plane_client
-        from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
-
-        # Own no segment: a save would otherwise wait on this actor, whose event
-        # loop is busy serving rollouts. Capture writes land in other segments.
-        dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
         pixel_dtype = self.llm.model_config.dtype if capture_media else None
-        sink = TQTokenSink(
-            dp_client,
-            staging_partition=staging_partition,
-            capture_media=capture_media,
-            media_pixel_dtype=pixel_dtype,
-        )
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -659,16 +609,11 @@ class VllmAsyncGenerationWorkerImpl(
             self._capture_image_token_id = int(context_ids[0])
             self._capture_patch_size = int(info.get_hf_config().patch_size)
         self._capture_media = capture_media
-        source = TQTokenSource(
-            dp_client, staging_partition=staging_partition, capture_media=capture_media
-        )
-        self._staging_source = source
-        self._chain_prefix.install(source)
-        install_capture(
-            self,
-            sink=sink,
-            weight_version_fn=lambda: self._rollout_weight_version,
-            adapter=VLLMCaptureAdapter(),
+        self._install_token_capture_host(
+            dp_cfg,
+            staging_partition,
+            capture_media=capture_media,
+            media_pixel_dtype=pixel_dtype,
         )
         if not capture_media:
             return None
@@ -679,62 +624,6 @@ class VllmAsyncGenerationWorkerImpl(
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
         return await asyncio.to_thread(run_checkpoint_command, body)
-
-    async def set_rollout_weight_version(self, version: int) -> None:
-        """Rotate the weight version stamped on subsequent captured calls."""
-        self._rollout_weight_version = int(version)
-
-    def _capture_admission(self, request: Any) -> Any | None:
-        """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
-
-        Returns None unless capture is installed and the request carries the
-        context. The dict itself is never mutated: the admission is the typed,
-        read-only contract that the prefix resolution and ``begin_call`` share.
-        """
-        context = getattr(request, "ng_capture", None)
-        if self.token_capture is None or not context:
-            return None
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
-        return CaptureAdmission.model_validate(context)
-
-    def _begin_request_capture(
-        self,
-        request: Any,
-        prompt_token_ids: list[int],
-        *,
-        admission: Any | None = None,
-        prefix_token_ids: list[int] | None = None,
-        media: CapturedMedia | None = None,
-    ) -> None:
-        """Admit one ledger-forwarded call into the capture layer.
-
-        Called from preprocess_chat once the exact engine prompt is known
-        (post-splice in token-in mode, full render in text mode). No-op
-        unless capture is installed and the request carries the ledger's
-        ``ng_capture`` context.
-
-        ``prefix_token_ids`` is the prefix resolved by
-        :meth:`_resolve_admission_prefix`. Gym's ``begin_call`` requires it for
-        a ``staging_chain`` admission and checks its length against
-        ``prev_len``; violations raise ``CaptureError`` before any state is kept.
-        """
-        capture = self.token_capture
-        if capture is None:
-            return
-        if admission is None:
-            admission = self._capture_admission(request)
-            if admission is None:
-                return
-        call = capture.begin_call(
-            admission,
-            prefix_token_ids=prefix_token_ids,
-            stream=bool(getattr(request, "stream", False)),
-        )
-        self._capture_calls[id(request)] = CapturedRequest(
-            call, list(prompt_token_ids), media
-        )
 
     def _capture_request_media(
         self,
@@ -832,17 +721,6 @@ class VllmAsyncGenerationWorkerImpl(
             patch_size=self._capture_patch_size,
         )
 
-    def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
-        """Resolve a staging chain through the shared, cached TQ read."""
-        return self._chain_prefix.fetch(staging_chain)
-
-    def _resolve_admission_prefix(self, admission: Any) -> list[int]:
-        """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
-        # Deferred import, matching setup_token_capture.
-        from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
-
-        return resolve_admission_prefix(admission, self._chain_prefix)
-
     def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
         """Attach the resolved prefix to the request through the capture adapter.
 
@@ -854,117 +732,6 @@ class VllmAsyncGenerationWorkerImpl(
         adapter = self.token_capture.adapter
         for field_name, value in adapter.enter_prefix({}, prefix_token_ids).items():
             setattr(request, field_name, value)
-
-    @staticmethod
-    def _delta_align_routed_experts(
-        payload: dict[str, Any], *, prev_len: int, prompt_len: int, generated_len: int
-    ) -> None:
-        """Normalize optional vLLM routes to the staged token delta (plus boundary row)."""
-        choices = payload.get("choices") or []
-        if len(choices) != 1 or not isinstance(choices[0], dict):
-            return
-        choice = dict(choices[0])
-        message = dict(choice.get("message") or {})
-        routed = message.get("routed_experts")
-        if routed is None:
-            return
-        try:
-            from nemo_rl.utils.routed_experts_codec import (
-                decode_routed_experts,
-                encode_routed_experts,
-            )
-
-            if isinstance(routed, str):
-                dtype_name = routed.split(":", 3)[1]
-                dtype = {
-                    "int8": torch.int8,
-                    "int16": torch.int16,
-                    "int32": torch.int32,
-                }.get(dtype_name)
-                if dtype is None:
-                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
-            else:
-                dtype = torch.int16
-            experts = decode_routed_experts(routed, dtype)
-            expected_full_len = prompt_len + generated_len
-            if experts.dim() != 3 or experts.shape[0] != expected_full_len:
-                raise ValueError(
-                    f"route length {experts.shape[0]} does not match engine sequence "
-                    f"length {expected_full_len}"
-                )
-            start = prev_len - boundary_route_rows(prev_len)
-            message["routed_experts"] = encode_routed_experts(experts[start:])
-        except (IndexError, TypeError, ValueError) as error:
-            LOGGER.warning(
-                "dropping invalid routed_experts from staged capture: %s", error
-            )
-            message.pop("routed_experts", None)
-        choice["message"] = message
-        payload["choices"] = [choice]
-
-    def _finish_request_capture(self, request: Any, content: dict) -> dict:
-        """Stage the finished call and ride its coords on the response.
-
-        Tokens and the call's new media tensors go to TQ in one write (the
-        media ride as opaque attachments beside the record), so ``staged``
-        coords vouch for both and any failure is ``capture_failed`` at call
-        time. Token ids, logprobs, and routes are stripped after staging, so
-        the worker->gate hop carries the completion and coords only.
-        """
-        state = self._capture_calls.pop(id(request), None)
-        if state is None:
-            return content
-        call, prompt_token_ids = state.call, state.prompt_token_ids
-        payload = dict(content)
-        # vLLM's OpenAI response carries no prompt ids; the adapter reads the
-        # preprocess-time engine prompt off the payload (see
-        # nemo_gym.token_id_capture.adapters.vllm.extract_prompt_ids).
-        payload["prompt_token_ids"] = prompt_token_ids
-        if state.media is not None:
-            # Optional Gym dependency: only captured media calls reach here.
-            from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
-
-            # Placeholder metadata (offsets, token hashes, sizes) rides the
-            # digest-covered extras; the pixels themselves are attachments.
-            payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
-        adapter = self.token_capture.adapter
-        if adapter is not None:
-            try:
-                generated_token_ids, _ = adapter.extract_generation(payload)
-            except Exception:  # capture core will report the authoritative failure
-                generated_token_ids = []
-            self._delta_align_routed_experts(
-                payload,
-                prev_len=call.admission.prev_len,
-                prompt_len=len(prompt_token_ids),
-                generated_len=len(generated_token_ids),
-            )
-        coords = self.token_capture.complete_call_from_response(
-            call,
-            payload,
-            attachments=state.media.tensors if state.media is not None else None,
-        )
-        for choice in content.get("choices") or []:
-            choice.pop("logprobs", None)
-            # Token arrays and delta-aligned routes were staged to TQ above;
-            # remove the serializer's message fields before the worker->gate hop.
-            message = choice.get("message")
-            if isinstance(message, dict):
-                for field in (
-                    "prompt_token_ids",
-                    "generation_token_ids",
-                    "generation_log_probs",
-                    "routed_experts",
-                ):
-                    message.pop(field, None)
-        content["ng_commit_coords"] = coords.model_dump()
-        return content
-
-    def _abort_request_capture(self, request: Any, *, reason: str) -> None:
-        """Drop the in-flight capture state for a request that errored."""
-        state = self._capture_calls.pop(id(request), None)
-        if state is not None and self.token_capture is not None:
-            self.token_capture.fail_call(state.call, reason=reason)
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -1473,46 +1240,15 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training
-            # stability. Validation rollouts are the one exception: they are stamped with
-            # the validation sampling profile (generation.val_temperature / val_top_p),
-            # which is metric-only and safe to serve — grpo.validate() is the only
-            # caller that constructs a non-train GenerationSamplingParams. Multi-turn
-            # agents issue their own requests, so this server-side check is the one
-            # chokepoint they all pass.
-            # vLLM resolves an unset top_p from the model's generation_config.json
-            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
-            # request omitting it would sample off-policy while passing this check.
-            assert request.top_p is not None, (
-                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
-                "resolved by vLLM from the model's generation_config.json and would "
-                "bypass the on-policy sampling check."
+            sampling_error = off_policy_sampling_error(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                generation_config=generation_config,
             )
-            request_top_p = request.top_p
-            is_train_sampling = (
-                request.temperature == generation_config["temperature"]
-                and request_top_p == generation_config["top_p"]
-            )
-            is_val_sampling = (
-                request.temperature == generation_config["val_temperature"]
-                and request_top_p == generation_config["val_top_p"]
-            )
-            assert is_train_sampling or is_val_sampling, (
-                f"request sampling (temperature={request.temperature}, "
-                f"top_p={request.top_p}) matches neither the train sampling params "
-                f"(temperature={generation_config['temperature']}, "
-                f"top_p={generation_config['top_p']}) nor the validation sampling "
-                f"params (val_temperature={generation_config['val_temperature']}, "
-                f"val_top_p={generation_config['val_top_p']})"
-            )
+            assert sampling_error is None, sampling_error
+            request.top_k = -1
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(

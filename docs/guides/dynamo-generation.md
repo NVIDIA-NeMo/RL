@@ -29,7 +29,7 @@ docker buildx build \
 ```
 
 `BUILD_DYNAMO=1` prebuilds the `DynamoVllmWorker` actor venv from the root
-project's `dynamo` extra, and installs etcd v3.5.21 and NATS Server v2.11.6 into
+project's `dynamo` and `nemo_gym` extras, and installs etcd v3.5.21 and NATS Server v2.11.6 into
 `/usr/local/bin` (`docker/install_dynamo_services.sh`). The `dynamo` extra is
 the `vllm` extra plus the base `ai-dynamo==1.5.1` package, so the Dynamo
 workers run the same vLLM (0.29.0), NCCL and `nemo_rl` code as NeMo RL's own
@@ -54,10 +54,13 @@ A Dynamo upgrade must update and reverify these coupled locations:
   posts to, which must still forward any `engine_rpc` to vLLM `collective_rpc`
   with the request body as keyword arguments
   (`test_every_engine_rpc_the_driver_sends_binds_to_the_extension`)
-- `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
-  keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
-  reverify them against real Dynamo output because unit tests validate only the
-  expected local response shape
+- `nemo_rl/models/generation/dynamo/engine_main.py`: the `dynamo.vllm` names it
+  rebinds (`worker_factory.DecodeWorkerHandler`, `main.WorkerFactory`,
+  `main.publish_vllm_token_budget`), the `generate(request, context)` signature,
+  and the request and final-chunk layout `engine_host.py` reads
+  (`token_ids`, `stop_conditions`, `annotations`, `engine_data`). The module
+  fails at startup if a name moves; reverify the layouts against real Dynamo
+  output, because unit tests use a stand-in for Dynamo's handler
 - `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
   `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
   jail removes `nvext.engine_data`; remove this setting only after an upgraded
@@ -103,7 +106,7 @@ Service ports and the namespace are runtime-owned rather than public config.
 | FP8 | Read by the vLLM backend's FP8 builder when `precision: fp8`; an error otherwise | `is_mx`, mixed BF16/FP8 layers, DeepGEMM, pow2 scales |
 | Engine patch | The vLLM backend's source patch, enabled in each engine's environment | `fp32_lm_head` (Nemotron-H fp32 LM head) |
 | Unsupported | Warning when active | tokenizer skipping, context-length token capping |
-| Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | HTTP-wrapper enablement, metrics sampling, processed rollout logprobs |
+| Managed runtime | Consumed or enforced by NeMo RL rather than forwarded | frontend URL publication for NeMo-Gym, metrics sampling, processed rollout logprobs |
 | Inapplicable | Ignored because the managed path owns that behavior | async mode, progress bars, NeMo RL HTTP/ZMQ refit ports |
 
 The shared GRPO base config also supplies `mcore_generation_config` and
@@ -176,7 +179,7 @@ own communicators and raise instead of hanging.
 The fixed port layout is:
 
 - `1313-1399`: driver-local etcd and NATS control plane
-- `3000-3999`: frontend and token-wrapper HTTP endpoints
+- `3000-3999`: frontend HTTP endpoints
 - `4000-4099`: node-local `DYN_SYSTEM_PORT`
 - `7000 + slot * 100`: node-local vLLM rendezvous ports
 
@@ -215,7 +218,8 @@ The async SingleController trainer can also use managed Dynamo. It follows the
 same data path as the native vLLM backend: the SingleController sends each turn
 to the Dynamo frontend, builds the rollout record from the response, and commits
 it to the TransferQueue data plane, from which the policy workers read their
-shards. No Dynamo-side component writes to TransferQueue.
+shards. On this path no Dynamo-side component writes to TransferQueue, except
+that with NeMo-Gym token capture each engine stages its own calls (below).
 
 Start from
 [`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml)
@@ -226,12 +230,56 @@ them on the new weights. With `async_rl.recompute_kv_cache_after_weight_updates`
 (the default) the pause also clears each engine's KV and prefix cache, so frozen
 requests recompute their KV on the new weights; set it to false to keep both.
 
+NeMo-Gym rollouts work too: start from
+[`examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml`](../../examples/nemo_gym/grpo_qwen3_0_6b_dynamo_single_controller.yaml).
+Gym's policy model talks to the Dynamo frontend directly, at the URL
+`vllm_cfg.expose_http_server` publishes, and NeMo RL sets Gym's Dynamo dialect
+for it (`vllm_model.dynamo_frontend`): token data travels in `nvext`, and the
+frontend renders each prompt with `policy.tokenizer.chat_template_kwargs`.
+
+Each engine runs `dynamo.vllm` through NeMo RL's entry module
+(`nemo_rl/models/generation/dynamo/engine_main.py`), which installs NeMo RL's
+engine host in the process that owns vLLM's AsyncLLM. Like NeMo RL's vLLM
+server, it handles every Gym request:
+
+- splices the last echoed assistant turn's exact tokens into a multi-turn
+  prompt, in place of the frontend's re-render of that history (Gym's dialect
+  sends them as an `ng_prefix` annotation; the vLLM server reads them from the
+  messages);
+- caps the request's output tokens so the prompt and output fit `max_model_len`,
+  and answers an overflowing prompt with the 400 Gym treats as a context-length
+  refusal;
+- rejects requests whose sampling matches neither the train nor the validation
+  profile, and disables `top_k`, which Dynamo would otherwise take from the
+  model's `generation_config.json`.
+
+The frontend aborts the engine request when Gym drops the call.
+
+With `token_capture.enabled`, the engine host also does exact-token capture with
+the native backend's own code (`TokenCaptureHostMixin`). Gym's `dynamo_worker`
+capture handler sends each call's admission as an `nvext` annotation. The engine
+then splices the staged prefix of a multi-turn call into the frontend's render,
+stages the finished call's tokens and logprobs to TransferQueue from its own
+process, and returns only the commit coordinates.
+
+In both modes the splice boundary is the prefix's EOS count. It matches the
+render when the history up to the prefix's last assistant turn is unedited
+(Gym's lineage admission checks this for captured calls) and the model emitted
+no EOS text as ordinary tokens. Set
+`dynamo_cfg.frontend_args.session_affinity_ttl_secs` so each rollout stays on
+the engine caching its prefix: the KV router matches the frontend's render, not
+the spliced prompt.
+
 Current limits on this path:
 
-- Native rollouts only. NeMo-Gym under the SingleController supports only
-  `backend: vllm` and `backend: megatron`.
 - Text policies only, and no MoE router replay: `policy.is_vlm` and
   `policy.router_replay.enabled` must be false.
+- Token capture is text-only. Gym requests may not carry `stop` strings: the
+  frontend matches them itself and drops the final chunk that carries the
+  engine's token data. Setup can't see them, so the engine refuses each such
+  request with a 400.
+- `async_rl.generation_router.enabled` must stay false, because the Dynamo
+  frontend routes the whole fleet behind one URL.
 - `async_rl.generation_fleet_health.enabled` must stay false, because the
   Dynamo frontend owns request routing. Its `refit_timeout_s` is honored: the
   worker extension in each engine enforces it.
@@ -240,7 +288,7 @@ Current limits on this path:
   the Dynamo metrics sampler and reports each engine's generated tokens, running
   and waiting requests, and KV-cache usage.
 
-Setup rejects any of these before allocating clusters.
+Setup rejects the others before allocating clusters.
 
 ## Run SWE1 with W&B
 

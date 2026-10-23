@@ -63,6 +63,10 @@ def _config(*, tp: int = 1) -> dict:
     return {
         "backend": "dynamo",
         "model_name": "model",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
         "colocated": {"enabled": False},
         "dynamo_cfg": {
             "engine": "vllm",
@@ -488,6 +492,10 @@ def test_worker_registers_process_group_immediately_after_launch(
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get", lambda ref: ref
     )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="10.0.0.1:6379"),
+    )
     monkeypatch.setattr(worker_cls, "_validate_argv", MagicMock())
     monkeypatch.setattr(worker_cls, "_wait_for_system_port", MagicMock())
     # The FP8 builder itself needs vLLM and is covered with the worker extension;
@@ -521,6 +529,16 @@ def test_worker_registers_process_group_immediately_after_launch(
 
     assert reservation.register_process_group.calls == [((4321,), {})]
     command, env = launched["command"], launched["env"]
+    # dynamo.vllm runs with NeMo RL's engine host, which attaches to this cluster for
+    # token capture and enforces on-policy rollout sampling.
+    assert command[1:3] == ["-m", "nemo_rl.models.generation.dynamo.engine_main"]
+    assert env["NRL_DYNAMO_RAY_ADDRESS"] == "10.0.0.1:6379"
+    assert json.loads(env["NRL_DYNAMO_SAMPLING_PROFILE"]) == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+    }
     assert command[command.index("--dtype") + 1] == "bfloat16"
     if precision == "fp8":
         assert command[command.index("--quantization") + 1] == "fp8"

@@ -75,7 +75,7 @@ uv run --no-sync tests/check_metrics.py \
   "${metrics_json}" \
   'max(data["train/token_mult_prob_error"]) < 1.05'
 
-if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[V]LLM::EngineCore|[n]emorl_dynamo_etcd_|[n]emorl_dynamo_nats_"; then
+if pgrep -f "[d]ynamo.frontend|[d]ynamo.vllm|[d]ynamo.engine_main|[V]LLM::EngineCore|[n]emorl_dynamo_etcd_|[n]emorl_dynamo_nats_"; then
   echo "Managed Dynamo processes remain after GRPO shutdown" >&2
   exit 1
 fi

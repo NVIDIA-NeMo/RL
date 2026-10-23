@@ -448,6 +448,13 @@ def test_frontend_argv_and_environment_are_runtime_owned() -> None:
     assert _flag_value(argv, "--router-mode") == "kv"
     assert not any(arg.startswith("--router-reset-states") for arg in argv)
     assert not any(arg.startswith("--no-router-reset-states") for arg in argv)
+    # Session affinity is off unless configured (token capture keys it by rollout).
+    assert "--router-session-affinity-ttl-secs" not in argv
+    cfg.frontend_args.session_affinity_ttl_secs = 600
+    affinity_argv = build_dynamo_frontend_argv(
+        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg
+    )
+    assert _flag_value(affinity_argv, "--router-session-affinity-ttl-secs") == "600"
 
     env = build_managed_worker_env(
         base_env={

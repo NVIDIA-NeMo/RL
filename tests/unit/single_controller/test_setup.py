@@ -21,6 +21,7 @@ import dataclasses
 import json
 import threading
 import warnings
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -363,15 +364,17 @@ def test_build_generation_passes_sglang_config():
 
 
 def test_build_generation_constructs_dynamo_from_normalized_config():
-    """DynamoGeneration receives the generation config setup already validated."""
+    """DynamoGeneration receives the validated config."""
     master_config = _make_master_config(backend="dynamo")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
     inference_cluster = MagicMock(name="inference_cluster")
+    tokenizer = MagicMock(name="tokenizer")
 
     with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
         generation, _ = sc_setup_mod._build_generation(
             inference_cluster,
             master_config,
+            tokenizer=tokenizer,
         )
 
     mock_dynamo.assert_called_once_with(
@@ -380,6 +383,18 @@ def test_build_generation_constructs_dynamo_from_normalized_config():
     )
     assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
     generation.finish_generation.assert_called_once_with()
+
+
+def test_failed_dynamo_build_fails_the_waiting_gym_spinup():
+    """Gym waits on the frontend URL, so a failed build must fail it, not hang it."""
+    base_urls = Future()
+    build = MagicMock(side_effect=RuntimeError("engines failed to start"))
+
+    with pytest.raises(RuntimeError, match="engines failed to start"):
+        sc_setup_mod._build_then_publish_base_urls(build, base_urls)
+    # timeout=0: a future left pending raises TimeoutError here instead of hanging.
+    with pytest.raises(RuntimeError, match="engines failed to start"):
+        base_urls.result(timeout=0)
 
 
 def test_build_generation_rejects_deferred_dynamo_load():
@@ -1528,7 +1543,7 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
-            ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
+            ("gym_on_sglang", NotImplementedError, "vllm, megatron and dynamo"),
             (
                 "deferred_routes_without_capture",
                 ValueError,
@@ -1717,6 +1732,11 @@ class TestSetup:
                 ),
                 "requires rollout_checkpointing.telemetry_interval_s",
                 id="unread_metrics_logger",
+            ),
+            pytest.param(
+                lambda mc: setattr(mc.async_rl.generation_router, "enabled", True),
+                "generation_router.enabled=true is not supported",
+                id="generation_router",
             ),
         ],
     )
@@ -2232,6 +2252,39 @@ class TestSetup:
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
         assert train_iters_at_build == [8]
         fake_policy.shutdown.assert_not_called()
+
+    def test_nemo_gym_on_dynamo_spins_up_on_the_frontend_url(self, patched_factories):
+        """Gym waits for managed Dynamo's frontend, which checks no bearer token."""
+        mc = _make_master_config(backend="dynamo")
+        mc.policy["generation"]["model_name"] = "test-model"
+        mc.policy["generation"]["stop_strings"] = None
+        mc.policy["generation"]["stop_token_ids"] = None
+        mc.policy["generation"]["top_k"] = None
+        fake_gen = patched_factories["fake_gen"]
+        fake_gen.dp_openai_server_base_urls = ["http://frontend:3000/v1"]
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        tokenizer = MagicMock(pad_token_id=0)
+
+        with (
+            patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_shards
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            actor_args, _ = setup_single_controller(mc, tokenizer)
+
+        _, spinup_kwargs = mock_spinup.call_args
+        assert spinup_kwargs["base_urls"] == ["http://frontend:3000/v1"]
+        assert spinup_kwargs["policy_api_key"] is None
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When enabled, the NeMo-Gym shard set is spun up and stored."""

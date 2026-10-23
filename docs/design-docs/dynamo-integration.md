@@ -22,10 +22,12 @@ NATS, etcd, and temporary state independently.
 ## Generation state
 
 Both GRPO trainers use `DynamoGeneration.generate_async()` against the managed
-frontend. NeMo-Gym traffic passes through a process-local token wrapper. It
-uses the policy tokenizer, preserves caller `nvext.extra_fields`, adds Dynamo
-engine metadata, and translates rendered multi-turn prefixes back to the exact
-caller token IDs.
+frontend. NeMo-Gym's policy model calls the frontend directly in Gym's Dynamo
+dialect, which carries token data in `nvext`. Each engine runs `dynamo.vllm`
+through `engine_main.py`, which binds NeMo RL's engine host
+(`engine_host.py`) to Dynamo's decode handler. The host shares the native vLLM
+worker's token-capture code, so per-request native features port to Dynamo
+by reusing that code in the AsyncLLM-owning process rather than copying it.
 
 Serialized rollout copies contain only frontend URLs, immutable worker admin
 endpoints, and the prepared refit metadata. They cannot own or stop services.

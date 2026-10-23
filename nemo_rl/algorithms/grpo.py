@@ -1928,8 +1928,6 @@ def setup(
             generation = DynamoGeneration(
                 cluster=inference_cluster,
                 config=generation_config,
-                tokenizer=tokenizer,
-                tokenizer_config=policy_config["tokenizer"],
             )
             return generation, time.perf_counter() - t0
 

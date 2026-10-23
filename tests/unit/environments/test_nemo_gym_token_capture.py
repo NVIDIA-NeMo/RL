@@ -39,7 +39,11 @@ def _digest(label: str) -> str:
 
 @pytest.mark.parametrize(
     ("generation_backend", "expected"),
-    [("vllm", "vllm_worker"), ("megatron", "megatron_worker")],
+    [
+        ("vllm", "vllm_worker"),
+        ("megatron", "megatron_worker"),
+        ("dynamo", "dynamo_worker"),
+    ],
 )
 def test_external_staging_backend_maps_generation_backend(
     generation_backend: str, expected: str
@@ -586,7 +590,8 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
             "generation": {
                 "backend": "dynamo",
                 "vllm_cfg": {"async_engine": False, "expose_http_server": False},
-            }
+            },
+            "tokenizer": {"name": "test-tokenizer"},
         },
     )
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,6 +46,9 @@ from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
+)
+from nemo_rl.models.generation.vllm.token_capture_host import (  # noqa: E402
+    TokenCaptureHostMixin,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
@@ -78,6 +81,9 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
+    )
+    worker._install_token_capture_host = MethodType(
+        TokenCaptureHostMixin._install_token_capture_host, worker
     )
     return worker
 
