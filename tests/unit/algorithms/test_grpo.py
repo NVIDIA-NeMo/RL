@@ -9246,6 +9246,80 @@ def test_tq_pct_diagnostics_use_the_statistics_mask(
     )
 
 
+@pytest.mark.parametrize("reward_policy", ["exclude", "include"])
+@pytest.mark.parametrize("mask_flagged", [True, False])
+def test_tq_forwards_should_mask_flagged_samples(
+    mock_grpo_components,
+    monkeypatch: pytest.MonkeyPatch,
+    mask_flagged: bool,
+    reward_policy: str,
+) -> None:
+    """The TQ actor forwards ``env.should_mask_flagged_samples`` to the Gym rollout.
+
+    Like the legacy loop, it passes the flag to ``run_nemo_gym_rollout_sync``,
+    which leaves ``mask_sample`` out of the batch when the flag is false;
+    otherwise the driver's ``_apply_mask_sample_filter`` drops flagged rows from
+    the loss. Both values are exercised so that an actor that always passed
+    ``False`` (silently disabling masking for every TQ Gym run) fails too.
+    """
+    components = mock_grpo_components
+    cfg = components["master_config"]
+    cfg.data_plane = {"enabled": True}
+    cfg.env = {"should_mask_flagged_samples": mask_flagged}
+    cfg.grpo.max_num_steps = 1
+    cfg.grpo.val_period = 0
+    cfg.grpo.num_generations_per_prompt = 4
+    cfg.grpo.masked_reward_policy = reward_policy
+    cfg.grpo.overlong_filtering = False
+    cfg.grpo.seq_logprob_error_threshold = None
+    cfg.loss_fn.use_kl_in_reward = False
+    batch = next(iter(components["train_dataloader"])).repeat_interleave(4)
+    batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    batch["truncated"] = torch.zeros(4, dtype=torch.bool)
+    gym_calls: list[dict[str, Any]] = []
+
+    def fake_gym_rollout(**kwargs: Any) -> SimpleNamespace:
+        gym_calls.append(kwargs)
+        final_batch = BatchedDataDict(dict(batch))
+        # run_nemo_gym_rollout_sync carries the env flags only when asked to.
+        if kwargs.get("mask_env_flagged_samples", True):
+            final_batch["mask_sample"] = [False, False, False, True]
+        return SimpleNamespace(
+            final_batch=final_batch,
+            rollout_metrics={"mean_gen_tokens_per_sample": 2.0},
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.should_use_nemo_gym", lambda _cfg: True
+    )
+    monkeypatch.setattr(sync_rollout_mod, "run_nemo_gym_rollout_sync", fake_gym_rollout)
+    meta, carry, rollout_metrics, actor_data = _tq_actor_rollout(
+        components, cfg, batch, monkeypatch
+    )
+    assert len(gym_calls) == 1
+    assert gym_calls[0].get("mask_env_flagged_samples", True) is mask_flagged
+    loss_mask = torch.tensor([1.0, 1.0, 1.0, float(not mask_flagged)])
+    # Under exclude the worker logprob passes drop a flagged row as well.
+    torch.testing.assert_close(
+        actor_data["sample_mask"],
+        loss_mask if reward_policy == "exclude" else torch.ones(4),
+    )
+    actor_data["prev_logprobs"] = torch.zeros_like(actor_data["generation_logprobs"])
+    actor_data["reference_policy_logprobs"] = torch.zeros_like(
+        actor_data["generation_logprobs"]
+    )
+    estimator = MagicMock(wraps=grpo_mod._create_advantage_estimator(cfg))
+    fields = _run_tq_train_step(
+        components, cfg, meta, carry, rollout_metrics, actor_data, estimator
+    )
+
+    logged = _logged_train_metrics_with_key(
+        components["logger"], "num_mask_sample_filtered"
+    )
+    assert logged["num_mask_sample_filtered"] == int(mask_flagged)
+    torch.testing.assert_close(fields["sample_mask"], loss_mask)
+
+
 def _two_group_rollout_batch(mock_grpo_components):
     """A trainable prompt group followed by an over-length one.
 

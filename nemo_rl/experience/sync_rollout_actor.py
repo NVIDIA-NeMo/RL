@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
@@ -263,6 +264,10 @@ class SyncRolloutActor:
                     cfg.grpo.length_penalty if apply_length_penalty else None
                 ),
                 thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                # Honour env.should_mask_flagged_samples as the other trainers
+                # do: the driver zeroes the loss weight of every mask_sample
+                # row this actor carries, so the flag must gate the carry.
+                mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
                 deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
                 debug_payload_metrics=cfg.grpo.debug_payload_metrics,
             )
