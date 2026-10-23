@@ -161,7 +161,40 @@ def _clear_vllm_backend_modules(monkeypatch):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend",
         "nemo_rl.models.generation.vllm.vllm_backend",
     ):
+        parent_name, _, child_name = module_name.rpartition(".")
+        parent = importlib.import_module(parent_name)
+        # Imports overwrite both caches, including entries absent before the test.
+        monkeypatch.setattr(
+            parent, child_name, getattr(parent, child_name, None), raising=False
+        )
+        monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+        monkeypatch.delitem(sys.modules, module_name)
+
+
+@pytest.mark.parametrize("preloaded", [False, True])
+def test_backend_import_restores_module_caches(monkeypatch, preloaded):
+    module_name = "nemo_rl.models.generation.vllm.vllm_backend"
+    parent = importlib.import_module("nemo_rl.models.generation.vllm")
+    original = types.ModuleType(module_name)
+    if preloaded:
+        monkeypatch.setitem(sys.modules, module_name, original)
+        monkeypatch.setattr(parent, "vllm_backend", original, raising=False)
+    else:
         monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.delattr(parent, "vllm_backend", raising=False)
+
+    with pytest.MonkeyPatch.context() as scoped:
+        _clear_vllm_backend_modules(scoped)
+        replacement = types.ModuleType(module_name)
+        sys.modules[module_name] = replacement
+        parent.vllm_backend = replacement
+
+    if preloaded:
+        assert sys.modules[module_name] is original
+        assert parent.vllm_backend is original
+    else:
+        assert module_name not in sys.modules
+        assert not hasattr(parent, "vllm_backend")
 
 
 def _import_vllm_quant_backend(monkeypatch):
@@ -1631,12 +1664,13 @@ def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatc
         fake_base_load_weights,
     )
 
-    assert (
-        extension._load_weights(
-            [("child.self_attn.k_bmm_quantizer._amax", torch.tensor([4.0]))]
+    with extension._patch_named_parameters_to_include_buffers(model):
+        assert (
+            extension._load_weights(
+                [("child.self_attn.k_bmm_quantizer._amax", torch.tensor([4.0]))]
+            )
+            == "loaded"
         )
-        == "loaded"
-    )
 
     assert "weight" in seen_names
     assert "input_quantizer._amax" in seen_names
@@ -1651,7 +1685,7 @@ def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatc
     )
 
 
-def test_fake_quant_eager_input_amax_loader_supports_direct_vllm_load(monkeypatch):
+def test_fake_quant_eager_amax_loader_supports_direct_vllm_load(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     model = torch.nn.Module()
@@ -1661,10 +1695,10 @@ def test_fake_quant_eager_input_amax_loader_supports_direct_vllm_load(monkeypatc
     model.k_bmm_quantizer.register_buffer("_amax", torch.tensor([2.0]))
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
 
-    with extension._attach_input_quantizer_amax_loaders(model):
+    with extension._patch_named_parameters_to_include_buffers(model):
         input_amax = model.input_quantizer._amax
         assert hasattr(input_amax, "weight_loader")
-        assert not hasattr(model.k_bmm_quantizer._amax, "weight_loader")
+        assert hasattr(model.k_bmm_quantizer._amax, "weight_loader")
 
         input_amax.weight_loader(input_amax, torch.tensor([3.0]))
         input_amax.weight_loader(input_amax, torch.tensor([2.0]))
@@ -2843,7 +2877,7 @@ def _amax_loader_context(monkeypatch, model):
     # The amax helpers only touch the model, so an uninitialized instance is
     # enough and avoids standing up a vLLM worker.
     worker = object.__new__(extension)
-    return worker._attach_input_quantizer_amax_loaders(model)
+    return worker._patch_named_parameters_to_include_buffers(model)
 
 
 def test_moe_amax_alias_writes_through_and_keeps_the_cross_expert_max(monkeypatch):
@@ -2869,3 +2903,251 @@ def test_moe_amax_alias_is_removed_when_loading_raises(monkeypatch):
 
     assert not hasattr(model.experts, "w13_input_quantizer._amax")
     assert not hasattr(model.experts.w13_input_quantizer._amax, "weight_loader")
+
+
+def test_fake_quant_amax_context_preserves_discovery_and_restores_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _FakeQuantModel()
+    experts = model.experts
+    amax = experts.w13_input_quantizer._amax
+    original_loader = object()
+    amax.weight_loader = original_loader
+    setattr(experts, "w13_input_quantizer._amax", amax)
+    model.in_proj.shared_input_quantizer = model.in_proj.input_quantizer
+    original_method = model.in_proj.named_parameters
+    model.in_proj.named_parameters = original_method
+    state_keys = set(model.state_dict())
+    original_parameters = dict(model.named_parameters())
+
+    for high, low in ((7.0, 3.0), (4.0, 2.0)):
+        with _amax_loader_context(monkeypatch, model):
+            assert set(model.state_dict()) == state_keys
+            assert getattr(experts, "w13_weight_input_quantizer._amax") is amax
+            assert model.get_submodule("experts.w13_input_quantizer")._amax is amax
+            for name, param in original_parameters.items():
+                assert dict(model.named_parameters())[name] is param
+            params = dict(experts.named_parameters(prefix="experts"))
+            assert params["experts.w13_input_quantizer._amax"] is amax
+            assert "experts.w13_weight_input_quantizer._amax" not in params
+            assert list(experts.named_parameters(recurse=False)) == [
+                ("w13_weight", experts.w13_weight),
+                ("w2_weight", experts.w2_weight),
+            ]
+            assert len(list(model.in_proj.named_parameters())) == 2
+            assert (
+                len(list(model.in_proj.named_parameters(remove_duplicate=False))) == 3
+            )
+            for incoming in (low, high):
+                assert amax.weight_loader(
+                    amax, torch.tensor([[[incoming]]]), return_success=True
+                )
+            assert amax.item() == high
+            assert experts.w2_input_quantizer._amax.item() == -1.0
+        assert amax.weight_loader is original_loader
+        assert getattr(experts, "w13_input_quantizer._amax") is amax
+        assert not hasattr(experts, "w13_weight_input_quantizer._amax")
+        assert "named_parameters" not in vars(model)
+        assert "named_parameters" not in vars(experts)
+        assert model.in_proj.named_parameters is original_method
+
+
+def test_fake_quant_amax_context_cleans_up_partial_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _FakeQuantModel()
+    conflicting = torch.tensor(99.0)
+    setattr(model.in_proj, "weight_input_quantizer._amax", conflicting)
+    with pytest.raises(ValueError, match="Conflicting quantizer buffer alias"):
+        with _amax_loader_context(monkeypatch, model):
+            pytest.fail("setup should reject conflicting aliases")
+    assert not hasattr(model.experts, "w13_input_quantizer._amax")
+    assert not hasattr(model.experts.w13_input_quantizer._amax, "weight_loader")
+    assert not hasattr(model.in_proj.input_quantizer._amax, "weight_loader")
+    assert getattr(model.in_proj, "weight_input_quantizer._amax") is conflicting
+
+
+@pytest.mark.parametrize("fail_finalize", [False, True])
+def test_fake_quant_amax_context_spans_packets_and_finalization(
+    monkeypatch: pytest.MonkeyPatch, fail_finalize: bool
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    model = _FakeQuantModel()
+    worker = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    worker.model_runner = types.SimpleNamespace(model=model)
+    amax = model.in_proj.input_quantizer._amax
+    events = []
+
+    @contextmanager
+    def base_lifecycle(self, transport):
+        assert transport == "ipc"
+
+        def finalize():
+            assert hasattr(amax, "weight_loader")
+            events.append("finalize")
+            if fail_finalize:
+                raise RuntimeError("finalize failed")
+
+        try:
+            yield finalize
+        finally:
+            assert hasattr(amax, "weight_loader")
+            events.append("base exit")
+
+    def base_load_weights(self, weights):
+        for _, incoming in weights:
+            assert incoming.ndim == 0
+            amax.weight_loader(amax, incoming)
+
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension, "_weight_update_lifecycle", base_lifecycle
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension, "_load_weights", base_load_weights
+    )
+    expected_error = (
+        pytest.raises(RuntimeError, match="finalize failed")
+        if fail_finalize
+        else nullcontext()
+    )
+    with expected_error:
+        with worker._weight_update_lifecycle("ipc") as finalize:
+            for incoming in (3.0, 7.0):
+                worker._load_weights(
+                    [("in_proj.input_quantizer._amax", torch.tensor([[[incoming]]]))]
+                )
+            assert amax.item() == 7.0
+            finalize()
+    assert events == ["finalize", "base exit"]
+    assert not hasattr(amax, "weight_loader")
+    assert not hasattr(model.in_proj, "input_quantizer._amax")
+
+
+def test_fake_quant_refit_rejects_nonscalar_amax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _import_vllm_quant_backend(monkeypatch)
+    worker = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    with pytest.raises(ValueError, match="scalar activation amax"):
+        worker._load_weights([("input_quantizer._amax", torch.ones(2))])
+    model = _FakeQuantModel()
+    model.in_proj.input_quantizer._amax = torch.ones(2)
+    with pytest.raises(ValueError, match="scalar activation amax"):
+        with worker._patch_named_parameters_to_include_buffers(model):
+            pytest.fail("setup should reject nonscalar amax")
+    assert not hasattr(model.experts.w13_input_quantizer._amax, "weight_loader")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_fake_quant_amax_fan_in_orders_collective_load_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _FakeQuantModel().cuda()
+    amax = model.experts.w13_input_quantizer._amax
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for values in ((3.0, 7.0), (2.0, 4.0)):
+        incoming = [torch.tensor(value, device="cuda") for value in values]
+        torch.cuda.synchronize()
+        with _amax_loader_context(monkeypatch, model):
+            for index, (stream, value) in enumerate(zip(streams, incoming)):
+                with torch.cuda.stream(stream):
+                    if index == 0:
+                        torch.cuda._sleep(10_000_000)
+                    amax.weight_loader(amax, value)
+            for stream in streams:
+                stream.synchronize()
+        assert amax.item() == max(values)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("packed", [False, True])
+def test_fake_quant_amax_context_satisfies_native_expert_loader(
+    monkeypatch: pytest.MonkeyPatch, packed: bool
+) -> None:
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    class LoaderFixture(_FakeRoutedExperts):
+        load_weights = RoutedExperts.load_weights
+        get_expert_mapping = RoutedExperts.get_expert_mapping
+        _orient_fused_weight = staticmethod(RoutedExperts._orient_fused_weight)
+        build_expert_params_mapping = staticmethod(
+            RoutedExperts.build_expert_params_mapping
+        )
+
+        def __init__(self):
+            super().__init__()
+            self.layer_name = "model.layers.1.mixer.experts"
+            self.moe_config = types.SimpleNamespace(
+                num_experts=2, num_logical_experts=2
+            )
+            self.expert_map_manager = types.SimpleNamespace(num_fused_shared_experts=0)
+            self.ckpt_gate_proj_name = "gate_proj"
+            self.ckpt_down_proj_name = "down_proj"
+            self.ckpt_up_proj_name = "up_proj"
+            self.lora_base_layer_prefix = ""
+            self.is_fused_checkpoint_transposed = False
+
+    model = _FakeQuantModel()
+    model.experts = LoaderFixture()
+    backend = _import_vllm_quant_backend(monkeypatch)
+    worker = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    worker.model_runner = types.SimpleNamespace(model=model)
+
+    @torch.no_grad()
+    def weight_loader(param, loaded_weight, *, expert_id, **kwargs):
+        param[expert_id].copy_(loaded_weight)
+        return True
+
+    model.experts.w2_weight.weight_loader = weight_loader
+    ordinary_weight = torch.arange(8.0).reshape(1, 2, 4)
+
+    def base_load_weights(self, weights):
+        return list(model.experts.load_weights(weights))
+
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension, "_load_weights", base_load_weights
+    )
+    for high, low in ((7.0, 3.0), (4.0, 2.0)):
+        if packed:
+            weights = [
+                ("down_proj", ordinary_weight),
+                ("gate_up_proj_input_quantizer._amax", torch.tensor([[[high]]])),
+                ("down_proj_input_quantizer._amax", torch.tensor([[[low]]])),
+            ]
+        else:
+            weights = [
+                ("0.down_proj.weight", ordinary_weight[0]),
+                ("0.gate_proj.input_quantizer._amax", torch.tensor(high)),
+                ("1.up_proj.input_quantizer._amax", torch.tensor(low)),
+                ("0.down_proj.input_quantizer._amax", torch.tensor(low)),
+            ]
+        with worker._patch_named_parameters_to_include_buffers(model):
+            for weight in weights:
+                assert worker._load_weights([weight])
+            assert model.experts.w2_weight.weight_loader is weight_loader
+        torch.testing.assert_close(model.experts.w2_weight, ordinary_weight)
+        assert model.experts.w13_input_quantizer._amax.item() == high
+        assert model.experts.w2_input_quantizer._amax.item() == low
+
+
+@pytest.mark.vllm
+def test_fake_quant_amax_context_satisfies_native_linear_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    model = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
+    torch.nn.Module.__init__(model)
+    model.prefix = "model.layers.0.mlp.gate_up_proj"
+    model.output_sizes = [2, 2]
+    model.input_quantizer = _FakeQuantizer(99.0)
+    amax = model.input_quantizer._amax
+    with _amax_loader_context(monkeypatch, model):
+        for shard_id, value in enumerate((3.0, 7.0)):
+            incoming = torch.tensor(value)
+            incoming.shard_id = shard_id
+            assert list(model.load_weights([("input_quantizer._amax", incoming)])) == [
+                "input_quantizer._amax"
+            ]
+    assert amax.item() == 7.0
+    assert not hasattr(amax, "weight_loader")
