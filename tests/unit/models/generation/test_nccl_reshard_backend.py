@@ -2094,12 +2094,12 @@ def test_native_mxfp8_refit_captures_bf16_destination_before_meta_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
-    native_param = torch.empty((32, 32), dtype=torch.float8_e4m3fn)
     bf16_param = torch.zeros((32, 32), dtype=torch.bfloat16)
     bf16_runtime_storage = bf16_param.data
     extension = _make_ext(
         {
-            "model.layers.0.mlp.down_proj.weight": native_param,
+            # Native checkpoint destinations are owned by the adapter and
+            # need not be registered runtime parameters before begin_update.
             "model.layers.1.mlp.down_proj.weight": bf16_param,
         }
     )

@@ -2194,8 +2194,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         - TRTLLM grouped experts: ``pre`` allocates canonical EP-local wire storage,
           and ``post`` sends each expert through vLLM's native weight loader.
         """
-        # Get dict of vllm_param and merged_slice for each hf_name
-        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
         param_info_by_name = {
             param_info["name"]: param_info
             for layer_name in refit_info["layer_names"]
@@ -2211,7 +2209,23 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         # Legacy parameters retain the existing direct/merged/receiver-quantized
         # mapping even when they share a refit plan with native components.
-        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
+        # Native destinations belong to the adapter and may only exist inside
+        # its checkpoint-storage window. Never resolve them through runtime
+        # model parameters before begin_update().
+        legacy_refit_info = {
+            **refit_info,
+            "per_layer_params": {
+                layer_name: [
+                    param_info
+                    for param_info in params
+                    if param_info["name"] not in native_names
+                ]
+                for layer_name, params in refit_info["per_layer_params"].items()
+            },
+        }
+        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(
+            legacy_refit_info
+        )
         vllm_params = dict(self.model_runner.model.named_parameters())
         vllm_names_by_id = {id(param): name for name, param in vllm_params.items()}
         vllm_modules = dict(self.model_runner.model.named_modules())
