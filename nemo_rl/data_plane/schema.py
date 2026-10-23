@@ -35,6 +35,10 @@ ROLLOUT_METRICS = "rollout_metrics"
 # prompt tokens, which two distinct groups can share.
 GROUP_ID_TAG = "group_id"
 
+# Each row's whole NeMo-Gym result as a JSON string, for the training-data
+# dump. A column, not a tag: tags ride every metadata RPC.
+GYM_FULL_RESULT_FIELD = "gym_full_result"
+
 # The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
 # `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
 # here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
