@@ -27,6 +27,8 @@ SELECTED_BACKUP=$TEST_DIR/selected-snapshot
 TEST_DATA=$TEST_DIR/test_data.jsonl
 GYM_ROOT=$PROJECT_ROOT/3rdparty/Gym-workspace/Gym
 SENTINEL_EVENT="NeMo RL checkpoint recovery sentinel"
+SENTINEL_PARTICIPANT="checkpoint-recovery@example.com"
+FOLLOW_UP_TOOL=calendar_search_events
 PHASE1_PID=""
 
 EXPECTED_GYM_INSTANCES=${SC_TURN_RECOVERY_EXPECTED_GYM_INSTANCES:-1}
@@ -41,21 +43,28 @@ TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 rm -rf "$TEST_DIR"
 mkdir -p "$TEST_DIR"
 
-# Force one real Workplace mutation per rollout. The checkpoint test agent holds
-# the first boundary after it in phase one, so a published checkpoint always
-# holds a turn whose calendar write has already been applied.
-jq -c -s --argjson count "$NUM_PROMPTS" --arg event "$SENTINEL_EVENT" '
+# Force one real Workplace mutation per rollout. In phase one the test hook's
+# policy proxy holds the first model call that carries a tool result, so Gym
+# stays at the post-tool boundary and a published checkpoint always holds a turn
+# whose calendar write has already been applied. After the write, the proxy
+# forces one calendar_search_events call, which reads the calendar the episode
+# continued from, and then sends tool_choice none, so no turn writes a second
+# event. The search names the participant only this test's events use.
+jq -c -s --argjson count "$NUM_PROMPTS" --arg event "$SENTINEL_EVENT" \
+    --arg participant "$SENTINEL_PARTICIPANT" '
     limit($count; .[])
     | del(.agent_ref)
-    | .task_source = "workplace_assistant_checkpoint_test_agent"
+    | .task_source = "workplace_assistant_simple_agent"
     | .responses_create_params.input = [{
         "role": "user",
         "content": ("Call calendar_create_event exactly once with event_name " + $event
-            + ", participant_email checkpoint-recovery@example.com, event_start "
-            + "2025-01-15 10:00:00, and duration 30.")
+            + ", participant_email " + $participant + ", event_start "
+            + "2025-01-15 10:00:00, and duration 30. Then call calendar_search_events "
+            + "exactly once with query " + $participant + ".")
       }]
     | .responses_create_params.tools = [
-        .responses_create_params.tools[] | select(.name == "calendar_create_event")
+        .responses_create_params.tools[]
+        | select(.name == "calendar_create_event" or .name == "calendar_search_events")
       ]
     | .responses_create_params.tool_choice = {"type": "function", "name": "calendar_create_event"}
     | .responses_create_params.parallel_tool_calls = false
@@ -63,7 +72,7 @@ jq -c -s --argjson count "$NUM_PROMPTS" --arg event "$SENTINEL_EVENT" '
         "name": "calendar_create_event",
         "arguments": ({
           "event_name": $event,
-          "participant_email": "checkpoint-recovery@example.com",
+          "participant_email": $participant,
           "event_start": "2025-01-15 10:00:00",
           "duration": "30"
         } | tojson)
@@ -110,7 +119,6 @@ if [[ "$EXPECTED_GYM_INSTANCES" -eq 1 ]]; then
         # The base config overrides a code_gen server it never launches; Gym
         # checkpoint discovery would probe it as a participant.
         '~env.nemo_gym.code_gen'
-        "env.nemo_gym.config_paths=[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml]"
     )
 else
     GYM_CONFIG_OVERRIDES=()
@@ -146,6 +154,8 @@ COMMON_OVERRIDES=(
     data.train.data_path="$TEST_DATA"
     data.validation.data_path="$TEST_DATA"
     policy.generation.temperature=0.1
+    # The prompt names two tools, and an episode makes three calls.
+    policy.max_total_sequence_length=1024
     "${GYM_CONFIG_OVERRIDES[@]}"
 )
 
@@ -155,14 +165,17 @@ setsid env \
     SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
     SC_TEST_CONFIG="$TEST_CONFIG" \
     SC_TURN_RECOVERY_TEST_EVENTS="$PHASE1_EVENTS" \
-    NEMO_GYM_TEST_HOLD_FIRST_MUTATED_BOUNDARY=1 \
+    SC_TURN_RECOVERY_FOLLOW_UP_TOOL="$FOLLOW_UP_TOOL" \
+    SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT=1 \
     RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}" "$@" &
 PHASE1_PID=$!
 
 # Select only a fully published bootstrap (pre-step-1) snapshot whose Gym
 # manifest, RL ledger, Workplace resource export and TQ references all describe
-# the same episode.
+# the episode the proxy held. Another episode also counts as at its boundary
+# while its own post-tool call is briefly in flight, so the hold, not the
+# snapshot contents, names the episode.
 uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$CHECKPOINT_DIR/bootstrap/rollout_snapshots" \
     "$SELECTION_FILE" \
@@ -171,7 +184,8 @@ uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$SNAPSHOT_TIMEOUT_S" \
     "$EXPECTED_GYM_INSTANCES" \
     "$SELECTED_BACKUP" \
-    "$SENTINEL_EVENT" <<'PY'
+    "$SENTINEL_EVENT" \
+    "$PHASE1_EVENTS" <<'PY'
 import json
 import os
 import shutil
@@ -188,6 +202,7 @@ deadline = time.monotonic() + float(sys.argv[5])
 expected_gym_instances = int(sys.argv[6])
 backup_path = Path(sys.argv[7])
 sentinel_event = sys.argv[8]
+events_path = Path(sys.argv[9])
 if expected_gym_instances < 1:
     raise ValueError("expected Gym instance count must be positive")
 
@@ -225,6 +240,20 @@ def sentinel_count(state: dict) -> int:
     return sum(str(name).lower() == sentinel_event.lower() for name in names)
 
 
+def held_rollout_id() -> str | None:
+    """The Gym rollout ID of the policy call the proxy holds, once it holds one."""
+    if not events_path.is_file():
+        return None
+    held = [
+        event["rollout_id"]
+        for event in map(json.loads, events_path.read_text().splitlines())
+        if event["event"] == "policy_call_held"
+    ]
+    if len(held) > 1:
+        raise RuntimeError(f"the policy proxy held more than one call: {held}")
+    return held[0] if held else None
+
+
 def participant_records(snapshot: Path, kind: str) -> list[tuple[Path, dict]]:
     records = []
     pattern = f"gym-instances/*/replica-*/gym/{kind}/*/manifest.json"
@@ -240,7 +269,8 @@ def participant_records(snapshot: Path, kind: str) -> list[tuple[Path, dict]]:
 
 
 while time.monotonic() < deadline:
-    for snapshot in sorted(root.glob("snapshot_*"), reverse=True):
+    held = held_rollout_id()
+    for snapshot in sorted(root.glob("snapshot_*"), reverse=True) if held else []:
         required = [
             snapshot / "manifest.json",
             snapshot / "gym_checkpoint.json",
@@ -282,6 +312,11 @@ while time.monotonic() < deadline:
             if not gym["staging_keys"].get(instance_id):
                 continue
             for episode in episodes:
+                # The capture key of a later attempt carries an -a<N> suffix.
+                if held != episode["rollout_id"] and not held.startswith(
+                    episode["rollout_id"] + "-a"
+                ):
+                    continue
                 key = (episode["rollout_id"], episode["attempt"])
                 recovery = ledger.get(key)
                 resources_entry = resource_index.get(key)
@@ -368,6 +403,7 @@ timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_TURN_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
+        SC_TURN_RECOVERY_FOLLOW_UP_TOOL="$FOLLOW_UP_TOOL" \
         RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" "${COMMON_OVERRIDES[@]}" "$@"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
@@ -387,7 +423,8 @@ uv run --directory "$PROJECT_ROOT" --no-sync tests/check_metrics.py "$PHASE2_MET
 
 uv run --directory "$PROJECT_ROOT" --no-sync python - \
     "$SELECTION_FILE" "$PHASE1_EVENTS" "$PHASE2_EVENTS" "$PHASE2_LOG" \
-    "$CHECKPOINT_DIR/step_$MAX_STEPS/training_info.json" "$MAX_STEPS" <<'PY'
+    "$CHECKPOINT_DIR/step_$MAX_STEPS/training_info.json" "$MAX_STEPS" \
+    "$SENTINEL_EVENT" "$SENTINEL_PARTICIPANT" "$FOLLOW_UP_TOOL" <<'PY'
 import json
 import re
 import sys
@@ -399,6 +436,7 @@ phase2 = [json.loads(line) for line in Path(sys.argv[3]).read_text().splitlines(
 log = Path(sys.argv[4]).read_text()
 training_info = json.loads(Path(sys.argv[5]).read_text())
 max_steps = int(sys.argv[6])
+sentinel_event, sentinel_participant, follow_up_tool = sys.argv[7:10]
 
 
 def matching_siblings(events: list[dict], event_name: str) -> list[dict]:
@@ -415,6 +453,15 @@ def matching_siblings(events: list[dict], event_name: str) -> list[dict]:
         )
     return found
 
+
+# The proxy held exactly one post-tool policy call in phase one, and it is the
+# selected episode's: that hold is what kept Gym at the post-tool boundary.
+held = [event for event in phase1 if event["event"] == "policy_call_held"]
+assert len(held) == 1, held
+assert (held[0]["rollout_id"] or "").startswith(selection["gym_rollout_id"]), (
+    held,
+    selection,
+)
 
 phase1_dispatch = matching_siblings(phase1, "dispatch")
 assert phase1_dispatch, "selected Gym episode was not observed in phase-one dispatches"
@@ -454,6 +501,8 @@ assert any(
 
 # Continued, not restarted: the sealed receipt keeps every model call the
 # episode made before the cut. A restart from the prompt makes only new calls.
+# The calendar search below cannot tell the two apart, since a restart writes
+# the event again into a fresh calendar; this check does.
 restored_completions = [
     event
     for event in phase2
@@ -463,6 +512,46 @@ restored_completions = [
     and event["sibling"]["status"] == "sealed"
 ]
 assert len(restored_completions) == 1, restored_completions
+
+# Phase two ran behind the proxy without a hold: the restored episode was free to
+# finish, and every post-tool call it made went through the tool_choice rules.
+proxies = {
+    phase: [event for event in events if event["event"] == "policy_proxy_started"]
+    for phase, events in (("phase1", phase1), ("phase2", phase2))
+}
+assert [event["hold_first_tool_result"] for event in proxies["phase1"]] == [True], proxies
+assert [event["hold_first_tool_result"] for event in proxies["phase2"]] == [False], proxies
+
+
+def of_selected(event_name: str) -> list[dict]:
+    return [
+        event
+        for event in phase2
+        if event["event"] == event_name
+        and (event["rollout_id"] or "").startswith(selection["gym_rollout_id"])
+    ]
+
+
+# The restored episode re-issued the held call, and the proxy forced the
+# read-only search with it, so it could not write a second event.
+reissued = of_selected("policy_call_tool_choice")
+assert reissued, "the restored episode never re-issued its post-tool policy call"
+assert reissued[0]["tool_choice"] == {
+    "type": "function",
+    "function": {"name": follow_up_tool},
+}, reissued
+# That search read the calendar the restored episode continued from: the event
+# the held turn wrote before the crash, exactly once. A restore that lost the
+# Workplace state would find none; a second write would find two.
+searches = of_selected("follow_up_tool_result")
+assert searches, "the restored episode never answered its calendar search"
+search_arguments = json.loads(searches[-1]["arguments"] or "{}")
+assert search_arguments.get("query") == sentinel_participant, searches[-1]
+found = str(searches[-1]["result"]).lower().count(sentinel_event.lower())
+assert found == 1, (found, searches[-1])
+# Workplace replays the episode's calls on a fresh calendar and compares it with
+# the ground truth's single event, so the episode made exactly one correct write.
+assert restored_completions[0]["reward"] == 1.0, restored_completions[0]
 pre_cut_calls = selection["pre_cut_model_call_ids"]
 assert pre_cut_calls, selection
 missing_calls = set(pre_cut_calls) - set(restored_completions[0]["receipt_model_call_ids"])

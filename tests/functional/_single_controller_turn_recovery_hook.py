@@ -14,7 +14,11 @@
 
 """Test-only SC entrypoint that records turn-recovery ownership.
 
-The wrapper does not alter scheduling or checkpoint timing. It records the
+Gym's policy calls go through ``_gym_policy_proxy``, which holds the first one
+carrying a tool result when ``SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT=1``, so
+phase one always publishes a checkpoint at a post-tool Workplace boundary, and
+forces ``SC_TURN_RECOVERY_FOLLOW_UP_TOOL`` as each episode's next call.
+Otherwise the wrapper does not alter scheduling or checkpoint timing. It records the
 structured recovery identity once each Gym submission is marked dispatched,
 when Gym refuses one at checkpoint admission, after each completion has been
 sealed in the RL ledger (with the model calls its receipt names), and which
@@ -33,8 +37,10 @@ from pathlib import Path
 from typing import Any
 
 from examples import run_grpo_single_controller
+from nemo_rl.algorithms.single_controller_utils import setup as sc_setup
 from nemo_rl.experience.rollout_manager import RolloutCompletionCallback
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from tests.functional._gym_policy_proxy import PolicyHoldProxy
 from tests.functional._single_controller_hook_utils import append_event, find_group
 
 
@@ -118,6 +124,7 @@ class _InstrumentedNemoGymRolloutImpl:
                 "completion",
                 **common,
                 sibling=self._sibling_fields(refreshed, generation_index),
+                reward=completion.reward,
                 # A continued episode keeps the calls it made before the cut.
                 receipt_model_call_ids=[
                     str(record["model_call_id"])
@@ -201,6 +208,27 @@ class _RecordingRestartLedger:
         )
         return self._prepare_for_restart(cut, **kwargs)
 
+
+_original_spinup_gym = sc_setup._spinup_gym
+# Kept alive for the life of the driver: Gym holds these URLs for the whole run.
+_policy_proxies: list[PolicyHoldProxy] = []
+
+
+def _spinup_gym_behind_policy_proxy(
+    *args: Any, base_urls: list[str], **kwargs: Any
+) -> Any:
+    proxy = PolicyHoldProxy(
+        base_urls,
+        hold_first_tool_result=os.environ.get("SC_TURN_RECOVERY_HOLD_FIRST_TOOL_RESULT")
+        == "1",
+        follow_up_tool=os.environ.get("SC_TURN_RECOVERY_FOLLOW_UP_TOOL") or None,
+        events_path=Path(os.environ["SC_TURN_RECOVERY_TEST_EVENTS"]),
+    ).start()
+    _policy_proxies.append(proxy)
+    return _original_spinup_gym(*args, base_urls=proxy.base_urls, **kwargs)
+
+
+sc_setup._spinup_gym = _spinup_gym_behind_policy_proxy
 
 _original_setup_single_controller = run_grpo_single_controller.setup_single_controller
 

@@ -18,7 +18,7 @@ env:
         port_range_high: 5999
         config_paths:
           - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-          - responses_api_agents/checkpoint_test_agent/configs/workplace_assistant.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
     common_inherited_overlays:
       - policy_model
     allowed_duplicate_entries:
