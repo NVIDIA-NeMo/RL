@@ -173,10 +173,29 @@ def test_checkpoint_instance_rejects_unsafe_identity(
 _CONTROL_TOKEN = "control-token"
 
 
-def _in_process_gym(ledger_dir: Path, *, restart_only_agent: Any = None):
+class _NoResourceSessions:
+    """Resources server hooks with no per-session state to save."""
+
+    async def export_session_states(self, session_ids):
+        return {}
+
+    async def restore_session_states(self, states):
+        return None
+
+    async def retire_session_state(self, session_id):
+        return None
+
+
+def _in_process_gym(
+    ledger_dir: Path,
+    *,
+    restart_only_agent: Any = None,
+    resources: dict[str, Any] | None = None,
+):
     """A policy model and an agent running Gym's real checkpoint participants.
 
-    ``restart_only_agent`` adds a second agent server with that participant.
+    ``restart_only_agent`` adds a second agent server with that participant, and
+    ``resources`` adds a resources server per entry.
 
     Control calls go to in-process ASGI apps through Gym's own control routes,
     so the adapter sees exactly the replies Gym's participants build. Server
@@ -244,6 +263,9 @@ def _in_process_gym(ledger_dir: Path, *, restart_only_agent: Any = None):
     if restart_only_agent is not None:
         participants["restart_only"] = restart_only_agent
         servers["restart_only"] = {"responses_api_agents": {"restart_only": {}}}
+    for name, participant in (resources or {}).items():
+        participants[name] = participant
+        servers[name] = {"resources_servers": {name: {}}}
     apps = {}
     for name, participant in participants.items():
         apps[name] = FastAPI()
@@ -845,3 +867,48 @@ def test_a_failed_checkpoint_control_call_crosses_ray_typed(
     restored = pickle.loads(pickle.dumps(raised.value))
     assert type(restored) is GymCheckpointUnavailable
     assert str(restored) == str(raised.value)
+
+
+def test_adapter_names_the_restart_only_servers_gym_reports(tmp_path: Path) -> None:
+    """Read the field each participant kind reports, through Gym's own status route."""
+    from nemo_gym._checkpoint.agent import RestartOnlyAgentParticipant
+    from nemo_gym._checkpoint.resources import ResourcesParticipant
+
+    restart_only_agent = RestartOnlyAgentParticipant()
+    if "restart_only" not in restart_only_agent.status_extra():
+        # Gyms before NVIDIA-NeMo/Gym#4957 do not report it; the adapter then
+        # cannot tell, which is checked below.
+        restart_only_agent.status_extra = lambda: {"restart_only": True}
+
+    async def exercise() -> tuple[list[str], list[str]]:
+        adapter, _, _ = _in_process_gym(
+            tmp_path / "ledger",
+            restart_only_agent=restart_only_agent,
+            resources={
+                "restarting_tools": ResourcesParticipant(
+                    _NoResourceSessions(), "restart_only"
+                ),
+                "exported_tools": ResourcesParticipant(
+                    _NoResourceSessions(), "exported"
+                ),
+                "stateless_tools": ResourcesParticipant(
+                    _NoResourceSessions(), "stateless"
+                ),
+            },
+        )
+        await adapter.discover()
+        named = await adapter.restart_only_servers()
+
+        older_agent = RestartOnlyAgentParticipant()
+        older_agent.status_extra = lambda: {}
+        older, _, _ = _in_process_gym(
+            tmp_path / "ledger-older", restart_only_agent=older_agent
+        )
+        await older.discover()
+        return named, await older.restart_only_servers()
+
+    named, older = asyncio.run(exercise())
+
+    # The session-capable agent and the policy model are not restart-only.
+    assert named == ["restart_only", "restarting_tools"]
+    assert older == []

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -196,6 +197,45 @@ class GymCheckpointAdapter:
                 self._participants = await discover(
                     self._client, auth_token=self._auth_token
                 )
+
+    async def restart_only_servers(self) -> list[str]:
+        """Return the participants whose rollouts start over after a crash.
+
+        Gym reports their in-flight rollouts as restarts at every checkpoint, so
+        turn-level recovery quietly becomes restart-from-task for them. A
+        resources server says so through its checkpoint ``mode``, and an agent
+        through ``restart_only``. An agent on a Gym that predates
+        ``restart_only`` is not listed; its restarts still show at each
+        checkpoint.
+        """
+        from nemo_gym._checkpoint.control import CHECKPOINT_ROUTE_PREFIX
+
+        participants = self._require_participants()
+
+        async def status(server_name: str) -> dict[str, Any]:
+            response = await self._client.request(
+                server_name=server_name,
+                url_path=f"{CHECKPOINT_ROUTE_PREFIX}/status",
+                method="GET",
+                headers={"Authorization": f"Bearer {self._auth_token}"},
+                _control=True,
+            )
+            content = await response.read()
+            if response.status != 200:
+                raise GymCheckpointUnavailable(
+                    f"Gym participant {server_name!r} status returned HTTP "
+                    f"{response.status}: {content[:200]!r}"
+                )
+            return json.loads(content)
+
+        restart_only = []
+        for member in participants.members:
+            reply = await status(member.server_name)
+            if (member.kind == "resources" and reply.get("mode") == "restart_only") or (
+                member.kind == "agent" and reply.get("restart_only") is True
+            ):
+                restart_only.append(member.server_name)
+        return sorted(restart_only)
 
     def _require_participants(self) -> Participants:
         if self._participants is None:

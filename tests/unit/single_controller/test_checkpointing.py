@@ -125,11 +125,11 @@ from nemo_rl.experience.route_plan import (
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
-from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
 from tests.unit.environments.gym_checkpoint_fakes import FakeGymActor, gym_coordinator
+from tests.unit.experience.test_rollout_recovery import _forest_sealed_ledger
 from tests.unit.single_controller.test_setup import (
     _native_tq_metadata,
     patched_factories,  # noqa: F401
@@ -2099,7 +2099,7 @@ class TestPeriodicRolloutCheckpoint:
         actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = (
             interval_s
         )
-        gym_commit = object()
+        gym_commit = SimpleNamespace(manifest=SimpleNamespace(restarts={}))
         validated_commits: list[object] = []
 
         @contextlib.asynccontextmanager
@@ -2155,7 +2155,7 @@ class TestPeriodicRolloutCheckpoint:
         @contextlib.asynccontextmanager
         async def prepared_gym_checkpoint(_path, *, checkpoint_id):
             async with coordinator.prepared(checkpoint_id):
-                yield object()
+                yield SimpleNamespace(manifest=SimpleNamespace(restarts={}))
 
         async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
             return None

@@ -64,6 +64,8 @@ class FakeGymActor:
         restarts: Episodes a prepare reports as restarts. A commit that names
             one is refused, as Gym does, and a commit never exports one.
         forget_errors: Raised by the first forget calls, one per call.
+        restart_only_servers: Participants whose status says their rollouts
+            start over after a crash.
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class FakeGymActor:
         while_prepared: Optional[Callable[[], Awaitable[Any]]] = None,
         restarts: tuple[GymCheckpointEpisode, ...] = (),
         forget_errors: tuple[BaseException, ...] = (),
+        restart_only_servers: tuple[str, ...] = (),
     ) -> None:
         self.prepared = prepared
         self.resume_errors = list(resume_errors)
@@ -96,6 +99,7 @@ class FakeGymActor:
         self.while_prepared = while_prepared
         self.restarts = restarts
         self.forget_errors = list(forget_errors)
+        self.restart_only_servers = list(restart_only_servers)
         # Between a prepare that parked Gym and the resume that reopens it.
         self.checkpoint_open = False
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
@@ -106,6 +110,7 @@ class FakeGymActor:
         self.checkpoint_restore = _RemoteMethod(self._restore)
         self.checkpoint_resume = _RemoteMethod(self._resume)
         self.checkpoint_forget = _RemoteMethod(self._forget)
+        self.checkpoint_restart_only_servers = _RemoteMethod(self._restart_only_servers)
 
     def operations(self) -> list[str]:
         """The control operations received, in order."""
@@ -134,6 +139,10 @@ class FakeGymActor:
 
     async def _renew(self, *args, **kwargs) -> None:
         await self._record("renew", args, kwargs)
+
+    async def _restart_only_servers(self) -> list[str]:
+        await self._record("status", (), {})
+        return self.restart_only_servers
 
     async def _commit(self, *args, **kwargs) -> GymCheckpointCommitSummary:
         await self._record("commit", args, kwargs)

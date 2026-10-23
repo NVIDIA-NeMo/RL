@@ -2695,3 +2695,56 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
                         )
 
         asyncio.run(exercise())
+
+
+def _restart_only_check(
+    restart_only_servers: tuple[str, ...], *, allowed: bool
+) -> tuple[Any, FakeGymActor]:
+    actor = FakeGymActor(restart_only_servers=restart_only_servers)
+    controller = _controller_for(gym_coordinator(actor))
+    controller._master_config = SimpleNamespace(
+        rollout_recovery=SimpleNamespace(allow_restart_only_gym_servers=allowed)
+    )
+    return controller, actor
+
+
+def test_turn_recovery_refuses_a_restart_only_gym_server_by_default() -> None:
+    """Its rollouts would start over after a crash without anyone being told."""
+    controller, actor = _restart_only_check(("tools_resources",), allowed=False)
+
+    with pytest.raises(ValueError, match="restart-only Gym servers") as raised:
+        asyncio.run(controller._check_restart_only_gym_servers())
+
+    assert "tools/replica-0" in str(raised.value)
+    assert "tools_resources" in str(raised.value)
+    assert "allow_restart_only_gym_servers=true" in str(raised.value)
+    assert actor.operations() == ["status"]
+
+
+def test_an_allowed_restart_only_gym_server_is_named_in_a_warning() -> None:
+    controller, _ = _restart_only_check(("tools_agent",), allowed=True)
+
+    with pytest.warns(UserWarning, match="start over after a crash.*tools_agent"):
+        asyncio.run(controller._check_restart_only_gym_servers())
+
+
+def test_allowing_restart_only_gym_servers_warns_when_there_are_none() -> None:
+    controller, _ = _restart_only_check((), allowed=True)
+
+    with pytest.warns(UserWarning, match="no Gym server is restart-only"):
+        asyncio.run(controller._check_restart_only_gym_servers())
+
+
+def test_no_restart_only_gym_server_and_no_opt_in_passes_silently() -> None:
+    controller, _ = _restart_only_check((), allowed=False)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        asyncio.run(controller._check_restart_only_gym_servers())
+
+
+def test_without_turn_recovery_there_are_no_gym_servers_to_check() -> None:
+    controller = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    controller._gym_checkpoint_coordinator = None
+
+    asyncio.run(controller._check_restart_only_gym_servers())
