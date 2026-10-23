@@ -61,7 +61,10 @@ from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
 )
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollout_recovery import (
+    RecoveryGranularity,
+    RecoveryTargetLevel,
+)
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -674,56 +677,98 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 
 @dataclass(frozen=True)
 class TaskSourceRecoveryGranularity:
-    """Recovery granularity selected for a prompt-group reservation.
+    """Resolved retry and restore policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``granularity``
-    is selected from an explicit agent override, a task-source override, or the
-    global default.
+    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
+    is the configured restart target. Until Gym advertises group-scoring
+    capabilities, ``granularity`` is derived from that target and explicit
+    task-source or agent overrides.
     """
 
     task_source: Optional[str]
-    granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
+
+    @property
+    def granularity(self) -> RecoveryGranularity:
+        return self.restore_level.granularity
 
 
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``sibling`` (the default) preserves completed generations and retries only
-    the missing ones. Prefer it when reusing work and avoiding repeated long-tail
-    generations matters more than keeping a group on one policy version.
-
-    ``prompt_group`` discards and regenerates every sibling when any generation
-    is unfinished. It costs a full group per recovery, but keeps the regenerated
-    group on the policy weights live at redispatch instead of mixing those results
-    with older sealed siblings.
-
-    The resolved value is persisted on each ledger group, so restoring a saved
-    group does not reinterpret it using a newer configuration. The same
-    granularity governs failures handled in-process and after a process restart.
+    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
+    generations and restarts unfinished siblings, and ``prompt_group`` restarts
+    every sibling in an unfinished group. Overrides may only make a particular
+    task source or agent coarser than the global target.
     """
 
-    default_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING
+    target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
     # Keyed by ``extra_env_info.task_source``, which is available before Gym
     # resolves the concrete agent used to execute the row.
-    task_source_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
     # a concrete Gym route. A matching agent override wins over task_source.
-    agent_granularity_overrides: dict[str, RecoveryGranularity] = Field(
+    agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
+    # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
+    gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
+    # With target_level='turn', a restart-only Gym server (an agent without
+    # checkpoint session support, or a resources server whose checkpoint mode
+    # is restart_only) starts every in-flight rollout over after a crash. False
+    # fails setup and names such servers; true accepts them with a warning.
+    allow_restart_only_gym_servers: bool = False
 
     @model_validator(mode="after")
-    def _reject_removed_override_keys(self) -> "RolloutRecoveryConfig":
-        """Reject the removed task-name map instead of silently ignoring it."""
-        removed = {"task_granularity_overrides"}.intersection(self.model_extra or {})
-        if removed:
+    def _validate_restart_only_opt_in(self) -> "RolloutRecoveryConfig":
+        """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
+        if (
+            self.allow_restart_only_gym_servers
+            and self.target_level is not RecoveryTargetLevel.TURN
+        ):
             raise ValueError(
-                f"rollout_recovery fields {sorted(removed)!r} were replaced by "
-                "task_source_granularity_overrides"
+                "rollout_recovery.allow_restart_only_gym_servers applies only to "
+                "target_level='turn'; with "
+                f"target_level={self.target_level.value!r} every unfinished "
+                "rollout already starts over"
             )
         return self
+
+    @model_validator(mode="after")
+    def _validate_target_overrides(self) -> "RolloutRecoveryConfig":
+        """Reject overrides finer than the global target."""
+        for mapping_name, overrides in (
+            (
+                "task_source_target_level_overrides",
+                self.task_source_target_level_overrides,
+            ),
+            ("agent_target_level_overrides", self.agent_target_level_overrides),
+        ):
+            finer = sorted(
+                name
+                for name, level in overrides.items()
+                if level.rank < self.target_level.rank
+            )
+            if finer:
+                raise ValueError(
+                    f"{mapping_name} may only force a coarser recovery level than "
+                    f"target_level={self.target_level.value!r}; invalid={finer!r}"
+                )
+            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+                # A checkpointing Gym deployment exports every live episode, so
+                # a coarser route on it would fall outside the commit scope.
+                raise ValueError(
+                    f"{mapping_name} is not supported with target_level='turn' "
+                    f"yet; got {sorted(overrides)!r}"
+                )
+        return self
+
+    @property
+    def turn_checkpointing_enabled(self) -> bool:
+        """Whether Gym participant state is required for the requested target."""
+        return self.target_level is RecoveryTargetLevel.TURN
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
@@ -745,6 +790,7 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                 if raw_agent_name is not None and not isinstance(raw_agent_name, str):
                     raise TypeError("prompt agent_ref.name must be a string or None")
                 agent_name = raw_agent_name
+        target_level = self.target_level
         if agent_name is not None:
             if task_source is None:
                 warnings.warn(
@@ -754,14 +800,21 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     FutureWarning,
                     stacklevel=2,
                 )
-            override = self.agent_granularity_overrides.get(agent_name)
+            override = self.agent_target_level_overrides.get(agent_name)
             if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        if task_source is not None:
-            override = self.task_source_granularity_overrides.get(task_source)
-            if override is not None:
-                return TaskSourceRecoveryGranularity(task_source, override)
-        return TaskSourceRecoveryGranularity(task_source, self.default_granularity)
+                target_level = override
+            elif task_source is not None:
+                target_level = self.task_source_target_level_overrides.get(
+                    task_source, target_level
+                )
+        elif task_source is not None:
+            target_level = self.task_source_target_level_overrides.get(
+                task_source, target_level
+            )
+        return TaskSourceRecoveryGranularity(
+            task_source=task_source,
+            restore_level=target_level,
+        )
 
 
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
@@ -1433,16 +1486,35 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     token_capture_config = master_config.token_capture
     recovery_config = master_config.rollout_recovery
-    if not token_capture_config.enabled and (
-        recovery_config.default_granularity is not RecoveryGranularity.SIBLING
-        or recovery_config.task_source_granularity_overrides
-        or recovery_config.agent_granularity_overrides
+    if (
+        not token_capture_config.enabled
+        and not recovery_config.turn_checkpointing_enabled
+        and (
+            recovery_config.target_level is not RecoveryTargetLevel.SIBLING
+            or recovery_config.task_source_target_level_overrides
+            or recovery_config.agent_target_level_overrides
+        )
     ):
         raise ValueError(
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if recovery_config.turn_checkpointing_enabled:
+        # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
+        # drain, and the stall watchdog keeps counting meanwhile.
+        gym_park_s = (
+            recovery_config.gym_prepare_timeout_s
+            + 2 * token_capture_config.control_timeout_s
+        )
+        stall_s = async_config.stall_watchdog.stall_timeout_s
+        if stall_s <= gym_park_s:
+            raise ValueError(
+                f"async_rl.stall_watchdog.stall_timeout_s ({stall_s}) must be > "
+                "rollout_recovery.gym_prepare_timeout_s + 2 * "
+                f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
+                "can hold rollout dispatch that long."
+            )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

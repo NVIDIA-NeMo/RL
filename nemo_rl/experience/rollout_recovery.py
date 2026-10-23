@@ -25,11 +25,12 @@ from __future__ import annotations
 import copy
 import dataclasses
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
 
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointEpisode
 from nemo_rl.experience.reward_penalties import (
     CaptureRewardSettings,
     FinalizedReward,
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 3
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
@@ -65,7 +66,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "prompt_id",
         "prompt_ref",
         "task_source",
-        "recovery_granularity",
+        "restore_level",
         "expected_generations",
         "target_step",
         "start_weight_version",
@@ -86,6 +87,8 @@ _ATTEMPT_STATE_FIELDS = frozenset(
         "reward_checks",
         "reward_log_context",
         "staging_keys",
+        "gym_instance_id",
+        "gym_attempt",
     }
 )
 
@@ -112,10 +115,32 @@ class PromptGroupPhase(StrEnum):
 
 
 class RecoveryGranularity(StrEnum):
-    """Unit of completed work reused after a live failure or process restart."""
+    """Unit retried after a live rollout failure."""
 
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
+
+
+class RecoveryTargetLevel(StrEnum):
+    """Finest requested restart boundary for an unfinished rollout."""
+
+    TURN = "turn"
+    SIBLING = "sibling"
+    PROMPT_GROUP = "prompt_group"
+
+    @property
+    def granularity(self) -> RecoveryGranularity:
+        """``prompt_group`` retries every sibling; finer levels keep sealed ones."""
+        return (
+            RecoveryGranularity.PROMPT_GROUP
+            if self is RecoveryTargetLevel.PROMPT_GROUP
+            else RecoveryGranularity.SIBLING
+        )
+
+    @property
+    def rank(self) -> int:
+        """0 for ``turn``; a larger rank restarts more work. Follows declaration order."""
+        return list(RecoveryTargetLevel.__members__.values()).index(self)
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -193,11 +218,20 @@ class RolloutAttemptRecord:
     reward_checks: RewardChecks | None = None
     reward_log_context: RewardLogContext | None = None
     staging_keys: list[str] = field(default_factory=list)
+    gym_instance_id: Optional[str] = None
+    gym_attempt: int = 0
 
     @property
     def attempt_id(self) -> str:
         """Return the compact external representation of this attempt UUID."""
         return self.attempt_uuid.hex
+
+    @property
+    def holds_gym_state(self) -> bool:
+        """A dispatched attempt, or a reserved restored one, may have live Gym state."""
+        return self.status is RolloutAttemptStatus.DISPATCHED or (
+            self.status is RolloutAttemptStatus.RESERVED and self.gym_attempt > 0
+        )
 
 
 @dataclass
@@ -225,7 +259,7 @@ class PromptGroupRecoveryRecord:
     prompt_id: str
     prompt_ref: PromptRef
     task_source: Optional[str]
-    recovery_granularity: RecoveryGranularity
+    restore_level: RecoveryTargetLevel
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
     target_step: Optional[int]
@@ -233,6 +267,11 @@ class PromptGroupRecoveryRecord:
     siblings: list[RolloutSiblingRecord]
     phase: PromptGroupPhase
     status: PromptGroupStatus = PromptGroupStatus.GENERATING
+
+    @property
+    def recovery_granularity(self) -> RecoveryGranularity:
+        """The unit retried after a live failure, set by the restore level."""
+        return self.restore_level.granularity
 
     @property
     def prompt_payload(self) -> DatumSpec:
@@ -262,11 +301,21 @@ class PromptGroupRecoveryRecord:
         return f"{self.group_id}_g{generation_index}"
 
     def gate_rollout_id(self, generation_index: int) -> str:
-        """Derive the physical Gate ID from group, sibling, and attempt UUID."""
+        """Return the string form of one Gym episode, as a ``/run`` row carries it.
+
+        Durable checkpoint state uses :meth:`gym_episode`; this is its capture
+        key, which RL's ``test_rollout_capture_key_matches_gym_episode_identity``
+        checks against Gym's ``EpisodeId``.
+        """
+        return self.gym_episode(generation_index).capture_key
+
+    def gym_episode(self, generation_index: int) -> GymCheckpointEpisode:
+        """Return Gym's base rollout ID and attempt number for one sibling."""
         sibling = self.siblings[generation_index]
-        return (
+        return GymCheckpointEpisode(
             f"{self.logical_rollout_id(generation_index)}"
-            f"_a{sibling.current_attempt.attempt_id}"
+            f"_a{sibling.current_attempt.attempt_id}",
+            sibling.current_attempt.gym_attempt,
         )
 
     @property
@@ -275,6 +324,16 @@ class PromptGroupRecoveryRecord:
             sibling.generation_index
             for sibling in self.siblings
             if sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+        ]
+
+    @property
+    def continued_generation_indices(self) -> list[int]:
+        """Siblings a restart continues from Gym state rather than their prompt."""
+        return [
+            sibling.generation_index
+            for sibling in self.siblings
+            if sibling.current_attempt.status is RolloutAttemptStatus.RESERVED
+            and sibling.current_attempt.gym_attempt > 0
         ]
 
 
@@ -338,6 +397,14 @@ class RolloutRecoveryLedger:
 
     def __init__(self) -> None:
         self._groups: dict[str, PromptGroupRecoveryRecord] = {}
+        # Gym episodes RL dropped after Gym may have admitted them, by owning
+        # Gym instance. In memory only: they belong to this process's Gym
+        # executions and must be retired before the next checkpoint commit.
+        self._gym_retirements: dict[str, set[GymCheckpointEpisode]] = {}
+        # Finished rollouts Gym still refuses by rollout ID, by owning Gym
+        # instance: retired ones, and restored ones whose continued attempt
+        # sealed. Gym's marks live in its processes, so these stay in memory too.
+        self._gym_forgets: dict[str, set[GymCheckpointEpisode]] = {}
 
     def groups(self) -> list[PromptGroupRecoveryRecord]:
         return [self._copy_group(group) for group in self._groups.values()]
@@ -352,7 +419,7 @@ class RolloutRecoveryLedger:
         target_step: Optional[int],
         start_weight_version: int,
         task_source: Optional[str] = None,
-        recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        restore_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING,
         admitted: bool = True,
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
@@ -380,7 +447,6 @@ class RolloutRecoveryLedger:
         admission_id = admission_id or group_id
         if not admission_id:
             raise ValueError("admission_id must not be empty")
-
         siblings = []
         for generation_index in range(expected_generations):
             siblings.append(
@@ -395,7 +461,7 @@ class RolloutRecoveryLedger:
             prompt_id=prompt_id,
             prompt_ref=prompt_ref,
             task_source=task_source,
-            recovery_granularity=recovery_granularity,
+            restore_level=restore_level,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
             # is released as soon as canonical rows take over recovery ownership.
@@ -446,16 +512,65 @@ class RolloutRecoveryLedger:
         )
         record.runtime_prompt_payload = prompt_payload
 
-    def prepare_for_restart(self, cut: DataPlaneMutationCut) -> None:
-        """Apply each group's persisted restore policy to interrupted attempts."""
+    def prepare_for_restart(
+        self,
+        cut: DataPlaneMutationCut,
+        *,
+        restored_gym_episodes: Optional[set[tuple[str, str, int]]] = None,
+    ) -> None:
+        """Apply each group's persisted restore policy to interrupted attempts.
+
+        ``restored_gym_episodes`` contains ``(instance_id, rollout_id, attempt)``
+        triples successfully installed by Gym. Those attempts are re-issued as
+        Gym's next attempt while keeping the same RL attempt and TQ lineage.
+        """
         cut.require_live()
         self.assert_checkpoint_safe()
+        restored = restored_gym_episodes or set()
+        consumed_restores: set[tuple[str, str, int]] = set()
         for record in self._groups.values():
             if record.status is PromptGroupStatus.GENERATING:
                 if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                     self._abandon_entire_group(record)
                 else:
-                    self.abandon_unsealed(cut, record.group_id)
+                    for sibling in record.siblings:
+                        attempt = sibling.current_attempt
+                        if attempt.status is RolloutAttemptStatus.SEALED:
+                            continue
+                        episode = record.gym_episode(sibling.generation_index)
+                        restore_key = (
+                            attempt.gym_instance_id or "",
+                            episode.rollout_id,
+                            episode.attempt,
+                        )
+                        if (
+                            record.restore_level is RecoveryTargetLevel.TURN
+                            and attempt.status
+                            in {
+                                RolloutAttemptStatus.DISPATCHED,
+                                RolloutAttemptStatus.RESERVED,
+                            }
+                            and attempt.gym_instance_id is not None
+                            and restore_key in restored
+                        ):
+                            attempt.gym_attempt += 1
+                            attempt.status = RolloutAttemptStatus.RESERVED
+                            consumed_restores.add(restore_key)
+                            continue
+                        # A reserved restored attempt continues Gym state; one
+                        # this restart did not restore again starts over.
+                        if (
+                            attempt.status is RolloutAttemptStatus.RESERVED
+                            and attempt.gym_attempt == 0
+                        ):
+                            continue
+                        attempt.status = RolloutAttemptStatus.ABANDONED
+        unused_restores = restored - consumed_restores
+        if unused_restores:
+            raise ValueError(
+                "Gym restored episodes are not owned by dispatched turn-level "
+                f"rollouts: {sorted(unused_restores)!r}"
+            )
 
     def _abandon_entire_group(self, record: PromptGroupRecoveryRecord) -> None:
         """Discard every current sibling when an incomplete group is atomic.
@@ -501,6 +616,134 @@ class RolloutRecoveryLedger:
             if attempt.status is RolloutAttemptStatus.SEALED
             for staging_key in attempt.staging_keys
         }
+
+    def gym_checkpoint_inventory(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return active turn-level Gym episodes grouped by owning actor."""
+        inventory: dict[str, list[GymCheckpointEpisode]] = {
+            instance_id: [] for instance_id in instance_ids
+        }
+        for record in self._groups.values():
+            if (
+                record.status is not PromptGroupStatus.GENERATING
+                or record.restore_level is not RecoveryTargetLevel.TURN
+            ):
+                continue
+            for sibling in record.siblings:
+                attempt = sibling.current_attempt
+                if not attempt.holds_gym_state:
+                    continue
+                instance_id = attempt.gym_instance_id
+                if instance_id is None:
+                    raise RuntimeError(
+                        "cannot checkpoint a dispatched turn-level rollout without "
+                        f"Gym ownership: group={record.group_id!r}, "
+                        f"generation_index={sibling.generation_index}"
+                    )
+                if instance_id not in inventory:
+                    raise RuntimeError(
+                        f"turn-level rollout references unavailable Gym instance "
+                        f"{instance_id!r}"
+                    )
+                inventory[instance_id].append(
+                    record.gym_episode(sibling.generation_index)
+                )
+        return {
+            instance_id: tuple(sorted(episodes))
+            for instance_id, episodes in inventory.items()
+        }
+
+    def _record_gym_retirements(self, record: PromptGroupRecoveryRecord) -> None:
+        """Remember each current attempt Gym may still be running for this group.
+
+        A dispatched attempt can have an admitted episode, and a reserved
+        restored attempt has restored Gym state. Dropping either from the ledger
+        does not stop it in Gym, which would export it at the next commit.
+        """
+        for sibling in record.siblings:
+            attempt = sibling.current_attempt
+            if not attempt.holds_gym_state or attempt.gym_instance_id is None:
+                continue
+            self._gym_retirements.setdefault(attempt.gym_instance_id, set()).add(
+                record.gym_episode(sibling.generation_index)
+            )
+
+    def gym_checkpoint_retirements(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return dropped Gym episodes to retire before the next commit."""
+        unknown = set(self._gym_retirements) - set(instance_ids)
+        if unknown:
+            raise RuntimeError(
+                f"dropped rollouts reference unavailable Gym instances {sorted(unknown)!r}"
+            )
+        return {
+            instance_id: tuple(sorted(self._gym_retirements.get(instance_id, ())))
+            for instance_id in instance_ids
+        }
+
+    def mark_gym_retired(
+        self, retired: Mapping[str, Iterable[GymCheckpointEpisode]]
+    ) -> None:
+        """Queue episodes Gym has retired for forget; later drops stay pending.
+
+        RL never sends a dropped attempt's rollout ID again, so once its retire
+        has completed nothing of it can still run.
+        """
+        for instance_id, episodes in retired.items():
+            episodes = set(episodes)
+            if episodes:
+                self._gym_forgets.setdefault(instance_id, set()).update(episodes)
+            pending = self._gym_retirements.get(instance_id)
+            if pending is None:
+                continue
+            pending.difference_update(episodes)
+            if not pending:
+                del self._gym_retirements[instance_id]
+
+    def _record_gym_forget_if_restored(
+        self, record: PromptGroupRecoveryRecord, generation_index: int
+    ) -> None:
+        """Queue a restored rollout for forget once its continued attempt sealed.
+
+        Gym's restore refuses the attempts it replaced until RL forgets the
+        rollout; a dropped one reaches the queue through its retire instead.
+        """
+        attempt = self._require_sibling(record, generation_index).current_attempt
+        if attempt.gym_attempt > 0 and attempt.gym_instance_id is not None:
+            self._gym_forgets.setdefault(attempt.gym_instance_id, set()).add(
+                record.gym_episode(generation_index)
+            )
+
+    def gym_checkpoint_forgets(
+        self,
+        instance_ids: set[str] | frozenset[str],
+    ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
+        """Return finished rollouts Gym still refuses, to forget while it is idle."""
+        unknown = set(self._gym_forgets) - set(instance_ids)
+        if unknown:
+            raise RuntimeError(
+                f"finished rollouts reference unavailable Gym instances {sorted(unknown)!r}"
+            )
+        return {
+            instance_id: tuple(sorted(self._gym_forgets.get(instance_id, ())))
+            for instance_id in instance_ids
+        }
+
+    def mark_gym_forgotten(
+        self, forgotten: Mapping[str, Iterable[GymCheckpointEpisode]]
+    ) -> None:
+        """Drop rollouts Gym has forgotten; ones queued meanwhile stay pending."""
+        for instance_id, episodes in forgotten.items():
+            pending = self._gym_forgets.get(instance_id)
+            if pending is None:
+                continue
+            pending.difference_update(episodes)
+            if not pending:
+                del self._gym_forgets[instance_id]
 
     def prepare_incomplete_retry(
         self,
@@ -568,6 +811,7 @@ class RolloutRecoveryLedger:
         group_id: str,
         *,
         generation_indices: Optional[list[int]] = None,
+        gym_instance_id: Optional[str] = None,
     ) -> None:
         """Move the selected current sibling attempts to dispatched."""
         cut.require_live()
@@ -589,7 +833,55 @@ class RolloutRecoveryLedger:
         if any(attempt.status != RolloutAttemptStatus.RESERVED for attempt in attempts):
             raise ValueError("only reserved rollout attempts may be dispatched")
         for attempt in attempts:
+            if (
+                record.restore_level is RecoveryTargetLevel.TURN
+                and attempt.gym_instance_id is None
+                and gym_instance_id is None
+            ):
+                raise ValueError(
+                    "turn-level rollout dispatch requires a Gym checkpoint owner"
+                )
+            if attempt.gym_instance_id is not None:
+                if gym_instance_id != attempt.gym_instance_id:
+                    raise ValueError(
+                        "restored Gym rollout must return to its checkpoint owner: "
+                        f"expected={attempt.gym_instance_id!r}, "
+                        f"actual={gym_instance_id!r}"
+                    )
+            elif gym_instance_id is not None:
+                attempt.gym_instance_id = gym_instance_id
             attempt.status = RolloutAttemptStatus.DISPATCHED
+
+    def release_refused_dispatch(
+        self,
+        cut: DataPlaneMutationCut,
+        group_id: str,
+        *,
+        generation_index: int,
+    ) -> None:
+        """Return one attempt Gym refused at admission to reserved.
+
+        Gym refuses a ``/run`` before recording anything for its episode, so the
+        attempt keeps its identity and is re-dispatched as-is. A fresh attempt
+        leaves the Gym checkpoint inventory until then. A restored turn
+        (``gym_attempt > 0``) stays Gym-owned while reserved, so the next
+        checkpoint carries its committed continuation forward.
+        """
+        cut.require_live()
+        record = self._require_group(group_id)
+        if record.status != PromptGroupStatus.GENERATING:
+            raise ValueError(
+                f"cannot release a refused dispatch of group {group_id!r} from "
+                f"{record.status.value!r}"
+            )
+        attempt = self._require_sibling(record, generation_index).current_attempt
+        if attempt.status != RolloutAttemptStatus.DISPATCHED:
+            raise ValueError(
+                "only a dispatched rollout attempt can be refused: "
+                f"{record.logical_rollout_id(generation_index)!r} is "
+                f"{attempt.status.value!r}"
+            )
+        attempt.status = RolloutAttemptStatus.RESERVED
 
     def mark_sibling_sealed(
         self,
@@ -653,6 +945,7 @@ class RolloutRecoveryLedger:
         attempt.reward_log_context = reward_log_context
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
+        self._record_gym_forget_if_restored(record, generation_index)
         if all(
             item.current_attempt.status == RolloutAttemptStatus.SEALED
             for item in record.siblings
@@ -716,7 +1009,7 @@ class RolloutRecoveryLedger:
 
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
-        for attempt, result, staging_keys in validated:
+        for generation_index, (attempt, result, staging_keys) in enumerate(validated):
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
             attempt.mask_sample = result.mask_sample
@@ -724,6 +1017,7 @@ class RolloutRecoveryLedger:
             attempt.reward_log_context = result.reward_log_context
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
+            self._record_gym_forget_if_restored(record, generation_index)
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
     def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
@@ -737,6 +1031,7 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 f"cannot abandon group {group_id!r} from {record.status.value!r}"
             )
+        self._record_gym_retirements(record)
         if (
             record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
             and record.status is PromptGroupStatus.GENERATING
@@ -837,7 +1132,7 @@ class RolloutRecoveryLedger:
     def discard_group(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Drop a group only after its external TQ/Gate ownership is cleaned."""
         cut.require_live()
-        self._require_group(group_id)
+        self._record_gym_retirements(self._require_group(group_id))
         del self._groups[group_id]
 
     def discard_canonical_groups(
@@ -889,7 +1184,7 @@ class RolloutRecoveryLedger:
                         "task_name": record.prompt_ref.task_name,
                     },
                     "task_source": record.task_source,
-                    "recovery_granularity": record.recovery_granularity.value,
+                    "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
                     "start_weight_version": record.start_weight_version,
@@ -916,6 +1211,8 @@ class RolloutRecoveryLedger:
                                     if attempt.reward_log_context is not None
                                     else None,
                                     "staging_keys": list(attempt.staging_keys),
+                                    "gym_instance_id": attempt.gym_instance_id,
+                                    "gym_attempt": attempt.gym_attempt,
                                 }
                                 for attempt in sibling.attempts
                             ],
@@ -949,7 +1246,8 @@ class RolloutRecoveryLedger:
             or schema_version not in SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
-                f"Unsupported rollout-recovery schema version: {schema_version!r}"
+                f"Unsupported rollout-recovery schema version: {schema_version!r}; "
+                f"expected {ROLLOUT_RECOVERY_SCHEMA_VERSION}"
             )
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):
@@ -1009,7 +1307,7 @@ class RolloutRecoveryLedger:
         admission_id = raw_group.get("admission_id")
         prompt_id = raw_group.get("prompt_id")
         task_source = raw_group.get("task_source")
-        raw_recovery_granularity = raw_group.get("recovery_granularity")
+        raw_restore_level = raw_group.get("restore_level")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
         if not isinstance(group_id, str) or not group_id:
@@ -1020,14 +1318,12 @@ class RolloutRecoveryLedger:
             raise ValueError("prompt_id must be a non-empty string")
         if task_source is not None and not isinstance(task_source, str):
             raise ValueError("task_source must be a string or None")
-        if not isinstance(raw_recovery_granularity, str):
-            raise ValueError("recovery_granularity must be a string")
+        if not isinstance(raw_restore_level, str):
+            raise ValueError("restore_level must be a string")
         try:
-            recovery_granularity = RecoveryGranularity(raw_recovery_granularity)
+            restore_level = RecoveryTargetLevel(raw_restore_level)
         except ValueError as error:
-            raise ValueError(
-                f"invalid recovery_granularity={raw_recovery_granularity!r}"
-            ) from error
+            raise ValueError(f"invalid restore_level={raw_restore_level!r}") from error
         if not isinstance(expected_generations, int) or expected_generations < 1:
             raise ValueError("expected_generations must be a positive integer")
         if (
@@ -1087,7 +1383,7 @@ class RolloutRecoveryLedger:
                 if attempt_uuid in seen_attempt_uuids:
                     raise ValueError("duplicate rollout attempt identity")
                 seen_attempt_uuids.add(attempt_uuid)
-                gate_id = f"{logical_id}_a{attempt_uuid.hex}"
+                base_gate_id = f"{logical_id}_a{attempt_uuid.hex}"
                 raw_attempt_status = attempt_state.get("status")
                 if not isinstance(raw_attempt_status, str):
                     raise ValueError(
@@ -1114,6 +1410,28 @@ class RolloutRecoveryLedger:
                     attempt_state.get("reward_log_context")
                 )
                 staging_keys = attempt_state.get("staging_keys")
+                # The writer always records both, and None/0 are valid values,
+                # so a missing field means a damaged ledger, not a non-Gym attempt.
+                for name in ("gym_instance_id", "gym_attempt"):
+                    if name not in attempt_state:
+                        raise ValueError(f"rollout-recovery attempt is missing {name}")
+                gym_instance_id = attempt_state["gym_instance_id"]
+                gym_attempt = attempt_state["gym_attempt"]
+                if gym_instance_id is not None and (
+                    not isinstance(gym_instance_id, str) or not gym_instance_id
+                ):
+                    raise ValueError(
+                        "gym_instance_id must be a non-empty string or None"
+                    )
+                if (
+                    not isinstance(gym_attempt, int)
+                    or isinstance(gym_attempt, bool)
+                    or gym_attempt < 0
+                ):
+                    raise ValueError("gym_attempt must be a non-negative integer")
+                if gym_attempt > 0 and gym_instance_id is None:
+                    raise ValueError("resumed Gym attempts require gym_instance_id")
+                gate_id = GymCheckpointEpisode(base_gate_id, gym_attempt).capture_key
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
                 ):
@@ -1158,6 +1476,8 @@ class RolloutRecoveryLedger:
                         reward_checks=checks,
                         reward_log_context=log_context,
                         staging_keys=list(staging_keys),
+                        gym_instance_id=gym_instance_id,
+                        gym_attempt=gym_attempt,
                     )
                 )
             siblings.append(
@@ -1211,7 +1531,7 @@ class RolloutRecoveryLedger:
             prompt_id=prompt_id,
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
             task_source=task_source,
-            recovery_granularity=recovery_granularity,
+            restore_level=restore_level,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,
             target_step=target_step,

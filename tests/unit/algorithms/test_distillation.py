@@ -1401,6 +1401,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         enable_router_replay=False,
         use_fastokens=False,
         policy_api_key="k",
+        turn_checkpointing_enabled=False,
     )
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
 

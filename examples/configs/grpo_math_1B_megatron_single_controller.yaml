@@ -222,20 +222,37 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Retry and restore policy for unfinished token-capture groups. "sibling" reuses
-# already sealed generations; "prompt_group" regenerates every sibling when any
-# sibling fails in-process or was unfinished at a checkpoint.
+# Target recovery boundary for unfinished token-capture groups. "turn" enables
+# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
+# "prompt_group" regenerates every sibling in an unfinished group.
+# "turn" also requires env.should_use_nemo_gym, the vllm generation backend,
+# token_capture.enabled: true, rollout_checkpointing.snapshot_attempt_interval_s,
+# rollout_checkpointing.restore_mode: latest, both override maps left empty,
+# only legacy_agent Gym environment servers, and
+# async_rl.stall_watchdog.stall_timeout_s above
+# gym_prepare_timeout_s + 2 * token_capture.control_timeout_s.
 rollout_recovery:
-  default_granularity: sibling
-  # Per-Gym-task-source override, keyed on extra_env_info.task_source.
-  #   task_source_granularity_overrides:
+  target_level: sibling
+  # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
+  # Until Gym advertises group-scoring capability, configure GenRM explicitly:
+  #   task_source_target_level_overrides:
   #     genrm_compare_resources_server: prompt_group
-  task_source_granularity_overrides: {}
+  task_source_target_level_overrides: {}
   # Agent-specific override for rows already carrying extra_env_info.agent_ref.
   # A matching agent entry wins over a matching task-source entry and also
   # provides compatibility for legacy datasets without task_source.
-  #   agent_granularity_overrides: {genrm_agent: prompt_group}
-  agent_granularity_overrides: {}
+  #   agent_target_level_overrides: {genrm_agent: prompt_group}
+  agent_target_level_overrides: {}
+  # Seconds every Gym deployment gets to park its in-flight steps before a
+  # "turn" checkpoint gives up on this attempt. Raise it for long agent or
+  # environment steps; token_capture.control_timeout_s still bounds each
+  # other Gym control call.
+  gym_prepare_timeout_s: 300.0
+  # With "turn", setup fails if a Gym server is restart-only: an agent without
+  # checkpoint session support, or a resources server whose checkpoint mode is
+  # restart_only. Such a server's in-flight rollouts start over after a crash.
+  # Set true to accept that with a warning; only valid with target_level: turn.
+  allow_restart_only_gym_servers: false
 
 # Leaving either map above non-empty requires the top-level token_capture section
 # to set enabled: true.
