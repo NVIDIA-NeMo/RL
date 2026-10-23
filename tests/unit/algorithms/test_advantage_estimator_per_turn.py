@@ -265,6 +265,48 @@ def test_3_turns_counted(counted, mults, first):
     assert_actions_untouched(out, batch)
 
 
+def test_3b_turns_counted_none_measures_the_total():
+    # V = P: A 800, B 1600, C 2400 thinking tokens; u = (1, 1/2, 1/3), c = 4800 / 2400 = 2.
+    batch = spec_group()
+    out, stats = run(batch, cfg(turns_counted="none"))
+    for row, mult in zip(range(3), (2.0, 1.0, 2.0 / 3.0)):
+        assert_multiplier(out, batch, row, "thinking", mult)
+    assert_actions_untouched(out, batch)
+    for row in range(3, 6):
+        assert torch.equal(out[row], batch["advantages"][row])
+    assert stats.weight_min == pytest.approx(2.0 / 3.0)
+    assert stats.weight_max == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("counted", ["with_spans", "none"])
+def test_3c_one_short_turn_vs_ten_turns(counted):
+    # 100 thinking tokens in 1 turn vs 1000 in 10 turns (100 per turn), both correct: per turn
+    # they are equally verbose; in total the second wrote 10x more and, under "none", weighs less.
+    short = [Turn(thinking=100, tool=10)]
+    long = [Turn(thinking=100, tool=10) for _ in range(10)]
+    wrong = [[Turn(thinking=300, tool=10)], [Turn(thinking=50, tool=10)]]
+    batch = build([short, long, *wrong], [1, 1, 0, 0])
+    out, _ = run(batch, cfg(turns_counted=counted))
+    w = [
+        (values_at(out, batch, r, "thinking") / values_at(batch["advantages"], batch, r, "thinking"))
+        for r in (0, 1)
+    ]
+    for r in (0, 1):
+        assert torch.allclose(w[r], w[r][0].expand_as(w[r]), atol=1e-6)
+    if counted == "with_spans":
+        assert float(w[0][0]) == pytest.approx(1.0) and float(w[1][0]) == pytest.approx(1.0)
+    else:
+        # u = (1, max(100 / 1000, 1/3)) = (1, 1/3); c = 1100 / (100 + 1000 / 3).
+        c = 1100.0 / (100.0 + 1000.0 / 3.0)
+        assert float(w[0][0]) == pytest.approx(c, rel=1e-5)
+        assert float(w[1][0]) == pytest.approx(c / 3.0, rel=1e-5)
+        # The group's positive credit on thinking tokens is unchanged.
+        before = sum(float(values_at(batch["advantages"], batch, r, "thinking").sum()) for r in (0, 1))
+        after = sum(float(values_at(out, batch, r, "thinking").sum()) for r in (0, 1))
+        assert after == pytest.approx(before, rel=1e-5)
+    assert_actions_untouched(out, batch)
+
+
 def test_4_thinking_to_content_leak():
     # C moves 1600 of its 2400 thinking tokens into visible content (400 per turn).
     c_turns = [Turn(thinking=200, content=400, tool=100) for _ in range(4)]
@@ -632,6 +674,10 @@ def test_config_defaults_and_validation():
         PositiveLengthReweightConfig(enabled=True, exclude_final_answer=True)
     with pytest.raises(ValueError):
         PositiveLengthReweightConfig(enabled=True, scope="per_turn")
+    assert (
+        PositiveLengthReweightConfig(enabled=True, turns_counted="none").turns_counted
+        == "none"
+    )
     with pytest.raises(ValueError):
         PositiveLengthReweightConfig(enabled=True, turns_counted="some")
     with pytest.raises(ValueError):

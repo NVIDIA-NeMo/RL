@@ -81,7 +81,8 @@ class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
     # "prose_per_turn": free text (thinking + visible content) per assistant turn; only those
     #   tokens are scaled, so moving text between thinking and content changes nothing.
     # The per-turn scopes (reweight_positive_text_per_turn) leave tool calls and end-of-turn
-    # tokens at the unweighted advantage, so the number of turns carries no length pressure.
+    # tokens at the unweighted advantage, so the number of turns carries no length pressure
+    # (unless turns_counted is "none", which measures the rollout's total).
     # They read the assistant_turn_id / thinking_mask / action_mask columns, which the
     # SingleController token-capture path builds.
     scope: Literal["trajectory", "thinking_per_turn", "prose_per_turn"] = "trajectory"
@@ -91,8 +92,9 @@ class PositiveLengthReweightConfig(BaseModel, extra="forbid"):
     exclude_final_answer: bool = False
     # Per-turn scopes: the turn count T in V = P / T. "with_spans" counts the turns that have at
     # least one measured token; "all" counts every trained assistant turn, so a turn holding
-    # only a tool call lowers V.
-    turns_counted: Literal["with_spans", "all"] = "with_spans"
+    # only a tool call lowers V; "none" does not divide (V = P, the rollout's total measured
+    # tokens), so of two rollouts equally verbose per turn the one with more turns weighs less.
+    turns_counted: Literal["with_spans", "all", "none"] = "with_spans"
 
     @model_validator(mode="after")
     def _check_scope_options(self) -> "PositiveLengthReweightConfig":
@@ -468,7 +470,7 @@ def reweight_positive_text_per_turn(
     Per group (rows with equal ``prompt_ids``), counted on ``[:, 1:]`` like the loss:
 
     * ``P_i`` = measured tokens, ``T_i`` = distinct turns with a measured token (``with_spans``)
-      or with any trained token (``all``), ``V_i = P_i / T_i``;
+      or with any trained token (``all``), or 1 (``none``: V is the total), ``V_i = P_i / T_i``;
     * positives ``S = {i : A_i > 0, valid_i, P_i > 0, T_i > 0}``; groups with ``|S| < 2`` are
       left unchanged;
     * raw weights ``u_i`` from ``V`` with the same function as ``scope="trajectory"`` uses for
@@ -480,7 +482,8 @@ def reweight_positive_text_per_turn(
     rows) is returned bit-identical. The sum of the group's positive advantages over measured
     tokens is unchanged, so with actions untouched each group keeps its share of the step. A row
     of the same per-turn verbosity gets the same weight whatever its turn count, so turns carry
-    no length pressure. Only within-group statistics are used (shard and row-order invariant).
+    no length pressure, except under ``turns_counted="none"``, where more turns of measured
+    text mean a larger V. Only within-group statistics are used (shard and row-order invariant).
 
     Must run on the estimator's output, before message-level penalties and advantage clipping:
     ``A_i`` is read as the row's single value over its trained tokens, and a row whose trained
@@ -546,8 +549,10 @@ def reweight_positive_text_per_turn(
     all_turns = _distinct_turns(loss_turn, in_turn[:, 1:])
     if config.turns_counted == "with_spans":
         counted_turns = _distinct_turns(loss_turn, loss_measured)
-    else:
+    elif config.turns_counted == "all":
         counted_turns = all_turns
+    else:  # "none": V is the row's total measured tokens
+        counted_turns = torch.ones_like(measured_len)
     trained_len = loss_trained.sum(dim=1).to(torch.float64)
 
     # A_i: the row's single value over its trained tokens.
