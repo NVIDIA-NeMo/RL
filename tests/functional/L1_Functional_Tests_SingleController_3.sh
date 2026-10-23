@@ -67,6 +67,9 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # This is intentionally full-tier because it performs three long-generation
 # runs: an uninterrupted reference, the interrupted run, and the recovery.
 run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# The same active-decode recovery with MoE router replay, on a tiny random MoE:
+# each restored call must stage the routes it restored for training.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_router_replay_prefix_recovery_single_controller_1n2g.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

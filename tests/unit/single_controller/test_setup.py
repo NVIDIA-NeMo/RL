@@ -1134,25 +1134,6 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_prefix_recovery_rejects_router_replay(self):
-        # Multimodal capture is accepted: test_prefix_recovery_accepts_multimodal_capture.
-        mc = _make_master_config(env={"should_use_nemo_gym": True})
-        mc.policy["generation"]["vllm_cfg"] = {
-            "async_engine": True,
-            "expose_http_server": True,
-        }
-        mc.token_capture.enabled = True
-        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            snapshot_attempt_interval_s=1.0
-        )
-        mc.policy["router_replay"] = {"enabled": True}
-
-        with pytest.raises(
-            NotImplementedError, match="does not yet support router replay"
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
     @pytest.mark.parametrize(
         ("overrides", "error", "match"),
         [
@@ -1290,12 +1271,15 @@ class TestSetup:
         assert actor_args.finalizer_actors == fake_finalizers
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
 
+    @pytest.mark.parametrize("router_replay", [False, True])
     def test_prefix_recovery_accepts_multimodal_capture(
         self,
         tmp_path: Path,
         patched_factories,
+        router_replay: bool,
     ):
         mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.policy["router_replay"] = {"enabled": router_replay}
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -1328,7 +1312,9 @@ class TestSetup:
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ) as mock_spinup,
-            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod, "router_replay_enabled", return_value=router_replay
+            ),
             patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."

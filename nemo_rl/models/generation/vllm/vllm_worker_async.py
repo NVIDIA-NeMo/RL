@@ -16,6 +16,7 @@ import asyncio
 import copy
 import functools
 import gc
+import importlib.metadata
 import logging
 import secrets
 import threading
@@ -33,6 +34,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from packaging.version import Version
 
 from nemo_rl.data.captured_media import (
     MEDIA_TENSOR_DIGESTS_FIELD,
@@ -54,9 +56,13 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.experience.route_assembly import boundary_route_rows
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    boundary_route_rows,
+)
 from nemo_rl.models.generation.generation_cut_capture import (
     GenerationCutCaptureMixin,
+    _prefix_routes_sha256,
     _CompletedCaptureState,
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
@@ -93,6 +99,10 @@ from nemo_rl.models.generation.openai_server_utils import (
     splice_prefix_tokens,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
+from nemo_rl.utils.routed_experts_codec import (
+    decode_routed_experts,
+    encode_routed_experts,
+)
 
 LOGGER = logging.getLogger(__name__)
 _RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
@@ -150,6 +160,8 @@ class _RestoredPrefixTerminal:
     reason: str
     finish_reason: Literal["stop", "length"]
     stop_reason: str | int | None = None
+    # Full-sequence routes for router replay; see _restored_prefix_terminal_routes.
+    routed_experts: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def original_prompt_token_count(self) -> int:
@@ -253,6 +265,26 @@ def _classify_restored_prefix_terminal(
     )
 
 
+def _restored_prefix_terminal_routes(
+    restored: torch.Tensor, *, prev_len: int
+) -> torch.Tensor:
+    """Full-sequence routes for a restored prefix that needs no more decoding.
+
+    ``restored`` is the cut's delta-aligned routes, ending with its final
+    placeholder row. The engine never runs, so no prefill routes the
+    positions before the delta, including the parent's last token, and
+    nothing routes the final token: those rows are ``ROUTE_MISSING_SENTINEL``,
+    as an uninterrupted call's final row is.
+    """
+
+    def missing(rows: int) -> torch.Tensor:
+        return torch.full(
+            (rows, *restored.shape[1:]), ROUTE_MISSING_SENTINEL, dtype=restored.dtype
+        )
+
+    return torch.cat((missing(prev_len), restored[:-1], missing(1)), dim=0)
+
+
 def _build_restored_prefix_terminal_output(
     request_id: str, terminal: _RestoredPrefixTerminal
 ) -> Any:
@@ -273,6 +305,11 @@ def _build_restored_prefix_terminal_output(
                 logprobs=[],
                 finish_reason=terminal.finish_reason,
                 stop_reason=terminal.stop_reason,
+                routed_experts=(
+                    None
+                    if terminal.routed_experts is None
+                    else terminal.routed_experts.numpy()
+                ),
             )
         ],
         finished=True,
@@ -457,6 +494,12 @@ def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 
 
+# The vLLM release whose private route state ``snapshot_routed_experts`` reads
+# (``OutputProcessor.external_req_ids`` / ``request_states`` and
+# ``RequestState.routed_experts_chunks``). Re-check those fields on a bump.
+_ROUTE_SNAPSHOT_VLLM_RELEASE = (0, 29, 0)
+
+
 class _AsyncLLMHTTPClient:
     """Keep HTTP generation on the loop that owns AsyncLLM request state.
 
@@ -559,6 +602,90 @@ class _AsyncLLMHTTPClient:
 
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
+
+    def check_route_snapshot_support(self) -> None:
+        """Fail at setup if ``snapshot_routed_experts`` cannot read this vLLM.
+
+        It reads private vLLM state. A release that renamed it would make
+        every router-replay call uncuttable, so prefix recovery would quietly
+        fall back to turn level.
+
+        Raises:
+            RuntimeError: vLLM is not the release that state was verified on,
+                or its output processor lacks the fields read.
+        """
+        installed = importlib.metadata.version("vllm")
+        if Version(installed).release[:3] != _ROUTE_SNAPSHOT_VLLM_RELEASE:
+            expected = ".".join(map(str, _ROUTE_SNAPSHOT_VLLM_RELEASE))
+            raise RuntimeError(
+                "router-replay prefix recovery reads vLLM's private route state, "
+                f"verified on vLLM {expected}; vLLM {installed} is installed. "
+                "Re-check snapshot_routed_experts and _ROUTE_SNAPSHOT_VLLM_RELEASE."
+            )
+        output_processor = self._engine_client.output_processor
+        missing = [
+            name
+            for name in ("external_req_ids", "request_states")
+            if not hasattr(output_processor, name)
+        ]
+        if missing:
+            raise RuntimeError(
+                "router-replay prefix recovery needs vLLM's "
+                f"OutputProcessor.{', '.join(missing)}, which this vLLM lacks"
+            )
+
+    def snapshot_routed_experts(
+        self, request_id: str, *, timeout_s: float | None
+    ) -> list[Any] | None:
+        """Copy an active request's route chunks on the engine loop.
+
+        vLLM 0.29 keeps routed experts in ``OutputProcessor.RequestState``
+        while decoding, only ever appends to them, and publishes them in
+        ``CompletionOutput`` once the request finishes. A generation cut reads
+        them here, from its own thread, after freezing the call's tokens.
+
+        Returns:
+            The request's route chunks in order, or ``None`` once the request
+            has left vLLM.
+
+        Raises:
+            TimeoutError: the engine loop did not answer within ``timeout_s``.
+            ValueError: more than one vLLM request serves ``request_id``, or its
+                state has no route chunks.
+        """
+
+        async def snapshot() -> list[Any] | None:
+            return self._routed_expert_chunks_on_owner(request_id)
+
+        future = asyncio.run_coroutine_threadsafe(snapshot(), self._engine_loop)
+        try:
+            return future.result(timeout=timeout_s)
+        except TimeoutError:
+            future.cancel()
+            raise
+
+    def _routed_expert_chunks_on_owner(self, request_id: str) -> list[Any] | None:
+        """List one request's route chunks while on the engine loop.
+
+        A shallow copy: vLLM appends new chunks but never rewrites one.
+        """
+        output_processor = self._engine_client.output_processor
+        internal_ids = list(output_processor.external_req_ids.get(request_id, ()))
+        if not internal_ids:
+            return None
+        if len(internal_ids) != 1:
+            raise ValueError(
+                "router-replay prefix capture requires exactly one active "
+                f"vLLM request for {request_id!r}; found {len(internal_ids)}"
+            )
+        state = output_processor.request_states.get(internal_ids[0])
+        if state is None:
+            return None
+        # Checked per call, not at setup: only a live request has this field.
+        chunks = getattr(state, "routed_experts_chunks", None)
+        if chunks is None:
+            raise ValueError("vLLM's request state has no routed_experts_chunks")
+        return list(chunks)
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -1041,6 +1168,13 @@ class VllmAsyncGenerationWorkerImpl(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
         self._staging_source = source
+        if generation_prefix_cuts_enabled and self._return_routed_experts_enabled():
+            # A cut reads the active request's routes through it.
+            if self._http_engine_client is None:
+                raise RuntimeError(
+                    "router-replay prefix capture requires the vLLM HTTP client"
+                )
+            self._http_engine_client.check_route_snapshot_support()
         self._chain_prefix.install(source)
         install_capture(
             self,
@@ -1086,6 +1220,7 @@ class VllmAsyncGenerationWorkerImpl(
         prefix_token_ids: list[int] | None = None,
         media: CapturedMedia | None = None,
         generation_cut: Any | None = None,
+        generation_cut_routed_experts: torch.Tensor | None = None,
         resumed_generation_token_ids: list[int] | None = None,
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
@@ -1121,6 +1256,9 @@ class VllmAsyncGenerationWorkerImpl(
         state = _RequestCaptureState(
             call=call,
             prompt_token_ids=list(prompt_token_ids),
+            capture_routed_experts=self._return_routed_experts_enabled(),
+            routed_experts_dtype=self.routed_experts_dtype,
+            restored_routed_experts=generation_cut_routed_experts,
             media=media,
             resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
             effective_output_limit=(
@@ -1178,12 +1316,31 @@ class VllmAsyncGenerationWorkerImpl(
                     f"probabilities: token_count={len(token_ids)}, "
                     f"logprob_count={observed + len(generation_token_ids)}"
                 )
+            complete_routed_experts = None
+            if state.capture_routed_experts and finish_reason is not None:
+                route_parts = [
+                    value
+                    for value in (
+                        getattr(request_output, "prompt_routed_experts", None),
+                        getattr(output, "routed_experts", None),
+                    )
+                    if value is not None
+                ]
+                if route_parts:
+                    complete_routed_experts = torch.cat(
+                        [torch.as_tensor(value) for value in route_parts], dim=0
+                    )
         except (RuntimeError, TypeError, ValueError) as error:
             with state.lock:
                 state.observation_error = f"{type(error).__name__}: {error}"
             return
         with state.lock:
+            if state.engine_request_id is None:
+                # A cut reads the request's active routes by this ID.
+                state.engine_request_id = getattr(request_output, "request_id", None)
             state.observe(generation_token_ids, generation_logprobs)
+            if complete_routed_experts is not None:
+                state.terminal_routed_experts = complete_routed_experts
             if finish_reason is not None:
                 if finish_reason not in ("stop", "length"):
                     state.observation_error = (
@@ -1204,6 +1361,15 @@ class VllmAsyncGenerationWorkerImpl(
                 else:
                     state.terminal_finish_reason = finish_reason
                     state.terminal_stop_reason = stop_reason
+
+    def _snapshot_engine_routed_experts(
+        self, engine_request_id: str, *, timeout_s: float | None
+    ) -> list[Any] | None:
+        """Return an active request's route pieces from vLLM, in order."""
+        assert self._http_engine_client is not None  # setup_token_capture checks
+        return self._http_engine_client.snapshot_routed_experts(
+            engine_request_id, timeout_s=timeout_s
+        )
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -1472,23 +1638,7 @@ class VllmAsyncGenerationWorkerImpl(
         if routed is None:
             return
         try:
-            from nemo_rl.utils.routed_experts_codec import (
-                decode_routed_experts,
-                encode_routed_experts,
-            )
-
-            if isinstance(routed, str):
-                dtype_name = routed.split(":", 3)[1]
-                dtype = {
-                    "int8": torch.int8,
-                    "int16": torch.int16,
-                    "int32": torch.int32,
-                }.get(dtype_name)
-                if dtype is None:
-                    raise ValueError(f"unsupported routed_experts dtype {dtype_name!r}")
-            else:
-                dtype = torch.int16
-            experts = decode_routed_experts(routed, dtype)
+            experts = decode_routed_experts(routed)
             expected_full_len = prompt_len + generated_len
             if experts.dim() != 3 or experts.shape[0] != expected_full_len:
                 raise ValueError(
@@ -1504,6 +1654,79 @@ class VllmAsyncGenerationWorkerImpl(
             message.pop("routed_experts", None)
         choice["message"] = message
         payload["choices"] = [choice]
+
+    def _merge_generation_cut_routed_experts(
+        self,
+        payload: dict[str, Any],
+        *,
+        restored: torch.Tensor | None,
+        prev_len: int,
+        generated_len: int,
+    ) -> torch.Tensor | None:
+        """Keep old prefix routes and current-policy boundary/suffix routes.
+
+        A resumed row trains with the saved routes for the restored prefix, and
+        with this call's routes for the row at the cut and the new tail. This
+        matches an uninterrupted run when
+        ``async_rl.recompute_kv_cache_after_weight_updates`` is False, so an
+        in-flight request keeps the KV, and routes, it sampled its prefix with.
+
+        After a parent call, the delta-aligned routes lead with the parent's
+        last-token row (``boundary_route_rows``); it comes from this call's
+        prefill, exactly as it would without a cut, and is kept.
+
+        Like ``_delta_align_routed_experts``, routes that do not fit are logged
+        and dropped rather than failing the call: the current routes alone
+        would describe the restored prefix under a policy that did not sample
+        it.
+
+        Returns:
+            The restored prefix's rows of the staged routes (one per prefix
+            delta token), or ``None`` when no routes were merged.
+        """
+        if restored is None:
+            return None
+        choices = payload.get("choices") or []
+        if len(choices) != 1 or not isinstance(choices[0], dict):
+            return None
+        choice = dict(choices[0])
+        message = dict(choice.get("message") or {})
+        routed = message.get("routed_experts")
+        if routed is None:
+            # vLLM returned none, or _delta_align_routed_experts dropped them.
+            LOGGER.warning(
+                "resumed generation staged no routed_experts to restore its "
+                "prefix's routes into"
+            )
+            return None
+        try:
+            current = decode_routed_experts(routed)
+            restored = restored.to(dtype=current.dtype)
+            if current.dim() != 3 or tuple(current.shape[1:]) != tuple(
+                restored.shape[1:]
+            ):
+                raise ValueError("restored routed experts changed model dimensions")
+            boundary_rows = boundary_route_rows(prev_len)
+            if current.shape[0] != boundary_rows + restored.shape[0] + generated_len:
+                raise ValueError(
+                    "resumed routed experts do not match prefix plus generated tail"
+                )
+            # The restored final row is a placeholder; the current one is kept.
+            replace_len = restored.shape[0] - 1
+            current[boundary_rows : boundary_rows + replace_len] = restored[
+                :replace_len
+            ]
+            message["routed_experts"] = encode_routed_experts(current)
+            merged = current[boundary_rows : boundary_rows + restored.shape[0]]
+        except (IndexError, TypeError, ValueError) as error:
+            LOGGER.warning(
+                "dropping routed_experts the restored prefix does not fit: %s", error
+            )
+            message.pop("routed_experts", None)
+            merged = None
+        choice["message"] = message
+        payload["choices"] = [choice]
+        return merged
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Run terminal token staging outside an active checkpoint cut."""
@@ -1556,6 +1779,7 @@ class VllmAsyncGenerationWorkerImpl(
             payload[MEDIA_SPANS_FIELD] = [item.to_dict() for item in state.media.items]
         adapter = self.token_capture.adapter
         generated_token_ids: list[int] = []
+        staged_prefix_routes = None
         if adapter is not None:
             try:
                 generated_token_ids, _ = adapter.extract_generation(payload)
@@ -1565,6 +1789,12 @@ class VllmAsyncGenerationWorkerImpl(
                 payload,
                 prev_len=call.admission.prev_len,
                 prompt_len=len(prompt_token_ids),
+                generated_len=len(generated_token_ids),
+            )
+            staged_prefix_routes = self._merge_generation_cut_routed_experts(
+                payload,
+                restored=state.restored_routed_experts,
+                prev_len=call.admission.prev_len,
                 generated_len=len(generated_token_ids),
             )
         coords = self.token_capture.complete_call_from_response(
@@ -1581,13 +1811,16 @@ class VllmAsyncGenerationWorkerImpl(
             LOGGER.info(
                 "generation prefix completed: rollout_id=%s model_call_id=%s "
                 "source_model_call_id=%s prefix_tokens=%d tail_tokens=%d "
-                "total_generation_tokens=%d",
+                "total_generation_tokens=%d prefix_routes_sha256=%s",
                 call.rollout_id,
                 call.model_call_id,
                 call.generation_cut.model_call_id,
                 prefix_tokens,
                 len(generated_token_ids),
                 total_generation_token_count,
+                _prefix_routes_sha256(
+                    staged_prefix_routes, generated_prefix_tokens=prefix_tokens
+                ),
             )
         with state.lock:
             effective_output_limit = state.effective_output_limit
@@ -1824,6 +2057,7 @@ class VllmAsyncGenerationWorkerImpl(
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
                 restored_generation_media = None
+                generation_cut_routed_experts = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if admission is not None:
@@ -1838,6 +2072,7 @@ class VllmAsyncGenerationWorkerImpl(
                     if resolved_cut is not None:
                         generation_cut = resolved_cut.snapshot
                         restored_generation_media = resolved_cut.media
+                        generation_cut_routed_experts = resolved_cut.routed_experts
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
                         restored_request_output_tokens = (
@@ -1905,6 +2140,7 @@ class VllmAsyncGenerationWorkerImpl(
                         prefix_token_ids=capture_prefix_token_ids,
                         media=media,
                         generation_cut=generation_cut,
+                        generation_cut_routed_experts=generation_cut_routed_experts,
                         resumed_generation_token_ids=resumed_generation_token_ids,
                     )
                     return res
@@ -1986,6 +2222,19 @@ class VllmAsyncGenerationWorkerImpl(
                             parameter="generation_prefix",
                             value=admission.generation_cut.prefix_token_count,
                         ) from error
+                    if (
+                        restored_prefix_terminal is not None
+                        and generation_cut_routed_experts is not None
+                    ):
+                        # The engine never runs for a terminal prefix, so its
+                        # output carries the restored routes instead.
+                        restored_prefix_terminal = replace(
+                            restored_prefix_terminal,
+                            routed_experts=_restored_prefix_terminal_routes(
+                                generation_cut_routed_experts,
+                                prev_len=admission.prev_len,
+                            ),
+                        )
 
                 # Reject overflows before media validation can mask the length
                 # error. A restored terminal prefix generates nothing more.
@@ -2055,6 +2304,7 @@ class VllmAsyncGenerationWorkerImpl(
                     prefix_token_ids=capture_prefix_token_ids,
                     media=media,
                     generation_cut=generation_cut,
+                    generation_cut_routed_experts=generation_cut_routed_experts,
                     resumed_generation_token_ids=resumed_generation_token_ids,
                 )
 

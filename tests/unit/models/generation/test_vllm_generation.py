@@ -14,6 +14,7 @@
 
 import asyncio
 import contextlib
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -566,6 +567,103 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
     assert calls[0][1:] == (http_loop, http_thread)
     assert calls[1][1:] == (engine_loop, engine_thread)
     assert calls[2][1:] == (http_loop, http_thread)
+
+
+@pytest.mark.asyncio
+async def test_async_vllm_http_client_snapshots_route_chunks_on_the_engine_loop() -> (
+    None
+):
+    engine_loop = asyncio.get_running_loop()
+    first = torch.tensor([[[1]], [[2]]], dtype=torch.int16)
+    second = torch.tensor([[[3]]], dtype=torch.int16)
+    chunks = [first, second]
+    read_on: list[asyncio.AbstractEventLoop] = []
+
+    class RequestStates(dict):
+        def get(self, key, default=None):
+            read_on.append(asyncio.get_running_loop())
+            return super().get(key, default)
+
+    output_processor = types.SimpleNamespace(
+        external_req_ids={
+            "external-request": ["internal-request"],
+            "forked-request": ["internal-a", "internal-b"],
+            "renamed-request": ["internal-renamed"],
+        },
+        request_states=RequestStates(
+            {
+                "internal-request": types.SimpleNamespace(routed_experts_chunks=chunks),
+                "internal-renamed": types.SimpleNamespace(),
+            }
+        ),
+    )
+
+    class FakeEngine:
+        model_config = None
+        renderer = None
+        input_processor = None
+        vllm_config = None
+
+        def __init__(self) -> None:
+            self.output_processor = output_processor
+
+    client = _AsyncLLMHTTPClient(FakeEngine(), engine_loop)
+
+    # A generation cut calls from its own thread, never the engine loop.
+    snapshot = await asyncio.to_thread(
+        client.snapshot_routed_experts, "external-request", timeout_s=5
+    )
+    assert read_on == [engine_loop]
+    assert snapshot == [first, second]
+    # vLLM keeps appending to its list; the snapshot does not grow with it.
+    assert snapshot is not chunks
+    # A request that already left vLLM has no active routes.
+    assert (
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "finished-request", timeout_s=5
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="exactly one active vLLM request"):
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "forked-request", timeout_s=5
+        )
+    # A renamed field fails only that call's cut, not the whole cut.
+    with pytest.raises(ValueError, match="no routed_experts_chunks"):
+        await asyncio.to_thread(
+            client.snapshot_routed_experts, "renamed-request", timeout_s=5
+        )
+
+
+@pytest.mark.parametrize(
+    ("installed", "output_processor", "match"),
+    [
+        ("0.29.0", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.29.0+cu129", {"external_req_ids": {}, "request_states": {}}, None),
+        ("0.30.0", {"external_req_ids": {}, "request_states": {}}, "vLLM 0.30.0"),
+        ("0.29.0", {"external_req_ids": {}}, "OutputProcessor.request_states"),
+    ],
+    ids=["verified", "local_build", "other_release", "renamed_field"],
+)
+def test_async_vllm_http_client_checks_it_can_read_vllm_route_state(
+    monkeypatch, installed: str, output_processor: dict, match: str | None
+) -> None:
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: installed)
+    engine = types.SimpleNamespace(
+        model_config=None,
+        renderer=None,
+        input_processor=None,
+        vllm_config=None,
+        output_processor=types.SimpleNamespace(**output_processor),
+    )
+    # The check runs at setup, off the engine loop.
+    client = _AsyncLLMHTTPClient(engine, MagicMock(name="engine_loop"))
+
+    if match is None:
+        client.check_route_snapshot_support()
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            client.check_route_snapshot_support()
 
 
 @pytest.mark.parametrize(

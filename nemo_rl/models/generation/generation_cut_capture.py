@@ -20,8 +20,17 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
+
+import numpy as np
+import torch
+
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    verify_route_fragment_integrity,
+)
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +39,42 @@ LOGGER = logging.getLogger(__name__)
 # evicting fresh evidence merely because a large deployment completed more
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
+
+
+def _final_route_placeholder(
+    layers: int, topk: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """The route row staged for a prefix's last token, which no step has routed.
+
+    A cut builds it when staging and a restore rebuilds it when joining
+    chunks; both must use this helper, or every resumed call fails the
+    digest check. It holds ``ROUTE_MISSING_SENTINEL``, as the final row of an
+    uncut call's routes does.
+    """
+    return torch.full((1, layers, topk), ROUTE_MISSING_SENTINEL, dtype=dtype)
+
+
+def _prefix_routes_sha256(
+    delta_routes: torch.Tensor | None, *, generated_prefix_tokens: int
+) -> str:
+    """Hash the routes a resumed call keeps for its restored generated prefix.
+
+    ``delta_routes`` holds one row per prefix delta token. The kept rows are
+    the generated prefix tokens' except the last, whose route the resumed
+    call's own prefill computes. Restore and completion both log this, so the
+    staged row can be checked against the routes restored from TQ.
+
+    Returns:
+        A SHA-256 hex digest over the kept rows as int32, or ``"none"`` when
+        the call carries no routes.
+    """
+    if delta_routes is None:
+        return "none"
+    end = int(delta_routes.shape[0])
+    kept = delta_routes[end - generated_prefix_tokens : end - 1]
+    return hashlib.sha256(
+        kept.to(torch.int32).contiguous().numpy().tobytes()
+    ).hexdigest()
 
 
 @dataclass
@@ -47,6 +92,19 @@ class _RequestCaptureState:
 
     call: Any
     prompt_token_ids: list[int]
+    # Router replay: a cut reads the engine's routes once, after it freezes
+    # the token count; see ``frozen_cut_routed_experts``.
+    capture_routed_experts: bool = False
+    routed_experts_dtype: torch.dtype = torch.int16
+    restored_routed_experts: torch.Tensor | None = None
+    # The engine's ID for this request, from its first output.
+    engine_request_id: str | None = None
+    # Full-sequence routes from the request's final output.
+    terminal_routed_experts: torch.Tensor | None = None
+    # The engine's route pieces joined so far, and how many pieces they cover:
+    # a cut converts only the pieces vLLM appended since. Cut-path only.
+    engine_routes: torch.Tensor | None = None
+    engine_route_piece_count: int = 0
     # Backend-owned opaque state that must survive until the terminal row is
     # staged. vLLM uses this for its processed-media snapshot; the first
     # generation-prefix row carries its tensor digests across recovery.
@@ -93,6 +151,20 @@ class _RequestCaptureState:
         self.generated_token_ids.extend(generated_token_ids)
         self.generated_logprobs.extend(generated_logprobs)
 
+    def _cumulative_route_count(self, generated_token_count: int) -> int:
+        """Rows in the delta-aligned routes of the first generated tokens.
+
+        One row per delta token: the prompt tokens past ``prev_len`` and the
+        generated ones, the last being the final-position placeholder.
+        """
+        if self.restored_routed_experts is not None:
+            return int(self.restored_routed_experts.shape[0]) + generated_token_count
+        return (
+            len(self.prompt_token_ids)
+            - self.call.admission.prev_len
+            + generated_token_count
+        )
+
     def freeze_for_checkpoint(
         self, checkpoint_id: str
     ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
@@ -114,6 +186,112 @@ class _RequestCaptureState:
             self.generated_token_ids[:frozen],
             self.generated_logprobs[:frozen],
         )
+
+    def absorb_engine_route_pieces(self, pieces: list[Any]) -> torch.Tensor:
+        """Join the engine's route pieces, converting only the new ones.
+
+        ``pieces`` is the request's whole route list as vLLM holds it. vLLM
+        only appends to it, so the pieces already joined are skipped and the
+        new ones are joined in one call. Returns the request's full-sequence
+        routes.
+
+        Raises:
+            ValueError: the list shrank, or a piece is not
+                ``[rows, layers, topk]`` with this request's model dimensions.
+        """
+        if len(pieces) < self.engine_route_piece_count:
+            raise ValueError(
+                "vLLM's route list shrank: "
+                f"{len(pieces)} pieces, {self.engine_route_piece_count} already joined"
+            )
+        new = pieces[self.engine_route_piece_count :]
+        if new:
+            # One concatenate instead of one conversion per piece; it raises
+            # ValueError if the pieces' dimensions disagree.
+            joined = torch.from_numpy(np.concatenate([np.asarray(p) for p in new]))
+            if joined.dim() != 3 or joined.shape[1] < 1 or joined.shape[2] < 1:
+                raise ValueError("vLLM route pieces must be [rows, layers, topk]")
+            if self.engine_routes is not None:
+                if tuple(joined.shape[1:]) != tuple(self.engine_routes.shape[1:]):
+                    raise ValueError("vLLM route pieces changed model dimensions")
+                joined = torch.cat(
+                    (self.engine_routes, joined.to(self.engine_routes.dtype))
+                )
+            self.engine_routes = joined
+            self.engine_route_piece_count = len(pieces)
+        if self.engine_routes is None:
+            raise ValueError("vLLM has not routed any token of the request yet")
+        return self.engine_routes
+
+    def frozen_cut_routed_experts(
+        self, engine_routed_experts: Any | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the routes of the cut in progress: its chunk's, then the prefix's.
+
+        ``engine_routed_experts`` are the request's full-sequence routes, read
+        from the engine after the freeze; ``None`` once the request has left
+        the engine. Rows decoding added after the freeze are dropped. vLLM only
+        appends routes, so earlier rows never change and every cut stages rows
+        that line up with what earlier cuts staged. The final output's routes
+        are used when the request has finished.
+
+        The chunk has one row per chunk token; the prefix's cumulative routes
+        end with a final placeholder row.
+
+        Raises:
+            ValueError: the routes are malformed, or do not cover every
+                frozen token.
+        """
+        if self.frozen_cut is None:
+            raise RuntimeError("no generation cut is in progress")
+        if not self.capture_routed_experts:
+            return None, None
+        frozen = self.frozen_cut[1]
+        staged = self.staged_token_count
+        restored = self.restored_routed_experts
+        if frozen == 0:
+            # Nothing decoded since the restore: the prefix is the restored one.
+            return None, None if restored is None else restored.clone()
+        raw = self.terminal_routed_experts
+        if raw is None:
+            raw = engine_routed_experts
+        if raw is None:
+            raise ValueError(
+                "the request left vLLM before its routes were read for the cut"
+            )
+        raw = torch.as_tensor(raw, dtype=self.routed_experts_dtype).cpu()
+        if raw.dim() != 3 or raw.shape[1] < 1 or raw.shape[2] < 1:
+            raise ValueError("routed experts must have shape [tokens, layers, topk]")
+        layers, topk = int(raw.shape[1]), int(raw.shape[2])
+        # Rows parent lineage or the restored cut already own.
+        skip = self.call.admission.prev_len
+        if restored is not None:
+            if tuple(restored.shape[1:]) != (layers, topk):
+                raise ValueError("restored routed experts changed model dimensions")
+            skip += int(restored.shape[0]) - 1
+        # The last frozen token is not routed until a later step prefills it.
+        needed = self._cumulative_route_count(frozen) - 1
+        if restored is not None:
+            needed -= int(restored.shape[0]) - 1
+        routes = raw[skip : skip + needed]
+        if routes.shape[0] < needed:
+            # vLLM can omit route rows (prefix caching with chunked prefill).
+            # Padding would shift later rows onto the wrong tokens, and a later
+            # cut would see different rows than this one staged.
+            raise ValueError(
+                "vLLM returned fewer routed experts than the frozen tokens need: "
+                f"routes={routes.shape[0]} needed={needed}"
+            )
+        final = _final_route_placeholder(layers, topk, self.routed_experts_dtype)
+        parts = [routes, final] if restored is None else [restored[:-1], routes, final]
+        cumulative = torch.cat(parts, dim=0).contiguous()
+        if frozen == staged:
+            return None, cumulative
+        if staged == 0 and restored is None:
+            return cumulative, cumulative
+        # The previous placeholder row becomes this chunk's first route.
+        start = self._cumulative_route_count(staged) - 1
+        return cumulative[start:-1], cumulative
 
     def seal_frozen_cut(self, checkpoint_id: str) -> None:
         """Count a successfully staged cut's tokens as written to TQ."""
@@ -147,10 +325,11 @@ class _CompletedCaptureState:
 
 @dataclass(frozen=True)
 class _ResolvedGenerationCut:
-    """A verified restored prefix and the media its call carried."""
+    """A verified restored prefix, with its call's media and router-replay routes."""
 
     snapshot: Any
     media: Any | None = None
+    routed_experts: torch.Tensor | None = None
 
 
 def _remaining_generation_limits_after_prefix(
@@ -239,12 +418,13 @@ class GenerationCutCaptureMixin:
     """
 
     # Initialized by the vLLM worker; declared so type checkers can see the
-    # insertion-ordered dicts this mixin evicts from.
+    # insertion-ordered dicts this mixin evicts from and the route dtype.
     _completed_capture_calls: dict[str, _CompletedCaptureState]
     _generation_cut_receipts: dict[tuple[str, str], Any]
     _generation_cut_tokenizer: Any
     _restored_generation_prefix_calls: int
     _restored_generation_prefix_tokens: int
+    routed_experts_dtype: torch.dtype
 
     def _generation_cut_record_payload(
         self, state: _RequestCaptureState
@@ -256,6 +436,21 @@ class GenerationCutCaptureMixin:
         """
         del state
         return None
+
+    def _return_routed_experts_enabled(self) -> bool:
+        """Whether calls carry router-replay routes; the host implements this."""
+        raise NotImplementedError
+
+    def _snapshot_engine_routed_experts(
+        self, engine_request_id: str, *, timeout_s: float | None
+    ) -> list[Any] | None:
+        """Return an active request's route pieces from the engine, in order.
+
+        ``None`` once the request has left the engine. Backends that serve
+        router replay override this.
+        """
+        del engine_request_id, timeout_s
+        raise NotImplementedError("this backend cannot read routes for a cut")
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -311,25 +506,90 @@ class GenerationCutCaptureMixin:
             )
         staging_keys = list(continuation.staging_keys)
         # The finalization read also returns each row's extras, which carry a
-        # media call's spans and tensor digests; plain ``fetch`` does not.
-        chunks = self._staging_source.fetch_for_finalization(staging_keys)
+        # media call's spans and tensor digests, and its route fragment when
+        # router replay is on; plain ``fetch`` returns neither.
+        chunks = self._staging_source.fetch_for_finalization(
+            staging_keys,
+            include_route_fragments=self._return_routed_experts_enabled(),
+        )
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         if not chunks:
             raise RuntimeError("generation-cut continuation has no staged chunks")
         return chunks
 
+    def _generation_cut_routes(
+        self, chunks: list[Any], snapshots: list[Any]
+    ) -> torch.Tensor | None:
+        """Verify each cut chunk's route fragment against its digest and join them.
+
+        The first chunk stores a normal full, delta-aligned route tensor whose
+        last row is the unused final-position placeholder. Every later chunk
+        stores one route per chunk token: its first row replaces that
+        placeholder, and a new placeholder is appended at the new boundary.
+        """
+        fragments = [chunk.fragment for chunk in chunks]
+        if all(fragment is None for fragment in fragments):
+            if self._return_routed_experts_enabled():
+                raise RuntimeError(
+                    "generation-cut checkpoint has no router-replay payload"
+                )
+            return None
+        if any(fragment is None for fragment in fragments):
+            raise RuntimeError("generation-cut route fragments are incomplete")
+
+        routes: torch.Tensor | None = None
+        for chunk, snapshot, fragment in zip(chunks, snapshots, fragments, strict=True):
+            assert fragment is not None
+            if chunk.routed_len != snapshot.delta_len:
+                raise RuntimeError(
+                    "generation-cut route length does not match token delta: "
+                    f"routes={chunk.routed_len} tokens={snapshot.delta_len}"
+                )
+            if not verify_route_fragment_integrity(
+                fragment,
+                extras_digest_version=snapshot.extras_digest_version,
+                expected_extras_digest=snapshot.extras_digest,
+            ):
+                raise RuntimeError(
+                    "generation-cut route fragment failed integrity check"
+                )
+            fragment_routes = fragment.routes.cpu().contiguous()
+            if fragment_routes.dim() != 3:
+                raise RuntimeError("generation-cut routes must have rank 3")
+            if routes is None:
+                routes = fragment_routes
+                continue
+            if tuple(fragment_routes.shape[1:]) != tuple(routes.shape[1:]):
+                raise RuntimeError("generation-cut route model dimensions changed")
+            final = _final_route_placeholder(
+                int(fragment_routes.shape[1]),
+                int(fragment_routes.shape[2]),
+                fragment_routes.dtype,
+            )
+            routes = torch.cat((routes[:-1], fragment_routes, final), dim=0)
+
+        assert routes is not None
+        expected_len = sum(snapshot.delta_len for snapshot in snapshots)
+        if routes.shape[0] != expected_len:
+            raise RuntimeError(
+                "rebuilt generation-cut routes do not match cumulative token delta"
+            )
+        return routes
+
     def _rebuild_generation_cut_snapshot(
         self, admission: Any, prefix_token_ids: list[int], chunks: list[Any]
-    ) -> Any:
+    ) -> _ResolvedGenerationCut:
         """Rebuild and verify the cumulative staged prefix from its fetched chunks."""
         snapshots = [chunk.snapshot for chunk in chunks]
+        # The source pops each chunk's route payload out of its decoded extras,
+        # so a router-replay chunk with nothing else decodes as ``{}``.
         extras_by_chunk = [chunk.extras for chunk in chunks]
-        if any(extras is not None for extras in extras_by_chunk[1:]):
+        if any(extras for extras in extras_by_chunk[1:]):
             raise RuntimeError(
                 "only the first generation-cut chunk may carry call extras"
             )
-        extras = extras_by_chunk[0]
+        call_extras = extras_by_chunk[0]
         continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
@@ -381,6 +641,11 @@ class GenerationCutCaptureMixin:
         # chunks. The cumulative snapshot uses the oldest contributing version
         # so downstream replay-buffer staleness checks remain conservative.
         weight_version = weight_versions[0]
+        # Routes are checked per chunk here and stay out of the prefix digest.
+        # With them popped, a text call's first-chunk extras read back as {};
+        # the cut digested no extras at all, so match it.
+        routed_experts = self._generation_cut_routes(chunks, snapshots)
+        extras = call_extras or None
         extras_digest = compute_extras_digest(extras)
         chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
         cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
@@ -435,7 +700,8 @@ class GenerationCutCaptureMixin:
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
             "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
-            "weight_version_span=[%d,%d] prefix_ids_sha256=%s",
+            "weight_version_span=[%d,%d] prefix_ids_sha256=%s "
+            "prefix_routes_sha256=%s",
             admission.rollout_id,
             admission.model_call_id,
             continuation.source_model_call_id,
@@ -444,15 +710,18 @@ class GenerationCutCaptureMixin:
             weight_versions[0],
             weight_versions[-1],
             prefix_ids_sha256,
+            _prefix_routes_sha256(
+                routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
+            ),
         )
-        return snapshot
+        return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
 
     def _resolve_generation_cut(
         self,
         admission: Any,
         prefix_token_ids: list[int],
         snapshots: list[Any] | None = None,
-    ) -> Any | None:
+    ) -> _ResolvedGenerationCut | None:
         """Fetch and rebuild the cumulative staged prefix named by an admission."""
         continuation = admission.generation_cut
         if continuation is None:
@@ -490,9 +759,10 @@ class GenerationCutCaptureMixin:
             # One fetch serves both the media and the prefix.
             chunks = self._fetch_generation_cut_chunks(continuation)
             media = self._restore_generation_cut_media(chunks)
-            snapshot = GenerationCutCaptureMixin._resolve_generation_cut(
+            resolved = GenerationCutCaptureMixin._resolve_generation_cut(
                 self, admission, prefix_token_ids, chunks
             )
+            snapshot = resolved.snapshot
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
             if snapshot.digest != continuation.prefix_digest:
@@ -503,7 +773,7 @@ class GenerationCutCaptureMixin:
                     f"rebuilt prefix has {generated} generated tokens, "
                     f"admission expects {continuation.prefix_token_count}"
                 )
-            return admission, _ResolvedGenerationCut(snapshot=snapshot, media=media)
+            return admission, replace(resolved, media=media)
         except Exception:  # noqa: BLE001 - any unusable prefix regenerates
             LOGGER.warning(
                 "cannot restore the generation prefix of model call %s; "
@@ -668,11 +938,45 @@ class GenerationCutCaptureMixin:
         )
         return GenerationCutPrefixAck.failure(prefix)
 
+    def _frozen_cut_engine_routed_experts(
+        self, state: _RequestCaptureState, *, deadline: float | None
+    ) -> Any | None:
+        """Read the engine's routes for a frozen cut that needs them.
+
+        Runs after the freeze, without ``state.lock``, so decoding continues.
+
+        Raises:
+            TimeoutError: the engine did not answer before ``deadline``.
+            ValueError: the engine cannot name the request's routes.
+        """
+        with state.lock:
+            needs_engine_routes = (
+                state.capture_routed_experts
+                and state.frozen_cut is not None
+                and state.frozen_cut[1] > 0
+                and state.terminal_routed_experts is None
+            )
+            engine_request_id = state.engine_request_id
+        if not needs_engine_routes:
+            return None
+        if engine_request_id is None:
+            raise ValueError("no vLLM output has named the request yet")
+        timeout_s = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        pieces = self._snapshot_engine_routed_experts(
+            engine_request_id, timeout_s=timeout_s
+        )
+        if pieces is None:
+            return None
+        # The cut owns the call's lifecycle lock, so only it touches the cache.
+        return state.absorb_engine_route_pieces(pieces)
+
     def _checkpoint_active_generation_cut(
         self,
         prefix: Any,
         state: _RequestCaptureState,
         checkpoint_id: str,
+        *,
+        deadline: float | None = None,
     ) -> Any | None:
         """Cut one live call, or return ``None`` if abort won the race."""
         from nemo_gym._checkpoint.generation_cut import (
@@ -792,26 +1096,75 @@ class GenerationCutCaptureMixin:
                     **prefix.model_dump(mode="json"),
                     disposition="durable_failure",
                 )
+            try:
+                engine_routed_experts = self._frozen_cut_engine_routed_experts(
+                    state, deadline=deadline
+                )
+                with state.lock:
+                    (
+                        chunk_routed_experts,
+                        cumulative_routed_experts,
+                    ) = state.frozen_cut_routed_experts(engine_routed_experts)
+            except (TimeoutError, TypeError, ValueError) as error:
+                # Only this call regenerates; the rest of the inventory is cut,
+                # and the next checkpoint tries this call again.
+                with state.lock:
+                    state.rollback_frozen_cut(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: routed experts: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return GenerationCutPrefixAck(
+                    **prefix.model_dump(mode="json"),
+                    disposition="durable_failure",
+                )
+
             staged_key = None
             try:
-                extras = self._generation_cut_record_payload(state)
+                # The advertised prefix digest covers tokens and call extras,
+                # not routes: each chunk's own digest covers its routes, and a
+                # restore checks every chunk's routes against it. Hashing the
+                # whole prefix's routes on every cut would cost far more than
+                # the tokens.
+                call_extras = self._generation_cut_record_payload(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=generated_logprobs,
-                    extras=extras,
+                    extras=call_extras,
                 )
                 if chunk_token_ids:
-                    chunk_record = (
-                        cumulative_record
-                        if not state.generation_cut_staging_keys
-                        else capture.build_generation_chunk_record(
+                    chunk_route_extras = (
+                        None
+                        if chunk_routed_experts is None
+                        else {
+                            "routed_experts": encode_routed_experts(
+                                chunk_routed_experts
+                            )
+                        }
+                    )
+                    if state.generation_cut_staging_keys:
+                        chunk_record = capture.build_generation_chunk_record(
                             state.call,
                             generated_token_ids=chunk_token_ids,
                             generated_logprobs=chunk_logprobs,
+                            extras=chunk_route_extras,
                         )
-                    )
+                    elif chunk_route_extras is None:
+                        chunk_record = cumulative_record
+                    else:
+                        # The first chunk is the whole prefix so far, with its
+                        # routes beside the call's extras.
+                        chunk_record = capture.build_prefix_record(
+                            state.call,
+                            prompt_token_ids=state.prompt_token_ids,
+                            generated_token_ids=generated_token_ids,
+                            generated_logprobs=generated_logprobs,
+                            extras={**(call_extras or {}), **chunk_route_extras},
+                        )
                     result = sink.stage_generation_prefix(
                         chunk_record,
                         checkpoint_id=checkpoint_id,
@@ -911,7 +1264,7 @@ class GenerationCutCaptureMixin:
             try:
                 acknowledgement = (
                     self._checkpoint_active_generation_cut(
-                        prefix, state, inventory.checkpoint_id
+                        prefix, state, inventory.checkpoint_id, deadline=deadline
                     )
                     if state is not None
                     else None
