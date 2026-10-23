@@ -317,7 +317,6 @@ def test_train_normalizes_survivors_before_optimizer_step(
         raise OptimizerReached
 
     worker = MagicMock()
-    worker._policy_profiler = None
     worker.dp_size = 1
     worker.mtp_enabled = False
     worker.model.modules.return_value = []

@@ -109,7 +109,6 @@ class MockGenerationInterface:
     """Mock generation interface for testing."""
 
     def __init__(self):
-        self.rollout_profiler_enabled = False
         self.prepare_calls = 0
         self.finish_calls = 0
         self.pause_generation_for_refit_calls: list[bool] = []
@@ -1361,15 +1360,11 @@ class TestAsyncTrajectoryCollector:
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal=None,
         resume_covered_task_indices=None,
-        rollout_profiler_enabled: bool = False,
-        enable_rollout_profile_windows: bool = False,
-        policy_generation=None,
+        profile_full_run: bool = False,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
-        if policy_generation is None:
-            policy_generation = MockGenerationInterface()
-            policy_generation.rollout_profiler_enabled = rollout_profiler_enabled
+        mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
         task_to_env = {}
         master_config = self.create_mock_config()
@@ -1379,7 +1374,7 @@ class TestAsyncTrajectoryCollector:
             replay_buffer.get_held_task_indices.remote.return_value = []
 
         return collector_cls(
-            policy_generation=policy_generation,
+            policy_generation=mock_generation,
             tokenizer=mock_tokenizer,
             task_to_env=task_to_env,
             master_config=master_config,
@@ -1390,7 +1385,7 @@ class TestAsyncTrajectoryCollector:
             ordinals_frontier_aligned=ordinals_frontier_aligned,
             resume_frontier_ordinal=resume_frontier_ordinal,
             resume_covered_task_indices=resume_covered_task_indices,
-            enable_rollout_profile_windows=enable_rollout_profile_windows,
+            profile_full_run=profile_full_run,
         )
 
     def _prime_collection_loop(self, collector):
@@ -1405,635 +1400,6 @@ class TestAsyncTrajectoryCollector:
             setattr(collector, attr, ev)
         collector._should_pause_for_generation_limits = lambda: False
         collector.running = True
-
-    @staticmethod
-    def _enable_rollout_profiler(collector):
-        collector._profile_async_grpo_rollouts = True
-        collector.policy_generation.rollout_profiler_enabled = True
-        collector.policy_generation.begin_rollout_profile = mock.MagicMock()
-        collector.policy_generation.finish_rollout_profile = mock.MagicMock()
-        collector.policy_generation.abort_rollout_profile = mock.MagicMock()
-
-    def test_rollout_profile_owner_is_nonblocking_and_hands_off(self):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-
-        with collector._profile_rollout_batch(
-            generation_weight_version=1, target_weight_version=2
-        ) as first_owner:
-            assert first_owner is True
-            with collector._profile_rollout_batch(
-                generation_weight_version=2, target_weight_version=3
-            ) as overlapping_owner:
-                assert overlapping_owner is False
-
-        with collector._profile_rollout_batch(
-            generation_weight_version=3, target_weight_version=4
-        ) as next_owner:
-            assert next_owner is True
-
-        assert collector.policy_generation.begin_rollout_profile.call_args_list == [
-            mock.call(step_id="generation1/target2/attempt1"),
-            mock.call(step_id="generation3/target4/attempt1"),
-        ]
-        assert collector.policy_generation.finish_rollout_profile.call_count == 2
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-
-    def test_rollout_profile_owner_aborts_failed_batch_and_releases_claim(self):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-
-        with pytest.raises(RuntimeError, match="batch failed"):
-            with collector._profile_rollout_batch(
-                generation_weight_version=1, target_weight_version=2
-            ) as owner:
-                assert owner is True
-                raise RuntimeError("batch failed")
-
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_batch_error"
-        )
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-        with collector._profile_rollout_batch(
-            generation_weight_version=2, target_weight_version=3
-        ) as next_owner:
-            assert next_owner is True
-
-    @pytest.mark.parametrize("phase", ["begin", "finish"])
-    def test_rollout_profile_lifecycle_failures_are_immediately_fatal(self, phase):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        getattr(
-            collector.policy_generation, f"{phase}_rollout_profile"
-        ).side_effect = RuntimeError(f"{phase} failed")
-
-        with pytest.raises(RuntimeError, match=f"{phase} failed"):
-            with collector._profile_rollout_batch(
-                generation_weight_version=1, target_weight_version=2
-            ):
-                pass
-
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason=f"async_grpo_rollout_{phase}_error"
-        )
-        with pytest.raises(
-            RuntimeError,
-            match=f"profiler lifecycle failure: {phase} failed",
-        ):
-            collector.check_health()
-        begin_count = collector.policy_generation.begin_rollout_profile.call_count
-        with pytest.raises(trajectory_collector_mod._RolloutProfilerDrainRequested):
-            with collector._profile_rollout_batch(
-                generation_weight_version=2,
-                target_weight_version=3,
-            ):
-                pytest.fail("profiler restarted after a fatal lifecycle failure")
-        assert (
-            collector.policy_generation.begin_rollout_profile.call_count == begin_count
-        )
-        assert collector._rollout_profile_lock.acquire(blocking=False)
-        collector._rollout_profile_lock.release()
-
-    def test_rollout_profile_abort_failure_is_immediately_fatal(self):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        collector.policy_generation.abort_rollout_profile.side_effect = RuntimeError(
-            "abort failed"
-        )
-
-        with pytest.raises(RuntimeError, match="abort failed"):
-            with collector._profile_rollout_batch(
-                generation_weight_version=1,
-                target_weight_version=2,
-            ):
-                raise ValueError("stream failed")
-
-        assert collector.running is False
-        assert collector._draining_for_profiler_shutdown.is_set()
-        with pytest.raises(RuntimeError, match="abort failed"):
-            collector.check_health()
-        assert collector._rollout_profile_lock.acquire(blocking=False)
-        collector._rollout_profile_lock.release()
-        begin_count = collector.policy_generation.begin_rollout_profile.call_count
-        with pytest.raises(trajectory_collector_mod._RolloutProfilerDrainRequested):
-            with collector._profile_rollout_batch(
-                generation_weight_version=2,
-                target_weight_version=3,
-            ):
-                pytest.fail("profiler restarted after abort failure")
-        assert (
-            collector.policy_generation.begin_rollout_profile.call_count == begin_count
-        )
-
-    def test_rollout_profiler_drain_waits_for_owner_to_settle(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            1.0,
-        )
-        owner_started = threading.Event()
-        release_owner = threading.Event()
-        drain_finished = threading.Event()
-
-        def own_profile_window():
-            try:
-                with collector._profile_rollout_batch(
-                    generation_weight_version=1,
-                    target_weight_version=2,
-                ):
-                    owner_started.set()
-                    assert release_owner.wait(timeout=2.0)
-            finally:
-                with collector._threads_lock:
-                    collector._inflight_threads.discard(threading.current_thread())
-
-        worker = threading.Thread(target=own_profile_window, name="rollout-owner")
-        with collector._threads_lock:
-            collector._inflight_threads.add(worker)
-            collector._live_threads.add(worker)
-            worker.start()
-        assert owner_started.wait(timeout=2.0)
-
-        drain_errors = []
-
-        def drain():
-            try:
-                collector.drain_for_rollout_profiler_shutdown()
-            except Exception as error:
-                drain_errors.append(error)
-            finally:
-                drain_finished.set()
-
-        drain_thread = threading.Thread(target=drain, name="profiler-drain")
-        drain_thread.start()
-        assert collector._draining_for_profiler_shutdown.wait(timeout=2.0)
-        assert not drain_finished.is_set()
-        release_owner.set()
-        drain_thread.join(timeout=2.0)
-        worker.join(timeout=2.0)
-
-        assert not drain_thread.is_alive()
-        assert not worker.is_alive()
-        assert drain_errors == []
-        assert collector.running is False
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-
-    def test_rollout_profiler_drain_cancels_async_owner(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            1.0,
-        )
-        owner_started = threading.Event()
-        stream_unwound = threading.Event()
-        owner_errors: list[BaseException] = []
-
-        async def own_profile_window():
-            try:
-                with collector._profile_rollout_batch(
-                    generation_weight_version=1,
-                    target_weight_version=2,
-                ):
-                    owner_started.set()
-                    try:
-                        await asyncio.Event().wait()
-                    finally:
-                        stream_unwound.set()
-            except trajectory_collector_mod._RolloutProfilerDrainRequested:
-                pass
-
-        def run_owner():
-            try:
-                asyncio.run(own_profile_window())
-            except BaseException as error:
-                owner_errors.append(error)
-
-        worker = threading.Thread(target=run_owner, name="async-rollout-owner")
-        worker.start()
-        assert owner_started.wait(timeout=2.0)
-
-        collector.drain_for_rollout_profiler_shutdown()
-        worker.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert stream_unwound.is_set()
-        assert owner_errors == []
-        assert collector.running is False
-        assert not collector._rollout_profile_drain_timed_out.is_set()
-        assert collector._fatal_error_message is None
-        assert collector._rollout_profile_owner is None
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_drain_requested"
-        )
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-        assert collector._rollout_profile_lock.acquire(blocking=False)
-        collector._rollout_profile_lock.release()
-
-    def test_rollout_profiler_drain_does_not_cancel_settled_async_owner(
-        self, monkeypatch
-    ):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            1.0,
-        )
-        finish_started = threading.Event()
-        release_finish = threading.Event()
-        post_profile_work_completed = threading.Event()
-        owner_errors: list[BaseException] = []
-        drain_errors: list[BaseException] = []
-
-        def blocked_finish():
-            finish_started.set()
-            assert release_finish.wait(timeout=2.0)
-
-        collector.policy_generation.finish_rollout_profile.side_effect = blocked_finish
-
-        async def own_profile_window():
-            with collector._profile_rollout_batch(
-                generation_weight_version=1,
-                target_weight_version=2,
-            ):
-                pass
-            # Yield after releasing ownership. A stale queued cancellation must
-            # not escape the profile context and cancel this post-profile work.
-            await asyncio.sleep(0)
-            post_profile_work_completed.set()
-
-        def run_owner():
-            try:
-                asyncio.run(own_profile_window())
-            except BaseException as error:
-                owner_errors.append(error)
-
-        def drain():
-            try:
-                collector.drain_for_rollout_profiler_shutdown()
-            except BaseException as error:
-                drain_errors.append(error)
-
-        worker = threading.Thread(target=run_owner, name="settling-async-owner")
-        worker.start()
-        assert finish_started.wait(timeout=2.0)
-
-        drain_thread = threading.Thread(target=drain, name="profile-drain")
-        drain_thread.start()
-        assert collector._draining_for_profiler_shutdown.wait(timeout=2.0)
-        release_finish.set()
-        worker.join(timeout=2.0)
-        drain_thread.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert not drain_thread.is_alive()
-        assert owner_errors == []
-        assert drain_errors == []
-        assert post_profile_work_completed.is_set()
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-
-    def test_rollout_profiler_drain_cancel_abort_failure_is_fatal(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        collector.policy_generation.abort_rollout_profile.side_effect = RuntimeError(
-            "abort failed"
-        )
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            1.0,
-        )
-        owner_started = threading.Event()
-        owner_errors: list[BaseException] = []
-
-        async def own_profile_window():
-            with collector._profile_rollout_batch(
-                generation_weight_version=1,
-                target_weight_version=2,
-            ):
-                owner_started.set()
-                await asyncio.Event().wait()
-
-        def run_owner():
-            try:
-                asyncio.run(own_profile_window())
-            except BaseException as error:
-                owner_errors.append(error)
-
-        worker = threading.Thread(target=run_owner, name="failing-async-rollout-owner")
-        worker.start()
-        assert owner_started.wait(timeout=2.0)
-
-        with pytest.raises(RuntimeError, match="abort failed"):
-            collector.drain_for_rollout_profiler_shutdown()
-        worker.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert len(owner_errors) == 1
-        assert isinstance(
-            owner_errors[0], trajectory_collector_mod._RolloutProfilerLifecycleError
-        )
-        assert collector.running is False
-        assert not collector._rollout_profile_drain_timed_out.is_set()
-        assert collector._rollout_profile_owner is None
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_drain_requested"
-        )
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-
-    def test_rollout_profiler_drain_times_out_on_blocked_owner(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            0.05,
-        )
-        owner_started = threading.Event()
-        release_owner = threading.Event()
-
-        def blocked_owner():
-            try:
-                with collector._profile_rollout_batch(
-                    generation_weight_version=1,
-                    target_weight_version=2,
-                ):
-                    owner_started.set()
-                    release_owner.wait(timeout=2.0)
-            finally:
-                with collector._threads_lock:
-                    collector._inflight_threads.discard(threading.current_thread())
-
-        worker = threading.Thread(target=blocked_owner, name="blocked-rollout-owner")
-        with collector._threads_lock:
-            collector._inflight_threads.add(worker)
-            collector._live_threads.add(worker)
-            worker.start()
-        assert owner_started.wait(timeout=2.0)
-
-        with pytest.raises(
-            RuntimeError,
-            match="did not settle within the 30-second profiler drain budget",
-        ):
-            collector.drain_for_rollout_profiler_shutdown()
-
-        assert collector.running is False
-        with pytest.raises(RuntimeError, match="profiler lifecycle failure"):
-            collector.check_health()
-
-        release_owner.set()
-        worker.join(timeout=2.0)
-        assert not worker.is_alive()
-        assert collector._rollout_profile_drain_timed_out.is_set()
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-
-    def test_rollout_profiler_drain_timeout_remains_fatal_after_late_finish(
-        self, monkeypatch
-    ):
-        """A blocked finish cannot turn a timed-out shutdown into success."""
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            0.05,
-        )
-        finish_started = threading.Event()
-        release_finish = threading.Event()
-
-        def blocked_finish():
-            finish_started.set()
-            assert release_finish.wait(timeout=2.0)
-
-        collector.policy_generation.finish_rollout_profile.side_effect = blocked_finish
-
-        def profile_attempt():
-            with collector._profile_rollout_batch(
-                generation_weight_version=1,
-                target_weight_version=2,
-            ):
-                pass
-
-        worker = threading.Thread(target=profile_attempt, name="blocked-profile-finish")
-        worker.start()
-        assert finish_started.wait(timeout=2.0)
-
-        with pytest.raises(RuntimeError, match="did not settle"):
-            collector.drain_for_rollout_profiler_shutdown()
-
-        release_finish.set()
-        worker.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert collector._rollout_profile_drain_timed_out.is_set()
-        assert collector.running is False
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-        with pytest.raises(RuntimeError, match="profiler lifecycle failure"):
-            collector.check_health()
-
-    def test_drain_timeout_prevents_stream_after_blocked_begin(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            0.05,
-        )
-        begin_started = threading.Event()
-        release_begin = threading.Event()
-        stream_started = threading.Event()
-        profile_errors = []
-
-        def blocked_begin(*, step_id):
-            begin_started.set()
-            assert release_begin.wait(timeout=2.0)
-
-        collector.policy_generation.begin_rollout_profile.side_effect = blocked_begin
-
-        def profile_attempt():
-            try:
-                with collector._profile_rollout_batch(
-                    generation_weight_version=1,
-                    target_weight_version=2,
-                ):
-                    stream_started.set()
-            except Exception as error:
-                profile_errors.append(error)
-
-        worker = threading.Thread(target=profile_attempt, name="blocked-profile-begin")
-        worker.start()
-        assert begin_started.wait(timeout=2.0)
-
-        with pytest.raises(RuntimeError, match="did not settle"):
-            collector.drain_for_rollout_profiler_shutdown()
-
-        release_begin.set()
-        worker.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert not stream_started.is_set()
-        assert len(profile_errors) == 1
-        assert isinstance(
-            profile_errors[0],
-            trajectory_collector_mod._RolloutProfilerDrainRequested,
-        )
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_drain_timeout"
-        )
-
-    def test_drain_request_prevents_stream_after_blocked_begin(self, monkeypatch):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "_ROLLOUT_PROFILER_COLLECTION_DRAIN_TIMEOUT_S",
-            1.0,
-        )
-        begin_started = threading.Event()
-        release_begin = threading.Event()
-        stream_started = threading.Event()
-        profile_errors = []
-        drain_errors = []
-
-        def blocked_begin(*, step_id):
-            begin_started.set()
-            assert release_begin.wait(timeout=2.0)
-
-        collector.policy_generation.begin_rollout_profile.side_effect = blocked_begin
-
-        def profile_attempt():
-            try:
-                with collector._profile_rollout_batch(
-                    generation_weight_version=1,
-                    target_weight_version=2,
-                ):
-                    stream_started.set()
-            except Exception as error:
-                profile_errors.append(error)
-
-        worker = threading.Thread(target=profile_attempt, name="blocked-profile-begin")
-        worker.start()
-        assert begin_started.wait(timeout=2.0)
-
-        def drain():
-            try:
-                collector.drain_for_rollout_profiler_shutdown()
-            except Exception as error:
-                drain_errors.append(error)
-
-        drain_thread = threading.Thread(target=drain, name="profile-drain")
-        drain_thread.start()
-        assert collector._draining_for_profiler_shutdown.wait(timeout=2.0)
-        release_begin.set()
-        worker.join(timeout=2.0)
-        drain_thread.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        assert not drain_thread.is_alive()
-        assert not stream_started.is_set()
-        assert len(profile_errors) == 1
-        assert isinstance(
-            profile_errors[0],
-            trajectory_collector_mod._RolloutProfilerDrainRequested,
-        )
-        assert drain_errors == []
-        collector.policy_generation.finish_rollout_profile.assert_not_called()
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_drain_requested"
-        )
-
-    def test_disabled_rollout_profiler_drain_is_inert(self):
-        collector = self.create_local_collector()
-        collector.running = True
-
-        collector.drain_for_rollout_profiler_shutdown()
-
-        assert collector.running is True
-        assert not collector._draining_for_profiler_shutdown.is_set()
-
-    def test_rollout_profile_late_entrant_after_drain_never_begins(self):
-        collector = self.create_local_collector()
-        self._enable_rollout_profiler(collector)
-
-        class DrainRacingLock:
-            def acquire(self, blocking=True, timeout=-1):
-                collector._draining_for_profiler_shutdown.set()
-                return True
-
-            def release(self):
-                return None
-
-        collector._rollout_profile_lock = DrainRacingLock()
-
-        with pytest.raises(trajectory_collector_mod._RolloutProfilerDrainRequested):
-            with collector._profile_rollout_batch(
-                generation_weight_version=1,
-                target_weight_version=2,
-            ):
-                pytest.fail("late rollout stream started after drain")
-
-        collector.policy_generation.begin_rollout_profile.assert_not_called()
-
-    def test_async_grpo_profiler_requires_explicit_window_enable(self):
-        disabled = self.create_local_collector(rollout_profiler_enabled=True)
-        enabled = self.create_local_collector(
-            rollout_profiler_enabled=True,
-            enable_rollout_profile_windows=True,
-        )
-
-        assert disabled._profile_async_grpo_rollouts is False
-        assert enabled._profile_async_grpo_rollouts is True
-
-    def test_process_batch_does_not_start_after_profiler_drain(self, monkeypatch):
-        class RemoteMethod:
-            def remote(self, *args, **kwargs):
-                return 1
-
-        class FakeReplayBuffer:
-            get_trajectories_needed = RemoteMethod()
-
-        class FakeBatch:
-            size = 1
-
-        target_weight = 5
-        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
-        collector.running = True
-
-        def reserve_target(generation_weight_version):
-            collector._generating_targets.add(target_weight)
-            return target_weight
-
-        collector._get_next_target_for_generation = reserve_target
-        collector._draining_for_profiler_shutdown.set()
-        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
-        thread_factory = mock.MagicMock()
-        monkeypatch.setattr(
-            trajectory_collector_mod._threading,
-            "Thread",
-            thread_factory,
-        )
-
-        batch = FakeBatch()
-        assert collector._process_batch(batch) is batch
-        assert target_weight not in collector._generating_targets
-        thread_factory.assert_not_called()
 
     def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
         collector = self.create_local_collector()
@@ -3157,37 +2523,6 @@ class TestAsyncTrajectoryCollector:
         assert collector._max_trajectory_age_steps == 5
         assert collector._calculate_target_weights(2) == [3, 4, 5]
 
-    def test_collector_rejects_rollout_profiler_for_async_ppo(self):
-        """PPO has no profiler drain-before-worker-shutdown contract yet."""
-        from nemo_rl.algorithms.ppo import (
-            AsyncPPOConfig,
-            PPOConfig,
-        )
-        from nemo_rl.algorithms.ppo import (
-            MasterConfig as PPOMasterConfig,
-        )
-
-        master_config = PPOMasterConfig.model_construct(
-            ppo=PPOConfig.model_construct(
-                num_prompts_per_step=2,
-                num_generations_per_prompt=4,
-                max_rollout_turns=1,
-                async_ppo=AsyncPPOConfig(max_trajectory_age_steps=3),
-            ),
-        )
-        generation = MockGenerationInterface()
-        generation.rollout_profiler_enabled = True
-        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
-
-        with pytest.raises(ValueError, match="not async PPO"):
-            collector_cls(
-                policy_generation=generation,
-                tokenizer=mock.MagicMock(),
-                task_to_env={},
-                master_config=master_config,
-                replay_buffer=mock.MagicMock(),
-            )
-
     def test_collector_grpo_window_remains_fixed(self):
         collector = self.create_local_collector()
 
@@ -3453,6 +2788,133 @@ class TestAsyncTrajectoryCollector:
             collector.resume_after_refit()
 
         assert not collector._refit_pause_cleared.is_set()
+
+    def _four_phase_collector(self, *, native_pause: bool = True):
+        """Async-engine collector whose rollout capture commands are recorded."""
+        collector = self.create_local_collector(profile_full_run=True)
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.wait_for_pending_generations = mock.Mock()
+        generation = collector.policy_generation
+        generation.pause_generation_for_refit_supported = native_pause
+        events = []
+        pause = generation.pause_generation_for_refit
+
+        def record_pause(*, clear_cache):
+            events.append(("pause", {}))
+            return pause(clear_cache=clear_cache)
+
+        generation.pause_generation_for_refit = record_pause
+        generation.full_step_profile = mock.Mock(
+            side_effect=lambda command, **kwargs: events.append((command, kwargs))
+        )
+        collector.set_weight_version(3)
+        collector.begin_rollout_profile_epoch(3)
+        collector.resume_after_refit()
+        return collector, events
+
+    def test_four_phase_epoch_hands_over_after_native_pause(self):
+        collector, events = self._four_phase_collector()
+
+        collector.prepare_for_refit()
+        # Without resumed generation, another pause is not a new epoch.
+        collector.prepare_for_refit()
+
+        assert [command for command, _ in events] == [
+            "begin_step",
+            "begin_phase",
+            "pause",
+            "end_phase",
+            "finish_step",
+            "begin_step",
+            "pause",
+        ]
+        assert events[0][1]["step_id"] == "generation3"
+        assert events[1][1]["labels"] == {
+            "weight_version": 3,
+            "eligible_target_weight_versions": collector._calculate_target_weights(3),
+            "ownership": "process_epoch",
+            "request_assignment": "may_cross_weight_epochs",
+        }
+        assert events[5][1] == {
+            "step_id": "generation4",
+            "attempt": 0,
+            "weight_version": 4,
+        }
+
+    def test_four_phase_epoch_requires_native_pause(self):
+        collector, events = self._four_phase_collector(native_pause=False)
+
+        with pytest.raises(RuntimeError, match="native generation pause"):
+            collector.prepare_for_refit()
+
+        assert "finish_step" not in [command for command, _ in events]
+
+    def test_four_phase_shutdown_quiesces_before_separate_save(self):
+        collector, events = self._four_phase_collector()
+        collector.running = True
+        events.clear()
+
+        with pytest.raises(RuntimeError, match="not quiesced"):
+            collector.finalize_rollout_profiler_shutdown()
+        collector.drain_for_rollout_profiler_shutdown()
+
+        assert [command for command, _ in events] == ["pause", "end_phase"]
+        assert collector.running is False
+        collector.finalize_rollout_profiler_shutdown()
+        assert [command for command, _ in events] == [
+            "pause",
+            "end_phase",
+            "finish_step",
+        ]
+
+    @pytest.mark.parametrize(
+        ("failure", "reason"),
+        [
+            ("pause", "async_epoch_shutdown_failed"),
+            ("finish_step", "async_epoch_save_failed"),
+        ],
+    )
+    def test_four_phase_shutdown_failure_aborts_epoch(self, failure, reason):
+        collector, events = self._four_phase_collector()
+        record = collector.policy_generation.full_step_profile.side_effect
+
+        def fail(command, **kwargs):
+            record(command, **kwargs)
+            if command == failure:
+                raise RuntimeError("capture failed")
+
+        collector.policy_generation.full_step_profile.side_effect = fail
+        if failure == "pause":
+            collector.policy_generation.pause_generation_for_refit = mock.Mock(
+                side_effect=RuntimeError("capture failed")
+            )
+
+        with pytest.raises(RuntimeError, match="capture failed"):
+            collector.drain_for_rollout_profiler_shutdown()
+            collector.finalize_rollout_profiler_shutdown()
+
+        assert events[-1] == ("abort_step", {"reason": reason})
+        assert collector.running is False
+        with pytest.raises(RuntimeError, match="not quiesced"):
+            collector.finalize_rollout_profiler_shutdown()
+
+    def test_disabled_four_phase_leaves_refit_and_shutdown_untouched(self):
+        collector = self.create_local_collector()
+        collector.policy_generation.full_step_profile = mock.Mock()
+        collector.running = True
+
+        collector.begin_rollout_profile_epoch(0)
+        collector.resume_after_refit()
+        collector.prepare_for_refit()
+        collector.drain_for_rollout_profiler_shutdown()
+        collector.finalize_rollout_profiler_shutdown()
+
+        collector.policy_generation.full_step_profile.assert_not_called()
+        assert collector.running is True
 
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""
@@ -3937,8 +3399,6 @@ class TestAsyncTrajectoryCollector:
     def test_unexpected_replay_buffer_status_fails_batch(self, monkeypatch):
         """Unknown replay-buffer statuses fail instead of polling forever."""
 
-        events = []
-
         class _ReadyResult:
             def __await__(self):
                 async def _resolve():
@@ -3948,7 +3408,6 @@ class TestAsyncTrajectoryCollector:
 
         class _AddRemote:
             def remote(self, *args):
-                events.append("enqueue")
                 return _ReadyResult()
 
         class _ReplayBuffer:
@@ -3962,13 +3421,6 @@ class TestAsyncTrajectoryCollector:
             )
 
         collector = self.create_local_collector(replay_buffer=_ReplayBuffer())
-        self._enable_rollout_profiler(collector)
-        collector.policy_generation.begin_rollout_profile.side_effect = (
-            lambda **kwargs: events.append("begin")
-        )
-        collector.policy_generation.finish_rollout_profile.side_effect = lambda: (
-            events.append("finish")
-        )
         collector.running = True
         monkeypatch.setattr(
             trajectory_collector_mod,
@@ -3989,80 +3441,11 @@ class TestAsyncTrajectoryCollector:
 
         assert exc.value.__cause__ is not None
         assert "unexpected add status" in str(exc.value.__cause__)
-        collector.policy_generation.begin_rollout_profile.assert_called_once_with(
-            step_id="generation2/target3/attempt1"
-        )
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-        assert events == ["begin", "finish", "enqueue"]
 
-    def test_profiler_drain_does_not_wait_for_buffer_full_enqueue(self, monkeypatch):
-        """The stream finishes its profile before terminal enqueue cancellation."""
-
-        class _FullResult:
-            def __await__(self):
-                async def _resolve():
-                    return "full"
-
-                return _resolve().__await__()
-
-        class _AddRemote:
-            def remote(self, *args):
-                return _FullResult()
-
-        class _ReplayBuffer:
-            add = _AddRemote()
-
-        async def fake_rollouts(**kwargs):
-            yield trajectory_collector_mod.RolloutGroupResult(
-                group_index=0,
-                final_batch=BatchedDataDict({"value": torch.tensor([1])}),
-                rollout_metrics={},
-            )
-
-        collector = self.create_local_collector(replay_buffer=_ReplayBuffer())
-        self._enable_rollout_profiler(collector)
-        collector.running = True
-        profile_finished = threading.Event()
-        collector.policy_generation.finish_rollout_profile.side_effect = (
-            profile_finished.set
-        )
-        monkeypatch.setattr(
-            trajectory_collector_mod,
-            "run_async_multi_turn_rollout_groups",
-            fake_rollouts,
-        )
-
-        worker = threading.Thread(
-            target=lambda: asyncio.run(
-                collector._run_rollout_batch_worker(
-                    repeated_batch=self.create_mock_batch(size=1),
-                    generation_weight_version=2,
-                    target_weight_version=3,
-                    num_generations=1,
-                    use_nemo_gym=False,
-                )
-            ),
-            name="buffer-full-nonowner",
-        )
-        worker.start()
-        assert profile_finished.wait(timeout=2.0)
-
-        collector.drain_for_rollout_profiler_shutdown()
-        worker.join(timeout=2.0)
-
-        assert not worker.is_alive()
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-        collector.policy_generation.abort_rollout_profile.assert_not_called()
-        assert collector._fatal_error_message is None
-
-    @pytest.mark.parametrize("first_attempt_failure", ["exception", "incomplete_eof"])
-    def test_nemo_gym_batch_retry_profiles_each_stream_attempt(
-        self, monkeypatch, first_attempt_failure
+    def test_nemo_gym_batch_retry_forwards_effort_config_without_duplicates(
+        self, monkeypatch
     ):
-        """Retries preserve shaping and penalties; each failed capture aborts."""
-
-        events = []
+        """Retries preserve effort shaping and length penalties without re-enqueueing buffered groups."""
 
         class _ReadyResult:
             def __init__(self, value):
@@ -4079,9 +3462,7 @@ class TestAsyncTrajectoryCollector:
                 self.task_indices = []
 
             def remote(self, trajectory_group, *args):
-                task_index = trajectory_group["_ng_task_index"]
-                self.task_indices.append(task_index)
-                events.append(f"enqueue{task_index}")
+                self.task_indices.append(trajectory_group["_ng_task_index"])
                 return _ReadyResult("success")
 
         class FakeReplayBuffer:
@@ -4090,16 +3471,6 @@ class TestAsyncTrajectoryCollector:
 
         replay_buffer = FakeReplayBuffer()
         collector = self.create_local_collector(replay_buffer=replay_buffer)
-        self._enable_rollout_profiler(collector)
-        collector.policy_generation.begin_rollout_profile.side_effect = (
-            lambda *, step_id: events.append(f"begin:{step_id}")
-        )
-        collector.policy_generation.finish_rollout_profile.side_effect = lambda: (
-            events.append("finish")
-        )
-        collector.policy_generation.abort_rollout_profile.side_effect = (
-            lambda *, reason: events.append(f"abort:{reason}")
-        )
         collector.running = True
         collector.master_config.policy["generation"] = {
             "stop_token_ids": [1],
@@ -4162,9 +3533,7 @@ class TestAsyncTrajectoryCollector:
             else:
                 assert task_indices == [8, 8]
             if rollout_calls == 1:
-                if first_attempt_failure == "exception":
-                    raise RuntimeError("transient stream failure")
-                return
+                raise RuntimeError("transient stream failure")
             yield _rollout_result(8)
 
         async def no_sleep(delay):
@@ -4188,22 +3557,6 @@ class TestAsyncTrajectoryCollector:
         assert rollout_calls == 2
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
-        assert collector.policy_generation.begin_rollout_profile.call_args_list == [
-            mock.call(step_id="generation3/target15/attempt1"),
-            mock.call(step_id="generation3/target15/attempt2"),
-        ]
-        collector.policy_generation.abort_rollout_profile.assert_called_once_with(
-            reason="async_grpo_rollout_batch_error"
-        )
-        collector.policy_generation.finish_rollout_profile.assert_called_once_with()
-        assert events == [
-            "begin:generation3/target15/attempt1",
-            "abort:async_grpo_rollout_batch_error",
-            "enqueue7",
-            "begin:generation3/target15/attempt2",
-            "finish",
-            "enqueue8",
-        ]
 
     def test_nemo_gym_actor_death_is_not_retried(self, monkeypatch):
         from ray.exceptions import ActorDiedError

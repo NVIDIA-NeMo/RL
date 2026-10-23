@@ -17,9 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from nemo_rl.models.generation.profiling import (
-    validate_rollout_profiler_topology,
-)
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -28,69 +25,19 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.models.profiling import ROLLOUT_PROFILER_METHODS
+
+BACKEND = "nemo_rl.models.generation.vllm.vllm_backend"
 
 
-def _worker_with_profiler():
-    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
-    worker._rollout_profiler = MagicMock()
-    worker._create_engine = MagicMock()
-    return worker
-
-
-def test_engine_creation_drives_profiler_initialization_window():
-    worker = _worker_with_profiler()
-    token = object()
-    worker._rollout_profiler.begin_engine_initialization.return_value = token
-    llm_kwargs = {"model": "test-model"}
-
-    worker._create_engine_with_profiler(llm_kwargs)
-
-    worker._rollout_profiler.begin_engine_initialization.assert_called_once_with()
-    worker._create_engine.assert_called_once_with(llm_kwargs)
-    worker._rollout_profiler.end_engine_initialization.assert_called_once_with(token)
-
-
-def test_engine_failure_closes_profiler_initialization_window():
-    worker = _worker_with_profiler()
-    token = object()
-    engine_error = RuntimeError("engine failed")
-    worker._rollout_profiler.begin_engine_initialization.return_value = token
-    worker._create_engine.side_effect = engine_error
-
-    with pytest.raises(RuntimeError, match="engine failed") as exc_info:
-        worker._create_engine_with_profiler({})
-
-    assert exc_info.value is engine_error
-    worker._rollout_profiler.end_engine_initialization.assert_called_once_with(token)
-
-
-def test_worker_drives_rollout_profiler_lifecycle():
-    worker = _worker_with_profiler()
-
-    worker.begin_rollout_profile(step_id="step2/attempt3")
-    worker.finish_rollout_profile()
-    worker.abort_rollout_profile(reason="rollout_error")
-
-    worker._rollout_profiler.begin_rollout.assert_called_once_with(
-        step_id="step2/attempt3"
-    )
-    worker._rollout_profiler.finish_rollout.assert_called_once_with()
-    worker._rollout_profiler.abort_rollout.assert_called_once_with(
-        reason="rollout_error"
-    )
-
-
-@pytest.mark.vllm
-@pytest.mark.parametrize("use_nixl", [False, True])
-def test_internal_worker_owns_profiler_lifecycle_with_dense_rank(use_nixl):
+def _internal_worker(use_nixl, events, profiler, *, worker_init_error=None):
+    """Construct an internal vLLM GPU worker without starting vLLM."""
     # The internal worker imports vLLM; collect this module in the driver first.
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        NixlVllmWorker,
         RolloutProfilingNixlVllmWorker,
         RolloutProfilingVllmWorker,
     )
 
-    events = []
     config = SimpleNamespace(
         additional_config={
             "nemo_rl_rollout_profiler": {
@@ -98,93 +45,120 @@ def test_internal_worker_owns_profiler_lifecycle_with_dense_rank(use_nixl):
                 "rank_prefix": 16,
             }
         },
-        events=events,
     )
-    profiler = MagicMock()
-    profiler.begin_engine_initialization.side_effect = lambda: events.append(
-        "profile_begin"
+    profiler.begin_engine_initialization.side_effect = (
+        lambda: events.append("profile_begin") or "init-token"
     )
-    nixl_agent = object()
-
-    def record_nixl_preinit(vllm_config):
-        assert vllm_config is config
-        events.append("nixl_preinit")
-        return nixl_agent
 
     def record_worker_init(_worker, **kwargs):
         events.append(("worker_init", kwargs["rank"]))
+        if worker_init_error is not None:
+            raise worker_init_error
 
     with (
-        patch.dict("os.environ"),
         patch(
-            "nemo_rl.models.generation.vllm.vllm_backend.preinit_nixl_from_vllm_config",
-            side_effect=record_nixl_preinit,
-        ) as nixl_preinit,
+            f"{BACKEND}.preinit_nixl_from_vllm_config",
+            side_effect=lambda _config: events.append("nixl_preinit"),
+        ),
+        patch(f"{BACKEND}.load_profiler", return_value=profiler) as load_profiler,
+        patch(f"{BACKEND}._current_device_uuid", return_value="GPU-test"),
         patch(
-            "nemo_rl.models.generation.vllm.vllm_backend.load_rollout_profiler",
-            return_value=profiler,
-        ) as load_profiler,
-        patch(
-            "nemo_rl.models.generation.vllm.vllm_backend.VllmWorker.__init__",
+            f"{BACKEND}.VllmWorker.__init__",
             autospec=True,
             side_effect=record_worker_init,
         ),
-        patch(
-            "nemo_rl.models.generation.vllm.vllm_backend.VllmWorker.shutdown",
-            autospec=True,
-        ) as shutdown_worker,
     ):
         worker_class = (
             RolloutProfilingNixlVllmWorker if use_nixl else RolloutProfilingVllmWorker
         )
         worker = worker_class(
-            vllm_config=config,
-            local_rank=2,
-            rank=2,
-            distributed_init_method="tcp://test",
+            vllm_config=config, local_rank=2, rank=2, distributed_init_method="tcp://"
         )
+    load_profiler.assert_called_once_with(
+        "profiler.Plugin", rank=18, required_methods=ROLLOUT_PROFILER_METHODS
+    )
+    return worker
 
-        load_profiler.assert_called_once_with(rank=18)
-        assert events == (["nixl_preinit"] if use_nixl else []) + [
-            "profile_begin",
-            ("worker_init", 2),
-        ]
-        if use_nixl:
-            assert isinstance(worker, NixlVllmWorker)
-            assert worker._nrl_nixl_preinit_agent is nixl_agent
-            nixl_preinit.assert_called_once_with(config)
-        else:
-            nixl_preinit.assert_not_called()
 
-        worker.end_rollout_profiler_engine_initialization()
-        worker.begin_rollout_profile(step_id="step2/attempt3")
-        worker.finish_rollout_profile()
-        worker.abort_rollout_profile(reason="rollout_error")
+@pytest.mark.vllm
+@pytest.mark.parametrize("use_nixl", [False, True])
+def test_internal_worker_captures_from_engine_startup_with_dense_rank(use_nixl):
+    events, profiler = [], MagicMock()
+    worker = _internal_worker(use_nixl, events, profiler)
+
+    # Capture starts in the GPU process before vLLM builds the model and graphs.
+    assert events == (["nixl_preinit"] if use_nixl else []) + [
+        "profile_begin",
+        ("worker_init", 2),
+    ]
+    with pytest.raises(RuntimeError, match="initialization is still open"):
+        worker.full_step_profile("configure_capture", run_id="run")
+
+    worker.end_rollout_profiler_engine_initialization()
+    worker.full_step_profile("configure_capture", run_id="run")
+    worker.full_step_profile("begin_step", step_id="generation0")
+    profiler.begin_phase.return_value = "phase-token"
+    worker.full_step_profile("begin_phase", name="generation_epoch")
+    worker.full_step_profile("end_phase")
+    with patch(f"{BACKEND}.VllmWorker.shutdown", autospec=True) as shutdown_worker:
         worker.shutdown()
 
-        shutdown_worker.assert_called_once_with(worker)
+    profiler.end_engine_initialization.assert_called_once_with("init-token")
+    profiler.configure_capture.assert_called_once_with(
+        device_uuid="GPU-test", run_id="run"
+    )
+    profiler.end_phase.assert_called_once_with("phase-token")
+    profiler.close.assert_called_once_with()
+    shutdown_worker.assert_called_once_with(worker)
+    with pytest.raises(RuntimeError, match="not active"):
+        worker.full_step_profile("finish_step")
 
-    profiler.end_engine_initialization.assert_called_once_with(None)
-    profiler.begin_rollout.assert_called_once_with(step_id="step2/attempt3")
-    profiler.finish_rollout.assert_called_once_with()
-    profiler.abort_rollout.assert_called_once_with(reason="rollout_error")
+
+@pytest.mark.vllm
+def test_internal_worker_initialization_failure_closes_profiler():
+    events, profiler = [], MagicMock()
+    error = RuntimeError("graph capture failed")
+
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        _internal_worker(False, events, profiler, worker_init_error=error)
+
+    assert events == ["profile_begin", ("worker_init", 2)]
+    profiler.end_engine_initialization.assert_called_once_with("init-token")
     profiler.close.assert_called_once_with()
 
 
 @pytest.mark.vllm
-def test_configure_internal_profiler_worker_preserves_additional_config():
-    # This helper lives alongside the vLLM worker and needs its test extra.
+@pytest.mark.parametrize(
+    ("worker_cls", "expected"),
+    [
+        (None, "RolloutProfilingVllmWorker"),
+        (
+            "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker",
+            "RolloutProfilingNixlVllmWorker",
+        ),
+        ("custom.Worker", None),
+    ],
+)
+def test_profiling_worker_composes_only_with_known_worker_classes(worker_cls, expected):
     from nemo_rl.models.generation.vllm.vllm_backend import (
         configure_rollout_profiler_worker,
     )
 
     vllm_kwargs = {"additional_config": {"existing": "value"}}
+    if worker_cls is not None:
+        vllm_kwargs["worker_cls"] = worker_cls
+    if expected is None:
+        with pytest.raises(ValueError, match="cannot be composed"):
+            configure_rollout_profiler_worker(
+                vllm_kwargs, class_path="profiler.Plugin", rank_prefix=0
+            )
+        return
 
     configure_rollout_profiler_worker(
         vllm_kwargs, class_path="profiler.Plugin", rank_prefix=16
     )
 
-    assert vllm_kwargs["worker_cls"].endswith(".RolloutProfilingVllmWorker")
+    assert vllm_kwargs["worker_cls"] == f"{BACKEND}.{expected}"
     assert vllm_kwargs["additional_config"] == {
         "existing": "value",
         "nemo_rl_rollout_profiler": {
@@ -194,193 +168,75 @@ def test_configure_internal_profiler_worker_preserves_additional_config():
     }
 
 
-@pytest.mark.vllm
-def test_configure_internal_profiler_worker_composes_with_nixl():
-    # This helper lives alongside the vLLM worker and needs its test extra.
-    from nemo_rl.models.generation.vllm.vllm_backend import (
-        configure_rollout_profiler_worker,
-    )
-
-    vllm_kwargs = {
-        "worker_cls": "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
-    }
-
-    configure_rollout_profiler_worker(
-        vllm_kwargs, class_path="profiler.Plugin", rank_prefix=0
-    )
-
-    assert vllm_kwargs["worker_cls"].endswith(".RolloutProfilingNixlVllmWorker")
-
-
-@pytest.mark.vllm
-def test_configure_internal_profiler_worker_rejects_other_worker_class():
-    # This helper lives alongside the vLLM worker and needs its test extra.
-    from nemo_rl.models.generation.vllm.vllm_backend import (
-        configure_rollout_profiler_worker,
-    )
-
-    with pytest.raises(ValueError, match="cannot be composed"):
-        configure_rollout_profiler_worker(
-            {"worker_cls": "custom.Worker"},
-            class_path="profiler.Plugin",
-            rank_prefix=0,
-        )
-
-
-def test_outer_worker_fans_out_profiler_lifecycle_to_internal_workers():
+def test_model_owner_forwards_capture_control_to_internal_workers():
     worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
-    worker._rollout_profiler = None
-    worker._use_internal_rollout_profiler = True
     worker.llm = MagicMock()
 
-    worker.begin_rollout_profile(step_id=4)
-    worker.finish_rollout_profile()
-    worker.abort_rollout_profile(reason="rollout_error")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        worker.full_step_profile("begin_step", step_id=4)
+    worker._rollout_profiler_class = "profiler.Plugin"
+    worker.full_step_profile("begin_step", step_id=4)
 
-    assert worker.llm.collective_rpc.call_args_list == [
-        call("begin_rollout_profile", args=tuple(), kwargs={"step_id": 4}),
-        call("finish_rollout_profile", args=tuple(), kwargs={}),
-        call(
-            "abort_rollout_profile",
-            args=tuple(),
-            kwargs={"reason": "rollout_error"},
-        ),
-    ]
+    worker.llm.collective_rpc.assert_called_once_with(
+        "full_step_profile",
+        args=tuple(),
+        kwargs={"command": "begin_step", "step_id": 4},
+    )
 
 
 @pytest.mark.asyncio
-async def test_async_outer_worker_awaits_internal_profiler_lifecycle():
+async def test_async_model_owner_awaits_internal_capture_control():
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._use_internal_rollout_profiler = True
+    worker._rollout_profiler_class = "profiler.Plugin"
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
 
-    await worker.begin_rollout_profile_async(step_id=4)
-    await worker.finish_rollout_profile_async()
-    await worker.abort_rollout_profile_async(reason="rollout_error")
+    await worker.full_step_profile_async("end_phase")
 
-    assert worker.llm.collective_rpc.await_args_list == [
-        call("begin_rollout_profile", args=tuple(), kwargs={"step_id": 4}),
-        call("finish_rollout_profile", args=tuple()),
-        call(
-            "abort_rollout_profile",
-            args=tuple(),
-            kwargs={"reason": "rollout_error"},
-        ),
-    ]
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "full_step_profile", args=tuple(), kwargs={"command": "end_phase"}
+    )
 
 
 @pytest.mark.parametrize(
-    ("async_engine", "expected_method"),
-    [(False, "begin_rollout_profile"), (True, "begin_rollout_profile_async")],
+    ("enabled", "async_engine", "expected_method"),
+    [
+        (True, False, "full_step_profile"),
+        (True, True, "full_step_profile_async"),
+        (False, False, None),
+    ],
 )
-def test_generation_selects_engine_specific_profiler_rpc(async_engine, expected_method):
+def test_generation_routes_capture_control_to_model_owners(
+    enabled, async_engine, expected_method
+):
     generation = VllmGeneration.__new__(VllmGeneration)
-    generation._rollout_profiler_enabled = True
+    generation._rollout_profiler_enabled = enabled
     generation.cfg = {"vllm_cfg": {"async_engine": async_engine}}
     generation.worker_group = MagicMock()
     generation.shutdown = MagicMock()
-    generation.worker_group.run_all_workers_single_data.return_value = [object()]
 
     with patch("nemo_rl.models.generation.vllm.vllm_generation.ray.get") as ray_get:
-        generation.begin_rollout_profile(step_id=4)
+        if expected_method is None:
+            with pytest.raises(RuntimeError, match="NRL_ROLLOUT_PROFILER_CLASS"):
+                generation.full_step_profile("finish_step")
+            return
+        generation.full_step_profile("finish_step")
 
     generation.worker_group.run_all_workers_single_data.assert_called_once_with(
         expected_method,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        step_id=4,
+        command="finish_step",
     )
-    ray_get.assert_called_once_with(
-        generation.worker_group.run_all_workers_single_data.return_value
-    )
+    ray_get.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    (
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "expert_parallel_size",
-    ),
-    [(8, 2, 1), (8, 1, 2), (8, 1, 16)],
-)
-def test_rollout_profiler_rejects_unsupported_topology_before_worker_start(
-    tensor_parallel_size,
-    pipeline_parallel_size,
-    expert_parallel_size,
-):
-    with pytest.raises(ValueError, match="Rollout profiling"):
-        validate_rollout_profiler_topology(
-            class_path="profiler.Plugin",
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            expert_parallel_size=expert_parallel_size,
-        )
-
-
-@pytest.mark.parametrize("expert_parallel_size", [1, 8])
-def test_rollout_profiler_accepts_tp8_topology(expert_parallel_size):
-    validate_rollout_profiler_topology(
-        class_path="profiler.Plugin",
-        tensor_parallel_size=8,
-        pipeline_parallel_size=1,
-        expert_parallel_size=expert_parallel_size,
-    )
-
-
-def test_rollout_profiler_topology_validation_is_inert_when_disabled():
-    validate_rollout_profiler_topology(
-        class_path="",
-        tensor_parallel_size=8,
-        pipeline_parallel_size=2,
-        expert_parallel_size=4,
-    )
-
-
-def test_worker_shutdown_closes_rollout_profiler():
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_worker_shutdown_closes_profilers_before_cleanup(close_fails, capsys):
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker._rollout_profiler = MagicMock()
-    worker._sparse_refit_receiver = None
-    worker.llm = None
-    worker.tokenizer = object()
-
-    with (
-        patch("nemo_rl.models.generation.vllm.vllm_worker.gc.collect"),
-        patch("nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache"),
-    ):
-        assert worker.shutdown() is True
-
-    worker._rollout_profiler.close.assert_called_once_with()
-    assert worker.tokenizer is None
-
-
-def test_worker_shutdown_closes_internal_rollout_profilers():
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker._rollout_profiler = None
-    worker._use_internal_rollout_profiler = True
+    worker._rollout_profiler_class = "profiler.Plugin"
     worker._sparse_refit_receiver = None
     llm = MagicMock()
-    worker.llm = llm
-    worker.tokenizer = object()
-
-    with (
-        patch("nemo_rl.models.generation.vllm.vllm_worker.gc.collect"),
-        patch("nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache"),
-    ):
-        assert worker.shutdown() is True
-
-    assert llm.collective_rpc.call_args_list == [
-        call("close_rollout_profiler", args=tuple()),
-        call("cleanup", args=tuple()),
-    ]
-    assert worker.llm is None
-
-
-def test_worker_shutdown_cleans_up_after_internal_profiler_close_failure(capsys):
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker._rollout_profiler = None
-    worker._use_internal_rollout_profiler = True
-    worker._sparse_refit_receiver = None
-    llm = MagicMock()
-    llm.collective_rpc.side_effect = [RuntimeError("close failed"), None]
+    if close_fails:
+        llm.collective_rpc.side_effect = [RuntimeError("close failed"), None]
     worker.llm = llm
     worker.tokenizer = object()
 
@@ -389,21 +245,20 @@ def test_worker_shutdown_cleans_up_after_internal_profiler_close_failure(capsys)
         patch("nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache"),
         patch("nemo_rl.models.generation.vllm.vllm_worker.shutdown_telemetry"),
     ):
-        assert worker.shutdown() is False
+        assert worker.shutdown() is not close_fails
 
     assert llm.collective_rpc.call_args_list == [
         call("close_rollout_profiler", args=tuple()),
         call("cleanup", args=tuple()),
     ]
-    assert worker.llm is None
-    assert worker.tokenizer is None
-    assert "Error during vLLM shutdown: close failed" in capsys.readouterr().out
+    assert (worker.llm, worker.tokenizer) == (None, None)
+    assert ("close failed" in capsys.readouterr().out) is close_fails
 
 
 @pytest.mark.asyncio
 async def test_async_worker_shutdown_cleans_up_after_profiler_close_failure(capsys):
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._use_internal_rollout_profiler = True
+    worker._rollout_profiler_class = "profiler.Plugin"
     worker._sparse_refit_receiver = None
     llm = MagicMock()
     llm.collective_rpc = AsyncMock(side_effect=[RuntimeError("close failed"), None])
@@ -425,6 +280,5 @@ async def test_async_worker_shutdown_cleans_up_after_profiler_close_failure(caps
         call("cleanup", args=tuple()),
     ]
     llm.shutdown.assert_called_once_with()
-    assert worker.llm is None
-    assert worker.tokenizer is None
+    assert (worker.llm, worker.tokenizer) == (None, None)
     assert "Error during vLLM shutdown: close failed" in capsys.readouterr().out

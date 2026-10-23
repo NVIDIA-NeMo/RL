@@ -24,12 +24,6 @@ import torch
 import zmq
 from torch.distributed._tensor import Shard
 
-from nemo_rl.models.four_phase_profiling import WorkerCapture
-from nemo_rl.models.generation.profiling import (
-    ROLLOUT_PROFILER_CLASS_ENV,
-    RolloutProfiler,
-    load_rollout_profiler,
-)
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     NIXL_VLLM_WORKER,
     VllmCheckpointEngineMixin,
@@ -51,6 +45,13 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.models.profiling import (
+    ROLLOUT_PROFILER_CONFIG_KEY,
+    ROLLOUT_PROFILER_METHODS,
+    RolloutProfiler,
+    WorkerCapture,
+    load_profiler,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -64,7 +65,6 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
 
 logger = logging.getLogger(__name__)
 
-_ROLLOUT_PROFILER_CONFIG_KEY = "nemo_rl_rollout_profiler"
 _ROLLOUT_PROFILING_VLLM_WORKER = (
     "nemo_rl.models.generation.vllm.vllm_backend.RolloutProfilingVllmWorker"
 )
@@ -282,12 +282,20 @@ class _ReloadWeightPreparer(Protocol):
     def finish(self) -> None: ...
 
 
+def _current_device_uuid() -> str:
+    # NVML is needed only by workers that selected rollout profiling.
+    from nemo_rl.utils.nvml import get_device_uuid
+
+    return get_device_uuid(torch.cuda.current_device())
+
+
 class _RolloutProfilingVllmWorkerBase(VllmWorker):
-    """Run a configured rollout profiler inside one vLLM GPU worker."""
+    """Run the selected rollout profiler inside one vLLM GPU worker."""
 
     _nrl_rollout_profiler: RolloutProfiler | None
     _nrl_rollout_engine_initialization_open: bool
     _nrl_rollout_engine_initialization_token: Any
+    _four_phase_capture: WorkerCapture
 
     def __init__(
         self,
@@ -297,38 +305,29 @@ class _RolloutProfilingVllmWorkerBase(VllmWorker):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ) -> None:
-        self._nrl_rollout_profiler = None
-        self._nrl_rollout_engine_initialization_open = False
-        self._nrl_rollout_engine_initialization_token = None
-
-        profiler_config = vllm_config.additional_config.get(
-            _ROLLOUT_PROFILER_CONFIG_KEY
+        profiler_config = vllm_config.additional_config[ROLLOUT_PROFILER_CONFIG_KEY]
+        profiler = load_profiler(
+            profiler_config["class_path"],
+            rank=int(profiler_config["rank_prefix"]) + rank,
+            required_methods=ROLLOUT_PROFILER_METHODS,
         )
-        if profiler_config is not None:
-            os.environ[ROLLOUT_PROFILER_CLASS_ENV] = profiler_config["class_path"]
-            profiler = load_rollout_profiler(
-                rank=int(profiler_config["rank_prefix"]) + rank
+        self._nrl_rollout_profiler = profiler
+        self._four_phase_capture = WorkerCapture(profiler, _current_device_uuid)
+        self._nrl_rollout_engine_initialization_open = False
+        try:
+            self._nrl_rollout_engine_initialization_token = (
+                profiler.begin_engine_initialization()
             )
-            if profiler is None:
-                raise RuntimeError(
-                    "The vLLM rollout profiling worker was selected without a "
-                    "rollout profiler class"
-                )
-            self._nrl_rollout_profiler = profiler
+            self._nrl_rollout_engine_initialization_open = True
+        except BaseException as profiler_error:
             try:
-                self._nrl_rollout_engine_initialization_token = (
-                    profiler.begin_engine_initialization()
+                profiler.close()
+            except Exception as close_error:
+                profiler_error.add_note(
+                    "Rollout profiler cleanup after initialization failure "
+                    f"also failed: {close_error!r}"
                 )
-                self._nrl_rollout_engine_initialization_open = True
-            except BaseException as profiler_error:
-                try:
-                    profiler.close()
-                except Exception as close_error:
-                    profiler_error.add_note(
-                        "Rollout profiler cleanup after initialization failure "
-                        f"also failed: {close_error!r}"
-                    )
-                raise
+            raise
 
         try:
             # vLLM is an optional import, so Pyrefly resolves this base
@@ -369,38 +368,12 @@ class _RolloutProfilingVllmWorkerBase(VllmWorker):
             self._nrl_rollout_engine_initialization_open = False
             self._nrl_rollout_engine_initialization_token = None
 
-    _four_phase_capture: WorkerCapture | None = None
-
     def full_step_profile(self, command: str, **kwargs: Any) -> None:
-        """Execute full-step capture control on this internal GPU process."""
-        if command == "configure_capture":
-            if self._nrl_rollout_engine_initialization_open:
-                raise RuntimeError("vLLM engine initialization is still open")
-            self._four_phase_capture = WorkerCapture(self._require_rollout_profiler())
-            # NVML is needed only for the selected four-phase capture mode.
-            from nemo_rl.utils.nvml import get_device_uuid
-
-            kwargs["device_uuid"] = get_device_uuid(torch.cuda.current_device())
-        if self._four_phase_capture is None:
-            raise RuntimeError("Four-phase internal rollout capture was not configured")
-        self._four_phase_capture.dispatch(command, **kwargs)
-
-    def begin_rollout_profile(self, *, step_id: int | str) -> None:
-        """Open one complete rollout capture window on this GPU worker."""
+        """Execute capture control on this internal GPU process."""
+        self._require_rollout_profiler()
         if self._nrl_rollout_engine_initialization_open:
-            raise RuntimeError(
-                "Cannot begin rollout profiling before vLLM engine "
-                "initialization has completed"
-            )
-        self._require_rollout_profiler().begin_rollout(step_id=step_id)
-
-    def finish_rollout_profile(self) -> None:
-        """Close a successful rollout capture window on this GPU worker."""
-        self._require_rollout_profiler().finish_rollout()
-
-    def abort_rollout_profile(self, *, reason: str) -> None:
-        """Abort a failed rollout capture window on this GPU worker."""
-        self._require_rollout_profiler().abort_rollout(reason=reason)
+            raise RuntimeError("vLLM engine initialization is still open")
+        self._four_phase_capture.dispatch(command, **kwargs)
 
     def close_rollout_profiler(self) -> None:
         """Close the profiler, including any open initialization window."""
@@ -487,7 +460,7 @@ def configure_rollout_profiler_worker(
 
     vllm_kwargs["worker_cls"] = profiling_worker_cls
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
-    additional_config[_ROLLOUT_PROFILER_CONFIG_KEY] = {
+    additional_config[ROLLOUT_PROFILER_CONFIG_KEY] = {
         "class_path": class_path,
         "rank_prefix": rank_prefix,
     }

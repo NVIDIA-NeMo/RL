@@ -48,10 +48,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     agreed_media_columns,
 )
-from nemo_rl.models.generation.profiling import (
-    ROLLOUT_PROFILER_CLASS_ENV,
-    validate_rollout_profiler_topology,
-)
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
@@ -68,6 +64,11 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
+)
+from nemo_rl.models.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    actor_profiler_selected,
+    validate_rollout_profiler_topology,
 )
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
@@ -239,22 +240,15 @@ class VllmGeneration(GenerationInterface):
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.model_parallel_size = self.tp_size * self.pp_size
-        configured_env_vars = self.cfg["vllm_cfg"].get("env_vars")
-        if configured_env_vars is None:
-            configured_env_vars = {}
-        if ROLLOUT_PROFILER_CLASS_ENV in configured_env_vars:
-            rollout_profiler_class = str(
-                configured_env_vars[ROLLOUT_PROFILER_CLASS_ENV]
-            )
-        else:
-            rollout_profiler_class = os.environ.get(ROLLOUT_PROFILER_CLASS_ENV, "")
-        validate_rollout_profiler_topology(
-            class_path=rollout_profiler_class,
-            tensor_parallel_size=self.tp_size,
-            pipeline_parallel_size=self.pp_size,
-            expert_parallel_size=self.ep_size,
+        self._rollout_profiler_enabled = actor_profiler_selected(
+            ROLLOUT_PROFILER_CLASS_ENV, self.cfg["vllm_cfg"].get("env_vars")
         )
-        self._rollout_profiler_enabled = bool(rollout_profiler_class)
+        if self._rollout_profiler_enabled:
+            validate_rollout_profiler_topology(
+                tensor_parallel_size=self.tp_size,
+                pipeline_parallel_size=self.pp_size,
+                expert_parallel_size=self.ep_size,
+            )
 
         assert cluster.world_size() % self.model_parallel_size == 0, (
             "World size must be a multiple of model parallel size. "
@@ -376,7 +370,7 @@ class VllmGeneration(GenerationInterface):
         env_vars = {}
         # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
         # Scoped to this generation config so it does not impact other test cases.
-        for k, v in configured_env_vars.items():
+        for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
             env_vars[str(k)] = str(v)
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -797,37 +791,21 @@ class VllmGeneration(GenerationInterface):
             self._step_metrics_snapshot = None
 
     def full_step_profile(self, command: str, **kwargs: Any) -> None:
-        """Forward full-step control through leaders to the GPU workers."""
-        self._run_rollout_profiler_rpc("full_step_profile", command=command, **kwargs)
-
-    def begin_rollout_profile(self, *, step_id: int | str) -> None:
-        """Open one complete rollout on profiled workers."""
-        self._run_rollout_profiler_rpc("begin_rollout_profile", step_id=step_id)
-
-    @property
-    def rollout_profiler_enabled(self) -> bool:
-        """Whether rollout profiling was selected for these vLLM workers."""
-        return self._rollout_profiler_enabled
-
-    def finish_rollout_profile(self) -> None:
-        """Close the current rollout on profiled workers."""
-        self._run_rollout_profiler_rpc("finish_rollout_profile")
-
-    def abort_rollout_profile(self, *, reason: str) -> None:
-        """Abort the current rollout on profiled workers."""
-        self._run_rollout_profiler_rpc("abort_rollout_profile", reason=reason)
-
-    def _run_rollout_profiler_rpc(self, method_name: str, **kwargs: Any) -> None:
-        if not self.rollout_profiler_enabled:
-            return
-        worker_method_name = (
-            f"{method_name}_async"
+        """Forward capture control through model owners to the GPU workers."""
+        if not self._rollout_profiler_enabled:
+            raise RuntimeError(
+                f"Four-phase capture requires {ROLLOUT_PROFILER_CLASS_ENV} "
+                "in the vLLM worker environment"
+            )
+        method_name = (
+            "full_step_profile_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else method_name
+            else "full_step_profile"
         )
         futures = self.worker_group.run_all_workers_single_data(
-            worker_method_name,
+            method_name,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            command=command,
             **kwargs,
         )
         ray.get(futures)

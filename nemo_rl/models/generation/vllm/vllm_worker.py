@@ -31,7 +31,6 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORTS_PER_ENGINE,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
-from nemo_rl.models.four_phase_profiling import WorkerCapture
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
@@ -39,12 +38,6 @@ from nemo_rl.models.generation.interfaces import (
     get_num_routed_experts,
     resolve_routed_experts_dtype,
     verify_right_padding,
-)
-from nemo_rl.models.generation.profiling import (
-    ROLLOUT_PROFILER_CLASS_ENV,
-    RolloutProfiler,
-    load_rollout_profiler,
-    validate_rollout_profiler_topology,
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
@@ -77,6 +70,10 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.models.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    selected_profiler_class,
+)
 from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -275,8 +272,7 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
-    _rollout_profiler: RolloutProfiler | None = None
-    _use_internal_rollout_profiler: bool = False
+    _rollout_profiler_class: str = ""
 
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -463,31 +459,20 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
-        self._rollout_profiler = None
-        rollout_profiler_class = os.environ.get(ROLLOUT_PROFILER_CLASS_ENV, "")
-        self._rollout_profiler_class = rollout_profiler_class
-        self._use_internal_rollout_profiler = bool(rollout_profiler_class) and (
-            self.tensor_parallel_size > 1 or self.cfg["vllm_cfg"]["async_engine"]
-        )
-        self._rollout_profiler_rank_prefix: int | None = None
+        # The profiler runs in vLLM's internal GPU workers so that it starts
+        # before model loading and CUDA graph creation.
         if self.is_model_owner:
-            validate_rollout_profiler_topology(
-                class_path=rollout_profiler_class,
-                tensor_parallel_size=self.tensor_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
-                expert_parallel_size=self.expert_parallel_size,
+            self._rollout_profiler_class = selected_profiler_class(
+                ROLLOUT_PROFILER_CLASS_ENV
             )
-        if self.is_model_owner and rollout_profiler_class:
+        if self._rollout_profiler_class:
             try:
-                rollout_rank = int(os.environ["RANK"])
+                self._rollout_profiler_rank_prefix = int(os.environ["RANK"])
             except (KeyError, ValueError) as exc:
                 raise RuntimeError(
                     "Rollout profiling requires the generation "
                     "worker RANK environment variable"
                 ) from exc
-            self._rollout_profiler_rank_prefix = rollout_rank
-            if not self._use_internal_rollout_profiler:
-                self._rollout_profiler = load_rollout_profiler(rank=rollout_rank)
         self._sparse_refit_receiver: Any = None
         if (
             self.is_model_owner
@@ -647,12 +632,11 @@ class BaseVllmGenerationWorker:
             self.expert_parallel_size,
         )
         vllm_kwargs["distributed_executor_backend"] = executor_backend
-        if self._use_internal_rollout_profiler:
+        if self._rollout_profiler_class:
             from nemo_rl.models.generation.vllm.vllm_backend import (
                 configure_rollout_profiler_worker,
             )
 
-            assert self._rollout_profiler_rank_prefix is not None
             configure_rollout_profiler_worker(
                 vllm_kwargs,
                 class_path=self._rollout_profiler_class,
@@ -835,8 +819,7 @@ class BaseVllmGenerationWorker:
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
-
-        self._create_engine_with_profiler(llm_kwargs)
+        self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
         )
@@ -881,80 +864,13 @@ class BaseVllmGenerationWorker:
             "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
         }
 
-    def _create_engine_with_profiler(self, llm_kwargs: dict[str, Any]) -> None:
-        """Create the vLLM engine inside the profiler initialization window."""
-        profiler = self._rollout_profiler
-        engine_token = None
-        if profiler is not None:
-            engine_token = profiler.begin_engine_initialization()
-        try:
-            self._create_engine(llm_kwargs)
-        except BaseException as engine_error:
-            if profiler is not None:
-                try:
-                    profiler.end_engine_initialization(engine_token)
-                except Exception as profiler_error:
-                    engine_error.add_note(
-                        "Rollout profiler engine-initialization cleanup also "
-                        f"failed: {profiler_error!r}"
-                    )
-            raise
-        else:
-            if profiler is not None:
-                profiler.end_engine_initialization(engine_token)
-
-    _four_phase_capture: WorkerCapture | None = None
-
     def full_step_profile(self, command: str, **kwargs: Any) -> None:
-        """Use the rank-local owner or forward to internal vLLM GPU workers."""
-        if self._use_internal_rollout_profiler:
-            self._run_internal_rollout_profiler_rpc(
-                "full_step_profile", command=command, **kwargs
-            )
-            return
-        if command == "configure_capture":
-            if self._rollout_profiler is None:
-                raise RuntimeError("Four-phase capture requires a rollout profiler")
-            self._four_phase_capture = WorkerCapture(self._rollout_profiler)
-            # NVML is needed only for the selected four-phase capture mode.
-            from nemo_rl.utils.nvml import get_device_uuid
-
-            kwargs["device_uuid"] = get_device_uuid(torch.cuda.current_device())
-        if self._four_phase_capture is None:
-            raise RuntimeError("Four-phase rollout capture was not configured")
-        self._four_phase_capture.dispatch(command, **kwargs)
-
-    def begin_rollout_profile(self, *, step_id: int | str) -> None:
-        """Open one complete rollout profile window."""
-        if self._rollout_profiler is not None:
-            self._rollout_profiler.begin_rollout(step_id=step_id)
-        elif self._use_internal_rollout_profiler:
-            self._run_internal_rollout_profiler_rpc(
-                "begin_rollout_profile", step_id=step_id
-            )
-
-    def finish_rollout_profile(self) -> None:
-        """Close a successful rollout profile window."""
-        if self._rollout_profiler is not None:
-            self._rollout_profiler.finish_rollout()
-        elif self._use_internal_rollout_profiler:
-            self._run_internal_rollout_profiler_rpc("finish_rollout_profile")
-
-    def abort_rollout_profile(self, *, reason: str) -> None:
-        """Abort a rollout profile window after an error."""
-        if self._rollout_profiler is not None:
-            self._rollout_profiler.abort_rollout(reason=reason)
-        elif self._use_internal_rollout_profiler:
-            self._run_internal_rollout_profiler_rpc(
-                "abort_rollout_profile", reason=reason
-            )
-
-    def _run_internal_rollout_profiler_rpc(
-        self, method_name: str, **kwargs: Any
-    ) -> None:
-        if self.llm is None:
-            raise RuntimeError("The vLLM engine is not initialized")
-        self.llm.collective_rpc(method_name, args=tuple(), kwargs=kwargs)
+        """Forward capture control to every internal vLLM GPU worker."""
+        if not self._rollout_profiler_class or self.llm is None:
+            raise RuntimeError("Four-phase rollout profiler is unavailable")
+        self.llm.collective_rpc(
+            "full_step_profile", args=tuple(), kwargs={"command": command, **kwargs}
+        )
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
@@ -1166,7 +1082,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def post_init(self):
         if self.llm is not None:
-            if self._use_internal_rollout_profiler:
+            if self._rollout_profiler_class:
                 self.llm.collective_rpc(
                     "end_rollout_profiler_engine_initialization", args=tuple()
                 )
@@ -1751,17 +1667,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """Clean up vLLM resources."""
         try:
             profiler_error = None
-            if self._rollout_profiler is not None:
-                try:
-                    self._rollout_profiler.close()
-                except Exception as error:
-                    profiler_error = error
-
             if self._sparse_refit_receiver is not None:
                 self._sparse_refit_receiver.shutdown()
 
             if self.llm is not None:
-                if self._use_internal_rollout_profiler:
+                if self._rollout_profiler_class:
                     try:
                         self.llm.collective_rpc("close_rollout_profiler", args=tuple())
                     except Exception as error:

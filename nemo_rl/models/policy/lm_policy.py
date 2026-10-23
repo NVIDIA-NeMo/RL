@@ -38,7 +38,6 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-from nemo_rl.models.four_phase_profiling import profile_policy_method
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -56,6 +55,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
+from nemo_rl.models.profiling import profile_policy_method
 from nemo_rl.models.policy.utils import (
     DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
@@ -1003,6 +1003,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
         ray.get(futures)
 
+    @profile_policy_method("policy_training", phase_slot="training")
     def train(
         self,
         data: BatchedDataDict[Any],

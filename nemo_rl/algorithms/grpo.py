@@ -18,9 +18,9 @@ import sys
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Iterator, Optional, TypeVar, cast
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -127,12 +127,6 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.four_phase_profiling import (
-    GrpoCapture,
-    four_phase_enabled,
-    profile_phase,
-    profile_refit,
-)
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
@@ -164,6 +158,12 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.profiling import (
+    GrpoCapture,
+    four_phase_enabled,
+    profile_phase,
+    profile_refit,
+)
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -219,8 +219,8 @@ from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_supp
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-# The collector's in-actor drain uses 30 seconds. Allow RPC scheduling margin
-# while ensuring a timeout returns before worker cleanup.
+# Bound final generation quiescence; a timeout invalidates the capture but still
+# lets worker cleanup proceed.
 _ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S = 40.0
 
 
@@ -2630,74 +2630,50 @@ def _apply_configured_message_level_advantage_penalties(
     )
 
 
-@contextmanager
-def _profile_sync_vllm_rollout(
-    policy_generation: GenerationInterface,
-    *,
-    step_id: int | str,
-) -> Iterator[None]:
-    """Drive an optional profiler around one complete synchronous rollout."""
-    if not isinstance(policy_generation, VllmGeneration):
-        yield
-        return
-    if not policy_generation.rollout_profiler_enabled:
-        yield
-        return
-
-    abort_reason = "grpo_rollout_begin_error"
-    try:
-        policy_generation.begin_rollout_profile(step_id=step_id)
-        abort_reason = "grpo_rollout_error"
-        yield
-        abort_reason = "grpo_rollout_finish_error"
-        policy_generation.finish_rollout_profile()
-    except BaseException as rollout_error:
-        try:
-            policy_generation.abort_rollout_profile(reason=abort_reason)
-        except Exception as profiler_error:
-            rollout_error.add_note(
-                f"Rollout profiler abort also failed: {profiler_error!r}"
-            )
-        raise
-
-
-def _shutdown_async_trajectory_collector(
+def _stop_async_collection(
     trajectory_collector: Any,
-    policy_generation: GenerationInterface,
+    replay_buffer: Any,
+    capture: GrpoCapture,
     *,
     flush_telemetry: Callable[[], None],
-    full_phase_capture: bool = False,
-) -> None:
-    """Bound quiescence, await full capture persistence, then reap the actor."""
-    drain_error: Exception | None = None
-    try:
-        if policy_generation.rollout_profiler_enabled:
+) -> Exception | None:
+    """Bound quiescence, await capture saves, reap actors, then close capture.
+
+    Cleanup always completes. The first capture failure is returned, with
+    later failures attached as notes, so callers can still shut down workers.
+    """
+    error: Exception | None = None
+    if capture.enabled:
+        try:
             ray.get(
                 trajectory_collector.drain_for_rollout_profiler_shutdown.remote(),
                 timeout=_ASYNC_ROLLOUT_PROFILER_DRAIN_RPC_TIMEOUT_S,
             )
-            if full_phase_capture:
-                # Native quiescence is bounded above. Artifact serialization is
-                # a separate transaction and must finish before worker cleanup.
-                ray.get(
-                    trajectory_collector.finalize_rollout_profiler_shutdown.remote()
-                )
-    except Exception as error:
-        drain_error = error
-        print(f"Error settling trajectory collector profiling: {error}")
+            # Native quiescence is bounded above. Artifact serialization is a
+            # separate transaction and must finish before worker cleanup.
+            ray.get(trajectory_collector.finalize_rollout_profiler_shutdown.remote())
+        except Exception as drain_error:
+            print(f"Error settling trajectory collector profiling: {drain_error}")
+            error = drain_error
+
+    flush_telemetry()
+    try:
+        ray.kill(trajectory_collector)
+    except Exception as e:
+        print(f"Error stopping trajectory collector: {e}")
+    try:
+        ray.kill(replay_buffer)
+    except Exception as e:
+        print(f"Error stopping replay buffer: {e}")
 
     try:
-        flush_telemetry()
-    except Exception as error:
-        print(f"Error flushing trajectory collector telemetry: {error}")
-    finally:
-        try:
-            ray.kill(trajectory_collector)
-        except Exception as error:
-            print(f"Error stopping trajectory collector: {error}")
-
-    if drain_error is not None:
-        raise drain_error
+        capture.close()
+    except Exception as close_error:
+        if error is None:
+            error = close_error
+        else:
+            error.add_note(f"Capture close also failed: {close_error!r}")
+    return error
 
 
 def _preserve_router_replay_routed_experts(
@@ -3332,7 +3308,7 @@ def _grpo_train_impl(
     master_config: MasterConfig,
     processor: Optional[AutoProcessor] = None,
     *,
-    capture: GrpoCapture | None = None,
+    capture: GrpoCapture,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer(context={"worker": "driver"})
@@ -3375,10 +3351,6 @@ def _grpo_train_impl(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    if capture is None:
-        capture = GrpoCapture(
-            policy, policy_generation, schedule="sync", colocated=colocated_inference
-        )
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
@@ -3432,7 +3404,6 @@ def _grpo_train_impl(
         if stop_message is not None:
             print(stop_message, flush=True)
             # Flush pending checkpoint finalization, like the other early returns.
-            capture.close()
             checkpointer.shutdown()
             return
 
@@ -3614,12 +3585,14 @@ def _grpo_train_impl(
                             "rl.num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
                         },
                     ),
-                    _profile_sync_vllm_rollout(
-                        policy_generation,
-                        step_id=(
-                            f"step{total_steps + 1}/attempt"
+                    profile_phase(
+                        (policy_generation,),
+                        name="vllm_generation",
+                        phase_slot="generation",
+                        labels={
+                            "rollout_id": f"step{total_steps + 1}/attempt"
                             f"{dynamic_sampling_num_gen_batches}"
-                        ),
+                        },
                     ),
                 ):
                     # Clear logger metrics for each generation step
@@ -4586,18 +4559,15 @@ def _grpo_train_impl(
             current_step += 1
             total_steps += 1
             if early_stop_message is not None:
-                capture.close()
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 return
             if should_save_by_timeout:
-                capture.close()
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
-                capture.close()
                 checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
@@ -4614,7 +4584,6 @@ def _grpo_train_impl(
     # the inline shutdown() calls at the max_num_steps / timeout early returns,
     # so without this the daemon finalization thread would be killed before the
     # final tmp_step_N is renamed.
-    capture.close()
     checkpointer.shutdown()
 
 
@@ -4641,6 +4610,13 @@ def grpo_train(
     ``capture`` may be configured before synthetic warmup; the trainer reuses it
     without consuming warmup work as GRPO capture steps.
     """
+    if capture is None:
+        capture = GrpoCapture(
+            policy,
+            policy_generation,
+            schedule="sync",
+            colocated=master_config.policy["generation"]["colocated"]["enabled"],
+        )
     try:
         _grpo_train_impl(
             policy=policy,
@@ -4658,6 +4634,8 @@ def grpo_train(
             processor=processor,
             capture=capture,
         )
+        # Every completed exit validates capture before worker teardown.
+        capture.close()
     finally:
         shutdown_environments(task_to_env, val_task_to_env)
 
@@ -5306,7 +5284,6 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
         processor=processor,
         trace_carrier=_tc_trace_carrier,
-        enable_rollout_profile_windows=not capture.enabled,
         profile_full_run=capture.enabled,
         **collector_start_kwargs,
     )
@@ -5457,27 +5434,14 @@ def async_grpo_train(
             # generation; the remaining actors are reaped when the driver
             # exits right after this return.
             checkpointer.shutdown()
-            try:
-                _shutdown_async_trajectory_collector(
-                    trajectory_collector,
-                    policy_generation,
-                    flush_telemetry=_flush_collector_telemetry,
-                    full_phase_capture=capture.enabled,
-                )
-            finally:
-                shutdown_error = sys.exception()
-                try:
-                    ray.kill(replay_buffer)
-                except Exception as e:
-                    print(f"Error stopping replay buffer: {e}")
-                try:
-                    capture.close()
-                except Exception as close_error:
-                    if shutdown_error is None:
-                        raise
-                    shutdown_error.add_note(
-                        f"Capture close also failed: {close_error!r}"
-                    )
+            stop_error = _stop_async_collection(
+                trajectory_collector,
+                replay_buffer,
+                capture,
+                flush_telemetry=_flush_collector_telemetry,
+            )
+            if stop_error is not None:
+                raise stop_error
             return
 
     print("✅ All setup complete, starting buffer wait...")
@@ -6598,7 +6562,6 @@ def async_grpo_train(
 
     finally:
         active_error = sys.exception()
-        collector_shutdown_error: Exception | None = None
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()
@@ -6606,33 +6569,15 @@ def async_grpo_train(
             print(f"Error finalizing pending checkpoint: {e}")
 
         print("🛑 Stopping trajectory collection...")
-        try:
-            _shutdown_async_trajectory_collector(
-                trajectory_collector,
-                policy_generation,
-                flush_telemetry=_flush_collector_telemetry,
-                full_phase_capture=capture.enabled,
-            )
-        except Exception as e:
-            collector_shutdown_error = e
-
-        try:
-            ray.kill(replay_buffer)
-        except Exception as e:
-            print(f"Error stopping replay buffer: {e}")
+        stop_error = _stop_async_collection(
+            trajectory_collector,
+            replay_buffer,
+            capture,
+            flush_telemetry=_flush_collector_telemetry,
+        )
 
         # Environments can have in-flight HTTP requests to generation workers.
         shutdown_environments(task_to_env, val_task_to_env)
-
-        try:
-            capture.close()
-        except Exception as error:
-            if collector_shutdown_error is None:
-                collector_shutdown_error = error
-            else:
-                collector_shutdown_error.add_note(
-                    f"Capture close also failed: {error!r}"
-                )
 
         print("🛑 Shutting down generation workers...")
         try:
@@ -6648,11 +6593,10 @@ def async_grpo_train(
                 print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")
-        if collector_shutdown_error is not None:
+        if stop_error is not None:
             if active_error is not None:
                 active_error.add_note(
-                    "Async trajectory collector shutdown also failed: "
-                    f"{collector_shutdown_error!r}"
+                    f"Async collection shutdown also failed: {stop_error!r}"
                 )
             else:
-                raise collector_shutdown_error
+                raise stop_error

@@ -952,7 +952,11 @@ def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
     ),
     [
         (
-            {"env_vars": {"USER_VAR": "value"}, "fp32_lm_head": True},
+            # Configured names reach nested workers once, after explicit names.
+            {
+                "env_vars": {"USER_VAR": "value", "EXPLICIT_VAR": "value"},
+                "fp32_lm_head": True,
+            },
             True,
             ["EXPLICIT_VAR", "USER_VAR"],
         ),

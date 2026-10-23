@@ -546,7 +546,7 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
-            if self._use_internal_rollout_profiler:
+            if self._rollout_profiler_class:
                 await self.llm.collective_rpc(
                     "end_rollout_profiler_engine_initialization", args=tuple()
                 )
@@ -583,40 +583,12 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def full_step_profile_async(self, command: str, **kwargs: Any) -> None:
         """Await control on every internal async vLLM GPU worker."""
-        if not self._use_internal_rollout_profiler or self.llm is None:
+        if not self._rollout_profiler_class or self.llm is None:
             raise RuntimeError("Four-phase async rollout profiler is unavailable")
         await self.llm.collective_rpc(
             "full_step_profile",
             args=tuple(),
             kwargs={"command": command, **kwargs},
-        )
-
-    async def begin_rollout_profile_async(self, *, step_id: int | str) -> None:
-        """Open one rollout profile window on every async-engine GPU worker."""
-        if not self._use_internal_rollout_profiler:
-            return
-        if self.llm is None:
-            raise RuntimeError("The vLLM engine is not initialized")
-        await self.llm.collective_rpc(
-            "begin_rollout_profile", args=tuple(), kwargs={"step_id": step_id}
-        )
-
-    async def finish_rollout_profile_async(self) -> None:
-        """Close a successful async-engine rollout profile window."""
-        if not self._use_internal_rollout_profiler:
-            return
-        if self.llm is None:
-            raise RuntimeError("The vLLM engine is not initialized")
-        await self.llm.collective_rpc("finish_rollout_profile", args=tuple())
-
-    async def abort_rollout_profile_async(self, *, reason: str) -> None:
-        """Abort an async-engine rollout profile window after an error."""
-        if not self._use_internal_rollout_profiler:
-            return
-        if self.llm is None:
-            raise RuntimeError("The vLLM engine is not initialized")
-        await self.llm.collective_rpc(
-            "abort_rollout_profile", args=tuple(), kwargs={"reason": reason}
         )
 
     async def get_reserved_url(self) -> Optional[str]:
@@ -2560,7 +2532,7 @@ class VllmAsyncGenerationWorkerImpl(
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
             if self.llm is not None:
-                if self._use_internal_rollout_profiler:
+                if self._rollout_profiler_class:
                     try:
                         await self.llm.collective_rpc(
                             "close_rollout_profiler", args=tuple()
