@@ -586,3 +586,34 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         # The engine's model dtype and the HF patch size, as pinned on the sink.
         assert spec == MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=2)
         assert worker._capture_image_token_id == 18
+
+
+@pytest.mark.parametrize("prev_len", [0, 3])
+def test_route_delta_preserves_actual_predecessor_tail(prev_len):
+    import torch
+    from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
+
+    from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+    routes = [[[i]] for i in range(7)]
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "routed_experts": routes,
+                }
+            }
+        ]
+    }
+    VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        payload,
+        prev_len=prev_len,
+        prompt_len=5,
+        generated_len=2,
+    )
+    extras = VLLMCaptureAdapter().extract_extras(payload)
+    assert (
+        decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
+        == routes[max(0, prev_len - 1) :]
+    )
+    assert "predecessor_tail_route" not in extras

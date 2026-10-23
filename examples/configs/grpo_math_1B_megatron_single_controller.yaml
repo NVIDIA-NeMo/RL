@@ -220,6 +220,10 @@ data_plane:
 # single-controller recovery options require it.
 token_capture:
   enabled: false
+  # Optional multi-path reconstruction; keeps one reward/advantage per rollout.
+  forest_training: false
+  # returned_history (default) or all_captured, including discarded attempts.
+  selection_policy: returned_history
   staging_partition: rollout_staging
 
 # Retry and restore policy for unfinished token-capture groups. "sibling" reuses

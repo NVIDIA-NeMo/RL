@@ -48,6 +48,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.utils import get_model_config, unwrap_model
 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
     FileSystemWriterAsync,
@@ -724,6 +725,35 @@ class MegatronPolicyWorkerImpl(
     def _routed_experts_dimensions(self) -> tuple[int, int]:
         """Return route dimensions from the initialized Megatron model config."""
         return router_replay_dimensions(self._get_model_config())
+
+    def validate_forest_execution_padding(self) -> None:
+        """Reject unqualified dummy-sensitive routers in the actual loaded model.
+
+        Policy/reference logprobs and training use this same model (reference
+        inference swaps weights only). Inspect nested routers, not just the outer
+        VLM config, after checkpoint settings and provider overrides resolve.
+        """
+        # TODO: Exclude artificial inputs from expert-bias update counts; see
+        # https://github.com/NVIDIA-NeMo/RL/pull/4519. Allow configured updates
+        # meanwhile: dummy rows can affect the counts despite zero policy loss.
+        for chunk in _unwrapped_chunks(self.model):
+            for module in chunk.modules():
+                if not isinstance(module, Router):
+                    continue
+                config = module.config
+                if (
+                    not isinstance(module, TopKRouter)
+                    or module.routing_type in ("sinkhorn", "quantile_balancing")
+                    or config.moe_expert_capacity_factor is not None
+                    or config.moe_expert_rank_capacity_factor is not None
+                    or config.moe_pad_experts_for_cuda_graph_inference
+                    or config.moe_token_dropping
+                    or get_aux_loss_track_names(config)
+                ):
+                    raise ValueError(
+                        "Forest execution padding requires dropless per-token MoE routing "
+                        "without auxiliary losses"
+                    )
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
