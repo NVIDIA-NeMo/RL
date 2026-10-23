@@ -1,6 +1,13 @@
 # Rollout Checkpointing as One Component of the Single Controller
 
-**Status:** proposal. Step 1 is implemented; steps 2 to 5 are proposed.
+**Status:** proposal. The move happens in five steps, detailed under
+[Migration Plan](#migration-plan):
+
+1. Move the Gym checkpoint code behind an `EnvironmentCheckpoint` interface. **Done in this PR.**
+2. Give the ledger and rollout manager backend-neutral names. *Proposed.*
+3. Move the snapshot writer into one `RolloutCheckpointing` component. *Proposed.*
+4. Move the restore chain into that component. *Proposed.*
+5. Collapse the rollout pump's two dispatch loops into one. *Proposed.*
 
 ## The Problem
 
