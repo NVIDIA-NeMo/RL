@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass, replace
 from typing import Any, Optional
 
@@ -62,6 +62,87 @@ VLLM_LOGPROB_FLOOR = -9999.0
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def _extract_selected_token_logprobs(
+    generation_token_ids: list[int],
+    generation_logprob_details: list[Any],
+    *,
+    where: str = "",
+) -> list[float]:
+    """Extract the sampled token's log probability at every output position.
+
+    Args:
+        generation_token_ids: The sampled token at each output position.
+        generation_logprob_details: vLLM's per-position logprob mapping.
+        where: Context prepended to the token in a missing-token error.
+    """
+    selected_logprobs: list[float] = []
+    for token_id, position_logprobs in zip(
+        generation_token_ids, generation_logprob_details, strict=True
+    ):
+        selected = position_logprobs.get(token_id)
+        if selected is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: {where}token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
+
+
+def _snapshot_generation_logprob_details(
+    generation_logprob_details: Any, start: int
+) -> list[Any]:
+    """Copy the fully published positions past ``start`` from an append-only container.
+
+    Positions are read one at a time: slicing a live ``FlatLogprobs`` reads its
+    start and end indices separately and can catch a position half-appended.
+    """
+    position_count = len(generation_logprob_details)
+    end_indices = getattr(generation_logprob_details, "end_indices", None)
+    if end_indices is not None:
+        position_count = min(position_count, len(end_indices))
+    return [generation_logprob_details[index] for index in range(start, position_count)]
+
+
+def extract_published_generation(
+    token_ids: Sequence[int], logprobs: Any, *, start: int
+) -> tuple[list[int], list[float]]:
+    """Copy the generated tokens past ``start`` that vLLM has published with logprobs.
+
+    A cumulative vLLM output holds the engine's live lists, which its engine
+    loop keeps appending to while another thread reads them. The engine appends
+    each token before its logprob, so the logprobs are read first and bound the
+    tokens taken: a token whose logprob is still pending is left for the next
+    output.
+
+    Args:
+        token_ids: The output's generated token IDs.
+        logprobs: The output's per-position logprobs, or None if vLLM sent none.
+        start: Generated positions already taken from earlier outputs.
+
+    Returns:
+        The newly published token IDs and their sampled log probabilities.
+    """
+    if logprobs is None:
+        if len(token_ids) > start:
+            raise RuntimeError(
+                "vLLM generation output with token IDs did not include logprobs"
+            )
+        return [], []
+    details = _snapshot_generation_logprob_details(logprobs, start)
+    generation_token_ids = list(token_ids[start : start + len(details)])
+    if len(generation_token_ids) != len(details):
+        raise RuntimeError(
+            "vLLM returned mismatched generation token IDs and log probabilities: "
+            f"token_count={len(generation_token_ids)}, logprob_count={len(details)}"
+        )
+    return generation_token_ids, _extract_selected_token_logprobs(
+        generation_token_ids, details
+    )
+
+
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -651,21 +732,11 @@ def attach_token_information_to_chat_response_choices(
                     f"token_count={len(generation_token_ids)}, "
                     f"logprob_count={len(generation_logprob_details)}."
                 )
-            generation_log_probs = []
-            for token_id, position_logprobs in zip(
-                generation_token_ids, generation_logprob_details
-            ):
-                selected_token_logprob = position_logprobs.get(token_id)
-                if selected_token_logprob is None:
-                    raise RuntimeError(
-                        "vLLM generation log probabilities did not include the "
-                        "selected token while attaching token information to "
-                        "the OpenAI-compatible chat response: "
-                        f"choice_idx={choice.index}, token_id={token_id}."
-                    )
-                generation_log_probs.append(
-                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-                )
+            generation_log_probs = _extract_selected_token_logprobs(
+                generation_token_ids,
+                generation_logprob_details,
+                where=f"choice_idx={choice.index}, ",
+            )
 
         choice.message.prompt_token_ids = list(prompt_token_ids)
         choice.message.generation_token_ids = generation_token_ids

@@ -112,6 +112,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.route_plan import (
@@ -1635,7 +1636,7 @@ class TestPeriodicRolloutCheckpoint:
         validated_commits: list[object] = []
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             assert checkpoint_id.startswith("rollout-")
             yield gym_commit
 
@@ -1674,6 +1675,34 @@ class TestPeriodicRolloutCheckpoint:
         if warns:
             assert "snapshot_attempt_interval_s=0.5s" in parked_warnings[0]
 
+    def test_rollout_checkpoint_logs_generation_cut_stats(self, tmp_path: Path) -> None:
+        """A prefix checkpoint logs its fence hold and Gym's cut outcome."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
+            assert cut_stats is not None
+            cut_stats.counts = {"cut": 3, "cut_failed": 1, "cut_skipped": 2}
+            yield object()
+            cut_stats.fence_hold_seconds = 1.5
+
+        async def validate_gym_checkpoint_cut(cut, commit, *, checkpoint_path):
+            pass
+
+        actor._prepared_gym_checkpoint = prepared_gym_checkpoint
+        actor._validate_gym_checkpoint_cut = validate_gym_checkpoint_cut
+        try:
+            assert asyncio.run(actor._save_rollout_checkpoint(force=True)).saved
+        finally:
+            actor._checkpointer.shutdown()
+
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["generation_cut_fence_hold_seconds"] == 1.5
+        assert logged["generation_cut_calls"] == 3.0
+        assert logged["generation_cut_failed_calls"] == 1.0
+        assert logged["generation_cut_skipped_calls"] == 2.0
+
     def test_a_resume_lost_after_gym_committed_keeps_the_snapshot(
         self, tmp_path: Path
     ) -> None:
@@ -1685,7 +1714,7 @@ class TestPeriodicRolloutCheckpoint:
         coordinator = gym_coordinator(gym)
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             async with coordinator.prepared(checkpoint_id):
                 yield object()
 
@@ -1719,7 +1748,7 @@ class TestPeriodicRolloutCheckpoint:
         gym_parked = asyncio.Event()
 
         @contextlib.asynccontextmanager
-        async def prepared_gym_checkpoint(_path, *, checkpoint_id):
+        async def prepared_gym_checkpoint(_path, *, checkpoint_id, cut_stats=None):
             gym_phase_events.append("park")
             try:
                 gym_parked.set()
@@ -2237,6 +2266,70 @@ class TestPeriodicRolloutCheckpoint:
             asyncio.run(_main())
         finally:
             actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        actor._generation_prefix_cuts_enabled = prefix_cuts_enabled
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", gym_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        actor._last_rollout_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(actor._save_rollout_checkpoint())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
 
     def test_periodic_pump_reports_each_consecutive_failure(
         self,

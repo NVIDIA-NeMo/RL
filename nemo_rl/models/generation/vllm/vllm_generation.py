@@ -705,6 +705,9 @@ class VllmGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -722,6 +725,9 @@ class VllmGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_token=generation_cut_control_token,
+            generation_cut_control_timeout_s=generation_cut_control_timeout_s,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return agreed_media_columns(ray.get(futures))
@@ -1836,6 +1842,60 @@ class VllmGeneration(GenerationInterface):
         if self.fleet_monitor is not None:
             self.fleet_monitor.raise_if_exhausted()
         return True
+
+    def begin_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Fence terminal staging while vLLM keeps decoding into live buffers."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "begin_token_capture_snapshot_fence requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_token_capture_snapshot_fence_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "Failed to fence terminal staging on every async vLLM engine"
+            )
+        return True
+
+    def end_token_capture_snapshot_fence(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Release terminal capture writes after the coordinated TQ snapshot."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "end_token_capture_snapshot_fence requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "end_token_capture_snapshot_fence_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "Failed to release every async vLLM token-capture snapshot fence"
+            )
+        return True
+
+    def get_generation_prefix_restore_counts(self) -> dict[str, int]:
+        """Sum over workers of calls resumed from a restored generation prefix."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_generation_prefix_restore_counts",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        totals = {"restored_calls": 0, "restored_prefix_tokens": 0}
+        for counts in ray.get(futures):
+            for name, value in counts.items():
+                totals[name] += value
+        return totals
 
     @property
     def requires_kv_scale_sync(self) -> bool:

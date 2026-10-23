@@ -15,10 +15,12 @@
 import asyncio
 import contextlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
 import threading
+import time
 import types
 import warnings
 from collections.abc import Callable
@@ -32,7 +34,7 @@ import pytest
 import ray
 import requests
 import torch
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -59,6 +61,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
@@ -1014,6 +1017,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
+        "vllm.sampling_params",
+        RequestOutputKind=type(
+            "RequestOutputKind", (), {"DELTA": "delta", "CUMULATIVE": "cumulative"}
+        ),
+    )
+    make_module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,
     )
@@ -1085,13 +1094,13 @@ def _nemo_gym_recognizes_context_overflow(
     )
 
 
-def _setup_fake_vllm_chat_handler(
+def _setup_fake_vllm_app(
     monkeypatch,
     *,
     with_cancellation: Callable[..., Any] | None = None,
     openai_serving_chat: type | None = None,
 ):
-    """Build the /v1/chat/completions handler against the fake vLLM modules.
+    """Build the worker's HTTP routes against the fake vLLM modules.
 
     Args:
         monkeypatch: The pytest fixture used to install the fake module tree.
@@ -1103,7 +1112,8 @@ def _setup_fake_vllm_chat_handler(
             stub does.
 
     Returns:
-        The worker, the OpenAIServingChat instance, and the route handler.
+        The worker, the OpenAIServingChat instance, and the app holding the
+        registered routes.
     """
     _, _, fake_serving_chat = _install_fake_vllm_openai_modules(monkeypatch)
     if with_cancellation is not None:
@@ -1132,6 +1142,8 @@ def _setup_fake_vllm_chat_handler(
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
     worker._capture_calls = {}
+    worker._capture_registry_lock = threading.Lock()
+    worker._generation_prefix_cuts_enabled = False
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -1140,10 +1152,32 @@ def _setup_fake_vllm_chat_handler(
 
     app = _FakeFastAPIApp()
     worker._setup_vllm_openai_api_server(app)
-    chat_handler = next(
-        handler for path, handler in app.routes if path == "/v1/chat/completions"
+    return worker, serving_chat_cls.instances[0], app
+
+
+def _route_handler(app: _FakeFastAPIApp, route: str) -> Callable[..., Any]:
+    return next(handler for path, handler in app.routes if path == route)
+
+
+def _setup_fake_vllm_chat_handler(
+    monkeypatch,
+    *,
+    with_cancellation: Callable[..., Any] | None = None,
+    openai_serving_chat: type | None = None,
+):
+    """Build the /v1/chat/completions handler against the fake vLLM modules.
+
+    Takes the arguments of ``_setup_fake_vllm_app``.
+
+    Returns:
+        The worker, the OpenAIServingChat instance, and the route handler.
+    """
+    worker, serving_chat, app = _setup_fake_vllm_app(
+        monkeypatch,
+        with_cancellation=with_cancellation,
+        openai_serving_chat=openai_serving_chat,
     )
-    return worker, serving_chat_cls.instances[0], chat_handler
+    return worker, serving_chat, _route_handler(app, "/v1/chat/completions")
 
 
 def _fake_chat_request():
@@ -1158,14 +1192,26 @@ def _fake_chat_request():
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
+        # NeMoRLChatCompletionRequest's private defaults for a call that
+        # restores no generation prefix.
+        _restored_generation_token_ids=(),
+        _restored_prefix_terminal=None,
     )
 
 
 def _track_request_capture(worker, request):
-    """Register in-flight capture state for request; return the fake capture sink."""
-    worker._capture_calls[id(request)] = types.SimpleNamespace(call="call")
+    """Register in-flight capture state for request; return the sink and its call."""
+    call = types.SimpleNamespace(model_call_id="call")
+    worker._capture_calls[id(request)] = types.SimpleNamespace(
+        call=call,
+        lifecycle_lock=threading.Lock(),
+        terminal_started=False,
+        generation_cut_staging_keys=[],
+    )
+    worker._capture_calls_by_model_call_id = {}
+    worker._completed_capture_calls = {}
     worker.token_capture = MagicMock()
-    return worker.token_capture
+    return worker.token_capture, call
 
 
 def _stalled_engine_generator(started: asyncio.Event, cancelled: asyncio.Event):
@@ -1240,6 +1286,153 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     assert error["code"] == 400
 
 
+@pytest.mark.parametrize(
+    ("max_tokens", "max_completion_tokens", "expected"),
+    [
+        # A request that set no limit still gets one. Otherwise vLLM falls
+        # back to the generation config's budget, which a restored call's
+        # remaining budget must not exceed.
+        (None, None, {"max_tokens": 424, "max_completion_tokens": None}),
+        (1, None, {"max_tokens": 424, "max_completion_tokens": None}),
+        (None, 1, {"max_tokens": None, "max_completion_tokens": 424}),
+    ],
+)
+def test_clamp_max_tokens_sets_the_limit_the_request_uses(
+    monkeypatch, max_tokens, max_completion_tokens, expected
+):
+    _, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+    renderer = serving_chat.kwargs["online_renderer"]
+    renderer.model_config = types.SimpleNamespace(max_model_len=2048)
+    request = types.SimpleNamespace(
+        max_tokens=max_tokens, max_completion_tokens=max_completion_tokens
+    )
+
+    renderer._clamp_max_tokens(request, 424, [0] * 1024)
+
+    assert vars(request) == expected
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected_kind"), [(False, "cumulative"), (True, "delta")]
+)
+def test_captured_requests_report_cumulative_progress_unless_streaming(
+    monkeypatch, stream, expected_kind
+):
+    """Cuts need per-step progress; a stream keeps the DELTA vLLM gave it."""
+    worker, _, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker._generation_prefix_cuts_enabled = True
+    worker._record_request_effective_output_limit = MagicMock()
+    worker._record_request_cut_constraints = MagicMock()
+    monkeypatch.setattr(
+        sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionRequest,
+        "to_sampling_params",
+        # vLLM's own choice: DELTA when streaming, FINAL_ONLY otherwise.
+        lambda self, *args, **kwargs: types.SimpleNamespace(
+            output_kind="delta" if self.stream else "final_only", max_tokens=16
+        ),
+        raising=False,
+    )
+    request_cls = inspect.signature(chat_handler).parameters["request"].annotation
+    request = request_cls.__new__(request_cls)
+    request.stream = stream
+    request.ng_capture = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+
+    assert request.to_sampling_params().output_kind == expected_kind
+
+
+def _generation_cut_route(
+    monkeypatch,
+    *,
+    enabled: bool = True,
+    token: str | None = "control-token",
+    timeout_s: float | None = None,
+):
+    """The generation-cut control route, with the cut it runs stubbed.
+
+    Returns:
+        The route handler and the ``(inventory, deadline)`` of each cut it ran.
+    """
+    worker, _, app = _setup_fake_vllm_app(monkeypatch)
+    worker._generation_prefix_cuts_enabled = enabled
+    worker._generation_cut_control_token = token
+    worker._generation_cut_control_timeout_s = timeout_s
+    cuts = []
+
+    def checkpoint_generation_cut(inventory, *, deadline):
+        cuts.append((inventory, deadline))
+        return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
+
+    async def run_generation_cut_control(operation, *args):
+        return operation(*args)
+
+    worker._checkpoint_generation_cut = checkpoint_generation_cut
+    worker._run_generation_cut_control = run_generation_cut_control
+    # nemo_gym is an optional extra; the route only uses it to type the inventory.
+    generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
+    generation_cut.GenerationCutInventory = types.SimpleNamespace(
+        model_validate=lambda inventory: ("typed", inventory)
+    )
+    monkeypatch.setitem(
+        sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
+    )
+    return _route_handler(app, _GENERATION_CUT_ROUTE), cuts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enabled", "token"), [(False, "control-token"), (True, None)])
+async def test_generation_cut_route_is_absent_while_cuts_are_disabled(
+    monkeypatch, enabled, token
+):
+    route, cuts = _generation_cut_route(monkeypatch, enabled=enabled, token=token)
+
+    with pytest.raises(HTTPException) as error:
+        await route({}, authorization="Bearer control-token")
+
+    assert error.value.status_code == 404
+    assert cuts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authorization",
+    [None, "Bearer wrong-token", "control-token", "bearer control-token"],
+)
+async def test_generation_cut_route_rejects_a_bad_control_bearer(
+    monkeypatch, authorization
+):
+    route, cuts = _generation_cut_route(monkeypatch)
+
+    with pytest.raises(HTTPException) as error:
+        await route({}, authorization=authorization)
+
+    assert error.value.status_code == 401
+    assert cuts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_s", [None, 30.0])
+async def test_generation_cut_route_runs_the_cut_against_its_deadline(
+    monkeypatch, timeout_s
+):
+    route, cuts = _generation_cut_route(monkeypatch, timeout_s=timeout_s)
+    inventory = {"checkpoint_id": "checkpoint-1"}
+
+    arrived = time.monotonic()
+    receipt = await route(inventory, authorization="Bearer control-token")
+    returned = time.monotonic()
+
+    assert receipt == {"acked": ("typed", inventory)}
+    ((typed_inventory, deadline),) = cuts
+    assert typed_inventory == ("typed", inventory)
+    if timeout_s is None:
+        assert deadline is None
+    else:
+        # The deadline counts from the request's arrival.
+        assert arrived + timeout_s <= deadline <= returned + timeout_s
+
+
 @pytest.mark.asyncio
 async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
     """vLLM's get_max_tokens overflow is a plain ValueError; it must still be a 400."""
@@ -1252,7 +1445,7 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
 
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     response = await chat_handler(request, MagicMock())
 
     response_content = response.body.decode()
@@ -1267,7 +1460,7 @@ async def test_plain_value_error_context_overflow_returns_http_400(monkeypatch):
         "param": "input_tokens",
         "code": 400,
     }
-    token_capture.fail_call.assert_called_once_with("call", reason="context_length")
+    token_capture.fail_call.assert_called_once_with(call, reason="context_length")
 
 
 @pytest.mark.asyncio
@@ -1280,10 +1473,48 @@ async def test_unrelated_value_error_is_reraised(monkeypatch):
 
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     with pytest.raises(ValueError, match="unexpected internal failure"):
         await chat_handler(request, MagicMock())
-    token_capture.fail_call.assert_called_once_with("call", reason="engine_error")
+    token_capture.fail_call.assert_called_once_with(call, reason="engine_error")
+
+
+@pytest.mark.asyncio
+async def test_capture_abort_waits_for_the_call_lifecycle_off_the_event_loop(
+    monkeypatch,
+):
+    """An abort queued behind a TQ write must not stall the worker's other requests."""
+    worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+
+    async def create_chat_completion(_request, _raw_request):
+        raise RuntimeError("engine failed")
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    token_capture, call = _track_request_capture(worker, request)
+    lifecycle_lock = worker._capture_calls[id(request)].lifecycle_lock
+    # Stands in for a generation cut or terminal write staging this call to TQ.
+    lifecycle_lock.acquire()
+    # Bounds the stall if the abort ever blocks the loop again.
+    releaser = threading.Timer(2.0, lifecycle_lock.release)
+    releaser.start()
+    loop = asyncio.get_running_loop()
+    try:
+        handler = asyncio.create_task(chat_handler(request, MagicMock()))
+        started = loop.time()
+        await asyncio.sleep(0.05)
+        loop_stall_s = loop.time() - started
+        abort_was_waiting = not handler.done()
+    finally:
+        releaser.cancel()
+        if lifecycle_lock.locked():
+            lifecycle_lock.release()
+
+    with pytest.raises(RuntimeError, match="engine failed"):
+        await handler
+    assert abort_was_waiting
+    assert loop_stall_s < 1.0
+    token_capture.fail_call.assert_called_once_with(call, reason="engine_error")
 
 
 @pytest.mark.asyncio
@@ -1328,7 +1559,7 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
     request.logprobs = logprobs
     request.return_tokens_as_token_ids = True
     request.top_logprobs = 0
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     try:
         await asyncio.wait_for(started.wait(), 5)
@@ -1339,7 +1570,7 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
 
         assert cancelled.is_set()
         token_capture.fail_call.assert_called_once_with(
-            "call", reason="client_disconnect"
+            call, reason="client_disconnect"
         )
         assert id(request) not in worker._capture_calls
     finally:
@@ -1364,7 +1595,7 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
     finish_capture = MagicMock()
     monkeypatch.setattr(worker, "_finish_request_capture", finish_capture)
     request = _fake_chat_request()
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
 
     async def exercise() -> None:
         # Use a separate loop so its executor cannot affect other async tests.
@@ -1391,7 +1622,7 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
             with pytest.raises(asyncio.CancelledError):
                 await task
             token_capture.fail_call.assert_called_once_with(
-                "call", reason="client_disconnect"
+                call, reason="client_disconnect"
             )
             assert id(request) not in worker._capture_calls
         finally:
@@ -1458,7 +1689,7 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     request.logprobs = logprobs
     request.return_tokens_as_token_ids = True
     request.top_logprobs = 0
-    token_capture = _track_request_capture(worker, request)
+    token_capture, call = _track_request_capture(worker, request)
     released = asyncio.Event()
     token_capture.fail_call.side_effect = lambda *_args, **_kwargs: released.set()
 
@@ -1473,7 +1704,7 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     assert await asyncio.wait_for(task, 1) is None
     await asyncio.wait_for(released.wait(), 1)
     assert cancelled.is_set()
-    token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
+    token_capture.fail_call.assert_called_once_with(call, reason="client_disconnect")
     assert id(request) not in worker._capture_calls
 
 

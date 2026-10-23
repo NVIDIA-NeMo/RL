@@ -549,8 +549,8 @@ def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
     )
     if typed:
         raise ValueError(
-            "rollout_recovery.target_level='turn' does not support environment "
-            f"servers with a typed episode protocol yet: {typed}; route these "
+            "rollout_recovery.target_level='turn' or 'prefix' does not support "
+            f"environment servers with a typed episode protocol yet: {typed}; route these "
             "rows through a legacy_agent environment server or use 'sibling'"
         )
 
@@ -2201,6 +2201,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool = False,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2222,6 +2223,9 @@ def build_nemo_gym_config(
             actor patches its tokenizer the same way the driver does.
         turn_checkpointing_enabled: Install Gym v2 checkpoint participants and
             validate their discovery during actor startup.
+        generation_prefix_cuts_enabled: Let Gym cut active model calls at a
+            checkpoint so a restore resumes them from their decoded prefix.
+            Requires ``turn_checkpointing_enabled``.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -2256,6 +2260,7 @@ def build_nemo_gym_config(
             replica_index=0,
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -2270,6 +2275,7 @@ def _build_gym_actor_config(
     use_fastokens: bool,
     checkpoint_instance: GymCheckpointInstance,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2335,6 +2341,10 @@ def _build_gym_actor_config(
                 checkpoint_instance.live_capture_dir(capture_root)
             )
 
+    if generation_prefix_cuts_enabled and not turn_checkpointing_enabled:
+        raise ValueError(
+            "generation-prefix cuts require Gym turn checkpointing to be enabled"
+        )
     if turn_checkpointing_enabled:
         if instance_token_capture is None or not instance_token_capture.get("enabled"):
             raise ValueError(
@@ -2361,6 +2371,8 @@ def _build_gym_actor_config(
             .setdefault("vllm_model", {})
         )
         policy_overrides["checkpoint_policy"] = True
+        if generation_prefix_cuts_enabled:
+            policy_overrides["checkpoint_generation_cuts"] = True
 
     return NemoGymConfig(
         model_name=model_name,
@@ -2605,6 +2617,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool = False,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
@@ -2623,6 +2636,9 @@ def build_nemo_gym_actors(
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
             coordinator per actor without triggering checkpoint saves.
+        generation_prefix_cuts_enabled: Let Gym cut active model calls at a
+            checkpoint so a restore resumes them from their decoded prefix.
+            Requires ``turn_checkpointing_enabled``.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -2644,6 +2660,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             turn_checkpointing_enabled=turn_checkpointing_enabled,
+            generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -2657,6 +2674,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -2673,6 +2691,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
@@ -2692,6 +2711,7 @@ def _build_single_gym_actor(
             replica_index=0,
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
+        generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -2731,6 +2751,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
+    generation_prefix_cuts_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -2820,6 +2841,7 @@ def _build_sharded_gym_actors(
                         replica_index=replica,
                     ),
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
+                    generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )

@@ -124,6 +124,7 @@ class RecoveryGranularity(StrEnum):
 class RecoveryTargetLevel(StrEnum):
     """Finest requested restart boundary for an unfinished rollout."""
 
+    PREFIX = "prefix"
     TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
@@ -139,8 +140,18 @@ class RecoveryTargetLevel(StrEnum):
 
     @property
     def rank(self) -> int:
-        """0 for ``turn``; a larger rank restarts more work. Follows declaration order."""
+        """0 for ``prefix``; a larger rank restarts more work. Follows declaration order."""
         return list(RecoveryTargetLevel.__members__.values()).index(self)
+
+    @property
+    def requires_gym_checkpoint(self) -> bool:
+        """Whether recovery needs Gym participant state for the active episode."""
+        return self in {RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN}
+
+    @property
+    def preserves_generation_prefix(self) -> bool:
+        """Whether recovery continues an active model call from decoded tokens."""
+        return self is RecoveryTargetLevel.PREFIX
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -366,10 +377,10 @@ class SiblingSealResult:
 def _holds_gym_episode(
     record: PromptGroupRecoveryRecord, sibling: RolloutSiblingRecord
 ) -> bool:
-    """Whether this sibling's current attempt is live turn-level Gym state."""
+    """Whether this sibling's current attempt is live turn/prefix Gym state."""
     return (
         record.status is PromptGroupStatus.GENERATING
-        and record.restore_level is RecoveryTargetLevel.TURN
+        and record.restore_level.requires_gym_checkpoint
         and sibling.current_attempt.holds_gym_state
     )
 
@@ -571,7 +582,7 @@ class RolloutRecoveryLedger:
                             episode.attempt,
                         )
                         if (
-                            record.restore_level is RecoveryTargetLevel.TURN
+                            record.restore_level.requires_gym_checkpoint
                             and attempt.status
                             in {
                                 RolloutAttemptStatus.DISPATCHED,
@@ -595,7 +606,7 @@ class RolloutRecoveryLedger:
         unused_restores = restored - consumed_restores
         if unused_restores:
             raise ValueError(
-                "Gym restored episodes are not owned by dispatched turn-level "
+                "Gym restored episodes are not owned by dispatched Gym-state "
                 f"rollouts: {sorted(unused_restores)!r}"
             )
 
@@ -648,7 +659,7 @@ class RolloutRecoveryLedger:
         self,
         instance_ids: set[str] | frozenset[str],
     ) -> dict[str, tuple[GymCheckpointEpisode, ...]]:
-        """Return active turn-level Gym episodes grouped by owning actor."""
+        """Return active turn/prefix Gym episodes grouped by owning actor."""
         inventory: dict[str, list[GymCheckpointEpisode]] = {
             instance_id: [] for instance_id in instance_ids
         }
@@ -660,13 +671,13 @@ class RolloutRecoveryLedger:
                 instance_id = attempt.gym_instance_id
                 if instance_id is None:
                     raise RuntimeError(
-                        "cannot checkpoint a dispatched turn-level rollout without "
+                        "cannot checkpoint a dispatched Gym-state rollout without "
                         f"Gym ownership: group={record.group_id!r}, "
                         f"generation_index={sibling.generation_index}"
                     )
                 if instance_id not in inventory:
                     raise RuntimeError(
-                        f"turn-level rollout references unavailable Gym instance "
+                        f"Gym-state rollout references unavailable Gym instance "
                         f"{instance_id!r}"
                     )
                 inventory[instance_id].append(
@@ -705,6 +716,20 @@ class RolloutRecoveryLedger:
                 ):
                     held[instance_id].add(episode)
         return held
+
+    def has_dispatched_generation_prefix(self) -> bool:
+        """Whether a dispatched attempt may be growing a recoverable prefix.
+
+        Decoding advances such an attempt without mutating the data plane, so a
+        snapshot cadence keyed only on data-plane mutations would never cut it.
+        """
+        return any(
+            record.status is PromptGroupStatus.GENERATING
+            and record.restore_level.preserves_generation_prefix
+            and sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            for record in self._groups.values()
+            for sibling in record.siblings
+        )
 
     def _record_gym_retirements(self, record: PromptGroupRecoveryRecord) -> None:
         """Remember each current attempt Gym may still be running for this group.
@@ -885,12 +910,12 @@ class RolloutRecoveryLedger:
             raise ValueError("only reserved rollout attempts may be dispatched")
         for attempt in attempts:
             if (
-                record.restore_level is RecoveryTargetLevel.TURN
+                record.restore_level.requires_gym_checkpoint
                 and attempt.gym_instance_id is None
                 and gym_instance_id is None
             ):
                 raise ValueError(
-                    "turn-level rollout dispatch requires a Gym checkpoint owner"
+                    "turn/prefix rollout dispatch requires a Gym checkpoint owner"
                 )
             if attempt.gym_instance_id is not None:
                 if gym_instance_id != attempt.gym_instance_id:

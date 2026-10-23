@@ -222,11 +222,13 @@ token_capture:
   enabled: false
   staging_partition: rollout_staging
 
-# Target recovery boundary for unfinished token-capture groups. "turn" enables
-# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
-# "prompt_group" regenerates every sibling in an unfinished group.
-# "turn" also requires env.should_use_nemo_gym, the vllm generation backend,
-# token_capture.enabled: true, rollout_checkpointing.snapshot_attempt_interval_s,
+# Target recovery boundary for unfinished token-capture groups. "prefix" also
+# preserves decoded tokens from an active model call; "turn" enables coordinated
+# Gym participant snapshots; "sibling" preserves sealed siblings; "prompt_group"
+# regenerates every sibling in an unfinished group.
+# "turn" and "prefix" also require env.should_use_nemo_gym, the vllm generation
+# backend, token_capture.enabled: true,
+# rollout_checkpointing.snapshot_attempt_interval_s,
 # rollout_checkpointing.restore_mode: latest, both override maps left empty,
 # only legacy_agent Gym environment servers, and
 # async_rl.stall_watchdog.stall_timeout_s above

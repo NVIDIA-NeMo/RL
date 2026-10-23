@@ -27,6 +27,7 @@ module tree, inspect consumer configuration, and exercise captured raw responses
 
 import asyncio
 import sys
+import threading
 import types
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -160,6 +161,12 @@ def _install_fake_vllm(monkeypatch):
         with_cancellation=lambda handler: handler,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+    module(
+        "vllm.sampling_params",
+        RequestOutputKind=type(
+            "RequestOutputKind", (), {"DELTA": "delta", "CUMULATIVE": "cumulative"}
+        ),
+    )
 
     class ValidationError(ValueError):
         def __init__(self, message, **kwargs):
@@ -208,6 +215,40 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, app=None):
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
 
 
+def _serving_chat_without_capture_state(monkeypatch: Any) -> tuple[Any, dict]:
+    """The real serving chat class, with capture bookkeeping reduced to stubs."""
+    _, chats, _ = _build_server(monkeypatch, {})
+    serving = chats[0]
+    serving.renderer = types.SimpleNamespace(tokenizer=None)
+    capture_calls: dict = {}
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_calls", capture_calls, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_registry_lock",
+        threading.Lock(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_generation_prefix_cuts_enabled",
+        False,
+        raising=False,
+    )
+    # An admitted marker is a placeholder, not capture state to observe.
+    for method in ("_observe_request_capture", "_restore_response_prefix"):
+        monkeypatch.setattr(
+            VllmAsyncGenerationWorkerImpl, method, lambda *_args, **_kwargs: None
+        )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_return_routed_experts_enabled",
+        lambda _self: False,
+    )
+    return serving, capture_calls
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "admitted,marker,stream,token_ids,default_token_ids,logprobs,bypass,invalid_raw",
@@ -244,24 +285,16 @@ async def test_captured_chat_logprobs_bypass(
     invalid_raw: bool,
 ) -> None:
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
-    _, chats, _ = _build_server(monkeypatch, {})
-    serving = chats[0]
+    serving, capture_calls = _serving_chat_without_capture_state(monkeypatch)
     serving.return_tokens_as_token_ids = default_token_ids
-    serving.renderer = types.SimpleNamespace(tokenizer=None)
-    capture_calls = {}
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_calls", capture_calls, raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_return_routed_experts_enabled",
-        lambda _self: False,
-    )
     request = types.SimpleNamespace(
         ng_capture={} if marker else None,
         stream=stream,
         logprobs=logprobs,
         top_logprobs=0,
+        # NeMoRLChatCompletionRequest's defaults for a call with no restored prefix.
+        _restored_generation_token_ids=(),
+        _restored_prefix_terminal=None,
         return_tokens_as_token_ids=token_ids,
     )
     if admitted:
@@ -344,6 +377,72 @@ async def test_captured_chat_logprobs_bypass(
         assert choice.message.prompt_token_ids == [1, 2]
         assert choice.message.generation_token_ids == [7]
         assert choice.message.generation_log_probs == [-0.5]
+
+
+@pytest.mark.asyncio
+async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch):
+    """The restored prefix the engine served as prompt is counted as completion."""
+    serving, _ = _serving_chat_without_capture_state(monkeypatch)
+    serving.return_tokens_as_token_ids = False
+    request = types.SimpleNamespace(
+        ng_capture=None,
+        stream=False,
+        logprobs=False,
+        top_logprobs=0,
+        # Prompt [1, 2, 3]; the call resumed from generated prefix [4, 5].
+        _restored_generation_token_ids=(4, 5),
+        _restored_prefix_terminal=None,
+        return_tokens_as_token_ids=False,
+    )
+
+    async def format_response(self, upstream_request, results, *args, **kwargs):
+        async for _ in results:
+            pass
+        response = sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionResponse()
+        response.choices = [types.SimpleNamespace(index=0, message=None, logprobs=None)]
+        response.prompt_token_ids = [1, 2, 3, 4, 5]
+        # vLLM's count: the prefix as prompt, the two-token tail as completion.
+        response.usage = types.SimpleNamespace(
+            prompt_tokens=5,
+            completion_tokens=2,
+            total_tokens=7,
+            prompt_tokens_details=None,
+        )
+        return response
+
+    monkeypatch.setattr(
+        _OpenAIServingChat,
+        "chat_completion_full_generator",
+        format_response,
+        raising=False,
+    )
+
+    async def results() -> AsyncIterator[Any]:
+        yield types.SimpleNamespace(
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            outputs=[
+                types.SimpleNamespace(
+                    index=0,
+                    token_ids=[6, 7],
+                    logprobs=None,
+                    text="tail",
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+        )
+
+    response = await serving.chat_completion_full_generator(request, results())
+
+    usage = response.usage
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
+        3,
+        4,
+        7,
+    )
+    assert response.prompt_token_ids == [1, 2, 3]
 
 
 @pytest.mark.parametrize(
@@ -438,7 +537,11 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
         },
     }
     captured = []
-    admission = SimpleNamespace(mode="token_in", prev_len=4) if capture_media else None
+    admission = (
+        SimpleNamespace(mode="token_in", prev_len=4, generation_cut=None)
+        if capture_media
+        else None
+    )
 
     async def preprocess(self, *, messages, **kwargs):
         rendered = (
