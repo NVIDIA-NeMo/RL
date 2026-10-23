@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
 import math
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -60,6 +62,13 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import (
+    GymCheckpointAdapter,
+    GymCheckpointCommitSummary,
+    GymCheckpointEpisode,
+    GymCheckpointInstance,
+    GymCheckpointPrepareSummary,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
     _has_image_before_first_trainable_output,
@@ -88,6 +97,7 @@ from nemo_rl.environments.nemotron_utils import (
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
+    GymAdmissionClosed,
     GymTransportError,
     RolloutDataFailure,
     http_status_is_infra,
@@ -356,6 +366,83 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     return RolloutDataFailure(detail)
 
 
+def _gym_error_code(response_body: object) -> Optional[str]:
+    """Return the ``error.code`` of a Gym control-plane error body, if it has one."""
+    if not isinstance(response_body, str):
+        return None
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError:
+        return None
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    code = error.get("code") if isinstance(error, Mapping) else None
+    return code if isinstance(code, str) else None
+
+
+def _gym_failure_row_error(
+    row: Mapping[str, Any], result: Mapping[str, Any]
+) -> Optional[Exception]:
+    """Map one Gym sidecar failure row onto the typed failure its ``/run`` raised.
+
+    ``run_examples(route_failures_to_sidecar=True)`` resolves a failed ``/run`` to its
+    row plus ``_ng_failure_*`` fields instead of an exception that carries no row. That
+    is what lets an ``admission_closed`` refusal name the row it refused while the rest
+    of the batch keeps streaming. An environment server's failed episode is data when
+    Gym marks it terminal and is re-sent otherwise. Every other failure maps to what
+    :func:`_typed_gym_failure` returns for the same error status, and one without an
+    error status, including a reply whose body broke off, is transport-shaped unless
+    the reply arrived but was not JSON.
+
+    Only Gym's no-rollout classes are failures. A row that ran can carry a class
+    too, such as the ``judge_failed`` row Gym's judge failsafe scores zero and masks;
+    it is post-processed like any other.
+
+    Returns None for a row that ran.
+    """
+    # Checked before the imports: every streamed row lands here, and NeMo-Gym is an
+    # optional extra that rows which ran must not need.
+    if "_ng_failure_class" not in result:
+        return None
+    from nemo_gym._checkpoint.errors import AdmissionClosedError
+
+    # Gym's own set, private but part of the row format this already reads, so a
+    # class Gym adds there is not mistaken for a row that ran.
+    from nemo_gym.rollout_collection import (
+        _NO_RESULT_FAILURE_CLASSES,
+        ENVIRONMENT_SERVER_FAILURE_CLASS,
+        NG_FAILURE_CLASS_KEY,
+        NG_TERMINAL_KEY,
+    )
+
+    if result[NG_FAILURE_CLASS_KEY] not in _NO_RESULT_FAILURE_CLASSES:
+        return None
+    status = result.get("_ng_failure_http_status")
+    body = result.get("_ng_failure_response_body")
+    message = result.get("_ng_failure_message")
+    if status == 409 and _gym_error_code(body) == AdmissionClosedError.code:
+        return GymAdmissionClosed(
+            f"NeMo-Gym refused /run while a checkpoint has admission closed: {body}",
+            row["_rowidx"],
+        )
+    if result[NG_FAILURE_CLASS_KEY] == ENVIRONMENT_SERVER_FAILURE_CLASS:
+        detail = f"NeMo-Gym environment server failed the episode: {message}"
+        if result.get(NG_TERMINAL_KEY):
+            return RolloutDataFailure(detail)
+        return GymTransportError(detail)
+    # Gym stamps the reply's own status when only its body failed, so a 200
+    # here is a transport failure, not a data one.
+    if isinstance(status, int) and status >= 400:
+        detail = f"NeMo-Gym /run failed with HTTP {status}: {message}"
+        if http_status_is_infra(status):
+            return GymTransportError(detail)
+        return RolloutDataFailure(detail)
+    failure_type = result.get("_ng_failure_type")
+    detail = f"NeMo-Gym /run failed without an HTTP reply ({failure_type}): {message}"
+    if failure_type == "JSONDecodeError":
+        return RolloutDataFailure(detail)
+    return GymTransportError(detail)
+
+
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
@@ -423,6 +510,10 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # Internal checkpoint topology. These are derived by the actor builder,
+    # never read from user YAML.
+    checkpoint_instance: GymCheckpointInstance
+    turn_checkpointing_enabled: bool
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -437,6 +528,30 @@ _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
+
+
+def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
+    """Refuse turn recovery behind an environment server with a typed episode protocol.
+
+    A restored attempt reaches Gym as the attempt-qualified rollout id
+    ``<id>-a<N>``. An agent decodes it, including behind the ``legacy_agent``
+    relay, but a typed environment server builds ``EpisodeId`` from it
+    directly, which Gym rejects, so every restored turn would be re-run from
+    scratch until its row budget is spent.
+    """
+    typed = sorted(
+        f"{instance}={server_type}"
+        for instance, entry in global_config.items()
+        if isinstance(entry, Mapping)
+        for server_type in entry.get("environment_servers") or {}
+        if server_type != "legacy_agent"
+    )
+    if typed:
+        raise ValueError(
+            "rollout_recovery.target_level='turn' does not support environment "
+            f"servers with a typed episode protocol yet: {typed}; route these "
+            "rows through a legacy_agent environment server or use 'sibling'"
+        )
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -680,6 +795,10 @@ class NemoGym(EnvironmentInterface):
         self.head_server_config: Any = None
         self.node_ip: Optional[str] = None
         self.head_server_port: Optional[int] = None
+        self._checkpoint_adapter: Optional[GymCheckpointAdapter] = None
+        self._server_client: Any = None
+        self._control_headers: Dict[str, str] = {}
+        self._control_timeout_s = 60.0
         # Installed by set_tokenizer at spinup, not passed per rollout call. Declared
         # here rather than in _spinup so a second spinup cannot wipe an installed
         # tokenizer and then report that set_tokenizer was never called.
@@ -831,7 +950,8 @@ Depending on your data shape, you may want to change these values."""
             token_capture and token_capture.get("enabled")
         )
         self._server_client = None
-        self._control_headers: Dict[str, str] = {}
+        self._checkpoint_adapter = None
+        self._control_headers = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
             assert token_capture is not None
@@ -932,6 +1052,127 @@ Depending on your data shape, you may want to change these values."""
             )
         return self._server_client
 
+    async def initialize_checkpoint_adapter(self) -> None:
+        """Discover this actor's Gym v2 checkpoint participants once."""
+        self._require_spinup()
+        if not self.cfg["turn_checkpointing_enabled"]:
+            raise RuntimeError("Gym checkpoint coordination is not enabled")
+        if self._checkpoint_adapter is None:
+            _reject_typed_environment_servers(self._control_client().global_config_dict)
+            self._checkpoint_adapter = GymCheckpointAdapter(
+                instance=self.cfg["checkpoint_instance"],
+                client=self._control_client(),
+                auth_token=self.cfg["initial_global_config_dict"]["checkpoint"][
+                    "control_auth_token"
+                ],
+            )
+        await self._checkpoint_adapter.discover()
+
+    def _require_checkpoint_adapter(self) -> GymCheckpointAdapter:
+        """Return the discovered actor-local adapter or fail before coordination."""
+        if self._checkpoint_adapter is None:
+            raise RuntimeError("Gym checkpoint adapter has not been initialized")
+        return self._checkpoint_adapter
+
+    async def checkpoint_prepare(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> GymCheckpointPrepareSummary:
+        """Park this actor's Gym deployment at one recoverable boundary."""
+        result = await self._require_checkpoint_adapter().prepare(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+        return GymCheckpointPrepareSummary.from_result(result)
+
+    async def checkpoint_renew(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Extend this actor's active Gym checkpoint lease."""
+        await self._require_checkpoint_adapter().renew(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_retire(
+        self,
+        checkpoint_id: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Retire selected episode attempts from this Gym deployment."""
+        await self._require_checkpoint_adapter().retire(
+            checkpoint_id,
+            episodes,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_forget(
+        self,
+        checkpoint_id: str,
+        rollout_ids: tuple[str, ...],
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Stop refusing these finished rollouts' retired attempts."""
+        await self._require_checkpoint_adapter().forget(
+            checkpoint_id,
+            rollout_ids,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_commit(
+        self,
+        checkpoint_id: str,
+        checkpoint_root: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        deadline_ts: float,
+    ) -> GymCheckpointCommitSummary:
+        """Persist this actor's selected episode state under ``checkpoint_root``."""
+        return await self._require_checkpoint_adapter().commit(
+            checkpoint_id,
+            checkpoint_root,
+            episodes,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_restore(
+        self,
+        checkpoint_id: str,
+        checkpoint_root: str,
+        episodes: tuple[GymCheckpointEpisode, ...],
+        *,
+        source_checkpoint_id: str,
+        deadline_ts: float,
+    ) -> None:
+        """Restore and validate this actor's state from ``checkpoint_root``."""
+        await self._require_checkpoint_adapter().restore(
+            checkpoint_id,
+            checkpoint_root,
+            episodes,
+            source_checkpoint_id=source_checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+
+    async def checkpoint_resume(
+        self,
+        checkpoint_id: str,
+        *,
+        deadline_ts: float,
+    ) -> None:
+        """Release this actor's Gym participants after commit or abort."""
+        await self._require_checkpoint_adapter().resume(
+            checkpoint_id,
+            deadline_ts=deadline_ts,
+        )
+
     async def _control(self, method: str, path: str, **kwargs: Any) -> dict:
         headers = {**kwargs.pop("headers", {}), **self._control_headers}
         try:
@@ -1011,7 +1252,7 @@ Depending on your data shape, you may want to change these values."""
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
         per_prompt: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete.
 
         A thin span-opening wrapper over :meth:`_stream_rollouts`, which holds
@@ -1042,7 +1283,9 @@ Depending on your data shape, you may want to change these values."""
             ``rowidx`` echoes back the ``_rowidx`` the caller stamped on the
             example, which is how the caller maps a result to its slot.
             ``timing_metrics`` is ``None`` on every tuple but the last, which
-            carries the batch totals.
+            carries the batch totals. A row Gym refused because a checkpoint
+            had admission closed is yielded as a ``GymAdmissionClosed``
+            naming its ``rowidx`` instead of a tuple.
         """
         attributes = {"rl.gym.batch_size": len(nemo_gym_examples)}
         # Two branches rather than a group variable, so the drift test can read
@@ -1077,7 +1320,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         timer_prefix: str,
         deduplicate_multimodal_data: bool = False,
-    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
+    ) -> AsyncGenerator[tuple[int, dict, dict, dict | None] | GymAdmissionClosed, None]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
         if not nemo_gym_examples:
@@ -1099,8 +1342,12 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
+        # Sidecar mode resolves a failed /run to its row rather than an exception
+        # that names no row; see _gym_failure_row_error.
         nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+            route_failures_to_sidecar=True,
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
@@ -1108,6 +1355,38 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
+
+        def finish_row(agent_name: str) -> Optional[dict[str, Any]]:
+            """Count one resolved row; return the ``/run`` timing on its last."""
+            nonlocal num_results
+            num_results += 1
+            counts_left[agent_name] -= 1
+            if counts_left[agent_name] <= 0:
+                counts_left.pop(agent_name)
+            if num_results % 10 == 0 and counts_left:
+                top_left = counts_left.most_common(5)
+                top_left_str = "\n".join(
+                    f"{index + 1}. {name}: {count}"
+                    for index, (name, count) in enumerate(top_left)
+                )
+                print(
+                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                    f"{top_left_str}",
+                    file=sys.stderr,
+                )
+            if num_results != len(nemo_gym_examples):
+                return None
+            timer.stop("_run_rollouts_total")
+            timing_metrics = timer.get_timing_metrics("sum")
+            total_time = timing_metrics.pop("_run_rollouts_total")
+            # A run whose every row was refused post-processed nothing.
+            postprocess_time = timing_metrics.get(f"{timer_prefix}/postprocess_results")
+            if postprocess_time is not None:
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100 * postprocess_time / total_time
+                )
+            return timing_metrics
+
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
@@ -1126,6 +1405,27 @@ Depending on your data shape, you may want to change these values."""
                         # the whole point. The status and message are already in `detail`.
                         raise typed from None
                     raise
+                failure = _gym_failure_row_error(nemo_gym_row, nemo_gym_result)
+                # A refusal is expected while a checkpoint is open; only a real
+                # failure is worth its body on stderr.
+                if failure is not None and not isinstance(failure, GymAdmissionClosed):
+                    print(
+                        "EXCEPTION RESULT",
+                        nemo_gym_result.get("_ng_failure_response_body"),
+                        file=sys.stderr,
+                    )
+                    raise failure
+
+            if isinstance(failure, GymAdmissionClosed):
+                # Yielded, not raised: rows Gym admitted before the checkpoint
+                # closed admission keep streaming, and the caller unwinds this one
+                # row before the checkpoint drains.
+                yield GymAdmissionClosed(
+                    failure.detail,
+                    failure.rowidx,
+                    finish_row(nemo_gym_row["agent_ref"]["name"]),
+                )
+                continue
 
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
                 if self._token_capture_enabled:
@@ -1145,33 +1445,7 @@ Depending on your data shape, you may want to change these values."""
                     )
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
-
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
+            timing_metrics = finish_row(nemo_gym_row["agent_ref"]["name"])
 
             # task_source is resolved to agent_ref inside this Ray actor, after
             # the caller's row was serialized. Return the resolved ref explicitly
@@ -1910,6 +2184,7 @@ def build_nemo_gym_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -1929,6 +2204,8 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        turn_checkpointing_enabled: Install Gym v2 checkpoint participants and
+            validate their discovery during actor startup.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -1958,6 +2235,11 @@ def build_nemo_gym_config(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        checkpoint_instance=GymCheckpointInstance(
+            shard_name=DEFAULT_SHARD_NAME,
+            replica_index=0,
+        ),
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -1970,6 +2252,8 @@ def _build_gym_actor_config(
     model_name: str,
     enable_router_replay: bool,
     use_fastokens: bool,
+    checkpoint_instance: GymCheckpointInstance,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2021,6 +2305,47 @@ def _build_gym_actor_config(
         else "int16"
     )
 
+    instance_token_capture = None
+    if token_capture is not None:
+        instance_token_capture = dict(token_capture)
+        if instance_token_capture.get("enabled"):
+            capture_root = instance_token_capture.get("capture_dir")
+            if not isinstance(capture_root, str) or not capture_root:
+                raise ValueError(
+                    "enabled token capture requires a non-empty capture_dir before "
+                    "building NeMo-Gym actors"
+                )
+            instance_token_capture["capture_dir"] = str(
+                checkpoint_instance.live_capture_dir(capture_root)
+            )
+
+    if turn_checkpointing_enabled:
+        if instance_token_capture is None or not instance_token_capture.get("enabled"):
+            raise ValueError(
+                "Gym checkpoint coordination requires token capture to be enabled"
+            )
+        # Gym serves its global config unauthenticated, so checkpoint control
+        # gets a credential of its own rather than the token-capture one.
+        nemo_gym_dict["checkpoint"] = {
+            "enabled": True,
+            "control_auth_token": secrets.token_hex(32),
+            # RL renews the lease at least every 10s while Gym is parked, so a
+            # lost resume should reopen Gym after a few missed renewals, not
+            # after Gym's 600s default.
+            "lease_grace_seconds": 3.0
+            * float(instance_token_capture.get("control_timeout_s") or 60.0),
+        }
+        # The copy above is shallow; keep the caller's policy_model untouched.
+        nemo_gym_dict["policy_model"] = copy.deepcopy(
+            nemo_gym_dict.get("policy_model", {})
+        )
+        policy_overrides = (
+            nemo_gym_dict.setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        policy_overrides["checkpoint_policy"] = True
+
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
@@ -2033,7 +2358,9 @@ def _build_gym_actor_config(
         use_fastokens=use_fastokens,
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
-        token_capture=token_capture,
+        token_capture=instance_token_capture,
+        checkpoint_instance=checkpoint_instance,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         **port_range,
         **multimodal_flags,
     )
@@ -2099,6 +2426,15 @@ class NemoGymShardSet:
         return [handle for replicas in self.handles.values() for handle in replicas]
 
     @property
+    def checkpoint_handles(self) -> Dict[str, Any]:
+        """Map every stable checkpoint instance ID to its actor handle."""
+        return {
+            GymCheckpointInstance(shard_name, replica).instance_id: handle
+            for shard_name, replicas in self.handles.items()
+            for replica, handle in enumerate(replicas)
+        }
+
+    @property
     def hosted_routes(self) -> frozenset[str]:
         """Agent and task-source entry names this set can route to."""
         return frozenset(self.route_to_shard)
@@ -2156,6 +2492,24 @@ class NemoGymShardSet:
                 if replica is handle:
                     return shard_name if len(replicas) == 1 else f"{shard_name}/{index}"
         raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
+
+    def checkpoint_instance_for_handle(self, handle: Any) -> GymCheckpointInstance:
+        """Return the durable checkpoint identity of an actor handle."""
+        for shard_name, replicas in self.handles.items():
+            for replica, candidate in enumerate(replicas):
+                if candidate is handle:
+                    return GymCheckpointInstance(shard_name, replica)
+        raise ShardSetupError("Handle does not belong to this NeMo-Gym shard set")
+
+    def handle_for_checkpoint_instance(self, instance_id: str) -> Any:
+        """Resolve a persisted checkpoint instance ID back to its actor handle."""
+        try:
+            return self.checkpoint_handles[instance_id]
+        except KeyError:
+            raise ShardSetupError(
+                f"No NeMo-Gym actor has checkpoint instance {instance_id!r}; "
+                f"available={sorted(self.checkpoint_handles)!r}"
+            ) from None
 
     def sole_handle(self) -> Any:
         """The only actor, for callers that predate routing.
@@ -2234,6 +2588,7 @@ def build_nemo_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
@@ -2250,6 +2605,8 @@ def build_nemo_gym_actors(
     Args:
         tokenizer: Installed on every actor once it is up, rather than passed
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
+        turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
+            coordinator per actor without triggering checkpoint saves.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -2270,6 +2627,7 @@ def build_nemo_gym_actors(
             tokenizer=tokenizer,
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
+            turn_checkpointing_enabled=turn_checkpointing_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -2282,6 +2640,7 @@ def build_nemo_gym_actors(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -2297,13 +2656,14 @@ def _build_single_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
-    """The pre-sharding path: one actor, no placement group, no discovery.
+    """The pre-sharding path: one actor and no placement group.
 
-    Discovery is skipped rather than merely unused. Its checks compare entry
-    names *between* shards, so with one shard there is nothing they could find.
+    Cross-shard route discovery is skipped because there is only one shard.
+    Gym checkpoint-participant discovery still runs when turn recovery is enabled.
     """
     actor_config = _build_gym_actor_config(
         nemo_gym_dict,
@@ -2311,6 +2671,11 @@ def _build_single_gym_actor(
         model_name=model_name,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        checkpoint_instance=GymCheckpointInstance(
+            shard_name=DEFAULT_SHARD_NAME,
+            replica_index=0,
+        ),
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -2329,6 +2694,8 @@ def _build_single_gym_actor(
     try:
         ray.get(actor._spinup.remote())
         ray.get(actor.set_tokenizer.remote(tokenizer))
+        if turn_checkpointing_enabled:
+            ray.get(actor.initialize_checkpoint_adapter.remote())
     except BaseException:
         shard_set.shutdown(
             timeout=NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S,
@@ -2347,6 +2714,7 @@ def _build_sharded_gym_actors(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -2431,13 +2799,23 @@ def _build_sharded_gym_actors(
                     model_name=model_name,
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
+                    checkpoint_instance=GymCheckpointInstance(
+                        shard_name=shard.name,
+                        replica_index=replica,
+                    ),
+                    turn_checkpointing_enabled=turn_checkpointing_enabled,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
 
-        _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
+        _spinup_shards_concurrently(
+            shard_set,
+            spinup_timeout,
+            tokenizer=tokenizer,
+            turn_checkpointing_enabled=turn_checkpointing_enabled,
+        )
         shard_set.route_to_shard = _discover_route_shard_map(shard_set, plan)
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
@@ -2457,6 +2835,7 @@ def _spinup_shards_concurrently(
     spinup_timeout: float,
     *,
     tokenizer: PreTrainedTokenizerBase,
+    turn_checkpointing_enabled: bool = False,
 ) -> None:
     """Start every shard at once, naming the shard behind any failure.
 
@@ -2465,9 +2844,11 @@ def _spinup_shards_concurrently(
     ``ServerRefNotFoundError`` there. Gym names the entry and field but has no
     concept of a shard, so the shard name is added here.
 
-    The tokenizer install is a second pass rather than a call queued behind
-    each ``_spinup``. Queuing both up front would mean waiting on the install
-    to learn the spinup failed, which loses the message above.
+    The tokenizer install, and with turn checkpointing each replica's
+    discovery of its own Gym checkpoint deployment, are a second pass rather
+    than calls queued behind each ``_spinup``. Queuing them up front would mean
+    waiting on them to learn the spinup failed, which loses the message above.
+    Both passes share the one startup deadline.
     """
     instance_handles = [
         (shard_name, replica, handle)
@@ -2502,11 +2883,27 @@ def _spinup_shards_concurrently(
                 f"config_paths is the usual cause: {error}"
             ) from error
 
-    installs = [
-        (shard_name, replica, handle.set_tokenizer.remote(tokenizer))
-        for shard_name, replica, handle in instance_handles
-    ]
-    for shard_name, replica, reference in installs:
+    # Each actor runs its calls in order, so discovery follows its own install.
+    setup_calls = []
+    for shard_name, replica, handle in instance_handles:
+        setup_calls.append(
+            (
+                shard_name,
+                replica,
+                "did not accept the tokenizer",
+                handle.set_tokenizer.remote(tokenizer),
+            )
+        )
+        if turn_checkpointing_enabled:
+            setup_calls.append(
+                (
+                    shard_name,
+                    replica,
+                    "could not discover its Gym v2 checkpoint participants",
+                    handle.initialize_checkpoint_adapter.remote(),
+                )
+            )
+    for shard_name, replica, failure, reference in setup_calls:
         remaining = max(0.0, deadline - monotonic())
         try:
             ray.get(reference, timeout=remaining)
@@ -2514,13 +2911,12 @@ def _spinup_shards_concurrently(
             if remaining <= 0.0:
                 raise ShardSetupError(
                     f"NeMo-Gym shards used the whole {spinup_timeout}s startup "
-                    f"budget before the tokenizer reached every replica. Raise "
+                    f"budget before every replica finished setting up. Raise "
                     f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
                     f"the image so a cold node starts faster."
                 ) from error
             raise ShardSetupError(
-                f"NeMo-Gym shard '{shard_name}' (replica {replica}) did not "
-                f"accept the tokenizer: {error}"
+                f"NeMo-Gym shard '{shard_name}' (replica {replica}) {failure}: {error}"
             ) from error
 
 
@@ -2547,6 +2943,7 @@ def spinup_nemo_gym_actor(
     tokenizer: PreTrainedTokenizerBase,
     enable_router_replay: bool,
     use_fastokens: bool,
+    turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> Any:
@@ -2564,6 +2961,8 @@ def spinup_nemo_gym_actor(
         token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
             token capture is enabled, else ``None``. Forwarded to
             ``build_nemo_gym_config``.
+        turn_checkpointing_enabled: Install and discover Gym v2 checkpoint
+            participants. This helper still returns one unsharded actor.
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -2591,6 +2990,7 @@ def spinup_nemo_gym_actor(
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
+        turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     ).sole_handle()
