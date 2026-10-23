@@ -1012,9 +1012,8 @@ def nemo_gym_data_processor(
                 "nor a dynamic min_num_patches/max_num_patches budget."
             )
 
-        # Record the cap so Gym can require captured media for this row, and
-        # send the same budget to vLLM's image processor.
-        extra_env_info["_nemo_rl_image_max_num_tiles"] = image_max_num_tiles
+        # Forward the processor request override. Gym setup rejects this option
+        # until generation and training can honor the same tile cap.
         from nemo_rl.environments.nemo_gym_multimodal import (
             _inject_vllm_mm_processor_kwargs,
         )

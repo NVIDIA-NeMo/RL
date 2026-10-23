@@ -142,6 +142,10 @@ entirely; repeat any default entries you want to keep. Unknown top-level keys
 merge individually and are then folded into `megatron_cfg_overrides`, whose
 explicit entries take precedence.
 
+NeMo Gym does not support the dataset option `image_max_num_tiles`, with or
+without token capture. Remove it from `data.default`, `data.train`, and
+`data.validation`; setup rejects it before starting model or Gym workers.
+
 > [!NOTE]
 > `adv_estimator: opd` fails fast at setup if the config would zero
 > `prev_logprobs` (`loss_fn.force_on_policy_ratio: true` with no

@@ -1343,7 +1343,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
@@ -1606,27 +1606,6 @@ def test_nemo_gym_postprocess_uses_batch_decode(token_fields, expected_count):
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("capture_enabled", [False, True])
-@pytest.mark.parametrize("tile_cap", [None, 1, 4])
-async def test_nemo_gym_image_tile_budget_requires_capture(capture_enabled, tile_cap):
-    actor = SimpleNamespace(
-        _require_spinup=MagicMock(),
-        _token_capture_enabled=capture_enabled,
-        _tokenizer=None,
-    )
-    stream = NemoGym.__ray_metadata__.modified_class._stream_rollouts(
-        actor, [{"_nemo_rl_image_max_num_tiles": tile_cap}], "test"
-    )
-    if tile_cap is not None and not capture_enabled:
-        error_type, message = ValueError, "image_max_num_tiles requires token_capture"
-    else:
-        # The configuration is accepted and reaches the next readiness check.
-        error_type, message = RuntimeError, "set_tokenizer"
-    with pytest.raises(error_type, match=message):
-        await anext(stream)
 
 
 @pytest.mark.parametrize("include_initial_multimodal_data", [False, True])

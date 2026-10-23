@@ -1080,14 +1080,6 @@ Depending on your data shape, you may want to change these values."""
     ) -> AsyncGenerator[tuple[int, dict, dict, dict | None], None]:
         """Body of :meth:`run_rollouts`; see there for the tracing wrapper."""
         self._require_spinup()
-        if not self._token_capture_enabled and any(
-            row.get("_nemo_rl_image_max_num_tiles") is not None
-            for row in nemo_gym_examples
-        ):
-            raise ValueError(
-                "image_max_num_tiles requires token_capture.enabled: legacy "
-                "Gym postprocessing cannot reproduce per-row image tile budgets."
-            )
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
         if self._tokenizer is None:
@@ -1875,6 +1867,20 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    # Validate before starting any workers. Capture preserves the generated
+    # media tensors but does not make the dynamic tiler honor this option.
+    for section in ("default", "train", "validation"):
+        datasets = config.data.get(section)
+        if datasets is None:
+            continue
+        for dataset in datasets if isinstance(datasets, list) else [datasets]:
+            if dataset.get("image_max_num_tiles") is not None:
+                raise ValueError(
+                    f"data.{section}.image_max_num_tiles is not supported by "
+                    "NeMo Gym, with or without token capture. Remove this "
+                    "setting; per-dataset image tile caps are not implemented."
+                )
+
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.

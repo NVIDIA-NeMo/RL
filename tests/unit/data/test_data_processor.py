@@ -191,57 +191,6 @@ def test_video_defaults_still_route_cached_video_rows_to_video_processor():
         )
 
 
-def test_gym_image_max_num_tiles_is_forwarded_to_vllm_and_kept_for_training():
-    class _ImageProcessor:
-        max_num_tiles = 12
-
-    class _Processor:
-        image_processor = _ImageProcessor()
-
-    extra_env_info = {
-        "responses_create_params": {
-            "input": [
-                {
-                    "role": "user",
-                    "content": [{"type": "input_image", "image_url": "frame.png"}],
-                }
-            ]
-        }
-    }
-
-    result = nemo_gym_data_processor(
-        datum_dict={
-            "extra_env_info": json.dumps(extra_env_info),
-            "task_name": "nemo_gym",
-        },
-        task_data_spec=TaskDataSpec(task_name="nemo_gym", image_max_num_tiles=4),
-        tokenizer=_Processor(),
-        max_seq_length=128,
-        idx=9,
-    )
-
-    forwarded = result["extra_env_info"]
-    assert forwarded["_nemo_rl_image_max_num_tiles"] == 4
-    extra_body = json.loads(
-        forwarded["responses_create_params"]["metadata"]["extra_body"]
-    )
-    assert extra_body["mm_processor_kwargs"] == {"max_num_tiles": 4}
-
-
-def test_gym_image_max_num_tiles_requires_an_image_processor():
-    with pytest.raises(TypeError, match="image_processor"):
-        nemo_gym_data_processor(
-            datum_dict={
-                "extra_env_info": json.dumps({"responses_create_params": {}}),
-                "task_name": "nemo_gym",
-            },
-            task_data_spec=TaskDataSpec(task_name="nemo_gym", image_max_num_tiles=4),
-            tokenizer=None,
-            max_seq_length=128,
-            idx=10,
-        )
-
-
 def test_nemo_gym_data_processor_allows_nonvideo_rows_with_video_defaults(
     monkeypatch,
 ):
