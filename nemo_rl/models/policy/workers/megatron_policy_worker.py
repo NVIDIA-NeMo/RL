@@ -701,6 +701,9 @@ class MegatronPolicyWorkerImpl(
     _train_step_state: Optional[dict[str, Any]] = None
     _remote_sparse_refit: Any = None
     _async_checkpoint_cuda_cache_active: bool = False
+    # megatron_cfg.manual_gc_interval when manual GC is on, else None.
+    _manual_gc_interval: Optional[int] = None
+    _manual_gc_steps: int = 0
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -882,6 +885,7 @@ class MegatronPolicyWorkerImpl(
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
+        self._maybe_enable_manual_gc()
 
         # Store the reserved HTTP server port for inference server initialization.
         # Megatron-LLM's hosts an inference server on every MP coordinator rank,
@@ -2239,7 +2243,7 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            return self._finish_train_step_body(state)
+            result = self._finish_train_step_body(state)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -2259,6 +2263,37 @@ class MegatronPolicyWorkerImpl(
                     "failed to restore mcore hooks after finish_train_step error"
                 )
             raise
+        self._maybe_run_manual_gc()
+        return result
+
+    def _maybe_enable_manual_gc(self) -> None:
+        """Disable automatic Python GC when megatron_cfg.manual_gc is set.
+
+        Mirrors Megatron's ``manual_gc``: collections then run on every rank at the
+        same point (see ``_maybe_run_manual_gc``) instead of stalling the other
+        ranks one at a time. Forked children re-enable GC so subprocesses such as
+        data workers keep the default behavior.
+        """
+        megatron_cfg = self.cfg["megatron_cfg"]
+        if not megatron_cfg.get("manual_gc"):
+            return
+        interval = megatron_cfg["manual_gc_interval"]
+        if interval < 0:
+            raise ValueError(
+                f"megatron_cfg.manual_gc_interval must be >= 0, got {interval}"
+            )
+        gc.disable()
+        os.register_at_fork(after_in_child=gc.enable)
+        gc.collect()
+        self._manual_gc_interval = interval
+
+    def _maybe_run_manual_gc(self) -> None:
+        """Collect every manual_gc_interval finished steps; every rank runs it in lockstep."""
+        if not self._manual_gc_interval:
+            return
+        self._manual_gc_steps += 1
+        if self._manual_gc_steps % self._manual_gc_interval == 0:
+            gc.collect()
 
     def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
