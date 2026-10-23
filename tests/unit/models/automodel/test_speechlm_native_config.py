@@ -42,8 +42,9 @@ def native_config(**kwargs):
 
 
 @pytest.mark.parametrize("immediate", [False, True])
+@pytest.mark.parametrize("mtp", [{}, None])
 def test_native_facade_uses_loaded_config_and_preserves_overrides(
-    tmp_path, monkeypatch, immediate
+    tmp_path, monkeypatch, immediate, mtp
 ):
     backbone = NemotronHConfig(
         architectures=["NemotronHForCausalLM"],
@@ -78,6 +79,7 @@ def test_native_facade_uses_loaded_config_and_preserves_overrides(
         "pretrained_weights": False,
         "init_configure_model": immediate,
         "encoder_chunk_size_seconds": 10.0,
+        "mtp": mtp,
     }
     model = SpeechLMPolicy(
         cfg,
@@ -117,6 +119,7 @@ def test_native_loader_uses_fp32_storage_at_speech_boundary(monkeypatch, dtype):
     )
     assert result is model
     assert observed["torch_dtype"] == torch.float32
+    assert observed["strict"] is True
     resolved = (
         getattr(torch, observed["torch_dtype"])
         if isinstance(observed["torch_dtype"], str)
@@ -463,6 +466,24 @@ def test_update_surface_accepts_optional_frozen_ctc(update_surface_model, ctc_dt
         ).removeprefix("torch.")
     SpeechLMPolicy.validate_update_surface(model)
     assert SpeechLMPolicy.refit_parameter_names(model) == ("llm.proj.weight",)
+
+
+@pytest.mark.parametrize("has_mtp", [False, True])
+def test_update_surface_accepts_optional_frozen_mtp(update_surface_model, has_mtp):
+    model = update_surface_model
+    if not has_mtp:
+        model.llm.mtp = None
+    SpeechLMPolicy.validate_update_surface(model)
+
+
+def test_update_surface_rejects_trainable_mtp(update_surface_model):
+    model = update_surface_model
+    model.llm.mtp.to(dtype=torch.float32).requires_grad_(True)
+    model.native_model["trainable_names"].append("llm.mtp.weight")
+    model.native_model["expected_trainable_tensors"] = 2
+    model.native_model["expected_trainable_scalars"] = 2
+    with pytest.raises(ValueError, match="Native MTP"):
+        SpeechLMPolicy.validate_update_surface(model)
 
 
 @pytest.mark.parametrize(

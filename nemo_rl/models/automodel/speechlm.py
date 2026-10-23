@@ -59,7 +59,7 @@ class SpeechLMPolicy(SALMAutomodel):
         cfg.update(self.native_model["model_config_overrides"])
         cfg["use_nemo_automodel"] = True
         cfg["retain_native_mtp"] = True
-        cfg["mtp"] = {**cfg.get("mtp", {}), "enabled": False}
+        cfg["mtp"] = {**(cfg.get("mtp") or {}), "enabled": False}
         cfg["packed_sequences"] = False
         cfg["packed_encoder_sequences"] = False
         cfg["packed_encoder_cp"] = False
@@ -189,10 +189,10 @@ class SpeechLMPolicy(SALMAutomodel):
                     raise ValueError(
                         "CTC parameters must remain frozen in their source storage dtype"
                     )
-        if self.llm.mtp is None or any(
+        if self.llm.mtp is not None and any(
             parameter.requires_grad for parameter in self.llm.mtp.parameters()
         ):
-            raise ValueError("Native MTP must be retained and frozen")
+            raise ValueError("Native MTP must remain frozen")
 
     def train(self, mode: bool = True) -> SpeechLMPolicy:
         super().train(mode)
