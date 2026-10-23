@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from PIL import Image
 import pytest
+from PIL import Image
 
 from nemo_rl.data.multimodal_utils import (
     extract_input_media_sources_from_responses_messages,
@@ -21,6 +21,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
+    _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _without_initial_media_sources,
 )
@@ -71,16 +72,21 @@ def test_extract_input_images_ignores_text_function_call_output():
     item["output"] = "Tool failed to create result.png"
     assert _extract_input_images_from_message(item) == []
 
-    item["output"] = "https://example.com/a-result-that-is-text"
-    assert _extract_input_images_from_message(item) == []
-
-    item["output"] = "file:///tmp/a-result-that-is-text"
-    assert _extract_input_images_from_message(item) == []
-
 
 @pytest.mark.parametrize("source", ["https://example.com/result", "file:///tmp/result"])
-def test_text_tool_output_preserves_initial_images(source):
+def test_text_tool_output_preserves_initial_images(monkeypatch, source):
+    from nemo_rl.environments import nemo_gym_multimodal
+
+    resolve_to_image = nemo_gym_multimodal.resolve_to_image
+
+    def reject_text_source(image_source):
+        assert image_source != source, "a text tool output must not be resolved"
+        return resolve_to_image(image_source)
+
+    monkeypatch.setattr(nemo_gym_multimodal, "resolve_to_image", reject_text_source)
     output = [{"type": "function_call_output", "output": source}, _assistant([1])]
+    assert _extract_input_images_from_message(output[0]) == []
+    assert not _has_image_before_first_trainable_output(output)
     per_turn = _index_per_turn_images(output, input_messages=[_user(_image((2, 2)))])
     assert [[image.size for image in turn] for turn in per_turn] == [[(2, 2)]]
 

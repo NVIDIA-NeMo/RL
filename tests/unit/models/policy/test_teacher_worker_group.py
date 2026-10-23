@@ -100,8 +100,20 @@ def test_create_teacher_configs_deduplicates():
     assert len(configs) == 2
 
 
-def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
-    """Frozen teachers do not require rollout-to-training route consistency."""
+@pytest.mark.parametrize("student_mtp_layers", [0, 5])
+@pytest.mark.parametrize(
+    "teacher_overrides,expected_mtp_layers",
+    [
+        ({}, 0),
+        ({"mtp_num_layers": 0}, 0),
+        ({"mtp_num_layers": 2}, 2),
+        ({"freeze_vision_model": False}, 0),
+    ],
+)
+def test_teacher_worker_group_isolates_student_inference_settings(
+    monkeypatch, student_mtp_layers, teacher_overrides, expected_mtp_layers
+):
+    """Scoring disables router replay and defaults MTP off independently of training."""
     import nemo_rl.distributed.worker_groups as worker_groups
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherConfig,
@@ -125,7 +137,12 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     cluster.world_size.return_value = 1
     policy_config = {
         "model_name": "/ckpt/student",
-        "megatron_cfg": {"enabled": True},
+        "megatron_cfg": {
+            "enabled": True,
+            "mtp_num_layers": student_mtp_layers,
+            "mtp_use_repeated_layer": True,
+            "freeze_vision_model": True,
+        },
         "automodel_cfg": {"enabled": False},
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
@@ -142,7 +159,7 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
         gpus_per_node=1,
         precision="bf16",
         micro_batch_size=1,
-        megatron_cfg_overrides={},
+        megatron_cfg_overrides=teacher_overrides,
     )
 
     teacher = TeacherWorkerGroup(
@@ -156,6 +173,13 @@ def test_teacher_worker_group_disables_student_router_replay(monkeypatch):
     assert captured["cfg"]["router_replay"]["enabled"] is False
     assert teacher.cfg["router_replay"]["enabled"] is False
     assert policy_config["router_replay"]["enabled"] is True
+    megatron_cfg = captured["cfg"]["megatron_cfg"]
+    assert megatron_cfg["mtp_num_layers"] == expected_mtp_layers
+    assert megatron_cfg["_provider_override_allowlist"] == sorted(
+        {"mtp_num_layers", *teacher_overrides}
+    )
+    assert policy_config["megatron_cfg"]["mtp_num_layers"] == student_mtp_layers
+    assert teacher_config.megatron_cfg_overrides == teacher_overrides
 
 
 def test_teacher_worker_group_drops_the_student_pretrained_checkpoint(monkeypatch):
@@ -750,6 +774,48 @@ def test_typed_override_blocks_round_trip_without_schema_fill():
     assert cfg.gpus_per_node == 4  # not the schema default 8
     assert cfg.num_nodes == 2
     assert cfg.micro_batch_size == 1
+    logged = opd.model_dump()["non_colocated_teachers"]
+    assert logged["default_teacher_cfg"]["precision"] == cfg.precision == "bf16"
+    assert (
+        logged["default_teacher_cfg"]["tensor_model_parallel_size"]
+        == cfg.tensor_model_parallel_size
+        == 1
+    )
+
+
+def test_teacher_megatron_override_dictionary_replaces_default():
+    from nemo_rl.algorithms.opd import OnPolicyDistillationConfig, _opd_cfg
+    from nemo_rl.models.policy.teacher_worker_group import (
+        create_teacher_configs_from_opd_config,
+    )
+
+    opd = OnPolicyDistillationConfig(
+        teacher_model_by_agent_name={"teacher": "/ckpt/teacher"},
+        non_colocated_teachers={
+            "default_teacher_cfg": {
+                "megatron_cfg_overrides": {
+                    "mtp_num_layers": 5,
+                    "mtp_detach_heads": True,
+                },
+                "freeze_vision_model": True,
+                "freeze_language_model": True,
+            },
+            "teacher_overrides": {
+                "teacher": {
+                    "megatron_cfg_overrides": {"mtp_num_layers": 0},
+                    "freeze_vision_model": False,
+                }
+            },
+        },
+    )
+    (cfg,) = create_teacher_configs_from_opd_config(
+        _opd_cfg({"on_policy_distillation": opd})
+    )
+    assert cfg.megatron_cfg_overrides == {
+        "mtp_num_layers": 0,
+        "freeze_vision_model": False,
+        "freeze_language_model": True,
+    }
 
 
 def test_provider_override_allowlist_is_explicit_keys_only():

@@ -6161,6 +6161,7 @@ class TestPeftWarmStart:
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
 
 
+@pytest.mark.mcore
 def test_apply_mtp_config_nonzero_layers_keeps_mtp_sources():
     from types import SimpleNamespace
 
@@ -6182,8 +6183,9 @@ def test_apply_mtp_config_nonzero_layers_keeps_mtp_sources():
     assert model_cfg.hybrid_override_pattern == "M-M*-/M"
 
 
+@pytest.mark.mcore
 def test_apply_mtp_config_respects_teacher_provider_allowlist():
-    """A teacher clone must not inherit the student's mtp_num_layers=0."""
+    """MTP settings apply only when the teacher provider allowlist permits them."""
     from types import SimpleNamespace
 
     from nemo_rl.models.megatron.setup import _apply_mtp_config

@@ -3504,27 +3504,17 @@ class MegatronPolicyWorkerImpl(
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
     def _build_refit_conversion_tasks(self) -> list:
-        """Build the conversion-task list driving refit (BF16 or FP8 export).
-
-        A destination that requests logical weights consumes standard Bridge
-        tasks. Otherwise, keep Bridge's physical FP8 data and scale tasks.
-        """
-        # Optionally omit MTP tasks when the generator does not use speculative
-        # decoding. This filters exported tasks, not Bridge's mapping validation.
-        skip_mtp = os.environ.get("NRL_REFIT_SKIP_MTP", "0") == "1"
+        """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
 
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
-                tasks = self.megatron_bridge.get_export_fp8_tasks(self.model)
-            else:
-                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+                return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
                 task
-                for task in tasks
+                for task in self.megatron_bridge.get_conversion_tasks([self.model])
                 if task is not None
-                and not (skip_mtp and "mtp." in task.global_param_name)
             ]
 
     def _generation_needs_logical_weights(self) -> bool:

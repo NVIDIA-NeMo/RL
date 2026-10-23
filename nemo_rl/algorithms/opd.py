@@ -95,11 +95,15 @@ class TeacherResourceOverrides(BaseModel, extra="allow"):
 
 
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
-    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
+    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation.
+
+    Per-alias overrides merge shallowly with defaults: ``megatron_cfg_overrides``
+    replaces the default dictionary, while extra top-level keys merge individually.
+    """
 
     enabled: bool = False
-    default_teacher_cfg: TeacherResourceOverrides = Field(
-        default_factory=TeacherResourceOverrides
+    default_teacher_cfg: TeacherResourceConfig = Field(
+        default_factory=TeacherResourceConfig
     )
     teacher_overrides: dict[str, TeacherResourceOverrides] = Field(default_factory=dict)
 

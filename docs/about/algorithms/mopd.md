@@ -130,6 +130,18 @@ on_policy_distillation:
 > adapters are never attached to the frozen teacher; and teachers run
 > unquantized (a policy `quant_cfg` is ignored, with a warning).
 
+Teachers default to `mtp_num_layers: 0` because scoring does not use MTP
+outputs, even when the student or teacher checkpoint has MTP layers. Set
+`megatron_cfg_overrides.mtp_num_layers` explicitly in the teacher configuration
+to retain them. Other model architecture settings come from the teacher's
+checkpoint unless explicitly overridden.
+
+Per-alias `teacher_overrides` merge shallowly with `default_teacher_cfg`.
+A per-alias `megatron_cfg_overrides` dictionary replaces the default dictionary
+entirely; repeat any default entries you want to keep. Unknown top-level keys
+merge individually and are then folded into `megatron_cfg_overrides`, whose
+explicit entries take precedence.
+
 > [!NOTE]
 > `adv_estimator: opd` fails fast at setup if the config would zero
 > `prev_logprobs` (`loss_fn.force_on_policy_ratio: true` with no
