@@ -1,10 +1,10 @@
 # NeMo Gym Integration
 
-This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/v0.2.1/index.html) for multi-step and multi-turn rollout collection. NeMo Gym rollouts are supported by GRPO and on-policy distillation.
+This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/main/tutorials/training-tutorials) for multi-step and multi-turn rollout collection. NeMo Gym rollouts are supported by GRPO and on-policy distillation.
 
 ## Overview
 
-NeMo Gym provides HTTP-based training environments for LLMs. **NeMo Gym is CPU-only**—it runs no inference engines and holds no GPU memory. NeMo RL exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
+NeMo Gym provides HTTP-based training environments for LLMs. In this integration, NeMo RL owns policy inference and exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
 
 - **Decoupled architecture**: Environments don't need direct access to model internals
 - **Multi-step/multi-turn support**: Agents can orchestrate complex interactions with tools
@@ -68,6 +68,8 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+See Gym's [NeMo RL setup guide](https://docs.nvidia.com/nemo/gym/main/tutorials/training-tutorials/nemo-rl-grpo/setup) for the training environment and submodule setup. Dataset paths are relative to the RL repository root; `env.nemo_gym.config_paths` are relative to the Gym checkout. Other values under `env.nemo_gym` override Gym configuration using the same key paths as its YAML files.
+
 ### Environment Server tasksets
 
 NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
@@ -78,7 +80,7 @@ RL sends each prompt group to an actor hosting the selected server. With the cur
 
 [`examples/nemo_gym/grpo-qwen2.5-1.5b-1n8g-megatron-weather.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/grpo-qwen2.5-1.5b-1n8g-megatron-weather.yaml) inherits the existing Gym GRPO recipe's Megatron training configuration (tensor parallelism 2) and uses Qwen2.5-1.5B on one node with eight GPUs, with vLLM for generation. The Environment Server's `resources_server` selects the weather tools and verifier; `agent_server` selects the existing SimpleAgent. `single_agent_turn` coordinates one complete agent turn, which can contain multiple model and tool calls.
 
-The recipe explicitly replaces the inherited `legacy_agent` implementation with `single_agent_turn` and grants the agent direct HTTP access to the tools. Its route maps the `example_tool_call_multireward` taskset to that Environment Server. GRPO uses the verifier's scalar `reward`, the sum of its correctness, format, and schema-validity scores.
+The recipe explicitly replaces the inherited `legacy_agent` implementation with `single_agent_turn`. Its route maps the `example_tool_call_multireward` taskset to that Environment Server. This verifier scores a predicted tool call, so the recipe sets SimpleAgent's `execute_tools: false` and grants no tool access. The agent returns the model's tool call without executing it or generating a follow-up answer. GRPO uses the verifier's scalar `reward`, the sum of its correctness, format, and schema-validity scores.
 
 First, prepare the five shipped weather prompts with Gym's dataset collator. Declaring `taskset` wraps each source row in `task_id` and `task_input`, preserving its messages, tools, and expected answer. This preparation step does not start servers or run inference. From the RL repository root:
 
@@ -331,7 +333,7 @@ sequenceDiagram
     Loop->>Policy: Compute loss and train
 ```
 
-> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/v0.2.1/about/concepts/core-components/)):
+> **NeMo Gym server types** (see [Gym architecture](https://docs.nvidia.com/nemo/gym/main/about/architecture)):
 > - **Environment Server**: Runs the episode lifecycle; `single_agent_turn` manages sessions and verification, while `legacy_agent` delegates to Agent `/run`
 > - **Agent Server**: Implements agent behavior; Simple Agent runs the model/tool loop
 > - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
@@ -422,4 +424,4 @@ Token IDs are extracted at the NeMo RL vLLM layer via the `/tokenize` endpoint. 
 - Tokenization matches the exact model and tokenizer used for generation
 - No re-tokenization drift between generation and training
 
-For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/v0.2.1/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).
+For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/main/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction).

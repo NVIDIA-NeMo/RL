@@ -31,6 +31,11 @@ env:
     workplace_assistant_environment_server: null
     environment_server_routes:
       example_tool_call_multireward: example_tool_call_multireward_environment_server
+    example_tool_call_multireward_simple_agent:
+      responses_api_agents:
+        simple_agent:
+          # The verifier scores the predicted tool call, without a follow-up answer.
+          execute_tools: false
     example_tool_call_multireward_environment_server:
       environment_servers:
         # Gym merges this with its loaded YAML; replace the inherited wrapper.
@@ -44,7 +49,6 @@ env:
           agent_server:
             type: responses_api_agents
             name: example_tool_call_multireward_simple_agent
-          resources_tool_transports: [direct_http]
 
 checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-1.5b-megatron-weather
