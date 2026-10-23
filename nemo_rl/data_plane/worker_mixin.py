@@ -167,6 +167,7 @@ def _broadcast_batched_data_dict(
         kind = entry[1]
         if kind == "tensor":
             dtype_str, shape, src_device = entry[2], entry[3], entry[4]
+            source_tensor = out[key] if is_leader else None
             if is_leader:
                 tensor = out[key]
                 if tensor.device.type != torch.device(bcast_device).type:
@@ -186,13 +187,11 @@ def _broadcast_batched_data_dict(
                 out[key] = tensor
             else:
                 torch.distributed.broadcast(tensor, src=src, group=group)
-            # Restore non-leader tensors to the leader's source device
-            # so downstream code sees the same layout pre-broadcast.
-            if (
-                not is_leader
-                and torch.device(src_device).type != torch.device(bcast_device).type
-            ):
-                out[key] = tensor.to(src_device)
+            # NCCL staging is temporary on every rank. Keeping the leader's
+            # CPU-sourced routing batch on CUDA retains the entire padded
+            # batch throughout model forward, unlike the other ranks.
+            if torch.device(src_device).type != torch.device(bcast_device).type:
+                out[key] = source_tensor if is_leader else tensor.to(src_device)
         elif kind == "packed_tensor":
             header, shapes, dtype_str, source_device = entry[2:]
             if is_leader:

@@ -20,6 +20,8 @@ Most cases run on CPU with Gloo; one optional NCCL case covers device staging.
 from __future__ import annotations
 
 import os
+from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
@@ -260,6 +262,53 @@ def _unsupported_type_body(rank: int):
     data = BatchedDataDict({"source_ids": ["a", "b"]}) if rank == 0 else None
     _broadcast_batched_data_dict(
         data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+
+
+def _nccl_dense_source_device_body(rank: int, *, source_device: str) -> None:
+    source = torch.device("cpu" if source_device == "cpu" else f"cuda:{rank}")
+    expected = {
+        "input_ids": torch.arange(12, dtype=torch.int64).reshape(3, 4),
+        "input_lengths": torch.tensor([4, 3, 2], dtype=torch.int32),
+        "sample_mask": torch.tensor([1, 0, 1], dtype=torch.float32),
+        # Exercise the int16 contiguous byte-broadcast path with a source view.
+        "routed_experts": torch.tensor(
+            [-32768, 9, -1, 9, 0, 9, 1, 9, 32767, 9], dtype=torch.int16
+        )[::2],
+    }
+    data = (
+        BatchedDataDict({key: value.to(source) for key, value in expected.items()})
+        if rank == 0
+        else None
+    )
+    originals = dict(data) if rank == 0 else {}
+    versions = {key: value._version for key, value in originals.items()}
+
+    out = _broadcast_batched_data_dict(
+        data, is_leader=(rank == 0), src=0, group=dist.group.WORLD
+    )
+
+    for key, value in out.items():
+        assert value.device == source
+        assert value.dtype == expected[key].dtype
+        assert torch.equal(value.cpu(), expected[key])
+        if rank == 0 and source_device == "cpu":
+            assert value is originals[key]
+            assert value._version == versions[key]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="two CUDA devices are required for NCCL broadcast",
+)
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_leader_broadcast_preserves_dense_source_device_nccl(
+    tmp_path: Path, source_device: str
+) -> None:
+    _run_two_ranks(
+        partial(_nccl_dense_source_device_body, source_device=source_device),
+        str(tmp_path / f"init_nccl_dense_{source_device}"),
+        backend="nccl",
     )
 
 
