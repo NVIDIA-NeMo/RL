@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training utilities for automodel (DTensor-based) policy workers.
+"""Training utilities for Automodel policy workers.
 
 This module provides post-processor classes and forward/backward functions
 that follow the same pattern as nemo_rl/models/megatron/train.py.
@@ -47,7 +47,11 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
-from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
+from nemo_rl.algorithms.loss import (
+    DraftRuntimeLossWrapper,
+    SequencePackingLossWrapper,
+    prepare_loss_input,
+)
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -61,6 +65,10 @@ from nemo_rl.models.automodel.data import (
     ProcessedMicrobatch,
     drop_explicit_only_kwargs_not_in_forward,
     filter_multimodal_kwargs_for_model,
+)
+from nemo_rl.models.automodel.router_replay import (
+    ReplayGate,
+    microbatch_replay_context,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
@@ -233,6 +241,13 @@ def extract_logits(
         return outputs.logits
 
 
+def need_temperature_scaling(
+    sampling_params: Optional[TrainingSamplingParams],
+) -> bool:
+    """Whether apply_temperature_scaling will mutate the logits in place."""
+    return sampling_params is not None and sampling_params.temperature != 1.0
+
+
 def apply_temperature_scaling(
     logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
@@ -245,7 +260,7 @@ def apply_temperature_scaling(
     Returns:
         torch.Tensor: Temperature-scaled logits
     """
-    if sampling_params is not None and sampling_params.temperature != 1.0:
+    if need_temperature_scaling(sampling_params):
         logits.div_(sampling_params.temperature)
     return logits
 
@@ -380,6 +395,16 @@ def forward_with_post_processing_fn(
     logits = extract_logits(model, outputs)
     del outputs
 
+    # Draft co-training distills against the policy's raw logits; stash them
+    # before the (in-place) temperature scaling below mutates the tensor.
+    if (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and post_processing_fn.draft_runtime is not None
+    ):
+        post_processing_fn.draft_runtime.stash_teacher_logits(
+            logits, need_clone=need_temperature_scaling(sampling_params)
+        )
+
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
     if isinstance(
@@ -467,6 +492,7 @@ def automodel_forward_backward(
     num_global_batches: int = 1,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    router_replay_gates: Optional[list[ReplayGate]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -498,80 +524,111 @@ def automodel_forward_backward(
             If None, all microbatches are considered valid.
         on_microbatch_start: Optional callback called at the start of each microbatch
             with the microbatch index. Useful for cache clearing, etc.
+        router_replay_gates: When given, replay each microbatch's rollout
+            ``routed_experts`` on these MoE gates (R3) for both its forward and backward.
 
     Returns:
         List of (result, metrics) tuples from each microbatch
     """
     results = []
 
-    for mb_idx, processed_mb in enumerate(data_iterator):
-        # Call optional callback at start of microbatch
-        if on_microbatch_start is not None:
-            on_microbatch_start(mb_idx)
+    # Draft co-training's per-batch hooks live here (not in the worker) so
+    # they bracket exactly the microbatches this call runs, the same way
+    # Megatron enables capture inside its forward step (megatron/train.py).
+    draft_runtime = (
+        post_processing_fn.draft_runtime
+        if isinstance(post_processing_fn, LossPostProcessor)
+        else None
+    )
+    if draft_runtime is not None:
+        from nemo_rl.models.automodel.draft.runtime import draft_capture_ctx
 
-        prepared = prepare_model_forward(
-            model,
-            processed_mb.processed_inputs,
-            device_mesh=device_mesh,
-            cp_size=cp_size,
-            padding_token_id=padding_token_id,
-            is_reward_model=is_reward_model,
-            allow_flash_attn_args=allow_flash_attn_args,
+        assert num_valid_microbatches is not None, (
+            "draft co-training requires num_valid_microbatches (the worker's "
+            "iterator_len) to average the per-slot draft losses."
         )
+        draft_runtime.begin_global_batch(num_valid_microbatches)
+        capture_ctx: AbstractContextManager[Any] = draft_capture_ctx(draft_runtime)
+    else:
+        capture_ctx = nullcontext()
 
-        with prepared.model_context_factory(), autocast_context_factory():
-            # Forward pass with post-processing
-            result, metrics, _ = forward_with_post_processing_fn(
-                model=model,
-                prepared=prepared,
-                post_processing_fn=post_processing_fn,
-                processed_mb=processed_mb,
-                global_valid_seqs=global_valid_seqs,
-                global_valid_toks=global_valid_toks,
-                sampling_params=sampling_params,
-                sequence_dim=sequence_dim,
+    with capture_ctx:
+        for mb_idx, processed_mb in enumerate(data_iterator):
+            # Call optional callback at start of microbatch
+            if on_microbatch_start is not None:
+                on_microbatch_start(mb_idx)
+
+            prepared = prepare_model_forward(
+                model,
+                processed_mb.processed_inputs,
+                device_mesh=device_mesh,
+                cp_size=cp_size,
+                padding_token_id=padding_token_id,
+                is_reward_model=is_reward_model,
+                allow_flash_attn_args=allow_flash_attn_args,
             )
 
-            # Check if this is a dummy batch
-            is_dummy = (
-                num_valid_microbatches is not None and mb_idx >= num_valid_microbatches
+            replay_context = microbatch_replay_context(
+                router_replay_gates, processed_mb
             )
+            with (
+                replay_context,
+                prepared.model_context_factory(),
+                autocast_context_factory(),
+            ):
+                # Forward pass with post-processing
+                result, metrics, _ = forward_with_post_processing_fn(
+                    model=model,
+                    prepared=prepared,
+                    post_processing_fn=post_processing_fn,
+                    processed_mb=processed_mb,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=sampling_params,
+                    sequence_dim=sequence_dim,
+                )
 
-            # Scale metrics for aggregation (only for loss)
-            if isinstance(post_processing_fn, LossPostProcessor):
-                # skip the update for dummy batches
-                if not is_dummy:
-                    ## scale by the number of global batches so we get the correct
-                    ## value when summing metrics across all microbatches
-                    for k in metrics.keys():
-                        if "_min" in k or "_max" in k:
-                            continue
+                # Check if this is a dummy batch
+                is_dummy = (
+                    num_valid_microbatches is not None
+                    and mb_idx >= num_valid_microbatches
+                )
 
-                        metrics[k] /= num_global_batches
-                else:
-                    # Zero out loss for dummy batches
-                    result = result * 0
+                # Scale metrics for aggregation (only for loss)
+                if isinstance(post_processing_fn, LossPostProcessor):
+                    # skip the update for dummy batches
+                    if not is_dummy:
+                        ## scale by the number of global batches so we get the correct
+                        ## value when summing metrics across all microbatches
+                        for k in metrics.keys():
+                            if "_min" in k or "_max" in k:
+                                continue
 
-                # Backward pass if training
-                if not forward_only:
-                    ## NOTE: invalid samples should be multiplied
-                    ## by zero in the loss function to prevent them
-                    ## from affecting the gradient calculation
+                            metrics[k] /= num_global_batches
+                    else:
+                        # Zero out loss for dummy batches
+                        result = result * 0
 
-                    # FSDP averages gradients over its DP mesh (dp_size * cp_size),
-                    # while loss normalization expects their sum, so cancel that
-                    # average here. Replicated CP losses send each local model
-                    # contribution to cp_size loss consumers; divide by that fanout
-                    # to avoid overcounting. Partitioned losses have a fanout of 1.
-                    loss = (
-                        result
-                        * dp_size
-                        * cp_size
-                        / post_processing_fn.cp_gradient_fanout
-                    )
-                    loss.backward()
+                    # Backward pass if training
+                    if not forward_only:
+                        ## NOTE: invalid samples should be multiplied
+                        ## by zero in the loss function to prevent them
+                        ## from affecting the gradient calculation
 
-        results.append((result, metrics))
+                        # FSDP averages gradients over its DP mesh (dp_size * cp_size),
+                        # while loss normalization expects their sum, so cancel that
+                        # average here. Replicated CP losses send each local model
+                        # contribution to cp_size loss consumers; divide by that fanout
+                        # to avoid overcounting. Partitioned losses have a fanout of 1.
+                        loss = (
+                            result
+                            * dp_size
+                            * cp_size
+                            / post_processing_fn.cp_gradient_fanout
+                        )
+                        loss.backward()
+
+            results.append((result, metrics))
 
     return results
 
@@ -588,6 +645,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        draft_runtime: Optional[Any] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -601,6 +659,10 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            draft_runtime: Optional draft co-training runtime (dspark/dflash
+                or eagle3); when set, the policy loss is combined with the
+                draft loss and the policy's raw logits are stashed as the
+                distillation teacher before temperature scaling.
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -609,6 +671,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.draft_runtime = draft_runtime
         self._cp_gradient_fanout = (
             cp_size
             if cp_size > 1
@@ -693,6 +756,18 @@ class LossPostProcessor:
                 cu_seqlens_q_padded=cu_seqlens_q_cpu,
             )
             loss, loss_metrics = loss_fn(
+                logits,
+                data_dict,
+                global_valid_seqs,
+                global_valid_toks,
+            )
+        elif self.draft_runtime is not None:
+            draft_wrapper = DraftRuntimeLossWrapper(
+                loss_fn=self.loss_fn,
+                prepare_fn=prepare_loss_input_wrapped,
+                draft_runtime=self.draft_runtime,
+            )
+            loss, loss_metrics = draft_wrapper(
                 logits,
                 data_dict,
                 global_valid_seqs,

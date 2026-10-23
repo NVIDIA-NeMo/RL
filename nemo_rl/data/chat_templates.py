@@ -21,3 +21,24 @@ class COMMON_CHAT_TEMPLATES:
     passthrough_prompt_response = (
         "{% for message in messages %}{{ message['content'] }}{% endfor %}"
     )
+
+
+def find_rendered_message_content_span(
+    text: str,
+    content: str,
+    cursor: int = 0,
+) -> tuple[int, int, str] | None:
+    """Locate the same canonical nonempty content key on every model surface.
+
+    Trimming the logical source *before* searching ensures templates preserving
+    and trimming boundary whitespace share one coordinate origin. Callers must
+    anchor ``cursor`` and the search surface to the corresponding logical turn.
+    Interior whitespace is never changed.
+    """
+    canonical = content.strip()
+    if not canonical:
+        return None
+    position = text.find(canonical, cursor)
+    if position < 0:
+        return None
+    return position, position + len(canonical), canonical

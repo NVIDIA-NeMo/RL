@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import threading
 import warnings
 from pathlib import Path
@@ -68,6 +69,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
@@ -164,10 +168,17 @@ def _make_master_config(
         # The megatron build path reads these before any generation factory runs.
         generation_config["mcore_generation_config"] = {
             "expose_http_server": False,
-            "kv_cache_management_mode": "persist",
+            "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
-    return MasterConfig.model_construct(
+    if backend == "dynamo":
+        # The fields DynamoGeneration.validate_settings reads, at accepted values.
+        generation_config["dynamo_cfg"] = {
+            "request_timeout_s": 900.0,
+            "control_timeout_s": 900.0,
+        }
+        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+    master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
             "impl": "transfer_queue",
@@ -213,6 +224,9 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+    if backend == "dynamo":
+        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
+    return master_config
 
 
 def _native_tq_metadata(
@@ -350,6 +364,51 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_constructs_dynamo_from_normalized_config():
+    """DynamoGeneration receives the generation config setup already validated."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    inference_cluster = MagicMock(name="inference_cluster")
+
+    with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
+        generation, _ = sc_setup_mod._build_generation(
+            inference_cluster,
+            master_config,
+        )
+
+    mock_dynamo.assert_called_once_with(
+        cluster=inference_cluster,
+        config=master_config.policy["generation"],
+    )
+    assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
+    generation.finish_generation.assert_called_once_with()
+
+
+def test_build_generation_rejects_deferred_dynamo_load():
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+
+    with (
+        patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo,
+        pytest.raises(AssertionError, match="defer_model_load"),
+    ):
+        sc_setup_mod._build_generation(
+            MagicMock(name="inference_cluster"),
+            master_config,
+            defer_model_load=True,
+        )
+    mock_dynamo.assert_not_called()
+
+
+def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
+    assert (
+        sc_setup_mod._generation_max_seq_len(
+            {"backend": "dynamo", "vllm_cfg": {"max_model_len": 1024}}
+        )
+        == 1024
+    )
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
@@ -373,7 +432,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
+        match="only supports vllm, sglang, megatron, or dynamo generation; got 'trtllm'",
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -1244,6 +1303,37 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_msc_checkpoint_dir_replaces_native_tq_requirement_with_warning(
+        self, patched_factories, tmp_path, monkeypatch
+    ):
+        # setup builds a real CheckpointManager, which resolves the MSC profile.
+        (tmp_path / "objects").mkdir()
+        msc_config = tmp_path / "msc.json"
+        msc_config.write_text(
+            json.dumps(
+                {
+                    "profiles": {
+                        "profile": {
+                            "storage_provider": {
+                                "type": "file",
+                                "options": {"base_path": str(tmp_path / "objects")},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("MSC_CONFIG", str(msc_config))
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing["checkpoint_dir"] = "msc://profile/run"
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.warns(UserWarning, match="msc:// checkpoint_dir"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_warns_when_custom_sampler_cannot_recover_buffered_rollouts(
         self, patched_factories
     ):
@@ -1434,6 +1524,11 @@ class TestSetup:
                 "defer_routed_experts_to_policy requires",
             ),
             (
+                "deferred_routes_on_automodel_policy",
+                NotImplementedError,
+                "only wired for the Megatron",
+            ),
+            (
                 "prompt_group_recovery_without_capture",
                 ValueError,
                 "non-default rollout_recovery policies require",
@@ -1470,16 +1565,20 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "deferred_routes_on_automodel_policy":
+            mc = _make_master_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
         elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
         elif invalid_case == "megatron_recompute_mismatch":
-            # Flag says recompute; the engine mode (fixture default "persist") disagrees.
+            # The opt-out disagrees with the fixture's default recompute mode.
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
             )
-            mc.async_rl.recompute_kv_cache_after_weight_updates = True
+            mc.async_rl.recompute_kv_cache_after_weight_updates = False
         elif invalid_case == "megatron_fleet_health":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
@@ -1564,6 +1663,104 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+
+        with (
+            patch.object(
+                sc_setup_mod.DynamoConfig,
+                "model_validate",
+                side_effect=ValueError("bad dynamo config"),
+            ),
+            pytest.raises(ValueError, match="bad dynamo config"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("misconfigure", "match"),
+        [
+            pytest.param(
+                lambda mc: mc.policy.update(router_replay={"enabled": True}),
+                "does not return routed experts",
+                id="router_replay",
+            ),
+            pytest.param(
+                lambda mc: mc.policy.update(is_vlm=True),
+                "serves text prompts only",
+                id="vlm",
+            ),
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "enabled", True
+                ),
+                "Dynamo frontend owns request routing",
+                id="fleet_health",
+            ),
+            # 300.0 is the FleetHealthConfig default, so a Dynamo config that does
+            # not opt out would otherwise only fail at its first weight sync.
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "refit_timeout_s", 300.0
+                ),
+                "refit_timeout_s must be null",
+                id="refit_deadline",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
+                    control_timeout_s=600.0
+                ),
+                "must be >= request_timeout_s",
+                id="drain_timeout",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["vllm_cfg"].update(
+                    enable_vllm_metrics_logger=True
+                ),
+                "requires rollout_checkpointing.telemetry_interval_s",
+                id="unread_metrics_logger",
+            ),
+        ],
+    )
+    def test_unsupported_dynamo_settings_fail_before_clusters(
+        self, patched_factories, misconfigure, match
+    ):
+        mc = _make_master_config(backend="dynamo")
+        misconfigure(mc)
+
+        with (
+            patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
+            pytest.raises(ValueError, match=match),
+        ):
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
+    def test_dynamo_generation_config_is_normalized(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+        normalized = {
+            **mc.policy["generation"],
+            "vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}},
+        }
+
+        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
+            validate.return_value.model_dump.return_value = normalized
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (raw_config,), _ = validate.call_args
+        assert raw_config["vllm_kwargs"]["hf_overrides"] == {"rope_theta": 1.0}
+        assert mc.policy["generation"] is normalized
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        _, sync_kwargs = patched_factories["create_weight_synchronizer"].call_args
+        assert sync_kwargs["generation_backend"] == "dynamo"
+        assert sync_kwargs["colocated"] is False
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()
@@ -1845,6 +2042,201 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
+
+    def test_megatron_train_iters_helper_reads_without_writing(self):
+        """The trainer thread reads the config while this runs, so it must not write it."""
+        mc = _make_master_config(megatron_enabled=True, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (7, None)
+        assert "train_iters" not in mc.policy["megatron_cfg"]
+
+        mc = _make_master_config(megatron_enabled=False, max_num_steps=7)
+        assert sc_setup_mod._megatron_train_iters(mc) == (None, None)
+
+    @staticmethod
+    def _gym_vllm_config(**kwargs: Any) -> MasterConfig:
+        """NeMo-Gym + vLLM + non-colocated: the path that overlaps the dataset load."""
+        mc = _make_master_config(backend="vllm", **kwargs)
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+            }
+        )
+        return mc
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _gym_patches(gym_shards: Any = None):
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod,
+                "build_nemo_gym_actors",
+                return_value=gym_shards if gym_shards is not None else MagicMock(),
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        ):
+            yield
+
+    def test_gym_vllm_loads_dataset_while_trainer_builds(self, patched_factories):
+        """The dataset load waits for the trainer build to start; in the old order
+        (load first, then build) it would time out."""
+        mc = self._gym_vllm_config()
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            assert trainer_started.wait(timeout=30), (
+                "dataset loaded before the trainer build started"
+            )
+            return list(range(8)), None
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with self._gym_patches():
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.dataloader is patched_factories["dataloader"]
+        assert patched_factories["_build_trainer"].call_count == 1
+
+    def test_native_path_loads_dataset_before_building(self, patched_factories):
+        """Outside NeMo-Gym + vLLM + non-colocated, the original order is kept."""
+        mc = _make_master_config(megatron_enabled=True)
+        trainer_started_before_load: list[bool] = []
+        trainer_started = threading.Event()
+        fake_policy = patched_factories["fake_policy"]
+        fake_return = patched_factories["setup_response_data"].return_value
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            trainer_started.set()
+            return fake_policy, 0.0
+
+        def _setup_response_data(*args: Any, **kwargs: Any) -> Any:
+            trainer_started_before_load.append(trainer_started.is_set())
+            return fake_return
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert trainer_started_before_load == [False]
+
+    def test_gym_vllm_keeps_speculative_trainer_when_clamp_does_not_bind(
+        self, patched_factories
+    ):
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=2, max_num_epochs=1
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4, so 2 steps fit: no rebuild.
+        assert train_iters_at_build == [2]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.policy["megatron_cfg"]["train_iters"] == 2
+
+    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds: the speculative trainer is replaced."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        stale_policy = MagicMock(name="stale_policy")
+        final_policy = patched_factories["fake_policy"]
+        policies = iter([stale_policy, final_policy])
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return next(policies), 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [1000, 8]
+        stale_policy.shutdown.assert_called_once()
+        final_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
+        mc = self._gym_vllm_config()
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
+        self, tmp_path, patched_factories
+    ):
+        """A resume restores Megatron's LR scheduler, which asserts that its saved
+        horizon equals train_iters, so the trainer is built only with the clamped value."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(_save_state())
+        # The trainer resumes from this checkpoint's weights and optimizer.
+        checkpointer.get_resume_paths.return_value = (
+            checkpoint_path / "policy" / "weights",
+            checkpoint_path / "policy" / "optimizer",
+        )
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer),
+            patch.object(sc_setup_mod, "load_dataloader_state"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
 
     def test_nemo_gym_wires_env_handle(self, patched_factories):
         """When enabled, the NeMo-Gym shard set is spun up and stored."""
@@ -2548,6 +2940,36 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+class TestAdaptiveLossRestore:
+    def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        save_state.cur_adaptive_ppo_clip_k = 0.5
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        patched_factories["ClippedPGLossFn"].side_effect = (
+            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        )
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+            )
+        )
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
@@ -2954,14 +3376,63 @@ class TestOPDFullValidation:
     until the first training forward.
     """
 
+    @pytest.mark.parametrize("full_vocab", [False, True])
+    def test_advantage_stage_config_derives_full_vocab_mode(self, full_vocab):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full.enabled = full_vocab
+        config.grpo.seq_logprob_error_threshold = 2.0
+
+        stage_config = AdvantageStageConfig.from_master_config(config)
+
+        assert stage_config.opd_full_enabled == full_vocab
+        assert stage_config.algo.seq_logprob_error_threshold == 2.0
+
     def test_accepts_the_shipped_recipe(self):
         config = _load_fullvocab_master_config()
         _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_is_a_no_op_when_full_is_absent(self):
+    @pytest.mark.parametrize(
+        ("top_k", "top_p", "expected_warning"),
+        [
+            (20, 1.0, True),
+            (None, 0.95, True),
+            (20, 0.95, True),
+            (None, 1.0, False),
+            (-1, 1.0, False),
+            (0, 1.0, False),
+        ],
+    )
+    def test_rollout_filtering_warns_without_changing_config(
+        self,
+        top_k: int | None,
+        top_p: float,
+        expected_warning: bool,
+        recwarn: pytest.WarningsRecorder,
+    ) -> None:
+        config = _load_fullvocab_master_config()
+        generation_config = config.policy["generation"]
+        generation_config.update(top_k=top_k, top_p=top_p)
+
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+        assert len(recwarn) == int(expected_warning)
+        if expected_warning:
+            message = str(recwarn[0].message)
+            assert "does not apply top-k/top-p filtering to policy logprobs" in message
+            assert "still applied during rollout" in message
+        assert (generation_config["top_k"], generation_config["top_p"]) == (
+            top_k,
+            top_p,
+        )
+
+    def test_is_a_no_op_when_full_is_absent(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.full = None
+        config.policy["generation"].update(top_k=20, top_p=0.95)
         _validate_opd_full_config(config, config.on_policy_distillation)
+        assert not recwarn
 
     def test_rejects_fused_linear_logprobs(self):
         """The fused forward bypasses output_layer, so the capture hook never fires."""

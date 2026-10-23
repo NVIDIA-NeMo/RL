@@ -53,7 +53,7 @@ def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
 
 
 class AutomodelCheckpointEngineSendMixin:
-    """Onload DTensor/FSDP2 policy weights for checkpoint-engine transfer."""
+    """Onload Automodel policy weights for checkpoint-engine transfer."""
 
     model: torch.nn.Module
 
@@ -75,7 +75,7 @@ class AutomodelCheckpointEngineSendMixin:
     ) -> Iterator[tuple[str, torch.Tensor]]:
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
         return self._checkpoint_engine_params()
 

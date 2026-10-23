@@ -813,3 +813,21 @@ def test_from_wire_preserves_object_arrays_through_densify() -> None:
     # Scalar column passes through untouched — no squeeze step any more.
     assert restored["input_lengths"].shape == (4,)
     np.testing.assert_array_equal(restored["content"], arr)
+
+
+def test_close_removes_this_process_offload_dir(monkeypatch, tmp_path) -> None:
+    """A client that closes cleanly leaves no offload files behind, even if Ray
+    then stops it with SIGTERM (which skips atexit)."""
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    offload_dir = tmp_path / "owner"
+    offload_dir.mkdir()
+    monkeypatch.setattr(mooncake_ssd_offload, "_dir", str(offload_dir))
+    monkeypatch.setattr(tq_adapter.tq, "close", MagicMock())
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._closed = False
+
+    client.close()
+
+    assert not offload_dir.exists()

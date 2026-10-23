@@ -12,13 +12,110 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shlex
 from pathlib import Path
 
 import pytest
+from omegaconf import DictConfig, OmegaConf
 
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 RECIPE_ROOT = Path(__file__).parents[2] / "examples/configs/recipes"
+FUNCTIONAL_ROOT = Path(__file__).parents[2] / "tests/functional"
+MEGATRON_FUNCTIONAL_SCRIPTS = sorted(
+    {
+        path.name
+        for path in FUNCTIONAL_ROOT.glob("*.sh")
+        if "policy.generation.backend=megatron" in path.read_text()
+    }
+    | {"grpo_megatron_generation_gym_single_controller.sh"}
+)
+
+
+def _load_megatron_functional_config(script_name: str) -> tuple[DictConfig, bool]:
+    register_omegaconf_resolvers()
+    project_root = Path(__file__).parents[2]
+    script = (FUNCTIONAL_ROOT / script_name).read_text()
+    commands = [
+        shlex.split(line)
+        for line in script.replace("\\\n", " ").splitlines()
+        if line.lstrip().startswith("uv run ")
+        and any(name in line for name in ("run_grpo", "run_vlm_grpo", "$SC_ENTRYPOINT"))
+    ]
+    arguments = next(
+        args
+        for args in commands
+        if any(
+            "run_grpo" in arg or "run_vlm_grpo" in arg or arg == "$SC_ENTRYPOINT"
+            for arg in args
+        )
+    )
+    if "--config" in arguments:
+        config_path = arguments[arguments.index("--config") + 1].replace(
+            "$PROJECT_ROOT", str(project_root)
+        )
+    else:
+        assert any(arg.endswith("run_grpo_sliding_puzzle.py") for arg in arguments)
+        config_path = str(project_root / "examples/configs/grpo_sliding_puzzle.yaml")
+    config_path = project_root / config_path
+    overrides = [
+        argument
+        for argument in arguments
+        if argument.lstrip("+").startswith(
+            (
+                "policy.generation.backend=",
+                "policy.generation.mcore_generation_config.kv_cache_management_mode=",
+                "async_rl.",
+                "grpo.async_grpo.",
+            )
+        )
+    ]
+    config = parse_hydra_overrides(load_config(config_path), overrides)
+    single_controller = any(
+        "run_grpo_single_controller" in arg or arg == "$SC_ENTRYPOINT"
+        for arg in arguments
+    )
+    return config, single_controller
+
+
+@pytest.mark.parametrize("script_name", MEGATRON_FUNCTIONAL_SCRIPTS)
+def test_megatron_functional_scripts_keep_kv_settings_consistent(
+    script_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Load algorithm schemas only for these tests; other recipe tests need no Ray/Torch.
+    from nemo_rl.algorithms.grpo import AsyncGRPOConfig
+    from nemo_rl.algorithms.single_controller_utils.config import AsyncRLConfig
+
+    # CI runs from tests/, while the launchers resolve paths from the repo root.
+    monkeypatch.chdir(tmp_path)
+    config, single_controller = _load_megatron_functional_config(script_name)
+    assert config.policy.generation.backend == "megatron"
+    async_path = "async_rl" if single_controller else "grpo.async_grpo"
+    raw_async_config = OmegaConf.select(config, async_path)
+    async_values = (
+        OmegaConf.to_container(raw_async_config, resolve=True)
+        if raw_async_config is not None
+        else {}
+    )
+    if single_controller:
+        async_config = AsyncRLConfig.model_validate(async_values)
+    else:
+        if raw_async_config is None:
+            return
+        async_config = AsyncGRPOConfig.model_validate(async_values)
+        if not async_config.enabled:
+            return
+    # Preserve intentional persist/offload opt-outs as well as the recompute default.
+    assert async_config.recompute_kv_cache_after_weight_updates == (
+        config.policy.generation.mcore_generation_config.kv_cache_management_mode
+        == "recompute"
+    )
 
 
 def test_speechlm_recipe_logs_typed_config_to_tensorboard(tmp_path, monkeypatch):

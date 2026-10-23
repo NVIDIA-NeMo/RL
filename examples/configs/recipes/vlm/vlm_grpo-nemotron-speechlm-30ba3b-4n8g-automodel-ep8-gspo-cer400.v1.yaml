@@ -365,7 +365,7 @@ policy:
       max_model_len: 62464
       gpu_memory_utilization: 0.23
       skip_tokenizer_init: false
-      load_base_weights_before_refit: true
+      load_format: auto
       env_vars:
         VLLM_USE_DEEP_GEMM: '0'
         VLLM_PLUGINS: nemo_speechlm

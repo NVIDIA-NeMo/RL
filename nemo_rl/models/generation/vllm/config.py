@@ -55,7 +55,6 @@ class VllmVideoConfig(BaseModel):
 
 class VllmSpecificArgs(TypedDict):
     native_speechlm: NotRequired[bool]
-    load_base_weights_before_refit: NotRequired[bool]
     tensor_parallel_size: int
     pipeline_parallel_size: int
     expert_parallel_size: int
@@ -84,6 +83,11 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # With is_mx, quantize weights to MXFP8 on the trainer during refit and
+    # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
+    # the vLLM worker then skips its per-refit re-quantization. Requires the
+    # Megatron policy backend.
+    refit_prequantize: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
@@ -244,9 +248,46 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def validate_vllm_quantization_config(config: VllmConfig) -> None:
+    """Reject quantization options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    refit_prequantize = vllm_cfg.get("refit_prequantize")
+    if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize must be a boolean."
+        )
+    if refit_prequantize and not (
+        vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize requires "
+            "precision='fp8' and is_mx=true."
+        )
+    if refit_prequantize and config.get("refit_transport") == "nccl_reshard":
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "nccl_reshard; that transport owns its weight-format conversion."
+        )
+    if refit_prequantize and vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "refit_with_reload_api; prequantized refit uses receiver scale names "
+            "that are not accepted by vLLM's native reload path."
+        )
+
+
 def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
     """Validate and return the optional vLLM video sampling contract."""
-    raw_video_config = config["vllm_cfg"].get("video")
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
     if raw_video_config is None:
         return None
     return VllmVideoConfig.model_validate(raw_video_config)
@@ -482,6 +523,7 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
+    validate_vllm_quantization_config(config)
     rollout = parse_nvfp4_pertoken_rollout(config)
     if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
         raise ValueError(
