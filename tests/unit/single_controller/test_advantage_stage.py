@@ -32,6 +32,8 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     SHARD_INVARIANT_ESTIMATORS,
@@ -43,7 +45,11 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     row_group_ids,
     split_meta_by_prompt_group,
 )
-from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+    MasterConfig,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -52,6 +58,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
@@ -72,6 +79,22 @@ def _config(**overrides) -> AdvantageStageConfig:
     )
     base.update(overrides)
     return AdvantageStageConfig(**base)
+
+
+@pytest.mark.parametrize("log_full_train_data", [False, True])
+def test_dump_directory_from_typed_logger_config(
+    tmp_path: Path, log_full_train_data: bool
+) -> None:
+    master = MasterConfig.model_construct(
+        ppo=PPOConfig(),
+        loss_fn=ClippedPGLossConfig(),
+        async_rl=AsyncRLConfig(log_full_train_data=log_full_train_data),
+        logger=LoggerConfig(log_dir=str(tmp_path)),
+    )
+
+    stage = AdvantageStageConfig.from_master_config(master)
+
+    assert stage.train_data_dump_dir == (str(tmp_path) if log_full_train_data else None)
 
 
 class TestInputFields:
