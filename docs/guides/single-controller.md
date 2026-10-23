@@ -545,7 +545,12 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
-- Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
+- Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
+  - `reward_shaping` — supported, both modes. The advantage stage applies it ahead of the baseline and the logged `reward`, as v1 does. Response length comes from `token_mask`, which the stage already fetches, so nothing is added to the rollout schema. Setup rejects an enabled DAPO block missing any of `overlong_buffer_length` / `overlong_buffer_penalty` / `max_response_length`; `stop_properly_penalty_coef` needs none of them.
+  - `overlong_filtering` — supported. Truncated completions are excluded from the loss through `sample_mask`.
+  - Environment-flagged sample masking — supported. A step in which every completion is filtered is rejected rather than skipped.
+  - `reward_scaling` — not implemented on either algorithm block; setup rejects it.
+  - `use_dynamic_sampling` — not implemented on either algorithm block; setup rejects it.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
 
