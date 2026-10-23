@@ -28,8 +28,12 @@ from nemo_rl.algorithms.single_controller_utils.setup import resolve_gym_results
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.utils.gym_results_log import (
     GYM_RESULTS_PREFIX,
+    REQUEST_INPUT_REF,
+    RESPONSE_OUTPUT_REF,
     RL_OUTCOMES_PREFIX,
+    TOOLS_REF,
     JsonlAppender,
+    compact_gym_result,
     gym_results_dir,
 )
 
@@ -126,6 +130,7 @@ def test_resolve_returns_the_shared_directory_and_settings(tmp_path):
         "include_model_calls": True,
         "include_payloads": True,
         "delete_capture_after_merge": True,
+        "compact": True,
     }
     # Model calls off: no Gym capture needed.
     cfg = _master_config(tmp_path)
@@ -158,6 +163,7 @@ class _StreamingSelf:
             "include_model_calls": False,
             "include_payloads": True,
             "delete_capture_after_merge": True,
+            "compact": True,
         }
         self._gym_results_log = JsonlAppender(str(tmp_path), GYM_RESULTS_PREFIX)
         self._gym_capture_dirs = None
@@ -315,3 +321,129 @@ def test_outcome_appender_names_its_file_per_process(tmp_path):
     appender.flush()
     assert Path(appender.path).name == f"{RL_OUTCOMES_PREFIX}.{os.getpid()}.jsonl"
     appender.close()
+
+
+def _enriched_three_step_result() -> dict:
+    tools = [{"type": "function", "name": "search", "parameters": {}}]
+    system = {"role": "system", "content": "be brief"}
+    user = {"role": "user", "content": "find it"}
+    call_1 = {
+        "type": "function_call",
+        "call_id": "t1",
+        "name": "search",
+        "arguments": "{}",
+    }
+    out_1 = {"type": "function_call_output", "call_id": "t1", "output": "found"}
+    answer = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "done"}],
+    }
+    return {
+        "_ng_rollout_id": "g_g0_a0",
+        "_ng_task_index": 3,
+        "responses_create_params": {
+            "input": [
+                {**system, "type": "message", "phase": None},
+                {**user, "type": "message"},
+            ],
+            "tools": tools,
+            "temperature": 1.0,
+            "metadata": None,
+        },
+        "response": {
+            "id": "r2",
+            "output": [call_1, out_1, answer],
+            "tools": tools,
+            "usage": None,
+        },
+        "reward": 1.0,
+        "ng_trajectory": {
+            "model_calls": [
+                {
+                    "model_call_id": "c1",
+                    "duration_ms": 10.0,
+                    "token_stats": {"prompt_tokens": 5, "cached_tokens": None},
+                    # Gym's request models omit the default message type and nulls.
+                    "request": {"input": [system, user], "tools": tools},
+                    "response": {"id": "r1", "output": [call_1], "tools": tools},
+                },
+                {
+                    "model_call_id": "c2",
+                    "duration_ms": 12.0,
+                    "request": {"input": [system, user, call_1, out_1], "tools": tools},
+                    "response": {"id": "r2", "output": [answer], "tools": tools},
+                },
+                {
+                    "model_call_id": "judge",
+                    "request": {"input": [{"role": "user", "content": "grade it"}]},
+                    "response": {"output": [{"type": "message", "content": "A"}]},
+                },
+            ]
+        },
+        "ng_model_call_capture": {
+            "rollout_id": "g_g0_a0",
+            "metrics": {"num_calls": 3},
+            "calls": [
+                {"model_call_id": "c1"},
+                {"model_call_id": "c2"},
+                {"model_call_id": "judge"},
+            ],
+        },
+    }
+
+
+def test_compaction_keeps_every_call_and_only_references_identical_fields():
+    result = _enriched_three_step_result()
+    before = json.dumps(result, sort_keys=True)
+
+    compact = compact_gym_result(
+        result,
+        added_keys={
+            "_ng_rollout_id",
+            "_ng_task_index",
+            "ng_trajectory",
+            "ng_model_call_capture",
+        },
+    )
+
+    # The input is shared with what RL post-processes: never mutated.
+    assert json.dumps(result, sort_keys=True) == before
+    assert "_ng_rollout_id" not in compact and "_ng_task_index" not in compact
+    assert compact["ng_model_call_capture"] == {
+        "rollout_id": "g_g0_a0",
+        "metrics": {"num_calls": 3},
+    }
+    assert "metadata" not in compact["responses_create_params"]
+    assert "usage" not in compact["response"]
+    assert compact["response"]["tools"] == TOOLS_REF
+    c1, c2, judge = compact["ng_trajectory"]["model_calls"]
+    assert [c["model_call_id"] for c in (c1, c2, judge)] == ["c1", "c2", "judge"]
+    # The first request is the agent's prompt; every request repeats the tools.
+    assert c1["request"] == {"input": REQUEST_INPUT_REF, "tools": TOOLS_REF}
+    assert c2["request"]["tools"] == TOOLS_REF
+    assert len(c2["request"]["input"]) == 4
+    # No single call's output is the whole multi-turn response: bodies stay.
+    assert c1["response"]["output"][0]["call_id"] == "t1"
+    assert c2["response"]["output"][0]["type"] == "message"
+    assert judge["request"]["input"][0]["content"] == "grade it"
+    # Metadata stays; only null fields go.
+    assert c1["duration_ms"] == 10.0 and c1["token_stats"] == {"prompt_tokens": 5}
+
+
+def test_compaction_references_a_single_call_that_is_the_whole_response():
+    result = _enriched_three_step_result()
+    result["response"]["output"] = result["ng_trajectory"]["model_calls"][1][
+        "response"
+    ]["output"]
+
+    compact = compact_gym_result(result, added_keys=())
+
+    assert (
+        compact["ng_trajectory"]["model_calls"][1]["response"]["output"]
+        == RESPONSE_OUTPUT_REF
+    )
+    assert (
+        compact["ng_trajectory"]["model_calls"][0]["response"]["output"][0]["call_id"]
+        == "t1"
+    )

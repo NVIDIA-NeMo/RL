@@ -497,6 +497,12 @@ class GymResultsLogConfig(BaseModel, extra="allow"):
     # Delete each rollout's capture file once it is merged into the log line.
     # Needs include_payloads, since the file is otherwise the only copy of the bodies.
     delete_capture_after_merge: bool = True
+    # Drop what a line repeats: the identity keys enrichment stamps on the result,
+    # the per-call list in ng_model_call_capture (same calls as
+    # ng_trajectory.model_calls), null fields, and any call input/tools/output equal
+    # to the agent's own result, which becomes a "=full_result...." reference.
+    # Every captured call keeps its entry and metadata. false logs Gym's record as is.
+    compact: bool = True
 
     @model_validator(mode="after")
     def _bodies_have_a_home(self) -> GymResultsLogConfig:

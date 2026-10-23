@@ -31,7 +31,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional, TextIO
 
@@ -99,6 +99,117 @@ class JsonlAppender:
                 os.makedirs(self._directory, exist_ok=True)
                 self._file = open(self.path, "a", buffering=1)
             self._file.write(line)
+
+
+# Top-level keys Gym's enrichment adds that are not a copy of something else.
+_ENRICHMENT_KEYS = frozenset({"ng_model_call_capture", "ng_trajectory", "ng_perf"})
+# Where a call field that repeats the agent's own result points instead.
+REQUEST_INPUT_REF = "=full_result.responses_create_params.input"
+TOOLS_REF = "=full_result.responses_create_params.tools"
+RESPONSE_OUTPUT_REF = "=full_result.response.output"
+
+
+def _drop_nulls(value: Any) -> Any:
+    """Copy ``value`` without null-valued keys (Pydantic defaults the log need not repeat)."""
+    if isinstance(value, Mapping):
+        return {k: _drop_nulls(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_nulls(v) for v in value]
+    return value
+
+
+def _normalized_input(items: Any) -> Any:
+    """Responses input as the model server receives it: no nulls, message type explicit.
+
+    A message item may omit ``type``, which defaults to ``message``; Gym's request
+    models fill it in, so the two forms are the same input.
+    """
+    items = _drop_nulls(items)
+    if not isinstance(items, list):
+        return items
+    return [
+        {"type": "message", **item}
+        if isinstance(item, dict) and "role" in item and "type" not in item
+        else item
+        for item in items
+    ]
+
+
+def compact_gym_result(
+    result: Mapping[str, Any], *, added_keys: Iterable[str]
+) -> dict[str, Any]:
+    """Return ``result`` without what it repeats, for the Gym-results log.
+
+    Every captured model call keeps its entry, metadata and any body that is not
+    already in the line. Removed:
+
+    - keys enrichment stamped on the result (``added_keys``, e.g. the rollout
+      identity, which the log line carries at top level),
+    - ``ng_model_call_capture.calls`` (the same calls as ``ng_trajectory.model_calls``;
+      its ``metrics`` and ``gaps`` stay),
+    - null-valued fields,
+    - a call's ``request.input``, ``request.tools``, ``response.output`` or
+      ``response.tools`` that equals the agent's own ``responses_create_params``
+      / ``response`` field, replaced by a ``"=full_result...."`` reference.
+
+    Never mutates ``result``: the logged copy shares nested objects with the
+    result RL post-processes.
+    """
+    added = set(added_keys)
+    out: dict[str, Any] = {
+        k: v for k, v in result.items() if k not in added or k in _ENRICHMENT_KEYS
+    }
+    rcp = out.get("responses_create_params")
+    rcp = rcp if isinstance(rcp, Mapping) else {}
+    tools = _drop_nulls(rcp.get("tools")) if rcp.get("tools") is not None else None
+    request_input = _normalized_input(rcp.get("input"))
+    response = out.get("response")
+    output = (
+        _drop_nulls(response.get("output")) if isinstance(response, Mapping) else None
+    )
+
+    def ref_tools(container: Mapping[str, Any]) -> dict[str, Any]:
+        container = dict(container)
+        if tools is not None and _drop_nulls(container.get("tools")) == tools:
+            container["tools"] = TOOLS_REF
+        return container
+
+    if isinstance(response, Mapping):
+        out["response"] = ref_tools(response)
+
+    trajectory = out.get("ng_trajectory")
+    if isinstance(trajectory, Mapping) and trajectory.get("model_calls"):
+        calls = []
+        for call in trajectory["model_calls"]:
+            call = dict(call)
+            request = call.get("request")
+            if isinstance(request, Mapping):
+                request = ref_tools(request)
+                if (
+                    rcp.get("input") is not None
+                    and _normalized_input(request.get("input")) == request_input
+                ):
+                    request["input"] = REQUEST_INPUT_REF
+                call["request"] = request
+            call_response = call.get("response")
+            if isinstance(call_response, Mapping):
+                call_response = ref_tools(call_response)
+                if (
+                    output is not None
+                    and _drop_nulls(call_response.get("output")) == output
+                ):
+                    call_response["output"] = RESPONSE_OUTPUT_REF
+                call["response"] = call_response
+            calls.append(call)
+        out["ng_trajectory"] = {**trajectory, "model_calls": calls}
+
+    capture = out.get("ng_model_call_capture")
+    if isinstance(capture, Mapping) and "calls" in capture:
+        out["ng_model_call_capture"] = {
+            k: v for k, v in capture.items() if k != "calls"
+        }
+
+    return _drop_nulls(out)
 
 
 def outcome_record(

@@ -609,7 +609,23 @@ env:
     model_call_capture_dir: /absolute/path/every/gym/node/can/write
 ```
 
-Setup rejects the combination otherwise. Every row carries a unique
+Setup rejects the combination otherwise. With `compact: true` (the default) each
+line drops what it repeats, and nothing else:
+
+- the identity keys enrichment stamps on `full_result` (the line carries them at
+  top level),
+- `ng_model_call_capture.calls`, the same calls as `ng_trajectory.model_calls`
+  (`metrics` and `gaps` stay),
+- null-valued fields,
+- a captured call's `request.input`, `request.tools`, `response.output` or
+  `response.tools` that equals the agent's own field. It is replaced by a
+  reference such as `"=full_result.responses_create_params.input"` or
+  `"=full_result.response.output"`; a call whose body differs keeps it in full.
+
+Every captured call keeps its entry, timing, status, `finish_reason` and token
+counts. Set `compact: false` to log Gym's record unchanged.
+
+Every row carries a unique
 `_ng_rollout_id` (the token-capture gate id, or `<group_id>_g<i>_a<attempt>`),
 which keys both the capture file and the log line. Each rollout's capture
 file is deleted once merged (`delete_capture_after_merge`). Calls a verifier

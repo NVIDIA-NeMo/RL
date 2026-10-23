@@ -105,7 +105,11 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.gym_results_log import GYM_RESULTS_PREFIX, JsonlAppender
+from nemo_rl.utils.gym_results_log import (
+    GYM_RESULTS_PREFIX,
+    JsonlAppender,
+    compact_gym_result,
+)
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -1295,6 +1299,8 @@ Depending on your data shape, you may want to change these values."""
                 # A debug log must not fail the rollout it describes; say why the
                 # line has no merged calls instead.
                 logged["_nrl_enrich_error"] = f"{type(error).__name__}: {error}"
+        if isinstance(logged, dict) and self._gym_results_cfg["compact"]:
+            logged = compact_gym_result(logged, added_keys=set(logged) - set(result))
         self._gym_results_log.append(
             {
                 "event": "result",

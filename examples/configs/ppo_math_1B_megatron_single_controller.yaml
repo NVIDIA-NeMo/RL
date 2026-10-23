@@ -60,6 +60,8 @@ async_rl:
     include_model_calls: true
     include_payloads: true
     delete_capture_after_merge: true
+    # Drop repeated fields; repeated call bodies become =full_result references.
+    compact: true
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are
