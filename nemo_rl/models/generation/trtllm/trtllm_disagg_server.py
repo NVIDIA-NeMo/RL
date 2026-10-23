@@ -416,15 +416,22 @@ def _build_frontend_tokenizer(
     import base64
 
     import numpy as np
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         build_spliced_prompt_ids,
         normalize_chat_inputs,
+        resolve_eos_token_ids,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    # Same turn-ending set the engine adapter splices with.
+    try:
+        generation_eos = GenerationConfig.from_pretrained(model_name).eos_token_id
+    except OSError:
+        generation_eos = None
+    eos_token_ids = resolve_eos_token_ids(tokenizer, None, generation_eos)
 
     async def _tokenize(payload: dict[str, Any]) -> str:
         # The ctx adapter renders these ids verbatim, so normalize exactly as
@@ -441,6 +448,7 @@ def _build_frontend_tokenizer(
             tokenizer,
             model_config,
             effective,
+            eos_token_ids,
         )
         return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
 
