@@ -74,10 +74,10 @@ When these build arguments are set, the corresponding `uv sync --extra` commands
 
 By default, the release image keeps `uv`'s download cache (`/root/.cache/uv`) on disk, which can accelerate re-installs. The tradeoff is a larger image.
 
-For size-sensitive builds that don't need that, drop the cache from the final image with `STRIP_UV_CACHE`:
+For size-sensitive builds, set `STRIP_UV_CACHE=1` to remove `/root/.cache/uv` before the dependency-install and TRT-LLM layers commit. Prebuilt virtual environments and the TRT-LLM wheel mirror are retained, but uncached re-installs may require downloads. Later release-stage installs (including optional Dynamo and Gym prefetch) can repopulate the cache, so the final image is not guaranteed to be cache-free:
 
 ```sh
-docker buildx build -f docker/Dockerfile \
+docker buildx build --target release -f docker/Dockerfile \
     --build-arg STRIP_UV_CACHE=1 \
     --tag <registry>/nemo-rl:latest \
     .
