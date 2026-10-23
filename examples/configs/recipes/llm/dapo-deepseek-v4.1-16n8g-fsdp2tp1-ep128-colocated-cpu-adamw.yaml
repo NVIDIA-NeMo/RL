@@ -1,0 +1,210 @@
+# H100 variant of dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml:
+# 16 nodes x 8 H100-80GB, training EP128, colocated vLLM TP8 x EP128 (vLLM DP16 x TP8, one instance), HybridEP
+# dispatcher, plain torch.optim.AdamW on the CPU-offloaded parameters. Validated for 50 steps (8 nodes) and 5 steps
+# (16 nodes) with generation-KL error 0.0005; see docs/guides/models/deepseek/deepseek-v4.1-flash.md, "H100".
+# Why not the 12n4g settings on 80 GB GPUs: TP8 x EP8 needs >= 1 TiB of HBM per vLLM instance and TP is capped at
+# o_groups = 8; `dispatcher: torch` needs memory proportional to the EP size; BF16CPUAdamW parks the FP32 gradient
+# shards on the GPU until the step (34.5 GB per rank at EP64).
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  batch_multiplier: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    name: grpo
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+  val_period: 10
+  max_val_samples: 30
+  val_num_generations_per_prompt: 8
+  val_batch_size: 30
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 1
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    max_response_length: 2048
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  enabled: true
+  keep_top_k: 1
+  # A checkpoint with torch.optim.AdamW state is 6.6 TB (FP32 moments); save every 10 steps and keep the newest one
+  # (metric_name: null makes keep_top_k recency-based so a checkpoint written at a non-validation step is also eligible for deletion).
+  save_period: 10
+  metric_name: null
+  checkpoint_must_save_by: 00:03:40:00
+  model_save_format: null
+  checkpoint_dir: results/dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw/checkpoints
+policy:
+  model_name: ${oc.env:DS41_FULL_CHECKPOINT}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 3072
+  logprob_chunk_size: 128
+  offload_optimizer_for_logprob: false
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  refit_buffer_size_gb: 1
+  optimizer:
+    # Plain AdamW on the CPU-offloaded parameters: FSDP2 reduces the gradients to host memory instead of keeping the
+    # FP32 shards on the GPU until the step (BF16CPUAdamW's streaming path). Costs ~35 GB of host memory per rank (FP32 moments).
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: true
+    sequence_parallel: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 128
+    activation_checkpointing: true
+    env_vars:
+      NRL_REFIT_SERIAL_COLLECTIVES: '1'
+      NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
+      NRL_REFIT_BUFFER_MAX_GB: '4'
+    moe_parallelizer:
+      reshard_after_forward: true
+      lm_head_precision: float32
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: tilelang
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep   # torch dispatcher: all-gather/all-reduce buffer grows with EP (12.7 GiB at EP64, 44 GiB at EP128)
+        rope_fusion: false
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_modules: []
+  megatron_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  hf_config_overrides:
+    vision_config:
+      num_hidden_layers: 0
+    text_config:
+      engram_host_checkpoint: ${policy.model_name}
+      compressed_kv_format: mxfp8
+  router_replay:
+    enabled: true
+  generation:
+    max_new_tokens: 2048
+    temperature: 1.0
+    vllm_cfg:
+      skip_tokenizer_init: false
+      precision: bfloat16
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8     # vLLM's V4.1 o_proj caps TP at o_groups = 8
+      expert_parallel_size: 128    # = vLLM DP16 x TP8: one 128-GPU instance; bf16 experts do not fit a TP8 x EP8 instance on 80 GB
+      gpu_memory_utilization: 0.65   # the policy side's resident HybridEP/NCCL buffers must fit next to vLLM across sleep/wake
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_prefix_caching: false
+      use_deep_gemm: true
+      load_format: dummy
+      refit_with_reload_api: false
+      frozen_engram_checkpoint: ${policy.model_name}
+      env_vars:
+        NRL_REFIT_SERIAL_COLLECTIVES: '1'
+        NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
+        NRL_REFIT_BUFFER_MAX_GB: '4'
+      sleep_level: 2
+    vllm_kwargs:
+      hf_overrides:
+        quantization_config: null
+        expert_dtype: bf16
+      kernel_config:
+        moe_backend: triton
+      language_model_only: true
+      max_num_batched_tokens: 2048
+      enable_chunked_prefill: true
+      max_num_seqs: 24   # every DP engine serves its prompts in one wave (KV budget allows ~590 x 3072-token sequences)
+      # With EP > TP the DP engines are coupled by the expert all-to-all; vLLM's default async scheduling then deadlocks
+      # the group when the first engine finishes its prompts (https://github.com/vllm-project/vllm/issues/43547).
+      async_scheduling: false
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: 16
+        gpus_per_node: 8
+data:
+  max_input_seq_length: 1024
+  filter_overlong_prompts: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024Deduplicated
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemorl-grpo-dsv41
+    name: dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw
+  tensorboard_enabled: true
+  tensorboard:
+    log_dir: tb_logs/dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw
+  mlflow:
+    run_name: dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8
+  segment_size: null
