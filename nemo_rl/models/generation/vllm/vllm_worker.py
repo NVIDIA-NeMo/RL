@@ -1229,11 +1229,18 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
+        expanded_placeholder_token_id = None
+        if self.cfg["vllm_cfg"].get("native_speechlm"):
+            tokenizer = self.llm.renderer.get_tokenizer()
+            expanded_placeholder_token_id = tokenizer.get_vocab()["<|audio|>"]
+
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
             validate_rollout_prompt(
-                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+                input_ids[i, :sequence_length].tolist(),
+                output.prompt_token_ids,
+                expanded_placeholder_token_id=expanded_placeholder_token_id,
             )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
