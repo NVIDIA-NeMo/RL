@@ -239,6 +239,33 @@ def test_second_run_is_a_no_op(cache: Path) -> None:
     assert prune_uv_cache.prune(cache, keep, set(), dry_run=False) == (0, 0)
 
 
+def test_dockerfile_prunes_in_the_layers_that_fill_the_cache() -> None:
+    # Deleting cache files in a later layer only hides them; the image still ships
+    # them. So the prune must run inside the dependency RUN that seeds and fills
+    # the cache, and Dynamo's wheels must never land in the shared cache.
+    lines = (REPO_ROOT / "docker" / "Dockerfile").read_text().splitlines()
+    code = [(i, line) for i, line in enumerate(lines) if not line.startswith("#")]
+
+    copy_script = next(
+        i for i, l in code if l.startswith("COPY") and "prune_uv_cache.py" in l
+    )
+    seed_run = next(i for i, l in code if "from=uv-cache-seed" in l)
+    run_end = next(i for i, l in code if i > seed_run and l == "EOF")
+    prefetch_end = lines.index("done < /opt/actor_venvs.tsv")
+    cache_key = next(i for i, l in code if '.cache-key"' in l and l.startswith("echo"))
+    prunes = [
+        i for i, l in code if "prune_uv_cache.py" in l and not l.startswith("COPY")
+    ]
+
+    assert copy_script < seed_run
+    assert len(prunes) == 1, "prune must run exactly once, in the dependency RUN"
+    assert seed_run < prefetch_end < prunes[0] < cache_key < run_end
+
+    dynamo = next(i for i, l in code if "docker/dynamo/install.sh" in l and "bash" in l)
+    assert lines[dynamo].startswith("UV_CACHE_DIR=/tmp/")
+    assert lines[dynamo + 1].startswith("rm -rf /tmp/")
+
+
 def test_main_refuses_a_suspiciously_small_lock(
     cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

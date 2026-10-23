@@ -243,6 +243,7 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl docker/prune_uv_cache.py ./docker/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -353,6 +354,13 @@ rm -rf /var/lib/apt/lists/*
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Drop cache entries uv.lock no longer pins -- versions the seed carried in from older locks
+# (see docker/prune_uv_cache.py). It has to run here, in the layer that writes them: deleting
+# them in a later layer only hides them, and the image still ships every byte.
+du -sh "${UV_CACHE_DIR}"
+"${UV_PROJECT_ENVIRONMENT}/bin/python" docker/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+du -sh "${UV_CACHE_DIR}"
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -630,7 +638,11 @@ if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
 fi
-bash docker/dynamo/install.sh
+# Dynamo syncs its own lock (Python 3.12) into a --link-mode copy venv that nothing re-syncs at
+# runtime, so its wheels are never needed from the shared cache. A throwaway cache keeps them
+# out of this layer instead of shipping them twice.
+UV_CACHE_DIR=/tmp/dynamo-uv-cache bash docker/dynamo/install.sh
+rm -rf /tmp/dynamo-uv-cache
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
@@ -690,20 +702,6 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
-
-# Drop uv cache entries no longer pinned by uv.lock -- see docker/prune_uv_cache.py's
-# module docstring for the full accumulation mechanism this addresses (every
-# dependency-version bump leaves its predecessor's wheel behind forever, because the
-# uv cache seed's own staleness key is BASE_IMAGE+UV_VERSION+HYBRID_EP_MULTINODE, not
-# the lock content -- see the dependency-install RUN above). Must run after every
-# uv-writing RUN above (dependency-install, TRT-LLM, Dynamo, worker-venv prefetch,
-# Gym prefetch) and before the ownership handoff below, so it can only ever remove
-# entries nothing in THIS build still needs -- it keeps every (name, version) pair
-# uv.lock pins across every extra, installed in this build or not, so it cannot break
-# the offline `uv run --extra <backend>` promise that UV_CACHE_DIR exists for.
-RUN echo "uv cache size before pruning:" && du -sh "${UV_CACHE_DIR}" && \
-    python docker/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}" && \
-    echo "uv cache size after pruning:" && du -sh "${UV_CACHE_DIR}"
 
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
 # (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
