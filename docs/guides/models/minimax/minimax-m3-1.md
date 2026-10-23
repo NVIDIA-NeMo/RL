@@ -43,8 +43,9 @@ used by NeMo-RL's editable installs.
 
 Sources:
 
-- AutoModel: `<automodel-repo-url>` at `<automodel-branch-or-commit>` — MiniMax-M3.1
-  checkpoint and processor support.
+- AutoModel: [main branch at `41f926247`](https://github.com/NVIDIA-NeMo/Automodel/commit/41f926247376f282bfe7c7e3a0a1e4d07229e0b3)
+  — MiniMax-M3.1 checkpoint support
+  ([PR #4491](https://github.com/NVIDIA-NeMo/Automodel/pull/4491)) is merged.
 - vLLM: `<vllm-repo-url>` at `<vllm-branch-or-commit>` — MiniMax-M3.1 support.
 
 From the NeMo-RL repository root, run:
@@ -52,9 +53,9 @@ From the NeMo-RL repository root, run:
 ```bash
 mkdir -p 3rdparty/Automodel-workspace 3rdparty/vLLM-workspace
 
-git clone <automodel-repo-url> \
+git clone https://github.com/NVIDIA-NeMo/Automodel.git \
   3rdparty/Automodel-workspace/Automodel
-git -C 3rdparty/Automodel-workspace/Automodel checkout <automodel-branch-or-commit>
+git -C 3rdparty/Automodel-workspace/Automodel checkout 41f926247376f282bfe7c7e3a0a1e4d07229e0b3
 
 git clone <vllm-repo-url> \
   3rdparty/vLLM-workspace/vllm
