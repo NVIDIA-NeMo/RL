@@ -477,24 +477,6 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
-    @pytest.mark.parametrize(
-        "enable",
-        [
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
-        ],
-        ids=[
-            "reward_shaping",
-        ],
-    )
-    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
-        mc = _ppo_master_config()
-        enable(mc.ppo)
-
-        with pytest.raises(
-            NotImplementedError, match="not supported on the SingleController"
-        ):
-            validate_single_controller_config(mc)
-
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather
         # than silently training on unadjusted rewards.

@@ -51,6 +51,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     logprob_passes_required,
@@ -400,6 +401,23 @@ class AdvantageComputer:
         truncated = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
+
+        # After scale_rewards and ahead of every other reader of `rewards`,
+        # the order v1 uses: the penalty is subtracted from the reward, so its
+        # magnitude is only meaningful against the scaled range. Per-row, so
+        # the stage stays shardable. token_mask.sum(-1) IS
+        # response_token_lengths -- see
+        # test_token_mask_sum_is_the_response_token_length.
+        rewards = apply_reward_shaping(
+            BatchedDataDict(
+                {
+                    "total_reward": rewards,
+                    "response_token_lengths": token_mask.sum(dim=-1).long(),
+                    "truncated": truncated,
+                }
+            ),
+            cfg.algo.reward_shaping,
+        )["total_reward"]
 
         has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
         # A context-only segment has no physical loss row, but its empty mask
