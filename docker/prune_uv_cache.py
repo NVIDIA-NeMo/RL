@@ -13,129 +13,178 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prune uv's PyPI wheel/sdist cache down to what uv.lock still pins.
+"""Prune uv's cache down to what uv.lock still pins.
 
-uv.lock pins exactly one version per package across the WHOLE project (every
-extra, installed in this build or not -- see the offline-extras comment on
-UV_CACHE_DIR in docker/Dockerfile). But uv's cache is append-only: `uv sync`
-only ever downloads what a build needs, it never removes a version a prior
-lockfile revision pinned and this one no longer does. Every routine
-dependency bump (torch, vllm, sglang, ...) therefore leaves its predecessor's
-wheel sitting in the cache forever, as long as BASE_IMAGE/UV_VERSION/
-HYBRID_EP_MULTINODE haven't changed (see docker/Dockerfile's dependency-install
-RUN for why those three are the only things that ever reset the cache).
+uv.lock pins one version (or one git commit) per package across the WHOLE
+project -- every extra, installed in this build or not. uv's cache is
+append-only: `uv sync` downloads what a build needs and never removes a version
+an older lockfile pinned. The CI seed persists the cache across builds for as
+long as BASE_IMAGE/UV_VERSION/HYBRID_EP_MULTINODE are unchanged (see the
+dependency-install RUN in docker/Dockerfile), so every dependency bump would
+otherwise leave its predecessor in the seed and in every shipped image.
+`uv cache prune` does not help: it removes stale cache-format buckets, cached
+environments and unlinked archives, never a valid entry for an older version.
 
-This script removes exactly those superseded entries -- never anything
-`uv.lock` still references, installed or not -- so it is safe to run before
-shipping UV_CACHE_DIR in the release image: it cannot remove a wheel the
-offline `uv run --extra <backend>` promise depends on, because that promise
-is itself "every wheel uv.lock could need," which is exactly the keep set
-computed here.
+Removed, matched against uv.lock (layout per uv's crates/uv-cache/src/wheel.rs):
+  wheels-v*/{pypi,index/<digest>}/<name>/<version>-<tags>[.http|.msgpack]
+  sdists-v*/{pypi,index/<digest>}/<name>/<version>[...]
+      kept iff (<name>, <version>) is pinned by uv.lock.
+  sdists-v*/git/<digest>/<first 16 hex of commit>
+  git-v*/checkouts/<digest>/<short commit>
+      kept iff the commit prefixes a git commit uv.lock pins.
+  archive-v0/<id>
+      kept iff any link left under wheels-v*/ or sdists-v*/ resolves to it --
+      the same reachability scan uv's own `uv cache prune` uses, so archives
+      behind entries this script never touches (url/, path/, editable/) stay.
 
-Scope: only the `pypi/` subtree of `wheels-v*`/`sdists-v*` (the dominant
-case -- every normal PyPI-sourced dependency). Git/URL/local-path/custom-index
-sources (`wheels-v*/url/`, `wheels-v*/index/`, `git-v*/`) are deliberately
-left untouched: their directory naming does not reliably encode a PEP 503
-package name + exact version the way the pypi/ tree does, so matching them
-against uv.lock risks a false match/miss. They are a small fraction of the
-cache's total size (see the before/after `du -sh` this script prints).
+Never removed: url/, path/, editable/ trees (keyed by URL digest, no version to
+match), git-v*/db, and every other bucket. That keeps it safe to run before
+shipping UV_CACHE_DIR: it cannot remove anything offline
+`uv run --extra <backend>` needs, because that is itself "what uv.lock pins".
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
 import tomllib
 from pathlib import Path
 
-# PEP 503 normalization: case-insensitive, runs of -_. collapse to one '-'.
-# uv.lock package names and the cache's on-disk directory names are not
-# guaranteed to use the same casing/separator, so both sides must go through
-# this before comparing.
+# PEP 503: uv.lock and the cache's directory names may differ in case/separator.
 _NORMALIZE_RE = re.compile(r"[-_.]+")
+_GIT_SHA_RE = re.compile(r"#([0-9a-f]{40})$")
+_METADATA_SUFFIXES = (".http", ".msgpack", ".lock", ".rev")
+# uv's archive-reference scan skips these; they are never links into archive-v0.
+_SCAN_SKIP_SUFFIXES = (".lock", ".whl", ".http", ".rev", ".msgpack")
 
 
 def normalize(name: str) -> str:
     return _NORMALIZE_RE.sub("-", name).lower()
 
 
-def load_keep_set(lock_path: Path) -> set[tuple[str, str]]:
+def load_lock(lock_path: Path) -> tuple[set[tuple[str, str]], set[str]]:
+    """Returns ({(normalized name, version)}, {full git commit SHA})."""
     with lock_path.open("rb") as f:
-        data = tomllib.load(f)
-    packages = data.get("package", [])
-    keep = {
-        (normalize(p["name"]), p["version"])
-        for p in packages
-        if "name" in p and "version" in p
-    }
-    return keep
+        packages = tomllib.load(f).get("package", [])
+    versions = set()
+    for p in packages:
+        if "name" in p and "version" in p:
+            name, version = normalize(p["name"]), p["version"]
+            versions.add((name, version))
+            # uv's WheelFilename::cache_key truncates long versions to 47 chars.
+            versions.add((name, version[:47].rstrip(".+")))
+    shas = set()
+    for p in packages:
+        git = p.get("source", {}).get("git")
+        if git and (m := _GIT_SHA_RE.search(git)):
+            shas.add(m.group(1))
+    return versions, shas
 
 
-def _entry_name_version(entry: Path) -> tuple[str, str] | None:
-    # entry is e.g. wheels-v6/pypi/<name>/<version>-<platform-tag-or-nothing>
-    # or sdists-v*/pypi/<name>/<version>
-    name = normalize(entry.parent.name)
-    version = entry.name.split("-", 1)[0]
-    if not version:
-        return None
-    return name, version
+def entry_version(entry_name: str) -> str | None:
+    """`<version>-<tags>[.http]` or `<version>` -> `<version>`; None if not a version."""
+    for suffix in _METADATA_SUFFIXES:
+        if entry_name.endswith(suffix):
+            entry_name = entry_name[: -len(suffix)]
+            break
+    version = entry_name.split("-", 1)[0]
+    # PEP 440 versions (including epochs) start with a digit. Anything else is
+    # not ours to judge, so it is kept.
+    return version if version[:1].isdigit() else None
+
+
+def _registry_roots(cache_dir: Path) -> list[Path]:
+    roots = []
+    for bucket in ("wheels-v*", "sdists-v*"):
+        for bucket_dir in cache_dir.glob(bucket):
+            roots.extend(p for p in [bucket_dir / "pypi"] if p.is_dir())
+            index = bucket_dir / "index"
+            if index.is_dir():
+                roots.extend(p for p in index.iterdir() if p.is_dir())
+    return roots
+
+
+def _sha_kept(prefix: str, shas: set[str]) -> bool:
+    # Unparseable names are kept: only a hex commit prefix can be matched.
+    if len(prefix) < 7 or not all(c in "0123456789abcdef" for c in prefix):
+        return True
+    return any(sha.startswith(prefix) for sha in shas)
+
+
+def plan_removals(
+    cache_dir: Path, versions: set[tuple[str, str]], shas: set[str]
+) -> list[Path]:
+    removals = []
+    for root in _registry_roots(cache_dir):
+        for name_dir in root.iterdir():
+            if not name_dir.is_dir() or name_dir.is_symlink():
+                continue
+            name = normalize(name_dir.name)
+            for entry in name_dir.iterdir():
+                version = entry_version(entry.name)
+                if version is not None and (name, version) not in versions:
+                    removals.append(entry)
+    commit_dirs = [
+        *cache_dir.glob("sdists-v*/git/*/*"),
+        *cache_dir.glob("git-v*/checkouts/*/*"),
+    ]
+    for commit_dir in commit_dirs:
+        if commit_dir.is_dir() and not _sha_kept(commit_dir.name, shas):
+            removals.append(commit_dir)
+    return removals
+
+
+def _reachable_archives(cache_dir: Path, removed: set[Path]) -> set[str]:
+    archive_root = (cache_dir / "archive-v0").resolve()
+    reachable = set()
+    for bucket in [*cache_dir.glob("wheels-v*"), *cache_dir.glob("sdists-v*")]:
+        for dirpath, dirnames, filenames in os.walk(bucket):
+            here = Path(dirpath)
+            dirnames[:] = [
+                d for d in dirnames if d != "src" and here / d not in removed
+            ]
+            # os.walk lists directory symlinks under dirnames without following them.
+            for name in [*filenames, *dirnames]:
+                link = here / name
+                if link in removed or name.endswith(_SCAN_SKIP_SUFFIXES):
+                    continue
+                if link.is_symlink():
+                    target = link.resolve()
+                    if target.parent == archive_root:
+                        reachable.add(target.name)
+    return reachable
 
 
 def prune(
-    cache_dir: Path, keep: set[tuple[str, str]], *, dry_run: bool
+    cache_dir: Path,
+    versions: set[tuple[str, str]],
+    shas: set[str],
+    *,
+    dry_run: bool,
+    verbose: bool = False,
 ) -> tuple[int, int]:
     """Returns (entries_removed, archives_removed)."""
-    reachable: set[str] = set()
-    entries_removed = 0
-
-    pypi_roots = [
-        p
-        for pattern in ("wheels-v*/pypi", "sdists-v*/pypi")
-        for p in cache_dir.glob(pattern)
-    ]
-
-    for pypi_root in pypi_roots:
-        for name_dir in pypi_root.iterdir():
-            if not name_dir.is_dir():
-                continue
-            for entry in name_dir.iterdir():
-                parsed = _entry_name_version(entry)
-                if parsed is None:
-                    continue
-                if parsed in keep:
-                    if entry.is_symlink():
-                        reachable.add(Path(entry.resolve()).name)
-                    continue
-                entries_removed += 1
-                if dry_run:
-                    continue
-                # Remove the pointer directory/symlink and its sibling
-                # metadata files (<same-stem>.msgpack, <same-stem>.http).
-                for sibling in name_dir.glob(f"{entry.name}*"):
-                    if sibling.is_symlink() or sibling.is_file():
-                        sibling.unlink()
-                    elif sibling.is_dir():
-                        shutil.rmtree(sibling)
-            if not dry_run and not any(name_dir.iterdir()):
-                name_dir.rmdir()
-
-    # Second pass: also mark reachable archives for every KEPT entry we
-    # didn't already see above (entries outside wheels-v*/sdists-v*/pypi
-    # that still resolve into archive-v0, if any such mounts exist).
-    archives_removed = 0
-    for archive_root in cache_dir.glob("archive-v0"):
-        if not archive_root.is_dir():
+    removals = plan_removals(cache_dir, versions, shas)
+    reachable = _reachable_archives(cache_dir, set(removals))
+    archive_root = cache_dir / "archive-v0"
+    orphaned = (
+        [a for a in archive_root.iterdir() if a.name not in reachable]
+        if archive_root.is_dir()
+        else []
+    )
+    for path in [*removals, *orphaned]:
+        if verbose:
+            print(f"{'would remove' if dry_run else 'remove'}: {path}")
+        if dry_run:
             continue
-        for archive_dir in archive_root.iterdir():
-            if archive_dir.name in reachable:
-                continue
-            archives_removed += 1
-            if not dry_run:
-                shutil.rmtree(archive_dir, ignore_errors=True)
-
-    return entries_removed, archives_removed
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    return len(removals), len(orphaned)
 
 
 def main() -> int:
@@ -149,9 +198,11 @@ def main() -> int:
         action="store_true",
         help="Report what would be removed without removing it",
     )
-    # Sanity floor: if parsing uv.lock somehow yields a near-empty keep set
-    # (e.g. a future uv.lock format change this script doesn't understand),
-    # refuse to prune rather than silently deleting almost everything.
+    parser.add_argument(
+        "--verbose", action="store_true", help="Print every removed path"
+    )
+    # Sanity floor: a near-empty keep set (e.g. a uv.lock format change this
+    # script does not understand) must not turn into deleting the whole cache.
     parser.add_argument("--min-keep", type=int, default=100)
     args = parser.parse_args()
 
@@ -162,10 +213,10 @@ def main() -> int:
         print(f"error: {args.cache_dir} does not exist", file=sys.stderr)
         return 1
 
-    keep = load_keep_set(args.lock)
-    if len(keep) < args.min_keep:
+    versions, shas = load_lock(args.lock)
+    if len(versions) < args.min_keep:
         print(
-            f"error: only parsed {len(keep)} pinned packages from {args.lock} "
+            f"error: only parsed {len(versions)} pinned packages from {args.lock} "
             f"(expected at least {args.min_keep}) -- refusing to prune, "
             "uv.lock's format may have changed in a way this script doesn't understand",
             file=sys.stderr,
@@ -173,12 +224,13 @@ def main() -> int:
         return 1
 
     entries_removed, archives_removed = prune(
-        args.cache_dir, keep, dry_run=args.dry_run
+        args.cache_dir, versions, shas, dry_run=args.dry_run, verbose=args.verbose
     )
     verb = "Would remove" if args.dry_run else "Removed"
     print(
-        f"{verb} {entries_removed} stale pypi cache entries and {archives_removed} "
-        f"orphaned archives (kept {len(keep)} packages pinned in {args.lock})"
+        f"{verb} {entries_removed} stale cache entries and {archives_removed} "
+        f"orphaned archives (kept {len(versions)} packages and {len(shas)} git "
+        f"commits pinned in {args.lock})"
     )
     return 0
 
