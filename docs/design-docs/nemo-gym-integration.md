@@ -76,9 +76,9 @@ RL sends each prompt group to an actor hosting the selected server. With the cur
 
 #### Example: SimpleAgent with `single_agent_turn`
 
-[`examples/nemo_gym/gdpo_single_agent_turn.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/gdpo_single_agent_turn.yaml) inherits the existing Qwen2.5-1.5B GDPO weather-tool recipe and its one-node, eight-GPU setup. The Environment Server's `resources_server` selects the weather tools and verifier; `agent_server` selects the existing SimpleAgent. `single_agent_turn` coordinates one complete agent turn, which can contain multiple model and tool calls.
+[`examples/nemo_gym/grpo_single_agent_turn.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/examples/nemo_gym/grpo_single_agent_turn.yaml) inherits the existing Gym GRPO recipe and uses Qwen2.5-1.5B on one node with eight GPUs. The Environment Server's `resources_server` selects the weather tools and verifier; `agent_server` selects the existing SimpleAgent. `single_agent_turn` coordinates one complete agent turn, which can contain multiple model and tool calls.
 
-The recipe explicitly replaces the inherited `legacy_agent` implementation with `single_agent_turn` and grants the agent direct HTTP access to the tools. Its route maps the `example_tool_call_multireward` taskset to that Environment Server. The model, sampling settings, and reward components come from the existing recipe.
+The recipe explicitly replaces the inherited `legacy_agent` implementation with `single_agent_turn` and grants the agent direct HTTP access to the tools. Its route maps the `example_tool_call_multireward` taskset to that Environment Server. GRPO uses the verifier's scalar `reward`, the sum of its correctness, format, and schema-validity scores.
 
 First, prepare the five shipped weather prompts with Gym's dataset collator. Declaring `taskset` wraps each source row in `task_id` and `task_input`, preserving its messages, tools, and expected answer. This preparation step does not start servers or run inference. From the RL repository root:
 
@@ -93,13 +93,13 @@ uv run gym dataset collate \
 cd ../../..
 ```
 
-The dataset declaration is a list, so the override replaces the complete list. As in the existing recipe's launcher, training repeats these five examples 60 times; validation uses one copy of the same examples. This example demonstrates the integration rather than a held-out evaluation.
+The dataset declaration is a list, so the override replaces the complete list. Training repeats these five examples 60 times to fill batches of eight prompts; validation uses one copy of the same examples. This example demonstrates the integration rather than a held-out evaluation.
 
 Run the recipe through the existing Gym training entrypoint:
 
 ```bash
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
-  --config examples/nemo_gym/gdpo_single_agent_turn.yaml
+  --config examples/nemo_gym/grpo_single_agent_turn.yaml
 ```
 
 ### Shard NeMo Gym across nodes

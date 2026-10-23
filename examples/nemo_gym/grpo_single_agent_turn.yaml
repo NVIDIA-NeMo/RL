@@ -1,0 +1,67 @@
+# GRPO with Qwen2.5-1.5B and episodes coordinated by an Environment Server.
+# Prepare the taskset data as described in docs/design-docs/nemo-gym-integration.md.
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+policy:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  max_total_sequence_length: 2048
+  automodel_cfg:
+    enabled: true
+    tensor_parallel_size: 1
+  megatron_cfg:
+    _override_: true
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 5.0e-06
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+  generation:
+    vllm_cfg:
+      http_server_serving_chat_kwargs:
+        tool_parser: hermes
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/example_tool_call_multireward_single_agent_turn/example.jsonl
+    # Repeat the five shipped tool-call prompts to fill training batches.
+    repeat: 60
+  validation:
+    data_path: ${data.train.data_path}
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/example_tool_call_multireward/configs/example_tool_call_multireward.yaml
+    workplace_assistant_environment_server: null
+    environment_server_routes:
+      example_tool_call_multireward: example_tool_call_multireward_environment_server
+    example_tool_call_multireward_environment_server:
+      environment_servers:
+        # Gym merges this with its loaded YAML; replace the inherited wrapper.
+        _delete_key: legacy_agent
+        single_agent_turn:
+          entrypoint: app.py
+          cleanup_timeout_seconds: 180
+          resources_server:
+            type: resources_servers
+            name: example_tool_call_multireward
+          agent_server:
+            type: responses_api_agents
+            name: example_tool_call_multireward_simple_agent
+          resources_tool_transports: [direct_http]
+
+checkpointing:
+  checkpoint_dir: results/grpo-single-agent-turn
+logger:
+  log_dir: logs/grpo-single-agent-turn
+  wandb:
+    project: nemo-rl
+    name: grpo-single-agent-turn
