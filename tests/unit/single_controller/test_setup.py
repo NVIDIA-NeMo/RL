@@ -1134,14 +1134,8 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    @pytest.mark.parametrize(
-        ("feature", "match"),
-        [
-            ("router_replay", "does not yet support router replay"),
-            ("multimodal", "does not yet support multimodal capture"),
-        ],
-    )
-    def test_prefix_recovery_rejects_unsupported_features(self, feature, match):
+    def test_prefix_recovery_rejects_router_replay(self):
+        # Multimodal capture is accepted: test_prefix_recovery_accepts_multimodal_capture.
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
@@ -1152,14 +1146,12 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        processor = None
-        if feature == "router_replay":
-            mc.policy["router_replay"] = {"enabled": True}
-        else:
-            processor = MagicMock()
+        mc.policy["router_replay"] = {"enabled": True}
 
-        with pytest.raises(NotImplementedError, match=match):
-            setup_single_controller(mc, MagicMock(pad_token_id=0), processor=processor)
+        with pytest.raises(
+            NotImplementedError, match="does not yet support router replay"
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     @pytest.mark.parametrize(
         ("overrides", "error", "match"),
@@ -1297,6 +1289,65 @@ class TestSetup:
 
         assert actor_args.finalizer_actors == fake_finalizers
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
+
+    def test_prefix_recovery_accepts_multimodal_capture(
+        self,
+        tmp_path: Path,
+        patched_factories,
+    ):
+        mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.checkpointing.update(
+            {
+                "checkpoint_dir": str(tmp_path / "checkpoints"),
+                "enabled": True,
+                "save_data_plane": True,
+                "save_period": 1,
+            }
+        )
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {"async_engine": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.PREFIX
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_attempt_interval_s=1.0
+        )
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor."
+                "create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer")],
+            ),
+        ):
+            tokenizer = MagicMock(pad_token_id=0)
+            setup_single_controller(
+                mc,
+                tokenizer,
+                processor=MagicMock(tokenizer=tokenizer),
+            )
+
+        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
+        generation, _ = patched_factories["_build_generation"].return_value
+        _, setup_kwargs = generation.setup_token_capture.call_args
+        assert setup_kwargs["capture_media"] is True
+        assert setup_kwargs["generation_prefix_cuts_enabled"] is True
 
     def test_disabled_periodic_checkpointing_ignores_existing_snapshots(
         self,

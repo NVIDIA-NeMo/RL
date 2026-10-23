@@ -579,6 +579,17 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Only newly introduced occurrences are staged. vLLM-specific `media_spans`
   extras retain placeholder positions and token hashes for multi-turn prefix
   replacement, including video's timestamp-separated visual-token spans.
+  With `rollout_recovery.target_level: prefix`, the first durable prefix row
+  for a model call carries that call's new media metadata and a SHA-256 digest
+  of each packed tensor, not the pixels; later token chunks carry no media.
+  Recovery reprocesses the reissued request, checks its metadata and tensor
+  digests against that row, and stages the reprocessed tensors in the canonical
+  terminal row. A row whose media metadata cannot be read makes the call
+  regenerate from its turn boundary, like any unusable prefix; reprocessed
+  media that does not match the digests is rejected with
+  `retained_media_changed`. The original image or video must therefore still be resolvable
+  by vLLM when the request is reissued: this path does not provide
+  source-free media prefill if the original media has disappeared.
   Capture requests use vLLM's `skip_mm_cache=True` path to obtain concrete
   processor tensors. vLLM can still reuse its processor-only cache; this does
   not guarantee fresh preprocessing. vLLM tiles images from a dummy prompt, so

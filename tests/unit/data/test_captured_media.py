@@ -37,9 +37,13 @@ from nemo_gym.token_id_capture.staging.records import (
 )
 
 from nemo_rl.data.captured_media import (
+    MEDIA_TENSOR_DIGESTS_FIELD,
+    CapturedMedia,
     MediaCaptureRejected,
     MediaColumnSpec,
+    media_tensor_digests,
     pack_images,
+    verify_restored_media,
 )
 from nemo_rl.data.captured_media import (
     capture_processed_media as _capture_processed_media,
@@ -63,9 +67,13 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+from nemo_rl.models.generation.generation_cut_capture import (
+    GenerationCutCaptureMixin,
+)
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _verify_resumed_media_prompt,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -646,6 +654,7 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
     )
     worker = SimpleNamespace(
         _capture_media=True,
+        _generation_prefix_cuts_enabled=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
         _staging_source=source,
@@ -675,6 +684,280 @@ def test_worker_restart_recovers_retained_geometry_without_fetching_pixels(
             engine_prompt(prefix + [50], [(Span(1, 2), torch.ones(3, 3, 2))]),
             admission=admission,
         )
+
+
+def _stage_media_prefix(dp, tokens, prompt):
+    """Capture a media call with prefix cuts on and stage its first prefix row.
+
+    Returns the worker, the captured media, and the row's staging key; the row
+    is written exactly as a checkpoint cut writes it.
+    """
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _generation_prefix_cuts_enabled=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+    )
+    admission = CaptureAdmission(
+        rollout_id="r0", model_call_id="c1", prev_len=0, mode="text"
+    )
+    media = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker, prompt, admission=admission
+    )
+    sink = TQTokenSink(
+        dp,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    capture = RolloutTokenCapture(
+        sink=sink, weight_version_fn=lambda: 3, adapter=VLLMCaptureAdapter()
+    )
+    record = capture.build_prefix_record(
+        capture.begin_call(admission),
+        prompt_token_ids=tokens,
+        generated_token_ids=[31],
+        generated_logprobs=[-0.25],
+        extras=VllmAsyncGenerationWorkerImpl._generation_cut_record_payload(
+            worker, SimpleNamespace(media=media)
+        ),
+    )
+    staged = sink.stage_generation_prefix(
+        record, checkpoint_id="checkpoint-1", chunk_sequence=0
+    )
+    assert staged.ok
+    return worker, media, staged.staging_key
+
+
+@pytest.mark.parametrize(
+    ("tokens", "make_prompt", "pixels"),
+    [
+        pytest.param(
+            [10, 18, 18, 11],
+            lambda tokens, pixels: engine_prompt(tokens, [(Span(1, 2), pixels)]),
+            torch.arange(18, dtype=torch.float32).reshape(3, 2, 3),
+            id="image",
+        ),
+        pytest.param(
+            # Two temporal tubelets separated by timestamp text.
+            [10, 90, 18, 18, 91, 18, 18, 11],
+            lambda tokens, frames: video_prompt(tokens, [(Span(1, 6), frames)]),
+            torch.arange(48, dtype=torch.float32).reshape(4, 3, 2, 2),
+            id="video",
+        ),
+    ],
+)
+def test_generation_prefix_restore_verifies_media_by_digest_without_pixels(
+    dp, tokens, make_prompt, pixels
+):
+    worker, media, staging_key = _stage_media_prefix(
+        dp, tokens, make_prompt(tokens, pixels)
+    )
+    assert media.tensor_digests == media_tensor_digests(media.tensors)
+    # Only a video call carries frame counts, so only its digests cover them.
+    is_video = media.items[0].modality == "video"
+    assert ("num_frames" in media.tensor_digests) is is_video
+
+    client = RecordingClient(dp)
+    source = TQTokenSource(client, staging_partition="staging", capture_media=True)
+    [chunk] = source.fetch_for_finalization([staging_key])
+    assert not chunk.media_present
+    restored = VllmAsyncGenerationWorkerImpl._restore_generation_cut_media(
+        worker, [chunk]
+    )
+    assert restored == CapturedMedia(
+        items=media.items, tensors=None, tensor_digests=media.tensor_digests
+    )
+    assert not client.tensor_reads()
+
+    resumed = CaptureAdmission(
+        rollout_id="r0-a1", model_call_id="c2", prev_len=0, mode="text"
+    )
+    verified = VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker,
+        make_prompt(tokens, pixels),
+        admission=resumed,
+        restored=restored,
+    )
+    torch.testing.assert_close(verified.tensors["imgs"], media.tensors["imgs"])
+
+    with pytest.raises(MediaCaptureRejected, match="tensor 'imgs' bytes") as error:
+        VllmAsyncGenerationWorkerImpl._capture_request_media(
+            worker,
+            make_prompt(tokens, torch.full_like(pixels, 9)),
+            admission=resumed,
+            restored=restored,
+        )
+    assert error.value.code == "retained_media_changed"
+
+
+def _media_prefix_chunk(dp):
+    tokens = [10, 18, 18, 11]
+    pixels = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+    worker, _, staging_key = _stage_media_prefix(
+        dp, tokens, engine_prompt(tokens, [(Span(1, 2), pixels)])
+    )
+    source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
+    [chunk] = source.fetch_for_finalization([staging_key])
+    return worker, chunk
+
+
+def _without(extras, key):
+    return {name: value for name, value in extras.items() if name != key}
+
+
+def _off_prompt_spans(extras):
+    span = {**extras[MEDIA_SPANS_FIELD][0], "placeholder_digest": "0" * 64}
+    return {**extras, MEDIA_SPANS_FIELD: [span]}
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "match"),
+    [
+        (lambda extras: None, "media metadata is missing"),
+        (
+            lambda extras: _without(extras, MEDIA_SPANS_FIELD),
+            "media metadata is missing",
+        ),
+        (
+            lambda extras: {**extras, MEDIA_SPANS_FIELD: {}},
+            "Media spans are malformed",
+        ),
+        (
+            lambda extras: _without(extras, MEDIA_TENSOR_DIGESTS_FIELD),
+            "media digests are missing",
+        ),
+        (
+            lambda extras: {**extras, MEDIA_TENSOR_DIGESTS_FIELD: {}},
+            "metadata and digests disagree",
+        ),
+        (
+            lambda extras: {**extras, MEDIA_SPANS_FIELD: []},
+            "metadata and digests disagree",
+        ),
+        (_off_prompt_spans, "does not match the exact carried prompt"),
+    ],
+    ids=[
+        "no_extras",
+        "no_spans",
+        "spans_not_a_list",
+        "no_digests",
+        "spans_without_digests",
+        "digests_without_spans",
+        "spans_off_the_prompt",
+    ],
+)
+def test_generation_prefix_media_restore_fails_closed_on_corrupt_rows(
+    dp, corrupt, match
+):
+    worker, chunk = _media_prefix_chunk(dp)
+
+    with pytest.raises(MediaCaptureRejected, match=match):
+        VllmAsyncGenerationWorkerImpl._restore_generation_cut_media(
+            worker, [replace(chunk, extras=corrupt(chunk.extras))]
+        )
+
+
+def test_generation_cut_rebuild_rejects_extras_after_the_first_chunk(dp):
+    worker, chunk = _media_prefix_chunk(dp)
+    later = replace(chunk, extras={MEDIA_SPANS_FIELD: []})
+
+    # The check runs before the admission is consulted.
+    with pytest.raises(RuntimeError, match="only the first generation-cut chunk"):
+        GenerationCutCaptureMixin._rebuild_generation_cut_snapshot(
+            worker, None, [], [chunk, later]
+        )
+
+
+def test_resumed_media_prompt_must_equal_prefix_plus_cut_prompt_tokens():
+    # One prompt-delta token run, then a generated token the check ignores.
+    cut = SimpleNamespace(
+        token_ids_delta=[18, 18, 11, 31], token_mask_delta=[0.0, 0.0, 0.0, 1.0]
+    )
+
+    _verify_resumed_media_prompt(
+        [10, 18, 18, 11], prefix_token_ids=[10], generation_cut=cut
+    )
+    with pytest.raises(
+        MediaCaptureRejected, match="differs from the durable generation prefix"
+    ) as error:
+        _verify_resumed_media_prompt(
+            [10, 18, 11, 11], prefix_token_ids=[10], generation_cut=cut
+        )
+    assert error.value.code == "retained_media_changed"
+
+
+def _image_media() -> CapturedMedia:
+    return capture_processed_media(
+        engine_prompt([10, 18, 18, 11], [(Span(1, 2), torch.ones(3, 2, 3))]),
+        prev_len=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        (lambda media: replace(media, items=()), "metadata"),
+        (
+            lambda media: replace(
+                media,
+                tensors={
+                    **media.tensors,
+                    "num_frames": torch.tensor([1], dtype=torch.int32),
+                },
+            ),
+            "tensor set",
+        ),
+        (
+            lambda media: replace(
+                media,
+                tensors={**media.tensors, "imgs": media.tensors["imgs"].double()},
+            ),
+            "tensor 'imgs' dtype or shape",
+        ),
+        (
+            lambda media: replace(
+                media,
+                tensors={**media.tensors, "imgs": media.tensors["imgs"] + 1},
+            ),
+            "tensor 'imgs' bytes",
+        ),
+    ],
+    ids=["items", "tensor_set", "dtype_or_shape", "bytes"],
+)
+def test_verify_restored_media_rejects_each_kind_of_change(change, match):
+    media = _image_media()
+    restored = CapturedMedia(
+        items=media.items,
+        tensors=None,
+        tensor_digests=media_tensor_digests(media.tensors),
+    )
+    verify_restored_media(media, restored)
+
+    with pytest.raises(MediaCaptureRejected, match=match) as error:
+        verify_restored_media(change(media), restored)
+    assert error.value.code == "retained_media_changed"
+
+
+def test_verify_restored_media_requires_staged_digests():
+    media = _image_media()
+
+    with pytest.raises(MediaCaptureRejected, match="no tensor digests"):
+        verify_restored_media(media, replace(media, tensors=None))
+
+
+def test_media_tensor_digests_fingerprint_dtype_shape_and_bytes():
+    pixels = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    digests = media_tensor_digests({"imgs": pixels, "imgs_sizes": torch.ones(1, 2)})
+
+    assert list(digests) == ["imgs", "imgs_sizes"]
+    assert digests["imgs"]["dtype"] == "torch.bfloat16"
+    assert digests["imgs"]["shape"] == [2, 3]
+    assert media_tensor_digests({"imgs": pixels.clone()}) == {"imgs": digests["imgs"]}
+    reshaped = media_tensor_digests({"imgs": pixels.reshape(3, 2)})["imgs"]
+    assert reshaped["sha256"] == digests["imgs"]["sha256"]
+    assert reshaped["shape"] != digests["imgs"]["shape"]
+    assert media_tensor_digests(None) == {}
 
 
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
@@ -986,6 +1269,7 @@ def retained_call(dp):
     source = TQTokenSource(client, staging_partition="staging", capture_media=True)
     worker = SimpleNamespace(
         _capture_media=True,
+        _generation_prefix_cuts_enabled=False,
         _capture_image_token_id=18,
         _capture_patch_size=1,
         _staging_source=source,
@@ -1373,6 +1657,50 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     assert isinstance(failure, GymTransportError)
     assert "retained_media_changed" in str(failure)
+
+    # A recovery request whose original URL/path/blob has disappeared fails
+    # while vLLM renders its engine-native prompt: before any TQ read and
+    # before begin_call. Prefix rows hold only tensor digests, so there are no
+    # staged pixels it could resume from instead.
+    worker.token_capture.reset_mock()
+    inference.reset_mock()
+    worker._staging_source = MagicMock(spec=TQTokenSource)
+    worker._chain_prefix = MagicMock(spec=ChainPrefixCache)
+    recovery_capture = {
+        **admission.model_dump(),
+        "generation_cut": {
+            "source_capture_key": admission.rollout_id,
+            "source_model_call_id": admission.model_call_id,
+            "staging_keys": ["active/checkpoint-1/r0/c2/0"],
+            "prefix_token_count": 1,
+            "prefix_digest": "0" * 64,
+            "effective_output_limit": 8,
+        },
+    }
+    missing_request = SimpleNamespace(
+        top_k=-1,
+        top_p=1.0,
+        temperature=1.0,
+        ng_capture=recovery_capture,
+        required_prefix_token_ids=None,
+        model_copy=lambda **kwargs: missing_request,
+    )
+
+    async def missing_media(self, **kwargs):
+        raise FileNotFoundError("original media disappeared")
+
+    monkeypatch.setattr(
+        _OnlineRenderer, "preprocess_chat", missing_media, raising=False
+    )
+    with pytest.raises(FileNotFoundError, match="original media disappeared"):
+        await handler(missing_request, MagicMock())
+    assert worker._capture_admission(missing_request).generation_cut is not None
+    assert worker._staging_source.method_calls == []
+    assert worker._chain_prefix.method_calls == []
+    inference.assert_not_awaited()
+    worker.token_capture.begin_call.assert_not_called()
+    worker.token_capture.complete_call_from_response.assert_not_called()
+    assert worker._capture_calls == {}
 
 
 def test_media_column_spec_feature_dim_matches_pack_images_width() -> None:
