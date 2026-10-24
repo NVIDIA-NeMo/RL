@@ -2715,6 +2715,75 @@ def test_distillation_loss_jsd_gradient_flow():
     )
 
 
+@pytest.mark.parametrize("jsd_beta", [0.3, 0.7])
+def test_distillation_loss_jsd_zero_gradient_when_student_matches_teacher(jsd_beta):
+    """Test the jsd gradient is exactly zero when the student matches the teacher.
+
+    Autograd leaves a small nonzero gradient here from separately rounded
+    softmaxes, which Adam turns into full-size steps away from the teacher
+    (see https://jonbarron.info/softmaxfix/).
+    """
+    data, student_logits = setup_distillation_test_data(device="cpu")
+    data["teacher_topk_logits"] = student_logits.gather(
+        -1, data["teacher_topk_indices"]
+    )
+    student_logits.requires_grad_(True)
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=False
+        )
+    )
+
+    loss, _, _ = _run_distillation_loss(loss_fn, student_logits, data)
+    loss.backward()
+
+    # Verify the gradient vanishes exactly
+    assert torch.count_nonzero(student_logits.grad) == 0
+
+
+def test_distillation_loss_jsd_gradient_matches_fp64_reference():
+    """Test the jsd gradient against an fp64 autograd reference."""
+    data, student_logits = setup_distillation_test_data(device="cpu")
+    student_logits.requires_grad_(True)
+    jsd_beta = 0.3
+
+    loss_fn = DistillationLossFn(
+        DistillationLossConfig(
+            kl_type="jsd", jsd_beta=jsd_beta, zero_outside_topk=False
+        )
+    )
+
+    loss, _, loss_data = _run_distillation_loss(loss_fn, student_logits, data)
+    loss.backward()
+
+    # fp64 reference, aligned to next-token prediction and normalized like the loss
+    student_logits_ref = student_logits.detach().double().requires_grad_(True)
+    student_logprobs = student_logits_ref.gather(
+        -1, data["teacher_topk_indices"]
+    ).log_softmax(-1)[:, :-1]
+    teacher_logprobs = data["teacher_topk_logits"].double().log_softmax(-1)[:, :-1]
+    mixture_logprobs = torch.logaddexp(
+        teacher_logprobs + math.log(jsd_beta),
+        student_logprobs + math.log1p(-jsd_beta),
+    )
+    expected_loss = (
+        jsd_beta * teacher_logprobs.exp() * (teacher_logprobs - mixture_logprobs)
+        + (1 - jsd_beta)
+        * student_logprobs.exp()
+        * (student_logprobs - mixture_logprobs)
+    ).sum() / torch.sum(
+        loss_data["sample_mask"].unsqueeze(-1) * loss_data["token_mask"]
+    )
+    expected_loss.backward()
+
+    # Verify the loss value is unchanged and the gradient matches
+    torch.testing.assert_close(loss.double(), expected_loss, atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        student_logits.grad.double(), student_logits_ref.grad, atol=1e-7, rtol=1e-4
+    )
+
+
 def test_distillation_loss_fn_initialization():
     """Test DistillationLossFn initialization."""
     # Test with default values
