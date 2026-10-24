@@ -378,6 +378,29 @@ Field definitions:
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
 
+## Dynamic sampling
+
+Set `grpo.use_dynamic_sampling: true` to drop prompt groups whose generations all received the same reward (zero within-group variance, so no advantage signal) and resample a substitute, as in [DAPO](dapo.md). Filtering works on both the token-capture and non-capture paths. Each dropped group needs a replacement prompt, otherwise it would silently shrink its training step, so setup requires:
+
+- `async_rl.rollout_failure.on_dropped_prompt: replace`.
+- `async_rl.rollout_failure.max_replacement_attempts >= 1`. Each slot gets at most this many replacements. If the last one is also dropped, that step closes one group short, and if too many groups are lost the step falls below `min_step_batch_fraction` and the run raises. At high drop rates, raise `max_replacement_attempts` or lower `min_step_batch_fraction`.
+- A sampler that stamps a target step: `in_order`, or a `custom` sampler that does. The other built-in samplers (`weight_fifo`, `ready_first`, `windowed`) are rejected, because without a stamped step a dropped group can be neither replaced nor counted as missing.
+- `grpo.num_generations_per_prompt >= 2`.
+
+The v1 knobs `grpo.dynamic_sampling_max_gen_batches` and `grpo.batch_multiplier` have no effect here; `max_replacement_attempts` is the budget instead. Dropped groups are counted separately from rollout failures and do not use up `max_skipped_prompts` or `max_consecutive_dropped_prompts`. This section covers GRPO only: PPO needs full-size steps (see [Known Missing Features](#known-missing-features)), and a dropped group that cannot be replaced shortens the step.
+
+`reward` stays the mean over the trained rows, which only hold groups with reward spread, so it can stay flat while the policy still improves. Watch `unfiltered_reward` (or `first_attempt_reward`) for the pre-filter progress signal instead. These per-step metrics are also reported, and all of them need a sampler that stamps target steps:
+
+| Metric | Meaning |
+| --- | --- |
+| `unfiltered_reward` | Mean reward over every generated group, kept or dropped; the progress signal to watch under dynamic sampling. |
+| `first_attempt_reward` | Mean reward over each slot's first attempt only (replacements excluded). |
+| `generated_prompt_groups` | Groups generated for the step, including dropped ones. |
+| `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups whose rewards were all equal. |
+| `rollout/zero_variance_groups_total` | Running total of dropped groups. |
+
+The reward totals are kept in memory only, so after a checkpoint resume the in-flight step's reward metrics cover just the groups generated after the resume.
+
 ## Implementation Structure
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.
@@ -545,7 +568,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
-- Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
+- Reward shaping — `reward_shaping` and `reward_scaling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Dynamic sampling (`use_dynamic_sampling`) is supported under the constraints in [Dynamic sampling](#dynamic-sampling). Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
 - The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
 

@@ -287,6 +287,46 @@ def test_finalize_group_publishes_n_rows_with_placeholder(tq_client, partitions)
         finalizer._source.fetch([receipt["manifest"][0]["staging_key"]])
 
 
+@pytest.mark.parametrize(
+    "rewards, second_rollout_has_receipt, expected",
+    [
+        ([1.0, 1.0], True, True),
+        ([1.0, 0.0], True, False),
+        # A lost receipt becomes an invalid placeholder; its reward is ignored, so
+        # a lone valid row carries no within-group spread either.
+        ([1.0, 0.0], False, True),
+    ],
+    ids=["all_equal", "mixed", "one_valid_row"],
+)
+def test_finalize_group_reports_zero_variance_over_valid_rows(
+    tq_client, partitions, rewards, second_rollout_has_receipt, expected
+):
+    group_id = "grp_zv"
+    rollout_ids = [f"{group_id}_g0", f"{group_id}_g1"]
+    receipts = []
+    for rollout_id, has_receipt in zip(rollout_ids, [True, second_rollout_has_receipt]):
+        if not has_receipt:
+            receipts.append(None)
+            continue
+        receipt, _ = _stage_fixture(tq_client, "worked_example", rollout_id=rollout_id)
+        receipt["rollout_id"] = rollout_id
+        receipts.append(receipt)
+
+    finalized = _finalizer(tq_client).finalize_group(
+        group_id,
+        rollout_ids,
+        receipts,
+        rewards,
+        mask_sample=[True, True],
+        fallback_weight_version=9,
+        prompt_idx=0,
+        loss_multiplier=1.0,
+    )
+
+    assert not finalized.dropped
+    assert finalized.zero_variance is expected
+
+
 def test_finalize_group_skips_unset_terminal_selection(tq_client, partitions):
     group_id = "grp_unset"
     receipt, expected = _stage_fixture(

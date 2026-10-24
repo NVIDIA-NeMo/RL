@@ -20,7 +20,7 @@ import enum
 import json
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -214,6 +214,34 @@ class RolloutRetryPolicy:
         return min(self.backoff_base_s * 2 ** (attempt - 1), self.max_backoff_s)
 
 
+def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
+    """Whether a group has no reward spread, so every row gets zero advantage.
+
+    True for at most one reward, or when all rewards are exactly equal. Exact
+    equality is used because float roundoff can give a uniform group a tiny std.
+    Same rule as v1's ``calculate_trivial_reward_distributions``; keep them in sync.
+    """
+    return len(rewards) <= 1 or max(rewards) == min(rewards)
+
+
+@dataclass
+class StepRewardStats:
+    """Reward totals for the groups generated for one training step.
+
+    Counts every group that finished generating, whether dynamic sampling kept or
+    dropped it. The kept groups all have reward spread, so their mean alone says
+    little about how well the policy is doing.
+    """
+
+    groups: int = 0
+    zero_variance_groups: int = 0
+    reward_sum: float = 0.0
+    samples: int = 0
+    # First attempts only: the prompts originally scheduled, not their replacements.
+    first_attempt_reward_sum: float = 0.0
+    first_attempt_samples: int = 0
+
+
 @dataclass
 class RolloutStats:
     """Counters describing what the retry policy has been doing.
@@ -225,6 +253,10 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
+    # Groups dropped by dynamic sampling because all generations got the same reward.
+    # Kept apart from the failure counts: the rollout was healthy, so counting it as a
+    # failure would make the fleet look sick.
+    zero_variance_groups: int = 0
     # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
     # conflating them defeats the whole point of the two-budget split -- an operator
     # watching redispatch_total climb needs to know whether the cluster is sick or the
@@ -281,6 +313,7 @@ class RolloutStats:
         metrics: dict[str, float] = {
             "rollout/committed_total": float(self.committed),
             "rollout/skipped_total": float(self.skipped),
+            "rollout/zero_variance_groups_total": float(self.zero_variance_groups),
             "rollout/redispatch_total": float(
                 sum(self.redispatches_by_reason.values())
             ),
@@ -1685,10 +1718,14 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        filter_zero_variance_groups: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # Dynamic sampling (DAPO): groups whose generations all got the same reward have
+        # zero advantage, so they are dropped and the caller replaces them with a spare.
+        self._filter_zero_variance_groups = filter_zero_variance_groups
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -1698,6 +1735,9 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        # Keyed by the step a group was generated for; the controller pops a step's
+        # entry when that step closes.
+        self._step_rewards: dict[int, StepRewardStats] = {}
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
@@ -1771,6 +1811,11 @@ class RolloutManager:
     def recovery_ledger(self) -> RolloutRecoveryLedger:
         """Return the prompt-group ownership ledger shared with the controller."""
         return self._recovery_ledger
+
+    @property
+    def filter_zero_variance_groups(self) -> bool:
+        """Whether dynamic sampling drops zero-variance groups (DAPO-style)."""
+        return self._filter_zero_variance_groups
 
     def record_finalizer_dropped_prompt(self) -> None:
         """Count a controller-side drop after generation and finalization succeeded.
@@ -1916,6 +1961,70 @@ class RolloutManager:
             recovery_granularity=recovery_granularity,
         )
 
+    @staticmethod
+    def _is_zero_variance_group(record: PromptGroupRecord) -> bool:
+        """Whether this group has no reward spread (see ``rewards_carry_no_signal``)."""
+        return rewards_carry_no_signal(
+            [completion.reward for completion in record.completions]
+        )
+
+    def record_group_rewards(
+        self,
+        target_step: Optional[int],
+        rewards: Sequence[float],
+        *,
+        replacement_index: int,
+    ) -> None:
+        """Add one finished group's rewards to the tally of the step it was made for.
+
+        Args:
+            target_step: Step the group was stamped for. ``None`` (sampler does not
+                stamp steps) means there is nothing to report against, so skip.
+            rewards: One reward per row of the group.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement.
+        """
+        if target_step is None or not rewards:
+            return
+        tally = self._step_rewards.setdefault(target_step, StepRewardStats())
+        total = float(sum(rewards))
+        tally.groups += 1
+        tally.zero_variance_groups += int(rewards_carry_no_signal(rewards))
+        tally.reward_sum += total
+        tally.samples += len(rewards)
+        if replacement_index == 0:
+            tally.first_attempt_reward_sum += total
+            tally.first_attempt_samples += len(rewards)
+
+    def pop_step_reward_metrics(self, step: int) -> dict[str, float]:
+        """Return the reward metrics for ``step`` and forget that step and older ones.
+
+        Groups count toward the step they were generated for, even if a later step
+        borrowed them (``promote_ready_group``). With lookahead above zero that can
+        differ from the step that trained on them.
+
+        Returns:
+            ``unfiltered_reward`` (mean over every generated group, kept or dropped),
+            ``first_attempt_reward`` (same, but first attempts only),
+            ``generated_prompt_groups``, ``zero_variance_prompt_groups`` and
+            ``zero_variance_fraction``. Empty if nothing was generated for the step.
+        """
+        tally = self._step_rewards.get(step)
+        self._step_rewards = {s: t for s, t in self._step_rewards.items() if s > step}
+        if tally is None or not tally.groups:
+            return {}
+        metrics = {
+            "unfiltered_reward": tally.reward_sum / tally.samples,
+            "generated_prompt_groups": float(tally.groups),
+            "zero_variance_prompt_groups": float(tally.zero_variance_groups),
+            "zero_variance_fraction": tally.zero_variance_groups / tally.groups,
+        }
+        if tally.first_attempt_samples:
+            metrics["first_attempt_reward"] = (
+                tally.first_attempt_reward_sum / tally.first_attempt_samples
+            )
+        return metrics
+
     async def generate_and_push(
         self,
         input_sample: DatumSpec,
@@ -1923,6 +2032,7 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -1946,6 +2056,9 @@ class RolloutManager:
             lineage_group_id: Stable group minted by the rollout ledger before
                 dataloader dispatch. TQ records this same ID rather than minting one.
                 ``None`` preserves the ordinary non-checkpointed fresh-ID retry path.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement after a group was dropped. Only used to separate first
+                attempts in the per-step reward metrics.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
@@ -2039,12 +2152,48 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
+                if self._filter_zero_variance_groups and self._is_zero_variance_group(
+                    record
+                ):
+                    # Checked before commit, so no rows were written; just free the
+                    # reserved slot, as a failed attempt does. No retry budget is
+                    # spent: the rollout was fine, it just has nothing to learn from,
+                    # and retrying the same prompt would likely be uniform again.
+                    await self._tq_buffer.remove_group(tq_group_id)
+                    # Generation succeeded, so the fleet is answering -- clear the
+                    # consecutive-drop run exactly as a commit does (L2277), and as the
+                    # finalizer path already does on a successful generation
+                    # (generate_for_finalization). A zero-variance drop is a data
+                    # decision, not an infra failure, so an earlier infra drop's run
+                    # must not carry across this healthy generation and prematurely trip
+                    # max_consecutive_dropped_prompts.
+                    self._consecutive_infra_drops = 0
+                    self._stats.zero_variance_groups += 1
+                    rewards = [c.reward for c in record.completions]
+                    self.record_group_rewards(
+                        target_step, rewards, replacement_index=replacement_index
+                    )
+                    print(
+                        f"  dynamic sampling: dropped group {tq_group_id} "
+                        f"(target_step={target_step}), all {len(rewards)} "
+                        f"generations scored {rewards[0] if rewards else float('nan')}; "
+                        f"{self._stats.zero_variance_groups} dropped so far",
+                        flush=True,
+                    )
+                    return RolloutOutcome.SKIPPED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     tq_group_id,
                     record,
                     start_weight_version=start_version,
                     end_weight_version=end_version,
+                )
+                # After the commit: a failed commit re-runs the rollout, and the same
+                # prompt must not be counted twice.
+                self.record_group_rewards(
+                    target_step,
+                    [c.reward for c in record.completions],
+                    replacement_index=replacement_index,
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an

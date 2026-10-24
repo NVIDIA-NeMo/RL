@@ -165,6 +165,8 @@ def _manager(
         max_skipped_prompts=8,
     )
     manager._stats = RolloutStats()
+    manager._filter_zero_variance_groups = False
+    manager._step_rewards = {}
     manager._canonical_groups_finalized = 0
     manager._canonical_output_tokens = 0
     manager._recovery_siblings_reused = 0

@@ -305,7 +305,10 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # torch cannot take max() of narrow unsigned dtypes such as the uint16 expert
+        # ids vLLM can return (NotImplementedError "max_all"), so widen to int64 first.
+        # The range check itself is unchanged.
+        max_id = int(tensor.to(torch.int64).max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(

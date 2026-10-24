@@ -2294,6 +2294,8 @@ def _train_pump_controller(*, sampler) -> object:
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        pop_step_reward_metrics=MagicMock(return_value={}),
+        filter_zero_variance_groups=False,
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()

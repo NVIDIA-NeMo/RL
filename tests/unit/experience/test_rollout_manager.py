@@ -372,6 +372,8 @@ def _make_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    mgr._step_rewards = {}
     return mgr
 
 
@@ -2047,6 +2049,8 @@ def _make_capture_manager(
     mgr._recovery_siblings_redispatched = 0
     mgr._skipped_prompts = 0
     mgr._consecutive_infra_drops = 0
+    mgr._filter_zero_variance_groups = False
+    mgr._step_rewards = {}
     mgr._recovery_ledger = RolloutRecoveryLedger()
     mgr._data_plane_checkpoint_barrier = buf.data_plane_checkpoint_barrier
 
@@ -2459,3 +2463,90 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
         tuple(restored.finalization_inputs(request.group_id)[6])
         == request.reward_log_contexts
     )
+
+
+def _scored_record(*rewards: float) -> PromptGroupRecord:
+    return PromptGroupRecord(
+        prompt_idx=0,
+        prompt=[],
+        extra_env_info=None,
+        metadata={},
+        completions=[SimpleNamespace(reward=reward) for reward in rewards],
+        rollout_metrics={},
+    )
+
+
+class TestStepRewardMetrics:
+    def test_committed_group_is_tallied_under_its_target_step(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0)))
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=3))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        metrics = mgr.pop_step_reward_metrics(3)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 0.0
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert metrics["first_attempt_reward"] == pytest.approx(0.5)
+
+    def test_dropped_zero_variance_group_still_counts_toward_the_reward(self):
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        assert outcome is RolloutOutcome.SKIPPED
+        assert len(buf.remove_calls) == 1
+        metrics = mgr.pop_step_reward_metrics(2)
+        assert metrics["generated_prompt_groups"] == 1.0
+        assert metrics["zero_variance_prompt_groups"] == 1.0
+        assert metrics["zero_variance_fraction"] == 1.0
+        assert metrics["unfiltered_reward"] == 0.0
+
+    def test_zero_variance_drop_clears_the_consecutive_drop_run(self):
+        # A dropped zero-variance group is a healthy generation, not an infra failure,
+        # so it must reset the consecutive-drop counter just as a commit does -- and as
+        # the finalizer path already does on a successful generation. Otherwise an
+        # earlier infra drop's run carries across it and can prematurely trip
+        # max_consecutive_dropped_prompts while the fleet is answering every prompt.
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
+        mgr._filter_zero_variance_groups = True
+        mgr._consecutive_infra_drops = 3
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=2))
+
+        assert outcome is RolloutOutcome.SKIPPED
+        assert mgr._consecutive_infra_drops == 0
+
+    def test_zero_variance_is_counted_even_when_the_filter_is_off(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 1.0, 1.0))
+        )
+
+        outcome = _run(mgr.generate_and_push({"idx": 0}, target_step=0))
+
+        assert outcome is RolloutOutcome.COMMITTED
+        assert mgr.pop_step_reward_metrics(0)["zero_variance_prompt_groups"] == 1.0
+
+    def test_replacement_is_excluded_from_the_first_attempt_reward(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 1.0, 0.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}, target_step=0, replacement_index=1))
+
+        metrics = mgr.pop_step_reward_metrics(0)
+        assert metrics["unfiltered_reward"] == pytest.approx(0.5)
+        assert "first_attempt_reward" not in metrics
+
+    def test_unstamped_prompt_is_not_tallied(self):
+        mgr = _make_manager(
+            _FakeBuffer(), _FakeImpl(record=_scored_record(1.0, 0.0, 1.0, 0.0))
+        )
+
+        _run(mgr.generate_and_push({"idx": 0}))
+
+        assert mgr._step_rewards == {}

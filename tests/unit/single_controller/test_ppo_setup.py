@@ -476,12 +476,10 @@ class TestPPOValidation:
     @pytest.mark.parametrize(
         "enable",
         [
-            lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
             lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
             lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
         ],
         ids=[
-            "use_dynamic_sampling",
             "reward_scaling",
             "reward_shaping",
         ],
@@ -594,6 +592,88 @@ class TestPPOValidation:
         mc.async_rl.sampler = WindowedSamplerConfig()
 
         validate_single_controller_config(mc)
+
+
+def _dynamic_sampling_config(
+    *,
+    on_dropped_prompt: str = "replace",
+    sampler: str = "in_order",
+    num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
+) -> MasterConfig:
+    """A GRPO SC config with dynamic sampling on and the knobs it validates."""
+    mc = _make_master_config()
+    mc.grpo.use_dynamic_sampling = True
+    mc.grpo.num_generations_per_prompt = num_generations_per_prompt
+    mc.policy["train_global_batch_size"] = (
+        _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
+    )
+    sampler_cfg = {"name": sampler}
+    if sampler == "custom":
+        # A custom sampler config requires a target; the validator does not import it.
+        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
+    mc.async_rl = AsyncRLConfig(
+        min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+        max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+        sampler=sampler_cfg,
+        rollout_failure={"on_dropped_prompt": on_dropped_prompt},
+    )
+    return mc
+
+
+class TestDynamicSamplingValidation:
+    """Dynamic sampling needs a substitute for every filtered group, or steps shrink."""
+
+    def test_accepts_replace_with_a_stamping_sampler(self):
+        validate_single_controller_config(_dynamic_sampling_config())
+
+    def test_accepts_a_custom_sampler(self):
+        # `custom` is permitted alongside `in_order`; stamping is the sampler's
+        # responsibility and cannot be checked here.
+        validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
+
+    def test_rejects_shrink_since_a_filtered_group_is_never_substituted(self):
+        mc = _dynamic_sampling_config(on_dropped_prompt="shrink")
+
+        with pytest.raises(ValueError, match='on_dropped_prompt="replace"'):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_sampler_that_stamps_no_target_step(self):
+        mc = _dynamic_sampling_config(sampler="ready_first")
+
+        with pytest.raises(ValueError, match="stamps a target step"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_single_generation_per_prompt(self):
+        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
+
+        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_rejects_dynamic_sampling_outright(self):
+        # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
+        # by the GRPO-only guard at the top of the dynamic-sampling block instead.
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_rejects_dynamic_sampling_even_when_grpo_requirements_are_met(self):
+        # The replace + stamping-sampler combo GRPO accepts must still be rejected for
+        # PPO: a dropped group shortens the step and breaks critic sharding (#2625).
+        # Without the explicit guard this config would slip through, since the PPO
+        # drop-budget check does not count dynamic-sampling drops.
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+        mc.async_rl = AsyncRLConfig(
+            min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+            max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+            sampler={"name": "in_order"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
 
 
 class TestAdvantageEstimatorSelection:

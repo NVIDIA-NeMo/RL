@@ -1904,6 +1904,9 @@ class SingleControllerActor:
 
     async def _discard_committed_group(self, request: "ReassemblyRequest") -> None:
         """Release a committed group the controller declines to train on."""
+        # The slot is already ready, and abort() ignores ready slots, so remove it
+        # first; otherwise the sampler could pick it after its rows are cleared.
+        await self._buffer.remove_group(request.group_id)
         await self._cleanup_known_finalization_request(request)
         # The group left the buffer unconsumed, so the post-step release for
         # consumed groups never reaches its pending metrics and observations.
@@ -2258,6 +2261,11 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
+                            self._rollout_manager.record_group_rewards(
+                                target_step,
+                                [row.reward for row in finalized.reward_observations],
+                                replacement_index=replacements,
+                            )
                             min_valid_fraction = self._master_config.token_capture.min_valid_fraction_per_group
                             below_threshold = (
                                 min_valid_fraction is not None
@@ -2266,37 +2274,52 @@ class SingleControllerActor:
                                 / finalized.total_row_count
                                 < min_valid_fraction
                             )
-                            if not below_threshold:
+                            zero_variance = (
+                                self._rollout_manager.filter_zero_variance_groups
+                                and finalized.zero_variance
+                            )
+                            if not below_threshold and not zero_variance:
                                 self._rollout_manager.stats.committed += 1
                                 ownership_transferred = True
                                 break
-                            # Enough rows verified to publish, but too few to
-                            # be worth training on. Unlike the finalizer's own
-                            # structural drops above, this is a policy call
-                            # only the controller can act on: it is the one
-                            # component that can source a replacement.
+                            # The group was published but is not worth training on:
+                            # too few valid rows, or (dynamic sampling) all rewards
+                            # equal. Only the controller can supply a replacement,
+                            # so it makes this call, not the finalizer.
                             try:
                                 await self._discard_committed_group(request)
                             except BaseException as cleanup_error:
                                 raise RuntimeError(
-                                    "finalizer group fell below "
-                                    "min_valid_fraction_per_group and "
-                                    "known-key cleanup failed for group "
+                                    "finalizer group was discarded "
+                                    f"({'below min_valid_fraction_per_group' if below_threshold else 'zero reward variance'}) "
+                                    "and known-key cleanup failed for group "
                                     f"{request.group_id}"
                                 ) from cleanup_error
-                            print(
-                                f"  finalize: group {request.group_id} below "
-                                "min_valid_fraction_per_group "
-                                f"({finalized.valid_row_count}/"
-                                f"{finalized.total_row_count} < "
-                                f"{min_valid_fraction}); seeking a replacement",
-                                flush=True,
-                            )
+                            if below_threshold:
+                                print(
+                                    f"  finalize: group {request.group_id} below "
+                                    "min_valid_fraction_per_group "
+                                    f"({finalized.valid_row_count}/"
+                                    f"{finalized.total_row_count} < "
+                                    f"{min_valid_fraction}); seeking a replacement",
+                                    flush=True,
+                                )
+                            else:
+                                self._rollout_manager.stats.zero_variance_groups += 1
+                                print(
+                                    f"  dynamic sampling: dropped group "
+                                    f"{request.group_id} (target_step={target_step}), "
+                                    "all rewards equal; "
+                                    f"{self._rollout_manager.stats.zero_variance_groups} "
+                                    "dropped so far; seeking a replacement",
+                                    flush=True,
+                                )
                             replacement = self._take_replacement(
                                 target_step, replacements
                             )
                             if replacement is None:
-                                self._rollout_manager.record_finalizer_dropped_prompt()
+                                if below_threshold:
+                                    self._rollout_manager.record_finalizer_dropped_prompt()
                                 self._buffer_capacity.release()
                                 self._credit_shortfall(target_step)
                                 return
@@ -2354,6 +2377,7 @@ class SingleControllerActor:
                                         prompt,
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
+                                        replacement_index=replacements,
                                     )
                                 else:
                                     outcome = await self._rollout_manager.generate_and_push(
@@ -2361,6 +2385,7 @@ class SingleControllerActor:
                                         target_step=target_step,
                                         inflight_registry=self._inflight_by_group_id,
                                         lineage_group_id=lineage_group_id,
+                                        replacement_index=replacements,
                                     )
                         except BaseException:
                             # On success ownership transfers to the train pump, which
@@ -2723,15 +2748,20 @@ class SingleControllerActor:
         """A spare prompt to stand in for a dropped group, or None to shrink instead.
 
         None covers the four ways a replacement can be unavailable: it was not asked
-        for, the sampler did not stamp this prompt so no step is waiting on it, the
-        per-slot budget is spent, or the pool is empty because the dataloader is
-        exhausted. Every one of them falls back to ``on_dropped_prompt="shrink"`` rather
-        than waiting, because a step whose replacements keep failing still has to close.
+        for, the sampler does not stamp target steps so no step is ever waiting on a
+        replacement, the per-slot budget is spent, or the pool is empty because the
+        dataloader is exhausted. Every one of them falls back to
+        ``on_dropped_prompt="shrink"`` rather than waiting, because a step whose
+        replacements keep failing still has to close.
+
+        Whether a step can be waiting on a replacement is the sampler's capability,
+        read from ``_sampler_stamps_target_steps`` -- not inferred from this prompt's
+        ``target_step`` being None, which would couple the decision to a per-call value.
         """
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if target_step is None:
+        if not self._sampler_stamps_target_steps:
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -3794,6 +3824,15 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
+                # Reward over every group generated for this step (kept or dropped by
+                # dynamic sampling) and how many were uniform. `reward` itself stays the
+                # trained-rows mean; `unfiltered_reward`/`first_attempt_reward` are the
+                # pre-filter progress signals, since the kept rows all have reward spread
+                # and their mean alone is a poor progress signal under dynamic sampling.
+                reward_metrics = self._rollout_manager.pop_step_reward_metrics(
+                    version_during_step
+                )
+                step_metrics.update(reward_metrics)
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:
