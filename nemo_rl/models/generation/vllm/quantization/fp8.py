@@ -1288,9 +1288,8 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
-    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
-    the weight_loader attribute which we need for refit.
+    Preserve parameter storage when the converted layout is compatible, and retain
+    weight_loader when the backend requires a different shape or dtype.
 
     Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
@@ -1320,23 +1319,12 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    if global_fp8_config.is_deepseek_v4:
-        # DSV4 restores checkpoint layouts before refit. Preserve compatible
-        # storage and retain loaders when converting to a different layout.
-        replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
-        replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
-        replace_parameter(
-            layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
-        )
-        replace_parameter(
-            layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True
-        )
-    else:
-        # Use .copy_() to preserve weight_loader attribute on Parameters.
-        layer.w13_weight.copy_(w13)
-        layer.w2_weight.copy_(w2)
-        getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-        getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
+    replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
+    replace_parameter(
+        layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
+    )
+    replace_parameter(layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because

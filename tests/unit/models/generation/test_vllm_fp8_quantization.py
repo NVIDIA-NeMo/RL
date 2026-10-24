@@ -2638,18 +2638,8 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
     params = {name: getattr(layer, name) for name in shapes}
     pointers = {name: param.data_ptr() for name, param in params.items()}
 
-    if not is_deepseek_v4 and change_layout == "shape":
-        # Preserve the old copy_ failure for incompatible shapes rather than
-        # silently replacing Parameters that an existing kernel may reference.
-        with pytest.raises(RuntimeError, match="size of tensor"):
-            fp8_module.process_weights_after_loading_moe(method, layer)
-        for name, param in params.items():
-            assert getattr(layer, name) is param
-            assert param.data_ptr() == pointers[name]
-        return
-
     fp8_module.process_weights_after_loading_moe(method, layer)
-    if is_deepseek_v4 and change_layout != "none":
+    if change_layout != "none":
         for name, param in params.items():
             assert getattr(layer, name) is not param
         params = {name: getattr(layer, name) for name in shapes}
@@ -2661,9 +2651,7 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
             assert param is params[name]
             assert param.data_ptr() == pointers[name]
             assert param.weight_loader is weight_loader
-            # Non-DSV4 copy_ retains the destination dtype even when the
-            # converter returns another dtype; prefer_copy would replace it.
-            torch.testing.assert_close(param, expected.to(dtype=param.dtype))
+            torch.testing.assert_close(param, expected)
     assert method.moe_kernel is kernel
     assert method.moe_quant_config is quant_config
 
