@@ -30,6 +30,46 @@ uv run examples/run_sft.py \
 
 ## Datasets
 
+### Full-conversation text formatting
+
+For templates that revise earlier turns (for example, templates grouping multiple
+tool responses into one turn), prefix-by-prefix formatting can leave stale turn
+delimiters in the concatenated training text. Text-only SFT can opt into rendering
+and tokenizing each complete conversation once:
+
+```yaml
+data:
+  add_generation_prompt: false
+  default:
+    processor: sft_full_conversation_processor
+```
+
+Set the processor on both training and validation dataset entries if they override
+`data.default.processor`. Other processors and existing recipes are unchanged.
+The selected template must wrap each complete assistant target, including its
+turn terminator and trailing whitespace, in one `{% generation %}` /
+`{% endgeneration %}` block. Assistant headers can remain outside the block.
+For example:
+
+```jinja
+{{ '<start>assistant\n' }}
+{% generation %}{{ message.content + '<stop>\n' }}{% endgeneration %}
+```
+
+The formatter maps generation character ranges through full-text token offsets,
+rejecting tokens crossing supervision boundaries. It returns context/assistant
+loss-ownership segments rather than source messages. Existing SFT masking,
+padding, next-token shifting, and `sft.only_unmask_final` continue to work; even
+adjacent assistant targets remain separate. No prefix matching or retokenization
+is performed. Tools and configured chat-template options are preserved.
+
+The complete template determines historical reasoning retention; this may differ
+from reasoning accidentally retained by incremental prefix rendering. Review that
+policy before changing an existing training recipe. This processor requires a
+fast tokenizer, text-only messages, and a final assistant target. Missing markers,
+partial generation coverage, and missing requested BOS/EOS tokens are errors,
+not silent fallbacks. The existing SFT overlength exclusion policy is unchanged.
+
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
   2. `task_name`: A string identifier that uniquely identifies the dataset.
