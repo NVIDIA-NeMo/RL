@@ -97,11 +97,6 @@ class StubEp:
         return [self.fail] * len(ops)
 
 
-class _Placement:
-    def order(self, units, *, node_id, nbytes):
-        return units
-
-
 def stub_store(ctl, ep=None, dead=False, monkeypatch=None, ssd=False):
     from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 
@@ -110,8 +105,6 @@ def stub_store(ctl, ep=None, dead=False, monkeypatch=None, ssd=False):
     s.ep = ep or StubEp()
     s.ctl = ctl
     s.timeout_s = 5.0
-    s.placement = _Placement()
-    s.node_id = "n"
     s.namespace = "ns"
     s._epoch = 1
     s._units = {
@@ -123,8 +116,7 @@ def stub_store(ctl, ep=None, dead=False, monkeypatch=None, ssd=False):
         }
         for u in (0, 1)
     }
-    s._blob_unit = {"b": 0}
-    s.stats = {"slow_reads": 0, "fast_reads": 0, "tag_mismatch": 0, "unit_refresh": 0}
+    s.stats = {"unit_refresh": 0}
     s._refresh_units = lambda: None
     s._unit_dead = lambda unit_id: dead
     return s

@@ -86,7 +86,6 @@ from nemo_rl.data_plane.nixl.errors import (
     StaleRead,
 )
 from nemo_rl.data_plane.nixl.nixl_io import GRAVEYARD, NixlEndpoint
-from nemo_rl.data_plane.nixl.placement import Spread
 from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit, split_key
 
 BACKEND_NAME = "NixlStore"
@@ -112,9 +111,9 @@ LEASE_MARGIN_S = 30.0
 def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
     """``(transfer_timeout_s, read_pin_s, op_timeout_s)`` from the config.
 
-    A region freed under a hinted read is reused after ``read_pin_s``, so a
-    READ that may run for ``transfer_timeout_s`` needs ``read_pin_s`` to cover
-    it with margin (design §3.3); anything shorter is rejected.
+    A read's pin holds its blobs for ``read_pin_s``, so a READ that may run
+    for ``transfer_timeout_s`` needs ``read_pin_s`` to cover it with margin
+    (design §3.3); anything shorter is rejected.
     """
     timeout_s = float(cfg.get("transfer_timeout_s", 120.0))
     margin = float(cfg.get("lease_margin_s", LEASE_MARGIN_S))
@@ -123,7 +122,7 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
     if read_pin_s < timeout_s + margin:
         raise ValueError(
             f"NixlStore read_pin_s={read_pin_s} must be >= transfer_timeout_s "
-            f"({timeout_s}) + lease_margin_s ({margin}): a hinted READ may run "
+            f"({timeout_s}) + lease_margin_s ({margin}): a pinned READ may run "
             "for transfer_timeout_s, and its source region must not be reused "
             "before it ends"
         )
@@ -317,8 +316,6 @@ class NixlKVClient(StorageKVClient):
             self.ep,
             directory,
             namespace=self.namespace,
-            placement=Spread(start=os.getpid()),
-            node_id=ray.get_runtime_context().get_node_id(),
             timeout_s=self.timeout_s,
             ssd=ssd is not None,
         )
@@ -441,7 +438,7 @@ class NixlKVClient(StorageKVClient):
 
     def _put_segments(
         self, p: blob_format.BlobPlan, blob_id: str, deadline: float, unit_id: int
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> str:
         """Lay out a blob without building it.
 
         Big values go zero-copy, the rest (small values, the index and the footer) is packed into one pool buffer.
@@ -486,9 +483,9 @@ class NixlKVClient(StorageKVClient):
                         segments,
                         p.nbytes,
                         len(p.entries),
+                        unit_id,
                         blob_id=blob_id,
                         deadline=deadline,
-                        unit_id=unit_id,
                     )
         finally:
             if regs:
