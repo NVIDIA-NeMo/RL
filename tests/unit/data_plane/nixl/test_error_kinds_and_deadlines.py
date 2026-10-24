@@ -173,36 +173,44 @@ def test_no_retryable_error_counts_as_data_loss():
 # ------------------------------------------------------------------ store classification
 @pytest.mark.parametrize("dead, expected", [(False, TransferFailed), (True, LostBlobs)])
 def test_unanswered_resolve_is_loss_only_if_the_unit_is_dead(dead, expected):
-    ctl = _Ctl({"resolve": lambda a: TransferError("did not answer resolve")})
+    ctl = _Ctl({"resolve_keys": lambda a: TransferError("did not answer resolve")})
     s = _store(ctl, dead=dead)
     with pytest.raises(expected):
-        s._read_pinned({"b": [(0, 8, 1000)]})
+        s.resolve_keys({0: ["1@x"]}, None)
 
 
-def test_failed_pinned_read_on_a_live_unit_is_retryable_and_unpins():
-    ctl = _Ctl(
-        {"resolve": lambda a: {"pin_id": "p", "offsets": {"b": 0}, "missing": []}}
-    )
-    s = _store(ctl, ep=_Ep(fail=TransferError("timed out", in_flight=True)))
-    with pytest.raises(TransferFailed) as ei:
-        s._read_pinned({"b": [(0, 8, 1000)]})
-    assert ei.value.in_flight
+def test_a_failed_resolve_unpins_the_units_already_resolved():
+    def resolve(addr):
+        if addr == "tcp://u1":
+            return TransferError("did not answer resolve")
+        return {
+            "pin_id": "p",
+            "entries": {},
+            "missing": [],
+            "pending": [],
+            "failed": [],
+        }
+
+    ctl = _Ctl({"resolve_keys": resolve})
+    with pytest.raises(TransferFailed):
+        _store(ctl).resolve_keys({0: ["1@x"], 1: ["2@x"]}, None)
     assert ("unpin", {"pin_id": "p"}) in ctl.notified
 
 
-def test_unit_reporting_the_blob_missing_is_loss():
-    ctl = _Ctl({"resolve": lambda a: {"pin_id": "p", "offsets": {}, "missing": ["b"]}})
-    with pytest.raises(LostBlobs):
-        _store(ctl)._read_pinned({"b": [(0, 8, 1000)]})
+def test_failed_read_on_a_live_unit_is_retryable():
+    s = _store(_Ctl({}), ep=_Ep(fail=TransferError("timed out", in_flight=True)))
+    with pytest.raises(TransferFailed) as ei:
+        s.read_entries({0: [(0, 8, 1000)]}, {0: ["1@x"]}, None)
+    assert ei.value.in_flight
 
 
-def test_put_raises_unitfull_only_when_every_unit_is_full():
+def test_put_raises_unitfull_only_when_the_unit_is_full():
     s = _store(_Ctl({"alloc": lambda a: UnitFull("full")}))
     with pytest.raises(UnitFull):
-        s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     s = _store(_Ctl({"alloc": lambda a: 0}), ep=_Ep(fail=TransferError("x")))
     with pytest.raises(TransferFailed):
-        s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
 
 
 def test_put_waits_out_busy_units_and_times_out_at_its_deadline(monkeypatch):
@@ -216,7 +224,7 @@ def test_put_waits_out_busy_units_and_times_out_at_its_deadline(monkeypatch):
     s = _store(_Ctl({"alloc": busy}))
     t0 = time.monotonic()
     with pytest.raises(DataPlaneTimeout):
-        s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b", deadline=t0 + 0.3)
+        s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b", deadline=t0 + 0.3)
     assert time.monotonic() - t0 < 0.6
     assert len(calls) > 2  # retried, never UnitFull
 
@@ -230,30 +238,40 @@ def test_put_succeeds_once_busy_clears(monkeypatch):
         return DataPlaneBusy("pressure") if n["alloc"] <= 3 else 64
 
     s = _store(_Ctl({"alloc": alloc}))
-    blob_id, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert hint["so"] == 64
+    assert s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b") == "b"
+    assert n["alloc"] == 4
 
 
-def test_ram_only_unit_is_busy_while_room_is_quarantined():
+def test_ram_only_unit_is_busy_while_a_reader_pins_the_freed_room():
     u = bare_unit(8192, read_pin_s=0.2)
     write_blob(u.slab, u.alloc("a", 8192, 1), 8192, key_of("a"), 1)
     assert u.commit("a") == "done"
     with pytest.raises(UnitFull):  # nothing will come back
         u.alloc("b", 4096, 1)
+    pin = u.resolve_keys([key_of("a")])["pin_id"]
     u.release_rows([gidx_of("a")])
-    with pytest.raises(DataPlaneBusy):  # comes back after read_pin_s
+    with pytest.raises(DataPlaneBusy):  # comes back when the pin expires
         u.alloc("b", 4096, 1)
     with pytest.raises(UnitFull):  # bigger than the slab: never fits
         u.alloc("c", 16384, 1)
+    u.unpin(pin)
     time.sleep(0.25)
     assert u.alloc("b", 4096, 1) == 0
+
+
+def test_an_unpinned_release_frees_the_room_at_once():
+    u = bare_unit(8192, read_pin_s=5.0)
+    write_blob(u.slab, u.alloc("a", 8192, 1), 8192, key_of("a"), 1)
+    assert u.commit("a") == "done"
+    u.release_rows([gidx_of("a")])
+    assert u.alloc("b", 8192, 1) == 0
 
 
 def test_deadline_spent_after_alloc_frees_the_region_at_once():
     ctl = _Ctl({"alloc": lambda a: 0})
     s = _store(ctl)
     with pytest.raises(DataPlaneTimeout):
-        s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b", deadline=time.monotonic())
+        s.put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b", deadline=time.monotonic())
     # The deadline check before alloc fires first, or the abort frees it.
     assert all(a.get("in_flight") is False for op, a in ctl.notified if op == "abort")
 
@@ -261,7 +279,7 @@ def test_deadline_spent_after_alloc_frees_the_region_at_once():
 def test_unanswered_alloc_tells_the_unit_to_free_the_region():
     ctl = _Ctl({"alloc": lambda a: TransferError("did not answer alloc")})
     with pytest.raises(TransferFailed):
-        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     aborts = [a for op, a in ctl.notified if op == "abort"]
     assert aborts and all(a == {"blob_id": "b", "in_flight": False} for a in aborts)
 
@@ -276,7 +294,7 @@ def test_unreachable_agent_after_alloc_frees_the_region():
 
     ctl = _Ctl({"alloc": lambda a: 0})
     with pytest.raises(TransferFailed):
-        _store(ctl, ep=_NoAgent()).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        _store(ctl, ep=_NoAgent()).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     aborts = [a for op, a in ctl.notified if op == "abort"]
     assert len(aborts) == ctl.calls.count("alloc")
     assert all(a == {"blob_id": "b", "in_flight": False} for a in aborts)

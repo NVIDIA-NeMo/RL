@@ -11,14 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""UnitSlabStore: where a blob's bytes live. The client never knows.
+"""UnitSlabStore: blob bytes on the storage units' slabs.
 
-The client lays values out as raw bytes in a registered local buffer, then
-hands the store ``(local_addr, plan)``; on read it hands the store byte
-ranges and registered destination addresses. Everything about placement,
-pins, refcounts and the medium is the store's business: pinned-DRAM slabs on
-CPU StorageUnit actors, one-sided RDMA over UCX, with an optional SSD tier on
-each unit.
+The client lays values out as raw bytes in registered local memory and hands
+the store the segments and the owner unit; on read it hands the store slab
+ranges and registered destination addresses. Pins, refcounts and the medium
+are the units' business: pinned-DRAM slabs on CPU StorageUnit actors,
+one-sided RDMA over UCX, with an optional SSD tier on each unit.
 """
 
 from __future__ import annotations
@@ -29,9 +28,8 @@ from typing import Any
 
 import ray
 
-from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.control import UnitClient
-from nemo_rl.data_plane.nixl.directory import DEAD, LOST
+from nemo_rl.data_plane.nixl.directory import DEAD
 from nemo_rl.data_plane.nixl.errors import (
     DataPlaneBusy,
     DataPlaneTimeout,
@@ -40,7 +38,6 @@ from nemo_rl.data_plane.nixl.errors import (
     UnitFull,
 )
 from nemo_rl.data_plane.nixl.nixl_io import NixlEndpoint
-from nemo_rl.data_plane.nixl.placement import Placement
 
 __all__ = [
     "LostBlobs",
@@ -84,30 +81,20 @@ def busy_wait(deadline: float | None, backoff: float) -> float:
     return min(2 * backoff, BUSY_RETRY_MAX_S)
 
 
-# (off_in_blob, nbytes, local_addr)
-ReadRange = tuple[int, int, int]
-
-
 # ============================================================================ unit slabs
 class UnitSlabStore:
     """Pinned-DRAM slabs on NixlStorageUnit actors, one-sided RDMA.
 
     No Ray on the op path: control messages go to the units over ZMQ
-    (nemo_rl/data_plane/nixl/control.py), bytes over NIXL.
+    (nemo_rl/data_plane/nixl/control.py), bytes over NIXL. The caller names
+    the unit of every op (rows live on unit ``gidx % N``).
 
-    - put:   1 ZMQ request/reply (``alloc``) + NIXL WRITE.
-    - get:   0 control messages when the key's location meta carries a hint
-             ``(u, so, z)``: READ the requested ranges plus the blob's footer
-             straight from ``slab_base + so`` and check the footer's blob tag.
-             A mismatch (blob moved by a checkpoint restore) or a missing hint
-             falls back to a directory lookup + ZMQ ``resolve`` pin.
+    - put:   ZMQ ``alloc`` + NIXL WRITE + ZMQ ``commit`` (publishes the rows).
+    - get:   one ZMQ ``resolve_keys`` per unit (pins) + one NIXL READ per unit.
     - clear: one awaited ZMQ ``release_rows`` per unit (row-wide).
 
-    Ray remains only off the op path: the unit list at start (and if every
-    cached unit refuses a put), and directory lookups for restored blobs.
-
-    Reads without a pin are safe because units quarantine every freed region
-    for ``read_pin_s`` before reusing it.
+    Ray remains only off the op path: the unit list at start (and when a unit
+    is unknown), and the liveness check after a failure.
     """
 
     def __init__(
@@ -116,31 +103,19 @@ class UnitSlabStore:
         directory: Any,
         *,
         namespace: str,
-        placement: Placement,
-        node_id: str,
         timeout_s: float,
         ssd: bool = False,
     ) -> None:
         self.ep = ep
-        # SSD tier on the units: a put commits after its WRITE is DONE. Put-area
-        # blobs keep their hints; a spilled put has none, so its reads resolve
-        # through the unit.
+        # SSD tier on the units: a put that RAM cannot take spills to disk.
         self.ssd = ssd
         self.directory = directory
         self.namespace = namespace
-        self.placement = placement
-        self.node_id = node_id
         self.timeout_s = timeout_s
         self._units: dict[int, dict[str, Any]] = {}
         self._epoch = 0
-        self._blob_unit: dict[str, int] = {}
         self.ctl = UnitClient(timeout_s=min(timeout_s, 30.0))
-        self.stats = {
-            "fast_reads": 0,
-            "slow_reads": 0,
-            "tag_mismatch": 0,
-            "unit_refresh": 0,
-        }
+        self.stats = {"unit_refresh": 0}
         self._refresh_units()
 
     # -- membership
@@ -167,18 +142,6 @@ class UnitSlabStore:
                 ) from e
         return u
 
-    def _gen(self, unit_id: int) -> str | None:
-        """Instance stamp of the live unit with this id (its NIXL agent suffix).
-
-        Hints carry the stamp of the unit that wrote them; after a checkpoint
-        restore the units are new instances, so stale hints stop matching.
-        """
-        u = self._units.get(unit_id)
-        return u["agent_name"].rsplit("-", 1)[-1] if u else None
-
-    def _hint_live(self, m: dict[str, Any]) -> bool:
-        return "u" in m and m.get("g") is not None and self._gen(int(m["u"])) == m["g"]
-
     def _addr(self, unit_id: int) -> str:
         u = self._units.get(unit_id)
         if u is None:
@@ -188,93 +151,39 @@ class UnitSlabStore:
             raise LostBlobs([], f"unit {unit_id} unknown to the directory")
         return u["zmq"]
 
-    def _where(self, blob_ids: list[str]) -> dict[str, int]:
-        unknown = [b for b in blob_ids if b not in self._blob_unit]
-        if unknown:
-            for b, u in ray.get(self.directory.where.remote(unknown)).items():
-                if u != LOST:
-                    self._blob_unit[b] = int(u)
-        return {b: self._blob_unit[b] for b in blob_ids if b in self._blob_unit}
-
-    def _locate(
-        self, blob_ids: list[str], metas: dict[str, dict[str, Any]]
-    ) -> dict[str, int]:
-        """Unit of each blob: its live hint (any writer), else cache / directory.
-
-        The directory only knows restored blobs, so a blob another client wrote
-        is found through its meta.
-        """
-        loc: dict[str, int] = {}
-        rest = []
-        for b in blob_ids:
-            m = metas.get(b) or {}
-            if self._hint_live(m):
-                loc[b] = int(m["u"])
-            else:
-                rest.append(b)
-        loc.update(self._where(rest))
-        return loc
-
-    def put(
-        self,
-        local_addr: int,
-        p: blob_format.BlobPlan,
-        deadline: float | None = None,
-    ) -> tuple[str, dict[str, Any]]:
-        return self.put_segments(
-            [(local_addr, 0, p.nbytes)], p.nbytes, len(p.entries), deadline=deadline
-        )
-
     def put_segments(
         self,
         segments: list[tuple[int, int, int]],
         nbytes: int,
         n_entries: int,
+        unit_id: int,
         blob_id: str | None = None,
         deadline: float | None = None,
-        unit_id: int | None = None,
-    ) -> tuple[str, dict[str, Any]]:
-        """Write one blob of ``nbytes`` from scattered registered regions.
-
-        ``unit_id`` pins the blob to the unit that owns its rows (index
-        addressing); without it the placement picks any unit.
+    ) -> str:
+        """Write one blob of ``nbytes`` to unit ``unit_id``; return its id.
 
         ``segments`` are ``(local_addr, blob_off, n)``: a value sent zero-copy
         from the caller's own (registered) memory, or a run copied into a pool
-        buffer. All go out in one NIXL transfer. Returns ``(blob_id, hint)``;
-        the hint ``{"u", "so", "z"}`` lets readers skip every RPC.
+        buffer. All go out in one NIXL transfer.
 
         Every wait is bounded by ``deadline`` (monotonic). Raises
-        :class:`UnitFull` only when every unit refused for lack of space,
-        :class:`TransferFailed` when units failed otherwise, and
-        :class:`DataPlaneTimeout` when the deadline passes (also while units
-        keep answering Busy, design §5.3).
+        :class:`UnitFull` when the unit refused for lack of space,
+        :class:`TransferFailed` when it failed otherwise, and
+        :class:`DataPlaneTimeout` when the deadline passes (also while the
+        unit keeps answering Busy, design §5.3).
         """
         blob_id = blob_id or uuid.uuid4().hex
-        if not self._units:
-            self._refresh_units()
+        # With the SSD tier on, the unit's RAM is tried before it spills.
+        spills = (False, True) if self.ssd else (True,)
         backoff = BUSY_RETRY_S
         refreshed = False
         while True:
             errs: list[Exception] = []
-            if unit_id is not None:
-                if unit_id not in self._units:
-                    self._refresh_units()
-                if unit_id not in self._units:
-                    raise LostBlobs(
-                        [blob_id], f"unit {unit_id} unknown to the directory"
-                    )
-                order = [self._units[unit_id]]
-            else:
-                order = self.placement.order(
-                    list(self._units.values()), node_id=self.node_id, nbytes=nbytes
-                )
-            # With the SSD tier on, every unit's RAM is tried before any unit spills.
-            tries = [(c, True) for c in order]
-            if self.ssd:
-                tries = [(c, False) for c in order] + tries
-            for cand, spill in tries:
-                unit_id = int(cand["unit_id"])
+            if unit_id not in self._units:
+                self._refresh_units()
+            if unit_id not in self._units:
+                raise LostBlobs([blob_id], f"unit {unit_id} unknown to the directory")
+            for spill in spills:
                 try:
                     off = self.ctl.call(
                         self._addr(unit_id),
@@ -327,23 +236,19 @@ class UnitSlabStore:
                     continue
                 if not self._commit(u, blob_id, deadline, errs):
                     continue
-                self._blob_unit[blob_id] = unit_id
-                hint = {"u": unit_id, "g": self._gen(unit_id)}
-                if off < int(u.get("put_bytes", off + 1)):  # not a spilled blob
-                    hint |= {"so": int(off), "z": int(nbytes)}
-                return blob_id, hint
+                return blob_id
             if any(isinstance(e, DataPlaneBusy) for e in errs):
                 backoff = busy_wait(deadline, backoff)
                 continue
             if not refreshed:
-                self._refresh_units()  # membership may have changed; one retry
+                self._refresh_units()  # the unit's address may have changed; one retry
                 refreshed = True
                 continue
             if errs and all(isinstance(e, UnitFull) for e in errs):
-                raise UnitFull(f"no unit could take {nbytes} B: {errs[-1]}")
+                raise UnitFull(f"unit {unit_id} could not take {nbytes} B: {errs[-1]}")
             raise TransferFailed(
                 [blob_id],
-                f"no unit took {nbytes} B: {errs[-1] if errs else 'no units'}",
+                f"unit {unit_id} did not take {nbytes} B: {errs[-1] if errs else '?'}",
                 in_flight=any(getattr(e, "in_flight", False) for e in errs),
             )
 
@@ -385,38 +290,6 @@ class UnitSlabStore:
                 self.ctl.notify(u["zmq"], "abort", blob_id=blob_id, in_flight=False)
         return bool(ok)
 
-    def read(
-        self,
-        requests: dict[str, list[ReadRange]],
-        metas: dict[str, dict[str, Any]],
-        scratch: tuple[int, memoryview] | None = None,
-        deadline: float | None = None,
-    ) -> None:
-        """Fill every local range from its blob.
-
-        ``scratch`` gives registered room for one footer per blob
-        (``len(requests) * FOOTER_SIZE`` bytes) and enables the RPC-free path for blobs whose meta carries a hint.
-
-        Raises :class:`LostBlobs` only for confirmed loss (the unit lacks the
-        blob, or the unit is dead) and :class:`TransferFailed` when a transfer
-        or reply failed while the unit is still alive.
-        """
-        slow: dict[str, list[ReadRange]] = {}
-        fast: dict[int, list[str]] = {}
-        for b, ranges in requests.items():
-            m = metas.get(b) or {}
-            # A hint exists only for blobs in the put area, which never move; a
-            # spilled blob has none and is read pinned.
-            if scratch is not None and "so" in m and "z" in m and self._hint_live(m):
-                fast.setdefault(int(m["u"]), []).append(b)
-            else:
-                slow[b] = ranges
-        if fast:
-            slow.update(self._read_hinted(requests, metas, fast, scratch, deadline))
-        if slow:
-            self.stats["slow_reads"] += len(slow)
-            self._read_pinned(slow, deadline, metas)
-
     def _failed(self, unit_id: int, blobs: list[str], e: Exception) -> Exception:
         """Classify a failed read: lost if the unit is dead, else retryable."""
         if self._unit_dead(unit_id):
@@ -445,146 +318,6 @@ class UnitSlabStore:
         except Exception:  # noqa: BLE001 - the verdict stands without the directory
             pass
         return True
-
-    def _read_hinted(
-        self, requests, metas, fast, scratch, deadline=None
-    ) -> dict[str, list[ReadRange]]:
-        sbase, sview = scratch
-        fsz = blob_format.FOOTER_SIZE
-        retry: dict[str, list[ReadRange]] = {}
-        slot = 0
-        # One READ per unit, all posted before any is waited for.
-        reads: list[tuple[int, list[str], dict[str, int], tuple[Any, ...]]] = []
-        for unit_id, blobs in fast.items():
-            try:
-                uinfo = self._unit(unit_id)
-            except LostBlobs:
-                retry.update({b: requests[b] for b in blobs})
-                continue
-            loc: list[tuple[int, int]] = []
-            rem: list[tuple[int, int]] = []
-            slots: dict[str, int] = {}
-            for b in blobs:
-                m = metas[b]
-                base = int(uinfo["slab_base"]) + int(m["so"])
-                for off, n, laddr in requests[b]:
-                    loc.append((laddr, n))
-                    rem.append((base + off, n))
-                slots[b] = slot
-                loc.append((sbase + slot * fsz, fsz))
-                rem.append((base + int(m["z"]) - fsz, fsz))
-                slot += 1
-            reads.append(
-                (unit_id, blobs, slots, ("READ", loc, rem, uinfo["agent_name"]))
-            )
-        errs = self.ep.transfer_many(
-            [r[3] for r in reads], timeout_s=remaining(deadline, self.timeout_s)
-        )
-        for (unit_id, blobs, slots, _), e in zip(reads, errs):
-            if e is not None:
-                if e.in_flight:
-                    # The READ may still land in these local ranges, so they
-                    # cannot be refilled by the pinned path; fail the read.
-                    raise self._failed(unit_id, blobs, e) from e
-                retry.update({b: requests[b] for b in blobs})
-                continue
-            for b in blobs:
-                s = slots[b]
-                tag = blob_format.footer_tag(sview[s * fsz : (s + 1) * fsz])
-                if tag is not None and tag.hex() == b:
-                    self.stats["fast_reads"] += 1
-                else:
-                    self.stats["tag_mismatch"] += 1
-                    retry[b] = requests[b]
-        return retry
-
-    def _read_pinned(
-        self,
-        requests: dict[str, list[ReadRange]],
-        deadline: float | None = None,
-        metas: dict[str, dict[str, Any]] | None = None,
-    ) -> None:
-        """Locate + ``unit.resolve`` pin: blobs without a usable hint.
-
-        Blobs a unit reports ``pending`` (being demoted or staged back from
-        disk) are asked for again until the deadline: at once after a round
-        that read something (its unpin frees staging room for the rest), else
-        on a doubling backoff from ``PENDING_POLL_S``.
-        """
-        backoff = PENDING_POLL_S
-        while requests:
-            rest = self._read_pinned_once(requests, deadline, metas or {})
-            if len(rest) < len(requests):
-                backoff = PENDING_POLL_S
-            elif rest:
-                backoff = busy_wait(deadline, backoff)
-            requests = rest
-
-    def _read_pinned_once(
-        self,
-        requests: dict[str, list[ReadRange]],
-        deadline: float | None,
-        metas: dict[str, dict[str, Any]],
-    ) -> dict[str, list[ReadRange]]:
-        """One resolve + READ round; returns the requests still pending."""
-        where = self._locate(list(requests), metas)
-        if len(where) < len(requests):
-            raise LostBlobs(
-                [b for b in requests if b not in where], "blob location unknown"
-            )
-        by_unit: dict[int, list[str]] = {}
-        for b, u in where.items():
-            by_unit.setdefault(u, []).append(b)
-
-        resolved: dict[int, dict[str, Any]] = {}
-        for u, bs in by_unit.items():
-            try:
-                resolved[u] = self.ctl.call(
-                    self._addr(u),
-                    "resolve",
-                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
-                    blob_ids=bs,
-                )
-            except (TransferError, LostBlobs, DataPlaneTimeout) as e:
-                for done_u, r in resolved.items():
-                    self.ctl.notify(
-                        self._units[done_u]["zmq"], "unpin", pin_id=r["pin_id"]
-                    )
-                if isinstance(e, DataPlaneTimeout):
-                    raise
-                raise self._failed(u, bs, e) from e
-        try:
-            missing = [b for r in resolved.values() for b in r["missing"]]
-            if missing:
-                raise LostBlobs(missing, "blob not on unit")
-            failed = [b for r in resolved.values() for b in r.get("failed", ())]
-            if failed:  # the unit still has the file, so the caller may retry
-                raise TransferFailed(failed, "disk read failed on the unit")
-            pending = {b for r in resolved.values() for b in r.get("pending", ())}
-            reads: list[tuple[int, list[str], tuple[Any, ...]]] = []
-            for u, blobs in by_unit.items():
-                blobs = [b for b in blobs if b not in pending]
-                if not blobs:
-                    continue
-                uinfo, r = self._unit(u), resolved[u]
-                loc: list[tuple[int, int]] = []
-                rem: list[tuple[int, int]] = []
-                for b in blobs:
-                    base = int(uinfo["slab_base"]) + int(r["offsets"][b])
-                    for off, n, laddr in requests[b]:
-                        loc.append((laddr, n))
-                        rem.append((base + off, n))
-                reads.append((u, blobs, ("READ", loc, rem, uinfo["agent_name"])))
-            errs = self.ep.transfer_many(
-                [r[2] for r in reads], timeout_s=remaining(deadline, self.timeout_s)
-            )
-            for (u, blobs, _), e in zip(reads, errs):
-                if e is not None:
-                    raise self._failed(u, blobs, e) from e
-        finally:
-            for u, r in resolved.items():
-                self.ctl.notify(self._units[u]["zmq"], "unpin", pin_id=r["pin_id"])
-        return {b: requests[b] for b in pending}
 
     # -- index-addressed reads and clears (rows live on unit gidx % N)
     def resolve_keys(

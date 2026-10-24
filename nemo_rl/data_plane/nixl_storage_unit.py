@@ -156,7 +156,7 @@ class NixlStorageUnit:
     """Owns one registered DRAM slab.
 
     Clients reach it over ZMQ (``info()["zmq"]``)
-    for alloc / resolve / release; Ray is only its lifecycle and admin path.
+    for alloc / commit / resolve_keys / release_rows; Ray is only its lifecycle and admin path.
     """
 
     def __init__(
@@ -228,7 +228,6 @@ class NixlStorageUnit:
                 "commit": self.commit,
                 "abort": self.abort,
                 "release_rows": self.release_rows,
-                "resolve": self.resolve,
                 "resolve_keys": self.resolve_keys,
                 "unpin": self.unpin,
             },
@@ -272,14 +271,14 @@ class NixlStorageUnit:
         self._max_io_jobs = _MAX_IO_JOBS
         self._staged: dict[str, BlobRec] = {}  # blobs with a staged copy
         if not ssd_dir:
-            self.alloc_ = SlabAllocator(slab_bytes, on_free=self._wipe_footer)
+            self.alloc_ = SlabAllocator(slab_bytes)
             return
         main = (slab_bytes - staging_bytes) // 4096 * 4096
         if staging_bytes <= 0 or main <= 0:
             raise ValueError(
                 f"ssd staging_bytes={staging_bytes} must be in (0, slab {slab_bytes})"
             )
-        self.alloc_ = SlabAllocator(main, on_free=self._wipe_footer)
+        self.alloc_ = SlabAllocator(main)
         self.staging_ = SlabAllocator(slab_bytes - main)
         self.staging_base = main
         self.ssd_dir = os.path.join(
@@ -569,7 +568,7 @@ class NixlStorageUnit:
                 and a.quarantined_bytes
                 and (a.free_bytes + a.quarantined_bytes >= align_up(nbytes, a.align))
             ):
-                # Room comes back when the quarantine ends (read_pin_s): Busy
+                # Room comes back when the readers' pins end: Busy
                 # makes the client wait for it, as _alloc_io does for the IO area.
                 raise DataPlaneBusy(
                     f"unit {self.unit_id} has no room for {nbytes} B yet",
@@ -699,15 +698,10 @@ class NixlStorageUnit:
             self._dispose(blob_id, rec)
 
     def _dispose(self, blob_id: str, rec: BlobRec) -> None:
-        """Free every copy of a released blob (caller holds ``_mu``)."""
-        if self.ssd_dir is None:
-            self._free_region(rec)
-            return
-        # SSD on: a copy is free once its pins end. Put-area blobs are also read
-        # by hint, without a pin: a hinted read issued after the release fails
-        # its footer tag check and raises. A READ already in flight while the
-        # region is reused is not guarded; consumers do not read a key while it
-        # is being cleared or overwritten, so a reasonable run never does this.
+        """Free every copy of a released blob (caller holds ``_mu``).
+
+        A copy is free once its pins end: every read pins what it reads.
+        """
         now = time.monotonic()
         at = rec.pin_expiry(now)
         if rec.in_slab:
@@ -721,21 +715,6 @@ class NixlStorageUnit:
         if rec.disk is not None and not rec.staging:
             self._worker.submit(_close, rec.disk)  # no blocking syscall under _mu
             rec.disk = None
-
-    def _free_region(self, rec: BlobRec) -> None:
-        now = time.monotonic()
-        # Always quarantine for read_pin_s, pinned or not: clients read with
-        # cached (unit, offset) hints and no pin RPC, so a freed region must not
-        # be reused while such a read could still be in flight. The blob tag in
-        # the footer catches anything older than that: _wipe_footer clears it
-        # before the region can be reused (a smaller blob would not overwrite it).
-        at = max(rec.pin_expiry(now), now + self.read_pin_s)
-        _free_at(self.alloc_, rec.off, rec.nbytes, at, now)
-
-    def _wipe_footer(self, off: int, nbytes: int) -> None:
-        """Zero a freed blob's footer so a stale hinted read fails its tag check."""
-        if nbytes >= blob_format.FOOTER_SIZE:
-            self.slab[off + nbytes - blob_format.FOOTER_SIZE : off + nbytes] = 0
 
     # ------------------------------------------------------------------ reads
     @_locked
