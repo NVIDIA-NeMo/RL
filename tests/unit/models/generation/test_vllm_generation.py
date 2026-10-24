@@ -61,6 +61,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
+    _warn_stale_prefix_cache_once,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -444,7 +445,7 @@ def test_context_capped_max_new_tokens():
 @pytest.mark.asyncio
 async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.cfg = {"vllm_cfg": {"async_engine": True, "enable_prefix_caching": False}}
     worker.llm = MagicMock(
         pause_generation=AsyncMock(),
         resume_generation=AsyncMock(),
@@ -455,6 +456,95 @@ async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
 
     worker.llm.pause_generation.assert_awaited_once_with(mode="keep", clear_cache=False)
     worker.llm.resume_generation.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("clear_cache", "prefix_caching", "capability", "expected_warnings"),
+    [
+        (False, True, 8, 1),
+        (False, False, 8, 0),
+        (False, None, 8, 1),
+        (False, None, 7, 0),
+        (True, True, 8, 0),
+        (True, None, 8, 0),
+    ],
+)
+async def test_async_vllm_pause_warns_only_when_prefix_cache_is_kept(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    clear_cache: bool,
+    prefix_caching: bool | None,
+    capability: int,
+    expected_warnings: int,
+) -> None:
+    """Use engine initialization's resolver and warn once per worker process."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (capability, 0))
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "vllm_cfg": {"async_engine": True, "enable_prefix_caching": prefix_caching}
+    }
+    worker.llm = MagicMock(pause_generation=AsyncMock())
+    _warn_stale_prefix_cache_once.cache_clear()
+    try:
+        for _ in range(2):
+            assert await worker.pause_generation_async(clear_cache=clear_cache)
+        assert worker.llm.pause_generation.await_count == 2
+        worker.llm.pause_generation.assert_awaited_with(
+            mode="keep", clear_cache=clear_cache
+        )
+        assert (
+            capsys.readouterr().out.count("prefix cache is NOT invalidated")
+            == expected_warnings
+        )
+    finally:
+        _warn_stale_prefix_cache_once.cache_clear()
+
+
+@pytest.mark.vllm
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "clear_cache, expect_cache_hit", [(True, False), (False, True)]
+)
+def test_keep_pause_clear_cache_resets_prefix_cache(
+    clear_cache: bool, expect_cache_hit: bool
+) -> None:
+    """A native keep-mode pause resets the prefix cache exactly when requested."""
+    # The optional vLLM engine is installed only in the GPU test lane.
+    from vllm import SamplingParams
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    async def cached_tokens_after_pause() -> int:
+        llm = AsyncLLM.from_engine_args(
+            AsyncEngineArgs(
+                model=model_name,
+                enable_prefix_caching=True,
+                enforce_eager=True,
+                gpu_memory_utilization=0.3,
+                max_model_len=1024,
+            )
+        )
+        try:
+            prompt = "The quick brown fox jumps over the lazy dog. " * 20
+            params = SamplingParams(max_tokens=1)
+
+            async def cached_tokens(request_id: str) -> int:
+                result = None
+                async for result in llm.generate(prompt, params, request_id):
+                    pass
+                assert result is not None
+                return result.num_cached_tokens
+
+            await cached_tokens("fill")
+            assert await cached_tokens("warm") > 0
+            await llm.pause_generation(mode="keep", clear_cache=clear_cache)
+            await llm.resume_generation()
+            return await cached_tokens("after-pause")
+        finally:
+            llm.shutdown()
+
+    assert (asyncio.run(cached_tokens_after_pause()) > 0) == expect_cache_hit
 
 
 @pytest.mark.asyncio

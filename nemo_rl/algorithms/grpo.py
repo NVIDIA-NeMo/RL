@@ -527,6 +527,37 @@ def _save_adaptive_loss_state(
     )
 
 
+def _check_megatron_recompute_kv_cache_flag(
+    async_grpo_config: AsyncGRPOConfig,
+    generation_config: GenerationConfig,
+) -> None:
+    """Check the async loop's recompute flag against Megatron's cache mode.
+
+    Megatron generation expresses recompute-after-refit engine-side via
+    ``kv_cache_management_mode="recompute"``; the async loop's flag must agree.
+
+    Args:
+        async_grpo_config: Enabled ``grpo.async_grpo`` configuration.
+        generation_config: ``policy.generation`` with ``backend == "megatron"``.
+
+    Raises:
+        ValueError: If the recompute flag disagrees with the engine's cache mode.
+    """
+    recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
+    kv_cache_mode = generation_config["mcore_generation_config"][
+        "kv_cache_management_mode"
+    ]
+    if recompute_kv_cache != (kv_cache_mode == "recompute"):
+        raise ValueError(
+            "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
+            f"{recompute_kv_cache} conflicts with policy.generation."
+            f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
+            "with policy.generation.backend='megatron' the two must agree. "
+            "Either set the flag to true with kv_cache_management_mode="
+            "'recompute', or set the flag to false with 'persist'/'offload'."
+        )
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -793,6 +824,17 @@ def setup(
             "This entry point never reads it, so leaving it enabled here would "
             "silently train the sampled-token top-k objective instead of the "
             "full-vocabulary reverse KL."
+        )
+
+    # Check the loop-level recompute flag against Megatron generation before the
+    # config is logged or Ray starts. Only async GRPO reads the flag.
+    if (
+        generation_config["backend"] == "megatron"
+        and grpo_config.async_grpo is not None
+        and grpo_config.async_grpo.enabled
+    ):
+        _check_megatron_recompute_kv_cache_flag(
+            grpo_config.async_grpo, generation_config
         )
 
     # Set seed for all random number generators
@@ -1414,29 +1456,6 @@ def setup(
             grpo_config.max_num_epochs * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    # Megatron generation expresses recompute-after-refit engine-side via
-    # `kv_cache_management_mode="recompute"`; the async loop's flag must agree.
-    # Synchronous GRPO does not consume this flag.
-    async_grpo_config = grpo_config.async_grpo
-    if (
-        generation_config["backend"] == "megatron"
-        and async_grpo_config is not None
-        and async_grpo_config.enabled
-    ):
-        recompute_kv_cache = async_grpo_config.recompute_kv_cache_after_weight_updates
-        kv_cache_mode = generation_config["mcore_generation_config"][
-            "kv_cache_management_mode"
-        ]
-        if recompute_kv_cache != (kv_cache_mode == "recompute"):
-            raise ValueError(
-                "grpo.async_grpo.recompute_kv_cache_after_weight_updates="
-                f"{recompute_kv_cache} conflicts with policy.generation."
-                f"mcore_generation_config.kv_cache_management_mode={kv_cache_mode!r}: "
-                "with policy.generation.backend='megatron' the two must agree. "
-                "Either set the flag to true with kv_cache_management_mode="
-                "'recompute', or leave the flag false with 'persist'/'offload'."
-            )
 
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0

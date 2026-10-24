@@ -1125,10 +1125,10 @@ class AsyncTrajectoryCollector:
             self._refit_pause_cleared.set()
             return
 
-        # Invalidate&recompute vLLM caches after the weight updates (in-flight or not) if
-        # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
-        # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        if self.async_config.recompute_kv_cache_after_weight_updates:
+        # Drained refit: nothing holds the cache, so always invalidate. The flag only
+        # decides what happens to requests in flight during an in-flight refit.
+        drained = not self._generation_pause_requested_for_refit
+        if drained or self.async_config.recompute_kv_cache_after_weight_updates:
             try:
                 print(
                     "🔄 Invalidating generation backend KV caches after weight update"
@@ -1137,6 +1137,22 @@ class AsyncTrajectoryCollector:
                 if invalidated:
                     print(
                         "✅ Invalidated generation backend KV caches after weight update"
+                    )
+                elif (
+                    drained
+                    and not self.async_config.recompute_kv_cache_after_weight_updates
+                    and self.master_config.policy["generation"]["backend"] == "megatron"
+                ):
+                    # Nobody asked for a recompute; a backend that keeps (or does
+                    # not expose) its cache after a drained refit is following its
+                    # own configuration, e.g. Megatron generation under
+                    # kv_cache_management_mode persist/offload. Say so without
+                    # raising a warning on every refit.
+                    print(
+                        "ℹ️ Generation backend kept its KV caches across this drained "
+                        "refit (recompute_kv_cache_after_weight_updates=false and the "
+                        "backend does not flush on request, e.g. Megatron "
+                        "kv_cache_management_mode != 'recompute')"
                     )
                 else:
                     print(

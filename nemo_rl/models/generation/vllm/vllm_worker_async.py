@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+import functools
 import gc
 import logging
 import secrets
@@ -73,7 +74,10 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
 )
-from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
+    _resolve_enable_prefix_caching,
+)
 from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
@@ -81,6 +85,20 @@ from nemo_rl.models.generation.openai_server_utils import (
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_stale_prefix_cache_once() -> None:
+    print(
+        "⚠️ vLLM in-flight weight update with "
+        "recompute_kv_cache_after_weight_updates=false and prefix caching enabled: "
+        "the prefix cache is NOT invalidated across weight updates, so later "
+        "requests can reuse KV/state computed by older weights. This staleness "
+        "is unbounded within the job. Set recompute_kv_cache_after_weight_updates=true "
+        "or policy.generation.vllm_cfg.enable_prefix_caching=false.",
+        flush=True,
+    )
+
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
@@ -2435,7 +2453,13 @@ class VllmAsyncGenerationWorkerImpl(
         torch.cuda.empty_cache()
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
-        """Pause vLLM generation for an in-flight weight update."""
+        """Pause vLLM generation for an in-flight weight update.
+
+        With ``clear_cache=True``, vLLM preempts every running request and resets
+        the prefix cache when the pause finishes, in keep mode too.
+        ``test_keep_pause_clear_cache_resets_prefix_cache`` fails if a vLLM bump
+        changes that.
+        """
         assert self.llm is not None, (
             "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
         )
@@ -2445,6 +2469,8 @@ class VllmAsyncGenerationWorkerImpl(
                 "pause_generation_async can only be used with async_engine=True"
             )
 
+        if not clear_cache and _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+            _warn_stale_prefix_cache_once()
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 

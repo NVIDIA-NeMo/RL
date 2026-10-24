@@ -44,6 +44,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
+    _check_megatron_recompute_kv_cache_flag,
     _get_grpo_save_state,
     _initial_grpo_save_state,
     _initial_policy_generation_stale,
@@ -4224,6 +4225,115 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
     )
     assert setup_metrics["weight_sync_time_s"] > 0
     assert result[2] is nemo_gym_shard_set
+
+
+def _megatron_generation_config(kv_cache_management_mode: str) -> dict[str, Any]:
+    return {
+        "backend": "megatron",
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "val_temperature": 1.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
+        "colocated": {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": 1},
+        },
+        "mcore_generation_config": {
+            "kv_cache_management_mode": kv_cache_management_mode,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("recompute_kv_cache", "kv_cache_management_mode"),
+    [(True, "recompute"), (False, "persist"), (False, "offload")],
+)
+def test_megatron_explicit_recompute_flag_agreeing_with_kv_cache_mode_is_kept(
+    recompute_kv_cache: bool, kv_cache_management_mode: str
+) -> None:
+    async_cfg = AsyncGRPOConfig(
+        enabled=True, recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+
+    _check_megatron_recompute_kv_cache_flag(
+        async_cfg, _megatron_generation_config(kv_cache_management_mode)
+    )
+
+    assert async_cfg.recompute_kv_cache_after_weight_updates is recompute_kv_cache
+
+
+@pytest.mark.parametrize(
+    ("recompute_kv_cache", "kv_cache_management_mode"),
+    [(True, "persist"), (True, "offload"), (False, "recompute")],
+)
+def test_megatron_explicit_recompute_flag_mismatch_raises(
+    recompute_kv_cache: bool, kv_cache_management_mode: str
+) -> None:
+    """A recompute flag that disagrees with the engine mode errors."""
+    async_cfg = AsyncGRPOConfig(
+        enabled=True, recompute_kv_cache_after_weight_updates=recompute_kv_cache
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"conflicts with .*kv_cache_management_mode={kv_cache_management_mode!r}",
+    ):
+        _check_megatron_recompute_kv_cache_flag(
+            async_cfg, _megatron_generation_config(kv_cache_management_mode)
+        )
+
+
+def test_setup_megatron_explicit_recompute_flag_mismatch_raises_before_logging(
+    monkeypatch, mock_grpo_components
+):
+    """An async mismatch fails before logging or allocating Ray resources."""
+    logger_cls = MagicMock()
+    monkeypatch.setattr(grpo_mod, "Logger", logger_cls)
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = _megatron_generation_config("persist")
+    master_config.grpo.async_grpo.enabled = True
+    master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
+
+    with pytest.raises(
+        ValueError, match="conflicts with .*kv_cache_management_mode='persist'"
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    logger_cls.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("recompute_kv_cache", "kv_cache_management_mode"),
+    [(True, "persist"), (True, "offload"), (False, "recompute")],
+)
+def test_setup_sync_megatron_ignores_async_recompute_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+    recompute_kv_cache: bool,
+    kv_cache_management_mode: str,
+) -> None:
+    """A sync run reaches logging even when its unused async flag disagrees."""
+
+    class StopAfterLogger(Exception):
+        pass
+
+    logger = MagicMock()
+    logger.log_hyperparams.side_effect = StopAfterLogger
+    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: logger)
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = _megatron_generation_config(
+        kv_cache_management_mode
+    )
+    master_config.grpo.async_grpo.enabled = False
+    master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = (
+        recompute_kv_cache
+    )
+
+    with pytest.raises(StopAfterLogger):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+    logger.log_hyperparams.assert_called_once()
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
