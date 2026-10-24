@@ -384,8 +384,9 @@ def test_non_deepseek_async_1off_recipes_pass_nccl_reshard_validation(
     config_path: Path,
 ) -> None:
     nccl_reshard_utils = pytest.importorskip("nemo_rl.weight_sync.nccl_reshard_utils")
-    config = _load_resolved_yaml(config_path)
-    master_config = SimpleNamespace(policy=config["policy"])
+    register_omegaconf_resolvers()
+    config = load_config(config_path)
+    master_config = SimpleNamespace(policy=config.policy)
 
     nccl_reshard_utils.check_nccl_reshard_refit_support(master_config)
 
