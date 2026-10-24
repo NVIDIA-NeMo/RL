@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.loss_functions import APPROX_ENTROPY_KEY
 from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
@@ -386,6 +388,13 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Threshold for the early stop; required when stop_at_validation_metric
     # is set.
     stop_at_validation_threshold: float | None = None
+    # Early stop on entropy collapse: end training (after saving a checkpoint,
+    # like the validation early stop) once the step's train approx_entropy has
+    # been below this value for stop_at_entropy_patience consecutive measured
+    # steps of the current run. A step that trained on no valid tokens is not
+    # measured and resets the count; null disables.
+    stop_at_entropy_below: float | None = None
+    stop_at_entropy_patience: int = 1
     skip_reference_policy_logprobs_calculation: bool = False
     seed: int = 42
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
@@ -424,6 +433,16 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+
+    @model_validator(mode="after")
+    def _check_entropy_stop(self) -> "GRPOConfig":
+        if self.stop_at_entropy_below is not None and not math.isfinite(
+            self.stop_at_entropy_below
+        ):
+            raise ValueError("grpo.stop_at_entropy_below must be finite or null")
+        if self.stop_at_entropy_patience < 1:
+            raise ValueError("grpo.stop_at_entropy_patience must be >= 1")
+        return self
 
 
 @dataclass
@@ -581,6 +600,24 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss does not support MTP, draft, "
             "positive-example NLL, or distillation losses"
+        )
+
+
+def _validate_entropy_stop(master_config: MasterConfig) -> None:
+    """``grpo.stop_at_entropy_below`` needs a loss that reports ``approx_entropy``.
+
+    ``ClippedPGLossFn`` reports it only at ``metrics_level: full``. With
+    ``minimal`` the stop could never fire, so reject the pairing here instead
+    of warning once at step 1 and training on to ``max_num_steps``.
+    """
+    if master_config.grpo.stop_at_entropy_below is None:
+        return
+    metrics_level = master_config.loss_fn.metrics_level
+    if metrics_level != "full":
+        raise ValueError(
+            "grpo.stop_at_entropy_below requires loss_fn.metrics_level='full' "
+            f"({APPROX_ENTROPY_KEY} is not reported at metrics_level="
+            f"{metrics_level!r})"
         )
 
 
@@ -747,6 +784,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_entropy_stop(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -3228,6 +3266,95 @@ def _validation_early_stop_message(
     )
 
 
+def _step_approx_entropy(train_results: dict[str, Any]) -> Optional[float]:
+    """Batch-level ``approx_entropy`` measured in one training step, or None.
+
+    The loss reports ``approx_entropy`` per microbatch, already divided by the
+    *global* number of valid tokens, so the per-microbatch values are
+    fragments of one batch mean and the step value is their sum. This is the
+    same reduction the train loops apply before logging. Averaging the
+    fragments instead under-reads by the number of microbatches (e.g. 0.005
+    instead of 0.31 with 64 microbatches) and would trip a floor at once.
+
+    None means the step measured nothing because it trained on no valid
+    tokens. (A loss that never reports ``approx_entropy`` is rejected by
+    ``setup()``, see ``_validate_entropy_stop``.) The workers stamp every
+    microbatch's metrics with the step's ``global_valid_toks``; when that is
+    zero everywhere (dynamic sampling off and every rollout filtered out, for
+    instance) the Megatron worker still reports ``approx_entropy == 0`` for
+    finite, healthy logprobs, because ``masked_mean`` divides an empty masked
+    sum by ``0 + 1e-8``. That zero is a diagnostic artefact, not measured
+    entropy, so it must not count as collapse. The AutoModel worker drops
+    such microbatches, which leaves no ``approx_entropy`` at all and is
+    treated the same way.
+    """
+    mb_metrics = train_results.get("all_mb_metrics") or {}
+    values = mb_metrics.get(APPROX_ENTROPY_KEY)
+    if values is None:
+        return None
+    valid_toks = np.asarray(mb_metrics.get("global_valid_toks", []), dtype=float)
+    if not (valid_toks > 0).any():
+        return None
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    return float(arr.sum()) if arr.size else None
+
+
+class EntropyFloorStop:
+    """Early-stop rule ``grpo.stop_at_entropy_below`` / ``stop_at_entropy_patience``.
+
+    ``update`` is called once per training step with that step's batch-level
+    ``approx_entropy`` (see ``_step_approx_entropy``) and returns a stop
+    message once the entropy has been below the threshold for ``patience``
+    consecutive measured steps, else None. Like
+    ``_validation_early_stop_message`` it only returns the message; the
+    trainer prints it once and exits after checkpointing. A step without an
+    observation (None) is not measured: it never counts toward ``patience``
+    and it resets the streak, so only an unbroken run of measured low-entropy
+    steps stops training. The count lives in memory, so it also restarts when
+    a run resumes from a checkpoint.
+    """
+
+    def __init__(self, threshold: Optional[float], patience: int = 1):
+        self.threshold = threshold
+        self.patience = patience
+        self.consecutive = 0
+        self._warned_unmeasured = False
+
+    @classmethod
+    def from_config(cls, grpo_config: Any) -> "EntropyFloorStop":
+        return cls(
+            grpo_config.stop_at_entropy_below, grpo_config.stop_at_entropy_patience
+        )
+
+    def update(self, approx_entropy: Optional[float]) -> Optional[str]:
+        if self.threshold is None:
+            return None
+        if approx_entropy is None:
+            # Not a measurement: a step with no valid tokens reads a
+            # diagnostic approx_entropy of 0 (Megatron) or none (AutoModel).
+            self.consecutive = 0
+            if not self._warned_unmeasured:
+                warnings.warn(
+                    "grpo.stop_at_entropy_below is set but this step trained on "
+                    f"no valid tokens, so it has no '{APPROX_ENTROPY_KEY}' "
+                    "observation; the step is not counted and the "
+                    "consecutive-low streak is reset."
+                )
+                self._warned_unmeasured = True
+            return None
+        self.consecutive = (
+            self.consecutive + 1 if approx_entropy < self.threshold else 0
+        )
+        if self.consecutive < self.patience:
+            return None
+        return (
+            f"Train {APPROX_ENTROPY_KEY} {approx_entropy:.4f} has been below "
+            f"grpo.stop_at_entropy_below={self.threshold} for {self.consecutive} "
+            "consecutive step(s); stopping training"
+        )
+
+
 def _grpo_train_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -3287,6 +3414,7 @@ def _grpo_train_impl(
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    entropy_floor_stop = EntropyFloorStop.from_config(master_config.grpo)
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -4017,7 +4145,11 @@ def _grpo_train_impl(
                         and (current_step + 1 == len(wrapped_dataloader))
                     )
 
-                early_stop_message: Optional[str] = None
+                # The entropy floor is known right after training; a validation
+                # early stop below can also end the run.
+                early_stop_message: Optional[str] = entropy_floor_stop.update(
+                    _step_approx_entropy(train_results)
+                )
                 should_run_validation = (
                     val_period > 0
                     and (total_steps + 1) >= val_start_at
@@ -4070,14 +4202,16 @@ def _grpo_train_impl(
                                 total_steps + 1,
                                 prefix="validation",
                             )
-                    early_stop_message = _validation_early_stop_message(
-                        val_metrics,
-                        stop_at_validation_threshold,
-                        stop_at_validation_metric,
+                    early_stop_message = early_stop_message or (
+                        _validation_early_stop_message(
+                            val_metrics,
+                            stop_at_validation_threshold,
+                            stop_at_validation_metric,
+                        )
                     )
-                    if early_stop_message is not None:
-                        # Exit at the end of this step, after checkpointing.
-                        print(early_stop_message, flush=True)
+                if early_stop_message is not None:
+                    # Exit at the end of this step, after checkpointing.
+                    print(early_stop_message, flush=True)
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -4994,6 +5128,7 @@ def async_grpo_train(
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    entropy_floor_stop = EntropyFloorStop.from_config(master_config.grpo)
 
     assert (not colocated_inference) or (
         isinstance(policy_generation, MegatronGeneration)
@@ -5830,9 +5965,15 @@ def async_grpo_train(
                         timer=timer,
                     )
 
+                # The entropy floor is known right after training, so a stop
+                # counts as a save-bound step for the engine wake-deferral below.
+                early_stop_message = entropy_floor_stop.update(
+                    _step_approx_entropy(train_results)
+                )
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (
                     is_last_step
+                    or early_stop_message is not None
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
                     or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
@@ -5842,7 +5983,7 @@ def async_grpo_train(
                 will_save_checkpoint = master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 )
-                # An early stop (known only after validation) also saves.
+                # A validation early stop (known only after validation) also saves.
                 saving_this_step = will_save_checkpoint
                 # Save-bound colocated steps leave the engine asleep through save with no transfer.
                 defer_wake_for_save = (
@@ -5964,10 +6105,12 @@ def async_grpo_train(
                             processor=processor,
                         )
                         # An early stop triggers a save; must note before engine wake/resume.
-                        early_stop_message = _validation_early_stop_message(
-                            val_metrics,
-                            stop_at_validation_threshold,
-                            stop_at_validation_metric,
+                        early_stop_message = early_stop_message or (
+                            _validation_early_stop_message(
+                                val_metrics,
+                                stop_at_validation_threshold,
+                                stop_at_validation_metric,
+                            )
                         )
                         saving_this_step = will_save_checkpoint or (
                             master_config.checkpointing["enabled"]
@@ -5993,10 +6136,6 @@ def async_grpo_train(
                                     step + 1,
                                     prefix="validation",
                                 )
-                        if early_stop_message is not None:
-                            # Exit at the end of this step, after checkpointing.
-                            print(early_stop_message, flush=True)
-
                         # Explicit GPU memory cleanup after validation in async mode
                         gc.collect()
                         torch.cuda.empty_cache()
@@ -6004,6 +6143,9 @@ def async_grpo_train(
                         if early_stop_message is None:
                             # Resume trajectory collection after validation
                             trajectory_collector.resume.remote()
+                if early_stop_message is not None:
+                    # Exit at the end of this step, after checkpointing.
+                    print(early_stop_message, flush=True)
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
