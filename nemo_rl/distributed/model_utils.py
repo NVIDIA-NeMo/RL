@@ -84,6 +84,98 @@ def _compute_distributed_log_softmax(
     return _compute_distributed_log_softmax_with_grad(vocab_parallel_logits, group)
 
 
+def _drop_owned_target(
+    exp_logits: torch.Tensor, target_index: torch.Tensor, target_mask: torch.Tensor
+) -> None:
+    """Zero ``exp_logits`` in place at the target, on the rows whose target is local."""
+    kept = exp_logits.gather(-1, target_index).masked_fill_(
+        ~target_mask.unsqueeze(-1), 0.0
+    )
+    exp_logits.scatter_(-1, target_index, kept)
+
+
+@torch.no_grad()
+def _compute_distributed_target_softmax(
+    vocab_parallel_logits: torch.Tensor,
+    *,
+    masked_target: torch.Tensor,
+    target_mask: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``softmax - one_hot(target)`` and target logprobs without softmax collapse.
+
+    The usual max-shifted log-softmax rounds a confident target's probability to
+    exactly 1 once its logit margin passes ~16.6 in fp32: its logprob and its
+    gradient ``1 - p`` collapse to 0 while the other tokens keep their gradients,
+    so the gradient no longer sums to zero. Both are computed here from the mass
+    of the other tokens instead, ``1 - p = sigmoid(log(sum_other) - z_t)`` (see
+    https://jonbarron.info/softmaxfix/).
+
+    Args:
+        vocab_parallel_logits: Float32 logits with shape [..., vocab_size // TP].
+        masked_target: Local target index, clamped to 0 where ``target_mask``.
+        target_mask: True where the target lives on another vocabulary partition.
+        group: Process group for the all-reduces.
+
+    Returns:
+        ``softmax - one_hot(target)`` over the local vocabulary, so the logprob
+        gradient is ``-result * grad_output``, and the target logprobs, 0 where
+        ``target_mask`` (the caller owns their sum-reduction).
+    """
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    torch.distributed.all_reduce(
+        logits_max,
+        op=torch.distributed.ReduceOp.MAX,
+        group=group,
+    )
+
+    shifted_logits = vocab_parallel_logits - logits_max
+    target_index = masked_target.unsqueeze(-1)
+    owned = ~target_mask.unsqueeze(-1)
+    selected_logits = shifted_logits.gather(-1, target_index)
+
+    softmax = shifted_logits.exp_()
+    selected_exp = softmax.gather(-1, target_index) * owned
+    _drop_owned_target(softmax, target_index, target_mask)
+    # One reduction for both the other-token mass and the target mass.
+    sums = torch.cat([softmax.sum(-1, keepdim=True), selected_exp], dim=-1).float()
+    torch.distributed.all_reduce(
+        sums,
+        op=torch.distributed.ReduceOp.SUM,
+        group=group,
+    )
+    sum_exp_other_logits, sum_exp_target_logits = sums.split(1, dim=-1)
+    softmax.div_(sum_exp_other_logits + sum_exp_target_logits)
+
+    # log((1 - p) / p) for the target, only meaningful where the target is local.
+    target_log_odds = sum_exp_other_logits.log() - selected_logits
+    target_entry = torch.where(
+        owned, -torch.sigmoid(target_log_odds), softmax.gather(-1, target_index)
+    )
+    softmax.scatter_(-1, target_index, target_entry)
+
+    target_logprobs = -torch.nn.functional.softplus(target_log_odds).squeeze(-1)
+    target_logprobs[target_mask] = 0.0
+    return softmax, target_logprobs
+
+
+def _target_logprobs_from_logits(
+    logits: torch.Tensor, target: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable ``log_softmax(logits).gather(target)`` without softmax collapse.
+
+    Uses ``-softplus(logsumexp(other logits) - target logit)`` so a confident
+    target keeps an accurate logprob and gradient (see
+    :func:`_compute_distributed_target_softmax`).
+    """
+    target_index = target.unsqueeze(-1)
+    target_logits = logits.gather(-1, target_index)
+    other_logits = logits.scatter(-1, target_index, float("-inf"))
+    return -torch.nn.functional.softplus(
+        torch.logsumexp(other_logits, dim=-1, keepdim=True) - target_logits
+    ).squeeze(-1)
+
+
 @torch.no_grad()
 def _compute_distributed_selected_logprobs(
     vocab_parallel_logits: torch.Tensor,
@@ -99,6 +191,10 @@ def _compute_distributed_selected_logprobs(
     the final log-normalizer subtraction is applied only to the selected token
     from each row instead of every vocabulary element. When ``reduce_output`` is
     ``False``, the caller owns the final sum-reduction across vocabulary partitions.
+
+    The normalizer excludes the selected token, so a confident target keeps an
+    accurate logprob instead of collapsing to exactly 0 (see
+    :func:`_compute_distributed_target_softmax`).
     """
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
     torch.distributed.all_reduce(
@@ -108,21 +204,23 @@ def _compute_distributed_selected_logprobs(
     )
 
     shifted_logits = vocab_parallel_logits - logits_max
-    selected_logits = torch.gather(
-        shifted_logits, -1, masked_target.unsqueeze(-1)
-    ).squeeze(-1)
+    target_index = masked_target.unsqueeze(-1)
+    selected_logits = torch.gather(shifted_logits, -1, target_index).squeeze(-1)
 
     # The selected logits have already been gathered, so the full-vocabulary
     # shifted buffer can be reused for exp/sum instead of allocating another
     # [batch, sequence, local_vocab] tensor.
-    sum_exp_logits = shifted_logits.exp_().sum(-1, keepdim=True).float()
+    exp_logits = shifted_logits.exp_()
+    _drop_owned_target(exp_logits, target_index, target_mask)
+    sum_exp_other_logits = exp_logits.sum(-1, keepdim=True).float()
     torch.distributed.all_reduce(
-        sum_exp_logits,
+        sum_exp_other_logits,
         op=torch.distributed.ReduceOp.SUM,
         group=group,
     )
-    selected_logprobs = selected_logits - sum_exp_logits.log().squeeze(-1).to(
-        selected_logits.dtype
+    selected_logprobs = -torch.nn.functional.softplus(
+        sum_exp_other_logits.log().squeeze(-1).to(selected_logits.dtype)
+        - selected_logits
     )
     selected_logprobs[target_mask] = 0.0
 
@@ -158,27 +256,29 @@ class DistributedLogprob(torch.autograd.Function):
 
         vocab_parallel_logits = vocab_parallel_logits.to(dtype=torch.float32)
 
-        full_log_probs = _compute_distributed_log_softmax(
-            vocab_parallel_logits, group=group
-        )
-
-        log_probs = torch.gather(
-            full_log_probs, -1, masked_target.unsqueeze(-1)
-        ).squeeze(-1)
-        log_probs[target_mask] = 0.0
+        if inference_only:
+            # Skip the [B, S, V_local] softmax the inference path never reads.
+            log_probs = _compute_distributed_selected_logprobs(
+                vocab_parallel_logits,
+                masked_target=masked_target,
+                target_mask=target_mask,
+                group=group,
+                reduce_output=False,
+            )
+        else:
+            softmax_minus_one_hot, log_probs = _compute_distributed_target_softmax(
+                vocab_parallel_logits,
+                masked_target=masked_target,
+                target_mask=target_mask,
+                group=group,
+            )
+            ctx.save_for_backward(softmax_minus_one_hot)
 
         torch.distributed.all_reduce(
             log_probs,
             op=torch.distributed.ReduceOp.SUM,
             group=group,
         )
-
-        if not inference_only:
-            # only save for backward when we have inference only=False. The
-            # softmax is materialized here rather than next to the log_softmax
-            # so the inference path does not pay for a [B, S, V_local] tensor
-            # it never reads (same placement as ChunkedDistributedLogprob).
-            ctx.save_for_backward(full_log_probs.exp(), target_mask, masked_target)
 
         return log_probs
 
@@ -188,38 +288,9 @@ class DistributedLogprob(torch.autograd.Function):
         *grad_outputs: torch.Tensor,
     ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
-        softmax, target_mask, masked_target = ctx.saved_tensors
+        (softmax_minus_one_hot,) = ctx.saved_tensors
 
-        if softmax.ndim == 3:
-            B, S, V = softmax.shape
-
-            # skip `torch.nn.functional.one_hot`
-            row = (
-                torch.arange(B, device=softmax.device)
-                .view(-1, 1)
-                .expand(-1, S)
-                .reshape(-1)
-            )
-            col = torch.arange(S, device=softmax.device).expand(B, -1).reshape(-1)
-            flat_idx = (row * S + col) * V
-
-            flat_chosen = flat_idx.masked_select(
-                ~target_mask.reshape(-1)
-            ) + masked_target.masked_select(~target_mask)
-
-            # `neg` is zero-copy
-            grad_input = softmax.neg()
-            grad_input = grad_input.mul_(grad_output.unsqueeze(-1))
-
-            grad_output_selected = grad_output.masked_select(~target_mask)
-            grad_input.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
-        else:
-            V = softmax.size(-1)
-            is_chosen = (~target_mask).unsqueeze(-1) * torch.nn.functional.one_hot(
-                masked_target, num_classes=V
-            )
-            grad_input = is_chosen.float().sub_(softmax)
-            grad_input.mul_(grad_output.unsqueeze(-1))
+        grad_input = softmax_minus_one_hot.neg().mul_(grad_output.unsqueeze(-1))
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -298,7 +369,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
-        partition_vocab_size = int(vocab_parallel_logits.shape[-1])
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -311,28 +381,21 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             logits = vocab_parallel_logits[:, chunk_start:chunk_end, :]
             logits = logits.to(dtype=torch.float32)
 
-            softmax_output = _compute_distributed_log_softmax(
+            softmax_minus_one_hot, _ = _compute_distributed_target_softmax(
                 logits,
+                masked_target=masked_target[:, chunk_start:chunk_end],
+                target_mask=target_mask[:, chunk_start:chunk_end],
                 group=tp_group,
             )
-            softmax_output = softmax_output.exp()
 
-            # 1 if it's the chosen log prob, 0 otherwise
-            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-                -1
-            ) * torch.nn.functional.one_hot(
-                masked_target[:, chunk_start:chunk_end],
-                num_classes=partition_vocab_size,
-            )
-
-            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
+            chunk_grad_fp32 = softmax_minus_one_hot.neg_()
             chunk_grad_fp32.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
             grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad_fp32
+            del softmax_minus_one_hot, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -879,13 +942,10 @@ def _tp_target_logprobs(
                 top_k=sampling_params.top_k,
                 top_p=sampling_params.top_p,
             )
-        log_probs = torch.nn.functional.log_softmax(logits_chunk, dim=-1)
         out_chunks.append(
-            log_probs.gather(dim=-1, index=target[:, start:end].unsqueeze(-1)).squeeze(
-                -1
-            )
+            _target_logprobs_from_logits(logits_chunk, target[:, start:end])
         )
-        del log_probs, logits_chunk
+        del logits_chunk
     return (
         torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
     ).contiguous()
@@ -1692,13 +1752,8 @@ def get_next_token_logprobs_from_logits(
             top_p=sampling_params.top_p if sampling_params is not None else 1.0,
         )
         # Compute logprobs
-        next_token_logprobs = torch.nn.functional.log_softmax(
-            next_token_logits_wo_last, dim=-1
-        )
         next_tokens = input_ids[:, 1:].cuda()  # Skip first token
-        logprobs = next_token_logprobs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
+        logprobs = _target_logprobs_from_logits(next_token_logits_wo_last, next_tokens)
 
     return logprobs
 

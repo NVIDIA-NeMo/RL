@@ -101,7 +101,11 @@ def calculate_kl(
         kl = torch.square(logr) / 2
 
     elif kl_type == "k3":
-        kl = torch.exp(logr) - 1 - logr
+        # exp(logr) - 1 cancels in fp32 for small logr, in the value and in the
+        # autograd gradient alike, so use expm1 for both: the gradient w.r.t.
+        # logr is substituted as expm1(logr) (https://jonbarron.info/softmaxfix/).
+        expm1_logr = torch.expm1(logr)
+        kl = (expm1_logr - logr).detach() + expm1_logr.detach() * (logr - logr.detach())
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
