@@ -111,7 +111,12 @@ def test_compute_distributed_selected_logprobs_tp_shards(monkeypatch):
     target = torch.randint(0, full_logits.shape[-1], (2, 5))
     global_max = full_logits.amax(dim=-1, keepdim=True)
     shifted_full_logits = full_logits - global_max
-    global_sum_exp = shifted_full_logits.exp().sum(dim=-1, keepdim=True)
+    # The normalizer is reduced over the non-target tokens only.
+    global_sum_exp = (
+        shifted_full_logits.exp()
+        .scatter(-1, target.unsqueeze(-1), 0.0)
+        .sum(dim=-1, keepdim=True)
+    )
     expected = (
         torch.log_softmax(full_logits, dim=-1)
         .gather(-1, target.unsqueeze(-1))
