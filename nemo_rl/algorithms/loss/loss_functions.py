@@ -847,7 +847,9 @@ class ClippedPGLossFn(LossFunction):
             actor_importance_weights_expanded = None
         elif self.sequence_level_importance_ratios:
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
-            seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            # Logprobs are already zero outside the mask; loss weights do not
+            # change a sequence's probability ratio.
+            seq_lp_diff = (prev_logprobs - generation_logprobs).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
             actor_importance_weights = torch.nan_to_num(
                 actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
@@ -1067,7 +1069,7 @@ class ClippedPGLossFn(LossFunction):
         with torch.no_grad():
             lp_error = torch.abs(generation_logprobs - prev_logprobs)
             metric_tensors["token_mult_prob_error"] = masked_mean(
-                torch.exp(lp_error * mask),
+                torch.exp(lp_error),
                 mask,
                 global_normalization_factor=global_valid_toks,
             )

@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -391,6 +392,12 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # NeMo-Gym loss weights keyed by resolved agent_ref.name. Values must be
+    # finite and >= 0; unlisted agents keep 1, and zero excludes a row's loss.
+    # Each nonempty optimizer step must retain a positive-weight trained row.
+    # Weights are relative; baselines and advantages are unchanged.
+    # Legacy synchronous/asynchronous GRPO only; None disables.
+    agent_loss_weights: dict[str, float] | None = None
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -424,6 +431,16 @@ class GRPOConfig(BaseModel, extra="allow"):
     # training rollout rewards (binary single-reward envs only); see
     # docs/guides/length-penalty.md. None/absent disables the feature.
     length_penalty: Optional[LengthPenaltyConfig] = None
+
+    @model_validator(mode="after")
+    def _check_agent_loss_weights(self) -> "GRPOConfig":
+        for agent_name, weight in (self.agent_loss_weights or {}).items():
+            if not math.isfinite(weight) or weight < 0:
+                raise ValueError(
+                    "grpo.agent_loss_weights values must be finite and >= 0; "
+                    f"got {agent_name!r}: {weight}"
+                )
+        return self
 
 
 @dataclass
@@ -616,6 +633,24 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
         )
 
 
+def _validate_agent_loss_weights(master_config: MasterConfig) -> None:
+    """Reject grpo.agent_loss_weights where no trainer would apply it."""
+    if not master_config.grpo.agent_loss_weights:
+        return
+    if not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "grpo.agent_loss_weights keys on each rollout's agent_ref.name, which "
+            "only NeMo-Gym rollouts carry; set env.should_use_nemo_gym=true or "
+            "remove grpo.agent_loss_weights."
+        )
+    if (master_config.data_plane or {}).get("enabled", False):
+        raise NotImplementedError(
+            "grpo.agent_loss_weights is applied by grpo_train and async_grpo_train "
+            "only; the data-plane trainer (data_plane.enabled=true) does not "
+            "support it yet."
+        )
+
+
 def _needs_hf_refit_handshake(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
@@ -747,6 +782,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_agent_loss_weights(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -2691,6 +2727,135 @@ def _trajectory_group_ids(trajectories: list[dict[str, Any]]) -> torch.Tensor:
     )
 
 
+def _apply_agent_loss_weights(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    agent_refs: Optional[list[Any]],
+    agent_loss_weights: Optional[dict[str, float]],
+    *,
+    train_global_batch_size: int,
+) -> dict[str, float]:
+    """Reweight each sample's loss weight by its agent without moving the token mass.
+
+    Multiplies ``train_data["sample_mask"]`` row-wise by
+    ``grpo.agent_loss_weights[agent_ref.name]`` (agents not listed keep 1.0;
+    already-masked rows stay 0), then rescales the product within every
+    optimizer-step global batch so that ``sum(token_mask[:, 1:] * sample_mask)``
+    is unchanged. A nonempty step whose trained rows all have weight 0 raises
+    before changing the mask or reaching the policy update: an empty weighted
+    loss must not leave auxiliary losses active with a zero token denominator.
+    Already-masked steps are unchanged. A global batch is each consecutive
+    ``train_global_batch_size`` rows of ``train_data``. ``Policy.train`` uses
+    ``BatchedDataDict.shard_by_batch_size`` to split these batches before each
+    worker computes
+    ``global_valid_toks`` over it (``process_global_batch``).
+
+    The policy loss divides its ``sample_mask``-weighted numerator by that same
+    ``global_valid_toks`` (or by ``global_valid_seqs`` under sequence-level
+    normalization), so the rescaling cancels there and the weights stay purely
+    relative. It exists for the consumers of ``global_valid_toks`` whose
+    numerator never sees ``sample_mask``: Megatron scales the MoE load-balancing
+    and router z-loss gradients by ``1 / global_valid_toks`` through
+    ``MoEAuxLossAutoScaler``, so an unnormalized uniform weight of 2 would halve
+    them. Because the rescaling is fixed before the batch is split into
+    data-parallel shards and microbatches, it does not depend on either. One
+    caveat: with ``loss_fn.seq_logprob_error_in_loss`` the Megatron worker
+    rescales every gradient by ``global_valid_toks / kept_tokens``
+    (``_normalize_in_loss_seq_filter``) and ``kept_tokens`` sums the weighted
+    mask, so that guarantee holds exactly only when no row is rejected in-loss;
+    uniform positive weights remain a no-op up to floating-point rounding.
+
+    Returns per-agent metrics: the configured weight, the effective (normalized)
+    multiplier applied to the agent's rows, its number of samples, and its share
+    of the trained-token mass before and after weighting. A configured agent
+    that matches no row of the batch is reported with zero samples and a
+    ``UserWarning`` names it, so a misspelled name does not pass as weight 1.0.
+    Returns ``{}`` when no weights are configured.
+    """
+    if not agent_loss_weights:
+        return {}
+    sample_mask = train_data["sample_mask"]
+    num_samples = sample_mask.shape[0]
+    if agent_refs is None or len(agent_refs) != num_samples:
+        raise ValueError(
+            "grpo.agent_loss_weights is set but the training batch has no "
+            "row-aligned agent_ref column (got "
+            f"{None if agent_refs is None else len(agent_refs)} entries for "
+            f"{num_samples} samples)."
+        )
+    if train_global_batch_size < 1:
+        raise ValueError(
+            "grpo.agent_loss_weights needs policy.train_global_batch_size >= 1 to "
+            f"normalize per optimizer step; got {train_global_batch_size}."
+        )
+    names = [
+        str(ref.get("name", "")) if isinstance(ref, dict) else str(ref or "")
+        for ref in agent_refs
+    ]
+    weights = torch.tensor(
+        [float(agent_loss_weights.get(name, 1.0)) for name in names],
+        dtype=sample_mask.dtype,
+        device=sample_mask.device,
+    )
+    # Same convention as process_global_batch: position 0 has no prediction.
+    trained_tokens = (
+        train_data["token_mask"][:, 1:].sum(dim=-1).to(sample_mask.dtype) * sample_mask
+    )
+    # Per optimizer step, rescale so the weighted token mass equals the raw one.
+    # Reject newly empty steps: auxiliary losses can remain active even when
+    # every sample's loss mask is zero.
+    normalizer = torch.ones_like(sample_mask)
+    for start in range(0, num_samples, train_global_batch_size):
+        rows = slice(start, start + train_global_batch_size)
+        original_mass = trained_tokens[rows].sum()
+        weighted_mass = (trained_tokens[rows] * weights[rows]).sum()
+        if weighted_mass > 0:
+            normalizer[rows] = original_mass / weighted_mass
+        elif original_mass > 0:
+            raise ValueError(
+                "grpo.agent_loss_weights removes all trained tokens from optimizer "
+                f"step {start // train_global_batch_size}; keep a positive weight "
+                "for at least one agent with trained tokens in every nonempty step."
+            )
+    effective_weights = weights * normalizer
+    train_data["sample_mask"] = sample_mask * effective_weights
+
+    trained_tokens = trained_tokens.cpu()
+    effective_weights = effective_weights.cpu()
+    weighted_tokens = trained_tokens * effective_weights
+    total_raw = float(trained_tokens.sum())
+    total_weighted = float(weighted_tokens.sum())
+    # A configured name that matches no row is weighted 1.0 by construction, so
+    # a typo would otherwise train exactly like an unset option. Report it with
+    # zero samples and warn; an agent can legitimately be absent from one step's
+    # prompt mix, so this is not a setup-time error.
+    configured = set(agent_loss_weights)
+    absent = sorted(configured - set(names))
+    if absent:
+        warnings.warn(
+            f"grpo.agent_loss_weights names {absent} match no agent_ref.name in "
+            f"this training batch (present: {sorted(set(names))}); check for typos.",
+            stacklevel=2,
+        )
+    metrics: dict[str, float] = {}
+    for name in sorted(set(names) | configured):
+        rows = torch.tensor([n == name for n in names])
+        key = f"agent_loss_weights/{name or 'unknown'}"
+        metrics[f"{key}/weight"] = float(agent_loss_weights.get(name, 1.0))
+        metrics[f"{key}/effective_weight"] = (
+            float(effective_weights[rows].mean()) if rows.any() else 0.0
+        )
+        metrics[f"{key}/num_samples"] = float(rows.sum())
+        metrics[f"{key}/token_share_unweighted"] = (
+            float(trained_tokens[rows].sum()) / total_raw if total_raw > 0 else 0.0
+        )
+        metrics[f"{key}/token_share_weighted"] = (
+            float(weighted_tokens[rows].sum()) / total_weighted
+            if total_weighted > 0
+            else 0.0
+        )
+    return metrics
+
+
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""
     if "mask_sample" not in repeated_batch:
@@ -3976,6 +4141,15 @@ def _grpo_train_impl(
                         train_data["advantages"], master_config.grpo
                     )
 
+                agent_loss_weight_metrics = _apply_agent_loss_weights(
+                    train_data,
+                    repeated_batch.get("agent_ref"),
+                    master_config.grpo.agent_loss_weights,
+                    train_global_batch_size=master_config.policy[
+                        "train_global_batch_size"
+                    ],
+                )
+
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -4157,6 +4331,7 @@ def _grpo_train_impl(
 
                 _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
+                metrics.update(agent_loss_weight_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
@@ -5810,6 +5985,15 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
+                agent_loss_weight_metrics = _apply_agent_loss_weights(
+                    train_data,
+                    repeated_batch.get("agent_ref"),
+                    master_config.grpo.agent_loss_weights,
+                    train_global_batch_size=master_config.policy[
+                        "train_global_batch_size"
+                    ],
+                )
+
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
@@ -6074,6 +6258,7 @@ def async_grpo_train(
                 finalize_draft_ratio_metrics(metrics)
                 _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
+                metrics.update(agent_loss_weight_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]

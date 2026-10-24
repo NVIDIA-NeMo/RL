@@ -14,6 +14,7 @@
 
 import math
 import os
+import warnings
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -41,6 +42,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     RewardScalingConfig,
+    _apply_agent_loss_weights,
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
@@ -57,6 +59,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _validate_agent_loss_weights,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -396,6 +399,488 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+class TestAgentLossWeights:
+    @staticmethod
+    def _train_data(trained_tokens, sample_mask):
+        # process_global_batch sums token_mask[:, 1:] (position 0 has no
+        # prediction), so lead with a 0 column to make the counts below exact.
+        width = max(trained_tokens)
+        token_mask = torch.tensor(
+            [[0.0] + [1.0] * n + [0.0] * (width - n) for n in trained_tokens]
+        )
+        return BatchedDataDict(
+            {"token_mask": token_mask, "sample_mask": torch.tensor(sample_mask)}
+        )
+
+    @staticmethod
+    def _global_valid_toks(train_data) -> float:
+        """global_valid_toks as process_global_batch computes it on one rank."""
+        token_mask = train_data["token_mask"][:, 1:]
+        return float((token_mask * train_data["sample_mask"].unsqueeze(-1)).sum())
+
+    def test_weights_set_relative_shares_and_preserve_token_mass(self):
+        # One long multi-turn trace next to two short tool-use rollouts: unweighted,
+        # the short agent is 2 * 25 / 1050 of the trained tokens; x8 lifts it to
+        # 400 / 1400. The normalizer c = 1050 / 1400 = 0.75 keeps the mass at 1050.
+        train_data = self._train_data([1000, 25, 25], [1.0, 1.0, 1.0])
+        valid_toks_before = self._global_valid_toks(train_data)
+        agent_refs = [
+            {"name": "long_agent"},
+            {"name": "short_agent"},
+            {"name": "short_agent"},
+        ]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"short_agent": 8.0}, train_global_batch_size=3
+        )
+
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([0.75, 6.0, 6.0])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(valid_toks_before)
+        assert metrics["agent_loss_weights/short_agent/weight"] == 8.0
+        assert metrics["agent_loss_weights/long_agent/weight"] == 1.0
+        assert metrics[
+            "agent_loss_weights/short_agent/effective_weight"
+        ] == pytest.approx(6.0)
+        assert metrics[
+            "agent_loss_weights/long_agent/effective_weight"
+        ] == pytest.approx(0.75)
+        assert metrics["agent_loss_weights/short_agent/num_samples"] == 2.0
+        assert metrics[
+            "agent_loss_weights/short_agent/token_share_unweighted"
+        ] == pytest.approx(50 / 1050)
+        assert metrics[
+            "agent_loss_weights/short_agent/token_share_weighted"
+        ] == pytest.approx(400 / 1400)
+        assert metrics[
+            "agent_loss_weights/long_agent/token_share_weighted"
+        ] == pytest.approx(1000 / 1400)
+
+    @pytest.mark.parametrize("weight", [0.5, 2.0, 4.0])
+    def test_uniform_weights_are_an_exact_noop(self, weight):
+        train_data = self._train_data([1000, 25, 25], [1.0, 0.0, 0.5])
+        before = train_data["sample_mask"].clone()
+        agent_refs = [{"name": "a"}, {"name": "b"}, {"name": "b"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data,
+            agent_refs,
+            {"a": weight, "b": weight},
+            train_global_batch_size=3,
+        )
+
+        torch.testing.assert_close(train_data["sample_mask"], before)
+        assert metrics["agent_loss_weights/a/weight"] == weight
+        assert metrics["agent_loss_weights/a/effective_weight"] == pytest.approx(1.0)
+        assert metrics["agent_loss_weights/b/effective_weight"] == pytest.approx(1.0)
+
+    def test_masked_rows_stay_masked_and_do_not_count_tokens(self):
+        # The masked row is longest: counting its tokens would change the normalizer.
+        train_data = self._train_data([10, 40, 10], [1.0, 0.0, 0.5])
+        agent_refs = [{"name": "a"}, {"name": "a"}, {"name": "b"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"a": 3.0}, train_global_batch_size=3
+        )
+
+        # Raw token mass 10 + 0 + 5 = 15, weighted 30 + 0 + 5 = 35, so c = 3 / 7.
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([9 / 7, 0.0, 1.5 / 7])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(15.0)
+        assert metrics["agent_loss_weights/a/token_share_unweighted"] == (
+            pytest.approx(10 / 15)
+        )
+        assert metrics["agent_loss_weights/a/token_share_weighted"] == (
+            pytest.approx(30 / 35)
+        )
+
+    def test_normalizes_within_each_optimizer_step_global_batch(self):
+        # Two optimizer steps (train_global_batch_size=2) with different agent
+        # mixes: each step keeps its own token mass, matching the per-global-batch
+        # global_valid_toks the workers compute.
+        train_data = self._train_data([100, 10, 10, 10], [1.0, 1.0, 1.0, 1.0])
+        agent_refs = [
+            {"name": "long"},
+            {"name": "short"},
+            {"name": "short"},
+            {"name": "short"},
+        ]
+
+        _apply_agent_loss_weights(
+            train_data, agent_refs, {"short": 4.0}, train_global_batch_size=2
+        )
+
+        mask = train_data["sample_mask"]
+        # Step 0: raw 110, weighted 100 + 40 = 140, c = 110 / 140.
+        torch.testing.assert_close(mask[:2], torch.tensor([110 / 140, 440 / 140]))
+        # Step 1 holds one agent only, so it is uniformly weighted: exact no-op.
+        torch.testing.assert_close(mask[2:], torch.tensor([1.0, 1.0]))
+        trained = train_data["token_mask"][:, 1:].sum(dim=-1)
+        assert float((trained[:2] * mask[:2]).sum()) == pytest.approx(110.0)
+        assert float((trained[2:] * mask[2:]).sum()) == pytest.approx(20.0)
+
+    def test_mass_is_preserved_per_global_batch_after_dp_sharding(self):
+        """The rescale scope is the population process_global_batch all-reduces over.
+
+        Policy.train shards train_data with shard_by_batch_size(dp, batch_size=gbs);
+        each rank then slices its local global batch gb_idx with get_batch(gb_idx,
+        gbs // dp) and all-reduces sum(token_mask[:, 1:] * sample_mask) across DP.
+        Rank-local masses change, so the rescale is not rank-local, but the
+        all-reduced total per optimizer step must equal the unweighted one, also
+        when one rank holds only one agent.
+        """
+        dp_size, gbs = 2, 4
+        # Two optimizer steps. shard_by_batch_size hands consecutive sub-chunks
+        # of each global batch to consecutive shards, so in step 0 rank 0 holds
+        # only "long" rows and rank 1 only "short" rows.
+        names = ["long", "long", "short", "short", "long", "short", "short", "short"]
+        train_data = self._train_data([100, 100, 10, 10, 100, 10, 10, 10], [1.0] * 8)
+
+        def per_step_global_valid_toks(data):
+            shards = data.shard_by_batch_size(dp_size, batch_size=gbs)
+            totals, rank_local = [], []
+            for gb_idx in range(data.size // gbs):
+                local = []
+                for shard in shards:  # one DP rank each
+                    batch = shard.get_batch(gb_idx, batch_size=gbs // dp_size)
+                    local.append(
+                        float(
+                            (
+                                batch["token_mask"][:, 1:]
+                                * batch["sample_mask"].unsqueeze(-1)
+                            ).sum()
+                        )
+                    )
+                rank_local.append(local)
+                totals.append(sum(local))  # the DP all-reduce
+            return totals, rank_local
+
+        before_totals, before_local = per_step_global_valid_toks(train_data)
+        assert before_totals == [220.0, 130.0]
+        assert before_local[0] == [200.0, 20.0]
+
+        _apply_agent_loss_weights(
+            train_data,
+            [{"name": n} for n in names],
+            {"short": 4.0},
+            train_global_batch_size=gbs,
+        )
+
+        after_totals, after_local = per_step_global_valid_toks(train_data)
+        assert after_totals == pytest.approx(before_totals)
+        # Step 0: c = 220 / (200 + 4 * 20) = 220 / 280; both ranks' masses moved.
+        assert after_local[0] == pytest.approx([200 * 220 / 280, 80 * 220 / 280])
+
+    @pytest.mark.parametrize(
+        "trained_tokens,sample_mask,names,global_batch_size,empty_step",
+        [
+            ([10, 10], [1.0, 1.0], ["a", "a"], 2, 0),
+            ([10, 10, 10, 10], [1.0] * 4, ["b", "b", "a", "a"], 2, 1),
+            ([10, 10], [1.0, 0.0], ["a", "b"], 2, 0),
+            ([10, 0], [1.0, 1.0], ["a", "b"], 2, 0),
+        ],
+        ids=[
+            "all-zero",
+            "later-step",
+            "masked-positive-agent",
+            "tokenless-positive-agent",
+        ],
+    )
+    def test_weights_cannot_remove_all_trained_tokens_from_an_optimizer_step(
+        self, trained_tokens, sample_mask, names, global_batch_size, empty_step
+    ):
+        train_data = self._train_data(trained_tokens, sample_mask)
+        original_mask = train_data["sample_mask"].clone()
+
+        with pytest.raises(
+            ValueError,
+            match=f"removes all trained tokens from optimizer step {empty_step}",
+        ):
+            _apply_agent_loss_weights(
+                train_data,
+                [{"name": name} for name in names],
+                {"a": 0.0},
+                train_global_batch_size=global_batch_size,
+            )
+
+        torch.testing.assert_close(train_data["sample_mask"], original_mask)
+
+    def test_already_masked_step_stays_masked(self):
+        train_data = self._train_data([10, 10], [0.0, 0.0])
+        agent_refs = [{"name": "a"}, {"name": "a"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"a": 0.0}, train_global_batch_size=2
+        )
+
+        assert torch.equal(train_data["sample_mask"], torch.tensor([0.0, 0.0]))
+        assert metrics["agent_loss_weights/a/effective_weight"] == 0.0
+        assert metrics["agent_loss_weights/a/token_share_weighted"] == 0.0
+
+    def test_zero_weight_agent_is_excluded_and_mass_moves_to_the_others(self):
+        # Weight 0 is legal (the validator accepts >= 0): the agent's rows drop
+        # out and the remaining agents absorb the step's token mass.
+        assert GRPOConfig(agent_loss_weights={"a": 0.0}).agent_loss_weights == {
+            "a": 0.0
+        }
+        train_data = self._train_data([1000, 25, 25], [1.0, 1.0, 1.0])
+        agent_refs = [{"name": "long"}, {"name": "short"}, {"name": "short"}]
+
+        metrics = _apply_agent_loss_weights(
+            train_data, agent_refs, {"short": 0.0}, train_global_batch_size=3
+        )
+
+        # Raw mass 1050 is now carried by the 1000 long tokens alone: c = 1.05.
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([1.05, 0.0, 0.0])
+        )
+        assert self._global_valid_toks(train_data) == pytest.approx(1050.0)
+        assert metrics["agent_loss_weights/short/effective_weight"] == 0.0
+        assert metrics["agent_loss_weights/short/token_share_weighted"] == 0.0
+        assert metrics["agent_loss_weights/long/token_share_weighted"] == (
+            pytest.approx(1.0)
+        )
+
+    def test_configured_agent_absent_from_batch_warns_and_logs_zero_samples(self):
+        # A misspelled name matches no row, so every row keeps weight 1.0 and the
+        # run would train exactly like an unset option; make that visible.
+        train_data = self._train_data([10, 10], [1.0, 1.0])
+        before = train_data["sample_mask"].clone()
+        agent_refs = [{"name": "short_tool_use_agent"}] * 2
+
+        with pytest.warns(UserWarning, match=r"\['short_tool_use_agnet'\]"):
+            metrics = _apply_agent_loss_weights(
+                train_data,
+                agent_refs,
+                {"short_tool_use_agnet": 8.0},
+                train_global_batch_size=2,
+            )
+
+        torch.testing.assert_close(train_data["sample_mask"], before)
+        absent = "agent_loss_weights/short_tool_use_agnet"
+        assert metrics[f"{absent}/weight"] == 8.0
+        assert metrics[f"{absent}/effective_weight"] == 0.0
+        assert metrics[f"{absent}/num_samples"] == 0.0
+        assert metrics[f"{absent}/token_share_unweighted"] == 0.0
+        assert metrics[f"{absent}/token_share_weighted"] == 0.0
+        present = "agent_loss_weights/short_tool_use_agent"
+        assert metrics[f"{present}/weight"] == 1.0
+        assert metrics[f"{present}/num_samples"] == 2.0
+
+        # The correctly spelled name is present, so no warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _apply_agent_loss_weights(
+                self._train_data([10, 10], [1.0, 1.0]),
+                agent_refs,
+                {"short_tool_use_agent": 8.0},
+                train_global_batch_size=2,
+            )
+
+    def test_unset_weights_are_a_noop(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        assert (
+            _apply_agent_loss_weights(train_data, None, None, train_global_batch_size=2)
+            == {}
+        )
+        assert (
+            _apply_agent_loss_weights(train_data, None, {}, train_global_batch_size=2)
+            == {}
+        )
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 1.0]))
+
+    def test_missing_or_misaligned_agent_refs_raise(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        with pytest.raises(ValueError, match="agent_ref"):
+            _apply_agent_loss_weights(
+                train_data, None, {"a": 2.0}, train_global_batch_size=2
+            )
+        with pytest.raises(ValueError, match="agent_ref"):
+            _apply_agent_loss_weights(
+                train_data, [{"name": "a"}], {"a": 2.0}, train_global_batch_size=2
+            )
+
+    def test_invalid_global_batch_size_raises(self):
+        train_data = self._train_data([4, 4], [1.0, 1.0])
+
+        with pytest.raises(ValueError, match="train_global_batch_size"):
+            _apply_agent_loss_weights(
+                train_data,
+                [{"name": "a"}, {"name": "a"}],
+                {"a": 2.0},
+                train_global_batch_size=0,
+            )
+
+    @pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf")])
+    def test_config_rejects_invalid_weights(self, weight):
+        with pytest.raises(ValueError, match="agent_loss_weights"):
+            GRPOConfig(agent_loss_weights={"a": weight})
+
+    def test_validate_requires_nemo_gym_and_legacy_trainer(self, monkeypatch):
+        config = SimpleNamespace(
+            grpo=SimpleNamespace(agent_loss_weights={"a": 2.0}), data_plane=None
+        )
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.grpo.should_use_nemo_gym", lambda cfg: False
+        )
+        with pytest.raises(ValueError, match="NeMo-Gym"):
+            _validate_agent_loss_weights(config)
+
+        monkeypatch.setattr(
+            "nemo_rl.algorithms.grpo.should_use_nemo_gym", lambda cfg: True
+        )
+        _validate_agent_loss_weights(config)
+        config.data_plane = {"enabled": True}
+        with pytest.raises(NotImplementedError, match="data_plane"):
+            _validate_agent_loss_weights(config)
+
+        config.grpo.agent_loss_weights = None
+        _validate_agent_loss_weights(config)
+
+
+class _PinnedMoEAuxLossAutoScaler(torch.autograd.Function):
+    """Megatron-LM ``MoEAuxLossAutoScaler`` (moe_utils.py @ b4d72b79, the Bridge pin).
+
+    Copied so the auxiliary-gradient regression below runs without Megatron: the
+    backward returns ``grad_output`` unchanged and ``ones_like(aux_loss) * scale``
+    for the auxiliary loss, where ``scale`` is whatever ``set_loss_scale`` set.
+    """
+
+    main_loss_backward_scale: torch.Tensor | None = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (aux_loss,) = ctx.saved_tensors
+        scale = _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale
+        if scale is None:
+            scale = torch.tensor(1.0, device=aux_loss.device)
+        return grad_output, torch.ones_like(aux_loss) * scale
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor) -> None:
+        if _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            _PinnedMoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+
+
+def _toy_token_features(train_data) -> torch.Tensor:
+    """Deterministic per-token features for the toy policy; fixed across calls."""
+    generator = torch.Generator().manual_seed(0)
+    num_rows, width = train_data["token_mask"][:, 1:].shape
+    return torch.randn(num_rows, width, 2, generator=generator)
+
+
+def _toy_moe_train_step(train_data, *, num_microbatches: int):
+    """One optimizer step of a toy per-token-normalized model with a MoE aux loss.
+
+    Mirrors the Megatron worker path that agent weights feed into:
+    ``global_valid_toks`` is ``sum(token_mask[:, 1:] * sample_mask)`` over the
+    global batch (``process_global_batch``); each microbatch's policy loss is its
+    ``token_mask * sample_mask``-weighted sum divided by that global count; the
+    router pre-multiplies its aux loss by the microbatch's token count, which
+    does not depend on ``sample_mask`` (router.py
+    ``attach_and_log_load_balancing_loss``); and the autoscaler applies
+    ``1 / global_valid_toks`` to the aux gradient
+    (``MegatronPolicyWorker._compute_moe_grad_scale``). Returns the policy and
+    router parameter gradients.
+    """
+    token_mask = train_data["token_mask"][:, 1:]
+    sample_mask = train_data["sample_mask"]
+    features = _toy_token_features(train_data)
+    global_valid_toks = (token_mask * sample_mask.unsqueeze(-1)).sum().clamp(min=1)
+    theta = torch.tensor([0.3, -0.7], requires_grad=True)
+    router = torch.tensor(0.5, requires_grad=True)
+    _PinnedMoEAuxLossAutoScaler.set_loss_scale(1.0 / global_valid_toks)
+    for rows in torch.arange(token_mask.shape[0]).chunk(num_microbatches):
+        per_token = features[rows] @ theta
+        policy_loss = (
+            per_token * token_mask[rows] * sample_mask[rows].unsqueeze(-1)
+        ).sum() / global_valid_toks
+        num_local_tokens = token_mask[rows].numel()
+        aux_loss = router.square() * num_local_tokens
+        _PinnedMoEAuxLossAutoScaler.apply(policy_loss, aux_loss).backward()
+    assert theta.grad is not None and router.grad is not None
+    return theta.grad.clone(), router.grad.clone()
+
+
+def _expected_policy_grad(train_data, weights: list[float]) -> torch.Tensor:
+    """Closed form of the toy policy gradient under relative weights ``weights``."""
+    token_mask = train_data["token_mask"][:, 1:]
+    mask = token_mask * train_data["sample_mask"].unsqueeze(-1)
+    weighted_mask = mask * torch.tensor(weights).unsqueeze(-1)
+    features = _toy_token_features(train_data)
+    return (features * weighted_mask.unsqueeze(-1)).sum((0, 1)) / weighted_mask.sum()
+
+
+class TestAgentLossWeightsAuxiliaryGradients:
+    """CPU autograd regression for the MoE auxiliary-gradient normalization.
+
+    Without the per-step rescaling, uniform agent weights 1 / 2 / 4 doubled and
+    quadrupled ``global_valid_toks`` while the router numerator stayed put, so the
+    auxiliary gradient came out as 2 / 1 / 0.5 of itself.
+    """
+
+    AGENT_REFS = [
+        {"name": "long"},
+        {"name": "short"},
+        {"name": "short"},
+        {"name": "other"},
+    ]
+
+    @staticmethod
+    def _batch():
+        return TestAgentLossWeights._train_data([12, 3, 3, 5], [1.0, 1.0, 0.5, 1.0])
+
+    @pytest.mark.parametrize("num_microbatches", [1, 2, 4])
+    def test_uniform_weights_leave_policy_and_aux_gradients_unchanged(
+        self, num_microbatches
+    ):
+        reference_policy, reference_router = _toy_moe_train_step(
+            self._batch(), num_microbatches=num_microbatches
+        )
+
+        for weight in (1.0, 2.0, 4.0):
+            train_data = self._batch()
+            _apply_agent_loss_weights(
+                train_data,
+                self.AGENT_REFS,
+                {"long": weight, "short": weight, "other": weight},
+                train_global_batch_size=4,
+            )
+            policy_grad, router_grad = _toy_moe_train_step(
+                train_data, num_microbatches=num_microbatches
+            )
+            torch.testing.assert_close(policy_grad, reference_policy)
+            torch.testing.assert_close(router_grad, reference_router)
+
+    def test_nonuniform_weights_reweight_policy_but_not_aux_gradient(self):
+        reference_policy, reference_router = _toy_moe_train_step(
+            self._batch(), num_microbatches=2
+        )
+        train_data = self._batch()
+
+        _apply_agent_loss_weights(
+            train_data, self.AGENT_REFS, {"short": 8.0}, train_global_batch_size=4
+        )
+        policy_grad, router_grad = _toy_moe_train_step(train_data, num_microbatches=2)
+
+        torch.testing.assert_close(router_grad, reference_router)
+        torch.testing.assert_close(
+            policy_grad, _expected_policy_grad(self._batch(), [1.0, 8.0, 8.0, 1.0])
+        )
+        assert not torch.allclose(policy_grad, reference_policy)
 
 
 def test_initial_policy_generation_stale() -> None:
@@ -2282,7 +2767,7 @@ def test_startup_pipeline_ready(
 
 
 @contextmanager
-def _patched_logprob_phase(policy):
+def _patched_logprob_phase(policy, num_rows: int = 1):
     """Provide real tensors for the logprob phase of ``grpo_train``.
 
     Both PRs #2174 / #2178 (``skip_reference_policy_logprobs_calculation=True``)
@@ -2291,23 +2776,24 @@ def _patched_logprob_phase(policy):
     ``TypeError: zeros_like(): argument 'input' must be Tensor, not MagicMock``
     when the surrounding inputs come straight from the bare ``mock_grpo_components``
     fixture. This helper swaps in real tensors for the duration of the test and
-    restores the original mock return values afterwards.
+    restores the original mock return values afterwards. ``num_rows`` is the
+    row count of the rollout batch the fake flat batch must stay aligned with.
     """
     fake_flat = BatchedDataDict(
         {
-            "token_ids": torch.tensor([[1, 2]]),
-            "advantages": torch.tensor([[0.5, 0.5]]),
-            "generation_logprobs": torch.tensor([[0.0, 0.0]]),
-            "token_loss_mask": torch.tensor([[1, 1]]),
-            "content": ["ok"],
+            "token_ids": torch.tensor([[1, 2]] * num_rows),
+            "advantages": torch.tensor([[0.5, 0.5]] * num_rows),
+            "generation_logprobs": torch.tensor([[0.0, 0.0]] * num_rows),
+            "token_loss_mask": torch.tensor([[1, 1]] * num_rows),
+            "content": ["ok"] * num_rows,
         }
     )
-    fake_lengths = torch.tensor([2])
+    fake_lengths = torch.tensor([2] * num_rows)
     saved_lp = policy.get_logprobs.return_value
     saved_rlp = policy.get_reference_policy_logprobs.return_value
-    policy.get_logprobs.return_value = {"logprobs": torch.zeros(1, 2)}
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(num_rows, 2)}
     policy.get_reference_policy_logprobs.return_value = {
-        "reference_logprobs": torch.zeros(1, 2)
+        "reference_logprobs": torch.zeros(num_rows, 2)
     }
     with patch(
         "nemo_rl.algorithms.grpo.batched_message_log_to_flat_message",
@@ -4710,7 +5196,11 @@ def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_
 
 
 def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
-    """Run one GRPO training step with rollout/logprob infrastructure mocked."""
+    """Run one GRPO training step with rollout/logprob infrastructure mocked.
+
+    The fake flat batch of the logprob phase is sized to the rollout batch so a
+    multi-row ``train_dataloader`` batch stays row-aligned through the step.
+    """
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
     mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
     policy = mock_grpo_components["policy"]
@@ -4725,7 +5215,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
         master_config.policy["generation"]["colocated"]["enabled"] = False
         with (
             mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
-            _patched_logprob_phase(policy),
+            _patched_logprob_phase(policy, num_rows=mock_batch.size),
         ):
             train_func(
                 policy,
@@ -4743,7 +5233,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
             )
     else:
         with (
-            _patched_logprob_phase(policy),
+            _patched_logprob_phase(policy, num_rows=mock_batch.size),
             patch(
                 "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
                 return_value=(mock_batch, mock_rollout_metrics),
@@ -4797,6 +5287,106 @@ def test_grpo_train_clips_advantages_when_configured(
     clipped = policy.train.call_args[0][0]["advantages"]
     assert clipped.min().item() == -2.0
     assert clipped.max().item() == 3.0
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_applies_agent_loss_weights(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Both loops hand policy.train the normalized two-agent mask after advantages.
+
+    One row of one agent cannot tell the weighted path from an untouched mask
+    (the per-step rescale makes both [1.0]); two equal rows of two agents with
+    weights {1, 4} must come out as [0.4, 1.6] (c = 2 / 5), which the unweighted
+    loop cannot produce.
+    """
+    batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    }
+                ]
+                for _ in range(2)
+            ],
+            "task_name": ["math", "math"],
+            "extra_env_info": [{}, {}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": torch.tensor([0, 1]),
+            "length": torch.tensor([3, 3]),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "agent_ref": [{"name": "long_agent"}, {"name": "short_agent"}],
+        }
+    )
+    mock_grpo_components["train_dataloader"].__iter__ = lambda self: iter([batch] * 10)
+    for env in (
+        mock_grpo_components["task_to_env"]["math"],
+        mock_grpo_components["val_task_to_env"]["math"],
+    ):
+        env.global_post_process_and_metrics.return_value = (batch, {})
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.agent_loss_weights = {"short_agent": 4.0}
+    master_config.policy["train_global_batch_size"] = 2
+    master_config.grpo.num_prompts_per_step = 1
+    # The sync loop repeats the dataloader batch num_generations_per_prompt
+    # times before the mocked rollout returns it unchanged; the async loop's
+    # fixed-batch check needs size == num_prompts_per_step * num_generations.
+    master_config.grpo.num_generations_per_prompt = (
+        2 if train_func is async_grpo_train else 1
+    )
+    calls = []
+
+    def recording_apply(
+        train_data, agent_refs, agent_loss_weights, *, train_global_batch_size
+    ):
+        calls.append(
+            (list(agent_refs), dict(agent_loss_weights), train_global_batch_size)
+        )
+        assert "advantages" in train_data
+        return _apply_agent_loss_weights(
+            train_data,
+            agent_refs,
+            agent_loss_weights,
+            train_global_batch_size=train_global_batch_size,
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._apply_agent_loss_weights", recording_apply
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    assert calls == [
+        (
+            [{"name": "long_agent"}, {"name": "short_agent"}],
+            {"short_agent": 4.0},
+            2,
+        )
+    ]
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    # Two equal 1-token rows, weights {1, 4}: c = 2 / 5 and the mask is c * w.
+    torch.testing.assert_close(
+        policy.train.call_args[0][0]["sample_mask"], torch.tensor([0.4, 1.6])
+    )
+    logged = {}
+    for call in mock_grpo_components["logger"].log_metrics.call_args_list:
+        logged.update(call.args[0])
+    assert logged["agent_loss_weights/short_agent/weight"] == 4.0
+    assert logged["agent_loss_weights/long_agent/weight"] == 1.0
+    assert logged["agent_loss_weights/short_agent/effective_weight"] == pytest.approx(
+        1.6
+    )
+    assert logged["agent_loss_weights/long_agent/effective_weight"] == pytest.approx(
+        0.4
+    )
+    assert logged["agent_loss_weights/short_agent/num_samples"] == 1.0
+    assert logged[
+        "agent_loss_weights/short_agent/token_share_weighted"
+    ] == pytest.approx(0.8)
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

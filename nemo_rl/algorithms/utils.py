@@ -281,13 +281,14 @@ def compute_seq_logprob_errors(
 
     Inputs must already be aligned to predicted tokens (without the first
     input token). Padding and previously masked samples do not participate.
+    Positive sample weights affect the loss, not a sequence's error or count.
     Nonfinite errors on valid tokens fail any finite threshold.
     """
-    mask = token_mask * sample_mask.unsqueeze(-1)
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
     counts = mask.sum(dim=-1)
     valid = counts > 0
-    error = torch.where(mask.bool(), (generation_logprobs - policy_logprobs).abs(), 0.0)
-    errors = (torch.exp(error * mask) * mask).sum(dim=-1) / counts.clamp(min=1)
+    error = torch.where(mask, (generation_logprobs - policy_logprobs).abs(), 0.0)
+    errors = (torch.exp(error) * mask).sum(dim=-1) / counts.clamp(min=1)
     return errors, valid
 
 
