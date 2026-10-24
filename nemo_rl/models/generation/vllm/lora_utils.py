@@ -88,6 +88,13 @@ def validate_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
         )
 
     lora_config = policy_config["automodel_cfg"]["lora_cfg"]
+    if lora_config.get("match_all_linear") and (
+        lora_config.get("target_modules") or lora_config.get("exclude_modules")
+    ):
+        raise ValueError(
+            "Automodel LoRA match_all_linear=true cannot be combined with "
+            "target_modules or exclude_modules."
+        )
     rank = int(lora_config["dim"])
     max_lora_rank = vllm_kwargs.get("max_lora_rank")
     if max_lora_rank is not None and int(max_lora_rank) < rank:
@@ -135,6 +142,16 @@ def configure_vllm_lora_refit(policy_config: Mapping[str, Any]) -> None:
     """Materialize vLLM adapter settings after native-refit validation."""
     generation_config = policy_config["generation"]
     lora_config = policy_config["automodel_cfg"]["lora_cfg"]
+
+    # Automodel's match-all setting includes the output head, but not every
+    # vLLM model exposes lm_head as a native-LoRA module (Qwen2 is one such
+    # model).  Exclude it before the policy is constructed so trainer and
+    # rollout agree on the set of trainable adapter modules.  This is safer
+    # than accepting the tensor at refit time and silently dropping its delta.
+    if lora_config.get("match_all_linear"):
+        lora_config["match_all_linear"] = False
+        lora_config["exclude_modules"] = ["*lm_head*"]
+
     rank = int(lora_config["dim"])
     alpha = int(lora_config["alpha"])
 

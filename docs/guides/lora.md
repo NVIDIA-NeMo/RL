@@ -199,6 +199,10 @@ unsupported combinations such as asynchronous vLLM, vLLM's exposed HTTP server (
 Gym), speculative decoding, quantized rollout models, custom refit transports, DoRA,
 `moe_rank_scaling`, or Megatron LoRA. Models with dynamically updated MoE router bias
 fail before their first native refit rather than silently omitting that mutable state.
+When `match_all_linear=true`, native refit configures Automodel to adapt every linear
+module except `lm_head`, because some vLLM model implementations (including Qwen2) do
+not expose the output head as a native-LoRA runtime module. The merged opt-in keeps its
+existing `match_all_linear` behavior.
 
 Individual recipes may still set
 `policy.automodel_cfg.automodel_kwargs.force_hf=true` for model-specific training or
