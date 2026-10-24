@@ -208,6 +208,54 @@ def test_historical_eos_outside_generation_is_rejected(
 
 
 @pytest.mark.parametrize(
+    "trailing_whitespace,add_eos", [("\n", True), (" \n\t", False)]
+)
+@pytest.mark.parametrize("only_final", [False, True])
+def test_shared_bos_eos_turn_headers(
+    tokenizer: PreTrainedTokenizerFast,
+    trailing_whitespace: str,
+    add_eos: bool,
+    only_final: bool,
+) -> None:
+    tokenizer.bos_token = tokenizer.eos_token
+    tokenizer.chat_template = (
+        "{% for m in messages %}{{ bos_token + m.role + '\\n' }}"
+        "{% if m.role == 'assistant' %}{% generation %}"
+        "{{ m.content + eos_token + target_whitespace }}{% endgeneration %}"
+        "{% else %}{{ m.content + '\\n' }}{% endif %}{% endfor %}"
+    )
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, target_whitespace=trailing_whitespace
+    )
+    source = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "last"},
+    ]
+    log = format_messages(tokenizer, source, add_bos_token=True, add_eos_token=add_eos)
+    ids = torch.cat([segment["token_ids"] for segment in log])
+    assert tokenizer.decode(ids) == tokenizer.apply_chat_template(
+        source, tokenize=False
+    )
+    assistant_segments = [segment for segment in log if segment["role"] == "assistant"]
+    assert [segment["content"] for segment in assistant_segments] == [
+        answer + tokenizer.eos_token + trailing_whitespace
+        for answer in ("answer", "last")
+    ]
+    add_loss_mask_to_message_log([log], only_unmask_final=only_final)
+    for index, segment in enumerate(assistant_segments):
+        stop = segment["token_ids"] == tokenizer.eos_token_id
+        assert stop.sum() == 1
+        assert segment["token_loss_mask"][stop].item() == int(
+            not only_final or index == 1
+        )
+    for segment in log:
+        if segment["role"] == "context":
+            assert not segment["token_loss_mask"].any()
+
+
+@pytest.mark.parametrize(
     "content", ["", "caf\u00e9 \u4f60\u597d \U0001f600", "  answer\n\t "]
 )
 def test_text_and_unicode(tokenizer: PreTrainedTokenizerFast, content: str) -> None:

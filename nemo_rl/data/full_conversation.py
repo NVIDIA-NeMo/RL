@@ -104,9 +104,11 @@ def get_full_conversation_message_log(
         if not cursor <= start < end <= len(text):
             raise ValueError("Assistant generation spans must be nonempty and ordered.")
         cursor = end
-    for (_, end), (next_start, _) in zip(spans, spans[1:]):
-        if tokenizer.eos_token and text[end:next_start].lstrip().startswith(
+    for (start, end), (next_start, _) in zip(spans, spans[1:]):
+        if (
             tokenizer.eos_token
+            and not text[start:end].rstrip().endswith(tokenizer.eos_token)
+            and text[end:next_start].lstrip().startswith(tokenizer.eos_token)
         ):
             raise ValueError(
                 "An assistant EOS terminator is outside its generation block."
