@@ -610,10 +610,23 @@ dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
 Completing the trace on the server side is a change in the Gym repository, not
-this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
-Until it does, the header arrives and is ignored, and Gym's internal spans (if
-any) stay in their own traces. Everything up to and including the client-side
-HTTP span still nests correctly.
+this one. Gym's app already calls `nemo.lens.contrib.fastapi.instrument_fastapi`
+from `instrument_app_for_telemetry`, but that returns early unless the server
+process has telemetry up, and the per-server venvs Gym builds in
+`nemo_gym/cli/setup_command.py` carry neither `nemo-lens` nor an OTLP exporter.
+Until they do, the header arrives and is ignored, and Gym's internal spans stay
+in their own traces. Everything up to and including the client-side HTTP span
+still nests correctly.
+
+Gym's own span groups are a separate concern from its exporters, and one this
+repository does control. `GymSpanGroup` registers into nemo-lens's
+`SpanRegistry` as an import side effect, so `NemoGym.__init__` imports
+`nemo_gym.telemetry` before calling `init_telemetry_worker`. A namespace
+registered after the span-group spec is validated is not selectable, and lens
+warns about it rather than failing. Group names share one flat namespace across
+libraries, so Gym's groups are named directly in `NEMO_RL_OTEL_SPAN_GROUPS` with
+no prefix — and `job` and `rollout` are registered by both libraries, so naming
+either enables it on both sides.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
