@@ -346,6 +346,7 @@ from nemo_rl.models.policy import (
     MegatronConfig,
     MegatronPeftConfig,
     PolicyConfig,
+    provider_override_allowed,
 )
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -1125,6 +1126,8 @@ def setup_model_config(
     # construction so RADIO positional encoding and frozen towers are stable
     # and consistent between logprob and training passes.
     for vlm_key, vlm_value in iter_vlm_config_overrides(config["megatron_cfg"]):
+        if not provider_override_allowed(config["megatron_cfg"], vlm_key):
+            continue
         if not hasattr(model_cfg, vlm_key):
             raise ValueError(
                 f"megatron_cfg set '{vlm_key}' but {type(model_cfg).__name__} has no "
@@ -1332,6 +1335,8 @@ def _apply_multimodal_config(model_cfg: Any, config: PolicyConfig) -> None:
     for config_key, provider_attr in field_mapping.items():
         if config_key not in megatron_cfg:
             continue
+        if not provider_override_allowed(megatron_cfg, config_key):
+            continue
         if not hasattr(model_cfg, provider_attr):
             raise ValueError(
                 f"policy.megatron_cfg.{config_key} is only supported by a "
@@ -1497,7 +1502,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply Multi-Token Prediction settings onto the mcore model config."""
     megatron_cfg = config["megatron_cfg"]
-    if "mtp_num_layers" in megatron_cfg:
+
+    def _allowed(key: str) -> bool:
+        return provider_override_allowed(megatron_cfg, key)
+
+    if "mtp_num_layers" in megatron_cfg and _allowed("mtp_num_layers"):
         # In mcore, mtp_num_layers is both the number of MTP layers (when
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
@@ -1515,11 +1524,13 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
                 pattern = getattr(model_cfg, pattern_attr, None)
                 if isinstance(pattern, str) and "/" in pattern:
                     setattr(model_cfg, pattern_attr, pattern.split("/")[0])
-    if "mtp_loss_scaling_factor" in megatron_cfg:
+    if "mtp_loss_scaling_factor" in megatron_cfg and _allowed(
+        "mtp_loss_scaling_factor"
+    ):
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
-    if "mtp_use_repeated_layer" in megatron_cfg:
+    if "mtp_use_repeated_layer" in megatron_cfg and _allowed("mtp_use_repeated_layer"):
         model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
-    if "mtp_detach_heads" in megatron_cfg:
+    if "mtp_detach_heads" in megatron_cfg and _allowed("mtp_detach_heads"):
         model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 

@@ -816,7 +816,9 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_part = {"type": "input_video", "video_url": "clip.mp4"}
+    row = {"responses_create_params": {"input": [{"content": [video_part]}]}}
+    data_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -1341,7 +1343,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
