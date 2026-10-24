@@ -46,6 +46,7 @@ from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
+    TQTokenSink,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
@@ -75,6 +76,9 @@ def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
         token_capture=None,
         _rollout_weight_version=0,
         _chain_prefix=ChainPrefixCache(),
+        _staging_source=None,
+        _staging_sink=None,
+        _capture_top_logprobs=0,
     )
     worker.install_token_capture = lambda capture: setattr(
         worker, "token_capture", capture
@@ -101,7 +105,10 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
 
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={"backend": "simple"}, staging_partition="rollout_staging"
+            worker,
+            dp_cfg={"backend": "simple"},
+            staging_partition="rollout_staging",
+            top_logprobs=4,
         )
     )
 
@@ -110,6 +117,9 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     assert segment_sizes == [0]
     assert isinstance(worker.token_capture, RolloutTokenCapture)
     assert worker.token_capture.adapter is not None
+    # The sink and top-k count stay on the worker for the request path.
+    assert worker._staging_sink is sink
+    assert worker._capture_top_logprobs == 4
     # The adapter is the vLLM one (prefix ids enter via the worker's field).
     payload = worker.token_capture.adapter.enter_prefix({}, [1, 2])
     assert payload["required_prefix_token_ids"] == [1, 2]
@@ -119,7 +129,7 @@ def test_setup_token_capture_skips_non_model_owners(monkeypatch):
     worker = _fake_worker(is_model_owner=False)
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
     assert installed is None
@@ -143,7 +153,7 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
     worker = _fake_worker()
     asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
-            worker, dp_cfg={}, staging_partition="rollout_staging"
+            worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
 
@@ -179,12 +189,13 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         lambda futures: futures,
     )
-    gen.setup_token_capture({"backend": "simple"}, "rollout_staging")
+    gen.setup_token_capture({"backend": "simple"}, "rollout_staging", 4)
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "setup_token_capture",
         dp_cfg={"backend": "simple"},
         staging_partition="rollout_staging",
         capture_media=False,
+        top_logprobs=4,
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
 
@@ -192,7 +203,7 @@ def test_generation_setup_token_capture_fans_out(monkeypatch):
 def test_generation_setup_token_capture_requires_async_engine():
     gen = _generation_with_mock_group(async_engine=False)
     with pytest.raises(AssertionError, match="async vLLM engine"):
-        gen.setup_token_capture({}, "rollout_staging")
+        gen.setup_token_capture({}, "rollout_staging", 0)
 
 
 def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
@@ -224,6 +235,7 @@ def _worker_with_capture(sink: _MemorySink):
     worker = _fake_worker()
     worker._capture_calls = {}
     worker._chain_prefix = ChainPrefixCache()
+    worker._staging_sink = sink
     worker._delta_align_routed_experts = (
         VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
@@ -242,6 +254,36 @@ def _worker_with_capture(sink: _MemorySink):
         adapter=VLLMCaptureAdapter(),
     )
     return worker
+
+
+@pytest.mark.parametrize(
+    ("logprobs", "top_logprobs"),
+    [(False, 4), (True, None), (True, 0), (True, 2), (True, 8)],
+)
+def test_capture_rejects_mismatched_http_topk(logprobs, top_logprobs):
+    worker = _worker_with_capture(_MemorySink())
+    worker._capture_top_logprobs = 4
+    request = SimpleNamespace(logprobs=logprobs, top_logprobs=top_logprobs)
+    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+
+    with pytest.raises(ValueError, match="top_logprobs=4 over HTTP"):
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+            worker, request, [10, 11], admission=admission
+        )
+    assert worker._capture_calls == {}
+
+
+def test_capture_accepts_matching_http_topk():
+    worker = _worker_with_capture(_MemorySink())
+    worker._capture_top_logprobs = 4
+    request = SimpleNamespace(logprobs=True, top_logprobs=4)
+    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [10, 11], admission=admission
+    )
+    assert id(request) in worker._capture_calls
+    assert request.top_logprobs == 4
 
 
 class _MemoryPrefixSource:
@@ -509,6 +551,127 @@ def test_request_capture_is_a_noop_without_context_or_capture(
     assert out == original
     assert worker._capture_calls == {}
     assert sink.records == []
+
+
+def _text_root_request() -> _FakeRequest:
+    return _FakeRequest(
+        ng_capture={
+            "rollout_id": "r0",
+            "model_call_id": "c1",
+            "parent_call_id": None,
+            "prev_len": 0,
+            "mode": "text",
+        },
+        stream=False,
+    )
+
+
+def _content_with_topk(gen_ids, logprobs):
+    content = _served_content(gen_ids, logprobs)
+    content["choices"][0]["message"].update(
+        sampler_topk_token_ids=torch.tensor(
+            [[token_id, 1] for token_id in gen_ids], dtype=torch.int32
+        ),
+        sampler_topk_logprobs=torch.tensor([[lp, -5.0] for lp in logprobs]),
+    )
+    return content
+
+
+def test_request_capture_stages_topk_with_the_call():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    content = _content_with_topk([13, 14], [-0.1, -0.2])
+    ids = content["choices"][0]["message"]["sampler_topk_token_ids"]
+    logprobs = content["choices"][0]["message"]["sampler_topk_logprobs"]
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert len(sink.records) == 1
+    assert sink.attachments == [
+        {"sampler_topk_token_ids": ids, "sampler_topk_logprobs": logprobs}
+    ]
+    # It never crosses the worker -> gate hop.
+    assert content["choices"] == [
+        {"index": 0, "message": {"role": "assistant", "content": "x"}}
+    ]
+
+
+def test_request_capture_skips_topk_when_the_call_did_not_stage():
+    class _RejectingSink(_MemorySink):
+        def stage(self, record: StagedCallRecord, *, attachments=None) -> StageResult:
+            assert attachments["sampler_topk_token_ids"].shape == (1, 2)
+            return StageResult(ok=False, staging_key=record.staging_key, error="down")
+
+    sink = _RejectingSink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _content_with_topk([13], [-0.1])
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.records == []
+    assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
+
+
+def test_request_capture_drops_topk_from_uncaptured_responses():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    plain = _FakeRequest(stream=False)  # no ng_capture attribute
+
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, plain, _content_with_topk([3], [-0.1])
+    )
+
+    assert "sampler_topk_token_ids" not in out["choices"][0]["message"]
+    assert "sampler_topk_logprobs" not in out["choices"][0]["message"]
+    assert sink.records == []
+
+
+def test_request_capture_missing_required_topk_fails_before_staging():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    worker._capture_top_logprobs = 2
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([13], [-0.1])
+    )
+    assert out["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.records == []
+    assert worker._capture_calls == {}
+
+
+def test_request_capture_topk_partial_write_returns_capture_failed():
+    sink = object.__new__(TQTokenSink)
+    sink._capture_media = False
+    sink._store = MagicMock()
+
+    def failed_put(key, fields, **kwargs):
+        assert "token_ids_delta" in fields
+        assert "sampler_topk_token_ids" in fields
+        raise RuntimeError("top-k storage unavailable")
+
+    sink._store.put.side_effect = failed_put
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _content_with_topk([13], [-0.1])
+    )
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    sink._store.put.assert_called_once()
+    sink._store.clear.assert_called_once_with(["r0/c1"])
+    assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
+    assert "sampler_topk_logprobs" not in content["choices"][0]["message"]
+    assert worker._capture_calls == {}
 
 
 def test_request_capture_abort_fails_the_call_and_drains_state():

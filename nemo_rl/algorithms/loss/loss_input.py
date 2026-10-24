@@ -41,6 +41,7 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -48,6 +49,21 @@ if TYPE_CHECKING:
     from nemo_automodel.components.distributed.context_parallel import (
         ContextParallelSharder,
     )
+
+
+def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
+    """Reject missing sampler inputs before computing trainer logprobs."""
+    missing = [
+        key
+        for key in ("sampler_topk_token_ids", "sampler_topk_logprobs")
+        if key not in data
+    ]
+    if missing:
+        raise ValueError(
+            f"Score centering requires {', '.join(missing)}: use SingleController "
+            "with NeMo Gym + vLLM, token_capture.enabled=true and "
+            "token_capture.top_logprobs > 0."
+        )
 
 
 def _prepare_opd_full_loss_input(
@@ -240,6 +256,8 @@ def prepare_loss_input(
     Returns:
         tuple(loss_input, maybe_updated_data)
     """
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     if loss_fn.input_type == LossInputType.LOGIT:
         loss_input = {"logits": logits}
 
@@ -288,6 +306,19 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
         if need_top_k_or_top_p_filtering(sampling_params):
             loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+        if getattr(loss_fn, "score_centering", False):
+            # Log-probs at the sampler's captured top-k ids, for score centering.
+            loss_input["policy_logprobs_at_sampler_topk"] = (
+                get_policy_logprobs_at_sampler_topk(
+                    sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                    next_token_logits=logits,
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    chunk_size=chunk_size,
+                    cp_sharder=cp_sharder,
+                )
+            )
 
     elif loss_fn.input_type == LossInputType.OPD_FULL:
         loss_input = _prepare_opd_full_loss_input(
@@ -485,9 +516,13 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data
+    if getattr(loss_fn, "score_centering", False) and input_is_prepacked:
+        raise ValueError("Score centering does not support externally prepacked inputs")
     cp_size = (
         1
         if context_parallel_group is None
@@ -566,4 +601,17 @@ def prepare_packed_loss_input(
     loss_input = {"next_token_logprobs": logprobs}
     if need_top_k_or_top_p_filtering(sampling_params):
         loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+    if getattr(loss_fn, "score_centering", False):
+        loss_input["policy_logprobs_at_sampler_topk"] = (
+            get_policy_logprobs_at_sampler_topk(
+                sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+            )
+        )
     return loss_input, data

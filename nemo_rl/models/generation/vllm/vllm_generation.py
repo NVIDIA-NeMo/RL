@@ -703,6 +703,7 @@ class VllmGeneration(GenerationInterface):
         self,
         dp_cfg: "DataPlaneConfig",
         staging_partition: str,
+        top_logprobs: int = 0,
         *,
         capture_media: bool = False,
     ) -> "Optional[MediaColumnSpec]":
@@ -712,6 +713,7 @@ class VllmGeneration(GenerationInterface):
         builds its in-worker data-plane client + TQTokenSink and makes the
         single Gym ``install_capture`` call. Returns the media column spec the
         leaders pinned (``None`` for text-only capture).
+        ``top_logprobs`` > 0 also stages sampler top-k log-probs.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
@@ -722,6 +724,7 @@ class VllmGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            top_logprobs=top_logprobs,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return agreed_media_columns(ray.get(futures))

@@ -681,6 +681,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
 
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._capture_calls = {}
+    worker._capture_top_logprobs = 0
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(
             dp,
