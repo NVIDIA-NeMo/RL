@@ -29,6 +29,9 @@ def _native_policy_config() -> dict:
             "automodel_kwargs": {"force_hf": False},
             "lora_cfg": {
                 "enabled": True,
+                "target_modules": [],
+                "exclude_modules": [],
+                "match_all_linear": True,
                 "dim": 16,
                 "alpha": 64,
             },
@@ -66,6 +69,32 @@ def test_native_lora_refit_materializes_vllm_adapter_config() -> None:
         "rank": 16,
         "alpha": 64,
     }
+
+    # match_all_linear also selects lm_head in Automodel, but Qwen2 and some
+    # other vLLM models do not expose the output head as a LoRA runtime module.
+    lora_config = policy_config["automodel_cfg"]["lora_cfg"]
+    assert lora_config["match_all_linear"] is False
+    assert lora_config["exclude_modules"] == ["*lm_head*"]
+
+
+def test_native_lora_refit_preserves_explicit_target_modules() -> None:
+    policy_config = _native_policy_config()
+    lora_config = policy_config["automodel_cfg"]["lora_cfg"]
+    lora_config["match_all_linear"] = False
+    lora_config["target_modules"] = ["*_proj"]
+
+    configure_lora_refit(policy_config)
+
+    assert lora_config["target_modules"] == ["*_proj"]
+    assert lora_config["exclude_modules"] == []
+
+
+def test_native_lora_refit_rejects_conflicting_match_all_config() -> None:
+    policy_config = _native_policy_config()
+    policy_config["automodel_cfg"]["lora_cfg"]["exclude_modules"] = ["*lm_head*"]
+
+    with pytest.raises(ValueError, match="match_all_linear=true"):
+        configure_lora_refit(policy_config)
 
 
 def test_native_lora_refit_does_not_require_force_hf() -> None:
@@ -105,13 +134,11 @@ def test_native_lora_refit_sizes_cpu_cache_for_configured_adapter_capacity() -> 
 def test_merged_lora_refit_is_an_explicit_unchanged_opt_in() -> None:
     policy_config = _native_policy_config()
     policy_config["generation"]["lora_refit_mode"] = "merged"
-    original_vllm_kwargs = deepcopy(policy_config["generation"]["vllm_kwargs"])
+    original_policy_config = deepcopy(policy_config)
 
     configure_lora_refit(policy_config)
 
-    generation_config = policy_config["generation"]
-    assert generation_config["vllm_cfg"]["load_format"] == "dummy"
-    assert generation_config["vllm_kwargs"] == original_vllm_kwargs
+    assert policy_config == original_policy_config
 
 
 def test_lora_refit_rejects_missing_mode() -> None:
