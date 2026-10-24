@@ -24,6 +24,49 @@ In this guide, we'll walk through how we handle:
 * Overall resource flow
 * Loss
 
+### Reusing a rollout batch for multiple policy updates
+
+Set `grpo.num_updates_per_rollout` to train repeatedly on the same prompts and
+generated responses before collecting the next training batch:
+
+```bash
+uv run examples/run_grpo.py --config examples/configs/grpo_math_1B.yaml \
+  grpo.num_updates_per_rollout=2
+```
+
+The default is `1`; values must be at least `1`. Each repetition calls the policy
+training method on the same prepared batch, keeping its rewards, advantages,
+generation logprobs, previous-policy logprobs, and reference-policy logprobs fixed.
+The current-policy logprobs are evaluated again during each training forward.
+A training call can contain multiple optimizer steps if the rollout batch is larger
+than `policy.train_global_batch_size`.
+
+This option is supported by the synchronous, asynchronous, and synchronous
+data-plane GRPO loops. Async collection continues in the background while the
+trainer reuses its current batch; weights are synchronized after all repetitions.
+The SingleController path rejects values other than `1`. Repeated updates also
+require `loss_fn.force_on_policy_ratio=false`, since the policy changes between
+updates on the same rollout.
+
+`grpo.max_num_steps`, `nemo_rl/step`, validation/checkpoint intervals, and async
+trajectory age remain measured in rollout steps. Increasing the repetition count
+therefore increases the number of training calls at a fixed rollout-step limit.
+The Megatron scheduler's total iteration budget is scaled by the repetition count;
+optimizer and scheduler advancement still happen within each policy training call.
+
+Compare `timing/train/time_per_policy_update` to measure the amortized cost of a
+training call, including its share of rollout-step overhead:
+
+```text
+time_per_policy_update = total_step_time / num_updates_per_rollout
+```
+
+`timing/train/total_step_time` retains its existing meaning and is not divided.
+For the default math recipe, each training call contains one optimizer step.
+Training FLOPs and worker-reported elapsed times are summed across repetitions;
+other training metrics, including loss, report the final repetition. Reward is
+measured on the generated rollout before training, once per rollout step.
+
 ### Data
 
 We support training with multiple RL "Environments" at the same time.
