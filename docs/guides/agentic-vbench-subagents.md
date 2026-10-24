@@ -220,7 +220,10 @@ unchanged. `opencode_subagent_prompt` is wired through the Gym config and
 
 ## Shared decomposition prompt experiment
 
-The opt-in `decomp` recipes share the instruction in
+Use the `decomp` recipes for matched GRPO/PPO decomposition experiments. Their
+shared instruction is part of the experiment configuration and must be retained
+when comparing algorithms or evaluating their checkpoints. Enabling the `task`
+tool alone does not select this instruction. The canonical prompt is in
 [`subagent_delegation_decomposition.yaml`](../../examples/configs/subagent_delegation_decomposition.yaml):
 
 | Algorithm and layout | Recipe |
@@ -229,7 +232,8 @@ The opt-in `decomp` recipes share the instruction in
 | GRPO, asynchronous, 16 nodes | [Super async16 decomposition](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp.v1.yaml) |
 | PPO, asynchronous, 16 nodes | [Super PPO async16 decomposition](../../examples/configs/recipes/vlm/vlm_ppo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp.v1.yaml) |
 
-The parent receives the same instruction for both ClawEval and Agentic VBench.
+Gym forwards `opencode_delegation_prompt` into OpenCode's main-agent system
+prompt. The parent receives the same instruction for both ClawEval and Agentic VBench.
 It may start distinct children with separate `task` calls that omit `task_id`,
 or continue an existing child with its actual returned `task_id` and a focused
 follow-up. Both modes use OpenCode's existing tools and session capture. The
@@ -251,6 +255,10 @@ resuming it. `CLUSTER_NAME` controls the W&B name suffix, with
 `SLURM_CLUSTER_NAME` as its fallback. `WANDB_NAME` can set the complete run name.
 The existing `AGENTIC_VBENCH_DELEGATION_PROMPT` and
 `CLAW_EVAL_DELEGATION_PROMPT` variables still override their respective agents.
+For a matched comparison, leave both unset to use the shared default, or set
+both to the same instruction. Use that same instruction when evaluating the
+base GA model and trained checkpoints; changing the evaluation prompt alongside
+the checkpoint would confound the comparison.
 
 ## Not ported
 

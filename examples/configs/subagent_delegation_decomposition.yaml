@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Shared prompt-only overlay for the opt-in decomposition experiment.
+# Shared main-agent system instruction for matched decomposition experiments.
+# Retain this overlay in both GRPO/PPO recipes and checkpoint evaluation.
 subagent_delegation_prompt: |-
   Identify useful task decomposition. Delegate distinct, bounded subtasks when beneficial; use multiple children for independent work and avoid duplicating the full task. Integrate and verify their results.
 
