@@ -783,6 +783,16 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
     assert "quantization" not in llm_kwargs
 
 
+def test_fake_quant_rejects_rollout_profiling():
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    llm_kwargs = {"additional_config": {"nemo_rl_rollout_profiler": {}}}
+
+    with pytest.raises(ValueError, match="fake quantization"):
+        worker_mod._configure_quant_engine_kwargs({"quant_cfg": ""}, llm_kwargs)
+
+
 def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"

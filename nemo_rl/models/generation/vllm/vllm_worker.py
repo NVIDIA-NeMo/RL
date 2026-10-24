@@ -70,6 +70,10 @@ from nemo_rl.models.generation.vllm.worker_utils import (
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.models.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    selected_profiler_class,
+)
 from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
@@ -268,6 +272,8 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
+    _rollout_profiler_class: str = ""
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -453,6 +459,20 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        # The profiler runs in vLLM's internal GPU workers so that it starts
+        # before model loading and CUDA graph creation.
+        if self.is_model_owner:
+            self._rollout_profiler_class = selected_profiler_class(
+                ROLLOUT_PROFILER_CLASS_ENV
+            )
+        if self._rollout_profiler_class:
+            try:
+                self._rollout_profiler_rank_prefix = int(os.environ["RANK"])
+            except (KeyError, ValueError) as exc:
+                raise RuntimeError(
+                    "Rollout profiling requires the generation "
+                    "worker RANK environment variable"
+                ) from exc
         self._sparse_refit_receiver: Any = None
         if (
             self.is_model_owner
@@ -492,7 +512,11 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
-        self._extra_env_vars = extra_env_vars
+        configured_env_vars = self.cfg["vllm_cfg"].get("env_vars") or {}
+        nested_worker_env_vars = list(
+            dict.fromkeys([*(extra_env_vars or []), *configured_env_vars])
+        )
+        self._extra_env_vars = nested_worker_env_vars or None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -500,7 +524,7 @@ class BaseVllmGenerationWorker:
         vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
-            extra_env_vars=extra_env_vars,
+            extra_env_vars=self._extra_env_vars,
             nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
@@ -608,6 +632,16 @@ class BaseVllmGenerationWorker:
             self.expert_parallel_size,
         )
         vllm_kwargs["distributed_executor_backend"] = executor_backend
+        if self._rollout_profiler_class:
+            from nemo_rl.models.generation.vllm.vllm_backend import (
+                configure_rollout_profiler_worker,
+            )
+
+            configure_rollout_profiler_worker(
+                vllm_kwargs,
+                class_path=self._rollout_profiler_class,
+                rank_prefix=self._rollout_profiler_rank_prefix,
+            )
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -830,6 +864,14 @@ class BaseVllmGenerationWorker:
             "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
         }
 
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Forward capture control to every internal vLLM GPU worker."""
+        if not self._rollout_profiler_class or self.llm is None:
+            raise RuntimeError("Four-phase rollout profiler is unavailable")
+        self.llm.collective_rpc(
+            "full_step_profile", args=tuple(), kwargs={"command": command, **kwargs}
+        )
+
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
 
@@ -1040,6 +1082,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def post_init(self):
         if self.llm is not None:
+            if self._rollout_profiler_class:
+                self.llm.collective_rpc(
+                    "end_rollout_profiler_engine_initialization", args=tuple()
+                )
             self.llm.collective_rpc("bind_numa", args=tuple())
             if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
                 target_counts = self.llm.collective_rpc(
@@ -1620,10 +1666,16 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            profiler_error = None
             if self._sparse_refit_receiver is not None:
                 self._sparse_refit_receiver.shutdown()
 
             if self.llm is not None:
+                if self._rollout_profiler_class:
+                    try:
+                        self.llm.collective_rpc("close_rollout_profiler", args=tuple())
+                    except Exception as error:
+                        profiler_error = error
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
 
@@ -1637,6 +1689,8 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             gc.collect()
             torch.cuda.empty_cache()
 
+            if profiler_error is not None:
+                raise profiler_error
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")

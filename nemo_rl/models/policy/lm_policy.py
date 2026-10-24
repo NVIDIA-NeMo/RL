@@ -61,6 +61,7 @@ from nemo_rl.models.policy.utils import (
     resolve_policy_worker_cls,
     validate_fp32_lm_head_config,
 )
+from nemo_rl.models.profiling import profile_policy_method
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
     get_hf_config,
@@ -794,6 +795,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         )
 
+    @profile_policy_method("previous_policy_logprobs")
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -841,6 +843,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return logprobs
 
+    @profile_policy_method("reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1000,6 +1003,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
         ray.get(futures)
 
+    @profile_policy_method("policy_training", phase_slot="training")
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -1203,11 +1207,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    @profile_policy_method("policy_training_onload", phase_slot="training")
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
+    @profile_policy_method("policy_logprobs_onload", phase_slot="logprobs")
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         """Put every worker in eval mode for logprob inference.
 
@@ -1251,6 +1257,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
+    @profile_policy_method("policy_logprobs_offload", phase_slot="logprobs")
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")
@@ -1573,6 +1580,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         user calls shutdown().
         """
         self.shutdown()
+
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Reach every policy GPU worker before returning to the GRPO driver."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "full_step_profile",
+                command=command,
+                **kwargs,
+            )
+        )
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

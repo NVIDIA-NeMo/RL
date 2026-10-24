@@ -18,6 +18,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -38,7 +39,10 @@ from nemo_rl.algorithms.loss import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    _get_free_consecutive_ports_local,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -170,6 +174,7 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
     assert process_group_type.call_args.args[1:] == (2, 4)
     assert nccl_backend_type.call_args.args[1:3] == (2, 4)
     assert tcp_store_type.call_args.kwargs["is_master"] is False
+    assert tcp_store_type.call_args.kwargs["port"] == 1234
     nccl_backend_type.assert_called_once()
     m2n_service_type.assert_called_once_with(group=process_group)
     assert worker.refit_copy_service is m2n_service
@@ -181,6 +186,52 @@ def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
         dst_rank_offset=2,
         execution_batch_bytes=123,
     )
+
+
+def test_mcore_refit_uses_allocated_port_when_adjacent_port_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker imports optional Megatron dependencies, available in MCore CI.
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    port = _get_free_consecutive_ports_local(20000, 30000, consecutive=2)
+    tcp_store_type = torch.distributed.TCPStore
+
+    class StoreInitialized(Exception):
+        pass
+
+    def create_store(**kwargs: Any) -> None:
+        store = tcp_store_type(timeout=timedelta(seconds=2), **kwargs)
+        assert store.port == port
+        store.set("refit-port-regression", "ok")
+        assert store.get("refit-port-regression") == b"ok"
+        # Stop after the real rendezvous; this test does not build GPU groups.
+        raise StoreInitialized
+
+    monkeypatch.setattr(worker_module.torch.distributed, "TCPStore", create_store)
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "get_rank", MagicMock(return_value=0)
+    )
+    adjacent_store = tcp_store_type(
+        host_name="127.0.0.1",
+        port=port + 1,
+        world_size=1,
+        is_master=True,
+        timeout=timedelta(seconds=2),
+    )
+    try:
+        with pytest.raises(StoreInitialized):
+            worker.init_collective_mcore_generation(
+                "127.0.0.1",
+                port,
+                1,
+                rank_offset=0,
+                refit_execution_batch_bytes=123,
+                refit_backend="gloo",
+            )
+    finally:
+        del adjacent_store
 
 
 @pytest.mark.parametrize(

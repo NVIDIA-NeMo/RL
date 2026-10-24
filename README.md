@@ -717,6 +717,9 @@ See `examples/configs/evals/eval.yaml` for the available configuration options.
 For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Set Up Clusters](docs/cluster.md) documentation.
 
 ## Tips and Tricks
+- To profile GRPO refit, generation, logprobs and training on GPU workers, see
+  the [GPU profiling guide](docs/four-phase-profiling.md).
+
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:
 
   ```sh

@@ -26,6 +26,27 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
 
+# Training may succeed before a later metric assertion fails. Keep the child
+# diagnostics in the CI log as well; the job workspace is removed on failure.
+report_failure() {
+    local status=$?
+    trap - EXIT
+    if [[ "$status" -ne 0 ]]; then
+        set +e
+        echo "[chaos] Failure diagnostics (exit $status)"
+        local file
+        for file in run.log command.json kill.json replacement.json result.json metrics.json; do
+            if [[ -f "$EXP_DIR/$file" ]]; then
+                echo "[chaos] BEGIN $file"
+                cat "$EXP_DIR/$file"
+                echo "[chaos] END $file"
+            fi
+        done
+    fi
+    exit "$status"
+}
+trap report_failure EXIT
+
 cd "$PROJECT_ROOT"
 uv run --no-sync python tests/functional/_sglang_grpo_chaos.py \
     --expect "$EXPECT" --exp-dir "$EXP_DIR" --max-steps "$MAX_STEPS" \

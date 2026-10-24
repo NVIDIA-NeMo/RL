@@ -546,6 +546,10 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
+            if self._rollout_profiler_class:
+                await self.llm.collective_rpc(
+                    "end_rollout_profiler_engine_initialization", args=tuple()
+                )
             await self.llm.collective_rpc("bind_numa", args=tuple())
             if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
                 target_counts = await resolve_collective_rpc_result(
@@ -576,6 +580,16 @@ class VllmAsyncGenerationWorkerImpl(
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
+
+    async def full_step_profile_async(self, command: str, **kwargs: Any) -> None:
+        """Await control on every internal async vLLM GPU worker."""
+        if not self._rollout_profiler_class or self.llm is None:
+            raise RuntimeError("Four-phase async rollout profiler is unavailable")
+        await self.llm.collective_rpc(
+            "full_step_profile",
+            args=tuple(),
+            kwargs={"command": command, **kwargs},
+        )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -2508,6 +2522,7 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            profiler_error = None
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
@@ -2517,6 +2532,13 @@ class VllmAsyncGenerationWorkerImpl(
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
             if self.llm is not None:
+                if self._rollout_profiler_class:
+                    try:
+                        await self.llm.collective_rpc(
+                            "close_rollout_profiler", args=tuple()
+                        )
+                    except Exception as error:
+                        profiler_error = error
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
@@ -2534,6 +2556,8 @@ class VllmAsyncGenerationWorkerImpl(
             gc.collect()
             torch.cuda.empty_cache()
 
+            if profiler_error is not None:
+                raise profiler_error
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")

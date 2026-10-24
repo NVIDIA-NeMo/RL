@@ -152,6 +152,13 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.models.profiling import (
+    POLICY_PROFILER_CLASS_ENV,
+    POLICY_PROFILER_METHODS,
+    WorkerCapture,
+    load_profiler,
+    selected_profiler_class,
+)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -901,6 +908,17 @@ class MegatronPolicyWorkerImpl(
             f"device drift after setup_distributed: current_device="
             f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
         )
+
+        # Construct the optional profiler after the distributed rank is
+        # available and before the worker begins handling policy calls.
+        profiler_class = selected_profiler_class(POLICY_PROFILER_CLASS_ENV)
+        if profiler_class:
+            profiler = load_profiler(
+                profiler_class,
+                rank=torch.distributed.get_rank(),
+                required_methods=POLICY_PROFILER_METHODS,
+            )
+            self._four_phase_capture = WorkerCapture(profiler, self.report_device_id)
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
@@ -2582,6 +2600,15 @@ class MegatronPolicyWorkerImpl(
             self.model.zero_grad_buffer()
             self.optimizer.zero_grad()
             self._train_step_state = None
+
+    def shutdown(self) -> bool:
+        """Close the optional profiler and release worker resources."""
+        try:
+            if self._four_phase_capture is not None:
+                self._four_phase_capture.profiler.close()
+        finally:
+            result = super().shutdown()
+        return result
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
