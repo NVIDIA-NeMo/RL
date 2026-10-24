@@ -312,6 +312,10 @@ def _stub_gym_spinup(run_helper):
     cli = types.ModuleType("nemo_gym.cli")
     cli.GlobalConfigDictParserConfig = MagicMock
     cli.RunHelper = lambda: run_helper
+    global_config = types.ModuleType("nemo_gym.global_config")
+    global_config.NEMO_GYM_RESERVED_TOP_LEVEL_KEYS = frozenset()
+    # The merged config the empty-mapping guard inspects before the servers start.
+    global_config.get_global_config_dict = lambda parser_config=None: DictConfig({})
     rollout_collection = types.ModuleType("nemo_gym.rollout_collection")
     rollout_collection.RolloutCollectionHelper = MagicMock
     server_utils = types.ModuleType("nemo_gym.server_utils")
@@ -323,6 +327,7 @@ def _stub_gym_spinup(run_helper):
             {
                 "nemo_gym": types.ModuleType("nemo_gym"),
                 "nemo_gym.cli": cli,
+                "nemo_gym.global_config": global_config,
                 "nemo_gym.rollout_collection": rollout_collection,
                 "nemo_gym.server_utils": server_utils,
             },
