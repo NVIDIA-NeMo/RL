@@ -17,6 +17,7 @@
 import json
 import logging
 from copy import deepcopy
+from functools import partial
 from typing import Any, Dict, cast
 
 import numpy as np
@@ -24,6 +25,7 @@ import torch
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.data.chat_utils import normalize_message_loss_mask
+from nemo_rl.data.full_conversation import get_full_conversation_message_log
 from nemo_rl.data.interfaces import (
     DatumSpec,
     LLMMessageLogType,
@@ -149,6 +151,7 @@ def sft_processor(
     add_bos: bool = True,
     add_eos: bool = True,
     add_generation_prompt: bool = False,
+    full_conversation: bool = False,
 ) -> DatumSpec:
     """Process a datum dictionary for SFT training."""
     # optional preprocessor
@@ -159,25 +162,63 @@ def sft_processor(
 
         datum_dict = format_clevr_cogent_dataset(datum_dict)
 
-    message_log = get_formatted_message_log(
-        datum_dict["messages"],
-        tokenizer,
-        task_data_spec,
-        add_bos_token=add_bos,
-        add_eos_token=add_eos,
-        add_generation_prompt=add_generation_prompt,
-        tools=datum_dict.get("tools", None),  # Pass tools from data if present
-    )
+    if full_conversation:
+        if max_seq_length <= 0:
+            raise ValueError(
+                "Full-conversation SFT requires a positive max_seq_length."
+            )
+        if add_generation_prompt:
+            raise ValueError(
+                "Full-conversation SFT requires data.add_generation_prompt=false."
+            )
+        message_log = get_full_conversation_message_log(
+            datum_dict["messages"],
+            tokenizer,
+            prompt=task_data_spec.prompt,
+            tools=datum_dict.get("tools"),
+            add_bos_token=add_bos,
+            add_eos_token=add_eos,
+        )
+    else:
+        message_log = get_formatted_message_log(
+            datum_dict["messages"],
+            tokenizer,
+            task_data_spec,
+            add_bos_token=add_bos,
+            add_eos_token=add_eos,
+            add_generation_prompt=add_generation_prompt,
+            tools=datum_dict.get("tools", None),
+        )
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
     loss_multiplier = 1.0
     if length >= max_seq_length:
-        # make smaller and mask out
-        for message in message_log:
-            message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
+        if full_conversation:
+            logging.getLogger(__name__).warning(
+                "Excluding full-conversation SFT row idx=%d tokens=%d limit=%d",
+                idx,
+                length,
+                max_seq_length,
+            )
+            placeholder = cast(torch.Tensor, message_log[0]["token_ids"])[
+                : min(4, max_seq_length)
             ]
+            message_log = [
+                {
+                    "role": "context",
+                    "content": tokenizer.decode(
+                        placeholder, clean_up_tokenization_spaces=False
+                    ),
+                    "token_ids": placeholder,
+                }
+            ]
+        else:
+            # make smaller and mask out
+            for message in message_log:
+                message["token_ids"] = message["token_ids"][
+                    : min(4, max_seq_length // len(message_log))
+                ]
         loss_multiplier = 0.0
 
     output: DatumSpec = {
@@ -1106,6 +1147,9 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
+        "sft_full_conversation_processor": partial(
+            sft_processor, full_conversation=True
+        ),
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
     },

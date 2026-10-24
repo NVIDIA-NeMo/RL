@@ -85,6 +85,7 @@ project-includes = [
   "nemo_rl/data/__init__.py",
   "nemo_rl/data/chat_templates.py",
   "nemo_rl/data/chat_utils.py",
+  "nemo_rl/data/full_conversation.py",
   "nemo_rl/data/xtoken/__init__.py",
   "nemo_rl/data/xtoken/native_chat.py",
   "nemo_rl/data/xtoken/cross_tokenizer_collate.py",
