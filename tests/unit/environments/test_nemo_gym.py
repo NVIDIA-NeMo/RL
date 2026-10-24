@@ -2614,3 +2614,73 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
     assert spin_up(exporting, telemetry={"enabled": False})["telemetry"] == {
         "enabled": False
     }
+
+
+def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
+    """Gym servers build their resource from `nemo.gym.*` and little else.
+
+    Without the job identity their spans carry no campaign stage, no slurm ids
+    and no run id, so a pipeline keyed on `nv.dl.campaign.stage` drops them
+    while this actor's own spans sail through. `nv.dl.rank` is withheld on
+    purpose: nemo-lens derives `service.instance.id` from it, so forwarding one
+    rank would collapse every Gym server onto a single instance id.
+    """
+    import os
+    from types import SimpleNamespace as NS
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from opentelemetry import trace as otel_trace
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    monkeypatch.setattr(gym_cli, "RunHelper", MagicMock())
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
+    )
+    monkeypatch.setattr(
+        otel_trace,
+        "get_tracer_provider",
+        lambda: NS(
+            resource=NS(
+                attributes={
+                    "nv.dl.campaign.stage": "RL",
+                    "slurm.job.id": "1416252",
+                    "nemo.run.id": "a-run",
+                    "host.name": "node-0",
+                    "service.name": "nemo-rl",
+                    "service.instance.id": "a-run-rank0",
+                    "nv.dl.rank": "0",
+                    "nv.dl.world_size": "16",
+                    "process.pid": "2538227",
+                }
+            )
+        ),
+    )
+    monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+
+    NemoGym.__ray_metadata__.modified_class(
+        {
+            "initial_global_config_dict": {},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+        }
+    )._spinup()
+
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+
+    published = parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+    # The job identity a Gym server cannot know, led by the one the ingest
+    # pipeline filters on.
+    assert published["nv.dl.campaign.stage"] == "RL"
+    assert published["slurm.job.id"] == "1416252"
+    assert published["nemo.run.id"] == "a-run"
+    assert published["host.name"] == "node-0"
+
+    # Everything a server must determine for itself stays behind.
+    for per_process in nemo_gym_mod._GYM_PER_PROCESS_RESOURCE_KEYS:
+        assert per_process not in published, per_process
