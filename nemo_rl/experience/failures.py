@@ -190,16 +190,19 @@ _INFRA_TYPE_NAMES: Final[frozenset[str]] = frozenset(
 
 
 def http_status_is_infra(status: int) -> bool:
-    """Whether an HTTP status means the endpoint is unwell rather than the request bad.
+    """Whether the HTTP status of a *failed* request blames the endpoint, not the request.
 
     5xx and the retriable 4xx are infrastructure; any other 4xx describes the request
-    itself, so another shard would answer it identically.
+    itself, so another shard would answer it identically. A status below 400 on a
+    request that nevertheless failed means the reply broke after its status line (the
+    body read or parse failed, as when a relayed multi-megabyte response is cut
+    mid-body), which is the transport's trouble, so it is infrastructure too.
 
     Public because NeMo-Gym has to make this same call on the *raising* side of a Ray
     actor boundary (see ``nemo_rl/environments/nemo_gym.py``), and the two copies of the
     decision must not drift apart.
     """
-    return status >= 500 or status in _RETRIABLE_HTTP_STATUSES
+    return status < 400 or status >= 500 or status in _RETRIABLE_HTTP_STATUSES
 
 
 def _http_status(exc: BaseException) -> Optional[int]:
@@ -223,7 +226,8 @@ def _is_infra(exc: BaseException) -> bool:
     # An HTTP error is classified by status, not by type. A 4xx from the generation
     # engine describes the request -- "This model's maximum context length is ..." comes
     # back as a 400 -- so retrying it on another shard would fail identically. 5xx and
-    # the retriable 4xx mean the endpoint is unwell, which another shard can serve.
+    # the retriable 4xx mean the endpoint is unwell, which another shard can serve, and
+    # so does a failed request whose status says success: its reply broke mid-body.
     status = _http_status(exc)
     if status is not None:
         return http_status_is_infra(status)
