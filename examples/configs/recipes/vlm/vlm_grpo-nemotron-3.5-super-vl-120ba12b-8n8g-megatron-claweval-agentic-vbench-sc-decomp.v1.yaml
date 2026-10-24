@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Same algorithm/model/data settings as the paired baseline, with the shared
+# independent-child and existing-session follow-up instruction.
+defaults:
+- ./vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-claweval-agentic-vbench-sc.v1.yaml
+- ../../subagent_delegation_decomposition.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-super-claweval-agentic-vbench-sync-decomp
+
+logger:
+  log_dir: logs/grpo-super-claweval-agentic-vbench-sync-decomp
+  wandb:
+    name: ${oc.env:WANDB_NAME,claweval_agentic_vbench_subagents_super_grpo_sync8_decomp_cluster-${oc.env:CLUSTER_NAME,${oc.env:SLURM_CLUSTER_NAME,unknown}}}

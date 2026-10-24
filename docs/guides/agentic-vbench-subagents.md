@@ -218,6 +218,40 @@ budgets, row limits, standard overlong filtering, and all RL mathematics remain
 unchanged. `opencode_subagent_prompt` is wired through the Gym config and
 `harbor_runner.py`; the child still has `task` denied, preserving depth one.
 
+## Shared decomposition prompt experiment
+
+The opt-in `decomp` recipes share the instruction in
+[`subagent_delegation_decomposition.yaml`](../../examples/configs/subagent_delegation_decomposition.yaml):
+
+| Algorithm and layout | Recipe |
+| --- | --- |
+| GRPO, synchronous, 8 nodes | [Super sync8 decomposition](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-3.5-super-vl-120ba12b-8n8g-megatron-claweval-agentic-vbench-sc-decomp.v1.yaml) |
+| GRPO, asynchronous, 16 nodes | [Super async16 decomposition](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp.v1.yaml) |
+| PPO, asynchronous, 16 nodes | [Super PPO async16 decomposition](../../examples/configs/recipes/vlm/vlm_ppo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp.v1.yaml) |
+
+The parent receives the same instruction for both ClawEval and Agentic VBench.
+It may start distinct children with separate `task` calls that omit `task_id`,
+or continue an existing child with its actual returned `task_id` and a focused
+follow-up. Both modes use OpenCode's existing tools and session capture. The
+instruction asks for useful, bounded decomposition and integration of the
+results; it does not require a fixed number of children or add a delegation
+reward.
+
+These recipes inherit their paired baseline's model, dataset, rollout settings,
+context limits, admission masks, optimizer, loss, and TMPE calculation. They
+change the parent instruction and use separate checkpoint/log directories and
+W&B names. The PPO variant inherits the existing PPO critic configuration.
+Choosing this prompt variant does not establish that a model or cluster
+configuration has completed end-to-end PPO qualification.
+
+Set `MODEL_PATH` to the same Super GA weights and `TRAIN_PATH`/`VAL_PATH` to the
+same mixed prompt-only JSONL for a GRPO/PPO comparison. Use separate output roots
+and W&B IDs for fresh arms; preserve an arm's ID and checkpoint root when
+resuming it. `CLUSTER_NAME` controls the W&B name suffix, with
+`SLURM_CLUSTER_NAME` as its fallback. `WANDB_NAME` can set the complete run name.
+The existing `AGENTIC_VBENCH_DELEGATION_PROMPT` and
+`CLAW_EVAL_DELEGATION_PROMPT` variables still override their respective agents.
+
 ## Not ported
 
 Score centering, the SFT export tooling, the SWE-bench harness and the

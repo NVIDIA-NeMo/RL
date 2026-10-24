@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Shared prompt-only overlay for the opt-in decomposition experiment.
+subagent_delegation_prompt: |-
+  Identify useful task decomposition. Delegate distinct, bounded subtasks when beneficial; use multiple children for independent work and avoid duplicating the full task. Integrate and verify their results.
+
+  Use the two delegation modes as appropriate:
+  1. Independent work: call the task tool separately for each distinct, bounded subtask, with subagent_type set to general. Omit task_id to create a fresh child session. Give each child its relevant input paths, objective, and expected output.
+  2. Related follow-up work: when continuing a child's previous work benefits from its existing context, call task again with that child's actual returned task_id and a focused follow-up prompt. Keep that same session rather than creating an unrelated new child. Never invent a task_id or reuse one from another task.
+
+  Choose the number of children and follow-ups according to the task. Preserve the original task instructions. Integrate the returned work and verify the required deliverables yourself. Claim delegation or verification only when the corresponding tool work actually occurred.
+
+env:
+  nemo_gym:
+    agentic_vbench_agent:
+      responses_api_agents:
+        agentic_vbench_agent:
+          opencode_delegation_prompt: ${oc.env:AGENTIC_VBENCH_DELEGATION_PROMPT,${subagent_delegation_prompt}}
+    claweval_agent:
+      responses_api_agents:
+        claweval_agent:
+          opencode_delegation_prompt: ${oc.env:CLAW_EVAL_DELEGATION_PROMPT,${subagent_delegation_prompt}}
