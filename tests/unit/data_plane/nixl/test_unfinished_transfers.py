@@ -259,7 +259,7 @@ def _plan_with_zero_copy_value():
 def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     from nemo_rl.data_plane.nixl.errors import UnitFull
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
+    def put_segments(segments, nbytes, n_entries, unit_id, blob_id=None, deadline=None):
         # The WRITE timed out: every local range it used is now unfinished.
         ep.unfinished.extend((a, n) for a, _, n in segments)
         raise UnitFull("no unit could take it")
@@ -279,8 +279,8 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
 
 
 def test_zero_copy_source_is_deregistered_after_a_clean_put():
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
-        return blob_id, {"u": 0}
+    def put_segments(segments, nbytes, n_entries, unit_id, blob_id=None, deadline=None):
+        return blob_id
 
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
@@ -294,9 +294,9 @@ def test_put_over_max_blob_bytes_is_split_at_key_boundaries():
 
     blobs = []
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
+    def put_segments(segments, nbytes, n_entries, unit_id, blob_id=None, deadline=None):
         blobs.append((blob_id, nbytes, n_entries))
-        return blob_id, {"u": 0}
+        return blob_id
 
     c, _ = _client_with(put_segments)
     c.max_blob_bytes = 10_000  # 4 KiB values: at most 2 per blob
@@ -314,20 +314,19 @@ def test_failed_part_of_a_split_put_keeps_the_parts_written():
 
     from nemo_rl.data_plane.nixl.errors import UnitFull
 
-    calls, released = [], []
+    calls = []
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
+    def put_segments(segments, nbytes, n_entries, unit_id, blob_id=None, deadline=None):
         calls.append(blob_id)
         if len(calls) == 2:
             raise UnitFull("no unit could take it")
-        return blob_id, {"u": 0}
+        return blob_id
 
     c, _ = _client_with(put_segments)
-    c.store.release = lambda counts, hints=None: released.append(counts)
     c.max_blob_bytes = 5_000  # one 4 KiB value per blob
     with pytest.raises(UnitFull):
         c._put_split(0, ["a", "b"], [torch.ones(1024)] * 2, time.monotonic() + 60)
-    assert len(calls) == 2 and released == []
+    assert len(calls) == 2
 
 
 def _store_with(ep_transfer_error: TransferError):
@@ -357,12 +356,11 @@ def _store_with(ep_transfer_error: TransferError):
         notify=lambda addr, op, **kw: notes.append((op, kw)),
         timeout_ms=30_000,
     )
-    st.placement = SimpleNamespace(order=lambda units, **kw: units)
-    st.node_id, st.timeout_s, st.ssd = "n0", 0.01, False
-    st._units, st._blob_unit = {0: unit}, {}
+    st.timeout_s, st.ssd = 0.01, False
+    st._units = {0: unit}
     st._refresh_units = lambda: None
     st._unit_dead = lambda unit_id: False  # a live unit: failures are retryable
-    st.stats = {"fast_reads": 0, "slow_reads": 0, "tag_mismatch": 0}
+    st.stats = {"unit_refresh": 0}
     return st, notes
 
 
@@ -373,33 +371,10 @@ def test_failed_put_tells_the_unit_whether_the_write_may_still_land(in_flight):
     st, notes = _store_with(TransferError("timed out", in_flight=in_flight))
     # A failed transfer is retryable, never UnitFull (design §6).
     with pytest.raises(TransferFailed) as ei:
-        st.put_segments([(1000, 0, 64)], 64, 1, blob_id="b")
+        st.put_segments([(1000, 0, 64)], 64, 1, 0, blob_id="b")
     assert ei.value.in_flight is in_flight
     assert notes and all(op == "abort" for op, _ in notes)
     assert all(kw["in_flight"] is in_flight for _, kw in notes)
-
-
-def test_in_flight_hinted_read_fails_instead_of_refilling_the_same_buffer():
-    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
-
-    st, _ = _store_with(TransferError("timed out", in_flight=True))
-    pinned = []
-    st._read_pinned = lambda reqs, deadline=None, metas=None: pinned.append(reqs)
-    meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
-    scratch = (5000, memoryview(bytearray(64)))
-    # Retryable (the unit is alive), but never refilled into the same buffer.
-    with pytest.raises(TransferFailed):
-        st.read({"b": [(0, 64, 1000)]}, {"b": meta}, scratch)
-    assert pinned == []  # the late READ could overwrite whatever pinned wrote
-
-
-def test_failed_hinted_read_that_never_posted_falls_back_to_pinned():
-    st, _ = _store_with(TransferError("no peer", in_flight=False))
-    pinned = []
-    st._read_pinned = lambda reqs, deadline=None, metas=None: pinned.append(reqs)
-    meta = {"u": 0, "so": 0, "z": 4096, "g": "abc"}
-    st.read({"b": [(0, 64, 1000)]}, {"b": meta}, (5000, memoryview(bytearray(64))))
-    assert pinned == [{"b": [(0, 64, 1000)]}]
 
 
 def _unit_abort():
@@ -561,8 +536,8 @@ def test_invalid_ops_raise_before_anything_is_posted(graveyard):
     assert agent.calls == 0
 
 
-def test_a_hinted_read_posts_every_unit_in_one_batch():
-    from nemo_rl.data_plane.nixl import blob_format
+def test_a_read_posts_every_unit_in_one_batch():
+    from nemo_rl.data_plane.nixl.blobstore import TransferFailed
     from tests.unit.data_plane._nixl_helpers import StubCtl, StubEp, stub_store
 
     batches = []
@@ -575,20 +550,15 @@ def test_a_hinted_read_posts_every_unit_in_one_batch():
     ep = Ep()
     ep.results = [None, None]
     s = stub_store(StubCtl({}), ep=ep)
-    s.stats = {"fast_reads": 0, "slow_reads": 0, "tag_mismatch": 0}
-    reqs = {"a": [(0, 8, 1000)], "b": [(0, 8, 2000)]}
-    metas = {"a": {"so": 0, "z": 64}, "b": {"so": 0, "z": 64}}
-    scratch = (5000, memoryview(bytearray(2 * blob_format.FOOTER_SIZE)))
-    s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
+    reads = {0: [(0, 8, 1000)], 1: [(0, 8, 2000)]}
+    keys_of = {0: ["1@a"], 1: ["2@b"]}
+    s.read_entries(reads, keys_of, None)
     assert batches == [["unit-0-abc", "unit-1-abc"]]
-    # A unit whose READ never posted falls back to the pinned path alone ...
-    ep.results = [TransferError("no peer"), None]
-    retry = s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
-    assert "a" in retry
-    # ... one whose READ may still land fails the read.
+    # A READ that may still land fails the read (retryable: the unit is alive).
     ep.results = [None, TransferError("late", in_flight=True)]
-    with pytest.raises(Exception, match="late"):
-        s._read_hinted(reqs, metas, {0: ["a"], 1: ["b"]}, scratch)
+    with pytest.raises(TransferFailed, match="late") as ei:
+        s.read_entries(reads, keys_of, None)
+    assert ei.value.in_flight
 
 
 def test_pool_registration_waits_are_counted_by_the_timed_lock():

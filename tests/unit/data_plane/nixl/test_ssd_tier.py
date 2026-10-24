@@ -238,25 +238,17 @@ class _SpillCtl(_Ctl):
 
 
 @pytest.mark.parametrize(
-    ("full", "allocs", "unit"),
+    ("full", "allocs"),
     [
-        # u0's RAM is full but u1 has room: no unit spills.
-        ({"tcp://u0"}, [("tcp://u0", False), ("tcp://u1", False)], 1),
-        # Every unit's RAM is full: only then does the first unit spill.
-        (
-            {"tcp://u0", "tcp://u1"},
-            [("tcp://u0", False), ("tcp://u1", False), ("tcp://u0", True)],
-            0,
-        ),
+        (set(), [("tcp://u1", False)]),  # RAM has room: no spill
+        ({"tcp://u1"}, [("tcp://u1", False), ("tcp://u1", True)]),  # then it spills
     ],
-    ids=["ram_on_next_unit", "spill_after_all_refused"],
+    ids=["ram", "spill_after_ram_refused"],
 )
-def test_a_put_tries_every_units_ram_before_any_unit_spills(full, allocs, unit):
+def test_a_put_tries_its_units_ram_before_it_spills(full, allocs):
     ctl = _SpillCtl(full)
-    s = _store(ctl)
-    s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    assert _store(ctl).put_segments([(1000, 0, 8)], 8, 1, 1, blob_id="b") == "b"
     assert ctl.allocs == allocs
-    assert s._blob_unit["b"] == unit
 
 
 def test_commit_waits_when_too_many_io_jobs_are_running(tmp_path, monkeypatch):
@@ -396,18 +388,6 @@ def test_a_failed_stage_read_keeps_the_file_and_the_retry_succeeds(
     assert u.stats()["stage_failures"] == 1
 
 
-def test_freed_region_loses_its_footer():
-    from nemo_rl.data_plane.nixl.blob_format import FOOTER_SIZE
-
-    u = bare_unit(1 << 16)  # read_pin_s=0: freed at once
-    off = u.alloc("a", 1000, 1)
-    write_blob(u.slab, off, 1000, key_of("a"), 7)
-    assert u.commit("a") == "done"
-    u.release_rows([gidx_of("a")])
-    assert not u.slab[off + 1000 - FOOTER_SIZE : off + 1000].any()
-    assert u.slab[off] == 7  # only the footer is wiped
-
-
 def _spilled(u):
     """Six blobs in the put area, two on disk: fills 1..8."""
     _fill(u)
@@ -506,14 +486,14 @@ def test_restore_with_a_full_disk_leaves_the_blob_to_another_unit(
 def test_every_put_commits(ssd):
     # The commit publishes the blob's rows on the unit, SSD tier or not.
     ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "done"})
-    _store(ctl, ssd=ssd).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    _store(ctl, ssd=ssd).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     assert ctl.calls == ["alloc", "commit"]
 
 
 def test_commit_is_asked_again_while_the_unit_writes_the_file():
     replies = iter(["pending", "pending", "done"])
     ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: next(replies)})
-    _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    _store(ctl).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     assert ctl.calls == ["alloc", "commit", "commit", "commit"]
     assert not [n for n in ctl.notified if n[0] == "abort"]
 
@@ -521,7 +501,7 @@ def test_commit_is_asked_again_while_the_unit_writes_the_file():
 def test_failed_commit_fails_the_put_and_frees_the_region():
     ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "lost"})
     with pytest.raises(blobstore.TransferFailed):
-        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     assert ("abort", {"blob_id": "b", "in_flight": False}) in ctl.notified
 
 
@@ -530,102 +510,8 @@ def test_deadline_during_commit_aborts_the_blob():
 
     ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: DataPlaneTimeout("late")})
     with pytest.raises(DataPlaneTimeout):
-        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+        _store(ctl).put_segments([(1000, 0, 8)], 8, 1, 0, blob_id="b")
     assert ("abort", {"blob_id": "b", "in_flight": False}) in ctl.notified
-
-
-def test_pending_blobs_are_asked_again_until_ready():
-    replies = iter(
-        [
-            {"pin_id": "p1", "offsets": {}, "missing": [], "pending": ["b"]},
-            {"pin_id": "p2", "offsets": {}, "missing": [], "pending": ["b"]},
-            {"pin_id": "p3", "offsets": {"b": 0}, "missing": [], "pending": []},
-        ]
-    )
-    ctl = _Ctl({"resolve": lambda a: next(replies)})
-    _store(ctl)._read_pinned({"b": [(0, 8, 1000)]}, deadline=time.monotonic() + 5)
-    assert ctl.calls == ["resolve"] * 3
-    assert [a["pin_id"] for op, a in ctl.notified if op == "unpin"] == [
-        "p1",
-        "p2",
-        "p3",
-    ]
-
-
-def test_a_failed_disk_read_is_retryable_and_releases_the_pin():
-    reply = {
-        "pin_id": "p",
-        "offsets": {},
-        "missing": [],
-        "pending": [],
-        "failed": ["b"],
-    }
-    ctl = _Ctl({"resolve": lambda a: reply})
-    with pytest.raises(blobstore.TransferFailed):
-        _store(ctl)._read_pinned({"b": [(0, 8, 1000)]}, deadline=time.monotonic() + 5)
-    assert [a["pin_id"] for op, a in ctl.notified if op == "unpin"] == ["p"]
-
-
-def test_pending_reads_reask_at_once_after_progress_and_reset_the_backoff(monkeypatch):
-    # A round that read blobs unpins them, freeing staging for the rest, so
-    # the next ask goes out at once; only rounds that read nothing back off.
-    pending = iter([["b", "c"], ["b", "c"], ["b", "c"], ["c"], ["c"], []])
-
-    def resolve(a):
-        p = next(pending)
-        offs = {b: 0 for b in "abc" if b not in p}
-        return {"pin_id": "p", "offsets": offs, "missing": [], "pending": p}
-
-    sleeps = []
-
-    def wait(deadline, backoff):
-        sleeps.append(backoff)
-        return 2 * backoff
-
-    monkeypatch.setattr(blobstore, "busy_wait", wait)
-    ctl = _Ctl({"resolve": resolve})
-    s = _store(ctl)
-    s._blob_unit = {b: 0 for b in "abc"}
-    s._read_pinned({b: [(0, 8, 1000)] for b in "abc"}, deadline=time.monotonic() + 5)
-    assert ctl.calls == ["resolve"] * 6
-    p0 = blobstore.PENDING_POLL_S
-    assert sleeps == [p0, 2 * p0, p0]
-
-
-def test_with_ssd_on_ram_blobs_read_by_hint_and_spilled_blobs_read_pinned():
-    s = _store(
-        _Ctl({"resolve": lambda a: {"pin_id": "p", "offsets": {"b": 0}, "missing": []}})
-    )
-    s._read_hinted = lambda *a, **k: {}  # the hinted path took the blob
-    s._blob_unit = {}  # this client never wrote "b"
-    s.directory = None  # asking the directory would raise
-    scratch = (2000, memoryview(bytearray(64)))
-    s._gen = lambda unit_id: 1
-    s.read(
-        {"b": [(0, 8, 1000)]},
-        {"b": {"u": 0, "so": 0, "z": 64, "g": 1}},
-        scratch=scratch,
-    )
-    assert s.stats["slow_reads"] == 0
-    s._read_hinted = lambda *a, **k: pytest.fail("hinted read of a spilled blob")
-    s.read({"b": [(0, 8, 1000)]}, {"b": {"u": 0, "g": 1}}, scratch=scratch)
-    assert s.stats["slow_reads"] == 1
-
-
-def test_a_put_that_spilled_carries_no_read_hint():
-    ctl = _Ctl({"alloc": lambda a: 600, "commit": lambda a: "done"})
-    s = _store(ctl)
-    s._units[0]["put_bytes"] = 512  # offset 600 is in the IO area
-    s._units[1]["put_bytes"] = 512
-    s._gen = lambda unit_id: 1
-    _, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert hint == {"u": 0, "g": 1}
-    ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "done"})
-    s = _store(ctl)
-    s._units[0]["put_bytes"] = 512
-    s._gen = lambda unit_id: 1
-    _, hint = s.put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert hint == {"u": 0, "g": 1, "so": 64, "z": 8}
 
 
 # ------------------------------------------------------------------ config

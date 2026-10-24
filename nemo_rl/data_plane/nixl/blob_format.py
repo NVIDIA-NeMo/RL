@@ -40,10 +40,8 @@ import torch
 ALIGN = 64
 MAGIC = 0x4E564450  # 'NVDP'
 VERSION = 3
-# v3 adds a 16-byte blob tag (the blob id) so a reader holding a cached
-# (unit, offset) location can verify, from the same READ, that the bytes there
-# are still this blob -- the basis of the RPC-free read path. v2 blobs (older
-# checkpoints) still decode; they just carry no tag.
+# v3 adds a 16-byte blob tag (the blob id); reads no longer check it, since
+# every read is pinned. v2 blobs (older checkpoints) still decode.
 _FOOTER_FMT = "<IHHII16s"  # magic, version, flags, index_off, index_len, blob_tag
 FOOTER_SIZE = struct.calcsize(_FOOTER_FMT)
 _FOOTER_V2_FMT = "<IHHII"
@@ -262,12 +260,6 @@ def _footer(blob: memoryview) -> tuple[int, int, bytes] | None:
         if magic == MAGIC and version == 2:
             return io, il, NO_TAG
     return None
-
-
-def footer_tag(tail: memoryview) -> bytes | None:
-    """Blob tag from a v3 footer (exactly the last ``FOOTER_SIZE`` bytes), else ``None``."""
-    f = _footer(tail)
-    return None if f is None or f[2] == NO_TAG else f[2]
 
 
 def read_index(blob: memoryview) -> list[Entry]:

@@ -11,12 +11,13 @@ units. TransferQueue keeps keys, fields and readiness, so the NeMo-RL adapter is
 unchanged apart from selecting the backend.
 
 ```
-client (trainer / vLLM / controller)                 NixlStorageUnit (CPU actor)
+client (trainer / vLLM / controller)                 NixlStorageUnit gidx % N
   put:  ZMQ alloc ───────────────────────────────►    slab allocator
         NIXL WRITE (zero-copy or pooled buffer) ──►   registered DRAM slab
-  get:  NIXL READ data + blob footer ◄─────────────   (no control message when the
-        (footer tag checked against the blob id)       location hint is live)
-  clear: ZMQ release_many (fire-and-forget) ───────►  quarantine, then free
+        ZMQ commit ──────────────────────────────►    publish rows in the row index
+  get:  ZMQ resolve_keys ────────────────────────►    look up rows, pin their blobs
+        NIXL READ entries ◄──────────────────────     (one READ per unit), then unpin
+  clear: ZMQ release_rows (awaited) ─────────────►    drop rows; free unpinned blobs
 ```
 
 ## Code layout
@@ -34,10 +35,10 @@ nemo_rl/data_plane/
 ├── nixl_storage_unit.py            CPU Ray actor owning one registered DRAM slab
 └── nixl/                           store side
     ├── blob_format.py              blob byte layout (index + footer with blob tag)
-    ├── blobstore.py                unit-slab and file stores, hinted reads
+    ├── blobstore.py                unit-slab store: put, resolve + read, clear
     ├── control.py                  ZMQ ROUTER/DEALER control plane
     ├── nixl_io.py                  NIXL endpoint, RDMA-only policy check
-    └── allocator.py, directory.py, placement.py, bufpool.py, errors.py
+    └── allocator.py, directory.py, bufpool.py, errors.py
 nemo_rl/distributed/numa_utils.py   socket detection and binding (numa: auto)
 nemo_rl/utils/checkpoint_engines/nixl.py   shared NIXL agent factory
 ```
@@ -75,14 +76,14 @@ on, keep `cuda_copy,cuda_ipc` in it.
 
 ## Design points
 
-- **Placement-free locations.** TransferQueue stores per-key location meta
-  `{b, o, n, k, d, s}` plus a hint `{u, so, z, g}` (unit, slab offset, blob
-  size, unit-instance stamp). A live hint lets reads skip every control
-  message; after a checkpoint restore the stamp no longer matches, and reads
-  fall back to a directory lookup and a pinned `resolve`.
-- **Safe reads without pins.** Units quarantine freed regions for
-  `read_pin_s`, and each blob's footer carries its id, which the reader checks
-  in the same READ.
+- **Index-addressed rows.** Like TransferQueue's SimpleStorage, row `gidx`
+  lives on unit `unit_ids[gidx % N]`, which keeps the row's
+  `field -> (blob, entry)` index. A put returns no location meta, so the TQ
+  controller holds no more than it does for SimpleStorage, and a new client
+  needs only the unit table.
+- **Pinned reads.** `resolve_keys` pins the blobs it returns for `read_pin_s`
+  (at least `transfer_timeout_s` + margin); a freed region is reused only
+  after its pins end.
 - **Put path.** Values of 1 to 32 MiB go zero-copy from the caller's memory.
   Larger values use torch's parallel copy into a registered buffer pool.
   Registering a fresh 1 GiB mapping costs about 70 ms, while copying it costs
@@ -90,8 +91,9 @@ on, keep `cuda_copy,cuda_ipc` in it.
 - **Sockets.** With `numa: auto`, the k-th unit on a multi-socket node pins its
   CPUs and slab memory to socket `k % sockets`. NICs are not restricted per
   socket: doing so broke cross-node UCX endpoint creation at 86 nodes.
-- **Checkpointing.** `save_data_plane` writes one shard per unit plus a
-  manifest. Restore re-places blobs on whichever units exist then.
+- **Checkpointing.** `save_data_plane` writes one shard per unit, its live
+  rows, and a manifest. With the same units, each shard restores in place;
+  with a different count, the live rows are put again through a client.
 
 ## Measured (GB300, 2 nodes, 4 RDMA rails; ms, lower is better)
 
