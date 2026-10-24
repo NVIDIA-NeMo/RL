@@ -650,6 +650,7 @@ def grpo_train_sync(
         dynamic_sampling_num_gen_batches = 0
 
         for batch in wrapped_dataloader:
+            checkpointer.raise_if_finalization_failed()
             metrics_logging_data: dict = {}
             metrics: dict = {}
 

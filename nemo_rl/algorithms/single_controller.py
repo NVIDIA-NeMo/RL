@@ -2949,6 +2949,12 @@ class SingleControllerActor:
         selection_kwargs = self._streaming_ppo_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            # A save holding the lock flushes finalization itself; skip polling
+            # so two threads never flush at once. A skipped poll is caught at
+            # the next step. Keep this call synchronous (no to_thread) so the
+            # locked() check and the poll stay atomic on the event loop.
+            if not self._checkpoint_save_lock.locked():
+                self._checkpointer.raise_if_finalization_failed()
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
             if self._gen is not self._trainer and isinstance(
                 self._gen, (VllmGeneration, MegatronGeneration)
@@ -5359,7 +5365,8 @@ class SingleControllerActor:
                 rollout_recovery_payload,
             )
         # Rename happens in the background once the async weight writes
-        # finish; flushed at the next save or on exit.
+        # finish; flushed at the next save or on exit. A failure that has
+        # already happened is raised at the start of the next step.
         self._checkpointer.begin_finalization(
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,

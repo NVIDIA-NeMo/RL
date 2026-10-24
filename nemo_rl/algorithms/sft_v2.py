@@ -227,6 +227,7 @@ class SFTSingleControllerActor:
             with umbrella_span(RLSpanGroup.U_JOB, "rl.sft_v2.job", tracer=self._tracer):
                 self._trainer.prepare_for_training()
                 while self._save_state.total_steps < self._max_steps:
+                    self._checkpointer.raise_if_finalization_failed()
                     # Read before _run_train_step increments it, so the whole
                     # pass is tagged with the step that is running rather than
                     # the one that just finished.

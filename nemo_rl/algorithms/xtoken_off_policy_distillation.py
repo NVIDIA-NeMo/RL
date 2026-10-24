@@ -652,6 +652,7 @@ def xtoken_off_policy_distillation_train(
             flush=True,
         )
         for batch in dataloader:
+            checkpointer.raise_if_finalization_failed()
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/"
                 f"{min(len(dataloader), max_steps)} {'=' * 25}",
