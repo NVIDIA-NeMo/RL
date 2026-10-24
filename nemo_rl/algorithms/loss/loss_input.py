@@ -303,7 +303,11 @@ def prepare_loss_input(
         )
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
-        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        # jsd only needs the student entropy when it degenerates to reverse KL.
+        calculate_entropy = loss_fn.zero_outside_topk and (
+            loss_fn.kl_type in ("reverse", "mixed")
+            or (loss_fn.kl_type == "jsd" and loss_fn.jsd_beta >= 1.0)
+        )
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=logits,
