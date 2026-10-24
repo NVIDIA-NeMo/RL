@@ -1,4 +1,4 @@
-# PPO-DAPO with DTensor (Automodel) Backend
+# PPO-DAPO with the Automodel Backend
 # DAPO-style PPO: no KL penalty, asymmetric clipping, dual-clip, reward scaling
 # Dynamic sampling is disabled (standard PPO batching).
 
@@ -35,7 +35,7 @@ ppo:
     # Requires policy_training_start_step > 0. null uses max_trajectory_age_steps.
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
     # true discards partial restored rows and fills from subsequent prompts.
     drop_incomplete_targets_on_restore: false
 
@@ -82,6 +82,11 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  # Only used by adaptive-ppo-clip.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
@@ -120,6 +125,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: true
@@ -180,6 +187,10 @@ policy:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
     flash_attention_version: 2
     bias_activation_fusion: True
@@ -280,10 +291,9 @@ policy:
     stop_strings: null
     mcore_generation_config:
       buffer_size_gb: 20
-      buffer_guaranteed_fraction: 0.1
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
-      num_cuda_graphs: 16
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
@@ -292,12 +302,10 @@ policy:
       prefix_caching_coordinator_policy: longest_prefix
       prefix_cache_ttl_seconds: 300.0
       prefix_caching_routing_alpha: 1.0
-      unified_memory_level: 0
       max_tokens: 16384
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      offload_policy_before_refit: false
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
@@ -325,7 +333,7 @@ policy:
         gpus_per_node: null
         num_nodes: null
 
-# Value Model with DTensor (Automodel) Backend (for GAE in PPO)
+# Value Model with the Automodel Backend (for GAE in PPO)
 value:
   model_name: ${policy.model_name}
   tokenizer:
@@ -340,7 +348,7 @@ value:
   precision: "bfloat16"
 
   reward_model_cfg:
-    enabled: true  # DTensor V2 value worker requires reward_model_cfg.enabled=true
+    enabled: true  # Automodel value worker requires reward_model_cfg.enabled=true
     reward_model_type: "regression"
 
   automodel_cfg:
@@ -401,6 +409,10 @@ value:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
     flash_attention_version: 2
     bias_activation_fusion: True
@@ -517,17 +529,17 @@ logger:
   swanlab_enabled: false
   monitor_gpus: false
   wandb:
-    project: "ppo-dapo-dtensor-dev"
-    name: "ppo_dapo_dtensor_1B"
+    project: "ppo-dapo-automodel-dev"
+    name: "ppo_dapo_automodel_1B"
     # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
     log_nemo_gym_full_result_tables: false
   swanlab:
-    project: "ppo-dapo-dtensor-dev"
-    name: "ppo_dapo_dtensor_1B"
+    project: "ppo-dapo-automodel-dev"
+    name: "ppo_dapo_automodel_1B"
   tensorboard: {}
   mlflow:
-    experiment_name: "ppo-dapo-dtensor-dev"
-    run_name: "ppo_dapo_dtensor_1B"
+    experiment_name: "ppo-dapo-automodel-dev"
+    run_name: "ppo_dapo_automodel_1B"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

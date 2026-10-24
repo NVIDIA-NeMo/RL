@@ -56,11 +56,16 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
+    WIRE_MULTIMODAL_FIELDS,
+    PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_media_sources_from_responses_messages,
+    image_size_from_source,
     media_sources_equal,
     uses_image_placeholder,
 )
+from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -69,6 +74,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_multimodal import (
+    _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _is_trainable_output_item,
     _without_initial_media_sources,
@@ -85,6 +91,12 @@ from nemo_rl.environments.nemo_gym_shards import (
     apply_shard_overlay,
     build_route_shard_map,
     parse_shard_plan,
+)
+from nemo_rl.environments.nemotron_utils import (
+    RolloutGeometryUnderdetermined,
+    count_image_placeholder_runs,
+    predicted_static_image_num_tokens,
+    supports_image_placeholder_run_parity,
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
@@ -160,6 +172,27 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _count_structured_response_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    reasoning_text: str,
+    answer_text: str,
+) -> tuple[int, int] | None:
+    """Count tokens in Gym-extracted reasoning and answer text."""
+    reasoning_text = reasoning_text.strip()
+    answer_text = answer_text.strip()
+    if not reasoning_text and not answer_text:
+        return None
+    return (
+        len(tokenizer.encode(reasoning_text, add_special_tokens=False))
+        if reasoning_text
+        else 0,
+        len(tokenizer.encode(answer_text, add_special_tokens=False))
+        if answer_text
+        else 0,
+    )
 
 
 def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
@@ -775,6 +808,9 @@ def get_nemo_gym_venv_dir() -> str | None:
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    # The bearer token the generation server requires on its OpenAI routes, handed
+    # to the Gym model server as policy_api_key. None when the server checks none.
+    policy_api_key: NotRequired[Optional[str]]
     initial_global_config_dict: Dict[str, Any]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (5000-5999) from
@@ -825,6 +861,10 @@ _POLICY_SERVER_NAME = "policy_model"
 _NG_ROLLOUT_ID_BODY_KEY = "_ng_rollout_id"
 _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
+# The generation server's bearer token travels to Gym's servers the same way as
+# the token-capture secret: as an environment interpolation each server
+# resolves in its own process, never as a value in the serialized config.
+_POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -1153,9 +1193,21 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("straggler_cutoff", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
-        initial_global_config_dict["policy_api_key"] = (
-            "dummy_key"  # No key necessary for training.
-        )
+        # The Gym model server sends this as the bearer token of every request to
+        # the generation server. A server that checks no key accepts any value, and
+        # Gym's client requires a non-empty string, hence the placeholder. A real
+        # key is not written into the config: the head server serves the merged
+        # global config unredacted (GET /global_config_dict_yaml) and server
+        # commands inline the YAML, so the config carries only the variable name
+        # and each Gym server resolves the value from its own environment (a copy
+        # of this actor's).
+        if self.cfg.get("policy_api_key"):
+            os.environ[_POLICY_API_KEY_ENV] = self.cfg["policy_api_key"]
+            initial_global_config_dict["policy_api_key"] = (
+                f"${{oc.env:{_POLICY_API_KEY_ENV}}}"
+            )
+        else:
+            initial_global_config_dict["policy_api_key"] = "dummy_key"
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
@@ -1169,8 +1221,8 @@ class NemoGym(EnvironmentInterface):
             or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
         ):
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
-                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"WARNING: Gym port range {_gym_port_low}-{_gym_port_high} is outside "
+                f"the default {DEFAULT_GYM_PORT_RANGE_LOW}-{DEFAULT_GYM_PORT_RANGE_HIGH}. "
                 f"Check the port layout in virtual_cluster.py for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
@@ -1197,7 +1249,8 @@ Depending on your data shape, you may want to change these values."""
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
-            "host": "0.0.0.0",
+            # Remote NeMo-Gym processes need a routable address, not 0.0.0.0.
+            "host": self.node_ip,
             "port": self.head_server_port,
         }
 
@@ -1349,8 +1402,10 @@ Depending on your data shape, you may want to change these values."""
         Gym does not start a process for them.
 
         Callers compare these names across actors to build the agent->shard map
-        and to catch an entry duplicated across shards. Names are all that is
-        interpreted; what an entry *means* is Gym's business.
+        and to catch an entry duplicated across shards; an unsharded job's
+        coverage check (``validate_dataset_agent_coverage``) reads them as the
+        entries a dataset row may name. Names are all that is interpreted; what
+        an entry *means* is Gym's business.
         """
         if self.rh is None:
             raise RuntimeError(
@@ -1834,6 +1889,10 @@ Depending on your data shape, you may want to change these values."""
         returned_media_sources = extract_input_media_sources_from_responses_messages(
             media_messages
         )
+        first_turn_has_additional_images = (
+            processor is not None
+            and _has_image_before_first_trainable_output(response["output"])
+        )
         initial_media_matches_raw_input = (
             bool(raw_initial_sources)
             and len(agent_initial_sources) == len(raw_initial_sources)
@@ -1856,7 +1915,62 @@ Depending on your data shape, you may want to change these values."""
             not include_initial_multimodal_data
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
+            # A tool image before the first model response shares the first
+            # trainable turn with the initial media. Keep that initial media in
+            # the actor payload so rollout-budget repair covers the complete
+            # ordered image set rather than marking a tool-only subset as
+            # authoritative.
+            and not first_turn_has_additional_images
         )
+        raw_initial_image_sources = [
+            source
+            for media_type, source in raw_initial_sources
+            if media_type == "image"
+        ]
+        parity_processor = (
+            processor
+            if processor is not None
+            and supports_image_placeholder_run_parity(processor)
+            else None
+        )
+        # Dedup omission is only safe when the statically-budgeted tensors the
+        # driver pre-attached provably match the rollout's per-image expansion.
+        # vLLM sizes image tiles per request, so budget-bound rows must instead
+        # be attached here using the rollout token counts.
+        if (
+            initial_multimodal_data_omitted
+            and parity_processor is not None
+            and raw_initial_image_sources
+            and len(raw_initial_image_sources) == len(raw_initial_sources)
+        ):
+            first_trainable_item = next(
+                (
+                    item
+                    for item in response["output"]
+                    if _is_trainable_output_item(item)
+                ),
+                None,
+            )
+            predicted = predicted_static_image_num_tokens(
+                parity_processor,
+                [
+                    image_size_from_source(source)
+                    for source in raw_initial_image_sources
+                ],
+            )
+            first_turn_runs = (
+                count_image_placeholder_runs(
+                    first_trainable_item["prompt_token_ids"], parity_processor
+                )
+                if first_trainable_item is not None
+                else []
+            )
+            if (
+                predicted is None
+                or len(first_turn_runs) < len(predicted)
+                or first_turn_runs[: len(predicted)] != predicted
+            ):
+                initial_multimodal_data_omitted = False
         if initial_multimodal_data_omitted:
             media_messages, _ = _without_initial_media_sources(
                 media_messages, raw_initial_sources
@@ -1872,8 +1986,23 @@ Depending on your data shape, you may want to change these values."""
         turn_idx = 0
 
         nemo_rl_message_log = []
+        # If a rollout's exact tiling cannot be reconstructed, remove all media
+        # from that sample and mask its loss rather than training on mismatched
+        # pixels and placeholder tokens.
+        media_geometry_failed = False
         seen_token_ids: List[int] = []
         batch_decode_items = []
+        reasoning_text = nemo_gym_result.get("reasoning_text")
+        answer_text = nemo_gym_result.get("answer_text")
+        response_token_counts = None
+        if isinstance(reasoning_text, str) and isinstance(answer_text, str):
+            response_token_counts = _count_structured_response_tokens(
+                tokenizer,
+                reasoning_text=reasoning_text,
+                answer_text=answer_text,
+            )
+            nemo_gym_result.pop("reasoning_text")
+            nemo_gym_result.pop("answer_text")
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -1961,22 +2090,48 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
             nemo_rl_message_log.append(user_message)
 
-            if processor is not None:
+            if processor is not None and not media_geometry_failed:
                 images_this_turn = (
                     per_turn_images[turn_idx] if turn_idx < len(per_turn_images) else []
                 )
-                attach_image_model_inputs_to_message(
-                    user_message,
-                    images=images_this_turn,
-                    processor=processor,
-                    # Read with a default, like _processor above: this method is
-                    # called unbound against lightweight stand-ins that define
-                    # only what they exercise, so a bare attribute access turns
-                    # an unrelated test into an AttributeError.
-                    pad_dynamic_image_shapes=getattr(
-                        self, "_pad_dynamic_image_shapes", False
-                    ),
-                )
+                expected_num_tokens: list[int] | None = None
+                if images_this_turn and parity_processor is not None:
+                    turn_runs = count_image_placeholder_runs(
+                        new_prompt_token_ids, parity_processor
+                    )
+                    omitted_leading_runs = (
+                        len(raw_initial_image_sources)
+                        if initial_multimodal_data_omitted and turn_idx == 0
+                        else 0
+                    )
+                    if len(turn_runs) != omitted_leading_runs + len(images_this_turn):
+                        raise ValueError(
+                            f"Rollout/image mismatch on NeMo Gym turn {turn_idx}: "
+                            f"the prompt delta contains {len(turn_runs)} image "
+                            f"placeholder runs but {len(images_this_turn)} images "
+                            f"were collected for this turn (plus "
+                            f"{omitted_leading_runs} deduplicated initial images). "
+                            "Refusing to train on misaligned media."
+                        )
+                    expected_num_tokens = turn_runs[omitted_leading_runs:]
+                try:
+                    attach_image_model_inputs_to_message(
+                        user_message,
+                        images=images_this_turn,
+                        processor=processor,
+                        # Some tests call this method unbound with lightweight
+                        # stand-ins, so preserve the defaulted attribute lookup.
+                        pad_dynamic_image_shapes=getattr(
+                            self, "_pad_dynamic_image_shapes", False
+                        ),
+                        expected_num_tokens_per_image=expected_num_tokens,
+                    )
+                except RolloutGeometryUnderdetermined as exc:
+                    media_geometry_failed = True
+                    print(
+                        "[NemoGym] Dropping media and masking sample: "
+                        f"turn {turn_idx}: {exc}"
+                    )
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -2064,11 +2219,33 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                         container[key], raw_initial_sources
                     )
 
-        result = {
+        if media_geometry_failed:
+            for message in nemo_rl_message_log:
+                if message.get("role") != "user":
+                    continue
+                for key in [
+                    key
+                    for key, value in message.items()
+                    if isinstance(value, PackedTensor) or key in WIRE_MULTIMODAL_FIELDS
+                ]:
+                    del message[key]
+                message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+            instance_config = nemo_gym_result.get("instance_config")
+            if not isinstance(instance_config, dict):
+                instance_config = {}
+                nemo_gym_result["instance_config"] = instance_config
+            instance_config[MASK_SAMPLE] = True
+
+        result: dict[str, Any] = {
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            "token_extraction_valid": response_token_counts is not None,
         }
+        (
+            result["reasoning_token_count"],
+            result["response_token_count"],
+        ) = response_token_counts or (None, None)
         if not include_initial_multimodal_data:
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
@@ -2186,10 +2363,17 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # Megatron Inference is always async; should_use_async_rollouts rejects
         # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
+    elif generation_config["backend"] == "trtllm":
+        # Must stay in sync with should_use_nemo_gym, which reads
+        # trtllm_cfg.expose_http_server to decide Gym owns the rollouts. Under
+        # disaggregation the server is also what the disagg frontend reaches
+        # each engine on, so there is no non-HTTP Gym path for this backend.
+        generation_config["trtllm_cfg"]["async_engine"] = True
+        generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, or megatron generation; got "
-            f"{generation_config['backend']!r}"
+            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            f"generation; got {generation_config['backend']!r}"
         )
 
     # Stop strings or token ids are not supported
@@ -2212,6 +2396,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -2229,6 +2414,9 @@ def build_nemo_gym_config(
             routed-experts carry dtype ("int8"/"int16"/"int32") for the model.
         use_fastokens: Forwarded from ``policy.tokenizer.use_fastokens`` so the
             actor patches its tokenizer the same way the driver does.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
@@ -2256,6 +2444,7 @@ def build_nemo_gym_config(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
 
@@ -2267,6 +2456,7 @@ def _build_gym_actor_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -2322,6 +2512,7 @@ def _build_gym_actor_config(
     return NemoGymConfig(
         model_name=model_name,
         base_urls=base_urls,
+        policy_api_key=policy_api_key,
         invalid_tool_call_patterns=invalid_tool_call_patterns,
         thinking_tags=thinking_tags,
         tokenizer_config=tokenizer_config,
@@ -2533,6 +2724,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -2568,6 +2760,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             token_capture=token_capture,
+            policy_api_key=policy_api_key,
         )
 
     return _build_sharded_gym_actors(
@@ -2579,6 +2772,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -2593,6 +2787,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
 
@@ -2606,6 +2801,7 @@ def _build_single_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     )
 
     actor_options: dict[str, Any] = {
@@ -2641,6 +2837,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -2724,6 +2921,7 @@ def _build_sharded_gym_actors(
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
                     token_capture=token_capture,
+                    policy_api_key=policy_api_key,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
@@ -2839,6 +3037,7 @@ def spinup_nemo_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    policy_api_key: Optional[str] = None,
 ) -> Any:
     """Spin up a single NeMo-Gym actor against the given generation server URLs.
 
@@ -2854,6 +3053,9 @@ def spinup_nemo_gym_actor(
         token_capture: Dumped ``TokenCaptureConfig`` when ledger-authoritative
             token capture is enabled, else ``None``. Forwarded to
             ``build_nemo_gym_config``.
+        policy_api_key: The bearer token the generation server requires on its
+            OpenAI routes (VllmGeneration.http_server_api_key), or None when it
+            checks none.
 
     Returns:
         The spun-up ``NemoGym`` Ray actor handle (``_spinup`` already awaited).
@@ -2879,6 +3081,7 @@ def spinup_nemo_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        policy_api_key=policy_api_key,
     ).sole_handle()
 
 
@@ -2892,21 +3095,28 @@ def validate_dataset_agent_coverage(
     Without this scan, a rare route can sit unseen for hours of training before
     its first dispatch fails.
 
-    Unsharded jobs are skipped: there is one actor, every route resolves to it,
-    and there is nothing a scan could discover.
+    A sharded job checks against the route map built at setup. An unsharded
+    job has one actor and no route map, so it asks that actor which entries
+    its resolved Gym config spawned and keeps the routable ones, agents and
+    resources servers, exactly as the sharded route map does. A model or
+    environment server is never a route, on one actor or on many.
 
     Args:
-        shard_set: The running actors, carrying the route map built at setup.
+        shard_set: The running actors. A sharded set carries the route map
+            built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
     """
-    if not shard_set.is_sharded:
-        return
-
-    hosted = shard_set.hosted_routes
+    if shard_set.is_sharded:
+        hosted = shard_set.hosted_routes
+    else:
+        # The same filter the sharded route map applies; with one shard its
+        # duplicate checks are vacuous, so only the routable-type rule remains.
+        entries = ray.get(shard_set.all_handles[0].list_entries.remote())
+        hosted = frozenset(build_route_shard_map({DEFAULT_SHARD_NAME: entries}))
     for split, dataset in datasets.items():
         unhosted = sorted(_iter_dataset_agent_names(dataset) - hosted)
         if unhosted:
@@ -2919,9 +3129,8 @@ def validate_dataset_agent_coverage(
 def _iter_dataset_agent_names(dataset: Any) -> set[str]:
     """Collect the agent or task-source names a dataset's rows reference.
 
-    Sharded jobs lazily scan each stable source file once.
-    Unsharded jobs never call this function.
-    Custom or changed sources retain the row-scan fallback.
+    A stable source file is scanned once and its names cached; a custom or
+    changed source falls back to scanning the loaded rows.
     """
     if dataset is None:
         return set()

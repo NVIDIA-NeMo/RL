@@ -44,6 +44,7 @@ from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.models.generation import (
     configure_generation_config,
+    draft_full_refit_enabled,
     maybe_configure_engine_reaping_env,
 )
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
@@ -177,6 +178,9 @@ def main() -> None:
                     tokenizer,
                     has_refit_draft_weights=has_refit_draft_weights,
                     trains_mtp=trains_mtp,
+                    # Only used by Automodel draft co-training; SC supports only the
+                    # Megatron train backend today, so this is always False here.
+                    draft_full_refit=draft_full_refit_enabled(config.policy),
                 )
 
             # Its own phase rather than part of the tokenizer block: it resolves

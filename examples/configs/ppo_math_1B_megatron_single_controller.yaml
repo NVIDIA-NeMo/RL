@@ -39,7 +39,7 @@ async_rl:
     # throughout. Buffer capacity below must cover the wider of the two.
     warmup_lookahead_versions: null
   # Recompute generation KV caches after each weight update.
-  recompute_kv_cache_after_weight_updates: false
+  recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
   # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
   # Value training stays full batch.
@@ -199,6 +199,8 @@ policy:
   # PPO's pre-critic offload is handled separately by offload_to_cpu or
   # pause_train_step_with_offloading.
   offload_optimizer_for_logprob: true
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false
@@ -209,13 +211,13 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 
   generation:
     # HTTP ports use the shared [3000, 4999) virtual-cluster defaults.
     mcore_generation_config:
-      unified_memory_level: 0
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
       prefix_caching_mamba_gb: null

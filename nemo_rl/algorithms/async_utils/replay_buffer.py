@@ -41,7 +41,6 @@ from typing import (
 )
 
 import ray
-import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
@@ -58,6 +57,7 @@ from nemo_rl.experience.interfaces import (
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.utils.path_utils import load_checkpoint_object, save_checkpoint_object
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -716,7 +716,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     def save_to_path(self, path: str) -> int:
         """Serialize inside the actor without materializing the buffer on the driver."""
         state = self.state_dict()
-        torch.save(state, path)
+        save_checkpoint_object(state, path)
         num_trajectories = len(state["trajectories"])
         del state
         gc.collect()
@@ -742,7 +742,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             groups that survived filtering — what a frontier-aligned resume
             must not regenerate).
         """
-        state = torch.load(path, weights_only=False)
+        state = load_checkpoint_object(path, weights_only=False)
         saved_task_indices = [
             int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
             for trajectory in state.get("trajectories", [])
@@ -1026,8 +1026,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         num_prompts_per_step: int,
         max_age_steps: int | None = None,
     ) -> int:
-        """Return additional trajectories needed for ``target_step``."""
+        """Return additional trajectories needed for an unconsumed ``target_step``."""
         with self._lock:
+            # Training may consume the target after the collector reads the
+            # frontier. An empty consumed target must not become new work.
+            if target_step <= self.last_target_weight_already_generated:
+                return 0
             current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 

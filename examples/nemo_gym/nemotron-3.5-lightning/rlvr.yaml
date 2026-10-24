@@ -21,6 +21,8 @@
 # Effective policy generation parallelism is TP=4, EP=1.
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster (training + generation actors; Gym nodes are allocated separately)
 # =============================================================================
@@ -145,6 +147,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false

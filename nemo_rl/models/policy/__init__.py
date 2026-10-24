@@ -17,7 +17,12 @@ from typing import Any, Literal, NotRequired, TypedDict, Union
 from pydantic import BaseModel
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.draft_config import (
+    DFlashDraftConfig,
+    DraftConfig,
+    DSparkDraftConfig,
+    Eagle3DraftConfig,
+)
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
@@ -38,21 +43,21 @@ def _patch_transformers_tokenizer_class_set():
 
     Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
     per process the first time any policy code is imported -- covers the driver
-    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
-    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron and Automodel
+    both import from nemo_rl.models.policy) without polluting nemo_rl
     consumers that don't touch tokenizers.
     """
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.12.1 still ships both registry entries, so the patch remains
+    # Transformers 5.16.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
     # https://github.com/NVIDIA-NeMo/RL/issues/2764
-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.20.0"), (
         f"transformers {transformers.__version__} detected. "
-        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+        "The deepseek_v3 tokenizer-blocklist patch was verified against <5.20. "
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
@@ -185,7 +190,7 @@ class MoEParallelizerOptions(TypedDict):
 
 
 class AutomodelCheckpointConfig(TypedDict, total=False):
-    """Automodel checkpoint settings used by DTensor v2."""
+    """Automodel checkpoint settings."""
 
     model_save_format: Literal["torch_save", "safetensors"] | None
     save_consolidated: Literal["false", "final", "every"]
@@ -217,6 +222,9 @@ class AutomodelConfig(TypedDict):
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
     checkpoint: NotRequired[AutomodelCheckpointConfig]
+    # Bitwise-reproducible forward/backward via deterministic kernels, at some
+    # step-time cost. Applies to policy workers only.
+    deterministic: NotRequired[bool]
 
 
 class SequencePackingConfigDisabled(TypedDict):
@@ -379,6 +387,15 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # When True, offload_after_refit skips rerunning the full offload_before_refit
+    # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
+    # and only re-offloads the optimizer with a single allocator cleanup.
+    # When True, the reference-policy swap in use_reference_model stages the
+    # active weights in persistent pinned CPU buffers and keeps the reference
+    # state dict pinned from setup, so the three per-step full-model PCIe
+    # transfers run as non-blocking pinned copies instead of pageable ones.
+    # Costs 2x model-size pinned host RAM per worker. Default False keeps the
+    # current pageable-copy behavior.
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
@@ -451,7 +468,7 @@ class MegatronConfig(TypedDict):
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
-    # Options: 'flashinfer', 'torch', 'vllm' (mcore default).
+    # Options: 'flashinfer', 'torch', 'vllm'.
     inference_grouped_gemm_backend: NotRequired[str]
     # Fixed decode row capacity for the FlashInfer routed-MXFP8 MoE path. Without it
     # every decode step processes the full NVLS dispatcher buffer
@@ -502,6 +519,14 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Collective timeout (minutes) for the default process group and the
+    # Megatron model-parallel and replica groups. Raise it when one rank can stall for
+    # longer than the default, e.g. a dist-checkpoint shard write on a slow
+    # shared filesystem holds up the save-finalize / load collectives.
+    # Omitted or None: the torch.distributed / Megatron Bridge default (10 min).
+    # Set it in every megatron_cfg that runs Megatron workers (in PPO, both
+    # policy and value).
+    distributed_timeout_minutes: NotRequired[float | None]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
@@ -585,6 +610,12 @@ class MegatronConfig(TypedDict):
     flash_attention_version: NotRequired[Literal[2, 3, 4] | None]
     # flag to enable zero train/gen KL with generation.backend='megatron'.
     zero_train_gen_mismatch: NotRequired[bool]
+
+
+# Block drafters propose a whole anchored block per step and exist only on
+# the Automodel co-training path; eagle3 additionally runs on Megatron.
+BLOCK_DRAFT_ALGOS = ("dspark", "dflash")
+DRAFT_ALGOS = ("eagle3", *BLOCK_DRAFT_ALGOS)
 
 
 class TokenizerConfig(TypedDict):
@@ -687,7 +718,7 @@ class PolicyConfig(TypedDict):
     reward_model_cfg: NotRequired[RewardModelConfig]
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
-    draft: NotRequired[Eagle3DraftConfig]
+    draft: NotRequired[DraftConfig]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     # Resolved once by the driver and carried to the student workers and (via
     # deepcopy) to the teacher group. Absent means full-vocabulary MOPD is off.
@@ -701,6 +732,10 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the AutomodelPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float | int]
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: bool
+    # Move optimizer state to CPU when offload_before_refit runs.
+    offload_optimizer_for_refit: bool
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

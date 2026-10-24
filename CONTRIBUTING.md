@@ -8,7 +8,7 @@ Thanks for your interest in contributing to NeMo RL!
 
 1. **Build and run the Docker container**:
 ```sh
-docker buildx build -t nemo-rl:latest -f Dockerfile .
+docker buildx build -t nemo-rl:latest -f docker/Dockerfile .
 ```
 
 To start a shell in the container to interactively run/develop:
@@ -172,7 +172,7 @@ Quality documentation is essential for both the usability of NeMo RL and its abi
 
 ## Code Quality
 
-- Follow the coding guidelines in [`.claude/skills/`](.claude/skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
+- Follow the coding guidelines in [`skills/`](skills/) — each skill covers a specific topic (style, config conventions, error handling, testing, copyright, docs)
 - Write tests for new features
 - Update documentation to reflect your changes
 - Ensure all tests pass before submitting a PR
@@ -247,7 +247,7 @@ owner, member, or collaborator. Other commenters, bots, and quoted mentions
 do not trigger a notice. These commands never run or automatically request a review.
 
 Repository review guidance remains in AGENTS.md and
-[the existing team-review skill](.agents/contributor-skills/review-pr-team/SKILL.md).
+[the existing team-review skill](skills/review-pr-team/SKILL.md).
 The local `/review-pr` and `/review-pr-team` workflows are unchanged.
 Before relying on repository-specific formal reviews, verify the service's
 profile registration and a Ready snapshot of the protected-main guidance.

@@ -287,6 +287,10 @@ class SyncRolloutActor:
         fb = final_batch.to("cpu")
         del final_batch
 
+        # Measure generated turns before flattening backfills generation_logprobs
+        # on prompt history. These decomposed fields are only for driver_carry.
+        decomposed = decompose_message_log(fb["message_log"])
+
         # Flatten message_log → bulk tensors.
         # GRPO masks only generated assistant turns, even if the dataset
         # prompt itself contains assistant messages as conversation history.
@@ -339,10 +343,6 @@ class SyncRolloutActor:
         # (kv_first_write wraps it via NonTensorStack).
         if "content" in flat:
             bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
-
-        # Decomposed only for ``driver_carry``; turn_* and the non-tensor fb
-        # columns are not written to TQ (no reader fetches them).
-        decomposed = decompose_message_log(fb["message_log"])
 
         # Slice — only what the driver can't derive from a TQ slice fetch
         # (anything containing `message_log` or per-token data would
