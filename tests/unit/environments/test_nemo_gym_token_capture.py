@@ -39,7 +39,11 @@ def _digest(label: str) -> str:
 
 @pytest.mark.parametrize(
     ("generation_backend", "expected"),
-    [("vllm", "vllm_worker"), ("megatron", "megatron_worker")],
+    [
+        ("vllm", "vllm_worker"),
+        ("megatron", "megatron_worker"),
+        ("dynamo", "dynamo_worker"),
+    ],
 )
 def test_external_staging_backend_maps_generation_backend(
     generation_backend: str, expected: str
@@ -572,8 +576,11 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert should_use_nemo_gym(config) is True
 
 
-def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None:
-    """Dynamo serves Gym through the vllm_cfg HTTP server settings."""
+@pytest.mark.parametrize("dynamo", [False, True])
+def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
+    dynamo: bool,
+) -> None:
+    """With Dynamo, Gym's policy model calls the frontend in Gym's Dynamo dialect."""
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.environments.nemo_gym import (
         setup_nemo_gym_config,
@@ -584,7 +591,8 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
         env={"should_use_nemo_gym": True},
         policy={
             "generation": {
-                "backend": "dynamo",
+                "backend": "vllm",
+                "dynamo": dynamo,
                 "vllm_cfg": {"async_engine": False, "expose_http_server": False},
             }
         },
@@ -596,3 +604,66 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
     assert should_use_nemo_gym(config) is True
+    policy_model = config.env["nemo_gym"].get("policy_model") if dynamo else None
+    if dynamo:
+        assert policy_model["responses_api_models"]["vllm_model"] == {
+            "dynamo_frontend": True,
+            # The frontend refuses reasoning under both of Gym's keys.
+            "reasoning_field": "reasoning_content",
+        }
+    else:
+        assert "nemo_gym" not in config.env
+
+
+@pytest.mark.parametrize(
+    ("vllm_model", "expected"),
+    [
+        ({}, {"enable_thinking": True, "truncate_history_thinking": False}),
+        (
+            {"chat_template_kwargs": {"enable_thinking": False}},
+            {"enable_thinking": False, "truncate_history_thinking": False},
+        ),
+        (
+            {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
+            {
+                "enable_thinking": True,
+                "truncate_history_thinking": False,
+                "force_nonempty_content": True,
+            },
+        ),
+    ],
+)
+def test_setup_nemo_gym_config_dynamo_sends_the_native_default_template_kwargs(
+    vllm_model: dict, expected: dict
+) -> None:
+    """The native server's default template kwargs sit under the ones Gym sends."""
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+
+    config = MasterConfig.model_construct(
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "policy_model": {"responses_api_models": {"vllm_model": vllm_model}}
+            },
+        },
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {
+                            "enable_thinking": True,
+                            "truncate_history_thinking": False,
+                        }
+                    },
+                },
+            }
+        },
+    )
+
+    setup_nemo_gym_config(config, tokenizer=None)
+
+    assert vllm_model["chat_template_kwargs"] == expected

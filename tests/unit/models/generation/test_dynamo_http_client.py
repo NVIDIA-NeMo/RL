@@ -13,29 +13,12 @@
 # limitations under the License.
 
 import asyncio
-import io
-import json
-import urllib.error
 
 import aiohttp
 import pytest
 
-from nemo_rl.models.generation.dynamo import dynamo_generation as generation_module
 from nemo_rl.models.generation.dynamo import http_client
-
-
-class _SyncResponse:
-    def __init__(self, body: bytes):
-        self._body = body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return None
-
-    def read(self) -> bytes:
-        return self._body
+from nemo_rl.models.generation.dynamo.rollout_client import _is_retryable
 
 
 class _AsyncResponse:
@@ -72,89 +55,6 @@ class _AsyncSession:
         return self._response
 
 
-def _sync_post(monkeypatch, result):
-    def fake_urlopen(request, timeout):
-        if isinstance(result, BaseException):
-            raise result
-        return _SyncResponse(result)
-
-    monkeypatch.setattr(http_client.urllib.request, "urlopen", fake_urlopen)
-    return http_client.http_post_json("http://worker/route", {"value": 1}, 3)
-
-
-def test_http_post_json_success_preserves_request_contract(monkeypatch) -> None:
-    captured = {}
-
-    def fake_urlopen(request, timeout):
-        captured["request"] = request
-        captured["timeout"] = timeout
-        return _SyncResponse(b'{"status":"ok"}')
-
-    monkeypatch.setattr(http_client.urllib.request, "urlopen", fake_urlopen)
-
-    response = http_client.http_post_json(
-        "http://worker/route", {"value": 1}, timeout_s=3
-    )
-
-    request = captured["request"]
-    assert response == {"status": "ok"}
-    assert request.full_url == "http://worker/route"
-    assert request.get_method() == "POST"
-    assert json.loads(request.data) == {"value": 1}
-    assert captured["timeout"] == 3
-
-
-@pytest.mark.parametrize(
-    ("body", "expected"),
-    [
-        (
-            b"not-json",
-            {"status": "error", "json_decode_error": True, "raw": "not-json"},
-        ),
-        (b"[1, 2]", {"status": "error", "raw": "[1, 2]"}),
-    ],
-)
-def test_http_post_json_rejects_invalid_json_shapes(
-    monkeypatch, body, expected
-) -> None:
-    assert _sync_post(monkeypatch, body) == expected
-
-
-@pytest.mark.parametrize(
-    ("error", "retryable", "message"),
-    [
-        (
-            urllib.error.HTTPError(
-                "http://worker/route",
-                503,
-                "unavailable",
-                hdrs=None,
-                fp=io.BytesIO(b"try later"),
-            ),
-            True,
-            "HTTP 503: try later",
-        ),
-        (
-            urllib.error.HTTPError(
-                "http://worker/route", 400, "bad request", hdrs=None, fp=None
-            ),
-            False,
-            "HTTP 400: ",
-        ),
-        (urllib.error.URLError("refused"), True, "URLError"),
-        (TimeoutError("slow"), True, "TimeoutError"),
-    ],
-)
-def test_http_errors_round_trip_through_consumers(
-    monkeypatch, error, retryable, message
-) -> None:
-    response = _sync_post(monkeypatch, error)
-
-    assert response["status"] == "error"
-    assert generation_module._is_retryable_http_response(response) is retryable
-    assert message in http_client.format_dynamo_error(response)
-
-
 @pytest.mark.parametrize(
     ("body", "status", "expected", "retryable"),
     [
@@ -173,7 +73,7 @@ def test_http_errors_round_trip_through_consumers(
         ),
     ],
 )
-def test_async_http_post_json_uses_same_error_contract(
+def test_async_http_post_json_error_contract(
     monkeypatch, body, status, expected, retryable
 ) -> None:
     session = _AsyncSession(_AsyncResponse(body, status))
@@ -190,14 +90,22 @@ def test_async_http_post_json_uses_same_error_contract(
     )
 
     assert response == expected
-    assert generation_module._is_retryable_http_response(response) is retryable
+    assert _is_retryable(response) is retryable
+    if response.get("status") == "error":
+        assert expected["raw"] in http_client.format_dynamo_error(response)
     assert session.requests == [("http://worker/route", {"value": 1})]
 
 
 @pytest.mark.parametrize(
-    "error", [aiohttp.ClientConnectionError("refused"), TimeoutError("slow")]
+    ("error", "key", "retryable"),
+    [
+        (aiohttp.ClientConnectionError("refused"), "transport_error", True),
+        # One request_timeout_s bounds a rollout: a timeout is not retried.
+        (TimeoutError("slow"), "timeout_error", False),
+        (aiohttp.ServerTimeoutError("slow read"), "timeout_error", False),
+    ],
 )
-def test_async_http_transport_errors_are_retryable(monkeypatch, error) -> None:
+def test_async_http_transport_errors(monkeypatch, error, key, retryable) -> None:
     session = _AsyncSession(error=error)
     monkeypatch.setattr(
         http_client.aiohttp,
@@ -212,5 +120,6 @@ def test_async_http_transport_errors_are_retryable(monkeypatch, error) -> None:
     )
 
     assert response["status"] == "error"
-    assert generation_module._is_retryable_http_response(response)
-    assert "transport_error" in response
+    assert _is_retryable(response) is retryable
+    assert key in response
+    assert response[key] in http_client.format_dynamo_error(response)

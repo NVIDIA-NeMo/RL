@@ -113,6 +113,10 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
     if [[ "$*" == *token_capture.enabled=true* ]]; then
         # Nonzero only when a finalizer actor ran, i.e. capture really was on.
         EXTRA_CHECKS+=('max(data["train/finalize/total_ms"]) > 0')
+        if [[ "$*" == *router_replay.enabled=true* ]]; then
+            # Every captured row carries routed experts for the policy to replay.
+            EXTRA_CHECKS+=('min(data["train/finalize/routed_experts_row_coverage"]) == 1')
+        fi
     fi
 
     # Observed to be between 0.8-1.3
@@ -120,4 +124,8 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
         'median(data["train/gen_kl_error"]) < 1.3' \
         'max(data["train/reward"]) > 0' \
         "${EXTRA_CHECKS[@]}"
+fi
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash $SCRIPT_DIR/check_dynamo_overlay.sh $RUN_LOG
 fi

@@ -12,11 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Small HTTP client helpers shared by managed Dynamo components."""
+"""HTTP helpers for requests to the managed Dynamo frontend."""
 
 import json
-import urllib.error
-import urllib.request
 from typing import Any
 
 import aiohttp
@@ -37,31 +35,6 @@ def _decode_json_object(body: bytes) -> dict[str, Any]:
     return decoded
 
 
-def http_post_json(
-    url: str, payload: dict[str, Any], timeout_s: float
-) -> dict[str, Any]:
-    """POST JSON and return either the decoded object or an error object."""
-    data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_s) as response:
-            body = response.read()
-    except urllib.error.HTTPError as error:
-        raw = error.read().decode("utf-8", "replace") if error.fp else ""
-        return {"status": "error", "http_status": error.code, "raw": raw}
-    except (urllib.error.URLError, TimeoutError) as error:
-        return {
-            "status": "error",
-            "transport_error": f"{type(error).__name__}: {error}",
-        }
-    return _decode_json_object(body)
-
-
 async def async_http_post_json(
     url: str, payload: dict[str, Any], timeout_s: float
 ) -> dict[str, Any]:
@@ -77,7 +50,13 @@ async def async_http_post_json(
                         "http_status": response.status,
                         "raw": body.decode("utf-8", "replace"),
                     }
-    except (aiohttp.ClientError, TimeoutError) as error:
+    except TimeoutError:
+        # Before ClientError: aiohttp's ServerTimeoutError is both.
+        return {
+            "status": "error",
+            "timeout_error": f"no response within {timeout_s}s",
+        }
+    except aiohttp.ClientError as error:
         return {
             "status": "error",
             "transport_error": f"{type(error).__name__}: {error}",
@@ -86,11 +65,13 @@ async def async_http_post_json(
 
 
 def format_dynamo_error(response: dict[str, Any]) -> str:
-    """Format an error object returned by :func:`http_post_json`."""
+    """Format an error object returned by :func:`async_http_post_json`."""
     if "http_status" in response:
         return f"HTTP {response['http_status']}: {response.get('raw', '')}"
     if "transport_error" in response:
         return str(response["transport_error"])
+    if "timeout_error" in response:
+        return str(response["timeout_error"])
     if "raw" in response:
         return str(response["raw"])
     return str(response)

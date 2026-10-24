@@ -380,3 +380,46 @@ def test_dynamo_frontend_args_without_router_reset_states_pass():
 
 def test_generation_without_dynamo_cfg_passes():
     check_outdated_config({"policy": {"generation": {"backend": "vllm"}}})
+
+
+# ============================================================================
+# reject_outdated_dynamo_backend
+# ============================================================================
+
+
+def _generation_config(**generation) -> dict:
+    return {"policy": {"generation": generation}}
+
+
+def test_dynamo_backend_is_rejected_with_the_migration():
+    with pytest.raises(
+        ValueError, match=r"backend=vllm and policy\.generation\.dynamo=true"
+    ):
+        check_outdated_config(_generation_config(backend="dynamo"))
+
+
+@pytest.mark.parametrize(
+    "dynamo_cfg, removed",
+    [
+        ({"engine": "vllm"}, r"dynamo_cfg\.engine"),
+        ({"control_timeout_s": 600}, r"dynamo_cfg\.control_timeout_s"),
+        ({"metrics_include_prefixes": None}, r"dynamo_cfg\.metrics_include_prefixes"),
+        ({"metrics_exclude_prefixes": None}, r"dynamo_cfg\.metrics_exclude_prefixes"),
+        ({"worker_args": {"extra_cli_args": []}}, r"worker_args\.extra_cli_args"),
+    ],
+)
+def test_removed_dynamo_cfg_keys_are_rejected(dynamo_cfg, removed):
+    with pytest.raises(ValueError, match=removed):
+        check_outdated_config(
+            _generation_config(backend="vllm", dynamo=True, dynamo_cfg=dynamo_cfg)
+        )
+
+
+def test_vllm_backend_with_dynamo_passes():
+    check_outdated_config(
+        _generation_config(
+            backend="vllm",
+            dynamo=True,
+            dynamo_cfg={"frontend_args": {"router_mode": "kv"}},
+        )
+    )

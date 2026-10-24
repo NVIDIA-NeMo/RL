@@ -157,3 +157,7 @@ uv run --no-sync tests/check_metrics.py "${JSON_METRICS}" \
     'min(data["train/finalize/media_row_rate"]) == 1' \
     'max(data["train/gen_kl_error"]) < 0.05' \
     'all_finite(data["train/reward"])'
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash "${SCRIPT_DIR}/check_dynamo_overlay.sh" "${RUN_LOG}"
+fi

@@ -82,26 +82,11 @@ policy:
   sequence_packing:
     fuse_loss: true
   generation:
-    backend: dynamo
+    backend: vllm
+    dynamo: true
     dynamo_cfg:
-      engine: vllm
       startup_timeout_s: 1800
       request_timeout_s: 7200
-      control_timeout_s: 600
-      metrics_include_prefixes: null
-      metrics_exclude_prefixes: null
-      worker_args:
-        tool_call_parser: qwen3_coder
-        reasoning_parser: nemotron_nano
-        exclude_tools_when_tool_choice_none: true
-        enable_structural_tag: false
-        structural_tag_scope: auto
-        structural_tag_schema: auto
-        custom_jinja_template: null
-        endpoint_types:
-        - chat
-        - completions
-        extra_cli_args: []
       frontend_args:
         tokenizer: fastokens
         tokenizer_cache: true
@@ -115,8 +100,6 @@ policy:
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
       env_vars: null
-      reasoning_parser_plugin: null
-      http_server_serving_chat_kwargs: null
     vllm_kwargs:
       attention_backend: FLASH_ATTN
       moe_backend: triton

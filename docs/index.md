@@ -79,11 +79,11 @@ Measure model and agent capabilities with repeatable benchmarks and custom evalu
 Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
-:::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
+:::{grid-item-card} {octicon}`workflow` Dynamo Serving
 :link: guides/dynamo-generation
 :link-type: doc
 
-Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+Serve any vLLM generation config through Dynamo's frontend and KV-aware router with `dynamo: true`.
 :::
 
 ::::

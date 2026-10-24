@@ -31,7 +31,7 @@ from nemo_rl.telemetry.vocabulary import (
 # Engine series surfaced per step, beyond the spec-decode family. These are the
 # family names vLLM registers (vllm/v1/metrics/loggers.py); its reader returns
 # family names, which prometheus_client strips of ``_total``, so no suffixed
-# alias is needed here (unlike the HTTP-scrape path in dynamo/metrics.py).
+# alias is needed here.
 # test_engine_metric_names_match_vllm checks these against vLLM itself.
 PROMPT_TOKEN_COUNTERS = ("vllm:prompt_tokens",)
 GENERATION_TOKEN_COUNTERS = ("vllm:generation_tokens",)

@@ -13,16 +13,16 @@
 # limitations under the License.
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
-    DynamoConfig,
     DynamoFrontendArgs,
     DynamoWorkerArgs,
+    dynamo_cfg,
+    dynamo_enabled,
 )
-from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
 
 __all__ = [
     "DynamoCfg",
-    "DynamoConfig",
     "DynamoFrontendArgs",
-    "DynamoGeneration",
     "DynamoWorkerArgs",
+    "dynamo_cfg",
+    "dynamo_enabled",
 ]

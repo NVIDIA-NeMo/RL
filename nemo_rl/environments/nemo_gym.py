@@ -92,6 +92,10 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.models.generation.dynamo.config import (
+    dynamo_enabled,
+    native_default_chat_template_kwargs,
+)
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -300,10 +304,6 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         should_expose_http_server = generation_config.get("trtllm_cfg", {}).get(
             "expose_http_server"
         )
-    elif generation_config["backend"] == "dynamo":
-        should_expose_http_server = generation_config.get("vllm_cfg", {}).get(
-            "expose_http_server"
-        )
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -446,9 +446,11 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
+    if generation_backend == "dynamo":
+        return "dynamo_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'dynamo'; got {generation_backend!r}"
     )
 
 
@@ -1870,8 +1872,7 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the backend's OpenAI-compatible server.
-    if generation_config["backend"] in ("vllm", "dynamo"):
-        # Dynamo uses these flags to expose its token wrapper to Gym.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
     elif generation_config["backend"] == "megatron":
@@ -1887,13 +1888,36 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         generation_config["trtllm_cfg"]["expose_http_server"] = True
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, megatron, or trtllm "
             f"generation; got {generation_config['backend']!r}"
         )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    if dynamo_enabled(generation_config):
+        # Gym's policy model calls the Dynamo frontend, which takes token data in
+        # nvext (Gym's Dynamo dialect) instead of vLLM's request extensions.
+        vllm_model = (
+            config.env.setdefault("nemo_gym", {})
+            .setdefault("policy_model", {})
+            .setdefault("responses_api_models", {})
+            .setdefault("vllm_model", {})
+        )
+        vllm_model["dynamo_frontend"] = True
+        # The frontend reads `reasoning` as another name for `reasoning_content` and
+        # refuses an echoed assistant turn that carries both, Gym's default.
+        vllm_model.setdefault("reasoning_field", "reasoning_content")
+        # The native server merges these under every request's own template
+        # kwargs; the frontend has no such default, so Gym sends them. They sit
+        # under the kwargs Gym sends: vllm_model's own, else extra_body's.
+        default_kwargs = native_default_chat_template_kwargs(generation_config)
+        if default_kwargs:
+            gym_kwargs = vllm_model.get("chat_template_kwargs") or (
+                (vllm_model.get("extra_body") or {}).get("chat_template_kwargs") or {}
+            )
+            vllm_model["chat_template_kwargs"] = {**default_kwargs, **gym_kwargs}
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for

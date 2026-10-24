@@ -289,9 +289,6 @@ def should_use_async_rollouts(
         return False
     backend = generation_config.get("backend", "")
 
-    if backend == "dynamo":
-        return True
-
     if backend == "sglang":
         return bool(generation_config.get("use_async_rollouts", False))
 

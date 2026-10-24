@@ -187,7 +187,7 @@ The counters carry the step's delta, so summing them across steps reconstructs t
 
 **What counts as failed.** vLLM's finish reasons are `stop`, `length`, `abort`, `error` and `repetition`. Only `stop` and `length` leave a usable sample behind, and `length` is a normal RL outcome — a rollout routinely runs to `max_tokens` — so those two are `ok` and *everything else* is `failed`. Counting the remainder rather than an explicit deny-list keeps `ok + failed` equal to the engine's own total even if a future vLLM adds a reason we have not heard of.
 
-These are the family names vLLM registers. The reader returns family names, which `prometheus_client` strips of `_total`, so no suffixed alias is needed on this path — unlike the HTTP-scrape path in `nemo_rl/models/generation/dynamo/metrics.py`, where sample names do carry it. `test_engine_metric_names_match_vllm` checks the copies against vLLM itself. A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero, and so is one whose total went backwards, which means an engine restarted mid-step.
+These are the family names vLLM registers. The reader returns family names, which `prometheus_client` strips of `_total`, so no suffixed alias is needed on this path. `test_engine_metric_names_match_vllm` checks the copies against vLLM itself. A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero, and so is one whose total went backwards, which means an engine restarted mid-step.
 
 ## Driver-side generation metrics (`gen_ai.*`)
 

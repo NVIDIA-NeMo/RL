@@ -380,7 +380,7 @@ def test_vllm_generation_rejects_unregistered_worker_extension(
     cluster._init_placement_groups.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm"])
 def test_generation_config_rejects_worker_extension_for_other_backends(
     backend: str,
 ) -> None:
@@ -392,7 +392,7 @@ def test_generation_config_rejects_worker_extension_for_other_backends(
         configure_generation_config(config, MagicMock())
 
 
-@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm"])
 @pytest.mark.parametrize("include_null", [False, True])
 def test_generation_config_allows_no_worker_extension(
     backend: str,
@@ -2425,6 +2425,63 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     master_config = types.SimpleNamespace(policy={"generation": vllm_config})
 
     VllmGeneration.validate_settings(master_config)
+
+
+def _dynamo_master_config(
+    *,
+    router=False,
+    fleet_health=False,
+    nemo_gym=True,
+    router_replay=False,
+    token_capture=False,
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["dynamo"] = True
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    vllm_config["vllm_cfg"]["expose_http_server"] = True
+    return types.SimpleNamespace(
+        policy={"generation": vllm_config, "router_replay": {"enabled": router_replay}},
+        env={"should_use_nemo_gym": nemo_gym},
+        async_rl=types.SimpleNamespace(
+            generation_router=types.SimpleNamespace(enabled=router),
+            generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
+        ),
+        token_capture=types.SimpleNamespace(enabled=token_capture),
+    )
+
+
+def test_vllm_validate_settings_accepts_dynamo_with_nemo_gym():
+    VllmGeneration.validate_settings(_dynamo_master_config())
+    VllmGeneration.validate_settings(
+        _dynamo_master_config(router_replay=True, token_capture=True)
+    )
+    VllmGeneration.validate_settings(
+        _dynamo_master_config(router_replay=True, nemo_gym=False)
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        ({"router": True}, "routes the whole fleet behind one URL"),
+        ({"fleet_health": True}, "Disable fleet health"),
+        ({"router_replay": True}, "requires token_capture.enabled=true"),
+    ],
+)
+def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):
+    with pytest.raises(ValueError, match=error):
+        VllmGeneration.validate_settings(_dynamo_master_config(**settings))
+
+
+@pytest.mark.parametrize("dynamo", [False, True])
+def test_vllm_client_base_urls_name_the_dynamo_frontend_when_it_serves(dynamo):
+    generation = object.__new__(VllmGeneration)
+    generation.dp_openai_server_base_urls = ["http://a/v1", "http://b/v1"]
+    generation.dynamo_frontend_url = "http://frontend/v1" if dynamo else None
+
+    assert generation.client_base_urls == (
+        ["http://frontend/v1"] if dynamo else ["http://a/v1", "http://b/v1"]
+    )
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

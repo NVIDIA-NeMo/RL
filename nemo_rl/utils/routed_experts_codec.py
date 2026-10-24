@@ -104,3 +104,11 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
         return torch.empty(shape, dtype=dtype)
     tensor = torch.frombuffer(raw, dtype=wire_dtype).reshape(shape)
     return tensor if tensor.dtype == dtype else tensor.to(dtype)
+
+
+def routed_experts_envelope_dtype(payload: str) -> torch.dtype:
+    """The dtype a base64 envelope was encoded with."""
+    parts = payload.split(":", 2)
+    if len(parts) != 3 or parts[0] != _MAGIC or parts[1] not in _WIRE_TORCH_DTYPES:
+        raise ValueError("routed_experts payload is not a valid envelope.")
+    return _WIRE_TORCH_DTYPES[parts[1]]

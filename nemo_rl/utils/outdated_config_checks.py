@@ -201,6 +201,57 @@ def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
         )
 
 
+# Keys of the managed dynamo.vllm backend's dynamo_cfg with no counterpart now that
+# Dynamo serves NeMo RL's own vLLM workers, and what replaces each.
+_REMOVED_DYNAMO_CFG_KEYS = {
+    "engine": "Dynamo always serves the vLLM backend's workers",
+    "control_timeout_s": "refit and pause use the vLLM backend's own controls",
+    "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+    "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
+}
+
+
+def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
+    """Fail on the removed ``backend: dynamo`` and its dynamo_cfg keys.
+
+    Dynamo now serves NeMo RL's own vLLM workers: ``backend: vllm`` plus
+    ``dynamo: true``. One migration, so the backend is reported first and the
+    dynamo_cfg keys that no longer exist with it.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if not isinstance(generation, dict):
+        return
+    problems = []
+    if generation.get("backend") == "dynamo":
+        problems.append(
+            "policy.generation.backend='dynamo' was removed: Dynamo now serves NeMo "
+            "RL's own vLLM workers. Set policy.generation.backend=vllm and "
+            "policy.generation.dynamo=true; vllm_cfg and vllm_kwargs keep their "
+            "meaning."
+        )
+    dynamo_cfg = generation.get("dynamo_cfg")
+    if isinstance(dynamo_cfg, dict):
+        for key, replacement in _REMOVED_DYNAMO_CFG_KEYS.items():
+            if key in dynamo_cfg:
+                problems.append(
+                    f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
+                )
+        worker_args = dynamo_cfg.get("worker_args")
+        if isinstance(worker_args, dict) and "extra_cli_args" in worker_args:
+            problems.append(
+                "policy.generation.dynamo_cfg.worker_args.extra_cli_args was "
+                "removed: engines are configured through vllm_cfg and vllm_kwargs."
+            )
+    if problems:
+        raise ValueError(" ".join(problems))
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -218,3 +269,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_dynamo_backend(config)

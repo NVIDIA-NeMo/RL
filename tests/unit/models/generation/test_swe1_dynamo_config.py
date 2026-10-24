@@ -8,7 +8,7 @@ from omegaconf import OmegaConf
 
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -43,9 +43,11 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
     setup_nemo_gym_config(
         SimpleNamespace(policy=config["policy"], env=config["env"]), tokenizer
     )
-    validated = DynamoConfig.model_validate(configured_generation)
-    assert validated.vllm_cfg.async_engine is True
-    assert validated.vllm_cfg.expose_http_server is True
+    vllm_cfg = configured_generation["vllm_cfg"]
+    assert configured_generation["backend"] == "vllm"
+    assert configured_generation["dynamo"] is True
+    assert vllm_cfg["async_engine"] is True
+    assert vllm_cfg["expose_http_server"] is True
 
     assert config["policy"]["model_name"] == (
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
@@ -63,12 +65,11 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
         "gpus_per_node": 8,
         "num_nodes": 1,
     }
-    assert validated.engine_world_size == 4
-    assert generation["vllm_cfg"]["expert_parallel_size"] == 4
-    assert validated.dynamo_cfg.frontend_args.router_mode == "kv"
-    assert validated.dynamo_cfg.control_timeout_s == 600
-    assert validated.vllm_cfg.enable_vllm_metrics_logger is True
-    assert validated.vllm_cfg.load_format == "dummy"
+    assert vllm_cfg["tensor_parallel_size"] * vllm_cfg["pipeline_parallel_size"] == 4
+    assert vllm_cfg["expert_parallel_size"] == 4
+    assert dynamo_cfg(configured_generation).frontend_args.router_mode == "kv"
+    assert vllm_cfg["enable_vllm_metrics_logger"] is True
+    assert vllm_cfg["load_format"] == "dummy"
     assert config["env"]["nemo_gym"]["config_paths"][-1].endswith(
         "swe_pivot_single_step_tool_use_with_argument_comparison.yaml"
     )
