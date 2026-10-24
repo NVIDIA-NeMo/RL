@@ -163,7 +163,7 @@ def sft_processor(
         datum_dict = format_clevr_cogent_dataset(datum_dict)
 
     if full_conversation:
-        if max_seq_length <= 0:
+        if max_seq_length is None or max_seq_length <= 0:
             raise ValueError(
                 "Full-conversation SFT requires a positive max_seq_length."
             )

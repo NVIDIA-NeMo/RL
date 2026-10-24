@@ -12,16 +12,140 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Full-conversation, text-only SFT formatting with explicit generation spans."""
+"""Full-conversation SFT formatting with automatic assistant loss ownership."""
 
-import re
+from collections.abc import Mapping
 from copy import deepcopy
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any
 
 import torch
+from jinja2 import Template, nodes
+from jinja2.visitor import NodeTransformer
 from transformers import PreTrainedTokenizerBase
-from transformers.utils.chat_template_utils import render_jinja_template
+from transformers.utils.chat_template_utils import (
+    _compile_jinja_template,
+    render_jinja_template,
+)
+
+
+class _MessageLoopTracker(NodeTransformer):
+    """Insert empty-output boundary callbacks without changing Jinja whitespace."""
+
+    def visit_For(self, node: nodes.For, *args: Any, **kwargs: Any) -> nodes.For:
+        self.generic_visit(node, *args, **kwargs)
+        if isinstance(node.target, nodes.Name):
+
+            def boundary(entering: bool) -> nodes.Output:
+                output = nodes.Output(
+                    [
+                        nodes.Call(
+                            nodes.Name("_nemo_sft_boundary", "load"),
+                            [
+                                nodes.Name(node.target.name, "load"),
+                                nodes.Const(entering),
+                            ],
+                            [],
+                            None,
+                            None,
+                        )
+                    ]
+                )
+                output.set_lineno(node.lineno)
+                return output
+
+            node.body = [boundary(True), *node.body, boundary(False)]
+        return node
+
+
+@lru_cache(maxsize=128)
+def _has_generation_blocks(template: str) -> bool:
+    environment = _compile_jinja_template(template).environment
+    generation_extensions = {
+        identifier
+        for identifier, extension in environment.extensions.items()
+        if "generation" in extension.tags
+    }
+    return any(
+        node.identifier in generation_extensions
+        for node in environment.parse(template).find_all(nodes.ExtensionAttribute)
+    )
+
+
+@lru_cache(maxsize=128)
+def _compile_message_tracking_template(template: str) -> Template:
+    environment = _compile_jinja_template(template).environment
+    tree = _MessageLoopTracker().visit(environment.parse(template))
+    return environment.from_string(tree)
+
+
+def _render_with_message_spans(
+    template: str,
+    messages: list[dict[str, Any]],
+    template_options: dict[str, Any],
+) -> tuple[str, list[tuple[int, int]]]:
+    """Track streamed assistant loop iterations, including headers and terminators.
+
+    Rendering is unchanged: callbacks emit empty strings, not markers in message
+    content. Loops buffered inside macros, assignments or filters cannot be
+    tracked in stream coordinates and are rejected.
+    """
+    compiled = _compile_message_tracking_template(template)
+    spans: list[tuple[int, int]] = []
+    assistant_messages = [m for m in messages if m["role"] == "assistant"]
+    position = 0
+    active: list[tuple[Any, int]] = []
+
+    def boundary(value: Any, entering: bool) -> str:
+        if not isinstance(value, Mapping) or value.get("role") != "assistant":
+            return ""
+        if entering:
+            active.append((value, position))
+        else:
+            if not active:
+                raise ValueError(
+                    "Unbalanced assistant message loop; use explicit "
+                    "{% generation %} blocks."
+                )
+            entered_value, start = active.pop()
+            if entered_value is not value:
+                raise ValueError(
+                    "The template replaced an assistant message inside its loop; "
+                    "use explicit {% generation %} blocks."
+                )
+            # Templates may scan messages for validation or history metadata
+            # before rendering them. Such loops do not own any output.
+            if start == position:
+                return ""
+            if (
+                len(spans) >= len(assistant_messages)
+                or value is not assistant_messages[len(spans)]
+            ):
+                raise ValueError(
+                    "Cannot infer assistant ownership from nested, copied or reordered "
+                    "message loops; use explicit {% generation %} blocks."
+                )
+            spans.append((start, position))
+        return ""
+
+    blocks: list[str] = []
+    render_options = {
+        "tools": None,
+        "documents": None,
+        "add_generation_prompt": False,
+        **template_options,
+    }
+    for block in compiled.generate(
+        **render_options, messages=messages, _nemo_sft_boundary=boundary
+    ):
+        blocks.append(block)
+        position += len(block)
+    if active or len(spans) != len(assistant_messages):
+        raise ValueError(
+            "Expected one rendered loop iteration per assistant message; "
+            "use explicit {% generation %} blocks for this template."
+        )
+    return "".join(blocks), spans
 
 
 def get_full_conversation_message_log(
@@ -35,11 +159,10 @@ def get_full_conversation_message_log(
 ) -> list[dict[str, str | torch.Tensor]]:
     """Render and tokenize once, separating assistant targets from context.
 
-    A template must mark each complete assistant target, including its turn
-    terminator and trailing whitespace, with one generation block. The template
-    author is responsible for model-specific terminator coverage; generation
-    ranges alone cannot establish semantic completeness. Headers may remain
-    outside the block. Returned segments are not source conversation turns;
+    Explicit generation blocks select assistant targets when present. Otherwise,
+    streamed assistant message-loop iterations select whole assistant turns,
+    including headers, matching incremental SFT without generation prompts.
+    Returned segments are not source conversation turns;
     their roles let the existing SFT mask helper select assistant targets without
     changing, retokenizing, or shifting the token sequence.
     Context segments are masked out of the training loss; assistant segments
@@ -47,7 +170,7 @@ def get_full_conversation_message_log(
 
     Args:
         messages: Text-only messages ending with an assistant target.
-        tokenizer: Fast tokenizer with an explicitly generation-marked template.
+        tokenizer: Fast tokenizer with a Jinja chat template.
         prompt: Optional format string applied to the first user message.
         tools: Tool schemas overriding configured defaults. None preserves the
             defaults; an empty list explicitly disables tools.
@@ -58,14 +181,21 @@ def get_full_conversation_message_log(
         Context/assistant segments containing contiguous slices of the full tokens.
 
     Raises:
-        ValueError: Unsupported inputs, missing/ambiguous generation spans, or
-            tokens crossing a supervision boundary.
+        ValueError: Unsupported inputs or missing/ambiguous assistant spans.
     """
     if not tokenizer.is_fast:
         raise ValueError("Full-conversation SFT requires a fast tokenizer.")
     if not messages or messages[-1].get("role") != "assistant":
         raise ValueError("Full-conversation SFT must end with an assistant target.")
-    if any(not isinstance(message.get("content"), str) for message in messages):
+    if any(
+        not isinstance(message.get("content"), str)
+        and not (
+            message.get("content") is None
+            and message.get("role") == "assistant"
+            and message.get("tool_calls")
+        )
+        for message in messages
+    ):
         raise ValueError("Full-conversation SFT supports text-only messages.")
     prepared = deepcopy(messages)
     user_indices = [
@@ -84,23 +214,51 @@ def get_full_conversation_message_log(
         template_options.update(tokenizer.apply_chat_template.keywords)
     if tools is not None:
         template_options["tools"] = tools
+    effective_tools = template_options.get("tools")
+    if effective_tools is not None and any(
+        not isinstance(tool, dict) for tool in effective_tools
+    ):
+        raise ValueError(
+            "Full-conversation SFT requires tool schemas to be dictionaries."
+        )
+    documents = template_options.get("documents")
+    if documents is not None and any(
+        not isinstance(document, dict) for document in documents
+    ):
+        raise TypeError(
+            "Documents should be a list of dicts with 'title' and 'text' keys!"
+        )
     template = tokenizer.get_chat_template(
         chat_template=template_options.get("chat_template"),
         tools=template_options.get("tools"),
     )
-    if not re.search(r"\{%-?\s*generation\s*-?%\}", template):
-        raise ValueError("Full-conversation SFT requires {% generation %} blocks.")
-    template_options.update(
-        chat_template=template,
-        return_assistant_tokens_mask=True,
-        add_generation_prompt=False,
-    )
-    template_options.pop("tokenize", None)
-    rendered_conversations, generation_spans = render_jinja_template(
-        conversations=[prepared], **template_options
-    )
-    text = rendered_conversations[0]
-    spans = generation_spans[0]
+    if template_options.get("continue_final_message"):
+        raise ValueError("Full-conversation SFT cannot continue the final message.")
+    for key in (
+        "chat_template",
+        "tokenize",
+        "return_assistant_tokens_mask",
+        "continue_final_message",
+        "return_dict",
+        "return_tensors",
+        "tokenizer_kwargs",
+        "padding",
+        "truncation",
+        "max_length",
+    ):
+        template_options.pop(key, None)
+    template_options["add_generation_prompt"] = False
+    if _has_generation_blocks(template):
+        rendered_conversations, generation_spans = render_jinja_template(
+            conversations=[prepared],
+            chat_template=template,
+            return_assistant_tokens_mask=True,
+            **template_options,
+        )
+        text = rendered_conversations[0]
+        spans = generation_spans[0]
+    else:
+        text, spans = _render_with_message_spans(template, prepared, template_options)
     if len(spans) != sum(message["role"] == "assistant" for message in prepared):
         raise ValueError("Expected exactly one generation block per assistant target.")
     previous_span_end = 0
@@ -108,23 +266,12 @@ def get_full_conversation_message_log(
         if not previous_span_end <= start < end <= len(text):
             raise ValueError("Assistant generation spans must be nonempty and ordered.")
         previous_span_end = end
-    eos_token = tokenizer.eos_token
-    if eos_token:
-        for (start, end), (next_start, _) in zip(spans, spans[1:]):
-            assistant_ends_with_eos = text[start:end].rstrip().endswith(eos_token)
-            following_context_starts_with_eos = (
-                text[end:next_start].lstrip().startswith(eos_token)
-            )
-            # After a supervised EOS, the next EOS-looking token may be a BOS.
-            if not assistant_ends_with_eos and following_context_starts_with_eos:
-                raise ValueError(
-                    "An assistant EOS terminator is outside its generation block."
-                )
-    if spans[-1][1] != len(text):
+    if text[spans[-1][1] :].strip():
         raise ValueError(
-            "The final generation block must include the assistant terminator "
-            "and all trailing whitespace."
+            "Non-whitespace content follows the final assistant span; "
+            "include the assistant terminator in its generation block or message loop."
         )
+    spans[-1] = (spans[-1][0], len(text))
     if add_eos_token:
         if tokenizer.eos_token is None:
             raise ValueError("EOS requested but the tokenizer has no EOS token.")
@@ -169,16 +316,12 @@ def get_full_conversation_message_log(
     token_cursor = 0
     next_token_targets = 0
     for start, end in spans:
-        overlaps_span = (
-            has_character_offset & (offsets[:, 1] > start) & (offsets[:, 0] < end)
+        starts_in_span = (
+            has_character_offset & (offsets[:, 0] >= start) & (offsets[:, 0] < end)
         )
-        token_indices = torch.nonzero(overlaps_span).flatten()
+        token_indices = torch.nonzero(starts_in_span).flatten()
         if not len(token_indices):
             raise ValueError("An assistant generation span has no supervised tokens.")
-        if (
-            (offsets[overlaps_span, 0] < start) | (offsets[overlaps_span, 1] > end)
-        ).any():
-            raise ValueError("A token crosses an assistant supervision boundary.")
         first_token = int(token_indices[0])
         end_token = int(token_indices[-1]) + 1
         if first_token < token_cursor:
@@ -192,6 +335,4 @@ def get_full_conversation_message_log(
         raise ValueError("The final assistant span must cover the final token.")
     if not next_token_targets:
         raise ValueError("Full-conversation SFT has no trainable next-token targets.")
-    if tokenizer.decode(tokens, clean_up_tokenization_spaces=False) != text:
-        raise ValueError("Full-conversation tokenization failed its text round trip.")
     return output

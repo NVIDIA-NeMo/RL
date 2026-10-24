@@ -30,14 +30,24 @@ uv run examples/run_sft.py \
 
 ## Datasets
 
+SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
+  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
+  2. `task_name`: A string identifier that uniquely identifies the dataset.
+
 ### Full-conversation text formatting
 
 For templates that revise earlier turns (for example, templates grouping multiple
-tool responses into one turn), prefix-by-prefix formatting can leave stale turn
-delimiters in the concatenated training text. Text-only SFT can opt into rendering
-and tokenizing each complete conversation once:
+tool responses into one turn), use full-conversation SFT to render and tokenize
+each complete conversation once. Keep the model's stock chat template; no manual
+generation annotations or model-family selection are needed for templates that
+render messages in a streaming loop:
 
 ```yaml
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: default
 data:
   add_generation_prompt: false
   default:
@@ -46,55 +56,67 @@ data:
 
 Set the processor on both training and validation dataset entries if they override
 `data.default.processor`. Other processors and existing recipes are unchanged.
-The selected template must wrap each complete assistant target, including its
-turn terminator and trailing whitespace, in one `{% generation %}` /
-`{% endgeneration %}` block. Assistant headers can remain outside the block.
-For example:
+When selecting a different chat model, keep `policy.tokenizer.name` tied to
+`policy.model_name` so the tokenizer and model remain compatible.
 
-```jinja
-{{ '<start>assistant\n' }}
-{% generation %}{{ message.content + '<stop>\n' }}{% endgeneration %}
+Without `{% generation %}` blocks, the formatter tracks each assistant message's
+loop iteration while rendering the original template. The complete assistant
+turn, **including its header and terminator**, is supervised, matching incremental
+SFT with `add_generation_prompt=false`. System/user turns and tool responses are
+context only. Templates with explicit generation blocks retain their own target
+selection, allowing assistant headers to be masked. Each assistant message must
+produce exactly one nonempty span. Final whitespace outside that span is preserved
+and included in the final target.
+
+Tokens are encoded from the full rendered text, with ownership determined by
+their start offsets. A token crossing a boundary belongs to the segment where
+it starts; no decode/encode round trip is required. Existing SFT masking, padding,
+next-token shifting, and `sft.only_unmask_final` continue to work. Configured
+template overrides and default tools are preserved; row-level tools take
+precedence, including an explicit empty list. Assistant tool-call messages may
+have missing/null content; these values are passed unchanged to the template,
+not replaced with empty strings. A template that cannot handle that message shape
+still raises its original error. Absent tools and documents are explicitly
+`None`, matching normal Transformers rendering. Tools must be dictionary schemas
+(not Python callables), and tool arguments must still use the format accepted by
+the model's template.
+
+This requires a fast tokenizer, text-only messages, and a final assistant target.
+Automatic ownership is not inference for arbitrary Jinja: templates that copy or
+reorder assistant messages, buffer the message loop inside a macro/filter/string
+assignment, or render messages without a loop require explicit generation blocks.
+Ambiguous ownership fails rather than silently falling back to prefix matching.
+Turn headers, bodies and terminators must be emitted within their corresponding
+loop iteration or generation block. The template still determines historical
+reasoning retention; for Nemotron, review `truncate_history_thinking` before
+switching an existing recipe.
+
+Loss ownership comes from the tracked loop iterations or explicit generation
+blocks, not token spelling. An EOS-looking prefix in context can belong to a
+turn header regardless of whether BOS and EOS are equal; it remains masked.
+The formatter does not infer missing terminators from such prefixes. Template
+authors must include the intended assistant targets and turn terminators in
+the corresponding spans; structural validation cannot prove their semantic
+completeness.
+
+Rows at or above `max_seq_length` retain their original diagnostic `length` and
+receive `loss_multiplier=0` with a short, masked batching placeholder. BOS/EOS
+insertion preserves the incremental convention: only trailing newlines are
+ignored when checking for an existing final EOS.
+
+The deterministic formatter tests use a synthetic tokenizer and need no model
+downloads. Run this correctness gate separately from the supplemental stock
+tokenizer tests:
+
+```bash
+uv run --group test python -m pytest --noconftest -q -o addopts= \
+  tests/unit/data/test_full_conversation.py -k 'not stock'
 ```
 
-The formatter maps generation character ranges through full-text token offsets,
-rejecting tokens crossing supervision boundaries. It returns context/assistant
-loss-ownership segments rather than source messages. Existing SFT masking,
-padding, next-token shifting, and `sft.only_unmask_final` continue to work; even
-adjacent assistant targets remain separate. No prefix matching or retokenization
-is performed. Configured template overrides and default tools are preserved;
-row-level tools take precedence, including an explicit empty list.
-
-The complete template determines historical reasoning retention; this may differ
-from reasoning accidentally retained by incremental prefix rendering. Review that
-policy before changing an existing training recipe. This processor requires a
-fast tokenizer, text-only messages, and a final assistant target. Missing markers,
-invalid span counts/order, uncovered final suffixes, a configured EOS immediately
-outside an earlier assistant span that does not already end in EOS, and missing
-requested BOS/EOS tokens are errors. An EOS-looking token after an already
-terminated assistant span may belong to the next turn's header, including when
-BOS and EOS share the same token; it is not rejected on that basis.
-Generation ranges do not prove semantic completeness: the template author must
-verify that every assistant span includes the intended content and model-specific
-turn terminator (which may differ from the tokenizer's EOS). The formatter does
-not claim to detect arbitrary partially marked targets or infer unknown terminators.
-The existing SFT overlength exclusion policy is unchanged: rows at or above
-`max_seq_length` remain in the dataset with `loss_multiplier=0`, rather than being
-removed or trained on truncated targets. Full-conversation formatting replaces
-their token sequence with a short, masked batching placeholder while retaining
-the original token count in `length` for diagnostics. Thus `length` intentionally
-differs from the placeholder's token count; batching uses the actual tensors.
-
-Final EOS insertion also preserves the incremental formatter's convention:
-only trailing newlines are ignored when checking for an existing EOS.
-`<eos>\n` therefore does not receive another EOS, but `<eos> \t` does when
-`add_eos_token=true`. Those spaces/tabs remain intact and the appended EOS is
-supervised. With `add_eos_token=false`, the template output is left unchanged.
-This differs intentionally from the historical-EOS guard's whitespace-insensitive
-check; that guard diagnoses ownership rather than deciding whether to append EOS.
-
-SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
-  1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
-  2. `task_name`: A string identifier that uniquely identifies the dataset.
+Use `-k stock` instead to run the integration cases with pinned Hugging Face
+revisions. They require downloaded tokenizer assets or network access; a missing
+cache is not a formatter correctness result. Neither selector runs shared-Ray
+initialization or end-to-end training.
 
 SFT datasets are expected to follow the HuggingFace chat format. Refer to the [chat dataset document](../design-docs/chat-datasets.md) for details. If your data is not in the correct format, simply write a preprocessing script to convert the data into this format. [response_datasets/squad.py](../../nemo_rl/data/datasets/response_datasets/squad.py) has an example:
 
@@ -382,6 +404,8 @@ sft:
   val_period: 0
   val_at_start: false
   val_at_end: false
+checkpointing:
+  metric_name: null             # no validation metrics are produced by SFTv2
 data:
   _override_: true              # replace the exemplar's HF data block wholesale
   backend: energon
@@ -410,7 +434,9 @@ supplied by any exemplar config, so both must be set explicitly. The `sft`
 overrides are needed for a different reason: SFTv2 runs no validation pass, so it
 rejects `val_period`, `val_at_start` or `val_at_end` left at their exemplar
 values, and `data.validation` must be null — the loader is always built with
-`split_role="train"`.
+`split_role="train"`. The exemplar's `checkpointing.metric_name: "val:val_loss"`
+is also rejected. Set it to `null`, as above, or to an available `train:<metric>`
+for training-metric checkpoint ranking.
 
 The processor runs inside Energon loader workers and returns the same tokenized `message_log` representation as the Hugging Face path. `prepare_sft_batch` creates the assistant loss mask, flattens the messages, and pads the batch without checking which loader produced it.
 
@@ -566,15 +592,17 @@ Your JSONL files should contain one JSON object per line following the [OpenAI C
   "tools": [
     {
       "type": "function",
-      "name": "get_weather",
-      "description": "Get current weather for a city",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "city": {"type": "string", "description": "City name"},
-          "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-        },
-        "required": ["city"]
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string", "description": "City name"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+          },
+          "required": ["city"]
+        }
       }
     }
   ]
@@ -590,10 +618,21 @@ When your dataset contains tools with different argument structures (heterogeneo
 
 ```yaml
 data:
-  dataset_name: openai_format
-  ...
-  use_preserving_dataset: true  # IMPORTANT: Enable this for tool calling datasets
+  train:
+    dataset_name: openai_format
+    data_path: <PathToTrainingDataset>
+    use_preserving_dataset: true
+  validation:
+    dataset_name: openai_format
+    data_path: <PathToValidationDataset>
+    use_preserving_dataset: true
 ```
+
+Set this flag on every applicable dataset entry, including each entry in a blend.
+Alternatively, set `data.default.use_preserving_dataset: true` and remove any
+entry-level `use_preserving_dataset: false` overrides from the basic example:
+dataset defaults only fill missing keys. A top-level
+`data.use_preserving_dataset` does not configure the dataset constructors.
 
 **Why this matters:** Standard HuggingFace dataset loading enforces uniform schemas by adding `None` values for missing keys. For example:
 - Tool A has arguments: `{"query": "search term"}`
