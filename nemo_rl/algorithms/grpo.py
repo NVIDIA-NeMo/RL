@@ -354,6 +354,8 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
+    # Number of policy updates performed on each rollout batch.
+    num_iterations: int = Field(default=1, ge=1)
     max_num_epochs: int = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
@@ -659,6 +661,10 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
+    generation_factory: Optional[
+        Callable[[PolicyConfig, ColocatablePolicyInterface], GenerationInterface]
+    ] = None,
+    generation_logprobs_available: bool = True,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -955,6 +961,7 @@ def setup(
     loss_fn = ClippedPGLossFn(
         loss_config,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
+        generation_logprobs_available=generation_logprobs_available,
         seq_logprob_error_threshold=grpo_config.seq_logprob_error_threshold,
     )
     _restore_adaptive_loss_state(loss_fn, grpo_save_state)
@@ -1114,6 +1121,7 @@ def setup(
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
+            or generation_factory is not None
             else 2,
             port_range_low=cluster_config.master_port_range_low,
             port_range_high=cluster_config.master_port_range_high,
@@ -1409,7 +1417,7 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
+        total_train_iters = grpo_config.num_iterations * min(
             grpo_config.max_num_steps,
             grpo_config.max_num_epochs * train_sample_count,
         )
@@ -1605,8 +1613,26 @@ def setup(
 
         return policy_generation, policy
 
+    # A caller-supplied factory supports research generation adapters without
+    # coupling the core algorithm to their runtime or configuration.
+    if generation_factory is not None:
+        assert colocated_inference, (
+            "Custom generation factories currently require colocated generation."
+        )
+        policy, policy_time = init_policy()
+        setup_timing_metrics.policy_init_time_s = policy_time
+        generation_t0 = time.perf_counter()
+        policy_generation = generation_factory(policy_config, policy)
+        setup_timing_metrics.generation_init_time_s = (
+            time.perf_counter() - generation_t0
+        )
+        print(
+            f"  ✓ Using custom {backend} generation with {policy_config['model_name']}",
+            flush=True,
+        )
+
     # Handle generation-specific setup
-    if backend == "megatron":
+    elif backend == "megatron":
         if enable_nemo_gym:
             print(
                 "  ⚡ Reserving the Megatron server address for overlapped NeMo Gym init",
@@ -3900,7 +3926,8 @@ def _grpo_train_impl(
                     del extra_multimodal_data
 
                 # Separate-pass seq-level metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # and real generation logprobs
+                if skip_prev_logprobs or not loss_fn.generation_logprobs_available:
                     # In-loss filtering reports counts through all_mb_metrics.
                     # Use {} so placeholder zeros cannot overwrite those counts
                     # when seq_logprob_error_metrics is merged after training.
@@ -3982,7 +4009,7 @@ def _grpo_train_impl(
                     policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...", flush=True)
+                num_iterations = master_config.grpo.num_iterations
                 with (
                     timer.time("policy_training"),
                     managed_span(
@@ -3991,11 +4018,20 @@ def _grpo_train_impl(
                         tracer=_tracer,
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for iteration in range(num_iterations):
+                        print(
+                            f"▶ Training policy iteration {iteration + 1}/{num_iterations}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -5712,7 +5748,8 @@ def async_grpo_train(
                         )
 
                 # Separate-pass seq-level metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                # and real generation logprobs
+                if skip_prev_logprobs or not loss_fn.generation_logprobs_available:
                     # In-loss filtering reports counts through all_mb_metrics.
                     # Use {} so placeholder zeros cannot overwrite those counts
                     # when seq_logprob_error_metrics is merged after training.
@@ -5815,7 +5852,7 @@ def async_grpo_train(
                     policy.prepare_for_training()
                     POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
+                num_iterations = master_config.grpo.num_iterations
                 with (
                     timer.time("policy_training"),
                     managed_span(
@@ -5824,11 +5861,20 @@ def async_grpo_train(
                         tracer=_tracer,
                     ),
                 ):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    for iteration in range(num_iterations):
+                        print(
+                            f"▶ Training policy iteration {iteration + 1}/{num_iterations}...",
+                            flush=True,
+                        )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        print(
+                            f"    • Policy loss: {train_results['loss'].mean().item():.4f}",
+                            flush=True,
+                        )
 
                 is_last_step = step + 1 == max_num_steps
                 should_save_by_step = (

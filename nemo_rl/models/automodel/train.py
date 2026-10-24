@@ -109,7 +109,12 @@ def _build_model_batch(
     if processed_inputs.attention_mask is not None:
         model_batch["attention_mask"] = processed_inputs.attention_mask
     if processed_inputs.position_ids is not None:
-        model_batch["position_ids"] = processed_inputs.position_ids
+        # LLaDA derives positions internally and does not accept position_ids.
+        model_batch.update(
+            filter_multimodal_kwargs_for_model(
+                model, {"position_ids": processed_inputs.position_ids}
+            )
+        )
     if processed_inputs.has_flash_attention:
         model_batch["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
 
@@ -614,6 +619,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        precomputed_logprobs: bool = False,
         draft_runtime: Optional[Any] = None,
     ):
         """Initialize LossPostProcessor.
@@ -628,6 +634,8 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            precomputed_logprobs: Whether ``logits`` already contains token
+                log probabilities and should bypass vocabulary reduction.
             draft_runtime: Optional draft co-training runtime (dspark/dflash
                 or eagle3); when set, the policy loss is combined with the
                 draft loss and the policy's raw logits are stashed as the
@@ -640,6 +648,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.precomputed_logprobs = precomputed_logprobs
         self.draft_runtime = draft_runtime
         self._cp_gradient_fanout = (
             cp_size
@@ -708,6 +717,7 @@ class LossPostProcessor:
         prepare_loss_input_wrapped = partial(
             prepare_loss_input,
             sampling_params=self.sampling_params,
+            precomputed_logprobs=self.precomputed_logprobs,
             context_parallel_group=(
                 self.cp_mesh.get_group() if self.cp_size > 1 else None
             ),
@@ -764,6 +774,7 @@ class LogprobsPostProcessor:
         cfg: PolicyConfig,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        shift_targets: bool = True,
     ):
         """Initialize LogprobsPostProcessor.
 
@@ -771,11 +782,13 @@ class LogprobsPostProcessor:
             cfg: Configuration dictionary
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            shift_targets: Whether position ``i`` scores token ``i+1``.
         """
         self.cfg = cfg
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+        self.shift_targets = shift_targets
 
     def __call__(
         self,
@@ -805,43 +818,55 @@ class LogprobsPostProcessor:
             policy support information in logprobs for the actor loss.
         """
         input_lengths = data_dict["input_lengths"]
+        # Ordinary training scores the model on its own input; corruption-based
+        # objectives feed a corrupted sequence and score the clean tokens.
+        score_ids = (
+            processed_inputs.input_ids
+            if processed_inputs.target_ids is None
+            else processed_inputs.target_ids
+        )
 
         if cp_sharder is not None:
-            # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
-            # the model-facing tensors so Automodel's in-place buffer sharding
+            # ``processed_inputs`` stays canonical under CP: ``_build_model_batch``
+            # clones model-facing tensors so Automodel's in-place buffer sharding
             # cannot reach the loss-side ones. Shift and gather against that
             # canonical sequence and let the sharder own the local layout.
-            canonical_input_ids = data_dict["input_ids"]
-            seq_len = canonical_input_ids.shape[1]
+            seq_len = score_ids.shape[1]
             token_logprobs = get_cp_sharded_next_token_logprobs(
                 logits,
-                canonical_input_ids,
+                score_ids,
                 cp_sharder,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
+                shift_targets=self.shift_targets,
             )
 
-            assert token_logprobs.shape[1] == seq_len - 1
+            assert token_logprobs.shape[1] == (
+                seq_len - 1 if self.shift_targets else seq_len
+            )
         else:
             seq_len = processed_inputs.seq_len
             if isinstance(logits, DTensor):
                 # DTensor path with TP sharding
                 token_logprobs = get_logprobs_from_vocab_parallel_logits(
                     logits,
-                    processed_inputs.input_ids,
+                    score_ids,
                     chunk_size=self.logprob_chunk_size,
                     sampling_params=self.sampling_params,  # top-k and top-p filtering
+                    shift_targets=self.shift_targets,
                 )
             else:
                 # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
-                    logits, processed_inputs.input_ids
+                    logits, score_ids, shift_targets=self.shift_targets
                 )
 
-        # Prepend 0 for first token to maintain sequence length
-        token_logprobs = torch.cat(
-            [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
-        )
+        if self.shift_targets:
+            # Prepend 0 for first token to maintain sequence length. Position-
+            # aligned scoring drops no position, so it needs no such padding.
+            token_logprobs = torch.cat(
+                [torch.zeros_like(token_logprobs[:, :1]), token_logprobs], dim=1
+            )
 
         # Handle sequence packing unpacking or mask application
         if self.enable_seq_packing:
@@ -886,12 +911,17 @@ class LogprobsPostProcessor:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
+        shift_targets: bool = True,
     ) -> torch.Tensor:
         """Compute logprobs locally without distributed processing.
 
         Args:
             logits: Model output logits
-            input_ids: Input token IDs
+            input_ids: Token IDs to score
+            shift_targets: If True (default), position ``i`` scores token ``i+1``
+                and the returned sequence is one shorter. If False, position
+                ``i`` scores token ``i`` and every position is kept -- the
+                masked diffusion convention.
 
         Returns:
             Token log probabilities
@@ -904,7 +934,9 @@ class LogprobsPostProcessor:
         # Input shapes:
         #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
         #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = input_ids[:, 1:].to(logits.device)
+        next_tokens = (input_ids[:, 1:] if shift_targets else input_ids).to(
+            logits.device
+        )
         target_seq_len = int(next_tokens.shape[1])
 
         if target_seq_len == 0:
