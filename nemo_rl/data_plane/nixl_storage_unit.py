@@ -14,8 +14,12 @@
 """NixlStorageUnit: a CPU Ray actor that owns one NIXL-registered DRAM slab.
 
 Passive on the data path: clients WRITE and READ one-sided. The unit only
-serves small control RPCs (alloc, resolve, release) and tracks pins and
-refcounts so a region is never reused under an in-flight read.
+serves small control RPCs (alloc, commit, resolve_keys, release_rows) and
+tracks pins and refcounts so a region is never reused under an in-flight read.
+
+Index-addressed, like TransferQueue's SimpleStorage: a row (TQ global index)
+belongs to unit ``unit_ids[gidx % N]``, and that unit keeps the row's
+``field -> (blob, entry)`` index. The TQ controller stores no locations.
 
 Started by :func:`nemo_rl.data_plane.adapters.tq_nixl.initialize_nixl_storage`;
 the store-side pieces it uses live in :mod:`nemo_rl.data_plane.nixl`.
@@ -33,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+import msgspec
 import numpy as np
 import ray
 
@@ -49,13 +54,26 @@ log = logging.getLogger(__name__)
 # region, so the area bounds it; this caps the count when blobs are tiny.
 _MAX_IO_JOBS = 256
 
+# A row's index entry: (blob_id, off_in_blob, len, kind, dtype, shape).
+RowEntry = tuple[str, int, int, str, "str | None", "tuple[int, ...] | None"]
+
+
+def split_key(key: str) -> tuple[int, str]:
+    """``"<global_index>@<field>"`` (TQ's KV key) -> ``(global_index, field)``."""
+    gidx, sep, fld = str(key).partition("@")
+    if not sep:
+        raise ValueError(f"not a TransferQueue key '<global_index>@<field>': {key!r}")
+    return int(gidx), fld
+
 
 @dataclass
 class BlobRec:
     off: int
     nbytes: int
-    refs: int
+    refs: int  # row-index entries that point at this blob
     created_at: float
+    published: bool = False  # its entries are in the row index (commit done)
+    entries: list[blob_format.Entry] | None = None  # parsed at commit, until published
     last_resolve_at: float = 0.0
     pins: dict[str, float] = field(default_factory=dict)  # pin_id → expiry (monotonic)
     holds: int = 0  # copies of the slab region running now (save_shard)
@@ -156,9 +174,13 @@ class NixlStorageUnit:
         ssd_dir: str | None = None,
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
+        alloc_lease_s: float | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
         self.read_pin_s = float(read_pin_s)
+        # An allocation not committed within this long belongs to a writer that
+        # crashed or gave up; it is retired (see _sweep).
+        self.alloc_lease_s = alloc_lease_s
         # Socket binding (nemo_rl/distributed/numa_utils.py): with numa=auto on a node
         # with >= 2 sockets, the k-th unit on the node (numa_index) pins its threads
         # and slab pages to socket k % sockets; a no-op on single-socket nodes.
@@ -189,7 +211,9 @@ class NixlStorageUnit:
         )
         self.slab_base = self.ep.register(self.slab)
         self.blobs: dict[str, BlobRec] = {}
+        self.rows: dict[int, dict[str, RowEntry]] = {}  # gidx → field → entry
         self._pins: dict[str, list[str]] = {}  # pin_id → blob_ids
+        self._pin_exp: dict[str, float] = {}  # pin_id → expiry (monotonic)
         self.retired_bytes = 0  # regions of WRITEs that never reached DONE
         # Blobs released while a checkpoint still copies them: freed once the
         # save's holds drop (save_shard's finally).
@@ -203,8 +227,9 @@ class NixlStorageUnit:
                 "alloc": self.alloc,
                 "commit": self.commit,
                 "abort": self.abort,
-                "release_many": self.release_many,
+                "release_rows": self.release_rows,
                 "resolve": self.resolve,
+                "resolve_keys": self.resolve_keys,
                 "unpin": self.unpin,
             },
             self._mu,
@@ -264,25 +289,28 @@ class NixlStorageUnit:
         self._worker = ThreadPoolExecutor(1, thread_name_prefix="nvdp-io")
 
     def _start_ticker(self) -> None:
-        """Start the SSD ticker; call once the unit is fully built."""
-        if self.ssd_dir is not None:
-            threading.Thread(
-                target=self._tick, name="nvdp-ssd-tick", daemon=True
-            ).start()
+        """Start the maintenance ticker; call once the unit is fully built."""
+        threading.Thread(target=self._tick, name="nvdp-tick", daemon=True).start()
 
     def _tick(self, every: float = 1.0, report_s: float = 30.0) -> None:
-        """SSD ticker thread: free what has aged out, print stats when they change."""
+        """Ticker thread: free what aged out and what dead clients left.
+
+        Also drops expired pins and stale allocations, and (SSD on) prints
+        stats when they change.
+        """
         last, last_at = None, 0.0
         while True:
             time.sleep(every)
             try:
                 with self._mu:
-                    self._reclaim(time.monotonic())
+                    now = time.monotonic()
+                    self._reclaim(now)
+                    self._sweep(now)
             except Exception:  # noqa: BLE001 - keep ticking; the next tick retries
-                log.exception("unit %d: SSD tick failed", self.unit_id)
+                log.exception("unit %d: tick failed", self.unit_id)
                 continue
             now = time.monotonic()
-            if now - last_at < report_s:
+            if self.ssd_dir is None or now - last_at < report_s:
                 continue
             last_at = now
             with self._mu:
@@ -302,6 +330,35 @@ class NixlStorageUnit:
         self.alloc_.reclaim(now)
         if self.staging_ is not None:
             self.staging_.reclaim(now)
+
+    def _sweep(self, now: float) -> None:
+        """Forget what dead clients left behind (caller holds ``_mu``).
+
+        Pins of readers that never unpinned are dropped once expired. An
+        allocation never committed within ``alloc_lease_s`` is retired, not
+        freed: its writer may have a WRITE still in flight (as ``abort(in_flight=True)``).
+        """
+        for pin_id in [p for p, t in self._pin_exp.items() if t <= now]:
+            self.unpin(pin_id)
+        lease = getattr(self, "alloc_lease_s", None)
+        if not lease:
+            return
+        for b, rec in list(self.blobs.items()):
+            if rec.published or rec.staging or now - rec.created_at <= lease:
+                continue
+            del self.blobs[b]
+            if not rec.in_slab and rec.staged_off is None:
+                # Already spilled to disk: no RDMA can target it any more.
+                self._dispose(b, rec)
+            else:
+                self.retired_bytes += rec.nbytes
+            log.warning(
+                "unit %d: retired allocation %s (%d B) never committed within %.0fs",
+                self.unit_id,
+                b,
+                rec.nbytes,
+                lease,
+            )
 
     def _alloc_io(self, nbytes: int, now: float) -> int:
         """IO-area region for a put the put area cannot take.
@@ -528,36 +585,58 @@ class NixlStorageUnit:
             self.blobs[blob_id] = BlobRec(
                 off=0,
                 nbytes=nbytes,
-                refs=int(n_entries),
+                refs=0,
                 created_at=now,
                 in_slab=False,
                 staged_off=io_off,
             )
             return self.staging_base + io_off
-        self.blobs[blob_id] = BlobRec(
-            off=off,
-            nbytes=nbytes,
-            refs=int(n_entries),
-            created_at=now,
-        )
+        self.blobs[blob_id] = BlobRec(off=off, nbytes=nbytes, refs=0, created_at=now)
         return off
 
     @_locked
     def commit(self, blob_id: str) -> str:
-        """The put's WRITE is DONE: ``"done"`` once the blob is durable.
+        """Publish a blob whose WRITE is DONE: ``"done"`` once its rows are indexed.
 
-        A spilled blob is ``"pending"`` while its disk write runs (the client asks
-        again); ``"lost"`` if the blob is gone (aborted or its write failed), and
-        the put then fails.
+        The blob's own embedded index names its ``gidx@field`` keys; they go
+        into the row index, and a key that already pointed elsewhere drops its
+        old blob's reference (an overwrite). Idempotent: a published blob
+        answers ``"done"`` again, so a client whose reply was lost can ask again.
+        A spilled blob is ``"pending"`` while its disk write runs; ``"lost"`` if
+        the blob is gone (aborted or its write failed), and the put then fails.
         """
         rec = self.blobs.get(blob_id)
         if rec is None:
             return "lost"
+        if rec.published:
+            return "done"
+        if rec.entries is None:
+            # Parsed before a spill can free the IO region holding the bytes.
+            rec.entries = blob_format.read_index(self._blob_view(rec))
         if rec.in_slab or rec.disk is not None:
+            self._publish(blob_id, rec)
             return "done"
         if not rec.staging and self._io_jobs < self._max_io_jobs:
             self._submit_io(self._spill, blob_id, rec)  # exactly once: staging is set
         return "pending"
+
+    def _blob_view(self, rec: BlobRec) -> memoryview:
+        """The blob's bytes in the put area or, for a spill in progress, the IO area."""
+        at = rec.off if rec.in_slab else self.staging_base + rec.staged_off
+        return memoryview(self.slab)[at : at + rec.nbytes]
+
+    def _publish(self, blob_id: str, rec: BlobRec) -> None:
+        """Install a committed blob's entries in the row index (caller holds ``_mu``)."""
+        for e in rec.entries or ():
+            gidx, fld = split_key(e.key)
+            row = self.rows.setdefault(gidx, {})
+            old = row.get(fld)
+            row[fld] = (blob_id, e.off, e.len, e.kind, e.dtype, e.shape)
+            rec.refs += 1
+            if old is not None:
+                self._unref(old[0])
+        rec.published = True
+        rec.entries = None
 
     @_locked
     def abort(self, blob_id: str, in_flight: bool = True) -> None:
@@ -565,11 +644,13 @@ class NixlStorageUnit:
 
         If the WRITE may still be running (``in_flight``), the region is never
         freed: a late WRITE would land in whatever blob reused it. The leak is
-        counted in ``retired_bytes``.
+        counted in ``retired_bytes``. A published blob is not aborted: its rows
+        are live (the commit reply was lost), and only clears release them.
         """
-        rec = self.blobs.pop(blob_id, None)
-        if rec is None:
+        rec = self.blobs.get(blob_id)
+        if rec is None or rec.published:
             return
+        del self.blobs[blob_id]
         if rec.staging:
             self._drop(blob_id, rec)  # its IO job frees the region when it ends
         elif in_flight:
@@ -583,24 +664,31 @@ class NixlStorageUnit:
             self.alloc_.free(rec.off, rec.nbytes)
 
     @_locked
-    def release(self, blob_id: str, n_entries: int) -> int:
-        """Decrement the live-entry count; at zero quarantine the region.
+    def release_rows(self, gidxs: list[int]) -> int:
+        """Drop every field of these rows; returns how many entries were dropped.
 
-        Returns the remaining count (0 when the blob is gone).
+        Row-wide, like SimpleStorage's clear: TQ's KV clear only names the
+        fields all cleared rows share. Unknown rows are ignored (idempotent).
         """
+        n = 0
+        for g in gidxs:
+            for ent in (self.rows.pop(int(g), None) or {}).values():
+                self._unref(ent[0])
+                n += 1
+        return n
+
+    def _unref(self, blob_id: str) -> None:
+        """One row-index entry stopped pointing at ``blob_id`` (caller holds ``_mu``)."""
         rec = self.blobs.get(blob_id)
         if rec is None:
-            return 0
-        if int(n_entries) <= 0:
-            raise ValueError(f"release of {blob_id}: n_entries must be > 0")
-        rec.refs -= int(n_entries)
+            return
+        rec.refs -= 1
         if rec.refs > 0:
-            return rec.refs
-        self.blobs.pop(blob_id, None)
+            return
+        del self.blobs[blob_id]
         if self.checkpointing:
             self.clears_during_save += 1  # TQ says no clears during a save
         self._drop(blob_id, rec)
-        return 0
 
     def _drop(self, blob_id: str, rec: BlobRec) -> None:
         """Free a gone blob's copies, or after the running copy of it ends."""
@@ -649,12 +737,6 @@ class NixlStorageUnit:
         if nbytes >= blob_format.FOOTER_SIZE:
             self.slab[off + nbytes - blob_format.FOOTER_SIZE : off + nbytes] = 0
 
-    @_locked
-    def release_many(self, items: list[tuple[str, int]]) -> None:
-        """Batched :meth:`release` -- one RPC per unit per clear, sent without waiting."""
-        for blob_id, n in items:
-            self.release(str(blob_id), int(n))
-
     # ------------------------------------------------------------------ reads
     @_locked
     def resolve(self, blob_ids: list[str]) -> dict[str, Any]:
@@ -701,6 +783,7 @@ class NixlStorageUnit:
             pinned.append(b)
         if pinned:
             self._pins[pin_id] = pinned
+            self._pin_exp[pin_id] = expiry
         return {
             "pin_id": pin_id,
             "offsets": offsets,
@@ -711,7 +794,43 @@ class NixlStorageUnit:
         }
 
     @_locked
+    def resolve_keys(self, keys: list[str]) -> dict[str, Any]:
+        """Locate ``gidx@field`` keys in the row index and pin their blobs.
+
+        Like :meth:`resolve`, but per key: ``entries`` maps a key to
+        ``[slab_off, len, kind, dtype, shape]`` (``slab_off`` already includes
+        the entry's offset in its blob); ``missing`` / ``pending`` / ``failed``
+        list keys, with :meth:`resolve`'s meanings.
+        """
+        found: dict[str, RowEntry] = {}
+        missing: list[str] = []
+        by_blob: dict[str, list[str]] = {}
+        for k in keys:
+            gidx, fld = split_key(k)
+            ent = self.rows.get(gidx, {}).get(fld)
+            if ent is None:
+                missing.append(k)
+                continue
+            found[k] = ent
+            by_blob.setdefault(ent[0], []).append(k)
+        r = self.resolve(list(by_blob))
+        out: dict[str, Any] = {"pin_id": r["pin_id"], "missing": missing}
+        for status in ("pending", "failed"):
+            out[status] = [k for b in r[status] for k in by_blob[b]]
+        missing.extend(k for b in r["missing"] for k in by_blob[b])
+        out["entries"] = {
+            k: [r["offsets"][b] + found[k][1], *found[k][2:6]]
+            for b, ks in by_blob.items()
+            if b in r["offsets"]
+            for k in ks
+        }
+        for k, ent in out["entries"].items():
+            ent[4] = list(ent[4]) if ent[4] is not None else None
+        return out
+
+    @_locked
     def unpin(self, pin_id: str) -> None:
+        self._pin_exp.pop(pin_id, None)
         for b in self._pins.pop(pin_id, []):
             rec = self.blobs.get(b)
             if rec is not None:
@@ -754,6 +873,7 @@ class NixlStorageUnit:
             "quarantined_bytes": self.alloc_.quarantined_bytes,
             "fragments": self.alloc_.fragments,
             "pins": len(self._pins),
+            "rows": len(self.rows),
             "retired_bytes": self.retired_bytes,
         }
 
@@ -764,10 +884,13 @@ class NixlStorageUnit:
 
     # ------------------------------------------------------------------ checkpoint (A2)
     def save_shard(self, path: str) -> dict[str, Any]:
-        """Dump every live blob back to back into ``path``.
+        """Dump every live blob back to back into ``path``, its live keys into ``path + ".rows"``.
 
         Returns ``{"blobs": {blob_id: [off_in_file, nbytes, refs]}, "nbytes":
-        total, "clears_during_save": n}``.
+        total, "clears_during_save": n}``. The rows file maps each blob to the
+        ``gidx@field`` keys the row index points at it with; a blob's own
+        embedded index may still list overwritten or cleared keys, which a
+        restore must not bring back.
 
         The snapshot is taken under the unit lock; the file I/O runs without it
         (blocking syscalls, design §2.5), so puts, reads and clears keep being
@@ -782,12 +905,16 @@ class NixlStorageUnit:
         published, so it is skipped.
         """
         held: list[tuple[str, BlobRec, int]] = []
+        live: dict[str, list[str]] = {}
         try:
             with self._mu:
                 self.checkpointing = True
                 self.clears_during_save = 0
+                for g, row in self.rows.items():
+                    for fld, ent in row.items():
+                        live.setdefault(ent[0], []).append(f"{g}@{fld}")
                 for b, rec in self.blobs.items():
-                    if not rec.in_slab and rec.disk is None:
+                    if not rec.published or (not rec.in_slab and rec.disk is None):
                         continue
                     rec.holds += 1
                     held.append((b, rec, rec.refs))
@@ -817,6 +944,12 @@ class NixlStorageUnit:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            rows = {b: live.get(b, []) for b, _, _ in held}
+            with open(tmp, "wb") as f:
+                f.write(msgspec.msgpack.encode(rows))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path + ".rows")
         finally:
             with self._mu:
                 for _, rec, _ in held:
@@ -848,13 +981,16 @@ class NixlStorageUnit:
         every unit's RAM is full, as puts do).
 
         Regions are allocated under the unit lock but filled without it; a
-        blob is published only once its bytes are in place.
+        blob is published only once its bytes are in place, and only with the
+        keys ``path + ".rows"`` lists as live (see :meth:`save_shard`).
         """
         loaded: list[str] = []
         failed: list[str] = []
         view = memoryview(self.slab)
+        with open(path + ".rows", "rb") as rf:
+            live = {b: set(ks) for b, ks in msgspec.msgpack.decode(rf.read()).items()}
         with open(path, "rb", buffering=0) as f:
-            for b, (off, nbytes, refs) in blobs.items():
+            for b, (off, nbytes, _refs) in blobs.items():
                 nbytes = int(nbytes)
                 with self._mu:
                     if b in self.blobs:
@@ -866,7 +1002,11 @@ class NixlStorageUnit:
                     except UnitFull:
                         dst = None
                 if dst is None:
-                    ok = spill and self._load_to_disk(f, b, int(off), nbytes, int(refs))
+                    ok = spill and self._load_to_disk(f, b, int(off), nbytes)
+                    if ok:
+                        entries = blob_format.read_index_file(f, int(off), nbytes)
+                        with self._mu:
+                            self._restore_rows(b, entries, live.get(b, set()))
                     (loaded if ok else failed).append(b)
                     continue
                 try:
@@ -882,17 +1022,27 @@ class NixlStorageUnit:
                     with self._mu:
                         self.alloc_.free(dst, nbytes)
                     raise
+                entries = blob_format.read_index(target)
                 with self._mu:
                     self.blobs[b] = BlobRec(
-                        off=dst,
-                        nbytes=nbytes,
-                        refs=int(refs),
-                        created_at=time.monotonic(),
+                        off=dst, nbytes=nbytes, refs=0, created_at=time.monotonic()
                     )
+                    self._restore_rows(b, entries, live.get(b, set()))
                 loaded.append(b)
         return {"loaded": loaded, "failed": failed}
 
-    def _load_to_disk(self, f, b: str, off: int, nbytes: int, refs: int) -> bool:
+    def _restore_rows(
+        self, b: str, entries: list[blob_format.Entry], keep: set[str]
+    ) -> None:
+        """Publish a restored blob with only its live keys (caller holds ``_mu``)."""
+        rec = self.blobs[b]
+        rec.entries = [e for e in entries if e.key in keep]
+        self._publish(b, rec)
+        if rec.refs == 0:  # nothing of it is live: do not keep it
+            del self.blobs[b]
+            self._dispose(b, rec)
+
+    def _load_to_disk(self, f, b: str, off: int, nbytes: int) -> bool:
         """Restore one blob from checkpoint file ``f`` into a fresh SSD file.
 
         False (the caller tries another unit) with the SSD tier off, if the blob
@@ -930,7 +1080,7 @@ class NixlStorageUnit:
             self.blobs[b] = BlobRec(
                 off=0,
                 nbytes=nbytes,
-                refs=refs,
+                refs=0,
                 created_at=time.monotonic(),
                 in_slab=False,
                 disk=fd,
