@@ -999,6 +999,11 @@ class VllmGeneration(GenerationInterface):
                         version=self._rollout_weight_version
                     )
                 )
+            print(
+                f"  restart_shard: shard {shard_idx} token capture reinstalled "
+                f"(weight version {self._rollout_weight_version})",
+                flush=True,
+            )
 
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return None
