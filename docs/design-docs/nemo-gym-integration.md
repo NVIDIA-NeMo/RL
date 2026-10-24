@@ -68,6 +68,12 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Environment Server tasksets
+
+NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
+
+RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.

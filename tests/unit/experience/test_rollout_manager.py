@@ -30,6 +30,7 @@ import tempfile
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,7 +47,11 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
-from nemo_rl.experience.failures import GenerationUnavailable
+from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.failures import (
+    GenerationUnavailable,
+    GymTerminalEpisodeFailure,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -71,6 +76,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -376,6 +382,53 @@ def _make_manager(
 
 
 class TestGenerateAndPushFlow:
+    @pytest.mark.parametrize("max_skipped_prompts", [0, 1])
+    @pytest.mark.parametrize("grouped", [False, True])
+    def test_terminal_gym_episode_is_not_retried(
+        self, max_skipped_prompts: int, grouped: bool
+    ) -> None:
+        attempts = 0
+        terminal = GymTerminalEpisodeFailure("resources rejected this task")
+        error = (
+            ExceptionGroup(
+                "siblings failed", [GenerationUnavailable("worker lost"), terminal]
+            )
+            if grouped
+            else terminal
+        )
+
+        async def fail_terminal(_sample: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(
+            buf,
+            _FakeImpl(on_run=fail_terminal),
+            retry_policy=RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=3,
+                max_data_attempts=3,
+                max_skipped_prompts=max_skipped_prompts,
+                backoff_base_s=0.0,
+            ),
+        )
+
+        if max_skipped_prompts:
+            assert _run(mgr.generate_and_push({"prompt": "p", "idx": 0})) is (
+                RolloutOutcome.SKIPPED
+            )
+            assert mgr._skipped_prompts == 1
+        else:
+            with pytest.raises(type(error)) as raised:
+                _run(mgr.generate_and_push({"prompt": "p", "idx": 0}))
+            assert raised.value is error
+
+        assert attempts == 1
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+        assert buf.commit_calls == []
+
     def test_post_write_failure_does_not_regenerate_the_rollout(self):
         class _EnrichmentFailBuffer(_FakeBuffer):
             async def commit(
@@ -1411,6 +1464,85 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
+    input_sample = {
+        "extra_env_info": {
+            "task_id": {"taskset": "workplace:train", "task_id": "17"},
+            "task_input": {
+                "responses_create_params": {
+                    "input": [{"role": "user", "content": "Check my meetings."}],
+                    "max_output_tokens": 32,
+                    "metadata": {"extra_body": '{"seed": 8}'},
+                },
+                "task_data": {"state": ["meeting-1"]},
+            },
+        }
+    }
+    original = deepcopy(input_sample)
+
+    rows = impl._build_inputs(input_sample)
+
+    assert input_sample == original
+    assert len(rows) == 2
+    for row in rows:
+        assert row["task_id"] == original["extra_env_info"]["task_id"]
+        assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
+        params = row["task_input"]["responses_create_params"]
+        assert params["temperature"] == 0.7
+        assert params["top_p"] == 0.9
+        assert params["max_output_tokens"] == 32
+        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        assert "responses_create_params" not in row
+    assert [row["_rowidx"] for row in rows] == [0, 1]
+    rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
+    assert rows[1]["task_input"]["task_data"] == {"state": ["meeting-1"]}
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    [None, {}, {"taskset": ""}, {"taskset": []}],
+    ids=["flat-no-route", "missing-taskset", "empty-taskset", "list-taskset"],
+)
+def test_nemo_gym_bare_and_routed_rollouts_reject_malformed_rows_before_dispatch(
+    task_id: dict | None,
+) -> None:
+    if task_id is None:
+        rows = [{"agent_ref": {"name": "alpha"}, "_rowidx": 0}, {"_rowidx": 1}]
+        expected_error = (
+            "A NeMo-Gym row must contain task_id.taskset and task_input, "
+            "or a non-empty agent_ref.name or task_source"
+        )
+    else:
+        rows = [
+            {"task_id": identifier, "task_input": {}, "_rowidx": index}
+            for index, identifier in enumerate(
+                [{"taskset": "workplace:train"}, task_id]
+            )
+        ]
+        expected_error = (
+            "A NeMo-Gym materialized task must have a non-empty task_id.taskset"
+        )
+    actor = Mock()
+    routed = NemoGymShardSet(
+        handles={"only": [actor]},
+        route_to_shard={"alpha": "only", "workplace_environment": "only"},
+        environment_server_routes={"workplace:train": "workplace_environment"},
+    )
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+
+    for environment in (actor, routed):
+        impl._task_to_env = {"nemo_gym": environment}
+        with pytest.raises(ValueError) as raised:
+            _run(impl._run_rollouts(rows, Timer(), "test"))
+
+        assert str(raised.value) == expected_error
+        assert actor.mock_calls == []
+
+
 # ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
@@ -2106,6 +2238,28 @@ def _make_capture_manager(
 
 
 class TestGenerateForFinalizationFlow:
+    def test_terminal_gym_episode_is_not_retried(self) -> None:
+        attempts = 0
+
+        async def fail_terminal(_sample: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise GymTerminalEpisodeFailure("resources rejected this task")
+
+        buf = _FakeCaptureBuffer()
+        mgr = _make_capture_manager(buf, on_run=fail_terminal)
+        mgr._retry_policy = RolloutRetryPolicy.single_attempt(
+            max_infra_attempts=3,
+            max_data_attempts=3,
+            backoff_base_s=0.0,
+        )
+
+        with pytest.raises(GymTerminalEpisodeFailure, match="resources rejected"):
+            _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
+
+        assert attempts == 1
+        assert len(buf.abort_calls) == 1
+
     def test_request_carries_env_mask_flags(self):
         buf = _FakeCaptureBuffer()
         mgr = _make_capture_manager(

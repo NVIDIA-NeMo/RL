@@ -24,6 +24,7 @@ from nemo_rl.environments.nemo_gym_shards import (
     ShardSpec,
     apply_shard_log_dir,
     apply_shard_overlay,
+    build_environment_server_routes,
     build_route_shard_map,
     find_gym_config_entries,
     parse_shard_plan,
@@ -556,8 +557,10 @@ def test_build_route_shard_map_routes_agents_and_task_sources():
             "tools": {
                 "bash_agent": ["responses_api_agents"],
                 "bash_tools": ["resources_servers"],
+                "bash_environment": ["environment_servers"],
             },
-        }
+        },
+        environment_server_routes={"bash:train": "bash_environment"},
     )
 
     assert route_to_shard == {
@@ -565,7 +568,140 @@ def test_build_route_shard_map_routes_agents_and_task_sources():
         "math_env": "judged",
         "bash_agent": "tools",
         "bash_tools": "tools",
+        "bash_environment": "tools",
     }
+
+
+def test_environment_server_routes_are_shared_settings_not_entry_overlays():
+    routes = {"math:train": "math_environment", "tools:train": "tools_environment"}
+    config = _sharded_config(environment_server_routes=routes)
+
+    assert find_gym_config_entries(config) == []
+    plan = parse_shard_plan(config)
+    for shard in plan.shards:
+        assert (
+            apply_shard_overlay(config, plan, shard)["environment_server_routes"]
+            == routes
+        )
+
+
+@pytest.mark.parametrize(
+    "environment_server_routes", [None, {"tools:train": "tools_environment"}]
+)
+def test_unrouted_environment_servers_can_be_duplicated_across_shards(
+    environment_server_routes: dict[str, str] | None,
+) -> None:
+    route_to_shard = build_route_shard_map(
+        {
+            "first": {
+                "math_simple_agent": ["responses_api_agents"],
+                "math_environment_server": ["environment_servers"],
+            },
+            "second": {
+                "math_agent": ["responses_api_agents"],
+                "math_environment_server": ["environment_servers"],
+                "tools_environment": ["environment_servers"],
+            },
+        },
+        environment_server_routes=environment_server_routes,
+    )
+
+    expected = {"math_simple_agent": "first", "math_agent": "second"}
+    if environment_server_routes:
+        expected["tools_environment"] = "second"
+    assert route_to_shard == expected
+
+
+@pytest.mark.parametrize("allowlisted", [False, True])
+def test_routed_environment_servers_cannot_be_duplicated_across_shards(
+    allowlisted: bool,
+) -> None:
+    with pytest.raises(ShardSetupError, match="hosted by both shard"):
+        build_route_shard_map(
+            {
+                "first": {"shared_environment": ["environment_servers"]},
+                "second": {"shared_environment": ["environment_servers"]},
+            },
+            allowed_duplicate_entries={"shared_environment"} if allowlisted else set(),
+            environment_server_routes={"tasks": "shared_environment"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("other_type", "expected"),
+    [
+        ("responses_api_agents", "hosted by both shard"),
+        ("responses_api_models", "allowed_duplicate_entries"),
+    ],
+)
+def test_unrouted_environment_entries_with_other_server_types_keep_duplicate_checks(
+    other_type: str, expected: str
+) -> None:
+    with pytest.raises(ShardSetupError, match=expected):
+        build_route_shard_map(
+            {
+                "first": {"shared": ["environment_servers", other_type]},
+                "second": {"shared": [other_type]},
+            }
+        )
+
+
+@pytest.mark.parametrize("shared_map", [False, True])
+def test_environment_server_routes_merge_shared_or_shard_local_maps(shared_map):
+    routes = {"math:train": "math_environment", "tools:train": "tools_environment"}
+    routes_by_shard = {
+        "math": routes if shared_map else {"math:train": "math_environment"},
+        "tools": routes if shared_map else {"tools:train": "tools_environment"},
+    }
+    entries_by_shard = {
+        "math": {"math_environment": ["environment_servers"]},
+        "tools": {"tools_environment": ["environment_servers"]},
+    }
+
+    assert build_environment_server_routes(routes_by_shard, entries_by_shard) == routes
+
+
+def test_environment_server_routes_reject_conflicting_taskset_destinations():
+    with pytest.raises(ShardSetupError, match="conflicting environment server routes"):
+        build_environment_server_routes(
+            {"left": {"shared": "first"}, "right": {"shared": "second"}},
+            {
+                "left": {"first": ["environment_servers"]},
+                "right": {"second": ["environment_servers"]},
+            },
+        )
+
+
+def test_environment_server_route_rejects_multiple_destination_shards() -> None:
+    with pytest.raises(ShardSetupError, match="exactly one shard"):
+        build_environment_server_routes(
+            {"first": {"tasks": "shared"}, "second": {"tasks": "shared"}},
+            {
+                "first": {"shared": ["environment_servers"]},
+                "second": {"shared": ["environment_servers"]},
+            },
+        )
+
+
+@pytest.mark.parametrize("server_types", [[], ["responses_api_agents"]])
+def test_environment_server_route_target_must_be_a_running_environment_server(
+    server_types,
+):
+    with pytest.raises(ShardSetupError, match="a running Environment Server"):
+        build_environment_server_routes(
+            {"only": {"tasks": "target"}}, {"only": {"target": server_types}}
+        )
+
+
+def test_environment_server_route_must_be_present_on_its_destination_shard():
+    with pytest.raises(ShardSetupError, match="that shard has no matching"):
+        build_environment_server_routes(
+            {"left": {"tasks": "right_environment"}, "right": {}},
+            {
+                "left": {},
+                "right": {"right_environment": ["environment_servers"]},
+            },
+        )
 
 
 def test_build_route_shard_map_rejects_an_agent_in_two_shards():

@@ -91,6 +91,10 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.environments.nemo_gym import (
+    ShardSetupError,
+    validate_dataset_agent_coverage,
+)
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
@@ -2285,12 +2289,66 @@ class TestSetup:
         mock_validate.assert_called_once_with(
             fake_gym_shards,
             {"training": list(range(8)), "validation": None},
+            reject_materialized_tasks=False,
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
             "fields"
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
+
+    @pytest.mark.parametrize(
+        "override_name",
+        ["agent_granularity_overrides", "task_source_granularity_overrides"],
+    )
+    def test_nemo_gym_rejects_recovery_overrides_for_materialized_tasks(
+        self, patched_factories, override_name: str
+    ) -> None:
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        getattr(mc.rollout_recovery, override_name)["weather_agent"] = (
+            RecoveryGranularity.PROMPT_GROUP
+        )
+        mc.policy["generation"].update(
+            model_name="test-model",
+            stop_strings=None,
+            stop_token_ids=None,
+            top_k=None,
+            vllm_cfg={"async_engine": True, "expose_http_server": True},
+        )
+        patched_factories["setup_response_data"].return_value = (
+            [
+                {
+                    "extra_env_info": {
+                        "task_id": {"taskset": "weather:train", "task_id": "1"},
+                        "task_input": {},
+                    }
+                }
+            ],
+            None,
+        )
+        fake_gym_shards = MagicMock(
+            is_sharded=True,
+            hosted_routes={"weather_environment"},
+            environment_server_routes={"weather:train": "weather_environment"},
+        )
+        with (
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_shards
+            ),
+            patch.object(
+                sc_setup_mod,
+                "validate_dataset_agent_coverage",
+                side_effect=validate_dataset_agent_coverage,
+            ),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            pytest.raises(
+                ShardSetupError, match="training.*Materialized.*" + override_name
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_gym_shards.shutdown.assert_called_once_with()
 
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("shaping_enabled", [False, True])
