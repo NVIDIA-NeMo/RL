@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -259,8 +260,22 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
+        tokenizer: Any = None,
+        thinking_tags: Sequence[str] | None = None,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        if (
+            reward_penalty_config is not None
+            and reward_penalty_config.penalize_malformed_think_tag
+            and (tokenizer is None or thinking_tags is None or len(thinking_tags) < 2)
+        ):
+            raise ValueError(
+                "penalize_malformed_think_tag requires a tokenizer and resolved "
+                "open/close thinking_tags"
+            )
+        # Decodes generations for the malformed-think-tag string check.
+        self._tokenizer = tokenizer
+        self._thinking_tags = thinking_tags
         self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -403,6 +418,8 @@ class RolloutReassembler:
                 effort_config=self._effort_config,
                 token_ids=row.token_ids,
                 link_spans=row.link_spans,
+                decode=self._decode if self._tokenizer is not None else None,
+                thinking_tags=self._thinking_tags,
             )
         except ValueError as error:
             return rejected(f"reward_processing:{error}", staging_keys)
@@ -508,6 +525,9 @@ class RolloutReassembler:
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
         )
+
+    def _decode(self, token_ids: Sequence[int]) -> str:
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
 
     def _resolve_media(
         self,
@@ -666,6 +686,17 @@ class RolloutReassembler:
                 else 0.0
             ),
         }
+        # Valid rows hitting max_seq_len (the TRUNCATED predicate below), pooled
+        # into termination rates like the penalty counts; receipt-side rates
+        # only saw a placeholder truncated=False.
+        metrics["finalize/truncated_count"] = 0.0
+        for row, context in zip(rows, log_contexts):
+            if row.valid:
+                truncated = float(len(row.token_ids) == self._max_seq_len)
+                metrics["finalize/truncated_count"] += truncated
+                if context is not None:
+                    key = f"finalize/truncated_count/{context.agent_name}"
+                    metrics[key] = metrics.get(key, 0.0) + truncated
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.

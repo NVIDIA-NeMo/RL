@@ -535,6 +535,8 @@ def prepare_packed_loss_input(
         chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
+        # Sole consumer of the packed logits, so the grad may overwrite them.
+        reuse_logits_storage=True,
     )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:

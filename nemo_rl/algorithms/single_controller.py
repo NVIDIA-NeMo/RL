@@ -56,7 +56,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -186,7 +186,7 @@ from nemo_rl.experience.rollout_recovery import (
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
 )
-from nemo_rl.experience.rollouts import get_effort_config
+from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking_tags
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
@@ -1923,6 +1923,10 @@ class SingleControllerActor:
         valid-row fraction is no longer a finalizer-side drop -- the caller
         decides that, since only the caller can source a replacement.
         """
+        # Popped before any await, so a dropped or cancelled group leaves no entry.
+        rollout_metrics = self._rollout_manager.pop_capture_rollout_metrics(
+            request.group_id
+        )
         self._finalizer_waiters += 1
         queue_depth = max(
             0,
@@ -2003,10 +2007,20 @@ class SingleControllerActor:
                     )
                 else:
                     try:
+                        meta = finalized.meta
+                        if rollout_metrics:
+                            # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
+                            meta = replace(
+                                meta,
+                                extra_info={
+                                    **meta.extra_info,
+                                    ROLLOUT_METRICS: [rollout_metrics],
+                                },
+                            )
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
-                            finalized.meta,
+                            meta,
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
@@ -3613,7 +3627,11 @@ class SingleControllerActor:
                         for name, values in step_finalizer_metrics.items()
                         if values
                         and not name.startswith(
-                            ("finalize/penalty_count/", "finalize/effort/")
+                            (
+                                "finalize/penalty_count/",
+                                "finalize/effort/",
+                                "finalize/truncated_count",
+                            )
                         )
                     }
                 )
@@ -4560,6 +4578,7 @@ class SingleControllerActor:
         return CaptureRewardSettings.from_configs(
             self._master_config.reward_penalties,
             get_effort_config(self._master_config.env),
+            get_nemo_gym_thinking_tags(self._master_config.env),
         )
 
     async def _capture_rollout_checkpoint_cut(

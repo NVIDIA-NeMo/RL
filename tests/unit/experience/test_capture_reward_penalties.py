@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Capture reward parity with the standard path, without token decoding."""
+"""Capture reward parity with the standard path (think-tag checks use a stub decoder)."""
 
 import json
 from itertools import product
 
 import pytest
+import torch
 
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.experience.reward_penalties import (
@@ -30,6 +31,7 @@ from nemo_rl.experience.reward_penalties import (
     finalize_capture_reward,
     has_duplicated_reasoning,
     has_empty_final_answer,
+    has_malformed_think_tag,
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -147,6 +149,115 @@ def test_generated_spans_only_including_each_terminal(ids, expected):
     assert counts["unwanted_token"] == int(expected)
 
 
+THINK_OPEN, THINK_CLOSE = 1, 2
+_THINK_VOCAB = {THINK_OPEN: "<think>", THINK_CLOSE: "</think>"}
+
+
+def _decode(token_ids) -> str:
+    return "".join(_THINK_VOCAB.get(token, f"t{token} ") for token in token_ids)
+
+
+# (turn-1 prompt, turn-1 generation, turn-2 prompt, turn-2 generation)
+THINK_TURNS = [
+    # thinking on: trailing open tag in the prompt, one close tag generated
+    ([10, 1], [11, 2, 12], [13, 1], [14, 2, 15]),
+    # thinking off: balanced tags in the prompt, no tags generated
+    ([10, 1, 2], [11], [13, 1, 2], [14]),
+    # a second close tag in one turn
+    ([10, 1], [11, 2, 12], [13, 1], [14, 2, 2]),
+    # an open tag generated
+    ([10, 1], [11, 2, 12], [13, 1], [1, 14, 2]),
+    # thinking on but the close tag never generated
+    ([10, 1], [11], [13], [14]),
+    # unexpected prompt pattern
+    ([1, 1, 10], [11, 2], [13], [14]),
+]
+
+
+@pytest.mark.parametrize("with_ids", [True, False])
+@pytest.mark.parametrize("turns", THINK_TURNS)
+def test_malformed_think_tag_parity(turns, with_ids):
+    """Capture spans hit the echo path's per-turn ID and string checks."""
+    prompt_1, gen_1, prompt_2, gen_2 = turns
+    penalties: dict = {
+        "penalize_malformed_think_tag": True,
+        "thinking_tags": ["<think>", "</think>"],
+    }
+    if with_ids:
+        penalties["token_ids"] = {"think_open": THINK_OPEN, "think_close": THINK_CLOSE}
+    result = {
+        "full_result": {
+            "reward": 1.0,
+            "response": {
+                "output": [
+                    {"type": "message", "generation_str": _decode(gen_1)},
+                    {"type": "message", "generation_str": _decode(gen_2)},
+                ]
+            },
+        },
+        "message_log": [
+            {"role": "user", "token_ids": torch.tensor(prompt_1)},
+            {"role": "assistant", "token_ids": torch.tensor(gen_1)},
+            {"role": "user", "token_ids": torch.tensor(prompt_2)},
+            {"role": "assistant", "token_ids": torch.tensor(gen_2)},
+        ],
+    }
+    expected = apply_reward_penalties([result], penalties)
+    reward, counts, _ = finalize_capture_reward(
+        1.0,
+        checks=None,
+        penalty_config=RewardPenaltyConfig.model_validate(penalties),
+        effort_config=None,
+        token_ids=[*prompt_1, *gen_1, *prompt_2, *gen_2],
+        link_spans=[
+            ("c1", len(prompt_1), len(gen_1)),
+            ("c2", len(prompt_2), len(gen_2)),
+        ],
+        decode=_decode,
+        thinking_tags=penalties["thinking_tags"],
+    )
+    assert counts["malformed_think_tag"] == expected["malformed_think_tag"]
+    assert reward == result["full_result"]["reward"]
+
+
+def test_malformed_think_tag_string_check_catches_spelled_out_tags():
+    """Ordinary tokens that decode to a tag bypass the ID check but not the string check."""
+    vocab = {30: "</th", 31: "ink>"}
+    assert has_malformed_think_tag(
+        [10, THINK_OPEN],
+        [11, THINK_CLOSE, 30, 31],
+        think_tag_ids=(THINK_OPEN, THINK_CLOSE),
+        thinking_tags=["<think>", "</think>"],
+        decode=lambda ids: "".join(
+            vocab.get(token, _THINK_VOCAB.get(token, "x")) for token in ids
+        ),
+    )
+
+
+def test_malformed_think_tag_requires_decode():
+    reward, counts, _ = finalize_capture_reward(
+        1.0,
+        checks=None,
+        penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+        effort_config=None,
+        token_ids=[10, 11],
+        link_spans=[("c1", 1, 1)],
+        decode=_decode,
+        thinking_tags=["<think>", "</think>"],
+    )
+    assert (reward, counts["malformed_think_tag"]) == (1.0, 0)
+    with pytest.raises(ValueError, match="needs_decode"):
+        finalize_capture_reward(
+            1.0,
+            checks=None,
+            penalty_config=RewardPenaltyConfig(penalize_malformed_think_tag=True),
+            effort_config=None,
+            token_ids=[10, 11],
+            link_spans=[("c1", 1, 1)],
+            thinking_tags=["<think>", "</think>"],
+        )
+
+
 def _observations(*rewards: float) -> list[FinalizedReward]:
     return [
         FinalizedReward(f"sample-{i}", f"attempt-{i}", value, None)
@@ -172,6 +283,30 @@ def test_metric_pooling_uses_valid_rollouts_and_legacy_names():
         "total_reward/histogram": [0.0, 2.0, 2.0, 2.0],
     }
     assert aggregate_capture_reward_metrics({}, []) == {}
+
+
+def test_termination_rates_pool_truncated_valid_rows():
+    # Two groups with 1 and 3 valid rows; 2 of the 4 rows hit max_seq_len.
+    observations = [
+        FinalizedReward(f"sample-{i}", f"attempt-{i}", 1.0, context)
+        for i, context in enumerate(
+            [RewardLogContext("a", None)] * 3 + [RewardLogContext("b", None)]
+        )
+    ]
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/truncated_count": [1.0, 1.0],
+            "finalize/truncated_count/a": [1.0, 0.0],
+            "finalize/truncated_count/b": [1.0],
+        },
+        observations,
+    )
+    assert metrics["truncation_rate"] == 0.5
+    assert metrics["natural_termination_rate"] == 0.5
+    assert metrics["a/truncation_rate"] == pytest.approx(1 / 3)
+    assert metrics["b/truncation_rate"] == 1.0
+    # No finalizer counts (echo path): termination rates come from completions.
+    assert "truncation_rate" not in aggregate_capture_reward_metrics({}, observations)
 
 
 def _input(*messages):
@@ -306,7 +441,7 @@ def test_metric_pooling_mixes_low_and_high_effort_groups():
 
 
 def test_reward_settings_ignore_extras_and_inactive_options():
-    baseline = CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None)
+    baseline = CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
     config = RewardPenaltyConfig.model_validate(
         {
             "experiment_note": "retry",
@@ -316,7 +451,7 @@ def test_reward_settings_ignore_extras_and_inactive_options():
     inactive_effort = EffortLevelsConfig(
         low_weight=0, low_string="changed", low_ub=123, note="unused"
     )
-    assert CaptureRewardSettings.from_configs(config, inactive_effort) == baseline
+    assert CaptureRewardSettings.from_configs(config, inactive_effort, None) == baseline
     assert (
         CaptureRewardSettings.from_state({"version": 1, "penalties": {}, "effort": {}})
         == baseline
@@ -330,6 +465,7 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
             penalize_unwanted_tokens=True, token_ids={"unwanted": [42, 7, 42]}
         ),
         EffortLevelsConfig(low_weight=1, low_string="budget"),
+        None,
     )
     restored = CaptureRewardSettings.from_state(
         {
@@ -367,11 +503,22 @@ def test_reward_settings_normalize_active_tokens_and_nested_extras():
             "effort.low_ub",
         ),
         ({"effort": None}, "effort.enabled"),
+        (
+            {
+                "penalties": {
+                    "penalize_malformed_think_tag": True,
+                    "thinking_tags": ["<think>", "</think>"],
+                }
+            },
+            "penalize_malformed_think_tag",
+        ),
     ],
 )
 def test_reward_settings_reject_semantic_changes_with_field_names(change, expected):
     settings = CaptureRewardSettings.from_configs(
-        RewardPenaltyConfig(), EffortLevelsConfig(low_weight=1, low_string="budget")
+        RewardPenaltyConfig(),
+        EffortLevelsConfig(low_weight=1, low_string="budget"),
+        None,
     )
     changed = CaptureRewardSettings.from_state({**settings.to_state(), **change})
     with pytest.raises(ValueError, match=expected):
@@ -388,6 +535,12 @@ def test_reward_settings_reject_semantic_changes_with_field_names(change, expect
         {"version": 2, "penalties": {}, "effort": None},
         {"version": True, "penalties": {}, "effort": None},
         {"version": 1, "penalties": {"penalize_unwanted_tokens": True}, "effort": None},
+        # The think-tag penalty without its resolved tags.
+        {
+            "version": 1,
+            "penalties": {"penalize_malformed_think_tag": True},
+            "effort": None,
+        },
         {
             "version": 1,
             "penalties": {},
@@ -398,6 +551,37 @@ def test_reward_settings_reject_semantic_changes_with_field_names(change, expect
 def test_reward_settings_reject_invalid_records(state):
     with pytest.raises(ValueError):
         CaptureRewardSettings.from_state(state)
+
+
+def _think_settings(open_id, close_id, tags=("<think>", "</think>")):
+    return CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(
+            penalize_malformed_think_tag=True,
+            token_ids={"think_open": open_id, "think_close": close_id},
+        ),
+        None,
+        tags,
+    )
+
+
+def test_reward_settings_persist_think_tag_rules():
+    saved = CaptureRewardSettings.from_state(_think_settings(1, 2).to_state())
+    assert saved == _think_settings(1, 2)
+    saved.require_compatible(_think_settings(1, 2))
+    with pytest.raises(ValueError, match="think_open/think_close"):
+        saved.require_compatible(_think_settings(3, 4))
+    with pytest.raises(ValueError, match="thinking_tags"):
+        saved.require_compatible(_think_settings(1, 2, ("<t>", "</t>")))
+    # Inferred IDs (none configured) differ from configured ones.
+    with pytest.raises(ValueError, match="think_open/think_close"):
+        saved.require_compatible(_think_settings(None, None))
+    # Rules are only part of the identity while the penalty is on.
+    off = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(token_ids={"think_open": 3, "think_close": 4}),
+        None,
+        ("<t>", "</t>"),
+    )
+    assert off == CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
 
 
 def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():

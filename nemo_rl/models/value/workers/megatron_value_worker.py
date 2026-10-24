@@ -59,6 +59,7 @@ from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -1038,6 +1039,13 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cpu")
+
+        # The critic trains with activation recompute on variable-length sequences,
+        # so the RoPE cache and MoE dispatcher cycles described in
+        # clear_transient_megatron_caches would otherwise stay resident across the
+        # offload, as they do for the policy before a refit.
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit"):
+            clear_transient_megatron_caches(self.model)
 
         gc.collect()
         torch.cuda.empty_cache()

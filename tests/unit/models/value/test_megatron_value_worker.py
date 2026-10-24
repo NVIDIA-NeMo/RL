@@ -337,6 +337,7 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
         optimizer_cpu_offload=optimizer_cpu_offload,
         move_model=move_model,
         move_optimizer=move_optimizer,
+        cfg={"megatron_cfg": {}},
     )
     with (
         patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
@@ -366,6 +367,7 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
     worker = object.__new__(MegatronValueWorkerImpl)
     worker.model = _EvalModel()
     worker.optimizer = None
+    worker.cfg = {"megatron_cfg": {}}
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
@@ -376,6 +378,35 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
 
     assert events == ["eval", "move_model"]
     assert move_kwargs == [{"move_params": True, "move_grads": True}]
+
+
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_finish_training_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches: bool
+) -> None:
+    """clear_memory_caches_before_refit releases the critic's RoPE/MoE caches too."""
+    from nemo_rl.models.value.workers import megatron_value_worker
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.model = model
+    worker.optimizer = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
+    monkeypatch.setattr(
+        megatron_value_worker,
+        "clear_transient_megatron_caches",
+        lambda m: events.append("clear") if m is model else None,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"] + (["clear"] if clear_caches else [])
 
 
 @pytest.fixture

@@ -246,6 +246,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size: int,
         tp_group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
+        reuse_logits_storage: bool = False,
     ) -> torch.Tensor:
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -285,6 +286,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             ctx.save_for_backward(vocab_parallel_logits, target_mask, masked_target)
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
+            ctx.reuse_logits_storage = reuse_logits_storage
 
         return log_probs
 
@@ -292,7 +294,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         vocab_parallel_logits, target_mask, masked_target = ctx.saved_tensors
         chunk_size = ctx.chunk_size
@@ -302,7 +304,19 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(vocab_parallel_logits)
+        # Opt-in: write the grad into the fp32 logits' storage instead of a second
+        # [B, S, V/TP] tensor. Only safe when this op is the logits' sole consumer;
+        # each chunk is read before it is overwritten, and leaf tensors are left intact.
+        reuse_logits_storage = (
+            ctx.reuse_logits_storage
+            and vocab_parallel_logits.dtype == torch.float32
+            and not vocab_parallel_logits.is_leaf
+        )
+        grad_input: torch.Tensor = (
+            vocab_parallel_logits
+            if reuse_logits_storage
+            else torch.zeros_like(vocab_parallel_logits)
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -335,7 +349,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             del softmax_output, is_chosen, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 class DistributedLogprobWithSampling(torch.autograd.Function):
@@ -1065,6 +1079,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     sampling_params: Optional[TrainingSamplingParams] = None,
     target_is_pre_rolled: bool = False,
     return_packed_layout: bool = False,
+    reuse_logits_storage: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -1091,6 +1106,8 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         return_packed_layout (bool): Keep the physical ``[1, T-1]`` layout.
             This is used when the input data was packed before it reached the
             model worker.
+        reuse_logits_storage (bool): Let the chunked path write its fp32 grad into
+            the logits' storage. Only for callers whose logits have no other consumer.
 
     Returns:
         torch.Tensor: Log probabilities in unpacked ``[batch_size,
@@ -1156,6 +1173,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 chunk_size,
                 group,
                 inference_only,
+                reuse_logits_storage,
             ).contiguous()
         else:
             probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore

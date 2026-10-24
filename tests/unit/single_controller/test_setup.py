@@ -825,15 +825,12 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_capture_rejects_malformed_thinking_reward_penalty(self, patched_factories):
+    def test_capture_allows_malformed_thinking_reward_penalty(self, patched_factories):
         mc = _make_master_config()
         mc.env["should_use_nemo_gym"] = True
         mc.token_capture.enabled = True
         mc.reward_penalties = RewardPenaltyConfig(penalize_malformed_think_tag=True)
-        with pytest.raises(
-            ValueError, match="does not support.*penalize_malformed_think_tag"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_capture_allows_text_and_token_penalties_without_warning(
         self, patched_factories
@@ -2292,10 +2289,11 @@ class TestSetup:
         ]
         assert WIRE_MULTIMODAL_FIELDS <= set(warmup_fields)
 
+    @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("shaping_enabled", [False, True])
     def test_token_capture_always_creates_finalizer_actor_pool(
-        self, patched_factories, with_processor, shaping_enabled
+        self, patched_factories, with_processor, shaping_enabled, think_tag_penalty
     ):
         # A VLM processor turns media capture on (Omni placeholder processor,
         # Megatron learner); text-only runs get capture_media=False.
@@ -2313,7 +2311,9 @@ class TestSetup:
             penalize_duplicated_reasoning=True,
             penalize_empty_final_answer=True,
             penalize_unwanted_tokens=True,
-            token_ids={"unwanted": [99]},
+            penalize_malformed_think_tag=think_tag_penalty,
+            # Explicit think IDs: the mock tokenizer is never asked to encode.
+            token_ids={"unwanted": [99], "think_open": 12, "think_close": 13},
         )
         mc.token_capture.enabled = True
         effort = (
@@ -2361,8 +2361,16 @@ class TestSetup:
         assert actor_config.staging_partition == mc.token_capture.staging_partition
         assert actor_config.pad_token_id == 9
         assert actor_config.capture_media is with_processor
-        assert actor_config.reward_penalty_config == mc.reward_penalties
         assert actor_config.effort_config == effort
+        # Only the malformed-think-tag penalty needs a finalizer-side tokenizer.
+        if think_tag_penalty:
+            assert actor_config.reward_penalty_config.penalize_malformed_think_tag
+            assert actor_config.tokenizer_config == mc.policy["tokenizer"]
+            assert actor_config.thinking_tags == ("<think>", "</think>")
+        else:
+            assert actor_config.reward_penalty_config == mc.reward_penalties
+            assert actor_config.tokenizer_config is None
+            assert actor_config.thinking_tags is None
         assert actor_kwargs == {"num_workers": 3}
         assert actor_args.finalizer_actors == fake_actors
         assert not hasattr(actor_args.rollout_manager, "_finalizer")

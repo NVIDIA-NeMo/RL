@@ -2236,6 +2236,46 @@ def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
     assert moved == (["cpu"] if offload_optimizer else [])
 
 
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_megatron_offload_before_refit_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches
+):
+    """clear_memory_caches_before_refit releases the policy's RoPE/MoE caches."""
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cleared = []
+    model = object()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = model
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.finalize_async_save = lambda: None
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: model
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(
+        megatron_policy_worker, "clear_transient_megatron_caches", cleared.append
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert cleared == ([model] if clear_caches else [])
+
+
 @pytest.mark.parametrize(
     "generation_backend, colocated, has_inference_model, shared_buffer, "
     "expect_move_params, expect_move_grads",
