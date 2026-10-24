@@ -1689,11 +1689,12 @@ def setup_single_controller(
     # NIXL units with storage_unit_placement=inference read the inference
     # placement groups when TQ bootstraps inside the trainer build, which runs
     # in parallel with the generation build: reserve them first.
-    nixl_block = dp_config.get("nixl") or {}
+    from nemo_rl.data_plane.interfaces import backend_config
+
     if (
         not colocated
         and dp_config["backend"] == "nixl"
-        and nixl_block.get("storage_unit_placement") == "inference"
+        and backend_config(dp_config).storage_unit_placement == "inference"
     ):
         inference_cluster.get_placement_groups()
 
