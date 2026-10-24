@@ -206,6 +206,7 @@ project-includes = [
   "nemo_rl/experience/failures.py",
   "nemo_rl/experience/interfaces.py",
   "nemo_rl/experience/metric_utils.py",
+  "nemo_rl/experience/nemo_gym_rollout_config.py",
   "nemo_rl/experience/payload.py",
   "nemo_rl/experience/rollout_manager.py",
   "nemo_rl/experience/rollout_reassembler.py",

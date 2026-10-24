@@ -548,6 +548,8 @@ def _make_gym_impl(
     impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
     impl._deadline_registry = None
     impl._max_gym_row_attempts = row_attempts
+    # Resolved "no hook": the fake environment has no rollout_config to read.
+    impl._rollout_metrics_hook = None
     # Real counters by default so row-level re-dispatches are observable; production
     # shares the owning RolloutManager's instance.
     impl._stats = stats if stats is not None else RolloutStats()
