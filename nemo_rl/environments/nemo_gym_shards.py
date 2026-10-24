@@ -54,6 +54,12 @@ SHARD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # Restated rather than imported: this module is imported on the driver, and
 # nemo_gym is installed only in the actor's venv.
 GYM_LOG_DIR_KEY = "nemo_gym_log_dir"
+# Gym's venv-directory key (``nemo_gym.global_config.UV_VENV_DIR_KEY_NAME``). Every
+# instance builds its server venvs under this directory, so replicas that share it race
+# the same ``uv sync`` and one of them starts servers from a half-built venv
+# (one replica died with ``No module named aiohttp`` while another was still
+# installing into the shared directory).
+GYM_VENV_DIR_KEY = "uv_venv_dir"
 
 # Gym's server-type keys that make an entry a rollout destination.
 GYM_ROUTABLE_KEYS = frozenset({"responses_api_agents", "resources_servers"})
@@ -556,17 +562,21 @@ def apply_shard_log_dir(
     name — which replicas always do, since they are stamped from one merge — and
     on shared storage that happens across nodes without any error.
 
-    Returns the config unchanged when no log dir is set, which is the default.
+    The venv directory (``uv_venv_dir``) gets the same treatment: instances
+    that share one build their server venvs concurrently, and ``skip_venv_if_present``
+    only checks that the directory exists, so the slower instance imports from a
+    venv the faster one is still populating.
+
+    Returns the config unchanged when neither key is set, which is the default.
     """
     config = dict(gym_config)
-    log_dir = config.get(GYM_LOG_DIR_KEY)
-    if not log_dir:
-        return config
-
     # Gym applies the same sanitization to server names before using them as
     # path components.
     suffix = shard_name.replace("/", "_")
     if replica_index is not None:
         suffix = f"{suffix}/{replica_index}"
-    config[GYM_LOG_DIR_KEY] = str(PurePosixPath(str(log_dir)) / suffix)
+    for key in (GYM_LOG_DIR_KEY, GYM_VENV_DIR_KEY):
+        value = config.get(key)
+        if value:
+            config[key] = str(PurePosixPath(str(value)) / suffix)
     return config
