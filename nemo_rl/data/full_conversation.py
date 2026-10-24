@@ -33,7 +33,7 @@ def get_full_conversation_message_log(
     add_bos_token: bool,
     add_eos_token: bool,
 ) -> list[dict[str, str | torch.Tensor]]:
-    """Render/tokenize once and return loss-ownership segments for SFT.
+    """Render and tokenize once, separating assistant targets from context.
 
     A template must mark each complete assistant target, including its turn
     terminator and trailing whitespace, with one generation block. The template
@@ -42,12 +42,15 @@ def get_full_conversation_message_log(
     outside the block. Returned segments are not source conversation turns;
     their roles let the existing SFT mask helper select assistant targets without
     changing, retokenizing, or shifting the token sequence.
+    Context segments are masked out of the training loss; assistant segments
+    are supervised unless SFT is configured to train only on the final target.
 
     Args:
         messages: Text-only messages ending with an assistant target.
         tokenizer: Fast tokenizer with an explicitly generation-marked template.
         prompt: Optional format string applied to the first user message.
-        tools: Optional tool schemas passed to the template.
+        tools: Tool schemas overriding configured defaults. None preserves the
+            defaults; an empty list explicitly disables tools.
         add_bos_token: Prepend the configured BOS if not already present.
         add_eos_token: Append the configured EOS if not already present.
 
@@ -74,7 +77,8 @@ def get_full_conversation_message_log(
         prepared[user_indices[0]]["content"] = prompt.format(
             prepared[user_indices[0]]["content"]
         )
-    # get_tokenizer binds configured controls (e.g. enable_thinking) with partial.
+    # get_tokenizer binds defaults with partial; resolve them before selecting
+    # the template because tools can select a different template.
     template_options: dict[str, Any] = dict(tokenizer.special_tokens_map)
     if isinstance(tokenizer.apply_chat_template, partial):
         template_options.update(tokenizer.apply_chat_template.keywords)
@@ -92,27 +96,30 @@ def get_full_conversation_message_log(
         add_generation_prompt=False,
     )
     template_options.pop("tokenize", None)
-    rendered, generations = render_jinja_template(
+    rendered_conversations, generation_spans = render_jinja_template(
         conversations=[prepared], **template_options
     )
-    text = rendered[0]
-    spans = generations[0]
+    text = rendered_conversations[0]
+    spans = generation_spans[0]
     if len(spans) != sum(message["role"] == "assistant" for message in prepared):
         raise ValueError("Expected exactly one generation block per assistant target.")
-    cursor = 0
+    previous_span_end = 0
     for start, end in spans:
-        if not cursor <= start < end <= len(text):
+        if not previous_span_end <= start < end <= len(text):
             raise ValueError("Assistant generation spans must be nonempty and ordered.")
-        cursor = end
-    for (start, end), (next_start, _) in zip(spans, spans[1:]):
-        if (
-            tokenizer.eos_token
-            and not text[start:end].rstrip().endswith(tokenizer.eos_token)
-            and text[end:next_start].lstrip().startswith(tokenizer.eos_token)
-        ):
-            raise ValueError(
-                "An assistant EOS terminator is outside its generation block."
+        previous_span_end = end
+    eos_token = tokenizer.eos_token
+    if eos_token:
+        for (start, end), (next_start, _) in zip(spans, spans[1:]):
+            assistant_ends_with_eos = text[start:end].rstrip().endswith(eos_token)
+            following_context_starts_with_eos = (
+                text[end:next_start].lstrip().startswith(eos_token)
             )
+            # After a supervised EOS, the next EOS-looking token may be a BOS.
+            if not assistant_ends_with_eos and following_context_starts_with_eos:
+                raise ValueError(
+                    "An assistant EOS terminator is outside its generation block."
+                )
     if spans[-1][1] != len(text):
         raise ValueError(
             "The final generation block must include the assistant terminator "
@@ -121,6 +128,7 @@ def get_full_conversation_message_log(
     if add_eos_token:
         if tokenizer.eos_token is None:
             raise ValueError("EOS requested but the tokenizer has no EOS token.")
+        # Match the incremental formatter: only newlines are ignored here.
         if not text.rstrip("\n").endswith(tokenizer.eos_token):
             text += tokenizer.eos_token
             spans[-1] = (spans[-1][0], len(text))
@@ -140,39 +148,46 @@ def get_full_conversation_message_log(
         return_offsets_mapping=True,
         return_tensors="pt",
     )
-    tokens = encoded["input_ids"][0]
-    offsets = encoded["offset_mapping"][0]
-    nonempty = offsets[:, 0] < offsets[:, 1]
+    tokens: torch.Tensor = encoded["input_ids"][0]
+    offsets: torch.Tensor = encoded["offset_mapping"][0]
+    has_character_offset = offsets[:, 0] < offsets[:, 1]
     output: list[dict[str, str | torch.Tensor]] = []
 
-    def append_segment(start: int, end: int, role: str) -> None:
-        if start < end:
+    def append_segment(start_token: int, end_token: int, role: str) -> None:
+        if start_token < end_token:
             output.append(
                 {
                     "role": role,
                     "content": tokenizer.decode(
-                        tokens[start:end], clean_up_tokenization_spaces=False
+                        tokens[start_token:end_token],
+                        clean_up_tokenization_spaces=False,
                     ),
-                    "token_ids": tokens[start:end],
+                    "token_ids": tokens[start_token:end_token],
                 }
             )
 
     token_cursor = 0
     next_token_targets = 0
     for start, end in spans:
-        selected = nonempty & (offsets[:, 1] > start) & (offsets[:, 0] < end)
-        indices = torch.nonzero(selected).flatten()
-        if not len(indices):
+        overlaps_span = (
+            has_character_offset & (offsets[:, 1] > start) & (offsets[:, 0] < end)
+        )
+        token_indices = torch.nonzero(overlaps_span).flatten()
+        if not len(token_indices):
             raise ValueError("An assistant generation span has no supervised tokens.")
-        if ((offsets[selected, 0] < start) | (offsets[selected, 1] > end)).any():
+        if (
+            (offsets[overlaps_span, 0] < start) | (offsets[overlaps_span, 1] > end)
+        ).any():
             raise ValueError("A token crosses an assistant supervision boundary.")
-        first, last = int(indices[0]), int(indices[-1]) + 1
-        if first < token_cursor:
+        first_token = int(token_indices[0])
+        end_token = int(token_indices[-1]) + 1
+        if first_token < token_cursor:
             raise ValueError("Assistant generation spans overlap in token space.")
-        append_segment(token_cursor, first, "context")
-        append_segment(first, last, "assistant")
-        next_token_targets += max(0, last - max(first, 1))
-        token_cursor = last
+        append_segment(token_cursor, first_token, "context")
+        append_segment(first_token, end_token, "assistant")
+        # Position zero has no preceding token from which to predict it.
+        next_token_targets += max(0, end_token - max(first_token, 1))
+        token_cursor = end_token
     if token_cursor != len(tokens):
         raise ValueError("The final assistant span must cover the final token.")
     if not next_token_targets:
