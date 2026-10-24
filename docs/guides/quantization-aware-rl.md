@@ -343,7 +343,7 @@ Generation-specific parameters are added under `policy.generation`:
 |---|---|
 | `quant_cfg` | ModelOpt recipe used only for simulated/fake-quant vLLM generation. Set it to `null` for real-quant rollout. |
 | `real_quant` | When `true`, vLLM receives ModelOpt-packed weights and deployment scales during refit. `policy.quant_cfg` selects the format. Verify that the pinned vLLM selects the intended native method; unsupported schemas may be rejected or may fall back to an unquantized method. When unset or `false`, vLLM uses fake-quantized generation. |
-| `real_quant_export_cpu_offload` | Boolean required for real-quant rollout. When `true`, packed export tensors are copied to CPU before refit. Set to `false` only for colocated CUDA-IPC refit without an explicit `refit_transport`; this avoids the CPU round trip at the cost of transient GPU memory. |
+| `real_quant_export_cpu_offload` | Boolean required for real-quant rollout. When `true`, packed export tensors are copied to CPU before refit. Set to `false` for default colocated CUDA-IPC or non-colocated collective refit, without an explicit `refit_transport`, to avoid the CPU round trip at the cost of transient GPU memory. |
 
 ## Megatron Checkpoint Directory
 
