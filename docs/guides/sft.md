@@ -77,7 +77,20 @@ Generation ranges do not prove semantic completeness: the template author must
 verify that every assistant span includes the intended content and model-specific
 turn terminator (which may differ from the tokenizer's EOS). The formatter does
 not claim to detect arbitrary partially marked targets or infer unknown terminators.
-The existing SFT overlength exclusion policy is unchanged.
+The existing SFT overlength exclusion policy is unchanged: rows at or above
+`max_seq_length` remain in the dataset with `loss_multiplier=0`, rather than being
+removed or trained on truncated targets. Full-conversation formatting replaces
+their token sequence with a short, masked batching placeholder while retaining
+the original token count in `length` for diagnostics. Thus `length` intentionally
+differs from the placeholder's token count; batching uses the actual tensors.
+
+Final EOS insertion also preserves the incremental formatter's convention:
+only trailing newlines are ignored when checking for an existing EOS.
+`<eos>\n` therefore does not receive another EOS, but `<eos> \t` does when
+`add_eos_token=true`. Those spaces/tabs remain intact and the appended EOS is
+supervised. With `add_eos_token=false`, the template output is left unchanged.
+This differs intentionally from the historical-EOS guard's whitespace-insensitive
+check; that guard diagnoses ownership rather than deciding whether to append EOS.
 
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.

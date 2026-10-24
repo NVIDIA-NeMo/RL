@@ -170,10 +170,10 @@ def test_bound_template_override(tokenizer: PreTrainedTokenizerFast) -> None:
 def test_bound_tools_and_row_precedence(
     tokenizer: PreTrainedTokenizerFast, row_tools: list[dict[str, Any]] | None
 ) -> None:
-    defaults = [{"name": "default_tool"}]
+    default_tools = [{"name": "default_tool"}]
     tokenizer.chat_template = {"default": "unmarked", "tool_use": TEMPLATE}
     tokenizer.apply_chat_template = partial(
-        tokenizer.apply_chat_template, tools=defaults
+        tokenizer.apply_chat_template, tools=default_tools
     )
     # An explicit empty list selects the default template, just as Transformers does.
     if row_tools == []:
@@ -184,7 +184,7 @@ def test_bound_tools_and_row_precedence(
     assert tokenizer.decode(torch.cat([m["token_ids"] for m in log])) == expected
 
 
-@pytest.mark.parametrize("whitespace", ["", "\\n"])
+@pytest.mark.parametrize("whitespace", ["", "\n"])
 def test_historical_eos_outside_generation_is_rejected(
     tokenizer: PreTrainedTokenizerFast, whitespace: str
 ) -> None:
@@ -192,8 +192,11 @@ def test_historical_eos_outside_generation_is_rejected(
         "prefix{% for m in messages %}{% if m.role == 'assistant' %}"
         "{% generation %}{{ m.content }}"
         "{% if loop.last %}{{ '<stop>' }}{% endif %}{% endgeneration %}"
-        "{% if not loop.last %}{{ '" + whitespace + "<stop>' }}{% endif %}"
+        "{% if not loop.last %}{{ terminator_prefix + '<stop>' }}{% endif %}"
         "{% else %}{{ m.content }}{% endif %}{% endfor %}"
+    )
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, terminator_prefix=whitespace
     )
     with pytest.raises(ValueError, match="EOS terminator is outside"):
         format_messages(
@@ -245,11 +248,10 @@ def test_shared_bos_eos_turn_headers(
     ]
     add_loss_mask_to_message_log([log], only_unmask_final=only_final)
     for index, segment in enumerate(assistant_segments):
-        stop = segment["token_ids"] == tokenizer.eos_token_id
-        assert stop.sum() == 1
-        assert segment["token_loss_mask"][stop].item() == int(
-            not only_final or index == 1
-        )
+        is_eos = segment["token_ids"] == tokenizer.eos_token_id
+        assert is_eos.sum() == 1
+        should_train = not only_final or index == len(assistant_segments) - 1
+        assert segment["token_loss_mask"][is_eos].item() == int(should_train)
     for segment in log:
         if segment["role"] == "context":
             assert not segment["token_loss_mask"].any()
@@ -463,3 +465,72 @@ def test_default_processor_is_unchanged(tokenizer: PreTrainedTokenizerFast) -> N
         torch.cat([m["token_ids"] for m in result["message_log"]]),
         torch.cat([m["token_ids"] for m in expected]),
     )
+
+
+@pytest.mark.parametrize("suffix", ["", "\n", "\n\n", " ", "\t", " \t", "\n \t"])
+@pytest.mark.parametrize("add_eos", [False, True])
+def test_final_eos_whitespace_matches_incremental_convention(
+    tokenizer: PreTrainedTokenizerFast, suffix: str, add_eos: bool
+) -> None:
+    tokenizer.chat_template = (
+        "{% for m in messages %}{{ '<start>' + m.role + '\\n' }}"
+        "{% if m.role == 'assistant' %}{% generation %}"
+        "{{ m.content + eos_token + eos_suffix }}{% endgeneration %}"
+        "{% else %}{{ m.content + '<stop>\\n' }}{% endif %}{% endfor %}"
+    )
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, eos_suffix=suffix
+    )
+    source = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    log = format_messages(tokenizer, source, add_eos_token=add_eos)
+    extra_eos = add_eos and bool(suffix.strip("\n"))
+    expected_target = "answer<stop>" + suffix + ("<stop>" if extra_eos else "")
+    assert log[-1]["content"] == expected_target
+    incremental = get_formatted_message_log(
+        source,
+        tokenizer,
+        TaskDataSpec(),
+        add_bos_token=False,
+        add_eos_token=add_eos,
+    )
+    ids = torch.cat([m["token_ids"] for m in log])
+    assert tokenizer.decode(ids) == tokenizer.decode(
+        torch.cat([m["token_ids"] for m in incremental])
+    )
+    add_loss_mask_to_message_log([log])
+    stop = log[-1]["token_ids"] == tokenizer.eos_token_id
+    assert stop.sum() == 1 + int(extra_eos)
+    assert log[-1]["token_loss_mask"][stop].all()
+
+
+def test_excluded_row_keeps_original_length_and_masked_placeholder(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    original = format_messages(tokenizer)
+    original_ids = torch.cat([segment["token_ids"] for segment in original])
+    original_length = len(original_ids)
+    result = PROCESSOR_REGISTRY["sft_full_conversation_processor"](
+        {"messages": messages(), "task_name": "test"},
+        TaskDataSpec(),
+        tokenizer,
+        original_length,
+        7,
+        add_bos=False,
+        add_eos=True,
+        add_generation_prompt=False,
+    )
+    assert result["length"] == original_length
+    assert result["loss_multiplier"] == 0.0
+    log = result["message_log"]
+    placeholder = torch.cat([segment["token_ids"] for segment in log])
+    assert 0 < len(placeholder) <= 4 < original_length
+    assert torch.equal(placeholder, original_ids[: len(placeholder)])
+    add_loss_mask_to_message_log([log])
+    flat, actual_lengths = batched_message_log_to_flat_message(
+        [log], {"token_ids": tokenizer.pad_token_id}
+    )
+    assert actual_lengths.tolist() == [len(placeholder)]
+    assert not flat["token_loss_mask"].any()

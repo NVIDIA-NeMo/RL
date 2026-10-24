@@ -195,6 +195,8 @@ def sft_processor(
     loss_multiplier = 1.0
     if length >= max_seq_length:
         if full_conversation:
+            # Keep the row with zero loss and a short batching placeholder;
+            # length below intentionally retains the original diagnostic count.
             logging.getLogger(__name__).warning(
                 "Excluding full-conversation SFT row idx=%d tokens=%d limit=%d",
                 idx,
