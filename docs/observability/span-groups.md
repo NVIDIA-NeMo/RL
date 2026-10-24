@@ -622,6 +622,17 @@ Set `env.nemo_gym.telemetry` to pass options through to that block, for example
 `{span_groups: "default,sandbox"}`; `enabled` defaults to true and an explicit
 `false` opts the Gym side out without disabling NeMo-RL's own telemetry.
 
+Alongside the block, `_spinup` publishes this actor's job identity —
+`nv.dl.campaign.stage`, the slurm ids, `nemo.run.id` — into
+`OTEL_RESOURCE_ATTRIBUTES`, which Gym's servers inherit. Gym builds its
+servers' resource from `nemo.gym.*` and little else, so without this their
+spans carry no campaign stage and a pipeline keyed on it drops them while this
+actor's sail through. `nv.dl.rank` is deliberately withheld: nemo-lens derives
+`service.instance.id` as `<run id>-rank<rank>`, so forwarding one rank would
+collapse every Gym server onto a single instance id. Until Gym publishes a
+per-server rank and instance id, Gym rows land with `identity_valid = 0` and
+`nv_dl_rank = -1`.
+
 Gym's own span groups are a separate concern from its exporters, and one this
 repository does control. `GymSpanGroup` registers into nemo-lens's
 `SpanRegistry` as an import side effect, so `NemoGym.__init__` imports
