@@ -69,7 +69,10 @@ from reasoning accidentally retained by incremental prefix rendering. Review tha
 policy before changing an existing training recipe. This processor requires a
 fast tokenizer, text-only messages, and a final assistant target. Missing markers,
 invalid span counts/order, uncovered final suffixes, a configured EOS immediately
-outside an earlier assistant span, and missing requested BOS/EOS tokens are errors.
+outside an earlier assistant span that does not already end in EOS, and missing
+requested BOS/EOS tokens are errors. An EOS-looking token after an already
+terminated assistant span may belong to the next turn's header, including when
+BOS and EOS share the same token; it is not rejected on that basis.
 Generation ranges do not prove semantic completeness: the template author must
 verify that every assistant span includes the intended content and model-specific
 turn terminator (which may differ from the tokenizer's EOS). The formatter does
