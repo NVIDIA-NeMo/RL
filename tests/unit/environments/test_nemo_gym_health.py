@@ -62,7 +62,7 @@ class _TaskSourceResolvingRolloutHelper:
     """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
 
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self, examples: list[dict[str, Any]], head_server_config: str, **_: Any
     ) -> list[Any]:
         assert head_server_config == "head-server"
         assert all("agent_ref" not in example for example in examples)
@@ -76,7 +76,7 @@ class _TaskSourceResolvingRolloutHelper:
 
 class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
     def run_examples(
-        self, examples: list[dict[str, Any]], head_server_config: str
+        self, examples: list[dict[str, Any]], head_server_config: str, **_: Any
     ) -> list[Any]:
         super().run_examples(examples, head_server_config)
 

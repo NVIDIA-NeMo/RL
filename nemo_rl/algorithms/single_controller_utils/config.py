@@ -101,8 +101,10 @@ class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
     # slow row actually holding the group up. None disables.
     rollout_timeout_s: Optional[PositiveFloat] = None
     # Attempts to re-dispatch just the rows that never arrived, before falling back to
-    # retrying the whole prompt group. Gym's stream dies on its first failing row, so one
-    # bad row takes every later row with it; recovering those individually is much
+    # retrying the whole prompt group. A row whose /run failed at the infrastructure
+    # level comes back from Gym as a failure marker and is dispatched again by itself,
+    # and a stream that dies by an infrastructure exception loses the rows still in
+    # flight, which are dispatched again too; recovering rows individually is much
     # cheaper than redoing all num_generations_per_prompt of them.
     max_row_attempts: PositiveInt = 3
 

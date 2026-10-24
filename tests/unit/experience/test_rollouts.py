@@ -47,7 +47,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.environments.interfaces import EnvironmentReturn
-from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym import GYM_INFRA_FAILURE_KEY, NemoGymShardSet
+from nemo_rl.experience.failures import GymTransportError, RolloutDataFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -1906,6 +1907,13 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     )
 
 
+class _RolloutConfigRemote:
+    """NemoGym.rollout_config stand-in: no driver-side rollout settings configured."""
+
+    async def remote(self):
+        return {}
+
+
 def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     """Prompt groups are yielded in completion order using async iteration."""
 
@@ -2100,7 +2108,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "nemo_gym": type(
                     "_Environment",
                     (),
-                    {"run_rollouts": _RunRolloutsRemote()},
+                    {
+                        "run_rollouts": _RunRolloutsRemote(),
+                        "rollout_config": _RolloutConfigRemote(),
+                    },
                 )()
             },
             generation_config={
@@ -2751,7 +2762,14 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
     manager._task_to_env = {
-        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+        "nemo_gym": type(
+            "_Environment",
+            (),
+            {
+                "run_rollouts": _RunRolloutsRemote(),
+                "rollout_config": _RolloutConfigRemote(),
+            },
+        )()
     }
     manager._tokenizer = None
     manager._effort_config = None
@@ -2790,6 +2808,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     assert metrics["completion_count"] == 2
     assert metrics["agent"] == "agent"
     assert metrics["remote_time"] == 2.0
+    assert metrics["nemo_gym_infra_redispatches"] == 0
     assert metrics["timing/test/routing/group_share/nemo_gym"] == 1
     assert metrics["reward_score_raw/mean"] == pytest.approx(1.5)
     assert metrics["reward_rubric_aggregate_valid/mean"] == pytest.approx(1.0)
@@ -2889,7 +2908,14 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     manager._deadline_registry = None
     manager._max_gym_row_attempts = 1
     manager._task_to_env = {
-        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+        "nemo_gym": type(
+            "_Environment",
+            (),
+            {
+                "run_rollouts": _RunRolloutsRemote(),
+                "rollout_config": _RolloutConfigRemote(),
+            },
+        )()
     }
     manager._tokenizer = None
     manager._effort_config = None
@@ -2952,8 +2978,11 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         timer_prefix,
         *,
         on_completion,
+        infra_failures=None,
+        stop_on_infra_failure=False,
     ):
-        del total_rows, timer_prefix, on_completion
+        del total_rows, timer_prefix, on_completion, infra_failures
+        del stop_on_infra_failure
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
@@ -3157,6 +3186,8 @@ def test_run_async_nemo_gym_rollout(
             "total_reward/histogram": None,
             "natural_termination_rate": None,
             "truncation_rate": None,
+            # Reported on every rollout, zero when no row was dispatched again.
+            "nemo_gym_infra_redispatches": 0,
             "zero_advantage_group_pct": 100.0,
             "reasoning_response_token_extraction_failure_rate": 1.0,
             # per agent metrics
@@ -3308,3 +3339,676 @@ def test_mask_sample_flags_read_either_form_of_the_flag():
         ]
     )
     assert flags.tolist() == [True, True, True, False, False, False]
+
+
+# ---------------------------------------------------------------------------
+# NeMo-Gym: bounded re-dispatch of rows lost to an infrastructure failure
+# ---------------------------------------------------------------------------
+
+_GYM_GENERATION_CONFIG = {
+    "stop_strings": [],
+    "stop_token_ids": [],
+    "top_k": None,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "val_temperature": 1.0,
+    "val_top_p": 1.0,
+    "val_top_k": None,
+    "max_new_tokens": 32,
+}
+
+
+def _gym_row():
+    return {"agent_ref": {"name": "agent"}, "responses_create_params": {}}
+
+
+def _gym_result(rowidx, **full_result_extras):
+    """One postprocessed Gym row as the actor yields it (token lists, not tensors)."""
+    return {
+        "rowidx": rowidx,
+        "input_message_log": [{"role": "user", "token_ids": [rowidx]}],
+        "message_log": [
+            {"role": "user", "token_ids": [rowidx]},
+            {"role": "assistant", "token_ids": [rowidx], "generation_logprobs": [0.0]},
+        ],
+        "full_result": {"reward": 1.0, **full_result_extras},
+    }
+
+
+class _ReadyValue:
+    """An already-resolved Ray object reference: awaiting it returns the value."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        async def _resolve():
+            return self.value
+
+        return _resolve().__await__()
+
+
+class _SetEvent:
+    """Scripted-stream item: set the event and continue, so one stream's
+    progress can gate another's."""
+
+    def __init__(self, event):
+        self.event = event
+
+
+class _ScriptedStream:
+    """A run_rollouts stream that yields scripted items.
+
+    Besides result tuples, an item may be an ``asyncio.Event`` the stream waits
+    on, a ``_SetEvent`` that sets one, a number of seconds the stream sleeps for
+    (0 yields to the event loop once), or an exception the stream raises as the
+    actor would.
+    """
+
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while self.items:
+            item = self.items.pop(0)
+            if isinstance(item, _SetEvent):
+                item.event.set()
+                continue
+            if isinstance(item, asyncio.Event):
+                await item.wait()
+                continue
+            if isinstance(item, (int, float)):
+                await asyncio.sleep(item)
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return _ReadyValue(item)
+        raise StopAsyncIteration
+
+
+async def _health_outcome(outcome):
+    """Resolve one scripted health check: raise an exception, wait on an event
+    (a probe that never answers), call a callable, or pass."""
+    if isinstance(outcome, BaseException):
+        raise outcome
+    if isinstance(outcome, asyncio.Event):
+        await outcome.wait()
+        return
+    if callable(outcome):
+        outcome()
+
+
+class _FakeGymActor:
+    """A NemoGym actor stand-in with scripted run_rollouts streams and health checks.
+
+    ``scripts`` holds one item list per dispatch, in dispatch order; an item is a
+    ``(rowidx, resolved_agent_ref, result, timing)`` tuple, as ``run_rollouts``
+    yields, or an ``asyncio.Event`` the stream waits on before continuing.
+    ``health_outcomes`` are consumed one per health check.
+    """
+
+    def __init__(self, scripts, health_outcomes=(), rollout_settings=None):
+        self.scripts = list(scripts)
+        self.health_outcomes = list(health_outcomes)
+        # What NemoGym.rollout_config hands back: the env.nemo_gym keys the
+        # driver's rollout loop reads (None for every key when unset).
+        self.rollout_settings = dict(rollout_settings or {})
+        self.dispatched_rows = []
+        self.health_calls = 0
+        actor = self
+
+        class _RunRollouts:
+            def options(self, *, num_returns):
+                assert num_returns == "streaming"
+                return self
+
+            def remote(self, rows, timer_prefix, deduplicate_multimodal_data):
+                actor.dispatched_rows.append(list(rows))
+                return _ScriptedStream(actor.scripts.pop(0))
+
+        class _HealthCheck:
+            def remote(self):
+                actor.health_calls += 1
+                outcome = (
+                    actor.health_outcomes.pop(0) if actor.health_outcomes else None
+                )
+                return _health_outcome(outcome)
+
+        class _RolloutConfig:
+            async def remote(self):
+                return dict(actor.rollout_settings)
+
+        self.run_rollouts = _RunRollouts()
+        self.health_check = _HealthCheck()
+        self.rollout_config = _RolloutConfig()
+
+
+def _postprocess_stub(**kwargs):
+    return rollouts_mod.NemoGymRolloutResult(
+        input_ids=torch.empty(0),
+        final_batch=kwargs["input_batch"],
+        rollout_metrics={},
+        task_index=None,
+    )
+
+
+async def _collect_gym_rollout(actor, rows, **kwargs):
+    input_batch = BatchedDataDict(
+        {"extra_env_info": rows, "loss_multiplier": torch.ones(len(rows))}
+    )
+    return [
+        result
+        async for result in run_async_nemo_gym_rollout(
+            policy_generation=type(
+                "_PolicyGeneration", (), {"cfg": {"vllm_cfg": {"max_model_len": 128}}}
+            )(),
+            input_batch=input_batch,
+            tokenizer=None,
+            task_to_env={"nemo_gym": actor},
+            generation_config=_GYM_GENERATION_CONFIG,
+            num_generations=len(rows),
+            log_full_result_tables=False,
+            returns_entire_batch=True,
+            **kwargs,
+        )
+    ]
+
+
+def test_nemo_gym_stream_accumulator_budgets_infra_attempts():
+    rows = [{"agent_ref": {"name": "agent"}}, {"agent_ref": {"name": "agent"}}]
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=rows, num_generations=2, allow_mixed_agents=False, max_infra_attempts=3
+    )
+    # The first two failures hand the same row back for re-dispatch.
+    assert accumulator.record_infra_failure(1, "HTTP 503") is rows[1]
+    assert accumulator.record_infra_failure(1, "HTTP 503") is rows[1]
+    assert accumulator.infra_redispatches == 2
+    # The third failure uses up the budget and carries the failure's detail.
+    with pytest.raises(GymTransportError, match="all 3 attempt.*HTTP 503 again"):
+        accumulator.record_infra_failure(1, "HTTP 503 again")
+    # The default budget of one attempt ends the rollout on the first failure.
+    single = rollouts_mod._NemoGymStreamAccumulator(
+        rows=rows, num_generations=2, allow_mixed_agents=False
+    )
+    with pytest.raises(GymTransportError, match="all 1 attempt"):
+        single.record_infra_failure(0, "boom")
+    # A failure reported for a row that already delivered its result is a stream bug.
+    assert accumulator.add(0, {"row": 0}, resolved_agent_ref={"name": "agent"}) is None
+    with pytest.raises(ValueError, match="after its result"):
+        accumulator.record_infra_failure(0, "late")
+    with pytest.raises(ValueError, match="at least 1"):
+        rollouts_mod._NemoGymStreamAccumulator(
+            rows=rows, num_generations=2, allow_mixed_agents=False, max_infra_attempts=0
+        )
+
+
+def _actor_timing(await_results, postprocess_results):
+    """One actor timing payload as ``NemoGym.run_rollouts`` attaches it to a
+    stream's last tuple: the two summed time labels and the share of the
+    postprocessing in the stream's whole run."""
+    return {
+        "timing/rollout/await_results": await_results,
+        "timing/rollout/postprocess_results": postprocess_results,
+        "timing/rollout/postprocess_results_pct": (
+            100.0 * postprocess_results / (await_results + postprocess_results)
+        ),
+    }
+
+
+def test_run_async_nemo_gym_rollout_redispatches_infra_failures(monkeypatch):
+    """A row whose /run failed at the infrastructure level is dispatched again
+    as its own stream while the other rows keep running; the group completes
+    from both streams and the re-dispatch is counted in the metrics. The actor
+    attaches its timing to the stream's last tuple, here the failure marker,
+    and the gate makes the one-row retry finish last: the bucket's totals must
+    survive, with the retry reporting under its own label, and the retry's
+    percentage, the share of one re-run row, never becomes the step's."""
+    gate = asyncio.Event()
+    rows = [_gym_row(), _gym_row()]
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _gym_result(0), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    _actor_timing(await_results=75.0, postprocess_results=25.0),
+                ),
+                _SetEvent(gate),
+            ],
+            [
+                gate,
+                (
+                    1,
+                    {"name": "agent"},
+                    _gym_result(1),
+                    _actor_timing(await_results=1.0, postprocess_results=1.0),
+                ),
+            ],
+        ]
+    )
+    captured = []
+
+    def _postprocess_group(**kwargs):
+        captured.append([result["rowidx"] for result in kwargs["results"]])
+        return _postprocess_stub(**kwargs)
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_group
+    )
+    results = asyncio.run(
+        _collect_gym_rollout(actor, rows, max_infra_attempts_per_rollout=3)
+    )
+    assert actor.dispatched_rows == [rows, [rows[1]]]
+    assert captured == [[0, 1]]
+    assert len(results) == 1
+    metrics = results[0].rollout_metrics
+    assert metrics["nemo_gym_infra_redispatches"] == 1
+    assert metrics["timing/rollout/await_results"] == 75.0
+    assert metrics["timing/rollout/postprocess_results_pct"] == 25.0
+    assert metrics["timing/rollout/shard/nemo_gym/await_results"] == 75.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/await_results"] == 1.0
+    assert (
+        metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results_pct"] == 50.0
+    )
+
+
+def test_redispatched_row_stays_on_its_own_replica(monkeypatch):
+    """The retry of an infrastructure-failed row runs on the replica whose
+    stream reported the failure. Routing it through shard_set.pick_handle
+    would rotate to a different replica and split the row's prompt group
+    across instances, which _bucket_nemo_gym_rows_by_instance forbids."""
+    rows = [_gym_row(), _gym_row()]
+    replica_a = _FakeGymActor(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _gym_result(0), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+            ],
+            [(1, {"name": "agent"}, _gym_result(1), None)],
+        ]
+    )
+    replica_b = _FakeGymActor(scripts=[])
+    shard_set = NemoGymShardSet(
+        handles={"tools": [replica_a, replica_b]},
+        route_to_shard={"agent": "tools"},
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    input_batch = BatchedDataDict(
+        {"extra_env_info": rows, "loss_multiplier": torch.ones(len(rows))}
+    )
+
+    async def _collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=type(
+                    "_PolicyGeneration",
+                    (),
+                    {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+                )(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={"nemo_gym": shard_set},
+                generation_config=_GYM_GENERATION_CONFIG,
+                num_generations=len(rows),
+                log_full_result_tables=False,
+                returns_entire_batch=True,
+                max_infra_attempts_per_rollout=2,
+            )
+        ]
+
+    results = asyncio.run(_collect())
+    assert len(results) == 1
+    assert replica_a.dispatched_rows == [rows, [rows[1]]]
+    assert replica_b.dispatched_rows == []
+
+
+def test_a_data_failure_is_not_hidden_by_a_sibling_markers_exhausted_budget(
+    monkeypatch,
+):
+    """Once one instance's stream has ended with a data failure, the merge keeps
+    draining the other streams but no longer re-dispatches their failure
+    markers: with the default budget a re-dispatch would raise the transport
+    error and hide the 400 that actually ended the rollout."""
+    rows = [_gym_row() for _ in range(4)]
+    failed = asyncio.Event()
+    replica_a = _FakeGymActor(
+        scripts=[
+            [
+                _SetEvent(failed),
+                RolloutDataFailure(
+                    "NeMo-Gym /run failed with HTTP 400 (ClientResponseError): bad request"
+                ),
+            ]
+        ]
+    )
+    replica_b = _FakeGymActor(
+        scripts=[
+            [
+                # The marker lands only after the merge has recorded replica A's
+                # failure: wait for it, then yield to the loop twice so A's
+                # completed task is processed first.
+                failed,
+                0,
+                0,
+                (
+                    2,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (3, {"name": "agent"}, _gym_result(3), None),
+            ]
+        ]
+    )
+    shard_set = NemoGymShardSet(
+        handles={"tools": [replica_a, replica_b]},
+        route_to_shard={"agent": "tools"},
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    input_batch = BatchedDataDict(
+        {"extra_env_info": rows, "loss_multiplier": torch.ones(len(rows))}
+    )
+
+    async def _collect():
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=type(
+                    "_PolicyGeneration",
+                    (),
+                    {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+                )(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={"nemo_gym": shard_set},
+                generation_config=_GYM_GENERATION_CONFIG,
+                num_generations=2,
+                log_full_result_tables=False,
+            )
+        ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="failed during rollout collection: NeMo-Gym /run failed with HTTP 400",
+    ) as raised:
+        asyncio.run(_collect())
+    assert isinstance(raised.value.__cause__, RolloutDataFailure)
+    # Replica B's marker was neither dispatched again nor turned into a transport error.
+    assert replica_a.dispatched_rows == [rows[:2]]
+    assert replica_b.dispatched_rows == [rows[2:]]
+
+
+def test_run_async_nemo_gym_rollout_folds_every_retry_of_an_instance_into_one_label(
+    monkeypatch,
+):
+    """A retry stream can itself report a marker. The row is dispatched again on
+    the same instance while the budget lasts, and every retry stream of the
+    instance reports under one ``retry`` label: the time keys are summed, the
+    percentage is recomputed from the sums, the label count does not grow with
+    the re-dispatches, and the bucket's totals survive."""
+    rows = [_gym_row(), _gym_row()]
+    marker = {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"}
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                (0, {"name": "agent"}, _gym_result(0), None),
+                (
+                    1,
+                    {"name": "agent"},
+                    marker,
+                    _actor_timing(await_results=75.0, postprocess_results=25.0),
+                ),
+            ],
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    marker,
+                    _actor_timing(await_results=5.0, postprocess_results=1.0),
+                )
+            ],
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    _gym_result(1),
+                    _actor_timing(await_results=1.0, postprocess_results=3.0),
+                )
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+
+    results = asyncio.run(
+        _collect_gym_rollout(actor, rows, max_infra_attempts_per_rollout=3)
+    )
+
+    assert actor.dispatched_rows == [rows, [rows[1]], [rows[1]]]
+    assert len(results) == 1
+    metrics = results[0].rollout_metrics
+    assert metrics["nemo_gym_infra_redispatches"] == 2
+    assert metrics["timing/rollout/await_results"] == 75.0
+    assert metrics["timing/rollout/postprocess_results_pct"] == 25.0
+    assert metrics["timing/rollout/shard/nemo_gym/await_results"] == 75.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/await_results"] == 6.0
+    assert metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results"] == 4.0
+    assert (
+        metrics["timing/rollout/shard/nemo_gym/retry/postprocess_results_pct"] == 40.0
+    )
+    assert not any("retry1" in key or "retry2" in key for key in metrics)
+
+
+def test_run_async_nemo_gym_rollout_raises_when_infra_attempts_are_exhausted(
+    monkeypatch,
+):
+    """With the default budget of one attempt a failure marker ends the rollout
+    with the transport error, and nothing is dispatched again."""
+    rows = [_gym_row(), _gym_row()]
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (0, {"name": "agent"}, _gym_result(0), None),
+            ]
+        ]
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="all 1 attempt.*HTTP 503"):
+        asyncio.run(_collect_gym_rollout(actor, rows))
+    assert len(actor.dispatched_rows) == 1
+
+
+def test_nemo_gym_max_infra_attempts_accessor():
+    attempts = rollouts_mod.get_nemo_gym_max_infra_attempts
+    assert attempts({}) == 1
+    assert attempts({"nemo_gym": {"max_infra_attempts_per_rollout": None}}) == 1
+    assert attempts({"nemo_gym": {"max_infra_attempts_per_rollout": 3}}) == 3
+    with pytest.raises(ValueError, match="at least 1"):
+        attempts({"nemo_gym": {"max_infra_attempts_per_rollout": 0}})
+    # bool is an int subclass and int() would truncate a float: both are refused
+    # rather than read as a budget the operator never wrote.
+    for not_a_budget in (True, 2.5, "3"):
+        with pytest.raises(ValueError, match="integer of at least 1"):
+            attempts({"nemo_gym": {"max_infra_attempts_per_rollout": not_a_budget}})
+
+
+def test_gym_rollout_reads_the_dispatch_budget_from_the_actor_config(monkeypatch):
+    """Without an explicit argument the rollout applies the environment's own
+    dispatch budget (NemoGym.rollout_config), so every caller of the rollout
+    function re-dispatches the same way."""
+    rows = [_gym_row(), _gym_row()]
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (0, {"name": "agent"}, _gym_result(0), None),
+            ],
+            [(1, {"name": "agent"}, _gym_result(1), None)],
+        ],
+        rollout_settings={"max_infra_attempts_per_rollout": 3},
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    results = asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.dispatched_rows == [rows, [rows[1]]]
+    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_nemo_gym_health_check_interval_accessor():
+    interval = rollouts_mod.get_nemo_gym_health_check_interval
+    assert interval({}) is None
+    assert interval({"nemo_gym": {"health_check_interval_seconds": None}}) is None
+    assert interval({"nemo_gym": {"health_check_interval_seconds": 60}}) == 60.0
+    with pytest.raises(ValueError, match="positive"):
+        interval({"nemo_gym": {"health_check_interval_seconds": 0}})
+
+
+def test_run_async_nemo_gym_rollout_polls_gym_health_while_waiting(monkeypatch):
+    """While no row arrives, the Gym actor's health check runs every interval;
+    healthy checks keep the wait going until the row completes."""
+    rows = [_gym_row()]
+    release = asyncio.Event()
+    actor = _FakeGymActor(
+        scripts=[[release, (0, {"name": "agent"}, _gym_result(0), None)]],
+        # The first poll finds the servers healthy; the second lets the row complete.
+        health_outcomes=[None, release.set],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    results = asyncio.run(
+        _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+    )
+    assert len(results) == 1
+    assert actor.health_calls == 2
+    # Reported on every rollout, zero when nothing was dispatched again.
+    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 0
+
+
+def test_run_async_nemo_gym_rollout_dead_gym_server_ends_the_step(monkeypatch):
+    """A failing health check ends the wait with the transport error the driver
+    classifies as infrastructure, instead of waiting for the wall."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(
+        scripts=[[asyncio.Event(), (0, {"name": "agent"}, _gym_result(0), None)]],
+        health_outcomes=[RuntimeError("Process `verifier` finished unexpectedly!")],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="health check failed.*verifier"):
+        asyncio.run(
+            _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+        )
+    assert actor.health_calls == 1
+
+
+def test_run_async_nemo_gym_rollout_unresponsive_health_check_ends_the_step(
+    monkeypatch,
+):
+    """A health probe that never answers is reported like a failing one: a live
+    actor whose event loop is blocked never resolves the call, so an unbounded
+    probe would turn the watchdog into the hang it exists to end."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(
+        scripts=[[asyncio.Event(), (0, {"name": "agent"}, _gym_result(0), None)]],
+        # An Event outcome parks the probe forever; the bound must fire.
+        health_outcomes=[asyncio.Event()],
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="did not answer within"):
+        asyncio.run(
+            _collect_gym_rollout(actor, rows, health_check_interval_seconds=0.01)
+        )
+    assert actor.health_calls == 1
+
+
+def test_gym_rollout_reads_both_reliability_knobs_from_the_actor_config(monkeypatch):
+    """Without explicit arguments the rollout applies the environment's own
+    health-check interval and dispatch budget (NemoGym.rollout_config), so every
+    caller of the rollout function polls and re-dispatches the same way."""
+    rows = [_gym_row(), _gym_row()]
+    release = asyncio.Event()
+    actor = _FakeGymActor(
+        scripts=[
+            [
+                release,
+                (
+                    1,
+                    {"name": "agent"},
+                    {GYM_INFRA_FAILURE_KEY: "NeMo-Gym /run failed with HTTP 503: down"},
+                    None,
+                ),
+                (0, {"name": "agent"}, _gym_result(0), None),
+            ],
+            [(1, {"name": "agent"}, _gym_result(1), None)],
+        ],
+        # The first poll finds the servers healthy; the second lets the rows flow.
+        health_outcomes=[None, release.set],
+        rollout_settings={
+            "health_check_interval_seconds": 0.01,
+            "max_infra_attempts_per_rollout": 3,
+        },
+    )
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    results = asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.health_calls == 2
+    assert actor.dispatched_rows == [rows, [rows[1]]]
+    assert results[0].rollout_metrics["nemo_gym_infra_redispatches"] == 1
+
+
+def test_gym_rollout_bounds_the_actor_config_read(monkeypatch):
+    """The rollout's first await asks one actor for the driver keys, before any
+    health polling starts, and the asynchronous collector retries a batch against
+    the same actors after a probe timeout. An actor whose event loop is blocked
+    never answers, so the read is bounded and fails as a transport error instead
+    of turning the retry into the hang the probe had just ended."""
+    rows = [_gym_row()]
+    actor = _FakeGymActor(scripts=[[(0, {"name": "agent"}, _gym_result(0), None)]])
+
+    class _ParkedRolloutConfig:
+        async def remote(self):
+            await asyncio.Event().wait()
+
+    actor.rollout_config = _ParkedRolloutConfig()
+    monkeypatch.setattr(rollouts_mod, "NEMO_GYM_ROLLOUT_CONFIG_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_stub
+    )
+    with pytest.raises(GymTransportError, match="did not answer rollout_config"):
+        asyncio.run(_collect_gym_rollout(actor, rows))
+    assert actor.dispatched_rows == []
