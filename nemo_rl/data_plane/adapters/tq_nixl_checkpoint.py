@@ -14,20 +14,21 @@
 """Checkpoint save / restore for the NixlStore backend (``NixlStorageManager``).
 
 TransferQueue saves the controller first and storage second, and restores
-storage first. Storage state here is just *the bytes of every live blob plus
-its live-entry count*. Placement is deliberately not saved: on restore the
-blobs are re-placed on whatever units are ACTIVE now (any count, any nodes)
-and the BlobDirectory is re-pointed. That is why the controller's location
-meta ``{"b","o","n","k","d","s"}`` carries no unit id.
+storage first. Storage state is each unit's live blobs plus, per blob, the
+``gidx@field`` keys its row index points at it with. Rows are index-addressed
+(row ``gidx`` lives on unit ``unit_ids[gidx % N]``), so:
+
+- same unit count: unit ``k`` reloads ``unit-k.shard`` into itself;
+- a different count: the driver re-puts every live key through the normal put
+  path, which routes it to its new owner (slower: all bytes pass the driver).
 
 Layout under ``<checkpoint_dir>/nixl_store/``::
 
-    manifest.json        {"version": 1, "shards": [...]}
+    manifest.json        {"version": 2, "unit_ids": [...], "shards": [...]}
     unit-<id>.shard      live blobs of one unit, back to back
+    unit-<id>.shard.rows msgpack {blob_id: [live gidx@field keys]}
 
-Blobs are copied with plain file I/O on the unit (sequential dump of a pinned
-slab; a few GB/s per unit on Lustre). A NIXL POSIX/GDS loopback path can
-replace it later without changing the layout.
+Version 1 checkpoints (locations kept in the TQ controller) are rejected.
 
 Callers must be quiescent: TQ's checkpoint runs under NeMo-RL's lifecycle
 guard, so no put/get/clear is in flight while a shard is written.
@@ -40,15 +41,17 @@ import os
 from pathlib import Path
 from typing import Any
 
+import msgspec
 import ray
 
+from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 from nemo_rl.data_plane.nixl.directory import ACTIVE
 from nemo_rl.data_plane.nixl.errors import UnitFull
 
 SUBDIR = "nixl_store"
 MANIFEST = "manifest.json"
-VERSION = 1
+VERSION = 2
 
 
 def _root(checkpoint_dir: str | os.PathLike) -> Path:
@@ -70,6 +73,7 @@ def save_storage_checkpoint(
     root = _root(checkpoint_dir)
     root.mkdir(parents=True, exist_ok=True)
     manifest = _save_units(client.store, root)
+    manifest["unit_ids"] = list(client.unit_ids)
     _write_json(root / MANIFEST, manifest)
     return manifest
 
@@ -113,53 +117,62 @@ def _save_units(store: UnitSlabStore, root: Path) -> dict[str, Any]:
 def load_storage_checkpoint(
     client: Any, checkpoint_dir: str | os.PathLike
 ) -> dict[str, Any]:
-    """Re-place every blob of the manifest on the units alive now; return the manifest."""
+    """Restore every live key of the manifest onto its owner unit now; return the manifest."""
     root = _root(checkpoint_dir)
     with open(root / MANIFEST) as f:
         manifest = json.load(f)
     if manifest.get("version") != VERSION:
         raise ValueError(
-            f"unsupported nixl_store checkpoint version {manifest.get('version')!r}"
+            f"unsupported nixl_store checkpoint version {manifest.get('version')!r} "
+            f"(this build reads version {VERSION})"
         )
-    _load_units(client.store, root, manifest)
+    if list(manifest["unit_ids"]) == list(client.unit_ids):
+        _load_in_place(client.store, root, manifest)
+    else:
+        _load_rerouted(client, root, manifest)
     return manifest
 
 
-def _load_units(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -> None:
-    units = _active_units(store)
-    if not units:
-        raise RuntimeError("no ACTIVE NixlStorageUnit to restore into")
-    placed: list[tuple[str, int]] = []
-    # Shard i starts on unit i (mod n); whatever does not fit spills to the next
-    # unit in order, so N units restore onto N±k units without a planner. Each
-    # round sends every shard with blobs left to its next unit at once, so the
-    # restore takes about one unit's read instead of the sum over units. As for
-    # puts, every unit's RAM is tried before any unit spills to its SSD tier.
-    shards = manifest["shards"]
-    paths = [str(root / s["file"]) for s in shards]
-    orders = [
-        units[i % len(units) :] + units[: i % len(units)] for i in range(len(shards))
-    ]
-    pending = [dict(s["blobs"]) for s in shards]
-    for spill, k in [(s, k) for s in (False, True) for k in range(len(units))]:
+def _load_in_place(store: UnitSlabStore, root: Path, manifest: dict[str, Any]) -> None:
+    """Same unit table: unit ``k`` reloads its own shard (RAM first, then its SSD tier)."""
+    shards = {int(s["unit_id"]): s for s in manifest["shards"]}
+    pending = {u: dict(s["blobs"]) for u, s in shards.items()}
+    for spill in (False, True):
         futs = {
-            i: _unit_actor(store, orders[i][k]).load_shard.remote(
-                paths[i], pending[i], spill
+            u: _unit_actor(store, u).load_shard.remote(
+                str(root / shards[u]["file"]), pending[u], spill
             )
-            for i in range(len(shards))
-            if pending[i]
+            for u in shards
+            if pending[u]
         }
-        if not futs:
-            break
-        for i, f in futs.items():
+        for u, f in futs.items():
             r = ray.get(f)
-            placed.extend((b, orders[i][k]) for b in r["loaded"])
-            pending[i] = {b: pending[i][b] for b in r["failed"]}
-    for shard, left in zip(shards, pending):
+            pending[u] = {b: pending[u][b] for b in r["failed"]}
+    for u, left in pending.items():
         if left:
             raise UnitFull(
-                f"{len(left)} blob(s) of shard {shard['file']} fit on no ACTIVE unit"
+                f"{len(left)} blob(s) of {shards[u]['file']} fit on unit {u}"
             )
-    ray.get(store.directory.put_blobs.remote(placed))
-    for b, u in placed:
-        store._blob_unit[b] = u
+
+
+def _load_rerouted(client: Any, root: Path, manifest: dict[str, Any]) -> None:
+    """A different unit table: re-put each shard's live keys through the client."""
+    for s in manifest["shards"]:
+        path = str(root / s["file"])
+        with open(path + ".rows", "rb") as rf:
+            live = {b: set(ks) for b, ks in msgspec.msgpack.decode(rf.read()).items()}
+        with open(path, "rb") as f:
+            for b, (off, nbytes, _refs) in s["blobs"].items():
+                keep = live.get(b, set())
+                if not keep:
+                    continue
+                f.seek(int(off))
+                blob = memoryview(bytearray(f.read(int(nbytes))))
+                entries = [e for e in blob_format.read_index(blob) if e.key in keep]
+                values = [
+                    blob_format.materialize(
+                        blob_format.decode_entry(blob[e.off : e.off + e.len], e)
+                    )
+                    for e in entries
+                ]
+                client.put([e.key for e in entries], values)
