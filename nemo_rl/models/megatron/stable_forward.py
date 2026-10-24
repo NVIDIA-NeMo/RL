@@ -345,11 +345,23 @@ def write_groups(
     splits: list[int],
     *,
     kernel: Callable,
+    max_output_bytes: int = 16 * 1024 * 1024,
 ) -> int:
-    """Write every real group into its original output buffer without padding."""
+    """Write every group using bounded native-kernel output temporaries.
+
+    The native kernel returns an allocated output even though TE has already
+    provided the destination. Process row blocks to bound that extra allocation
+    without changing any dot product or the native GroupedLinear backward.
+    """
     if not weights or len(weights) != len(inputs) or len(weights) != len(splits):
         raise ValueError("Expected equally sized, nonempty weight/input/split lists")
     features, hidden = weights[0].shape
+    row_bytes = features * destination.element_size()
+    if type(max_output_bytes) is not int or max_output_bytes <= 0:
+        raise ValueError("Output temporary budget must be a positive integer")
+    if row_bytes <= 0 or max_output_bytes < row_bytes:
+        raise ValueError("Output temporary budget must fit at least one output row")
+    block_rows = max_output_bytes // row_bytes
     if destination.shape != (sum(splits), features):
         raise ValueError("Output shape does not match original group sizes")
     for weight, values, rows in zip(weights, inputs, splits, strict=True):
@@ -366,8 +378,11 @@ def write_groups(
     offset = 0
     calls = 0
     for weight, values, rows in zip(weights, inputs, splits, strict=True):
-        if rows:
-            destination[offset : offset + rows].copy_(kernel(values, weight.t()))
+        for start in range(0, rows, block_rows):
+            stop = min(start + block_rows, rows)
+            destination[offset + start : offset + stop].copy_(
+                kernel(values[start:stop], weight.t())
+            )
             calls += 1
         offset += rows
     return calls
