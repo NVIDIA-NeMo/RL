@@ -1288,3 +1288,34 @@ def test_clear_global_router_replay_instances_clears_registry():
         assert RouterReplay.global_router_replay_instances == []
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+def test_global_moe_layer_numbers_follow_the_hybrid_layer_pattern() -> None:
+    """Nemotron-H style stacks mark MoE layers with 'E'; '|' and '/' are not layers."""
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(num_layers=8, hybrid_layer_pattern="M-M*E-|ME/MM")
+    assert _global_moe_layer_numbers(config) == [5, 8]
+    legacy = SimpleNamespace(num_layers=4, hybrid_override_pattern="MEME")
+    assert _global_moe_layer_numbers(legacy) == [2, 4]
+
+
+def test_global_moe_layer_numbers_rejects_a_hybrid_pattern_of_the_wrong_length() -> (
+    None
+):
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(
+        num_layers=5, hybrid_layer_pattern="MEME", moe_layer_freq=1
+    )
+    with pytest.raises(ValueError, match="hybrid layer pattern has 4 layers"):
+        _global_moe_layer_numbers(config)
+
+
+def test_global_moe_layer_numbers_without_a_pattern_uses_moe_layer_freq() -> None:
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(
+        num_layers=4, moe_layer_freq=[0, 1, 1, 0], hybrid_layer_pattern=None
+    )
+    assert _global_moe_layer_numbers(config) == [2, 3]

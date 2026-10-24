@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 
@@ -117,12 +117,40 @@ def verify_route_fragment_integrity(
         return False
 
 
+def compress_full_layer_routes(
+    routes: torch.Tensor,
+    num_moe_layers: int,
+    full_layout: Optional[tuple[int, Sequence[int]]],
+) -> torch.Tensor:
+    """Select the MoE layers out of a full-transformer-layer route fragment.
+
+    A fragment already in the compressed ``[T, num_moe_layers, K]`` layout, or
+    one whose layer axis matches neither layout, is returned unchanged (the
+    caller's shape check decides).
+    """
+    if full_layout is None or routes.dim() != 3:
+        return routes
+    total_num_layers, moe_layer_indices = full_layout
+    if (
+        int(routes.shape[1]) != int(total_num_layers)
+        or int(routes.shape[1]) == num_moe_layers
+    ):
+        return routes
+    if len(moe_layer_indices) != num_moe_layers:
+        return routes
+    index = torch.as_tensor(
+        list(moe_layer_indices), dtype=torch.long, device=routes.device
+    )
+    return routes.index_select(1, index)
+
+
 def execute_route_plan(
     plan: RouteAssemblyPlan,
     fragments: Mapping[str, RouteFragment],
     *,
     dims: tuple[int, int],
     canonical_len: int,
+    full_layout: Optional[tuple[int, Sequence[int]]] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Assemble one canonical route tensor from staged fragments.
 
@@ -135,6 +163,12 @@ def execute_route_plan(
             direct-mode finalizer supplies dims learned from the fetched
             fragments.
         canonical_len: The published row's token length.
+        full_layout: Optional ``(total_num_layers, moe_layer_indices)``. vLLM
+            emits one route slot per decoder layer for hybrid models such as
+            NemotronH (dense/Mamba layers hold sentinels), so a fragment whose
+            layer axis equals ``total_num_layers`` is compressed to the listed
+            0-based MoE layer indices before the shape check, mirroring the
+            canonical path (``router_replay._payload_indices_for_moe_layers``).
 
     Returns:
         ``(tensor, None)`` on success — ``[canonical_len, num_moe_layers,
@@ -175,6 +209,7 @@ def execute_route_plan(
                 return None, ROUTE_FAILURE_RANK
             if int(routes.shape[0]) != span.staged_route_len:
                 return None, ROUTE_FAILURE_LENGTH
+            routes = compress_full_layer_routes(routes, num_moe_layers, full_layout)
             if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
                 return None, ROUTE_FAILURE_MODEL_SHAPE
             if span.boundary_rows:

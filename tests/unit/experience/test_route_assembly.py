@@ -32,8 +32,10 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
 
 from nemo_rl.data_plane.schema import ROUTE_ENCODING_ENVELOPE  # noqa: E402
 from nemo_rl.experience.route_assembly import (  # noqa: E402
+    ROUTE_FAILURE_MODEL_SHAPE,
     RouteFragment,
     boundary_route_rows,
+    compress_full_layer_routes,
     execute_route_plan,
 )
 from nemo_rl.experience.route_plan import (  # noqa: E402
@@ -59,7 +61,12 @@ def _routes(*rows: list[int]) -> torch.Tensor:
     return torch.tensor([[row] for row in rows], dtype=torch.int16)
 
 
-def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
+def _assemble(
+    calls: list[tuple[torch.Tensor, int, int]],
+    *,
+    full_layout: tuple[int, list[int]] | None = None,
+    expect_reason: str | None = None,
+) -> torch.Tensor:
     """Stage each call like the vLLM worker, then run the route executor.
 
     Each call is ``(vllm_routes, prev_len, prompt_len)``.
@@ -105,8 +112,11 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
         expected_token_length=total_len,
     )
     routed, reason = execute_route_plan(
-        plan, fragments, dims=(1, 2), canonical_len=total_len
+        plan, fragments, dims=(1, 2), canonical_len=total_len, full_layout=full_layout
     )
+    if expect_reason is not None:
+        assert reason == expect_reason, reason
+        return routed
     assert reason is None, reason
     return routed
 
@@ -128,3 +138,31 @@ def test_turn_boundary_gets_the_next_calls_route() -> None:
 
     assert routed[3].tolist() == [[16, 17]], "boundary token has no route"
     assert torch.equal(routed, call2)
+
+
+def _full_layout_routes(*rows: list[int]) -> torch.Tensor:
+    """vLLM's hybrid-model layout: 3 decoder layers, only layer 1 is MoE (top_k=2)."""
+    return torch.tensor([[NO_ROUTE, row, NO_ROUTE] for row in rows], dtype=torch.int16)
+
+
+def test_full_layer_layout_is_compressed_to_the_moe_layers() -> None:
+    # NemotronH-style payload: one route slot per decoder layer, dense/Mamba
+    # layers hold sentinels. The worker's dims are the MoE-only shape.
+    call = _full_layout_routes([10, 11], [12, 13], [14, 15], NO_ROUTE)
+    routed = _assemble([(call, 0, 2)], full_layout=(3, [1]))
+    assert torch.equal(routed, _routes([10, 11], [12, 13], [14, 15], NO_ROUTE))
+
+
+def test_full_layer_layout_without_a_layer_map_is_a_model_shape_failure() -> None:
+    call = _full_layout_routes([10, 11], [12, 13], [14, 15], NO_ROUTE)
+    _assemble([(call, 0, 2)], expect_reason=ROUTE_FAILURE_MODEL_SHAPE)
+
+
+def test_compress_full_layer_routes_leaves_compressed_and_unknown_layouts_alone() -> (
+    None
+):
+    compressed = _routes([10, 11], NO_ROUTE)
+    assert compress_full_layer_routes(compressed, 1, (3, [1])) is compressed
+    odd = torch.zeros((2, 5, 2), dtype=torch.int16)
+    assert compress_full_layer_routes(odd, 1, (3, [1])) is odd
+    assert compress_full_layer_routes(compressed, 1, None) is compressed
