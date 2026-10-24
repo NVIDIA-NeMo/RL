@@ -6366,6 +6366,10 @@ class TestValidateFunction:
         assert sampling_params.temperature == pytest.approx(0.1)
         assert sampling_params.top_p == pytest.approx(0.9)
         assert sampling_params.top_k is None
+        # Validation measures the policy, so it never cuts slow rollouts.
+        assert (
+            mock_rollout.call_args.kwargs.get("allow_straggler_cutoff", False) is False
+        )
         assert val_metrics["accuracy"] == pytest.approx(0.25)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
 
@@ -7047,6 +7051,42 @@ def test_grpo_train_sync_applies_length_penalty_to_training_rollouts(
     calls = rollout_actor.rollout_to_tq.remote.call_args_list
     assert calls
     assert all(call.kwargs["apply_length_penalty"] is True for call in calls)
+
+
+def test_grpo_train_sync_lets_training_rollouts_cut_stragglers(
+    mock_grpo_components,
+):
+    """Training rollouts opt in to env.nemo_gym.straggler_cutoff via rollout_to_tq."""
+    import nemo_rl.algorithms.grpo_sync as grpo_sync_module
+
+    config = mock_grpo_components["master_config"]
+    config.data_plane = {"enabled": True}
+    config.grpo.max_num_steps = 1
+    config.grpo.val_period = 0
+    config.grpo.val_at_start = False
+    config.grpo.val_at_end = False
+    policy = mock_grpo_components["policy"]
+    with mock_sync_grpo_infrastructure(policy):
+        grpo_train_sync(
+            policy,
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            config,
+        )
+        rollout_actor = (
+            grpo_sync_module.SyncRolloutActor.options.return_value.remote.return_value
+        )
+    calls = rollout_actor.rollout_to_tq.remote.call_args_list
+    assert calls
+    assert all(call.kwargs["allow_straggler_cutoff"] is True for call in calls)
 
 
 def test_in_loss_threshold_skips_policy_forward_without_disabling_threshold():

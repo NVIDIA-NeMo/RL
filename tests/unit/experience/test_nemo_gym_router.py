@@ -80,8 +80,10 @@ class _FakeRunRollouts:
         rows,
         timer_prefix,
         deduplicate_multimodal_data=False,
+        **kwargs,
     ):
         self._handle.calls.append((rows, timer_prefix))
+        self._handle.kwargs_seen.append(kwargs)
         return _FakeStream(
             rows,
             self._handle.shard_name,
@@ -96,6 +98,7 @@ class _FakeActor:
         self.fail = fail
         self.fail_on_await = fail_on_await
         self.calls = []
+        self.kwargs_seen = []
         self.run_rollouts = _FakeRunRollouts(self)
 
 
@@ -305,6 +308,33 @@ def test_the_merge_drains_every_shard_and_tags_each_row_with_its_own():
     assert sum(timing is not None for _, timing, _ in drained) == 2
 
 
+@pytest.mark.parametrize("allow", [True, False])
+def test_the_merge_forwards_allow_straggler_cutoff_to_every_shard(allow):
+    """The flag reaches each actor as the keyword its ``run_rollouts`` declares.
+
+    It travels outside the positional payload-metrics tuple, so this is the
+    only place that checks the keyword is sent, and sent only when enabled.
+    """
+    left, right = _FakeActor("left"), _FakeActor("right")
+    buckets = [
+        ("left", left, _rows(["alpha"], num_generations=2)),
+        ("right", right, _rows(["beta"], num_generations=3)),
+    ]
+
+    async def drain():
+        return [
+            rowidx
+            async for rowidx, *_ in _merge_nemo_gym_instance_streams(
+                buckets, timer_prefix="timing/rollout", allow_straggler_cutoff=allow
+            )
+        ]
+
+    assert sorted(asyncio.run(drain())) == [0, 0, 1, 1, 2]
+    expected = {"allow_straggler_cutoff": True} if allow else {}
+    assert left.kwargs_seen == [expected]
+    assert right.kwargs_seen == [expected]
+
+
 def test_a_failing_shard_names_itself_rather_than_surfacing_a_bare_ray_error():
     healthy, broken = _FakeActor("healthy"), _FakeActor("broken", fail=True)
     buckets = [
@@ -394,3 +424,54 @@ def test_replicas_report_separately_rather_than_overwriting_each_other():
 
 def test_no_shard_reported_timing_yields_no_metrics():
     assert _merge_nemo_gym_timing_metrics({}, "timing/rollout") == {}
+
+
+def test_straggler_cutoff_stats_add_up_over_shards_instead_of_taking_the_worst():
+    """Three shards cut 2, 3 and 0 rows: the batch cut 5, not 3.
+
+    The timestamps and the done fraction describe one shard's event each, so
+    a batch-wide max would pair shard a's fraction with shard b's max-wall
+    flag; they stay per shard.
+    """
+
+    def stats(num_cut, armed, cut_by_max_wall, **event):
+        return {
+            "timing/rollout/await_results": 4.0 + num_cut,
+            "straggler_cutoff/num_cut": num_cut,
+            "straggler_cutoff/armed": armed,
+            "straggler_cutoff/cut_by_max_wall": cut_by_max_wall,
+            **{f"straggler_cutoff/{key}": value for key, value in event.items()},
+        }
+
+    merged = _merge_nemo_gym_timing_metrics(
+        {
+            "a": stats(
+                2.0,
+                1.0,
+                0.0,
+                armed_at_s=600.0,
+                cut_at_s=900.0,
+                done_fraction_at_cut=0.9,
+            ),
+            "b": stats(3.0, 0.0, 1.0, cut_at_s=1200.0, done_fraction_at_cut=0.5),
+            "c": stats(0.0, 0.0, 0.0),
+        },
+        "timing/rollout",
+    )
+
+    assert merged["straggler_cutoff/num_cut"] == 5.0
+    assert merged["straggler_cutoff/armed"] == 1.0
+    assert merged["straggler_cutoff/cut_by_max_wall"] == 1.0
+    for per_event_key in ("armed_at_s", "cut_at_s", "done_fraction_at_cut"):
+        assert f"straggler_cutoff/{per_event_key}" not in merged
+    assert merged["straggler_cutoff/shard/a/num_cut"] == 2.0
+    assert merged["straggler_cutoff/shard/a/done_fraction_at_cut"] == 0.9
+    assert merged["straggler_cutoff/shard/b/cut_at_s"] == 1200.0
+    assert merged["straggler_cutoff/shard/b/cut_by_max_wall"] == 1.0
+    assert merged["straggler_cutoff/shard/c/num_cut"] == 0.0
+    # The timings that share the dict still roll up to the slowest shard.
+    assert merged["timing/rollout/await_results"] == 7.0
+    assert merged["timing/rollout/shard/a/await_results"] == 6.0
+    assert not any(
+        key.startswith("timing/rollout/shard/") and "straggler" in key for key in merged
+    )

@@ -777,6 +777,7 @@ def grpo_train_sync(
                             group_size=master_config.grpo.num_generations_per_prompt,
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
                             apply_length_penalty=True,
+                            allow_straggler_cutoff=True,
                         )
                     )
 
