@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional
 
 import torch
@@ -72,9 +73,8 @@ def clipped_pg_diagnostic_metrics(
     )
 
     # Jensen-Shannon divergence via KL(P_train || M) and KL(P_gen || M).
-    log_mixture = torch.log(
-        0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
-    )
+    # logaddexp keeps log(M) finite when both logprobs underflow to zero in fp32.
+    log_mixture = torch.logaddexp(prev_logprobs, generation_logprobs) - math.log(2.0)
     prev_to_mixture = prev_logprobs - log_mixture
     gen_to_mixture = generation_logprobs - log_mixture
     kl_prev_to_mixture = torch.exp(prev_to_mixture) - prev_to_mixture - 1
