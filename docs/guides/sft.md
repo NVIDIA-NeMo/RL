@@ -30,6 +30,68 @@ uv run examples/run_sft.py \
 
 ## Datasets
 
+### Full-conversation text formatting
+
+For templates that revise earlier turns (for example, templates grouping multiple
+tool responses into one turn), prefix-by-prefix formatting can leave stale turn
+delimiters in the concatenated training text. Text-only SFT can opt into rendering
+and tokenizing each complete conversation once:
+
+```yaml
+data:
+  add_generation_prompt: false
+  default:
+    processor: sft_full_conversation_processor
+```
+
+Set the processor on both training and validation dataset entries if they override
+`data.default.processor`. Other processors and existing recipes are unchanged.
+The selected template must wrap each complete assistant target, including its
+turn terminator and trailing whitespace, in one `{% generation %}` /
+`{% endgeneration %}` block. Assistant headers can remain outside the block.
+For example:
+
+```jinja
+{{ '<start>assistant\n' }}
+{% generation %}{{ message.content + '<stop>\n' }}{% endgeneration %}
+```
+
+The formatter maps generation character ranges through full-text token offsets,
+rejecting tokens crossing supervision boundaries. It returns context/assistant
+loss-ownership segments rather than source messages. Existing SFT masking,
+padding, next-token shifting, and `sft.only_unmask_final` continue to work; even
+adjacent assistant targets remain separate. No prefix matching or retokenization
+is performed. Configured template overrides and default tools are preserved;
+row-level tools take precedence, including an explicit empty list.
+
+The complete template determines historical reasoning retention; this may differ
+from reasoning accidentally retained by incremental prefix rendering. Review that
+policy before changing an existing training recipe. This processor requires a
+fast tokenizer, text-only messages, and a final assistant target. Missing markers,
+invalid span counts/order, uncovered final suffixes, a configured EOS immediately
+outside an earlier assistant span that does not already end in EOS, and missing
+requested BOS/EOS tokens are errors. An EOS-looking token after an already
+terminated assistant span may belong to the next turn's header, including when
+BOS and EOS share the same token; it is not rejected on that basis.
+Generation ranges do not prove semantic completeness: the template author must
+verify that every assistant span includes the intended content and model-specific
+turn terminator (which may differ from the tokenizer's EOS). The formatter does
+not claim to detect arbitrary partially marked targets or infer unknown terminators.
+The existing SFT overlength exclusion policy is unchanged: rows at or above
+`max_seq_length` remain in the dataset with `loss_multiplier=0`, rather than being
+removed or trained on truncated targets. Full-conversation formatting replaces
+their token sequence with a short, masked batching placeholder while retaining
+the original token count in `length` for diagnostics. Thus `length` intentionally
+differs from the placeholder's token count; batching uses the actual tensors.
+
+Final EOS insertion also preserves the incremental formatter's convention:
+only trailing newlines are ignored when checking for an existing EOS.
+`<eos>\n` therefore does not receive another EOS, but `<eos> \t` does when
+`add_eos_token=true`. Those spaces/tabs remain intact and the appended EOS is
+supervised. With `add_eos_token=false`, the template output is left unchanged.
+This differs intentionally from the historical-EOS guard's whitespace-insensitive
+check; that guard diagnoses ownership rather than deciding whether to append EOS.
+
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
   2. `task_name`: A string identifier that uniquely identifies the dataset.
