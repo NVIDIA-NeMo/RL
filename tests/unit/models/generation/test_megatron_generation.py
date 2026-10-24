@@ -434,7 +434,6 @@ def test_megatron_generation_rebuild_dispatches_only_selected_ranks() -> None:
         world_size=10,
         train_world_size=8,
         rank_offset=8,
-        nccl_peer="nemo",
     )
     workers[1].init_collective.remote.assert_not_called()
     workers[2].init_collective.remote.assert_called_once_with(
@@ -443,7 +442,6 @@ def test_megatron_generation_rebuild_dispatches_only_selected_ranks() -> None:
         world_size=10,
         train_world_size=8,
         rank_offset=7,
-        nccl_peer="nemo",
     )
 
     assert generation.rebuild_nccl_reshard_comm_group(

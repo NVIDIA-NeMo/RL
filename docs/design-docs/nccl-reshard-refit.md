@@ -28,8 +28,11 @@ single `ValueError` listing every violation. The current requirements are:
   path uses IPC and is unaffected by this feature.
 * **Megatron training backend** — `policy.megatron_cfg.enabled=true` (the Automodel
   training backend is not supported yet.).
-* **vLLM or Megatron generation backend** — `policy.generation.backend` must be
-  `vllm` or `megatron` (SGLang and TRTLLM are not supported yet).
+* **vLLM, Dynamo or Megatron generation backend** — `policy.generation.backend` must
+  be `vllm`, `dynamo` or `megatron` (SGLang and TRTLLM are not supported yet).
+  Managed Dynamo engines load the vLLM backend's receiver as a worker extension,
+  so every vLLM destination rule below applies to Dynamo too; see
+  [Managed Dynamo generation](dynamo-integration.md#weight-refit).
 * Training-side Megatron supports expert tensor parallelism when the generation
   destination is Megatron. A vLLM destination still requires
   `expert_tensor_parallel_size: 1`. Custom PP layouts

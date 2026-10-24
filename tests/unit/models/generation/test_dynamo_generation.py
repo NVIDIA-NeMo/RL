@@ -14,6 +14,7 @@
 
 import asyncio
 import pickle
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -21,19 +22,19 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import REFIT_ABORTED_TOKEN, RefitAborted
 from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.dynamo import dynamo_generation as generation_module
 from nemo_rl.models.generation.dynamo import metrics as metrics_module
 from nemo_rl.models.generation.dynamo import refit as refit_module
-from nemo_rl.models.generation.dynamo.config import (
-    VLLM_PACKED_BUFFER_SIZE_BYTES,
-    VLLM_PACKED_NUM_BUFFERS,
-)
 from nemo_rl.models.generation.dynamo.metrics import (
     DynamoMetricsSampler,
     parse_prometheus_metrics,
 )
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
+from nemo_rl.models.generation.interfaces import RefitFleetShape
+from nemo_rl.utils.staged_payload import decode_staged_payload
+from nemo_rl.weight_sync.membership import desired_membership
 
 
 def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
@@ -165,11 +166,6 @@ def test_runtime_start_world_size_sender_geometry_and_shutdown(monkeypatch) -> N
     assert generation.frontend_url == "http://10.0.0.1:3000/v1"
     assert generation.dp_openai_server_base_urls == [None]
     assert generation.get_inference_world_size() == 4
-    sender = generation.get_collective_sender_spec()
-    assert sender.nccl_peer == "vllm"
-    assert sender.buffer_size_bytes == VLLM_PACKED_BUFFER_SIZE_BYTES
-    assert sender.num_buffers == VLLM_PACKED_NUM_BUFFERS
-    assert sender.use_legacy_packing
     assert generation.shutdown()
     assert generation.shutdown()
     assert calls.count("shutdown") == 1
@@ -285,60 +281,73 @@ def test_token_wrapper_is_used_for_nemo_gym(monkeypatch) -> None:
     assert wrappers[0].kwargs["tokenizer"] is tokenizer
 
 
-def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -> None:
-    workers = [
-        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
-        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
-    ]
-    _patch_runtime(monkeypatch, workers=workers)
-    init_calls = []
-    update_calls = []
+def test_collective_refit_drives_the_worker_extension_and_survives_pickling(
+    monkeypatch,
+) -> None:
+    generation, posts, staged = _reshard_generation(monkeypatch, refit_transport=None)
     cache_calls = []
-    monkeypatch.setattr(
-        refit_module._post_worker_route,
-        "remote",
-        lambda **kwargs: init_calls.append(kwargs) or True,
-    )
-    monkeypatch.setattr(
-        refit_module._update_worker_weights,
-        "remote",
-        lambda **kwargs: update_calls.append(kwargs) or True,
-    )
-    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
 
-    generation = DynamoGeneration(cluster=object(), config=_config(tp=2))
-    generation.prepare_refit_info({"weight": (torch.Size([4, 8]), torch.bfloat16)})
+    generation.prepare_refit_info(
+        {
+            "z.weight": (torch.Size([4, 8]), torch.bfloat16),
+            "a.bias": (torch.Size([8]), torch.float32),
+        }
+    )
+    assert [call["payload"]["engine_rpc"] for call in staged] == [
+        "nrl_prepare_refit_info_from_stage"
+    ] * 2
+    # The packed broadcast walks this order on both sides, so it must survive.
+    assert decode_staged_payload(
+        staged[0]["chunks"], staged[0]["payload"]["sha256"]
+    ) == [["z.weight", [4, 8], "bfloat16"], ["a.bias", [8], "float32"]]
+
     assert generation.init_collective("10.1.0.1", 1500, 7, train_world_size=3) == [
         True,
         True,
     ]
-    assert [call["payload"]["init_info"]["rank_offset"] for call in init_calls] == [
-        3,
-        5,
+    assert [call["payload"] for call in posts] == [
+        {
+            "engine_rpc": "init_collective",
+            "rank_prefix": prefix,
+            "ip": "10.1.0.1",
+            "port": 1500,
+            "world_size": 7,
+            "train_world_size": 3,
+        }
+        for prefix in (0, 2)
     ]
-    assert all(call["timeout_s"] == 10 for call in init_calls)
-    # vLLM reads packing from the init info only (worker default is unpacked).
-    for call in init_calls:
-        init_info = call["payload"]["init_info"]
-        assert init_info["packed"] is True
-        assert init_info["packed_buffer_size_bytes"] == 1024**3
-        assert init_info["packed_num_buffers"] == 2
-    assert generation.update_weights_from_collective() == [True, True]
-    assert update_calls[0]["update_info"] == {
-        "names": ["weight"],
-        "dtype_names": ["bfloat16"],
-        "shapes": [[4, 8]],
-    }
-    assert all(call["timeout_s"] == 10 for call in update_calls)
+    with pytest.raises(ValueError, match="does not match expected"):
+        generation.init_collective("10.1.0.1", 1500, 8, train_world_size=3)
 
+    posts.clear()
+    assert generation.update_weights_from_collective(refit_timeout_s=20) == [
+        True,
+        True,
+    ]
+    assert all(
+        call["route"] == "update_weights_from_distributed"
+        and call["payload"]
+        == {
+            "engine_rpc": "nrl_update_weights_from_collective",
+            "allow_unpaused": True,
+            "reset_prefix_cache": False,
+            "refit_timeout_s": 20,
+            "refit_with_reload_api": False,
+        }
+        and call["timeout_s"] == 80
+        for call in posts
+    )
+
+    # SingleController issues refits from a pickled copy in its own actor; the
+    # prepared metadata stays inside the engines, so only endpoints travel.
     restored = pickle.loads(pickle.dumps(generation))
     assert restored.frontend_url == generation.frontend_url
-    # SingleController prepares refit on the driver, then pickles the
-    # generation client into its actor, which issues the weight updates.
-    expected_update_info = update_calls[0]["update_info"]
-    update_calls.clear()
+    posts.clear()
     assert restored.update_weights_from_collective() == [True, True]
-    assert [call["update_info"] for call in update_calls] == [expected_update_info] * 2
+    assert [call["system_url"] for call in posts] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
+    ]
     monkeypatch.setattr(
         refit_module._post_worker_route,
         "remote",
@@ -367,6 +376,28 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
     assert restored._metrics_sampler._workers == restored._refit_channel.workers
     assert restored.shutdown()
     assert restored._metrics_sampler is None
+
+
+def test_collective_refit_forwards_the_reload_api_choice(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    posts = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
+    )
+    config = _config()
+    config["vllm_cfg"]["refit_with_reload_api"] = True
+    generation = DynamoGeneration(cluster=object(), config=config)
+
+    generation.update_weights_from_collective()
+
+    assert posts[0]["payload"]["refit_with_reload_api"] is True
+    # As on the vLLM backend, reload refit cannot also update a co-trained drafter.
+    config["vllm_kwargs"] = {"speculative_config": {"method": "mtp"}}
+    config["_mtp_weights_from_refit"] = True
+    with pytest.raises(AssertionError, match="MTP draft weights"):
+        DynamoGeneration(cluster=object(), config=config)
 
 
 def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
@@ -405,7 +436,7 @@ def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
 
 
 @pytest.mark.parametrize("clear_cache", [True, False])
-def test_refit_pause_drains_every_worker_and_resume_restores_them(
+def test_refit_pause_freezes_every_worker_and_resume_restores_them(
     monkeypatch, clear_cache: bool
 ) -> None:
     workers = [
@@ -425,10 +456,13 @@ def test_refit_pause_drains_every_worker_and_resume_restores_them(
     generation = pickle.loads(
         pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
     )
-    assert generation.pause_generation_for_refit(clear_cache=clear_cache)
-    assert [(call["route"], call["payload"]) for call in calls] == [
-        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
-        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
+    assert generation.pause_generation_for_refit(
+        clear_cache=clear_cache, timeout_s=30.0
+    )
+    pause = ("pause_generation", {"mode": "keep", "clear_cache": clear_cache}, 30.0)
+    assert [(call["route"], call["payload"], call["timeout_s"]) for call in calls] == [
+        pause,
+        pause,
     ]
 
     calls.clear()
@@ -463,36 +497,13 @@ def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
     )
 
     with pytest.raises(RuntimeError, match="pause before weight update failed"):
-        channel.pause(clear_cache=True)
+        channel.pause(clear_cache=True, timeout_s=None)
 
     assert [(call["route"], call["system_url"]) for call in calls] == [
         ("pause_generation", "http://worker-a:4000"),
         ("pause_generation", "http://worker-b:4000"),
         ("resume_generation", "http://worker-a:4000"),
     ]
-
-
-def test_native_refit_transaction_keeps_cache_mode_external(monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(
-        refit_module,
-        "http_post_json",
-        lambda url, payload, timeout_s: calls.append(payload) or {"status": "ok"},
-    )
-    assert refit_module._update_worker_weights._function(
-        system_url="http://worker:4000",
-        update_info={"names": ["weight"]},
-        timeout_s=30,
-    )
-    assert [call["engine_rpc"] for call in calls] == [
-        "start_weight_update",
-        "update_weights",
-        "finish_weight_update",
-    ]
-    assert all(call["reset_prefix_cache"] is False for call in calls)
-    # vLLM's Worker.start_weight_update takes no arguments; Dynamo forwards
-    # every non-reserved key, so any extra key would raise in the engine.
-    assert set(calls[0]) == {"engine_rpc", "allow_unpaused", "reset_prefix_cache"}
 
 
 def test_metrics_parser_and_sampler_aliases() -> None:
@@ -665,3 +676,349 @@ def test_direct_completions_are_not_limited_by_default_thread_pool(
 
     assert entered_count == request_count
     assert len(responses) == request_count
+
+
+def _reshard_generation(monkeypatch, *, refit_transport="nccl_reshard"):
+    """A two-engine, TP=2 DynamoGeneration whose engine RPCs are recorded, not sent."""
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    posts: list[dict[str, Any]] = []
+    staged: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        refit_module._stage_and_post_worker_route,
+        "remote",
+        lambda **kwargs: staged.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    config = _config(tp=2)
+    config["refit_transport"] = refit_transport
+    generation = DynamoGeneration(cluster=object(), config=config)
+    return generation, posts, staged
+
+
+def _full_fleet():
+    return desired_membership(
+        absent_shards=[], dp_size=2, total_gen_workers=4, train_world_size=3
+    )
+
+
+def test_nccl_reshard_drives_the_worker_extension_on_every_engine(
+    monkeypatch,
+) -> None:
+    generation, posts, staged = _reshard_generation(monkeypatch)
+    membership = _full_fleet()
+
+    assert generation.get_refit_fleet_shape() == RefitFleetShape(
+        dp_size=2, total_gen_workers=4
+    )
+    generation.set_refit_membership(membership)
+
+    assert generation.rebuild_collective(membership, "10.1.0.1", 1500) == [True] * 2
+    assert [call["route"] for call in posts] == ["init_weights_update_group"] * 2
+    assert [call["payload"] for call in posts] == [
+        {
+            "engine_rpc": "init_collective",
+            "rank_prefix": prefix,
+            "ip": "10.1.0.1",
+            "port": 1500,
+            "world_size": 7,
+            "train_world_size": 3,
+        }
+        for prefix in (0, 2)
+    ]
+    # Past the server's init deadline (control_timeout_s=10), never before it.
+    assert all(call["timeout_s"] == 40 for call in posts)
+
+    posts.clear()
+    generation.rebuild_nccl_reshard_comm_group(
+        membership,
+        pp_ips=["10.1.0.1"],
+        pp_ports=[1600],
+        pp_size=1,
+        train_ranks_per_stage=3,
+        sub_world_size=7,
+    )
+    assert [call["payload"] for call in posts] == [
+        {
+            "engine_rpc": "init_nccl_reshard_comm_group",
+            "rank_prefix": prefix,
+            "pp_ips": ["10.1.0.1"],
+            "pp_ports": [1600],
+            "pp_size": 1,
+            "train_ranks_per_stage": 3,
+            "sub_world_size": 7,
+        }
+        for prefix in (0, 2)
+    ]
+
+    refit_info = {
+        "per_layer_params": {"layers.0": [{"name": "w", "global_shape": [4, 8]}]},
+        "misc_meta": {"embed": {"shape": [8, 4], "dtype": "bfloat16"}},
+    }
+    generation.prepare_nccl_reshard_refit_info(refit_info)
+    assert [call["system_url"] for call in staged] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
+    ]
+    for call in staged:
+        payload = call["payload"]
+        assert payload["engine_rpc"] == "nrl_prepare_nccl_reshard_refit_info_from_stage"
+        assert payload["key"] == call["key"]
+        assert decode_staged_payload(call["chunks"], payload["sha256"]) == refit_info
+
+    posts.clear()
+    assert generation.nccl_reshard_refit(refit_timeout_s=100) == [True] * 2
+    assert [call["route"] for call in posts] == ["update_weights_from_distributed"] * 2
+    assert all(
+        call["payload"]
+        == {
+            "engine_rpc": "nrl_nccl_reshard_refit",
+            "allow_unpaused": True,
+            "reset_prefix_cache": False,
+            "refit_timeout_s": 100,
+        }
+        for call in posts
+    )
+    # The HTTP call outlives the refit's own deadline.
+    assert all(call["timeout_s"] == 160 for call in posts)
+
+    # SingleController issues refits from a pickled copy in its own actor.
+    restored = pickle.loads(pickle.dumps(generation))
+    posts.clear()
+    assert restored.nccl_reshard_refit() == [True] * 2
+    assert [call["system_url"] for call in posts] == [
+        "http://10.0.0.2:4000",
+        "http://10.0.0.3:4000",
+    ]
+    assert all(call["payload"]["refit_timeout_s"] is None for call in posts)
+    assert all(call["timeout_s"] == 10 for call in posts)
+
+
+def test_dynamo_refit_membership_must_be_the_whole_fixed_fleet(monkeypatch) -> None:
+    generation, posts, _ = _reshard_generation(monkeypatch)
+    one_engine_lost = desired_membership(
+        absent_shards=[1], dp_size=2, total_gen_workers=4, train_world_size=3
+    )
+
+    with pytest.raises(NotImplementedError, match="fixed worker fleet"):
+        generation.set_refit_membership(one_engine_lost)
+    with pytest.raises(NotImplementedError, match="fixed worker fleet"):
+        generation.rebuild_collective(one_engine_lost, "10.1.0.1", 1500)
+    assert posts == []
+
+
+def test_dynamo_collective_refit_can_be_rebuilt_over_the_full_fleet(
+    monkeypatch,
+) -> None:
+    generation, posts, _ = _reshard_generation(monkeypatch, refit_transport=None)
+
+    generation.rebuild_collective(_full_fleet(), "10.1.0.1", 1500)
+    assert [call["payload"]["rank_prefix"] for call in posts] == [0, 2]
+
+
+def test_engine_route_errors_surface_and_aborts_stay_recognizable(
+    monkeypatch,
+) -> None:
+    responses = iter(
+        [
+            {"status": "ok"},
+            {"status": "error", "message": "boom"},
+            {"status": "error", "message": f"{REFIT_ABORTED_TOKEN} deadline passed"},
+        ]
+    )
+    monkeypatch.setattr(
+        refit_module, "http_post_json", lambda url, payload, timeout_s: next(responses)
+    )
+    post = refit_module._post_worker_route._function
+    kwargs = {
+        "system_url": "http://w:4000",
+        "route": "update_weights_from_distributed",
+        "payload": {"engine_rpc": "nrl_nccl_reshard_refit"},
+        "timeout_s": 1.0,
+    }
+
+    assert post(**kwargs) is True
+    with pytest.raises(RuntimeError, match="nrl_nccl_reshard_refit.*boom"):
+        post(**kwargs)
+    with pytest.raises(RefitAborted):
+        post(**kwargs)
+
+
+def test_engine_rpc_tasks_are_never_retried() -> None:
+    # A re-POST of a collective after a worker died can never complete.
+    for task in (
+        refit_module._post_worker_route,
+        refit_module._stage_and_post_worker_route,
+    ):
+        assert task._default_options["max_retries"] == 0
+
+
+def test_staging_posts_every_chunk_in_order_before_the_call(monkeypatch) -> None:
+    sent = []
+    monkeypatch.setattr(
+        refit_module,
+        "http_post_json",
+        lambda url, payload, timeout_s: sent.append((url, payload)) or {"status": "ok"},
+    )
+    call = {"engine_rpc": "nrl_prepare_nccl_reshard_refit_info_from_stage"}
+
+    refit_module._stage_and_post_worker_route._function(
+        system_url="http://w:4000",
+        key="k",
+        chunks=["c0", "c1", "c2"],
+        payload=call,
+        timeout_s=1.0,
+    )
+
+    assert [url for url, _ in sent] == [
+        "http://w:4000/engine/init_weights_update_group"
+    ] * 4
+    assert [payload for _, payload in sent] == [
+        {
+            "engine_rpc": "nrl_stage_chunk",
+            "key": "k",
+            "index": index,
+            "total": 3,
+            "data": f"c{index}",
+        }
+        for index in range(3)
+    ] + [call]
+
+
+def test_reshard_synchronizer_drives_dynamo_end_to_end(monkeypatch) -> None:
+    """NcclReshardWeightSynchronizer over a real DynamoGeneration: 3 trainers, 2x TP2."""
+    from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
+        NcclReshardWeightSynchronizer,
+    )
+
+    generation, posts, staged = _reshard_generation(monkeypatch)
+    trainer_calls: dict[str, Any] = {}
+    policy = SimpleNamespace(
+        cfg={
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "expert_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "generation": generation.cfg,
+        },
+        init_collective=lambda *args, **kwargs: trainer_calls.setdefault(
+            "init_collective", (args, kwargs)
+        )
+        and ["train-init"],
+        init_nccl_reshard_comm_group=lambda **kwargs: trainer_calls.setdefault(
+            "bulk", kwargs
+        )
+        and ["train-bulk"],
+        prepare_nccl_reshard_refit_info=lambda *args,
+        **kwargs: trainer_calls.setdefault("plan", (args, kwargs))
+        and {
+            "per_layer_params": {},
+            "misc_meta": {"w": {"shape": [2], "dtype": "bfloat16"}},
+        },
+        nccl_reshard_refit=lambda **kwargs: trainer_calls.setdefault("refit", kwargs)
+        and ["train-refit"],
+    )
+    train_cluster = SimpleNamespace(
+        world_size=lambda: 3,
+        num_gpus_per_node=8,
+        get_master_address_and_port=lambda: ("10.1.0.1", 1500),
+        get_available_address_and_port=lambda pg_idx, bundle_idx: ("10.1.0.1", 1600),
+    )
+    sync = NcclReshardWeightSynchronizer(
+        policy=policy,
+        generation=generation,
+        train_cluster=train_cluster,
+        inference_cluster=None,
+        refit_timeout_s=30.0,
+    )
+
+    sync.init_communicator()
+
+    _, init_kwargs = trainer_calls["init_collective"]
+    assert init_kwargs == {"train_world_size": 3}
+    gen_rpcs = [call["payload"]["engine_rpc"] for call in posts]
+    assert gen_rpcs == ["init_collective"] * 2 + ["init_nccl_reshard_comm_group"] * 2
+    assert [call["payload"]["rank_prefix"] for call in posts] == [0, 2, 0, 2]
+    # The reshard plan is built for every Dynamo rank: 2 engines x TP2.
+    plan_args, _ = trainer_calls["plan"]
+    assert plan_args[1]["tp_size"] == 2 and plan_args[3] == 4
+    assert len(staged) == 2
+
+    posts.clear()
+    sync.sync_weights()
+
+    assert trainer_calls["refit"]["refit_timeout_s"] == 30.0
+    assert [call["payload"]["engine_rpc"] for call in posts] == [
+        "nrl_nccl_reshard_refit"
+    ] * 2
+    assert all(call["payload"]["refit_timeout_s"] == 30.0 for call in posts)
+    assert not sync.is_stale
+
+
+@pytest.mark.parametrize(
+    ("mtp_from_refit", "load_format", "expected_rpcs"),
+    [
+        (
+            False,
+            "dummy",
+            ["configure_mtp_drafter_weight_source", "load_mtp_weights_from_disk"],
+        ),
+        (True, "dummy", ["configure_mtp_drafter_weight_source"]),
+        (False, "auto", ["configure_mtp_drafter_weight_source"]),
+    ],
+)
+def test_mtp_drafter_is_configured_on_every_engine(
+    monkeypatch, mtp_from_refit, load_format, expected_rpcs
+) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    posts = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: posts.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+    config = _config(tp=2)
+    config["vllm_kwargs"] = {
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 1}
+    }
+    config["vllm_cfg"]["load_format"] = load_format
+    config["_mtp_weights_from_refit"] = mtp_from_refit
+
+    DynamoGeneration(cluster=object(), config=config)
+
+    rpcs = [call["payload"]["engine_rpc"] for call in posts]
+    # Each step reaches both engines before the next starts.
+    assert rpcs == [rpc for rpc in expected_rpcs for _ in workers]
+    assert posts[0]["payload"]["weights_from_refit"] is mtp_from_refit
+    if "load_mtp_weights_from_disk" in rpcs:
+        assert posts[-1]["payload"]["model_path"] == "Qwen/Qwen3-0.6B"
+
+
+def test_speculative_lookahead_stops_short_of_the_context_limit(monkeypatch) -> None:
+    _patch_runtime(monkeypatch)
+    config = _config()
+    config["vllm_cfg"]["max_model_len"] = 64
+    config["max_new_tokens"] = 32
+    config["vllm_kwargs"] = {
+        "speculative_config": {"method": "ngram", "num_speculative_tokens": 3}
+    }
+    generation = DynamoGeneration(cluster=object(), config=config)
+
+    assert generation._allowed_new_tokens(input_length=10) == 32
+    # 64 - 40 - (3 + 1): the drafter must not read past max_model_len.
+    assert generation._allowed_new_tokens(input_length=40) == 20
+    assert generation._allowed_new_tokens(input_length=62) == 1

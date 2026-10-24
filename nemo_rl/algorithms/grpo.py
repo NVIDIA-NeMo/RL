@@ -627,6 +627,19 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
+def _managed_refit_timeout_s(generation_config: Any) -> Optional[float]:
+    """Deadline for one non-colocated refit set up by the managed path.
+
+    Managed Dynamo reaches its engines over HTTP, so a generation-side failure can
+    return early while the trainers sit in NCCL waiting for it. The worker extension
+    in each engine enforces a deadline, so reuse the Dynamo control timeout and let
+    the trainers abort instead of hanging. Every other backend keeps its behavior.
+    """
+    if generation_config["backend"] == "dynamo":
+        return generation_config["dynamo_cfg"]["control_timeout_s"]
+    return None
+
+
 def _uses_managed_noncolocated_refit(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
@@ -1903,6 +1916,12 @@ def setup(
 
     elif backend == "dynamo":
         # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
+        if generation_config["vllm_cfg"]["precision"] == "fp8":
+            # Same requirement as the vLLM backend: FP8 rollouts drift from the
+            # BF16 policy, which importance sampling corrects.
+            assert loss_config.use_importance_sampling_correction, (
+                "Importance sampling must be enabled for Dynamo FP8 generation for good convergence!"
+            )
 
         def init_dynamo():
             t0 = time.perf_counter()
@@ -1948,12 +1967,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "dynamo" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; Dynamo "
+            "generation supports 'nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -1984,6 +2005,7 @@ def setup(
                 colocated=False,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
+                refit_timeout_s=_managed_refit_timeout_s(generation_config),
             )
             policy_generation.weight_synchronizer.init_communicator()
         else:

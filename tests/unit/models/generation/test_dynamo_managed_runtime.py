@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from nemo_rl.models.generation.dynamo import venv as dynamo_venv
 from nemo_rl.models.generation.dynamo.dynamo_worker import (
     DynamoGpuReservation,
     DynamoVllmWorker,
@@ -30,7 +31,6 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
 )
-from nemo_rl.models.generation.dynamo.venv import get_dynamo_venv_dir
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
     _vllm_port_for_node_slot,
@@ -219,13 +219,51 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"
 
 
-def test_dynamo_venv_uses_explicit_env_or_repository_fallback(monkeypatch) -> None:
-    monkeypatch.setenv("NEMO_RL_DYNAMO_VENV_DIR", "/custom/dynamo")
-    assert get_dynamo_venv_dir() == Path("/custom/dynamo")
+def test_dynamo_python_builds_the_dynamo_actor_venv(monkeypatch) -> None:
+    built = []
+    monkeypatch.setattr(
+        dynamo_venv,
+        "get_actor_python_env",
+        lambda fqn: "uv run --locked --extra dynamo",
+    )
+    monkeypatch.setattr(
+        dynamo_venv,
+        "create_local_venv",
+        lambda py_executable, venv_name: built.append((py_executable, venv_name))
+        or "/venvs/dynamo/bin/python",
+    )
 
-    monkeypatch.delenv("NEMO_RL_DYNAMO_VENV_DIR")
-    monkeypatch.setenv("NRL_CONTAINER", "1")
-    assert get_dynamo_venv_dir().parts[-2:] == ("venvs", "dynamo")
+    assert dynamo_venv.get_dynamo_python() == "/venvs/dynamo/bin/python"
+    assert built == [("uv run --locked --extra dynamo", dynamo_venv.DYNAMO_WORKER_FQN)]
+
+
+def test_dynamo_python_passes_an_interpreter_through(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dynamo_venv, "get_actor_python_env", lambda fqn: "/usr/bin/python3"
+    )
+    monkeypatch.setattr(
+        dynamo_venv,
+        "create_local_venv",
+        MagicMock(side_effect=AssertionError("no venv for an interpreter")),
+    )
+
+    assert dynamo_venv.get_dynamo_python() == "/usr/bin/python3"
+
+
+def test_dynamo_services_resolve_from_bin_dir_then_path(monkeypatch, tmp_path) -> None:
+    etcd = tmp_path / "etcd"
+    etcd.write_text("#!/bin/sh\n")
+    etcd.chmod(0o755)
+    monkeypatch.setenv("NEMO_RL_DYNAMO_BIN_DIR", str(tmp_path))
+    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="NEMO_RL_DYNAMO_BIN_DIR"):
+        dynamo_venv.get_dynamo_service_executable("nats-server")
+
+    monkeypatch.delenv("NEMO_RL_DYNAMO_BIN_DIR")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert dynamo_venv.get_dynamo_service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="not on PATH"):
+        dynamo_venv.get_dynamo_service_executable("nats-server")
 
 
 def test_vllm_node_local_port_bands_are_deterministic() -> None:
@@ -403,7 +441,12 @@ def test_worker_argument_validation_has_startup_timeout(monkeypatch) -> None:
         )
 
 
-def test_worker_registers_process_group_immediately_after_launch(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("precision", "fp32_lm_head"), [("bfloat16", True), ("fp8", False)]
+)
+def test_worker_registers_process_group_immediately_after_launch(
+    monkeypatch, precision, fp32_lm_head
+) -> None:
     class FakeSocket:
         def __enter__(self):
             return self
@@ -428,25 +471,43 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
         lambda *args, **kwargs: FakeSocket(),
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_python",
-        lambda: "/opt/dynamo_venv/bin/python",
+        "nemo_rl.models.generation.vllm.patches.ensure_vllm_source_compat",
+        lambda: None,
     )
+    fp32_patch = MagicMock()
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.dynamo_worker.get_dynamo_venv_dir",
-        lambda: Path("/opt/dynamo_venv"),
+        "nemo_rl.models.generation.vllm.patches.require_nemotron_h_fp32_lm_head_patch",
+        fp32_patch,
     )
+    launched = {}
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.subprocess.Popen",
-        lambda *args, **kwargs: process,
+        lambda command, env, **kwargs: launched.update(command=command, env=env)
+        or process,
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.dynamo_worker.ray.get", lambda ref: ref
     )
     monkeypatch.setattr(worker_cls, "_validate_argv", MagicMock())
     monkeypatch.setattr(worker_cls, "_wait_for_system_port", MagicMock())
+    # The FP8 builder itself needs vLLM and is covered with the worker extension;
+    # this checks that its output reaches dynamo.vllm.
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.dynamo_worker._fp8_engine_args",
+        lambda model_name, vllm_cfg, vllm_kwargs, model_parallel_size: (
+            {**vllm_cfg, "precision": "bfloat16"},
+            {**vllm_kwargs, "quantization": "fp8"},
+            {"VLLM_USE_DEEP_GEMM": "1"},
+            {"NRL_VLLM_FP8_CONFIG": "{}"},
+        ),
+    )
+    monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
+    config = _config()
+    config["vllm_cfg"]["precision"] = precision
+    config["vllm_cfg"]["fp32_lm_head"] = fp32_lm_head
 
     worker_cls(
-        _config(),
+        config,
         namespace="nemo-rl-test",
         group_name="worker-0",
         cuda_devices=[0],
@@ -459,6 +520,18 @@ def test_worker_registers_process_group_immediately_after_launch(monkeypatch) ->
     )
 
     assert reservation.register_process_group.calls == [((4321,), {})]
+    command, env = launched["command"], launched["env"]
+    assert command[command.index("--dtype") + 1] == "bfloat16"
+    if precision == "fp8":
+        assert command[command.index("--quantization") + 1] == "fp8"
+        assert env["NRL_VLLM_FP8_CONFIG"] == "{}"
+        assert env["VLLM_USE_DEEP_GEMM"] == "1"
+    else:
+        assert "--quantization" not in command
+        assert "NRL_VLLM_FP8_CONFIG" not in env
+    # The Nemotron-H fp32 LM head: source patch in this venv, enabled per engine.
+    assert fp32_patch.called is fp32_lm_head
+    assert env["NRL_VLLM_FP32_LM_HEAD"] == ("1" if fp32_lm_head else "0")
 
 
 def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
@@ -588,8 +661,8 @@ def test_fixed_pool_tracks_worker_before_metadata_failure(monkeypatch) -> None:
         WorkerFactory,
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
-        lambda _fqn: "python",
+        "nemo_rl.models.generation.dynamo.worker_pool.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",
@@ -679,8 +752,8 @@ def test_fixed_pool_launches_all_workers_before_waiting_for_model_metadata(
         WorkerFactory,
     )
     monkeypatch.setattr(
-        "nemo_rl.models.generation.dynamo.worker_pool.get_actor_python_env",
-        lambda _fqn: "python",
+        "nemo_rl.models.generation.dynamo.worker_pool.make_actor_runtime_env",
+        lambda _fqn: {"py_executable": "python", "env_vars": {}},
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.worker_pool.PlacementGroupSchedulingStrategy",

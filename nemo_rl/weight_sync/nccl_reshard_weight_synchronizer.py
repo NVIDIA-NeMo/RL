@@ -159,7 +159,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def _gen_parallelism(self) -> dict[str, int]:
         generation_cfg = self._policy.cfg["generation"]
-        if generation_cfg["backend"] == "vllm":
+        # Managed Dynamo runs vLLM engines and describes them with the same vllm_cfg.
+        if generation_cfg["backend"] in ("vllm", "dynamo"):
             vllm_cfg = generation_cfg.get("vllm_cfg", {})
             tp_size = vllm_cfg.get("tensor_parallel_size", 1)
             ep_size = vllm_cfg.get("expert_parallel_size", 1)
@@ -184,7 +185,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 "pp_size": megatron_cfg["pipeline_model_parallel_size"],
             }
         raise ValueError(
-            "NCCL M-to-N refit only supports vLLM or Megatron generation, got "
+            "NCCL M-to-N refit only supports vLLM, Dynamo or Megatron generation, got "
             f"{generation_cfg['backend']!r}."
         )
 
@@ -245,16 +246,31 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
     def is_stale(self) -> bool:
         return self._stale
 
+    def _desired_membership(
+        self, absent_shards: Sequence[int], train_world_size: int
+    ) -> RefitMembership:
+        """The membership over the generation backend's DP shards, minus the absent.
+
+        Unlike the collective transport, a backend without shards is a hard error:
+        the reshard plan is built per generation rank, so there is no shard-free mode
+        to fall back to.
+        """
+        shape = self._generation.get_refit_fleet_shape()
+        if shape is None:
+            raise ValueError(
+                "nccl_reshard refit needs the generation backend's DP shards, but "
+                f"{type(self._generation).__name__} reports none."
+            )
+        return desired_membership(
+            absent_shards=absent_shards,
+            dp_size=shape.dp_size,
+            total_gen_workers=shape.total_gen_workers,
+            train_world_size=train_world_size,
+        )
+
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
-        self._build(
-            desired_membership(
-                absent_shards=[],
-                dp_size=self._generation.worker_group.dp_size,
-                total_gen_workers=len(self._generation.worker_group.workers),
-                train_world_size=self._train_cluster.world_size(),
-            )
-        )
+        self._build(self._desired_membership([], self._train_cluster.world_size()))
 
     def _build(self, membership: RefitMembership) -> None:
         """Build everything this transport needs for the given fleet membership.
@@ -281,18 +297,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         # 1. model_update_group: shared channel for the misc packed-broadcast
         #    (and the FP8 KV-cache scales).  Same setup as the collective path.
         ip, port = self._train_cluster.get_master_address_and_port()
-        # nccl_peer, for the same reason the collective synchronizer passes it: the
-        # receiver's bootstrap is not negotiable, and omitting it rebuilds with the "nemo"
-        # default. Mismatched warmups on one communicator hang rather than error.
-        sender_spec = self._generation.get_collective_sender_spec()
         # The dispatch, so a missing [train] line below distinguishes "never asked" from
         # "asked and did not answer". The collective synchronizer prints its equivalent;
         # this path had none, which is why three rounds of diagnosis could not tell which
         # of the two it was.
         print(
             f"  refit: dispatching model_update_group rebuild addr={ip}:{port} "
-            f"world_size={world_size} train_world_size={train_world_size} "
-            f"peer={sender_spec.nccl_peer}",
+            f"world_size={world_size} train_world_size={train_world_size}",
             flush=True,
         )
         futures_train = self._policy.init_collective(
@@ -300,7 +311,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             port,
             world_size,
             train_world_size=train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
@@ -405,20 +415,14 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         communicators without regenerating the plan would corrupt the refit silently,
         which is why the plan is regenerated rather than reused.
         """
-        membership = desired_membership(
-            absent_shards=absent_shards,
-            dp_size=self._generation.worker_group.dp_size,
-            total_gen_workers=len(self._generation.worker_group.workers),
-            train_world_size=self._train_cluster.world_size(),
+        membership = self._desired_membership(
+            absent_shards, self._train_cluster.world_size()
         )
         # An unrecorded membership means the full fleet -- see should_rebuild's docstring,
         # which owns the rest of this rule for both hardened transports.
         if self._built_membership is None:
-            self._built_membership = desired_membership(
-                absent_shards=[],
-                dp_size=self._generation.worker_group.dp_size,
-                total_gen_workers=len(self._generation.worker_group.workers),
-                train_world_size=membership.train_world_size,
+            self._built_membership = self._desired_membership(
+                [], membership.train_world_size
             )
         if not should_rebuild(
             desired=membership,

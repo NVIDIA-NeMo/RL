@@ -290,8 +290,26 @@ def _get_fp8_parameter_names(config: PretrainedConfig) -> list[str]:
     return [name for name, _ in model.named_parameters()]
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    global global_fp8_config
+def build_fp8_config(
+    vllm_cfg: dict[str, Any], model_name: str, model_parallel_size: int
+) -> tuple[FP8Config, dict[str, Any]]:
+    """Validate FP8 rollout settings and derive the engine's FP8 arguments.
+
+    Side-effect free, so a process that only launches an engine (managed Dynamo)
+    can use it; :func:`init_fp8` adds the in-process patch hooks.
+
+    Args:
+        vllm_cfg: ``policy.generation.vllm_cfg``.
+        model_name: HF model name or path; its config gives the layer count.
+        model_parallel_size: TP x PP of one engine.
+
+    Returns:
+        The ``FP8Config`` the engine workers' patches read, and the vLLM engine
+        kwargs (``quantization``, ``kv_cache_dtype``, ``hf_overrides``).
+
+    Raises:
+        ValueError: On an invalid FP8, KV-cache or BF16-layer setting.
+    """
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
@@ -395,21 +413,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         fp8_config_kwargs["use_activation_pow2_scale"] = vllm_cfg.get(
             "pow2_activation_scaling_factors", False
         )
-    global_fp8_config = FP8Config(**fp8_config_kwargs)
-
-    # Keep existing DeepGEMM behavior unless a recipe explicitly opts into E8M0.
-    if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
-        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ.setdefault("VLLM_USE_DEEP_GEMM_E8M0", "0")
-
-    if vllm_cfg["async_engine"]:
-        EngineCoreProc.run_engine_core = my_run_engine_core
-        CoreEngineProcManager.__init__ = my_init
-    else:
-        monkey_patch_vllm_ray_executor(global_fp8_config)
+    fp8_config = FP8Config(**fp8_config_kwargs)
 
     # create fp8 kwargs for vllm's LLM(...)
-    if global_fp8_config.is_mx:
+    if fp8_config.is_mx:
         fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
     else:
         fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
@@ -481,6 +488,47 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
+
+    return fp8_config, vllm_kwargs
+
+
+def fp8_engine_env(vllm_cfg: dict[str, Any], fp8_config: FP8Config) -> dict[str, str]:
+    """Environment the engine needs for FP8: DeepGEMM unless the recipe uses MXFP8.
+
+    ``VLLM_USE_DEEP_GEMM_E8M0`` is a default; an explicit setting wins.
+    """
+    if vllm_cfg.get("use_deep_gemm", False) and not fp8_config.is_mx:
+        return {"VLLM_USE_DEEP_GEMM": "1", "VLLM_USE_DEEP_GEMM_E8M0": "0"}
+    return {}
+
+
+def init_fp8(vllm_cfg, model_name, model_parallel_size):
+    """Configure this process's vLLM engine for FP8 rollouts.
+
+    Builds the FP8 config, then installs the hooks that apply the FP8 patches in
+    the engine's worker processes before they load the model.
+
+    Returns:
+        The vLLM engine kwargs from :func:`build_fp8_config`.
+    """
+    global global_fp8_config
+    global_fp8_config, vllm_kwargs = build_fp8_config(
+        vllm_cfg, model_name, model_parallel_size
+    )
+
+    # Keep existing DeepGEMM behavior unless a recipe explicitly opts into E8M0.
+    engine_env = fp8_engine_env(vllm_cfg, global_fp8_config)
+    if engine_env:
+        os.environ["VLLM_USE_DEEP_GEMM"] = engine_env["VLLM_USE_DEEP_GEMM"]
+        os.environ.setdefault(
+            "VLLM_USE_DEEP_GEMM_E8M0", engine_env["VLLM_USE_DEEP_GEMM_E8M0"]
+        )
+
+    if vllm_cfg["async_engine"]:
+        EngineCoreProc.run_engine_core = my_run_engine_core
+        CoreEngineProcManager.__init__ = my_init
+    else:
+        monkey_patch_vllm_ray_executor(global_fp8_config)
 
     return vllm_kwargs
 

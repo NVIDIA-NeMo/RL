@@ -33,14 +33,20 @@ from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
-    CollectiveSenderSpec,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    reject_unenforceable_refit_deadline,
+    RefitFleetShape,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.utils import (
+    assert_reload_refit_config_supported,
+    mtp_drafter_setup,
+    spec_decode_max_tokens,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.weight_sync.membership import RefitMembership
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -174,24 +180,8 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
-        if fleet_health.refit_timeout_s is not None:
-            # Dynamo workers cannot abort their refit collective, so a deadline would
-            # be refused at the first weight update; fail before anything builds.
-            raise ValueError(
-                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
-                "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
-                "refit deadline."
-            )
         # Setup has already normalized this through DynamoConfig.
         generation = cast(dict[str, Any], master_config.policy["generation"])
-        dynamo_cfg = generation["dynamo_cfg"]
-        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
-            raise ValueError(
-                "policy.generation.dynamo_cfg.control_timeout_s "
-                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
-                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
-                "which waits for running requests to finish."
-            )
         if (
             generation["vllm_cfg"]["enable_vllm_metrics_logger"]
             and master_config.rollout_checkpointing.telemetry_interval_s is None
@@ -214,6 +204,9 @@ class DynamoGeneration(GenerationInterface):
     ):
         validated_config = DynamoConfig.model_validate(config)
         self.cfg = validated_config.model_dump()
+        # The same refit-path limits as the vLLM backend: every engine refits
+        # through NeMo RL's vLLM worker extension.
+        assert_reload_refit_config_supported(cast(VllmConfig, self.cfg))
         self._dynamo_cfg = validated_config.dynamo_cfg
         dynamo_cfg = self._dynamo_cfg
         vllm_cfg = validated_config.vllm_cfg
@@ -260,6 +253,7 @@ class DynamoGeneration(GenerationInterface):
                 control_timeout_s=dynamo_cfg.control_timeout_s,
                 validate_workers=self._managed_runtime.validate_workers,
             )
+            self._configure_mtp_drafter()
 
             if expose_http_server:
                 self._token_wrapper_server = DynamoTokenWrapperServer(
@@ -349,12 +343,19 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.inference_world_size
 
-    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
-        """Return vLLM's NCCL protocol and packed-transfer geometry."""
+    def get_refit_fleet_shape(self) -> RefitFleetShape:
+        """One DP shard per Dynamo engine, each with TP x PP refit ranks."""
+        channel = self._require_refit_channel()
+        return RefitFleetShape(
+            dp_size=channel.num_engines,
+            total_gen_workers=channel.inference_world_size,
+        )
+
+    def _require_refit_channel(self) -> DynamoRefitChannel:
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.sender_spec
+        return channel
 
     def shutdown(self) -> bool:
         """Stop process-local helpers and any driver-owned managed runtime."""
@@ -497,14 +498,24 @@ class DynamoGeneration(GenerationInterface):
         return payload
 
     def _allowed_new_tokens(self, input_length: int) -> int:
-        """Return the generation budget for a prompt."""
+        """Return the generation budget for a prompt, with the vLLM backend's spec-decode clamp."""
         remaining_ctx = int(self.cfg["vllm_cfg"]["max_model_len"]) - input_length
         if remaining_ctx <= 0:
             raise ValueError(
                 f"Dynamo prompt length {input_length} must be less than "
                 f"vllm_cfg.max_model_len={self.cfg['vllm_cfg']['max_model_len']}"
             )
-        return min(self.cfg["max_new_tokens"], remaining_ctx)
+        allowed = min(self.cfg["max_new_tokens"], remaining_ctx)
+        speculative_config = self.cfg["vllm_kwargs"].get("speculative_config") or {}
+        lookahead = int(speculative_config.get("num_speculative_tokens") or 0)
+        if lookahead > 0:
+            allowed = spec_decode_max_tokens(
+                allowed,
+                input_length,
+                int(self.cfg["vllm_cfg"]["max_model_len"]),
+                lookahead,
+            )
+        return allowed
 
     def _assert_response_within_context(
         self, *, input_length: int, generated_length: int
@@ -693,11 +704,8 @@ class DynamoGeneration(GenerationInterface):
         *,
         train_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Initialize native vLLM NCCL transfer on every managed worker."""
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.init_collective(
+        """Join every engine's worker extension to the ``model_update_group``."""
+        return self._require_refit_channel().init_collective(
             ip,
             port,
             world_size,
@@ -707,13 +715,13 @@ class DynamoGeneration(GenerationInterface):
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
-        """Serialize checkpoint-format tensor metadata for native vLLM refit."""
+        """Hand the ordered tensor metadata to every engine's worker extension.
+
+        Returns None: managed Dynamo requests no trainer-side pre-quantization.
+        """
         if state_dict_info is None:
             return None
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.prepare(state_dict_info)
+        self._require_refit_channel().prepare_refit_info(state_dict_info)
         return None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -724,15 +732,90 @@ class DynamoGeneration(GenerationInterface):
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
     ) -> list[ray.ObjectRef]:
-        """Receive packed checkpoint-format weights on every Dynamo worker."""
-        reject_unenforceable_refit_deadline("Dynamo", refit_timeout_s)
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        return channel.update_weights()
+        """Receive one packed-broadcast refit on every engine.
+
+        The extension's watchdog enforces ``refit_timeout_s`` inside each engine.
+        """
+        return self._require_refit_channel().update_weights_from_collective(
+            refit_timeout_s,
+            refit_with_reload_api=bool(
+                self.cfg["vllm_cfg"].get("refit_with_reload_api")
+            ),
+        )
+
+    def _configure_mtp_drafter(self) -> None:
+        """Run the vLLM backend's post-start MTP drafter setup on every engine."""
+        weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        enabled, load_from_disk = mtp_drafter_setup(
+            self.cfg["vllm_kwargs"].get("speculative_config"),
+            load_format=self.cfg["vllm_cfg"]["load_format"],
+            weights_from_refit=weights_from_refit,
+        )
+        if not enabled:
+            return
+        channel = self._require_refit_channel()
+        ray.get(
+            channel.call_on_every_engine(
+                "configure_mtp_drafter_weight_source",
+                {"weights_from_refit": weights_from_refit},
+            )
+        )
+        if load_from_disk:
+            ray.get(
+                channel.call_on_every_engine(
+                    "load_mtp_weights_from_disk",
+                    {"model_path": self.cfg["model_name"]},
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Membership and nccl_reshard refit, through the worker extension
+    # ------------------------------------------------------------------
+
+    def set_refit_membership(self, membership: RefitMembership) -> None:
+        """Accept only the full fleet: managed Dynamo engines are never replaced."""
+        self._require_refit_channel().check_full_fleet(membership)
+
+    def rebuild_collective(
+        self, membership: RefitMembership, ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the NeMo RL ``model_update_group``."""
+        return self._require_refit_channel().rebuild_collective(membership, ip, port)
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: RefitMembership,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every engine to the per-training-PP-stage bulk reshard groups."""
+        return self._require_refit_channel().rebuild_nccl_reshard_comm_group(
+            membership,
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Ship the wire-safe reshard plan to every engine and wait for its map."""
+        self._require_refit_channel().prepare_nccl_reshard_refit_info(refit_info)
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive one nccl_reshard refit on every engine.
+
+        The extension's watchdog enforces ``refit_timeout_s`` inside each engine.
+        """
+        return self._require_refit_channel().nccl_reshard_refit(refit_timeout_s)
 
     def invalidate_kv_cache(self) -> bool:
-        """Flush every fixed Dynamo worker's prefix/KV cache."""
+        """Drain every fixed Dynamo worker, then clear its prefix/KV cache."""
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
@@ -741,27 +824,21 @@ class DynamoGeneration(GenerationInterface):
     def pause_generation_for_refit(
         self, *, clear_cache: bool, timeout_s: Optional[float] = None
     ) -> bool:
-        """Drain and pause every worker; layerwise reload is unsafe mid-request.
+        """Freeze every engine's requests in place, as the vLLM backend does.
 
-        Unlike vLLM's frozen pause, running requests finish on the current
-        weights; queued and new requests wait and run on the new ones. Because
-        the drain waits for running requests, ``dynamo_cfg.control_timeout_s``
-        bounds it rather than ``timeout_s``.
+        Frozen requests continue on the new weights after
+        :meth:`resume_generation_after_refit`; with ``clear_cache`` their KV is
+        dropped at pause time, so they recompute it. ``timeout_s`` bounds each
+        engine's call; None falls back to ``dynamo_cfg.control_timeout_s``.
         """
-        del timeout_s
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.pause(clear_cache=clear_cache)
+        self._require_refit_channel().pause(
+            clear_cache=clear_cache, timeout_s=timeout_s
+        )
         return True
 
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
-        """Resume every worker after a weight update."""
-        del timeout_s
-        channel = self._refit_channel
-        if channel is None:
-            raise RuntimeError("Dynamo refit channel is unavailable")
-        channel.resume()
+        """Resume every engine paused by :meth:`pause_generation_for_refit`."""
+        self._require_refit_channel().resume(timeout_s=timeout_s)
         return True

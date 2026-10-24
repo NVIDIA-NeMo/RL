@@ -35,44 +35,6 @@ def test_policy_waits_for_param_sync_before_refit(monkeypatch):
     assert waited_for == [["future"]]
 
 
-def test_policy_forwards_nccl_peer_to_workers():
-    calls = []
-
-    class WorkerGroup:
-        def run_all_workers_single_data(self, method_name, **kwargs):
-            calls.append((method_name, kwargs))
-            return ["future"]
-
-        def shutdown(self, **_kwargs):
-            pass
-
-    policy = Policy.__new__(Policy)
-    policy.worker_group = WorkerGroup()
-
-    futures = policy.init_collective(
-        "127.0.0.1",
-        1234,
-        4,
-        train_world_size=2,
-        nccl_peer="vllm",
-    )
-
-    assert futures == ["future"]
-    assert calls == [
-        (
-            "init_collective",
-            {
-                "ip": "127.0.0.1",
-                "port": 1234,
-                "world_size": 4,
-                "train_world_size": 2,
-                "rank_offset": 0,
-                "nccl_peer": "vllm",
-            },
-        )
-    ]
-
-
 def test_policy_forwards_rank_offset_to_workers():
     """Megatron M-to-N generation ranks join the group after the training ranks."""
     calls = []
@@ -94,7 +56,6 @@ def test_policy_forwards_rank_offset_to_workers():
         6,
         train_world_size=4,
         rank_offset=4,
-        nccl_peer="nemo",
     )
 
     assert calls == [
@@ -106,7 +67,6 @@ def test_policy_forwards_rank_offset_to_workers():
                 "world_size": 6,
                 "train_world_size": 4,
                 "rank_offset": 4,
-                "nccl_peer": "nemo",
             },
         )
     ]
@@ -225,7 +185,7 @@ def test_policy_uses_megatron_save_path_when_automodel_is_disabled(monkeypatch):
     ]
 
 
-def test_policy_worker_initializes_requested_nccl_peer(monkeypatch):
+def test_policy_worker_initializes_its_collective(monkeypatch):
     calls = []
 
     class ProcessGroup:
@@ -251,7 +211,6 @@ def test_policy_worker_initializes_requested_nccl_peer(monkeypatch):
         1234,
         4,
         train_world_size=2,
-        nccl_peer="vllm",
     )
 
     assert calls == [
@@ -264,7 +223,7 @@ def test_policy_worker_initializes_requested_nccl_peer(monkeypatch):
                 "world_size": 4,
             },
         ),
-        ("init", {"device": 3, "peer": "vllm"}),
+        ("init", {"device": 3}),
     ]
 
 

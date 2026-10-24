@@ -436,13 +436,15 @@ class GenerationOutputSpec(TypedDict):
 
 
 @dataclass(frozen=True)
-class CollectiveSenderSpec:
-    """Policy-side protocol and packing geometry for NCCL weight transfer."""
+class RefitFleetShape:
+    """How a generation backend's refit ranks divide into DP shards.
 
-    nccl_peer: str = "nemo"
-    buffer_size_bytes: int | None = None
-    num_buffers: int | None = None
-    use_legacy_packing: bool = False
+    Refit membership (``nemo_rl.weight_sync.membership``) tracks shards by index and
+    gives each a contiguous block of ``total_gen_workers // dp_size`` ranks.
+    """
+
+    dp_size: int
+    total_gen_workers: int
 
 
 def agreed_media_columns(
@@ -626,12 +628,16 @@ class GenerationInterface(ABC):
         """
         raise NotImplementedError
 
-    def get_collective_sender_spec(self) -> CollectiveSenderSpec:
-        """Return policy-side NCCL protocol and packed-buffer requirements."""
-        return CollectiveSenderSpec()
-
     def get_inference_world_size(self) -> int | None:
         """Return a backend-specific collective world size when required."""
+        return None
+
+    def get_refit_fleet_shape(self) -> RefitFleetShape | None:
+        """Return the DP shards refit membership tracks, or None if there are none.
+
+        None means the backend has no shards for membership to track, so collective
+        refit treats every reconcile as a no-op. nccl_reshard requires a shape.
+        """
         return None
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:

@@ -31,6 +31,7 @@ from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     ShardState,
 )
+from nemo_rl.models.generation.interfaces import RefitFleetShape
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -52,6 +53,9 @@ def _minimal_generation(dp_size=2):
             workers=[object()] * dp_size,
             dp_size=dp_size,
             get_dp_leader_worker_idx=lambda shard: shard,
+        ),
+        get_refit_fleet_shape=lambda: RefitFleetShape(
+            dp_size=dp_size, total_gen_workers=dp_size
         ),
     )
 
@@ -136,10 +140,6 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             dp_size=dp_size,
             get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
         ),
-        # The rebuild bootstraps with the same peer protocol as the first build, so it
-        # asks the backend which one that is. A stand-in has to carry every hook the code
-        # under test reads, or it tests a shape the product never has.
-        get_collective_sender_spec=lambda: SimpleNamespace(nccl_peer="nemo"),
     )
     from nemo_rl.models.generation.vllm import vllm_generation
 
@@ -156,6 +156,9 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
             generation, membership, ip, port
         )
     )
+    generation.get_refit_fleet_shape = (
+        lambda: vllm_generation.VllmGeneration.get_refit_fleet_shape(generation)
+    )
     policy_calls = []
     refit_info_requests = []
 
@@ -167,12 +170,7 @@ def _rebuildable(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_siz
     policy = SimpleNamespace(
         prepare_refit_info=prepare_refit_info,
         refit_info_requests=refit_info_requests,
-        init_collective=lambda ip,
-        port,
-        world_size,
-        *,
-        train_world_size,
-        nccl_peer=None: (
+        init_collective=lambda ip, port, world_size, *, train_world_size: (
             policy_calls.append(
                 {
                     "ip": ip,
@@ -642,11 +640,9 @@ class TestStragglersAreWaitedForBeforeARebuild:
 class TestBackendsWithoutAWorkerGroup:
     """CollectiveWeightSynchronizer holds a GenerationInterface, not a VllmGeneration.
 
-    Only some implementations own a Ray worker group with DP shards -- vLLM and TRT-LLM do;
-    Dynamo, Megatron and SGLang do not, and the interface declares nothing either way. Of
-    those, Dynamo reaches this synchronizer through the ordinary non-colocated branch of
-    the factory, so reading self._generation.worker_group broke it on the plain grpo.py
-    path:
+    Backends report their DP shards through ``get_refit_fleet_shape``; one with none
+    (SGLang) returns None. Reading ``self._generation.worker_group`` directly once broke
+    Dynamo on the plain grpo.py path:
 
         grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
         AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
@@ -663,11 +659,12 @@ class TestBackendsWithoutAWorkerGroup:
         )
 
         sync = CollectiveWeightSynchronizer.__new__(CollectiveWeightSynchronizer)
-        generation = SimpleNamespace()
-        if has_worker_group:
-            generation.worker_group = SimpleNamespace(
-                dp_size=2, workers=[object(), object()]
-            )
+        shape = (
+            RefitFleetShape(dp_size=2, total_gen_workers=2)
+            if has_worker_group
+            else None
+        )
+        generation = SimpleNamespace(get_refit_fleet_shape=lambda: shape)
         sync._generation = generation
         sync._train_cluster = SimpleNamespace(world_size=lambda: 2)
         sync._built_membership = None
