@@ -16,6 +16,7 @@
 scaling algorithms in nemo_rl/utils/length_penalty.py."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -395,6 +396,605 @@ class TestProfiledLengthPenalty:
         assert rewards_of(results) == pytest.approx([1.0, 0.7])
 
 
+class TestProfiledLengthZeroOverMax:
+    """profiled_length_penalty_type: zero_over_max (Kimi-style cap): a rollout
+    strictly longer than the longest PASSING profiled rollout for its prompt
+    gets exactly 0.0 reward.
+
+    Rollouts are built with all their length in reasoning and an empty answer,
+    so each ``lengths`` entry is the total length the cap compares against.
+    Rewards are compared with ``==``, not ``approx``: a capped reward must be
+    exactly zero, and an uncapped one exactly what the env returned.
+    """
+
+    @staticmethod
+    def make_group(rewards, lengths, p_rewards, p_lengths):
+        results = [
+            make_result("x" * length, "", reward)
+            for reward, length in zip(rewards, lengths)
+        ]
+        for r in results:
+            r["profiled_rewards"] = p_rewards
+            r["profiled_output_lengths"] = p_lengths
+        return results
+
+    @staticmethod
+    def cfg(num_gens, min_samples=2, **params):
+        return make_config(
+            default={
+                "enabled": True,
+                "profiled_length_penalty_type": "zero_over_max",
+                "profiled_length_min_samples": min_samples,
+                **params,
+            },
+            num_gens=num_gens,
+        )
+
+    @pytest.mark.parametrize(
+        "rewards, lengths, p_rewards, p_lengths, min_samples, expected",
+        [
+            pytest.param(
+                [1.0, 1.0, 1.0, 1.0],
+                [5, 10, 11, 40],
+                [1, 1, 1],
+                [4, 8, 10],
+                2,
+                [1.0, 1.0, 0.0, 0.0],
+                id="over_max_zeroed_at_max_kept",
+            ),
+            pytest.param(
+                [1.0, 1.0, 1.0],
+                [12, 13, 50],
+                [1, 1, 0],
+                [10, 12, 100],
+                2,
+                # A failing profiled length (100) must not raise the cap.
+                [1.0, 0.0, 0.0],
+                id="failing_profiled_lengths_ignored",
+            ),
+            pytest.param(
+                [1.0, 1.0],
+                [20, 30],
+                [1, 1],
+                [10, 10],
+                2,
+                [0.0, 0.0],
+                id="whole_group_over_max",
+            ),
+            pytest.param(
+                [0.0, 1.0, 0.0, 1.0],
+                [50, 50, 5, 5],
+                [1, 1],
+                [10, 10],
+                2,
+                [0.0, 0.0, 0.0, 1.0],
+                id="wrong_rollouts_stay_zero",
+            ),
+            pytest.param(
+                [0.0, 0.0],
+                [50, 5],
+                [1, 1],
+                [10, 10],
+                2,
+                [0.0, 0.0],
+                id="all_wrong_group_unchanged",
+            ),
+            pytest.param(
+                [1.0, 1.0],
+                [50, 5],
+                [1, 0, 0],
+                [10, 100, 100],
+                2,
+                [1.0, 1.0],
+                id="fewer_passes_than_min_samples_no_cap",
+            ),
+            pytest.param(
+                [1.0, 1.0],
+                [50, 5],
+                [0, 0],
+                [10, 10],
+                0,
+                # min_samples=0 must not reach max([]) on an all-failed profile.
+                [1.0, 1.0],
+                id="no_passes_no_cap",
+            ),
+            pytest.param(
+                [1.0, 1.0],
+                [10, 11],
+                [1, 0],
+                [10, 100],
+                1,
+                [1.0, 0.0],
+                id="single_pass_allowed_when_min_samples_one",
+            ),
+        ],
+    )
+    def test_rewards_in_rewards_out(
+        self, rewards, lengths, p_rewards, p_lengths, min_samples, expected
+    ):
+        results = self.make_group(rewards, lengths, p_rewards, p_lengths)
+        apply(results, self.cfg(len(rewards), min_samples=min_samples))
+        assert rewards_of(results) == expected
+
+    @pytest.mark.parametrize(
+        "correct_threshold, expected",
+        [
+            # Correct profiled lengths -> cap, for rollouts of length 12 and 13:
+            pytest.param(None, [1.0, 1.0], id="default_0"),  # all 4 -> 100
+            pytest.param(0.4, [1.0, 1.0], id="0.4_counts_0.5"),  # 90, 10, 12 -> 90
+            pytest.param(0.5, [1.0, 0.0], id="0.5_excludes_0.5"),  # 10, 12 -> 12
+            pytest.param(0.9, [1.0, 1.0], id="too_few_correct"),  # 12 < min 2
+        ],
+    )
+    def test_reward_correct_threshold(self, correct_threshold, expected):
+        # Graded profiled rewards: only r > threshold counts as correct, so
+        # the threshold picks the lengths that set the cap and the count that
+        # min_samples gates on.
+        results = self.make_group(
+            [1.0, 1.0], [12, 13], [0.3, 0.5, 0.8, 1.0], [100, 90, 10, 12]
+        )
+        params = (
+            {}
+            if correct_threshold is None
+            else {"profiled_reward_correct_threshold": correct_threshold}
+        )
+        apply(results, self.cfg(num_gens=2, **params))
+        assert rewards_of(results) == expected
+
+    def test_reward_correct_threshold_applies_to_constant_type(self):
+        # With the default 0, the 0.3-reward length 100 counts and drags the
+        # mean + std threshold (~92) past the 50-long rollout. At 0.5 only the
+        # two length-10 profiles count: threshold 10, so the rollout loses 0.3.
+        p_rewards, p_lengths = [0.3, 1.0, 1.0], [100, 10, 10]
+        outs = []
+        for correct_threshold in (0.0, 0.5):
+            results = self.make_group([1.0, 1.0], [5, 50], p_rewards, p_lengths)
+            cfg = make_config(
+                default={
+                    "profiled_length_penalty": 0.3,
+                    "profiled_reward_correct_threshold": correct_threshold,
+                }
+            )
+            apply(results, cfg)
+            outs.append(rewards_of(results))
+        assert outs[0] == pytest.approx([1.0, 1.0])
+        assert outs[1] == pytest.approx([1.0, 0.7])
+
+    def test_each_group_uses_its_own_profile(self):
+        # Same lengths, different profiles: group 0 caps at 10, group 1 at 30.
+        results = self.make_group([1.0, 1.0], [20, 20], [1, 1], [10, 10])
+        results += self.make_group([1.0, 1.0], [20, 20], [1, 1], [30, 30])
+        apply(results, self.cfg(num_gens=2))
+        assert rewards_of(results) == [0.0, 0.0, 1.0, 1.0]
+
+    def test_zero_survives_bonus(self):
+        # total_bonus lifts the shortest correct rollout (length 20) to 1.5,
+        # but it is over the cap of 10: the cap runs last, so it ends at 0.0.
+        results = self.make_group([1.0, 1.0], [20, 30], [1, 1], [10, 10])
+        apply(results, self.cfg(num_gens=2, total_bonus=0.5))
+        assert rewards_of(results) == [0.0, 0.0]
+
+    def test_zero_survives_group_relative_penalty(self):
+        # The longer rollout (50 > cap 10) also takes the group-relative -0.05.
+        # The no-double-penalty rule drops a constant_over_n_std penalty on
+        # such a rollout, but it must not drop the cap: 0.0, not 0.95.
+        results = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        apply(results, self.cfg(num_gens=2, group_total_length_penalty_coeff=0.1))
+        under_cap, over_cap = rewards_of(results)
+        assert under_cap == pytest.approx(1.05)
+        assert over_cap == 0.0
+
+    def test_zero_survives_profile_band_multiplier(self):
+        band = {"total": {"a": 1, "b": 100, "f": 0.5}}
+        results = self.make_group([1.0, 1.0], [5, 20], [1, 1], [10, 10])
+        for r in results:
+            r["profile_band"] = band
+        apply(results, self.cfg(num_gens=2, profile_band_total=True))
+        under_cap, over_cap = rewards_of(results)
+        assert under_cap == pytest.approx(1.0 - (5 - 1) / 99 * 0.5)
+        assert over_cap == 0.0
+
+    def test_type_picks_algorithm_on_same_profile(self):
+        # Passing lengths 8 and 12 (failing 100 ignored), n_std=0. The same
+        # rollouts under each type:
+        #   constant_over_n_std: threshold = mean = 10, length >= 10 loses 0.3
+        #   zero_over_max:       cap = max = 12, length > 12 is zeroed
+        rewards, lengths = [1.0, 1.0, 1.0, 1.0], [5, 10, 12, 13]
+        p_rewards, p_lengths = [1, 1, 0], [8, 12, 100]
+        constant = self.make_group(rewards, lengths, p_rewards, p_lengths)
+        apply(
+            constant,
+            make_config(
+                default={"profiled_length_penalty": 0.3, "profiled_length_n_std": 0.0},
+                num_gens=4,
+            ),
+        )
+        assert rewards_of(constant) == pytest.approx([1.0, 0.7, 0.7, 0.7])
+        zeroed = self.make_group(rewards, lengths, p_rewards, p_lengths)
+        apply(zeroed, self.cfg(num_gens=4))
+        assert rewards_of(zeroed) == [1.0, 1.0, 1.0, 0.0]
+
+    def test_constant_with_zero_over_max_rejected(self):
+        # zero_over_max ignores the constant, so setting both is a config error
+        # rather than a penalty that silently does nothing.
+        with pytest.raises(ValueError, match="profiled_length_penalty"):
+            LengthPenaltyConfig.model_validate(
+                {
+                    "default": {
+                        "profiled_length_penalty_type": "zero_over_max",
+                        "profiled_length_penalty": 0.3,
+                    }
+                }
+            )
+
+    def test_counts_tokens_when_length_type_is_tokens(self):
+        # Profiled lengths are token counts. "a b c" is 3 tokens but 5 chars:
+        # counting chars would wrongly cap it against a 3-token profile.
+        tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens: text.split()
+        )
+        results = [
+            make_result("a b c", "", 1.0),
+            make_result("a b c d", "", 1.0),
+        ]
+        for r in results:
+            r["profiled_rewards"] = [1, 1]
+            r["profiled_output_lengths"] = [3, 3]
+        apply(results, self.cfg(num_gens=2, length_type="tokens"), tokenizer)
+        assert rewards_of(results) == [1.0, 0.0]
+
+    def test_off_by_default(self):
+        # The default type is constant_over_n_std, which stays off at the
+        # default profiled_length_penalty of 0.
+        results = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        apply(results, make_config(default={"enabled": True}))
+        assert rewards_of(results) == [1.0, 1.0]
+
+    @pytest.mark.parametrize(
+        "penalty",
+        [
+            pytest.param({"profiled_length_penalty_type": "zero_over_max"}, id="zero"),
+            pytest.param({"profiled_length_penalty": 0.3}, id="constant"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "p_rewards, p_lengths",
+        [
+            # rollouts.py copies a field the gym row lacks as None.
+            pytest.param(None, None, id="both_missing"),
+            pytest.param([1, 1], None, id="lengths_missing"),
+            pytest.param(None, [10, 10], id="rewards_missing"),
+            pytest.param([1, 1], "10,10", id="lengths_not_a_list"),
+            pytest.param([1, 1], {"p50": 10}, id="lengths_a_stats_dict"),
+            pytest.param([1, 1, 0], [10, 10], id="length_mismatch"),
+        ],
+    )
+    def test_bad_profile_fields_raise(self, penalty, p_rewards, p_lengths):
+        # A forgotten, misspelled, or malformed profile must fail the rollout,
+        # not silently train without the penalty.
+        results = self.make_group([1.0, 1.0], [5, 50], p_rewards, p_lengths)
+        cfg = make_config(default={"enabled": True, **penalty}, num_gens=2)
+        with pytest.raises(ValueError, match=f"{AGENT}.*profiled_output_lengths"):
+            apply(results, cfg)
+
+    def test_rows_without_profile_ok_when_agent_turns_it_off(self):
+        # Mixed data: the profiled agent's group is capped, and another agent
+        # whose rows carry no profile turns the penalty off in its override.
+        profiled = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        unprofiled = self.make_group([1.0, 1.0], [5, 50], None, None)
+        for r in unprofiled:
+            r["agent_ref"] = {"name": "code_agent"}
+        cfg = self.cfg(num_gens=2)
+        cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+            AGENT: {},
+            "code_agent": {"profiled_length_penalty_type": "constant_over_n_std"},
+        }
+        apply(profiled + unprofiled, cfg)
+        assert rewards_of(profiled + unprofiled) == [1.0, 0.0, 1.0, 1.0]
+
+    def test_rows_without_profile_ok_when_penalty_off(self):
+        # Only the group-relative penalty is on: no profile is needed.
+        results = self.make_group([1.0, 1.0], [5, 25], None, None)
+        cfg = make_config(
+            default={"enabled": True, "group_total_length_penalty_coeff": 0.1}
+        )
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.05, 0.95])
+
+    def test_agent_override_switches_type(self):
+        # Default zeroes over the max (10); this agent's override switches it
+        # to constant_over_n_std, so the over-length rollout loses 0.3 instead.
+        cfg = self.cfg(num_gens=2)
+        cfg["grpo"]["length_penalty"]["agent_overrides"] = {
+            AGENT: {
+                "profiled_length_penalty_type": "constant_over_n_std",
+                "profiled_length_penalty": 0.3,
+            }
+        }
+        results = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.0, 0.7])
+
+    @pytest.mark.parametrize(
+        "rewards",
+        [
+            pytest.param([-1.0, 1.0], id="negative"),
+            pytest.param([0.5, 1.0], id="graded"),
+        ],
+    )
+    def test_non_binary_group_untouched_and_warned(self, rewards, caplog, monkeypatch):
+        # Default (profiled_length_allow_non_binary_rewards off): the binary
+        # check skips the whole group — both rows are over the cap of 10 and
+        # both keep their env reward — and warns.
+        monkeypatch.setattr(length_penalty_mod, "_NON_BINARY_WARNED_AGENTS", set())
+        results = self.make_group(rewards, [50, 50], [1, 1], [10, 10])
+        with caplog.at_level(logging.WARNING, logger=length_penalty_mod.__name__):
+            metrics = apply(results, self.cfg(num_gens=2))
+        assert rewards_of(results) == rewards
+        assert "non-binary" in caplog.text
+        assert AGENT in caplog.text
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 1.0
+
+    @pytest.mark.parametrize(
+        "rewards, lengths, expected",
+        [
+            pytest.param(
+                [0.5, 0.7, 0.3, 2.0],
+                [5, 50, 50, 5],
+                [0.5, 0.0, 0.0, 2.0],
+                id="graded_over_cap_zeroed",
+            ),
+            pytest.param(
+                [0.9, 0.1],
+                [20, 30],
+                [0.0, 0.0],
+                id="graded_all_over_cap",
+            ),
+            pytest.param(
+                [1.0, 0.0, 0.25, 1.0],
+                [50, 50, 5, 5],
+                [0.0, 0.0, 0.25, 1.0],
+                id="binary_and_graded_mixed",
+            ),
+            pytest.param(
+                [0.0, 0.6],
+                [50, 50],
+                [0.0, 0.0],
+                id="zero_stays_zero",
+            ),
+        ],
+    )
+    def test_non_binary_rewards_capped_when_allowed(self, rewards, lengths, expected):
+        # With the option on, every non-negative scalar reward over the cap
+        # (10) becomes exactly 0; under the cap it is untouched.
+        results = self.make_group(rewards, lengths, [1, 1], [10, 10])
+        cfg = self.cfg(
+            num_gens=len(rewards), profiled_length_allow_non_binary_rewards=True
+        )
+        metrics = apply(results, cfg)
+        assert rewards_of(results) == expected
+        assert metrics["length_penalty/skipped_non_binary_frac"] == 0.0
+
+    @pytest.mark.parametrize(
+        "rewards, lengths",
+        [
+            pytest.param([-1.0, 1.0], [50, 50], id="negative_over_cap"),
+            # Raised even when no rollout is over the cap: whether a run fails
+            # must not depend on how long the rollouts happen to be.
+            pytest.param([-0.5, 0.5], [5, 5], id="negative_under_cap"),
+        ],
+    )
+    def test_negative_reward_raises_when_allowed(self, rewards, lengths):
+        results = self.make_group(rewards, lengths, [1, 1], [10, 10])
+        cfg = self.cfg(num_gens=2, profiled_length_allow_non_binary_rewards=True)
+        with pytest.raises(ValueError, match=f"{AGENT}.*negative reward"):
+            apply(results, cfg)
+
+    @pytest.mark.parametrize("allow_non_binary", [False, True])
+    def test_reward_components_raise(self, allow_non_binary):
+        # Zeroing the scalar alone would break reward == sum(reward_components),
+        # so zero_over_max refuses multi-component rewards outright.
+        results = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        for r in results:
+            r["full_result"]["reward_components"] = {"correct": 1.0, "format": 0.0}
+        cfg = self.cfg(
+            num_gens=2, profiled_length_allow_non_binary_rewards=allow_non_binary
+        )
+        with pytest.raises(ValueError, match=f"{AGENT}.*reward_components"):
+            apply(results, cfg)
+
+    def test_non_binary_group_gets_only_the_cap(self):
+        # Group 0 is binary: group-relative +/-0.05, then the cap zeroes the
+        # over-cap rollout. Group 1 is graded: the group-relative penalty is
+        # binary-only, so it gets the cap alone and its under-cap rollout keeps
+        # exactly 0.5.
+        results = self.make_group([1.0, 1.0], [5, 50], [1, 1], [10, 10])
+        results += self.make_group([0.5, 0.5], [5, 50], [1, 1], [10, 10])
+        cfg = self.cfg(
+            num_gens=2,
+            profiled_length_allow_non_binary_rewards=True,
+            group_total_length_penalty_coeff=0.1,
+        )
+        apply(results, cfg)
+        assert rewards_of(results) == pytest.approx([1.05, 0.0, 0.5, 0.0])
+        assert rewards_of(results)[1:] == [0.0, 0.5, 0.0]
+
+    def test_low_effort_group_skipped_when_allowed(self):
+        # Effort shaping already rewrote these rewards (even below 0); the
+        # length penalties leave low-effort groups alone, without raising.
+        results = self.make_group([-0.2, 0.5], [50, 50], [1, 1], [10, 10])
+        for r in results:
+            r["low_effort_applied"] = True
+        cfg = self.cfg(num_gens=2, profiled_length_allow_non_binary_rewards=True)
+        apply(results, cfg)
+        assert rewards_of(results) == [-0.2, 0.5]
+
+    def test_metrics_count_capped_non_binary_rollouts(self):
+        results = self.make_group([0.5, 0.5], [5, 50], [1, 1], [10, 10])
+        cfg = self.cfg(num_gens=2, profiled_length_allow_non_binary_rewards=True)
+        metrics = apply(results, cfg)
+        assert rewards_of(results) == [0.5, 0.0]
+        assert metrics["length_penalty/wiped_correct_frac"] == 0.5
+        assert metrics["length_penalty/adjusted_frac"] == 0.5
+        assert metrics["length_penalty/reward_delta_mean"] == -0.25
+
+    def test_allow_non_binary_requires_zero_over_max(self):
+        # Every other length penalty needs binary rewards, so the option would
+        # silently do nothing next to constant_over_n_std.
+        with pytest.raises(ValueError, match="zero_over_max"):
+            LengthPenaltyConfig.model_validate(
+                {
+                    "default": {
+                        "profiled_length_penalty": 0.3,
+                        "profiled_length_allow_non_binary_rewards": True,
+                    }
+                }
+            )
+
+    def test_metrics_count_zeroed_rollouts(self):
+        results = self.make_group(
+            [1.0, 1.0, 0.0, 0.0], [5, 50, 50, 5], [1, 1], [10, 10]
+        )
+        metrics = apply(results, self.cfg(num_gens=4))
+        assert rewards_of(results) == [1.0, 0.0, 0.0, 0.0]
+        assert metrics["length_penalty/env_reward_mean"] == 0.5
+        assert metrics["length_penalty/reward_delta_mean"] == -0.25
+        assert metrics["length_penalty/wiped_correct_frac"] == 0.25
+        assert metrics["length_penalty/adjusted_frac"] == 0.25
+
+
+class TestAllGeneratedTokens:
+    """length_type: all_generated_tokens counts every token id in the
+    assistant messages of message_log instead of re-tokenizing text."""
+
+    @staticmethod
+    def make_rollout(reward, generated_per_turn):
+        # 2000 chars of text: were the text measured, every rollout would be
+        # far over any cap below. Each turn also has 50 prompt/observation
+        # tokens in a user message, which must not count.
+        result = make_result("x" * 1000, "y" * 1000, reward)
+        result["message_log"] = []
+        for n_generated in generated_per_turn:
+            result["message_log"].append({"role": "user", "token_ids": [0] * 50})
+            result["message_log"].append(
+                {"role": "assistant", "token_ids": [1] * n_generated}
+            )
+        result["profiled_rewards"] = [1, 1]
+        result["profiled_output_lengths"] = [10, 10]
+        return result
+
+    @staticmethod
+    def cfg(num_gens, **params):
+        return make_config(
+            default={"length_type": "all_generated_tokens", **params},
+            num_gens=num_gens,
+        )
+
+    def test_cap_counts_generated_tokens_of_all_turns(self):
+        # Cap 10. Generated tokens: 10, 4 + 6 = 10, 4 + 7 = 11, 12.
+        results = [
+            self.make_rollout(1.0, turns) for turns in ([10], [4, 6], [4, 7], [12])
+        ]
+        apply(results, self.cfg(4, profiled_length_penalty_type="zero_over_max"))
+        assert rewards_of(results) == [1.0, 1.0, 0.0, 0.0]
+
+    def test_total_length_settings_use_generated_tokens(self):
+        # 5 vs 15 generated tokens: the group-relative total channel gives the
+        # same +/-0.05 it gives any two-length group.
+        results = [self.make_rollout(1.0, [5]), self.make_rollout(1.0, [15])]
+        apply(results, self.cfg(2, group_total_length_penalty_coeff=0.1))
+        assert rewards_of(results) == pytest.approx([1.05, 0.95])
+
+    @pytest.mark.parametrize(
+        "setting",
+        [
+            {"reasoning_bonus": 0.1},
+            {"answer_bonus": 0.1},
+            {"longest_reasoning_penalty": 0.1},
+            {"longest_answer_penalty": 0.1},
+            {"group_reasoning_length_penalty_coeff": 0.1},
+            {"group_answer_length_penalty_coeff": 0.1},
+            {"reasoning_zmad_threshold": 2.0, "reasoning_zmad_penalty": 0.1},
+            {"answer_zmad_threshold": 2.0, "answer_zmad_penalty": 0.1},
+            {"profile_band_reasoning": True},
+            {"profile_band_answer": True},
+            {
+                "group_length_penalty_profile_gate": True,
+                "group_length_penalty_profile_gate_channel": "reasoning",
+            },
+        ],
+        ids=lambda setting: next(iter(setting)),
+    )
+    def test_reasoning_or_answer_setting_rejected(self, setting):
+        # Generated token ids have no reasoning/answer split: these settings
+        # would silently see length 0.
+        with pytest.raises(ValueError, match=next(iter(setting))):
+            LengthPenaltyConfig.model_validate(
+                {"default": {"length_type": "all_generated_tokens", **setting}}
+            )
+
+    @pytest.mark.parametrize(
+        "default, override",
+        [
+            pytest.param(
+                {"length_type": "all_generated_tokens"},
+                {"group_reasoning_length_penalty_coeff": 0.1},
+                id="override_adds_reasoning_setting",
+            ),
+            pytest.param(
+                {"group_reasoning_length_penalty_coeff": 0.1},
+                {"length_type": "all_generated_tokens"},
+                id="override_switches_length_type",
+            ),
+        ],
+    )
+    def test_rejected_on_merged_agent_settings(self, default, override):
+        # Each block is fine alone; the agent's merged settings are not.
+        with pytest.raises(ValueError, match=AGENT):
+            LengthPenaltyConfig.model_validate(
+                {"default": default, "agent_overrides": {AGENT: override}}
+            )
+
+    def test_global_reasoning_band_rejected_unless_turned_off(self):
+        band = {"enabled": True, "defaults": {"reasoning": {"a": 1, "b": 2, "f": 0.5}}}
+        with pytest.raises(ValueError, match="profile_band_reasoning"):
+            LengthPenaltyConfig.model_validate(
+                {
+                    "default": {"length_type": "all_generated_tokens"},
+                    "profile_band": band,
+                }
+            )
+        LengthPenaltyConfig.model_validate(
+            {
+                "default": {
+                    "length_type": "all_generated_tokens",
+                    "profile_band_reasoning": False,
+                },
+                "profile_band": band,
+            }
+        )
+
+    def test_total_only_and_disabled_agents_accepted(self):
+        LengthPenaltyConfig.model_validate(
+            {
+                "default": {
+                    "length_type": "all_generated_tokens",
+                    "profiled_length_penalty_type": "zero_over_max",
+                    "group_total_length_penalty_coeff": 0.1,
+                    "total_zmad_threshold": 2.0,
+                    "total_zmad_penalty": 0.1,
+                    "profile_band_total": True,
+                },
+                "agent_overrides": {
+                    "code_agent": {
+                        "enabled": False,
+                        "group_reasoning_length_penalty_coeff": 0.1,
+                    }
+                },
+            }
+        )
+
+
 class TestPassRateLengthPenalty:
     """MAI-style penalty: -w * rho_q * |y_i| / l_max on correct rollouts."""
 
@@ -594,6 +1194,8 @@ class TestReviewFixes:
             {"length_type": "token"},
             {"group_length_penalty_profile_gate_channel": "totl"},
             {"group_length_penalty_profile_gate_field": "x"},
+            {"profiled_length_penalty_type": "zero_over_mean"},
+            {"length_type": "generated_tokens"},
         ):
             with pytest.raises(ValueError):
                 LengthPenaltyConfig.model_validate({"default": bad})
@@ -749,8 +1351,6 @@ class TestNemoGymPostprocessHook:
 
     @staticmethod
     def postprocess(rows, texts, grpo_config, reward_penalty_config=None):
-        from types import SimpleNamespace
-
         torch = pytest.importorskip("torch")
 
         from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -816,6 +1416,70 @@ class TestNemoGymPostprocessHook:
         assert metrics["length_penalty/reward_delta_mean"] == pytest.approx(
             (0.35 - 1.0 + 0.3 - 1.0) / 4
         )
+
+    def test_profiled_zero_over_max_reaches_total_reward(self):
+        # The profiled fields are copied from the gym rows onto the results,
+        # and the capped rollout (total 11 > max 10) trains on exactly 0.
+        rows = [
+            {
+                "agent_ref": {"name": AGENT},
+                "profiled_rewards": [1, 1],
+                "profiled_output_lengths": [10, 10],
+            }
+            for _ in range(2)
+        ]
+        grpo_config = make_config(
+            default={"profiled_length_penalty_type": "zero_over_max"}
+        )["grpo"]
+        texts = [("12345", "12345"), ("123456", "12345")]
+        rollout_result = self.postprocess(rows, texts, grpo_config)
+        assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 0.0]
+        assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 1.0]
+
+    def test_all_generated_tokens_reads_gym_message_log(self):
+        # Each rollout generated 1 token (the tensor-valued assistant message
+        # the Gym path builds) but has 10 chars of text. Group 0's cap is 0, so
+        # it is zeroed; group 1's cap is 1, so it is kept, which measuring the
+        # text would not do.
+        rows = [
+            {
+                "agent_ref": {"name": AGENT},
+                "profiled_rewards": [1, 1],
+                "profiled_output_lengths": [cap, cap],
+            }
+            for cap in (0, 1)
+            for _ in range(2)
+        ]
+        grpo_config = make_config(
+            default={
+                "length_type": "all_generated_tokens",
+                "profiled_length_penalty_type": "zero_over_max",
+            }
+        )["grpo"]
+        texts = [("12345", "12345")] * 4
+        rollout_result = self.postprocess(rows, texts, grpo_config)
+        rewards = rollout_result.final_batch["total_reward"].tolist()
+        assert rewards == [0.0, 0.0, 1.0, 1.0]
+
+    def test_gym_row_without_profile_raises(self):
+        # The user's mistake end to end: profiled penalty on, but the gym rows
+        # nest the profile under extra_env_info instead of the top level.
+        rows = [
+            {
+                "agent_ref": {"name": AGENT},
+                "extra_env_info": {
+                    "profiled_rewards": [1, 1],
+                    "profiled_output_lengths": [10, 10],
+                },
+            }
+            for _ in range(2)
+        ]
+        grpo_config = make_config(
+            default={"profiled_length_penalty_type": "zero_over_max"}
+        )["grpo"]
+        texts = [("12345", "12345"), ("123456", "12345")]
+        with pytest.raises(ValueError, match="profiled_rewards=None"):
+            self.postprocess(rows, texts, grpo_config)
 
     def test_runs_after_reward_penalties(self):
         # The duplicated-reasoning penalty zeroes row 2 first, so it drops out
