@@ -31,6 +31,7 @@ from typing import Any, Dict, List, NotRequired, Optional, Protocol, Self, Typed
 import ray
 import torch
 from pydantic import BaseModel, Field, field_validator, model_validator
+from ray.exceptions import GetTimeoutError, RayTaskError
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -139,10 +140,6 @@ DEFAULT_SHARD_CPUS = 8
 # fewer usable nodes than the plan needs, which is worth reporting quickly.
 DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS = 180.0
 
-# Waiting for a shard to finish _spinup. Generous because a node that has never
-# run Gym builds every server's venv first; with venvs baked into the image
-# this is far shorter.
-DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS = 1800.0
 DEFAULT_SHARD_DRAIN_TIMEOUT_SECONDS = NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S
 
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
@@ -2237,7 +2234,6 @@ def build_nemo_gym_actors(
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
-    spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
     """Create and spin up every NeMo-Gym actor this job needs.
 
@@ -2245,7 +2241,9 @@ def build_nemo_gym_actors(
     ``shards`` it makes one actor per replica, each pinned by a STRICT_SPREAD
     placement group to a distinct node, each holding its own complete Gym
     stack. Actors are spun up concurrently, so the wall-clock cost is roughly
-    the slowest shard rather than the sum.
+    the slowest shard rather than the sum, and they share one startup budget,
+    ``ShardPlan.spinup_timeout`` (``env.nemo_gym.spinup_timeout``). The single
+    unsharded actor has no startup deadline.
 
     Args:
         tokenizer: Installed on every actor once it is up, rather than passed
@@ -2255,6 +2253,10 @@ def build_nemo_gym_actors(
         A :class:`NemoGymShardSet` whose actors are all running and validated.
 
     Raises:
+        ShardConfigError: The sharding config is malformed, or
+            ``spinup_timeout`` is shorter than a shard's
+            ``external_service_readiness.timeout_seconds``. Raised before any
+            bundle is placed.
         ShardSetupError: The bundles could not be placed, a shard failed to
             start, or the shards' entries did not pass the startup checks. Any
             actors already created are torn down first.
@@ -2285,8 +2287,36 @@ def build_nemo_gym_actors(
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
-        spinup_timeout=spinup_timeout,
     )
+
+
+def _check_spinup_timeout_covers_external_readiness(
+    merged_by_shard: Mapping[str, Mapping[str, Any]], spinup_timeout: float
+) -> None:
+    """Reject a startup budget that ends before the readiness gate can.
+
+    ``_spinup`` waits on ``external_service_readiness`` inside the shard
+    startup budget, after the local Gym servers are up. With a shorter budget
+    the shard fails with ``ShardSetupError`` partway through startup while the
+    gate would still have waited. Gym's own ``server_spinup_timeout_seconds``
+    bounds the server startup that comes first.
+    """
+    for shard_name, gym_dict in merged_by_shard.items():
+        readiness = gym_dict.get("external_service_readiness")
+        if readiness is None:
+            continue
+        readiness_timeout = ExternalServiceReadinessConfig.model_validate(
+            readiness
+        ).timeout_seconds
+        if spinup_timeout < readiness_timeout:
+            raise ShardConfigError(
+                f"env.nemo_gym.spinup_timeout is {spinup_timeout}s, shorter than "
+                f"the {readiness_timeout}s that shard '{shard_name}' may wait for "
+                f"external_service_readiness. Set env.nemo_gym.spinup_timeout to "
+                f"at least {readiness_timeout}s plus the time the shard's local "
+                f"Gym servers need to start, which Gym bounds with "
+                f"server_spinup_timeout_seconds."
+            )
 
 
 def _build_single_gym_actor(
@@ -2350,7 +2380,6 @@ def _build_sharded_gym_actors(
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
-    spinup_timeout: float,
 ) -> NemoGymShardSet:
     instances = _shard_instances(plan)
 
@@ -2380,6 +2409,9 @@ def _build_sharded_gym_actors(
         shard.name: apply_shard_overlay(base_gym_dict, plan, shard)
         for shard in plan.shards
     }
+    _check_spinup_timeout_covers_external_readiness(
+        merged_by_shard, plan.spinup_timeout
+    )
 
     # This may create a temporary all-node placement group while materializing
     # the actor venv. Finish it before the shard group reserves those CPUs.
@@ -2437,7 +2469,7 @@ def _build_sharded_gym_actors(
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)
 
-        _spinup_shards_concurrently(shard_set, spinup_timeout, tokenizer=tokenizer)
+        _spinup_shards_concurrently(shard_set, plan.spinup_timeout, tokenizer=tokenizer)
         shard_set.route_to_shard = _discover_route_shard_map(shard_set, plan)
     except BaseException:
         # A ray.get timeout does not cancel the actor-side work, so a
@@ -2496,6 +2528,26 @@ def _spinup_shards_concurrently(
                     )
                 except Exception:
                     pass
+            # GetTimeoutError is our own ray.get running out of budget. An error
+            # raised inside the actor arrives as a RayTaskError, which also
+            # subclasses its cause's type.
+            if isinstance(error, GetTimeoutError) and not isinstance(
+                error, RayTaskError
+            ):
+                raise ShardSetupError(
+                    f"NeMo-Gym shard '{shard_name}' (replica {replica}) failed to "
+                    f"start within the {spinup_timeout}s startup budget, which "
+                    f"also covers any external_service_readiness wait. Raise "
+                    f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
+                    f"the image so a cold node starts faster."
+                ) from error
+            # A TimeoutError raised inside _spinup, such as the
+            # external_service_readiness gate giving up; its message names the wait.
+            if isinstance(error, RayTaskError) and isinstance(error, TimeoutError):
+                raise ShardSetupError(
+                    f"NeMo-Gym shard '{shard_name}' (replica {replica}) timed out "
+                    f"while starting: {error}"
+                ) from error
             raise ShardSetupError(
                 f"NeMo-Gym shard '{shard_name}' (replica {replica}) failed to "
                 f"start. A reference to an entry that is not in this shard's "

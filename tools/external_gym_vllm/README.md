@@ -31,6 +31,14 @@ balancer's `/health` response must report `status: ok` and both
 count. The Gym actor applies one shared, bounded deadline across all pools and
 shuts down its local servers if that deadline expires.
 
+That deadline is the largest `POOL_STARTUP_TIMEOUT`. Sharded NeMo Gym jobs
+(`env.nemo_gym.shards`) also bound each shard's whole startup with
+`env.nemo_gym.spinup_timeout`, which defaults to 1800 seconds, and setup
+rejects a `spinup_timeout` shorter than the readiness deadline. For a sharded
+job, add `++env.nemo_gym.spinup_timeout=<seconds>` to `COMMAND`, with room for
+the local Gym servers to start before the readiness wait. Unsharded jobs must
+not set it.
+
 Recipe launchers keep their concrete model and serving settings outside these
 helpers. A launcher can add another service without adding another server body
 or lifecycle path to this wrapper.
