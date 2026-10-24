@@ -32,6 +32,7 @@ Supports per-agent filtering and parameter overrides via config.
 from __future__ import annotations
 
 import logging
+import math
 import statistics
 from typing import Any, Literal, Optional
 
@@ -61,7 +62,7 @@ class LengthPenaltyParams(BaseModel, extra="forbid"):
     """
 
     enabled: bool = True
-    length_type: Literal["tokens", "chars"] = "tokens"
+    length_type: Literal["tokens", "chars", "all_generated_tokens"] = "tokens"
     top_percentile: float = 0.5
     reasoning_bonus: float = 0.0
     answer_bonus: float = 0.0
@@ -79,8 +80,13 @@ class LengthPenaltyParams(BaseModel, extra="forbid"):
     total_zmad_threshold: float = 0.0
     total_zmad_penalty: float = 0.0
     profiled_length_penalty: float = 0.0
+    profiled_length_penalty_type: Literal["constant_over_n_std", "zero_over_max"] = (
+        "constant_over_n_std"
+    )
     profiled_length_n_std: float = 1.0
     profiled_length_min_samples: int = 2
+    profiled_reward_correct_threshold: float = 0.0
+    profiled_length_allow_non_binary_rewards: bool = False
     pass_rate_length_penalty_weight: float = 0.0
     profile_band_total: bool = False
     profile_band_reasoning: bool = False
@@ -89,6 +95,31 @@ class LengthPenaltyParams(BaseModel, extra="forbid"):
     group_length_penalty_profile_gate_channel: ProfileBandChannelName = "total"
     group_length_penalty_profile_gate_field: Literal["a", "b", "f"] = "a"
     group_length_penalty_profile_gate_positive_only: bool = True
+
+    @model_validator(mode="after")
+    def validate_profiled_length_penalty_type(self) -> "LengthPenaltyParams":
+        # zero_over_max sets the reward to 0, so a constant set next to it
+        # would be silently ignored.
+        if (
+            self.profiled_length_penalty_type == "zero_over_max"
+            and self.profiled_length_penalty != 0.0
+        ):
+            raise ValueError(
+                "profiled_length_penalty is the constant subtracted by "
+                "profiled_length_penalty_type: constant_over_n_std; "
+                "zero_over_max sets the reward to 0 instead, so leave "
+                f"profiled_length_penalty unset (got {self.profiled_length_penalty})"
+            )
+        if (
+            self.profiled_length_allow_non_binary_rewards
+            and self.profiled_length_penalty_type != "zero_over_max"
+        ):
+            raise ValueError(
+                "profiled_length_allow_non_binary_rewards only applies to "
+                "profiled_length_penalty_type: zero_over_max; every other length "
+                "penalty requires binary (0/1) rewards"
+            )
+        return self
 
 
 class ProfileBandChannel(BaseModel, extra="forbid"):
@@ -134,6 +165,42 @@ class LengthPenaltyConfig(BaseModel, extra="forbid"):
     default: LengthPenaltyParams = Field(default_factory=LengthPenaltyParams)
     agent_overrides: Optional[dict[str, Optional[LengthPenaltyParams]]] = None
     profile_band: Optional[ProfileBandConfig] = None
+
+    def resolved_defaults(self) -> dict[str, Any]:
+        """Return ``default`` as a dict, with global profile-band channels on.
+
+        Channels listed under ``profile_band.defaults`` are implicitly enabled,
+        unless ``default`` explicitly sets the channel flag, which always wins
+        (e.g. ``profile_band_total: false`` stays false).
+        """
+        defaults = self.default.model_dump()
+        for channel in _resolve_global_profile_band(self.profile_band):
+            if f"profile_band_{channel}" not in self.default.model_fields_set:
+                defaults[f"profile_band_{channel}"] = True
+        return defaults
+
+    @model_validator(mode="after")
+    def validate_all_generated_tokens(self) -> "LengthPenaltyConfig":
+        # Generated token ids carry no reasoning/answer split, so a setting
+        # that measures either alone would silently see length 0. Checked on
+        # each agent's merged params, where overrides and global bands meet.
+        defaults = self.resolved_defaults()
+        resolved = [("default", defaults)] + [
+            (agent, _resolve_agent_params(agent, self.agent_overrides, defaults))
+            for agent in self.agent_overrides or {}
+        ]
+        for name, params in resolved:
+            if not params["enabled"] or params["length_type"] != "all_generated_tokens":
+                continue
+            in_use = _split_length_settings_in_use(params)
+            if in_use:
+                raise ValueError(
+                    f"length_type all_generated_tokens ({name}) counts generated "
+                    "tokens with no reasoning/answer split, so it cannot drive "
+                    f"{in_use}. Use total-length settings only, or length_type "
+                    "tokens or chars."
+                )
+        return self
 
 
 # Length adjustments are defined for binary (0/1) single-reward env rewards
@@ -204,6 +271,51 @@ def _extract_reasoning_and_answer_text(result: dict[str, Any]) -> tuple[str, str
     return reasoning_text, answer_text
 
 
+def _generated_token_count(result: dict[str, Any]) -> int:
+    """Count every token the policy generated for one rollout.
+
+    The assistant messages of a Gym rollout's ``message_log`` hold exactly the
+    generated token ids of each turn (think tags, end-of-turn and tool-call
+    tokens included); prompt, chat-template and environment-observation tokens
+    are in its user messages.
+    """
+    return sum(
+        len(message["token_ids"])
+        for message in result["message_log"]
+        if message["role"] == "assistant"
+    )
+
+
+def _split_length_settings_in_use(params: dict[str, Any]) -> list[str]:
+    """Return the enabled settings that read reasoning or answer length alone."""
+    in_use = [
+        key
+        for key in (
+            "reasoning_bonus",
+            "answer_bonus",
+            "longest_reasoning_penalty",
+            "longest_answer_penalty",
+            "group_reasoning_length_penalty_coeff",
+            "group_answer_length_penalty_coeff",
+        )
+        if params[key] > 0
+    ]
+    for channel in ("reasoning", "answer"):
+        if (
+            params[f"{channel}_zmad_threshold"] > 0
+            and params[f"{channel}_zmad_penalty"] != 0
+        ):
+            in_use.append(f"{channel}_zmad_threshold")
+        if params[f"profile_band_{channel}"]:
+            in_use.append(f"profile_band_{channel}")
+    if (
+        params["group_length_penalty_profile_gate"]
+        and params["group_length_penalty_profile_gate_channel"] != "total"
+    ):
+        in_use.append("group_length_penalty_profile_gate_channel")
+    return in_use
+
+
 def apply_group_length_penalties(
     results: list[dict[str, Any]],
     length_penalty_config: LengthPenaltyConfig | dict[str, Any],
@@ -251,13 +363,7 @@ def apply_group_length_penalties(
         raise ValueError("group_size must be greater than zero")
 
     num_gens = group_size
-    defaults: dict[str, Any] = cfg.default.model_dump()
-    # Channels listed under length_penalty.profile_band.defaults are implicitly
-    # enabled — unless the user explicitly configured the channel flag, which
-    # always wins (e.g. profile_band_total: false stays false).
-    for _ch in global_band:
-        if f"profile_band_{_ch}" not in cfg.default.model_fields_set:
-            defaults[f"profile_band_{_ch}"] = True
+    defaults = cfg.resolved_defaults()
 
     n = len(results)
     original_rewards = [r["full_result"]["reward"] for r in results]
@@ -289,8 +395,9 @@ def apply_group_length_penalties(
     total_lengths = [0] * n
     groups_adjusted = 0
     group_gate_infos: dict[int, dict[str, Any]] = {}
-    # Rows whose group passed the binary-rewards check; all other rows are
-    # left completely untouched (no adjustment, no clamp, no reward writeback).
+    # Rows whose group passed the binary-rewards check. All other rows are
+    # left untouched (no adjustment, no clamp, no reward writeback), except
+    # the rollouts zero_over_max caps in a non-binary group it is allowed on.
     binary_ok = [False] * n
     skipped_non_binary_rows = 0
 
@@ -303,15 +410,36 @@ def apply_group_length_penalties(
             continue
         if not params.pop("enabled", True):
             continue
+        has_reward_components = any(
+            results[g + k]["full_result"].get("reward_components")
+            for k in range(group_size)
+        )
+        zero_over_max = params["profiled_length_penalty_type"] == "zero_over_max"
+        if zero_over_max and has_reward_components:
+            raise ValueError(
+                "profiled_length_penalty_type zero_over_max is on for agent "
+                f"{agent_name!r}, which produced multi-component rewards "
+                "(reward_components). zero_over_max does not support them: "
+                "zeroing the scalar alone would break reward == "
+                "sum(reward_components). Turn it off for this agent under "
+                "grpo.length_penalty.agent_overrides."
+            )
         # Length adjustments are defined for binary (0/1) single-reward env
         # rewards only: every algorithm and the phase-3 clamp assume it, and a
-        # multi-reward row must keep reward == sum(reward_components). Skip
-        # (and warn once per agent) on graded, negative, or component rewards.
-        if any(
-            not _is_binary_reward(original_rewards[g + k])
-            or results[g + k]["full_result"].get("reward_components")
-            for k in range(group_size)
-        ):
+        # multi-reward row must keep reward == sum(reward_components). The one
+        # exception is the zero_over_max cap with
+        # profiled_length_allow_non_binary_rewards, which caps any non-negative
+        # scalar reward (cap_only). Otherwise skip (and warn once per agent)
+        # on graded, negative, or component rewards.
+        is_binary = not has_reward_components and all(
+            _is_binary_reward(original_rewards[g + k]) for k in range(group_size)
+        )
+        cap_only = (
+            not is_binary
+            and zero_over_max
+            and params["profiled_length_allow_non_binary_rewards"]
+        )
+        if not is_binary and not cap_only:
             skipped_non_binary_rows += group_size
             if agent_name not in _NON_BINARY_WARNED_AGENTS:
                 _NON_BINARY_WARNED_AGENTS.add(agent_name)
@@ -322,18 +450,34 @@ def apply_group_length_penalties(
                     f"its prompt groups"
                 )
             continue
-        for k in range(group_size):
-            binary_ok[g + k] = True
+        if is_binary:
+            for k in range(group_size):
+                binary_ok[g + k] = True
         if any(results[g + k].get("low_effort_applied") for k in range(group_size)):
             continue
+        # The cap collapses every over-cap reward to 0, which would raise a
+        # negative one, so negative rewards are a hard error here.
+        if cap_only and any(original_rewards[g + k] < 0 for k in range(group_size)):
+            raise ValueError(
+                f"agent {agent_name!r} produced a negative reward "
+                f"({min(original_rewards[g : g + group_size])}), which "
+                "profiled_length_allow_non_binary_rewards does not support: "
+                "zero_over_max sets over-cap rewards to 0, which would raise a "
+                "negative one. Make the env reward non-negative, or turn the "
+                "option off for this agent."
+            )
 
-        group_lt = params.pop("length_type", "tokens")
-        use_tokens = group_lt == "tokens"
+        group_lt = params.pop("length_type")
 
         for k in range(group_size):
             idx = g + k
+            if group_lt == "all_generated_tokens":
+                # No reasoning/answer split exists here, so those stay 0; the
+                # config rejects settings that would read them.
+                total_lengths[idx] = _generated_token_count(results[idx])
+                continue
             r_text, a_text = texts[idx]
-            if use_tokens and tokenizer is not None:
+            if group_lt == "tokens" and tokenizer is not None:
                 reasoning_lengths[idx] = (
                     len(tokenizer.encode(r_text, add_special_tokens=False))
                     if r_text
@@ -347,11 +491,21 @@ def apply_group_length_penalties(
             else:
                 reasoning_lengths[idx] = len(r_text)
                 answer_lengths[idx] = len(a_text)
+            total_lengths[idx] = reasoning_lengths[idx] + answer_lengths[idx]
 
         group_reasoning = reasoning_lengths[g : g + num_gens]
         group_answer = answer_lengths[g : g + num_gens]
-        group_total = [r + a for r, a in zip(group_reasoning, group_answer)]
-        total_lengths[g : g + group_size] = group_total[:group_size]
+        group_total = total_lengths[g : g + num_gens]
+        if cap_only:
+            # Only the cap is defined for non-binary rewards; the other
+            # length penalties skip this group.
+            all_profiled_length_adj[g : g + group_size] = _profiled_length_adjustments(
+                row=results[g],
+                params=params,
+                agent_name=agent_name,
+                total_lengths=total_lengths[g : g + group_size],
+            )
+            continue
         group_rewards = original_rewards[g : g + num_gens]
         gate_info = _group_length_profile_gate_info(
             band=_merged_profile_band(results[g].get("profile_band"), global_band),
@@ -403,26 +557,12 @@ def apply_group_length_penalties(
         if any(a != 0.0 for a in adjustments):
             groups_adjusted += 1
 
-        # Profiled length penalty: penalize rollouts longer than mean + n_std of
-        # passing profiled lengths for this prompt. If fewer than min_samples
-        # profiled rollouts passed, the profiled model found the problem hard
-        # and its lengths carry no budget signal — apply no penalty at all.
-        plp = params.get("profiled_length_penalty", 0.0)
-        if plp > 0.0:
-            p_rewards = results[g].get("profiled_rewards")
-            p_lengths = results[g].get("profiled_output_lengths")
-            if p_rewards is not None and p_lengths is not None:
-                min_samples = int(params.get("profiled_length_min_samples", 2))
-                passing = [l for r, l in zip(p_rewards, p_lengths) if r > 0]
-                if len(passing) >= min_samples:
-                    mean_l = statistics.mean(passing)
-                    std_l = statistics.stdev(passing) if len(passing) >= 2 else 0.0
-                    n_std = float(params.get("profiled_length_n_std", 1.0))
-                    threshold = mean_l + n_std * std_l
-                    for k in range(group_size):
-                        idx = g + k
-                        if total_lengths[idx] >= threshold:
-                            all_profiled_length_adj[idx] = -plp
+        all_profiled_length_adj[g : g + group_size] = _profiled_length_adjustments(
+            row=results[g],
+            params=params,
+            agent_name=agent_name,
+            total_lengths=total_lengths[g : g + group_size],
+        )
 
         # Pass-rate-scaled length penalty (MAI): -w * rho_q * |y_i| / l_max on
         # correct rollouts, where rho_q is the group's pass rate. Easy prompts
@@ -497,7 +637,9 @@ def apply_group_length_penalties(
                 )
             else:
                 lt = params.get("length_type", "tokens")
-                unit = "tok" if lt == "tokens" else "chr"
+                unit = {"tokens": "tok", "chars": "chr", "all_generated_tokens": "gen"}[
+                    lt
+                ]
                 print(
                     f"\n  group {g // num_gens} agent={agent_name}"
                     f" length_type={unit}"
@@ -517,8 +659,10 @@ def apply_group_length_penalties(
                     f" total_zmad_threshold={params['total_zmad_threshold']}"
                     f" total_zmad_penalty={params['total_zmad_penalty']}"
                     f" profiled_length_penalty={params['profiled_length_penalty']}"
+                    f" profiled_length_penalty_type={params['profiled_length_penalty_type']}"
                     f" profiled_length_n_std={params['profiled_length_n_std']}"
-                    f" profiled_length_min_samples={params['profiled_length_min_samples']}",
+                    f" profiled_length_min_samples={params['profiled_length_min_samples']}"
+                    f" profiled_reward_correct_threshold={params['profiled_reward_correct_threshold']}",
                     flush=True,
                 )
                 gate = group_gate_infos.get(g)
@@ -535,8 +679,9 @@ def apply_group_length_penalties(
             for k in range(group_size):
                 idx = g + k
                 orig = original_rewards[idx]
-                profiled_adj = (
-                    all_profiled_length_adj[idx] if all_adjustments[idx] >= 0 else 0.0
+                profiled_adj = _stacked_profiled_adj(
+                    profiled_adj=all_profiled_length_adj[idx],
+                    group_adj=all_adjustments[idx],
                 )
                 final = max(
                     0.0,
@@ -570,22 +715,23 @@ def apply_group_length_penalties(
 
         print(f"{'=' * 70}\n", flush=True)
 
-    # Phase 3: apply additive adjustments (binary-verified rows only)
+    # Phase 3: apply additive adjustments (binary-verified rows, plus the
+    # rollouts zero_over_max capped in a non-binary group it is allowed on)
     additive_base_rewards = [0.0] * n
     for i, r in enumerate(results):
-        if not binary_ok[i]:
+        if not binary_ok[i] and all_profiled_length_adj[i] != -math.inf:
             continue
-        # The profiled-length penalty stacks only on rollouts whose group
-        # adjustments are non-negative: a rollout already penalized by the
-        # group-relative channels should not be double-penalized for the same
-        # excess length.
-        profiled_adj = all_profiled_length_adj[i] if all_adjustments[i] >= 0 else 0.0
+        profiled_adj = _stacked_profiled_adj(
+            profiled_adj=all_profiled_length_adj[i], group_adj=all_adjustments[i]
+        )
         additive_delta = all_adjustments[i] + profiled_adj + all_pass_rate_len_adj[i]
         additive_base_rewards[i] = original_rewards[i] + additive_delta
-        # Rewards here are binary, so any negative value is penalty-created.
+        # Rewards here are binary (or, for a capped non-binary row, checked
+        # non-negative), so any negative value is penalty-created.
         # Length penalties may wipe a reward out but never flip its sign; this
         # also keeps all-wrong groups variance-free (no gradient from a group
-        # with no correctness signal).
+        # with no correctness signal). A zero_over_max rollout (-inf) lands
+        # here at exactly 0, and phase 4 leaves a zero base alone.
         if additive_base_rewards[i] < 0:
             additive_base_rewards[i] = 0.0
         r["full_result"]["reward"] = additive_base_rewards[i]
@@ -618,7 +764,9 @@ def apply_group_length_penalties(
         "length_penalty/wiped_correct_frac": sum(
             1
             for i in range(n)
-            if binary_ok[i] and original_rewards[i] > 0 and final_rewards[i] <= 0.0
+            # Rows no phase wrote keep their reward, so this also counts the
+            # non-binary rollouts zero_over_max capped.
+            if original_rewards[i] > 0 and final_rewards[i] <= 0.0
         )
         / n,
         "length_penalty/adjusted_frac": sum(
@@ -627,6 +775,105 @@ def apply_group_length_penalties(
         / n,
         "length_penalty/skipped_non_binary_frac": skipped_non_binary_rows / n,
     }
+
+
+def _profiled_length_adjustments(
+    *,
+    row: dict[str, Any],
+    params: dict[str, Any],
+    agent_name: str,
+    total_lengths: list[int],
+) -> list[float]:
+    """Return one prompt group's per-rollout profiled-length adjustments.
+
+    Thresholds come from the passing profiled lengths for this prompt. If
+    fewer than ``profiled_length_min_samples`` profiled rollouts passed, the
+    profiled model found the problem hard and its lengths carry no budget
+    signal, so no profiled penalty applies at all.
+
+    Args:
+        row: The group's first result, which carries the prompt's profile.
+        params: The agent's resolved length-penalty parameters.
+        agent_name: The group's agent, for the error message.
+        total_lengths: Each rollout's total generated length.
+
+    Returns:
+        One adjustment per rollout: ``-profiled_length_penalty`` past the
+        ``constant_over_n_std`` threshold, ``-inf`` past the ``zero_over_max``
+        cap (the phase-3 clamp turns it into exactly 0), otherwise 0.
+
+    Raises:
+        ValueError: The penalty is on, but the row lacks equal-length
+            ``profiled_rewards`` and ``profiled_output_lengths`` lists.
+    """
+    adjustments = [0.0] * len(total_lengths)
+    plp = params["profiled_length_penalty"]
+    plp_type = params["profiled_length_penalty_type"]
+    if plp_type == "constant_over_n_std" and plp <= 0.0:
+        return adjustments
+    # A row missing these fields (forgotten, misspelled, or nested under
+    # extra_env_info) would otherwise silently skip the penalty.
+    p_rewards = row["profiled_rewards"]
+    p_lengths = row["profiled_output_lengths"]
+    if (
+        not isinstance(p_rewards, list)
+        or not isinstance(p_lengths, list)
+        or len(p_rewards) != len(p_lengths)
+    ):
+        raise ValueError(
+            f"profiled_length_penalty_type {plp_type} is on for agent "
+            f"{agent_name!r}, so each of its rows needs top-level "
+            "profiled_rewards and profiled_output_lengths lists of equal "
+            f"length; got profiled_rewards={p_rewards!r} and "
+            f"profiled_output_lengths={p_lengths!r}. Add them to the data, or "
+            "turn the profiled penalty off for this agent under "
+            "grpo.length_penalty.agent_overrides."
+        )
+    # A profiled rollout counts as correct (passing) when its reward is
+    # strictly above the threshold; the default 0 means r > 0.
+    correct_threshold = params["profiled_reward_correct_threshold"]
+    passing = [l for r, l in zip(p_rewards, p_lengths) if r > correct_threshold]
+    if not passing or len(passing) < params["profiled_length_min_samples"]:
+        return adjustments
+    if plp_type == "constant_over_n_std":
+        # Flat penalty at or past mean + n_std * std of the passing lengths.
+        mean_l = statistics.mean(passing)
+        std_l = statistics.stdev(passing) if len(passing) >= 2 else 0.0
+        threshold = mean_l + params["profiled_length_n_std"] * std_l
+        for k, length in enumerate(total_lengths):
+            if length >= threshold:
+                adjustments[k] = -plp
+    else:
+        # zero_over_max (Kimi-style cap): a rollout strictly longer than the
+        # longest passing profiled rollout loses its whole reward. The penalty
+        # is unbounded, so the phase-3 clamp floors the reward at exactly 0
+        # whatever bonus it also got.
+        max_passing = max(passing)
+        for k, length in enumerate(total_lengths):
+            if length > max_passing:
+                adjustments[k] = -math.inf
+    return adjustments
+
+
+def _stacked_profiled_adj(*, profiled_adj: float, group_adj: float) -> float:
+    """Return the part of a rollout's profiled-length penalty that applies.
+
+    The ``constant_over_n_std`` penalty stacks only on rollouts whose group
+    adjustments are non-negative: a rollout already penalized by the
+    group-relative channels is not double-penalized for the same excess
+    length. The ``zero_over_max`` penalty (``-inf``) always applies, so a
+    capped rollout's reward is clamped to exactly 0.
+
+    Args:
+        profiled_adj: The rollout's profiled-length adjustment from phase 1.
+        group_adj: The rollout's summed group-relative adjustments.
+
+    Returns:
+        The profiled-length adjustment to add to the rollout's reward.
+    """
+    if group_adj < 0 and profiled_adj != -math.inf:
+        return 0.0
+    return profiled_adj
 
 
 def _resolve_global_profile_band(

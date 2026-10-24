@@ -33,6 +33,11 @@ through untouched — and a warning is logged once per agent. An agent disabled 
 `agent_overrides` with `enabled: false` is skipped before this check, so a deliberately graded
 agent (e.g. a genrm judge) produces no warning.
 
+The one exception is the `zero_over_max` profiled cap: with
+`profiled_length_allow_non_binary_rewards: true` it also caps groups with graded (non-negative)
+scalar rewards instead of skipping them, and a negative reward or `reward_components` is an error
+rather than a skip. See [Profiled Length Penalty](#5-profiled-length-penalty).
+
 Consequences of binariness worth knowing:
 
 - The adjusted reward is clamped at 0, so penalties can wipe a correct rollout's reward out but
@@ -67,8 +72,11 @@ grpo:
       total_zmad_threshold: 0.0
       total_zmad_penalty: 0.0
       profiled_length_penalty: 0.0
+      profiled_length_penalty_type: constant_over_n_std
       profiled_length_n_std: 1.0
       profiled_length_min_samples: 2
+      profiled_reward_correct_threshold: 0.0
+      profiled_length_allow_non_binary_rewards: false
       profile_band_total: false
       profile_band_reasoning: false
       profile_band_answer: false
@@ -88,12 +96,27 @@ grpo:
 
 `length_type` may be:
 
-- `tokens`: lengths are tokenizer token counts.
-- `chars`: lengths are character counts.
+- `tokens`: lengths are tokenizer token counts of the reasoning and answer text, re-tokenized
+  without special tokens.
+- `chars`: lengths are character counts of the reasoning and answer text.
+- `all_generated_tokens`: the total length is every token the policy generated, read from the
+  assistant messages of the rollout's `message_log` with no re-tokenizing. It covers all
+  assistant turns, including think tags, end-of-turn and tool-call tokens, and is the length the
+  reasoning pipelines' Kimi penalty uses.
 
-Lengths count the model's own output only: `reasoning` items and `message` items with role
-`assistant` (or no role). Environment observations that some agents append to the response as
-`user`-role messages are ignored.
+With `tokens` and `chars`, lengths count the model's own output only: `reasoning` items and
+`message` items with role `assistant` (or no role). Environment observations that some agents
+append to the response as `user`-role messages are ignored, and so are tool-call items.
+`all_generated_tokens` also excludes prompt, chat-template and environment-observation tokens,
+which sit in the user messages of `message_log`.
+
+Generated token ids carry no reasoning/answer split, so `all_generated_tokens` measures total
+length only. Settings that read the reasoning or answer length on its own are rejected at config
+load under it, for `default` and for each agent's merged `agent_overrides`: `reasoning_bonus`,
+`answer_bonus`, `longest_reasoning_penalty`, `longest_answer_penalty`,
+`group_reasoning_length_penalty_coeff`, `group_answer_length_penalty_coeff`, the reasoning and
+answer zMAD penalties, `profile_band_reasoning` / `profile_band_answer` (including channels
+turned on by global `profile_band.defaults`), and a `reasoning` or `answer` profile gate channel.
 
 `agent_overrides` can override any supported parameter per agent; only the keys set under an
 agent replace the `default` value, everything else is inherited. If an agent is missing from
@@ -122,7 +145,7 @@ grpo:
 | `default` | Default length-adjustment config used for agents without an override. |
 | `agent_overrides` | Per-agent config overrides keyed by agent name. |
 | `enabled` | Enables length adjustment for this config block. |
-| `length_type` | Selects length unit: `tokens` (tokenizer counts) or `chars` (character counts). |
+| `length_type` | Selects length unit: `tokens` (re-tokenized text), `chars` (character counts), or `all_generated_tokens` (every generated token, total length only). |
 | `top_percentile` | Fraction of positive scorers treated as top scorers for longest-penalty selection. |
 | `reasoning_bonus` | Flat bonus for the shortest positive/top-scoring reasoning trace in a prompt group. |
 | `answer_bonus` | Flat bonus for the shortest positive/top-scoring answer in a prompt group. |
@@ -139,9 +162,12 @@ grpo:
 | `answer_zmad_penalty` | Flat penalty applied to answer lengths above the zMAD threshold. |
 | `total_zmad_threshold` | Modified-Z threshold for flagging long total-length outliers. |
 | `total_zmad_penalty` | Flat penalty applied to total lengths above the zMAD threshold. |
-| `profiled_length_penalty` | Flat penalty for rollouts longer than a per-prompt profiled-length threshold. |
-| `profiled_length_n_std` | Number of standard deviations used in `mean + n_std * std` for profiled-length thresholding. |
-| `profiled_length_min_samples` | Minimum PASSING profiled rollouts required; below this no profiled penalty is applied. |
+| `profiled_length_penalty` | Constant subtracted from rollouts past the `constant_over_n_std` threshold; 0 disables that type. |
+| `profiled_length_penalty_type` | Profiled-length algorithm: `constant_over_n_std` (default) subtracts `profiled_length_penalty` at or past `mean + n_std * std`; `zero_over_max` sets the reward to exactly 0 past the longest passing profiled length. |
+| `profiled_length_n_std` | Number of standard deviations used in `mean + n_std * std` (`constant_over_n_std` only). |
+| `profiled_length_min_samples` | Minimum PASSING profiled rollouts required; below this no profiled penalty of either type is applied. |
+| `profiled_reward_correct_threshold` | A profiled rollout is PASSING (correct) when its `profiled_rewards` entry is strictly greater than this; default `0.0` (i.e. `r > 0`). |
+| `profiled_length_allow_non_binary_rewards` | `zero_over_max` only: also cap groups with graded (non-negative) scalar rewards instead of skipping them; a negative reward then raises. Default `false`. |
 | `pass_rate_length_penalty_weight` | Weight of the pass-rate-scaled (MAI-style) dense length penalty; 0 disables. |
 | `profile_band_total` | Enables per-prompt `{a,b,f}` multiplier on total length for correct rollouts. |
 | `profile_band_reasoning` | Enables per-prompt `{a,b,f}` multiplier on reasoning length for correct rollouts. |
@@ -157,8 +183,9 @@ Some algorithms depend on per-prompt metadata stored on each training-data row. 
 each NeMo-Gym JSONL row as `extra_env_info`, and the rollout code reads these fields from the
 row's **top level** (next to `responses_create_params` and `agent_ref`), then copies them onto
 each rollout result before applying length adjustments. Do not nest them under an
-`extra_env_info` key: nested fields are never read, so per-row profiled-length and profile-band
-adjustments are silently skipped and a profile gate without a global band stays closed.
+`extra_env_info` key: nested fields are never read. A row whose agent has the profiled length
+penalty on then fails the rollout with a `ValueError` (see below), while profile-band adjustments
+are silently skipped and a profile gate without a global band stays closed.
 
 ```json
 {
@@ -177,9 +204,10 @@ adjustments are silently skipped and a profile gate without a global band stays 
 
 Field usage:
 
-- `profiled_rewards`: used by `profiled_length_penalty` to identify passing profiled rollouts.
-- `profiled_output_lengths`: used by `profiled_length_penalty` to compute
-  `mean + n_std * std`.
+- `profiled_rewards`: used by the profiled length penalty to identify passing profiled rollouts
+  (`reward > profiled_reward_correct_threshold`).
+- `profiled_output_lengths`: used by the profiled length penalty to compute `mean + n_std * std`
+  (`constant_over_n_std`) or the longest passing length (`zero_over_max`).
 - `profile_band.total`: used by `profile_band_total` and by profile-gated group-relative
   penalties when `group_length_penalty_profile_gate_channel: total`.
 - `profile_band.reasoning`: used by `profile_band_reasoning` and by profile-gated
@@ -343,42 +371,110 @@ grpo:
       total_zmad_penalty: 0.1
 ```
 
-### 5. Profiled Length Threshold Penalty
+### 5. Profiled Length Penalty
 
 Config keys:
 
+- `profiled_length_penalty_type`
 - `profiled_length_penalty`
 - `profiled_length_n_std`
 - `profiled_length_min_samples`
+- `profiled_reward_correct_threshold`
 
 This uses per-prompt profiling metadata:
 
 - `profiled_rewards`
 - `profiled_output_lengths`
 
+`profiled_length_penalty_type` picks how a rollout is penalized for running past what the
+profiled model needed:
+
+| Type | Threshold | Rollouts hit | Effect | Turned on by |
+| --- | --- | --- | --- | --- |
+| `constant_over_n_std` (default) | `mean + n_std * std` of passing lengths | length `>=` threshold | subtract `profiled_length_penalty` | `profiled_length_penalty > 0` |
+| `zero_over_max` (Kimi-style) | `max` of passing lengths | length `>` threshold | reward set to exactly `0.0` | selecting the type |
+
 For each prompt group:
 
-1. Select profiled lengths from passing rollouts (`profiled_rewards > 0`) only.
-2. If there are fewer than `profiled_length_min_samples` passing rollouts, apply **no penalty**
-   for this prompt. A profile that mostly failed carries no signal about the right thinking
-   budget — the problem may simply need more than the profiled model had.
-3. Otherwise compute:
+1. Select profiled lengths from passing rollouts only: those whose `profiled_rewards` entry is
+   strictly greater than `profiled_reward_correct_threshold` (default `0.0`, i.e. `> 0`). Raise
+   the threshold when the profiling rewards are graded, e.g. `0.5` to count only rollouts scored
+   above 0.5. The threshold also decides the count that `profiled_length_min_samples` checks.
+2. If there are fewer than `profiled_length_min_samples` passing rollouts (or none at all), apply
+   **no penalty** for this prompt. A profile that mostly failed carries no signal about the right
+   thinking budget — the problem may simply need more than the profiled model had.
+3. Otherwise compute the threshold for the selected type:
 
    ```text
-   threshold = mean(profiled_lengths) + profiled_length_n_std * std(profiled_lengths)
+   constant_over_n_std:  threshold = mean(profiled_lengths) + profiled_length_n_std * std(profiled_lengths)
+   zero_over_max:        threshold = max(profiled_lengths)
    ```
 
-4. Penalize rollouts whose total generated length is greater than or equal to the threshold.
+4. `constant_over_n_std` subtracts `profiled_length_penalty` from rollouts whose total generated
+   length is greater than or equal to the threshold. `zero_over_max` sets the reward to `0.0` for
+   rollouts whose total generated length is strictly greater than the threshold: a rollout exactly
+   as long as the longest passing profiled rollout keeps its reward.
 
-Example:
+`zero_over_max` subtracts the whole reward (an unbounded penalty that the 0-clamp floors at exactly
+`0.0`), so a capped rollout ends at exactly `0.0` whatever bonus or group-relative adjustment it
+received, and profile-band multipliers leave it there. Unlike `constant_over_n_std`, which is not
+stacked on a rollout the group-relative channels already penalized, it always applies.
+
+Non-binary rewards and `zero_over_max`:
+
+| Env rewards in the group | `profiled_length_allow_non_binary_rewards: false` (default) | `true` |
+| --- | --- | --- |
+| binary (0/1) | over-cap rollouts set to `0.0` | over-cap rollouts set to `0.0` |
+| graded, all `>= 0` (e.g. `0.5`, `2.0`) | group skipped, warning once per agent | over-cap rollouts set to `0.0`; the other length penalties still skip the group |
+| any negative | group skipped, warning once per agent | `ValueError`: setting an over-cap negative reward to 0 would raise it, so negatives are not supported |
+| any `reward_components` | `ValueError` | `ValueError` |
+
+The negative-reward error fires for any negative reward in the group, not only an over-cap one, so
+whether a run fails does not depend on rollout lengths. Multi-component rewards are always an error
+with `zero_over_max`, because zeroing the scalar alone would break
+`reward == sum(reward_components)`; turn the cap off for such agents under `agent_overrides`.
+Low-effort groups are skipped before either check, as for every other length penalty.
+`profiled_length_allow_non_binary_rewards` is rejected at config load unless the type is
+`zero_over_max`, since every other length penalty requires binary rewards.
+
+`zero_over_max` ignores `profiled_length_penalty` and `profiled_length_n_std`. Setting a nonzero
+`profiled_length_penalty` in the same block as `profiled_length_penalty_type: zero_over_max` is
+rejected when the config is loaded.
+
+While either type is on for an agent, every row of that agent must carry `profiled_rewards` and
+`profiled_output_lengths` as top-level lists of equal length. A row that lacks them (forgotten,
+misspelled, or nested under `extra_env_info`) or carries something else fails the rollout with a
+`ValueError` naming the agent, rather than silently training without the penalty. On the legacy
+and data-plane drivers this stops the run; the async collector counts it as a batch-worker failure
+and aborts once failures exceed `max_generation_failures`. For mixed data where some agents have
+no profiles, turn the profiled penalty off for those agents under `agent_overrides` (for example
+`profiled_length_penalty_type: constant_over_n_std` with `profiled_length_penalty` left at 0, or
+`enabled: false`).
+
+`profiled_output_lengths` should be in the same unit as `length_type`. If they record the
+profiled responses' generated token counts, use `length_type: all_generated_tokens`; then
+`zero_over_max` measures length exactly like the reasoning pipelines' Kimi penalty. If they
+record re-tokenized text, use `length_type: tokens`.
+
+Examples:
 
 ```yaml
 grpo:
   length_penalty:
     default:
       enabled: true
+      profiled_length_penalty_type: constant_over_n_std
       profiled_length_penalty: 0.1
       profiled_length_n_std: 1.0
+      profiled_length_min_samples: 2
+```
+
+```yaml
+grpo:
+  length_penalty:
+    default:
+      enabled: true
+      profiled_length_penalty_type: zero_over_max
       profiled_length_min_samples: 2
 ```
 
@@ -602,9 +698,13 @@ fractions.
 - Most length algorithms act only on positive rollouts (`reward > 0`).
 - Additive penalties can wipe a rollout's reward out but never flip its sign: the adjusted
   reward is clamped at 0 (stacked flat penalties exceeding the reward produce 0, not a negative
-  value). Non-binary rewards never reach the clamp — their groups are skipped wholesale (see
-  Binary Rewards Requirement).
+  value). Non-binary rewards reach the clamp only through the `zero_over_max` cap with
+  `profiled_length_allow_non_binary_rewards`, which rejects negative rewards; otherwise their
+  groups are skipped wholesale (see Binary Rewards Requirement).
 - `profile_band_*` multipliers also apply only to originally correct rollouts.
+- `profiled_length_penalty_type: zero_over_max` is the one adjustment that overrides all
+  others: a capped rollout's reward is exactly 0. Capped correct rollouts show up in
+  `length_penalty/wiped_correct_frac`.
 - Group-relative scaling can reduce average length aggressively because it gives dense per-group
   pressure.
 - zMAD is more selective: it only hits high-side outliers.
