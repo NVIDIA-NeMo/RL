@@ -230,7 +230,7 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     zero_copy_max_bytes: int = 33554432
     parallel_copy_min_bytes: int = 16777216
     # read_pin_s must be >= transfer_timeout_s + lease_margin_s (checked at
-    # start): a region freed under a hinted READ is reused after read_pin_s.
+    # start): a read pins its blobs for read_pin_s.
     # None: exactly that sum, so raising the transfer timeout raises the pin.
     read_pin_s: float | None = None
     transfer_timeout_s: float = 120.0
