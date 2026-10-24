@@ -779,6 +779,33 @@ def test_private_ray_and_vllm_ports_match_sub_ephemeral_layout():
     assert '--port "${VLLM_HTTP_PORT}"' in source
 
 
+def test_replica_head_ip_skips_link_local_addresses():
+    source = (REPO_ROOT / "tools/external_gym_vllm/run_in_allocation.sh").read_text()
+    assert "HEAD_IP=$(head_node_ip)" in source
+    function = source[source.index("head_node_ip() {") :]
+    function = function[: function.index("\n}\n") + 3]
+
+    def head_ip(getent_ip, hostname_ips):
+        stubs = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            hostname() {{ if [[ "${{1:-}}" == -I ]]; then echo "{hostname_ips}"; else echo node1; fi; }}
+            getent() {{ [[ -n "{getent_ip}" ]] && echo "{getent_ip} STREAM $2"; }}
+            """
+        )
+        result = subprocess.run(
+            ["bash", "-c", stubs + function + "head_node_ip\n"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    assert head_ip("10.0.0.7", "169.254.3.1 10.0.0.5") == "10.0.0.7"
+    assert head_ip("169.254.9.9", "169.254.3.1 fe80::1 10.0.0.5") == "10.0.0.5"
+    assert head_ip("", "169.254.3.1") == ""
+
+
 def test_pool_config_interface_registers_an_arbitrary_third_pool():
     script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
     program = textwrap.dedent(

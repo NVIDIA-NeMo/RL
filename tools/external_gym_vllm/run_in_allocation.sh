@@ -561,6 +561,17 @@ MIN_WORKER_PORT=2000
 MAX_WORKER_PORT=2999
 VLLM_ENGINE_PORT=7000
 
+# getent first: hostname -I lists addresses in no fixed order and can put a
+# link-local 169.254.x first, which no other node can reach.
+head_node_ip() {
+  local ip
+  ip=$(getent ahostsv4 "$(hostname)" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+  if [[ -z "${ip}" || "${ip}" == 169.254.* ]]; then
+    ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9.]+$/ && !/^169\.254\./ { print; exit }' || true)
+  fi
+  printf '%s' "${ip}"
+}
+
 cleanup_replica() {
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     registry_remove "${REPLICA_ID}" || true
@@ -572,12 +583,9 @@ trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
 
 if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   rm -f "${HEAD_IP_FILE}"
-  HEAD_IP=$(hostname -I | awk '{ print $1 }')
+  HEAD_IP=$(head_node_ip)
   if [[ -z "${HEAD_IP}" ]]; then
-    HEAD_IP=$(getent ahostsv4 "$(hostname)" | awk 'NR == 1 { print $1 }')
-  fi
-  if [[ -z "${HEAD_IP}" ]]; then
-    echo "[${REPLICA_ID}] ERROR: could not determine the head-node IP" >&2
+    echo "[${REPLICA_ID}] ERROR: could not determine a routable head-node IP" >&2
     exit 1
   fi
 
