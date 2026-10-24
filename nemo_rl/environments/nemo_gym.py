@@ -515,6 +515,9 @@ def _mask_undrained_receipt(receipt: dict) -> dict:
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
+# Standard OTel channel. Named here rather than imported from nemo-lens so the
+# constant is available whether or not telemetry is installed.
+_OTEL_RESOURCE_ATTRIBUTES_ENV = "OTEL_RESOURCE_ATTRIBUTES"
 
 
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
@@ -829,6 +832,63 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
                     raise
 
 
+# Resource attributes a Gym server must determine for itself. Everything else
+# this actor exports describes the job and is equally true of its servers, so it
+# is forwarded to them. ``nv.dl.rank`` is withheld deliberately: nemo-lens
+# derives ``service.instance.id`` from it as ``<run id>-rank<rank>``, so handing
+# every Gym server this actor's rank would collapse a hundred-odd processes onto
+# one instance id. Without a rank the SDK assigns each its own uuid instead,
+# which costs ``identity_valid`` on the Gym rows until Gym publishes a
+# per-server rank and instance id of its own.
+_GYM_PER_PROCESS_RESOURCE_KEYS = frozenset(
+    {
+        "service.name",
+        "service.instance.id",
+        "nv.dl.rank",
+        "nv.dl.world_size",
+        "process.pid",
+    }
+)
+
+
+def _publish_gym_resource_identity() -> None:
+    """Forward this actor's job identity to Gym's servers through the environment.
+
+    Gym builds its servers' resource from ``nemo.gym.*`` and little else, so
+    without this their spans carry no campaign stage, no slurm ids and no run id
+    -- and a pipeline keyed on ``nv.dl.campaign.stage`` drops them on the floor
+    while the actor's own spans sail through.
+
+    ``OTEL_RESOURCE_ATTRIBUTES`` is the channel because it is the only one that
+    survives a spawn, and because nemo-lens resolves caller attributes over
+    environment ones: a Gym server still wins on the few keys it sets itself.
+    Composed with ``defaults=`` so a launcher that already published an
+    attribute keeps its value.
+
+    Silent when nemo-lens is absent or no provider carries a resource; losing
+    the Gym half of a trace is not a reason to fail a rollout.
+    """
+    try:
+        from nemo.lens.resources.attributes import extend_otel_resource_attributes
+        from opentelemetry import trace as otel_trace
+    except ImportError:
+        return
+
+    resource = getattr(otel_trace.get_tracer_provider(), "resource", None)
+    if resource is None:
+        return
+    forwarded = {
+        key: str(value)
+        for key, value in resource.attributes.items()
+        if key not in _GYM_PER_PROCESS_RESOURCE_KEYS
+    }
+    if not forwarded:
+        return
+    os.environ[_OTEL_RESOURCE_ATTRIBUTES_ENV] = extend_otel_resource_attributes(
+        os.environ.get(_OTEL_RESOURCE_ATTRIBUTES_ENV), defaults=forwarded
+    )
+
+
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
 # permanently broken: _require_spinup() rejects every later rollout call, and
@@ -996,6 +1056,7 @@ class NemoGym(EnvironmentInterface):
                 TELEMETRY_KEY_NAME,
                 {"enabled": True, **(self.cfg.get("telemetry") or {})},
             )
+            _publish_gym_resource_identity()
 
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
