@@ -120,6 +120,55 @@ def maybe_configure_data_plane_env(cfg: DataPlaneConfig | None) -> None:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
 
+def declared_packed_fields(cfg: DataPlaneRuntimeConfig | None) -> list[str]:
+    """Return the sorted unique custom packed-input names, or an empty list.
+
+    Args:
+        cfg: Data-plane config. Typed local configs cannot declare custom fields.
+
+    Raises:
+        ValueError: The declaration is not a list of identifiers, or a typed
+            local config contains the declaration key.
+    """
+    if cfg is None:
+        return []
+    if isinstance(cfg, LocalDataPlaneConfig):
+        if "packed_multimodal_fields" in (cfg.model_extra or {}):
+            raise ValueError(
+                "LocalDataPlaneConfig does not support packed_multimodal_fields"
+            )
+        return []
+    names = cfg.get("packed_multimodal_fields")
+    if names is None:
+        return []
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or not name.isidentifier() for name in names
+    ):
+        raise ValueError("packed_multimodal_fields must be a list of model-input names")
+    return sorted(set(names))
+
+
+def configure_multimodal_fields(cfg: DataPlaneRuntimeConfig | None) -> None:
+    """Apply the packed-field declaration in each data-plane participant.
+
+    Args:
+        cfg: Data-plane config whose ``packed_multimodal_fields`` declares the
+            custom packed inputs. ``None`` is a no-op; a ``LocalDataPlaneConfig``
+            declares none and rejects the key.
+
+    Raises:
+        ValueError: The declaration is invalid or differs from the one already
+            registered in this process.
+    """
+    if cfg is None:
+        return
+    # Lazy: the native codec imports this package during data initialization.
+    from nemo_rl.data.multimodal_utils import register_packed_multimodal_fields
+
+    names = declared_packed_fields(cfg)
+    register_packed_multimodal_fields(names)
+
+
 def build_data_plane_client(
     cfg: DataPlaneRuntimeConfig | None,
     *,
@@ -174,47 +223,52 @@ def build_data_plane_client(
             "(which never engages the data plane) for that case."
         )
 
-    impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
-    if impl == "transfer_queue":
-        from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
+    # Lazy: the native codec imports this package during data initialization.
+    from nemo_rl.data.multimodal_utils import packed_multimodal_field_registration
 
-        assert not isinstance(cfg, LocalDataPlaneConfig)
-        client: DataPlaneClient = TQDataPlaneClient(
-            cfg,
-            bootstrap=bootstrap,
-            checkpointing=checkpointing,
-            segment_size=segment_size,
-            storage_unit_node_ids=storage_unit_node_ids,
-        )
-    elif impl == "local":
-        from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+    names = declared_packed_fields(cfg)
+    with packed_multimodal_field_registration(names):
+        impl = cfg.impl if isinstance(cfg, LocalDataPlaneConfig) else cfg["impl"]
+        if impl == "transfer_queue":
+            from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
-        local_cfg = (
-            cfg
+            assert not isinstance(cfg, LocalDataPlaneConfig)
+            client: DataPlaneClient = TQDataPlaneClient(
+                cfg,
+                bootstrap=bootstrap,
+                checkpointing=checkpointing,
+                segment_size=segment_size,
+                storage_unit_node_ids=storage_unit_node_ids,
+            )
+        elif impl == "local":
+            from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+
+            local_cfg = (
+                cfg
+                if isinstance(cfg, LocalDataPlaneConfig)
+                else LocalDataPlaneConfig.model_validate(cfg)
+            )
+            client = LocalDataPlaneClient(local_cfg)
+        else:
+            raise ValueError(f"unknown data_plane impl: {impl!r}")
+
+        obs = (
+            cfg.observability
             if isinstance(cfg, LocalDataPlaneConfig)
-            else LocalDataPlaneConfig.model_validate(cfg)
-        )
-        client = LocalDataPlaneClient(local_cfg)
-    else:
-        raise ValueError(f"unknown data_plane impl: {impl!r}")
+            else cfg.get("observability")
+        ) or {}
+        obs_enabled = obs.get("enabled", False)
+        # Telemetry alone installs the wrapper, for its spans.
+        if obs_enabled or telemetry_enabled_in_env():
+            from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
-    obs = (
-        cfg.observability
-        if isinstance(cfg, LocalDataPlaneConfig)
-        else cfg.get("observability")
-    ) or {}
-    obs_enabled = obs.get("enabled", False)
-    # Telemetry alone installs the wrapper, for its spans.
-    if obs_enabled or telemetry_enabled_in_env():
-        from nemo_rl.data_plane.observability import MetricsDataPlaneClient
-
-        # Callback and hash check are observability features; off for
-        # telemetry-only runs.
-        # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
-        client = MetricsDataPlaneClient(
-            client,  # type: ignore[bad-argument-type]
-            on_event=obs.get("callback") if obs_enabled else None,  # type: ignore[bad-argument-type]
-            verify_tensor_hash=obs_enabled and bool(obs.get("verify_tensor_hash")),
-            observability_enabled=obs_enabled,
-        )
-    return client
+            # Callback and hash check are observability features; off for
+            # telemetry-only runs.
+            # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
+            client = MetricsDataPlaneClient(
+                client,  # type: ignore[bad-argument-type]
+                on_event=obs.get("callback") if obs_enabled else None,  # type: ignore[bad-argument-type]
+                verify_tensor_hash=obs_enabled and bool(obs.get("verify_tensor_hash")),
+                observability_enabled=obs_enabled,
+            )
+        return client

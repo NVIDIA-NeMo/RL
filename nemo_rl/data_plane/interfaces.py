@@ -226,6 +226,10 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     simple: NotRequired[SimpleStorageConfig]
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
+    # Additional model inputs using PackedTensor and row-shape tags. Optional;
+    # absent means no custom fields. Names cannot collide with native media,
+    # trainer, forward, packing, or router fields. One declaration per process.
+    packed_multimodal_fields: NotRequired[list[str]]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]

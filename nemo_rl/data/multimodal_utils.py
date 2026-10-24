@@ -18,10 +18,12 @@ import logging
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Optional, Union
 from urllib.parse import unquote
 
@@ -140,7 +142,9 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
 
 # Packed per-sample: jagged. ``PackedTensor`` in-memory; a single
 # ``torch.nested`` value on the wire, whose rows carry their own shapes.
-PACKED_MULTIMODAL_FIELDS = frozenset(
+# Mutable: ``register_packed_multimodal_fields`` adds declared custom fields in
+# place, so import the set itself and never keep a derived copy.
+PACKED_MULTIMODAL_FIELDS = set(
     {
         "pixel_values",
         "pixel_values_videos",
@@ -185,8 +189,149 @@ ROW_GEOMETRY_PREPROCESS_KWARGS = "preprocess_kwargs"
 # *and* train) must ship so the trainer's forward matches the rollout. One wire
 # field per logical field: ``PACKED`` fields travel as a single nested tensor
 # whose rows carry their own shapes, and per-token fields are rectangular and
-# travel as plain tensors.
-WIRE_MULTIMODAL_FIELDS = PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS
+# travel as plain tensors. Mutated in place like ``PACKED_MULTIMODAL_FIELDS``.
+WIRE_MULTIMODAL_FIELDS = set(PER_TOKEN_MULTIMODAL_FIELDS | PACKED_MULTIMODAL_FIELDS)
+
+
+# Classification is shared by codecs and imported include-lists in this process.
+# One immutable declaration keeps all clients and native columns consistent.
+G_CUSTOM_PACKED_FIELDS: frozenset[str] | None = None
+G_PACKED_FIELDS_LOCK = RLock()
+
+
+def register_packed_multimodal_fields(names: list[str] | None) -> None:
+    """Declare one immutable set of custom packed inputs for this process.
+
+    Repeating the same declaration is allowed. A different declaration,
+    including omitting a previously supplied one, raises before data-plane I/O.
+    Native fields and trainer/model/packing metadata names cannot be reclassified.
+
+    Args:
+        names: Custom packed model-input names, or ``None`` for no custom fields.
+
+    Raises:
+        ValueError: ``names`` is not a list of identifiers, contains a reserved or
+            native name or the ``__row_shapes`` suffix, or differs from the
+            declaration already registered in this process.
+    """
+    # Lazy to avoid the data/data_plane package initialization cycle.
+    from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
+    from nemo_rl.data_plane.schema import (
+        GROUP_ID_TAG,
+        META_IDX,
+        PER_TOKEN_STAGING_FIELDS,
+        ROUTED_EXPERTS_ENCODING_FIELD,
+        ROUTED_EXPERTS_FIELD,
+        ROUTED_EXTRAS_METADATA_FIELD,
+        ROUTED_LEN_FIELD,
+        SC_ROLLOUT_SCHEMA_FIELDS,
+    )
+
+    global G_CUSTOM_PACKED_FIELDS
+    if names is not None and (
+        not isinstance(names, list)
+        or any(not isinstance(name, str) or not name.isidentifier() for name in names)
+    ):
+        raise ValueError("packed_multimodal_fields must be a list of model-input names")
+    declaration = frozenset(names or ())
+    reserved = {
+        *SC_ROLLOUT_SCHEMA_FIELDS,
+        *TOKEN_ALIGNED_FIELDS,
+        *PER_TOKEN_STAGING_FIELDS,
+        *PER_TOKEN_MULTIMODAL_FIELDS,
+        *VLLM_PROMPT_KEYS,
+        ROUTED_EXPERTS_FIELD,
+        ROUTED_LEN_FIELD,
+        ROUTED_EXPERTS_ENCODING_FIELD,
+        ROUTED_EXTRAS_METADATA_FIELD,
+        META_IDX,
+        GROUP_ID_TAG,
+        "token_ids",
+        "loss_multiplier",
+        "teacher_topk_logits",
+        "teacher_topk_indices",
+        "mtp_loss_mask",
+        "prompt_idx",
+        "weight_version",
+        "multimodal_row_tags",
+        "position_ids",
+        "attention_mask",
+        "attention_bias",
+        "labels",
+        "loss_mask",
+        "decoder_input",
+        "packed_seq_params",
+        "inference_context",
+        "inference_params",
+        "runtime_gather_output",
+        "fp32_output",
+        "return_logprobs_for_linear_ce_fusion",
+        "cu_seqlens",
+        "cu_seqlens_padded",
+        "max_seqlen",
+        "seq_idx",
+        "padding_mask",
+        # Model forward arguments and kwargs supplied by the trainers.
+        "extra_block_kwargs",
+        "mtp_input_mask",
+        "output_processor",
+        "output_processor_context",
+        "is_spec_decode",
+        "use_cache",
+        "flash_attn_kwargs",
+    }
+    with G_PACKED_FIELDS_LOCK:
+        # Native packed fields remain valid transport inputs, but are not custom.
+        native_fields = PACKED_MULTIMODAL_FIELDS - (
+            G_CUSTOM_PACKED_FIELDS or frozenset()
+        )
+        invalid = sorted(
+            name
+            for name in declaration
+            if name in reserved | native_fields or name.endswith(ROW_SHAPES_SUFFIX)
+        )
+        if invalid:
+            raise ValueError(
+                f"packed_multimodal_fields contains reserved names: {invalid}"
+            )
+        if G_CUSTOM_PACKED_FIELDS is not None and declaration != G_CUSTOM_PACKED_FIELDS:
+            raise ValueError(
+                "packed_multimodal_fields must be identical for every client in a process: "
+                f"{sorted(G_CUSTOM_PACKED_FIELDS)} != {sorted(declaration)}"
+            )
+        PACKED_MULTIMODAL_FIELDS.update(declaration)
+        WIRE_MULTIMODAL_FIELDS.update(declaration)
+        G_CUSTOM_PACKED_FIELDS = declaration
+
+
+@contextmanager
+def packed_multimodal_field_registration(names: list[str] | None) -> Iterator[None]:
+    """Register during client construction; roll back a failed first construction.
+
+    Args:
+        names: Custom packed model-input names, or ``None`` for no custom fields.
+
+    Yields:
+        None. ``G_PACKED_FIELDS_LOCK`` is held for the body, so client
+        construction runs with the declaration installed.
+
+    Raises:
+        ValueError: The declaration is invalid or differs from the one already
+            registered in this process.
+    """
+    global G_CUSTOM_PACKED_FIELDS
+    with G_PACKED_FIELDS_LOCK:
+        previous = G_CUSTOM_PACKED_FIELDS
+        register_packed_multimodal_fields(names)
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            if not succeeded and previous is None:
+                PACKED_MULTIMODAL_FIELDS.difference_update(G_CUSTOM_PACKED_FIELDS or ())
+                WIRE_MULTIMODAL_FIELDS.difference_update(G_CUSTOM_PACKED_FIELDS or ())
+                G_CUSTOM_PACKED_FIELDS = previous
 
 
 def present_multimodal_fields(meta: "KVBatchMeta") -> list[str]:

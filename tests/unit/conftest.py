@@ -14,8 +14,10 @@
 import json
 import os
 import random
+import sys
 import time
 import unittest.mock
+from collections.abc import Iterator
 from datetime import datetime
 from io import StringIO
 from typing import Callable, TypedDict
@@ -29,6 +31,41 @@ import torch.multiprocessing as mp
 from nemo_rl.distributed.virtual_cluster import init_ray
 
 dir_path = os.path.dirname(os.path.abspath(__file__))
+
+
+@pytest.fixture(autouse=True)
+def isolated_packed_declaration() -> Iterator[None]:
+    """Isolate process-wide packed fields without importing optional dependencies."""
+    mm = sys.modules.get("nemo_rl.data.multimodal_utils")
+    if mm is None:
+        try:
+            yield
+        finally:
+            # A test may import the module for the first time in its body.
+            mm = sys.modules.get("nemo_rl.data.multimodal_utils")
+            if mm is not None:
+                mm.PACKED_MULTIMODAL_FIELDS.difference_update(
+                    mm.G_CUSTOM_PACKED_FIELDS or ()
+                )
+                mm.WIRE_MULTIMODAL_FIELDS.difference_update(
+                    mm.G_CUSTOM_PACKED_FIELDS or ()
+                )
+                mm.G_CUSTOM_PACKED_FIELDS = None
+        return
+    packed = mm.PACKED_MULTIMODAL_FIELDS.copy()
+    wire = mm.WIRE_MULTIMODAL_FIELDS.copy()
+    declaration = mm.G_CUSTOM_PACKED_FIELDS
+    mm.PACKED_MULTIMODAL_FIELDS.difference_update(declaration or ())
+    mm.WIRE_MULTIMODAL_FIELDS.difference_update(declaration or ())
+    mm.G_CUSTOM_PACKED_FIELDS = None
+    try:
+        yield
+    finally:
+        mm.PACKED_MULTIMODAL_FIELDS.clear()
+        mm.PACKED_MULTIMODAL_FIELDS.update(packed)
+        mm.WIRE_MULTIMODAL_FIELDS.clear()
+        mm.WIRE_MULTIMODAL_FIELDS.update(wire)
+        mm.G_CUSTOM_PACKED_FIELDS = declaration
 
 
 def pytest_addoption(parser):

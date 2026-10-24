@@ -810,6 +810,15 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_token_capture_rejects_custom_packed_fields(self, patched_factories):
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+        mc.data_plane["packed_multimodal_fields"] = ["encoder_features"]
+        with pytest.raises(ValueError, match="custom packed_multimodal_fields"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     def test_token_capture_rejects_message_level_advantage_penalties(
         self, patched_factories
     ):
@@ -3284,6 +3293,44 @@ class TestNativeTQRecoverySetup:
                 sampler_name="in_order",
                 opd_full_teacher_checkpoints=current,
             )
+
+    @pytest.mark.parametrize(
+        "saved,current,accepted",
+        [
+            (["encoder_features"], ["encoder_features"], True),
+            (["a", "b"], ["b", "a", "a"], True),
+            (["encoder_features"], None, False),
+            (["encoder_features"], ["renamed_features"], False),
+            (None, ["encoder_features"], False),
+            (None, None, True),
+            ([], None, True),
+        ],
+    )
+    def test_checkpoint_custom_packed_field_declaration(
+        self, tmp_path, saved, current, accepted
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["packed_multimodal_fields"] = saved
+        kwargs = dict(
+            load_checkpoint=MagicMock(return_value=metadata),
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            data_plane_config={"packed_multimodal_fields": current},
+        )
+        if accepted:
+            assert (
+                sc_setup_mod._maybe_restore_native_data_plane_checkpoint(**kwargs)
+                == metadata
+            )
+        else:
+            with pytest.raises(ValueError, match="packed_multimodal_fields"):
+                sc_setup_mod._maybe_restore_native_data_plane_checkpoint(**kwargs)
 
     def test_accepts_tq_checkpoint_with_the_same_teacher_numbering(self, tmp_path):
         checkpoint_path = tmp_path / "step_3"

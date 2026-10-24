@@ -470,6 +470,7 @@ data_plane:
       enabled: false                   # true: spill memory to local SSD
       path: null                       # absolute node-local dir; required if enabled
       offload_threshold: 0.5           # offload above this share of segment memory
+  packed_multimodal_fields: []         # NotRequired; custom PackedTensor model inputs (SingleController)
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
