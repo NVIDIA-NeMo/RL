@@ -61,14 +61,20 @@ rejecting tokens crossing supervision boundaries. It returns context/assistant
 loss-ownership segments rather than source messages. Existing SFT masking,
 padding, next-token shifting, and `sft.only_unmask_final` continue to work; even
 adjacent assistant targets remain separate. No prefix matching or retokenization
-is performed. Tools and configured chat-template options are preserved.
+is performed. Configured template overrides and default tools are preserved;
+row-level tools take precedence, including an explicit empty list.
 
 The complete template determines historical reasoning retention; this may differ
 from reasoning accidentally retained by incremental prefix rendering. Review that
 policy before changing an existing training recipe. This processor requires a
 fast tokenizer, text-only messages, and a final assistant target. Missing markers,
-partial generation coverage, and missing requested BOS/EOS tokens are errors,
-not silent fallbacks. The existing SFT overlength exclusion policy is unchanged.
+invalid span counts/order, uncovered final suffixes, a configured EOS immediately
+outside an earlier assistant span, and missing requested BOS/EOS tokens are errors.
+Generation ranges do not prove semantic completeness: the template author must
+verify that every assistant span includes the intended content and model-specific
+turn terminator (which may differ from the tokenizer's EOS). The formatter does
+not claim to detect arbitrary partially marked targets or infer unknown terminators.
+The existing SFT overlength exclusion policy is unchanged.
 
 SFT datasets in NeMo RL are encapsulated using classes. Each SFT data class is expected to have the following attributes:
   1. `dataset`: A dictionary containing the formatted datasets. Each example in the dataset must conform to the format described below.
