@@ -598,8 +598,8 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     """Return HF names whose Bridge tasks expose safe direct local views.
 
     Every task contributing to a grouped HF tensor must provide local specs.
-    Mappings that need transpose, interleave, or other grouped-export transforms
-    return no specs and therefore stay on the normal Bridge conversion path.
+    Canonical local views do not include grouped destination transposition;
+    those mappings must stay on the normal Bridge conversion path.
 
     The result is expert-parallel invariant. Bridge conversion tasks are
     EP-local -- each EP rank only enumerates its own ``experts.N.*`` -- while the
@@ -611,7 +611,9 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
     for task in conversion_tasks:
         if task is None:
             continue
-        has_local_views = bool(task.local_hf_param_specs())
+        has_local_views = bool(task.local_hf_param_specs()) and not getattr(
+            task.mapping, "transpose_on_export", False
+        )
         for name in task.hf_param_names:
             support_by_name[name] = support_by_name.get(name, True) and has_local_views
 
@@ -1764,6 +1766,8 @@ class MegatronPolicyWorkerImpl(
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        if "logprobs" not in reference_logprobs:
+            return return_data
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
 
@@ -2688,6 +2692,10 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
 
+        # Only the model-parallel replica leader is consumed by the driver.
+        if not self._is_replica_leader():
+            return BatchedDataDict[LogprobOutputSpec]()
+
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
@@ -3068,7 +3076,10 @@ class MegatronPolicyWorkerImpl(
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
         ## disable overlap param gather when swapping weights
-        if self.should_disable_forward_pre_hook:
+        reenable_forward_pre_hook = (
+            self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled()
+        )
+        if reenable_forward_pre_hook:
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
@@ -3124,7 +3135,7 @@ class MegatronPolicyWorkerImpl(
                 torch.cuda.empty_cache()
 
             ## re-enable overlap param gather after weight swap
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
@@ -3501,7 +3512,9 @@ class MegatronPolicyWorkerImpl(
         """Return True if the train side stores weights as TE blockwise FP8."""
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
@@ -3511,7 +3524,14 @@ class MegatronPolicyWorkerImpl(
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
             return [
                 task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
+                for task in self.megatron_bridge.get_conversion_tasks(
+                    [self.model],
+                    **(
+                        {"exclude_param_patterns": exclude_param_patterns}
+                        if exclude_param_patterns
+                        else {}
+                    ),
+                )
                 if task is not None
             ]
 
@@ -4578,15 +4598,17 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cuda", move_grads=uses_mxfp8_shared_buffer
         )
-        if (
-            uses_mxfp8_shared_buffer
-            and not keep_train_buffers
-            and self.optimizer is not None
-        ):
-            # reload_from_cpu() zeros the shared storage. Restage optimizer
-            # masters before a logprob forward gathers parameters from it.
-            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.eval()
+
+        # Packed logprob shards can require different numbers of forwards on
+        # different DP ranks, so their forwards cannot run DP collectives. Do
+        # the one required parameter gather before releasing any train buffer.
+        # During an open split train step, parameters are already gathered and
+        # the accumulated gradients must not be zeroed.
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step(
+                param_sync=not keep_train_buffers
+            )
 
         if not keep_train_buffers and not uses_mxfp8_shared_buffer:
             # offload grads to cpu
@@ -4926,6 +4948,15 @@ class MegatronPolicyWorkerImpl(
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()
 
+        # Forced refit sync marks BF16 buckets as dispatched. After replacing
+        # their storage, the next forward must start a new parameter-gather epoch.
+        if (
+            self.should_disable_forward_pre_hook
+            and isinstance(self.model, DistributedDataParallel)
+            and not keep_shared_buffer
+        ):
+            self.model.reset_param_sync_dispatch_state()
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
@@ -5077,7 +5108,11 @@ class MegatronPolicyWorkerImpl(
             if not is_training:
                 self.model.eval()
 
-            if self.should_disable_forward_pre_hook:
+            reenable_forward_pre_hook = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook:
                 self.disable_forward_pre_hook()
             if self.scheduler is not None:
                 # Megatron-Bridge copies consumed_train_samples into scheduler.num_steps
@@ -5103,7 +5138,7 @@ class MegatronPolicyWorkerImpl(
                     ckpt_cfg=self.mcore_state.cfg.checkpoint,
                     blocking=True,
                 )
-            if self.should_disable_forward_pre_hook:
+            if reenable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
             if not is_training:

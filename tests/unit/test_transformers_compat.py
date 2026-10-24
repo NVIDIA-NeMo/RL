@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for Transformers runtime compatibility patches."""
 
+import json
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from pathlib import Path
@@ -21,8 +23,12 @@ import pytest
 import transformers.dynamic_module_utils as dynamic_module_utils
 import transformers.utils.import_utils as transformers_import_utils
 from packaging.version import Version
+from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers.models.auto import tokenization_auto
 
 import nemo_rl.transformers_compat as transformers_compat
+from nemo_rl.models.policy import _patch_transformers_tokenizer_class_set
 from nemo_rl.transformers_compat import (
     _compute_local_source_files_hash_with_symlink_fix,
     _patch_transformers_dynamic_module_symlink_cache,
@@ -211,3 +217,72 @@ def test_torch_fx_compat_patch_preserves_existing_helper(monkeypatch):
 
     assert _patch_transformers_torch_fx_compat() is False
     assert transformers_import_utils.is_torch_fx_available is existing_helper
+
+
+def test_deepseek_v3_local_fast_tokenizer_keeps_native_backend(tmp_path: Path) -> None:
+    backend = Tokenizer(
+        models.WordLevel({"[UNK]": 0, "[EOS]": 1, "hello": 2}, unk_token="[UNK]")
+    )
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", eos_token="[EOS]"
+    ).save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v3"}))
+    config_path = tmp_path / "tokenizer_config.json"
+    config = json.loads(config_path.read_text())
+    config["tokenizer_class"] = "LlamaTokenizerFast"
+    config_path.write_text(json.dumps(config))
+
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
+
+    assert type(tokenizer).__name__ == "TokenizersBackend"
+    assert tokenizer("hello", add_special_tokens=True)["input_ids"] == [2]
+    assert "deepseek_v3" in tokenization_auto.MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS
+    assert (
+        tokenization_auto.TOKENIZER_MAPPING_NAMES["deepseek_v3"] == "TokenizersBackend"
+    )
+
+
+@pytest.mark.parametrize("fail_first", (False, True))
+def test_deepseek_v3_tokenizer_registry_retry(
+    monkeypatch: pytest.MonkeyPatch, fail_first: bool
+) -> None:
+    blocked = {"deepseek_v3", "unrelated"}
+    mapping = {"deepseek_v3": "TokenizersBackend", "unrelated": "TokenizersBackend"}
+    monkeypatch.setattr(
+        tokenization_auto, "MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS", blocked
+    )
+    monkeypatch.setattr(tokenization_auto, "TOKENIZER_MAPPING_NAMES", mapping)
+    calls = []
+    result = object()
+
+    def load_tokenizer(name: str, **kwargs: object) -> object:
+        assert name == "local-fixture"
+        assert kwargs == {"trust_remote_code": True}
+        calls.append(("deepseek_v3" in blocked, "deepseek_v3" in mapping))
+        if fail_first and len(calls) == 1:
+            raise OSError("missing tokenizer.json")
+        return result
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
+    _patch_transformers_tokenizer_class_set()
+
+    assert (
+        AutoTokenizer.from_pretrained("local-fixture", trust_remote_code=True) is result
+    )
+    assert calls == ([(True, True), (False, False)] if fail_first else [(True, True)])
+    assert "unrelated" in blocked
+    assert mapping["unrelated"] == "TokenizersBackend"
+
+
+@pytest.mark.parametrize("version", ("5.21.0", "6.0.0"))
+def test_deepseek_v3_tokenizer_patch_rejects_unverified_versions(
+    monkeypatch: pytest.MonkeyPatch, version: str
+) -> None:
+    # Patch the guard's live import target, not a collection-time module alias.
+    live_transformers = import_module("transformers")
+    monkeypatch.setattr(live_transformers, "__version__", version)
+    assert import_module("transformers") is live_transformers
+    assert import_module("transformers").__version__ == version
+    with pytest.raises(AssertionError, match="verified on 5.12.1 and 5.20.1"):
+        _patch_transformers_tokenizer_class_set()

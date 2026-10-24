@@ -451,6 +451,8 @@ def stream_weights_via_ipc_zmq_impl(
     zmq_socket,
     rank: int,
     worker_name: str,
+    *,
+    drain_between_groups: bool = False,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -458,14 +460,18 @@ def stream_weights_via_ipc_zmq_impl(
     to reduce memory allocation overhead and improve stability.
 
     Args:
-        params_generator: Generator yielding (name, tensor) pairs
+        params_generator: Generator yielding (name, tensor) pairs. When
+            ``drain_between_groups`` is true, yields groups of those pairs.
         buffer_size_bytes: total size of buffer in bytes for batching parameters
         zmq_socket: ZMQ socket for communication
         rank: Worker rank for logging
         worker_name: Name of the worker for logging
+        drain_between_groups: Drain buffered tensors and acknowledgements before
+            requesting the next parameter group.
     """
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
+    buffer_capacity = 0 if drain_between_groups else buffer_size_bytes
 
     def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
         """Send a group of parameters and return new pending_recv state."""
@@ -483,7 +489,7 @@ def stream_weights_via_ipc_zmq_impl(
 
     def allocate_buffer(device):
         """Allocate a new aligned buffer with proper memory alignment."""
-        aligned_size = calculate_aligned_size(buffer_size_bytes)
+        aligned_size = calculate_aligned_size(buffer_capacity)
         return torch.empty(
             aligned_size,
             device=device,
@@ -523,7 +529,58 @@ def stream_weights_via_ipc_zmq_impl(
     count_of_groups = 0
 
     try:
-        for name, tensor in params_generator:
+        if drain_between_groups:
+            param_groups = params_generator
+
+            def _iter_params_with_group_boundaries():
+                nonlocal buffer_capacity
+
+                groups = iter(param_groups)
+                while True:
+                    try:
+                        group = tuple(next(groups))
+                    except StopIteration:
+                        return
+                    # Zero-sized tensors still need storage for a CUDA IPC handle.
+                    required_capacity = min(
+                        buffer_size_bytes,
+                        max(
+                            1,
+                            sum(calculate_aligned_size(t.nbytes) for _, t in group),
+                        ),
+                    )
+                    if required_capacity > buffer_capacity:
+                        # The preceding group's ACKs have drained. Release the
+                        # old pair before growing; retain capacity for reuse.
+                        torch.cuda.current_stream().synchronize()
+                        release_staging_buffers()
+                        buffer_capacity = required_capacity
+                    try:
+                        yield from group
+                    finally:
+                        del group
+                    yield None
+
+            params_generator = _iter_params_with_group_boundaries()
+
+        for item in params_generator:
+            if item is None:
+                # The grouped producer may synchronize before its next group.
+                # Drain this group first so producer and consumer cannot wait on
+                # opposite sides of that synchronization.
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    used_bytes, param_names = 0, []
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                continue
+
+            name, tensor = item
+            del item
             aligned_size = calculate_aligned_size(tensor.nbytes)
             # Resolve the transfer device without allocating staging storage.
             # CPU exports still need CUDA storage for the IPC reducer.
@@ -609,7 +666,7 @@ def stream_weights_via_ipc_zmq_impl(
                 current_buffer = buffer_a
 
             # Check if we need to send current buffer and switch to the other one
-            if used_bytes + aligned_size > buffer_size_bytes:
+            if used_bytes + aligned_size > buffer_capacity:
                 await_recv = send_buffer_group_overlap(
                     current_buffer, param_names, used_bytes, await_recv
                 )
@@ -622,6 +679,7 @@ def stream_weights_via_ipc_zmq_impl(
             # Pack tensor into current buffer
             param_names.append(name)
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
+            del tensor
 
         # Send remaining tensors
         if param_names:

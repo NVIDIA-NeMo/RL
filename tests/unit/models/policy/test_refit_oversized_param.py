@@ -222,7 +222,15 @@ def test_oversized_parameter_alone(monkeypatch):
 
 def test_consecutive_oversized_parameters(monkeypatch):
     """Back-to-back oversized parameters never allocate the regular pair."""
-    params = [_param("a.weight", 3072), _param("b.weight", 4096)]
+
+    def params():
+        for name, size in (("a.weight", 3072), ("b.weight", 4096)):
+            _, tensor = _param(name, size)
+            tensor_ref = weakref.ref(tensor)
+            yield name, tensor
+            del tensor
+            assert tensor_ref() is None
+
     allocations = []
     real_empty = torch.empty
 
@@ -233,7 +241,7 @@ def test_consecutive_oversized_parameters(monkeypatch):
 
     monkeypatch.setattr(torch, "empty", tracked_empty)
 
-    socket = _stream(monkeypatch, params)
+    socket = _stream(monkeypatch, params())
 
     assert allocations == [3072, 4096]
     assert [names for names, _ in socket.payloads] == [["a.weight"], ["b.weight"]]
