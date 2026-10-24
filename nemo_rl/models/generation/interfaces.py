@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW
+from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -262,6 +263,9 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    # Controller-only connection and NCCL-refit settings for an external
+    # stock vLLM deployment.
+    remote_vllm_cfg: NotRequired[RemoteVllmServiceConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # Eagle draft weights arrive via refit when policy.draft.enabled=true.
@@ -290,6 +294,10 @@ def should_use_async_rollouts(
     backend = generation_config.get("backend", "")
 
     if backend == "dynamo":
+        return True
+
+    if backend == "remote_vllm":
+        # Rollouts run through the external server's asynchronous HTTP API.
         return True
 
     if backend == "sglang":

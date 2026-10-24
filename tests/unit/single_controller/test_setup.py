@@ -105,6 +105,41 @@ from nemo_rl.utils.logger import LoggerConfig, WandbConfig
 _REAL_BUILD_GENERATION = sc_setup_mod._build_generation
 
 
+def test_spinup_gym_uses_remote_vllm_served_model_name(monkeypatch):
+    """Gym must address the remote service alias, not its checkpoint path."""
+    spinup = MagicMock(return_value=object())
+    monkeypatch.setattr(sc_setup_mod, "build_nemo_gym_actors", spinup)
+    master_config = SimpleNamespace(
+        policy={
+            "model_name": "/checkpoints/policy",
+            "tokenizer": {"use_fastokens": False},
+            "generation": {
+                "backend": "remote_vllm",
+                "model_name": "/checkpoints/policy",
+                "remote_vllm_cfg": {
+                    "base_url": "http://rollout.example/v1",
+                    "served_model_name": "policy",
+                    "max_model_len": 512,
+                    "refit": {},
+                },
+            },
+        },
+        env={"nemo_gym": {}},
+        token_capture=SimpleNamespace(enabled=False),
+    )
+
+    actor, _ = sc_setup_mod._spinup_gym(
+        master_config,
+        ["http://rollout.example/v1"],
+        MagicMock(),
+        policy_api_key=None,
+    )
+
+    assert actor is spinup.return_value
+    assert spinup.call_args.kwargs["model_name"] == "policy"
+    assert spinup.call_args.kwargs["policy_api_key"] is None
+
+
 class _CheckpointingCustomSampler(WindowedSampler):
     """Custom sampler whose static capability must be validated during setup."""
 
@@ -1517,7 +1552,11 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
-            ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
+            (
+                "gym_on_sglang",
+                NotImplementedError,
+                "vllm, remote_vllm, and megatron",
+            ),
             (
                 "deferred_routes_without_capture",
                 ValueError,
@@ -2897,7 +2936,7 @@ class TestSetup:
 
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
-        """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
+        """SC Gym supports vllm, remote_vllm, and megatron; reject other backends."""
         mc = _make_master_config(backend=backend)
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),

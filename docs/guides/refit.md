@@ -46,6 +46,69 @@ refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft
 weights refitted from the trainer are not supported yet; use the legacy loader
 for those cases.
 
+## External vLLM NCCL Refit
+
+SingleController/NeMo-Gym can use `policy.generation.backend: remote_vllm`
+with a separately launched vLLM **0.29.0** server. Launch that server with
+`VLLM_SERVER_DEV_MODE=1` and `--weight-transfer-config '{"backend":"nccl"}'`.
+Keep its development endpoints on a private network reachable from the
+training controller. The trainer and serving GPU workers also need mutual
+network access and compatible NCCL transport/plugin settings.
+
+```yaml
+policy:
+  generation:
+    backend: remote_vllm
+    colocated:
+      enabled: false
+    refit_transport: null
+    remote_vllm_cfg:
+      base_url: http://serving-host:8000/v1
+      served_model_name: policy
+      max_model_len: 8192
+      refit:
+        transport: nccl
+        nccl_num_engines: 1
+        nccl_engine_world_size: 2  # TP * PP * DP within this deployment
+```
+
+This path requires a Megatron policy and Gym rollouts. Each refit pauses
+serving, starts a native weight update, broadcasts HF-named tensors directly
+over NCCL, finishes the update with a weight version, and resumes serving.
+HTTP carries control and metadata; no HF checkpoint is written or loaded from
+disk. Native vLLM layerwise loading still runs. `quant_cfg`, trainer-refitted
+draft weights, and separate KV-scale transfer are not supported here.
+
+Only **one independent serving deployment** is supported. Its TP/PP/DP GPU
+workers can span multiple devices; the router and HTTP frontend are not NCCL
+participants. `nccl_num_engines` accepts only `1`, and service preflight rejects
+multiple backends even when a router advertises control fan-out. P/D
+separation and independent-replica fan-out are future work. Setup also checks
+the serving version, NCCL transfer backend, and declared GPU world size.
+
+The refit configuration defines `timeout_s` (1800 seconds),
+`nccl_packed_buffer_size_bytes` (1 GiB), and `nccl_packed_num_buffers` (2).
+Packing geometry is negotiated at initialization. The policy broadcast uses
+vLLM's packing convention, including tensors larger than a packed buffer.
+A configured fleet-health refit deadline can shorten the collective deadline.
+
+A failed update leaves generation paused and prevents reuse of the failed
+synchronizer. Restart both training and serving before retrying. Each paired
+HTTP call releases its executor; NCCL communicators belong to the GPU
+processes and are reclaimed when those processes exit. NeMo-RL does not
+terminate the externally managed service. Do not share it with another
+training job while a communicator is active.
+
+The functional script
+`tests/functional/grpo_external_vllm_gym_single_controller.sh` launches one
+server, runs at least ten training steps, and checks nonzero policy gradients
+and trainer-side parameter-sync timings, and verifies the vLLM `/weight_info`
+version after training. The parameter-sync timing excludes the NCCL refit transfer.
+For an existing server, provide
+`EXTERNAL_VLLM_TEST_BASE_URL` and set `EXTERNAL_VLLM_TEST_ENGINE_WORLD_SIZE` to
+its TP * PP * DP size. These checks are functional smoke coverage, not a
+convergence or throughput benchmark.
+
 ## Constraints
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |
