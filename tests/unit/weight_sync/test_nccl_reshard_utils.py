@@ -135,6 +135,51 @@ def test_check_nccl_reshard_refit_support_rejects_reload_api() -> None:
         check_nccl_reshard_refit_support(config)
 
 
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "eagle3"},
+        {"method": "dflash"},
+        {"method": "dspark"},
+        {"method": "dflash", "num_speculative_tokens": 4},
+        {"model": "draft-checkpoint", "num_speculative_tokens": 3},
+    ],
+    ids=["eagle3", "dflash", "dspark", "dflash-k4", "model-without-method"],
+)
+def test_check_nccl_reshard_refit_support_rejects_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """Co-trained drafters never reach process_weights_after_loading here."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    with pytest.raises(ValueError, match="speculative_config.method"):
+        check_nccl_reshard_refit_support(config)
+
+
+@pytest.mark.parametrize(
+    "speculative_config",
+    [
+        {"method": "mtp"},
+        {"method": "eagle3", "num_speculative_tokens": 0},
+        {"num_speculative_tokens": 3},
+    ],
+    ids=["mtp", "disabled-eagle3", "no-method-no-model"],
+)
+def test_check_nccl_reshard_refit_support_accepts_non_draft_speculators(
+    speculative_config: dict,
+) -> None:
+    """MTP finalizes outside the draft manifest; K=0 disables speculation."""
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_kwargs"] = {
+        "speculative_config": speculative_config
+    }
+
+    check_nccl_reshard_refit_support(config)
+
+
 def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
     config = _valid_nccl_reshard_config()
     config.policy["generation"]["backend"] = "sglang"
