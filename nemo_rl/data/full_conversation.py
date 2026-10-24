@@ -36,8 +36,10 @@ def get_full_conversation_message_log(
     """Render/tokenize once and return loss-ownership segments for SFT.
 
     A template must mark each complete assistant target, including its turn
-    terminator and trailing whitespace, with one generation block. Headers may
-    remain outside the block. Returned segments are not source conversation turns;
+    terminator and trailing whitespace, with one generation block. The template
+    author is responsible for model-specific terminator coverage; generation
+    ranges alone cannot establish semantic completeness. Headers may remain
+    outside the block. Returned segments are not source conversation turns;
     their roles let the existing SFT mask helper select assistant targets without
     changing, retokenizing, or shifting the token sequence.
 
@@ -72,16 +74,19 @@ def get_full_conversation_message_log(
         prepared[user_indices[0]]["content"] = prompt.format(
             prepared[user_indices[0]]["content"]
         )
-    template = tokenizer.get_chat_template(tools=tools)
-    if not re.search(r"\{%-?\s*generation\s*-?%\}", template):
-        raise ValueError("Full-conversation SFT requires {% generation %} blocks.")
-
     # get_tokenizer binds configured controls (e.g. enable_thinking) with partial.
     template_options: dict[str, Any] = dict(tokenizer.special_tokens_map)
     if isinstance(tokenizer.apply_chat_template, partial):
         template_options.update(tokenizer.apply_chat_template.keywords)
+    if tools is not None:
+        template_options["tools"] = tools
+    template = tokenizer.get_chat_template(
+        chat_template=template_options.get("chat_template"),
+        tools=template_options.get("tools"),
+    )
+    if not re.search(r"\{%-?\s*generation\s*-?%\}", template):
+        raise ValueError("Full-conversation SFT requires {% generation %} blocks.")
     template_options.update(
-        tools=tools,
         chat_template=template,
         return_assistant_tokens_mask=True,
         add_generation_prompt=False,
@@ -99,6 +104,13 @@ def get_full_conversation_message_log(
         if not cursor <= start < end <= len(text):
             raise ValueError("Assistant generation spans must be nonempty and ordered.")
         cursor = end
+    for (_, end), (next_start, _) in zip(spans, spans[1:]):
+        if tokenizer.eos_token and text[end:next_start].lstrip().startswith(
+            tokenizer.eos_token
+        ):
+            raise ValueError(
+                "An assistant EOS terminator is outside its generation block."
+            )
     if spans[-1][1] != len(text):
         raise ValueError(
             "The final generation block must include the assistant terminator "

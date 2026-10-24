@@ -155,6 +155,58 @@ def test_one_render_and_one_tokenization(tokenizer: PreTrainedTokenizerFast) -> 
     assert encode.call_count == 1
 
 
+def test_bound_template_override(tokenizer: PreTrainedTokenizerFast) -> None:
+    tokenizer.chat_template = "default without generation markers"
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, chat_template="CUSTOM:" + TEMPLATE
+    )
+    log = format_messages(tokenizer)
+    actual = tokenizer.decode(torch.cat([m["token_ids"] for m in log]))
+    assert actual == tokenizer.apply_chat_template(messages(), tokenize=False)
+    assert actual.startswith("CUSTOM:")
+
+
+@pytest.mark.parametrize("row_tools", [None, [], [{"name": "row_tool"}]])
+def test_bound_tools_and_row_precedence(
+    tokenizer: PreTrainedTokenizerFast, row_tools: list[dict[str, Any]] | None
+) -> None:
+    defaults = [{"name": "default_tool"}]
+    tokenizer.chat_template = {"default": "unmarked", "tool_use": TEMPLATE}
+    tokenizer.apply_chat_template = partial(
+        tokenizer.apply_chat_template, tools=defaults
+    )
+    # An explicit empty list selects the default template, just as Transformers does.
+    if row_tools == []:
+        tokenizer.chat_template["default"] = "NO_TOOLS:" + TEMPLATE
+    log = format_messages(tokenizer, tools=row_tools)
+    options = {} if row_tools is None else {"tools": row_tools}
+    expected = tokenizer.apply_chat_template(messages(), tokenize=False, **options)
+    assert tokenizer.decode(torch.cat([m["token_ids"] for m in log])) == expected
+
+
+@pytest.mark.parametrize("whitespace", ["", "\\n"])
+def test_historical_eos_outside_generation_is_rejected(
+    tokenizer: PreTrainedTokenizerFast, whitespace: str
+) -> None:
+    tokenizer.chat_template = (
+        "prefix{% for m in messages %}{% if m.role == 'assistant' %}"
+        "{% generation %}{{ m.content }}"
+        "{% if loop.last %}{{ '<stop>' }}{% endif %}{% endgeneration %}"
+        "{% if not loop.last %}{{ '" + whitespace + "<stop>' }}{% endif %}"
+        "{% else %}{{ m.content }}{% endif %}{% endfor %}"
+    )
+    with pytest.raises(ValueError, match="EOS terminator is outside"):
+        format_messages(
+            tokenizer,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": "last"},
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     "content", ["", "caf\u00e9 \u4f60\u597d \U0001f600", "  answer\n\t "]
 )
