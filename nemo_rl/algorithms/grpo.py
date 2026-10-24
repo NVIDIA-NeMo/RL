@@ -83,7 +83,11 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS, PackedTensor
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    extract_necessary_env_names,
+    load_dataloader_state,
+    save_dataloader_state,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -186,6 +190,12 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     print_multimodal_payload_metrics,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.checkpoint_engine_config import (
@@ -234,7 +244,7 @@ def _maybe_restore_async_replay_buffer_checkpoint(
         return None
 
     replay_buffer_path = os.path.join(checkpoint_path, "replay_buffer.pt")
-    if not os.path.exists(replay_buffer_path):
+    if not path_exists(replay_buffer_path):
         print(
             f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
             "Starting with an empty replay buffer."
@@ -2760,12 +2770,12 @@ def _write_latest_checkpoint_status(
         str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
     )
     status: dict[str, Any] = {}
-    if os.path.exists(status_path):
-        with open(status_path) as f:
+    if path_exists(status_path):
+        with open_path(status_path) as f:
             status = json.load(f)
     status["last_successful_ckpt_save_completion"] = time.time()
     status["last_checkpoint_step"] = last_checkpoint_step
-    with open(status_path, "w") as f:
+    with open_path(status_path, "w") as f:
         json.dump(status, f)
 
 
@@ -4289,17 +4299,14 @@ def _grpo_train_impl(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            torch.save(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         # Finalize in the background. The directory rename is
                         # deferred until any async write completes (via wait_fn);
@@ -5079,9 +5086,9 @@ def async_grpo_train(
         )
 
         rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
-        if os.path.exists(rollouts_path):
+        if path_exists(rollouts_path):
             # weights_only=False: this is a trusted same-job checkpoint artifact.
-            rollouts_state = torch.load(rollouts_path, weights_only=False)
+            rollouts_state = load_checkpoint_object(rollouts_path, weights_only=False)
 
     next_nemo_gym_task_index = max(
         int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0)),
@@ -6207,9 +6214,8 @@ def async_grpo_train(
                         )
                         dataloader_snapshot = collector_checkpoint["dataloader"]
                         rollouts_state = collector_checkpoint["rollouts"]
-                        torch.save(
-                            dataloader_snapshot["dataloader_state"],
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            dataloader_snapshot["dataloader_state"], checkpoint_path
                         )
                         _save_async_replay_buffer_checkpoint(
                             replay_buffer,
@@ -6235,7 +6241,7 @@ def async_grpo_train(
                             rollouts_state[TRAINED_TASK_INDICES_KEY] = sorted(
                                 recent_trained_task_indices
                             )
-                        torch.save(
+                        save_checkpoint_object(
                             rollouts_state,
                             os.path.join(checkpoint_path, "rollouts.pt"),
                         )

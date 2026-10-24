@@ -15,7 +15,7 @@
 
 import asyncio
 import logging
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -40,6 +40,10 @@ from nemo_rl.models.generation.interfaces import (
     reject_unenforceable_refit_deadline,
     verify_right_padding,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -144,6 +148,63 @@ def _parse_dynamo_completion_response(
 class DynamoGeneration(GenerationInterface):
     """Own a fixed Dynamo service fleet and expose it for NeMo-RL rollouts."""
 
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController settings the managed Dynamo backend cannot honor."""
+        # Both would otherwise fail only after the engines are up: R3 in the Megatron
+        # worker's setup, a VLM policy at its first multimodal prompt.
+        if router_replay_enabled(master_config.policy):
+            raise ValueError(
+                "policy.router_replay.enabled=true requires "
+                "policy.generation.backend='vllm'; managed Dynamo does not return "
+                "routed experts."
+            )
+        if master_config.policy.get("is_vlm"):
+            raise ValueError(
+                "policy.is_vlm=true is not supported with "
+                "policy.generation.backend='dynamo'; managed Dynamo serves text "
+                "prompts only."
+            )
+        fleet_health = master_config.async_rl.generation_fleet_health
+        if fleet_health.enabled:
+            # The Dynamo frontend routes every request across its worker fleet, so
+            # there are no NeMo RL-selected shards for fleet health to track.
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported with "
+                "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
+                "routing. Set async_rl.generation_fleet_health.enabled=false."
+            )
+        if fleet_health.refit_timeout_s is not None:
+            # Dynamo workers cannot abort their refit collective, so a deadline would
+            # be refused at the first weight update; fail before anything builds.
+            raise ValueError(
+                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
+                "policy.generation.backend='dynamo'; Dynamo workers cannot enforce a "
+                "refit deadline."
+            )
+        # Setup has already normalized this through DynamoConfig.
+        generation = cast(dict[str, Any], master_config.policy["generation"])
+        dynamo_cfg = generation["dynamo_cfg"]
+        if dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]:
+            raise ValueError(
+                "policy.generation.dynamo_cfg.control_timeout_s "
+                f"({dynamo_cfg['control_timeout_s']}) must be >= request_timeout_s "
+                f"({dynamo_cfg['request_timeout_s']}): it bounds the pre-refit drain, "
+                "which waits for running requests to finish."
+            )
+        if (
+            generation["vllm_cfg"]["enable_vllm_metrics_logger"]
+            and master_config.rollout_checkpointing.telemetry_interval_s is None
+        ):
+            # The rollout telemetry pump is the only reader of Dynamo's metrics on
+            # this path; without it the flag would silently do nothing.
+            raise ValueError(
+                "policy.generation.vllm_cfg.enable_vllm_metrics_logger requires "
+                "rollout_checkpointing.telemetry_interval_s with "
+                "policy.generation.backend='dynamo' under the SingleController; "
+                "the rollout telemetry pump is what reports Dynamo's metrics."
+            )
+
     def __init__(
         self,
         cluster: Optional[RayVirtualCluster],
@@ -220,15 +281,6 @@ class DynamoGeneration(GenerationInterface):
             else:
                 self.dp_openai_server_base_urls = [None]
                 print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
-
-            if vllm_cfg.enable_vllm_metrics_logger:
-                self._metrics_sampler = DynamoMetricsSampler(
-                    workers,
-                    interval_s=vllm_cfg.vllm_metrics_logger_interval,
-                    include_prefixes=dynamo_cfg.metrics_include_prefixes,
-                    exclude_prefixes=dynamo_cfg.metrics_exclude_prefixes,
-                )
-                self._metrics_sampler.start()
         except Exception:
             self.shutdown()
             raise
@@ -251,16 +303,44 @@ class DynamoGeneration(GenerationInterface):
         """Invalidate cached rollout state after synchronous generation."""
         return self.invalidate_kv_cache()
 
+    def _logger_sampler(self) -> DynamoMetricsSampler | None:
+        """Return this process's metrics sampler, starting it on first use.
+
+        The sampler owns a thread and locks, so it cannot travel with a pickled
+        copy: it starts in whichever process reads the metrics (the driver for
+        the legacy loops, the SingleController actor for its telemetry pump).
+        """
+        vllm_cfg = self.cfg["vllm_cfg"]
+        channel = self._refit_channel
+        if (
+            self._metrics_sampler is None
+            and vllm_cfg["enable_vllm_metrics_logger"]
+            and channel is not None
+        ):
+            self._metrics_sampler = DynamoMetricsSampler(
+                channel.workers,
+                interval_s=vllm_cfg["vllm_metrics_logger_interval"],
+                include_prefixes=self._dynamo_cfg.metrics_include_prefixes,
+                exclude_prefixes=self._dynamo_cfg.metrics_exclude_prefixes,
+            )
+            self._metrics_sampler.start()
+        return self._metrics_sampler
+
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""
-        sampler = self._metrics_sampler
+        sampler = self._logger_sampler()
         return {} if sampler is None else sampler.snapshot()
 
     def clear_logger_metrics(self) -> None:
         """Clear the Dynamo metric timelines for the next logging window."""
-        sampler = self._metrics_sampler
+        sampler = self._logger_sampler()
         if sampler is not None:
             sampler.clear()
+
+    def drain_latest_logger_metrics(self) -> dict[str, Any]:
+        """Return each worker's latest Dynamo metrics for rollout telemetry."""
+        sampler = self._logger_sampler()
+        return {} if sampler is None else sampler.drain_latest()
 
     def get_inference_world_size(self) -> int:
         """Return the number of vLLM ranks across all discovered workers."""
@@ -310,8 +390,9 @@ class DynamoGeneration(GenerationInterface):
         """Serialize only HTTP clients needed by Ray rollout actors.
 
         Driver-owned subprocesses, threads, and Ray worker handles are excluded.
-        The endpoint-only refit channel is retained so AREAL-style cache
-        invalidation still reaches every managed worker after deserialization.
+        The refit channel's client copy is retained so weight updates and
+        AREAL-style cache invalidation still reach every managed worker after
+        deserialization.
         """
         refit_channel = self._refit_channel
         return {
@@ -656,3 +737,31 @@ class DynamoGeneration(GenerationInterface):
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
         return channel.flush_cache()
+
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Drain and pause every worker; layerwise reload is unsafe mid-request.
+
+        Unlike vLLM's frozen pause, running requests finish on the current
+        weights; queued and new requests wait and run on the new ones. Because
+        the drain waits for running requests, ``dynamo_cfg.control_timeout_s``
+        bounds it rather than ``timeout_s``.
+        """
+        del timeout_s
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.pause(clear_cache=clear_cache)
+        return True
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume every worker after a weight update."""
+        del timeout_s
+        channel = self._refit_channel
+        if channel is None:
+            raise RuntimeError("Dynamo refit channel is unavailable")
+        channel.resume()
+        return True
