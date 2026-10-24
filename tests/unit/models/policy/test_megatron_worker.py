@@ -414,9 +414,18 @@ def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
+def test_nccl_reshard_all_misc_refit_supports_empty_bulk(
+    monkeypatch: pytest.MonkeyPatch, pp_size: int
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
+    )
+
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_pipeline_model_parallel_group",
+        lambda: None,
     )
 
     misc_name = "model.layers.0.mlp.experts.down_proj"
@@ -427,6 +436,8 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         local_hf_param_specs=lambda: (),
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.draft_model = None
     worker.refit_conversion_tasks = [task]
     worker.model = object()
     worker.megatron_bridge = SimpleNamespace(
@@ -492,6 +503,11 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
             local_hf_param_specs=lambda: (object(),) if safe else (),
         )
 
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_pipeline_model_parallel_group",
+        lambda: None,
+    )
     bulk_task = task(bulk_name, safe=True)
     export_tasks = [task(name) for name in values]
     compound_task = SimpleNamespace(
@@ -500,6 +516,8 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     )
     export_tasks.append(compound_task)
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {}
+    worker.draft_model = None
     worker.model = object()
     worker.model_update_group = object()
     worker.refit_conversion_tasks = export_tasks
@@ -549,13 +567,46 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
         "packed_broadcast_producer",
         lambda *, iterator, **kwargs: received.extend(iterator),
     )
-    worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0})
+    worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0}, draft_weights=())
     assert [name for name, _ in received] == list(expected_misc)
     assert all(tensor is expected_misc[name] for name, tensor in received)
     worker._iter_params_with_optional_kv_scales.assert_called_with(
         kv_scales={"unused": 1.0},
         conversion_tasks=worker._misc_conversion_tasks,
+        draft_weights=(),
     )
+
+
+@pytest.mark.parametrize(
+    ("draft_tensor", "message"),
+    [
+        (torch.empty(2, 3), None),
+        (torch.empty(3, 2), "changed after prepare"),
+        (torch.empty(2, 3, dtype=torch.float16), "changed after prepare"),
+    ],
+)
+def test_draft_refit_metadata_drift_compares_prepared_misc_meta(
+    draft_tensor: torch.Tensor, message: Optional[str]
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.nccl_reshard_refit_info = {
+        "misc_meta": {"draft.fc.weight": {"shape": [2, 3], "dtype": str(torch.float32)}}
+    }
+
+    error = worker._draft_refit_metadata_drift((("draft.fc.weight", draft_tensor),))
+    if message is None:
+        assert error is None
+    else:
+        assert message in str(error)
+
+    unknown = worker._draft_refit_metadata_drift(
+        (("draft.unknown.weight", torch.empty(1)),)
+    )
+    assert "is not in the prepared refit metadata" in str(unknown)
 
 
 def test_refit_destination_uses_common_worker_interface(
@@ -1778,7 +1829,16 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.my_pp_stage = 0
     worker.pp_comm_group = object()
+    worker.model_update_group = object()
+    worker.cfg = {}
+    worker.draft_model = None
     worker._broadcast_misc_params_packed = MagicMock()
+    preflight_calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_preflight_producer",
+        lambda group, src, error: preflight_calls.append((group, src, error)),
+    )
     source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
     wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
     if source_dtype != torch.uint8:
@@ -1887,7 +1947,9 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         assert len(materialized_sources) == 1
         assert completed == []
         worker._broadcast_misc_params_packed.assert_not_called()
+        assert preflight_calls == [(worker.model_update_group, 0, None)]
         failure_stage = None
+        preflight_calls.clear()
         materialized_sources.clear()
         transferred.clear()
         source.add_(10)
@@ -1909,6 +1971,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
+    assert preflight_calls == [(worker.model_update_group, 0, None)] * 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
