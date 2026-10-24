@@ -68,6 +68,12 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Environment Server tasksets
+
+NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
+
+RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
@@ -133,6 +139,7 @@ flowchart LR
     end
     
     subgraph Gym["NeMo Gym"]
+        Environment["Environment Server"]
         Agent["Agent"]
         Model["Model (Proxy)"]
         Resources["Resources"]
@@ -141,6 +148,9 @@ flowchart LR
     Loop -->|refit| vLLM
     Loop -->|run_rollouts| Bridge
     Bridge -->|spawns| Gym
+    Bridge -->|via Gym collector| Environment
+    Environment <--> Agent
+    Environment <--> Resources
     Agent <--> Model
     Agent <--> Resources
     Model -->|HTTP| vLLM
@@ -159,7 +169,7 @@ The integration is handled by the `NemoGym` Ray actor at `nemo_rl/environments/n
 
 1. **Created by NeMo RL** during training setup via `NemoGym.remote(config)`
 2. **Joins the existing Ray cluster** that NeMo RL already initialized
-3. **Spawns NeMo Gym servers** as OS subprocesses (Head, Agent, Model, Resources)
+3. **Spawns NeMo Gym servers** as OS subprocesses (Head, Environment, Agent, Model, Resources)
 4. **Injects vLLM base URLs** so NeMo Gym's Model Server knows where to proxy requests
 5. **Exposes `run_rollouts()`** as the entry point for the training loop to call
 
@@ -173,12 +183,15 @@ flowchart LR
     
     subgraph Gym["NeMo Gym"]
         RCH["RolloutCollectionHelper"]
+        Environment["Environment Server"]
         Agent["Agent Server"]
     end
     
     Loop --> Actor
-    Actor --> Agent
-    Agent --> RCH
+    Actor -->|run_examples| RCH
+    RCH -->|POST /run| Environment
+    Environment <--> Agent
+    Environment -->|completed result| RCH
     RCH --> Actor
     Actor --> Loop
 
@@ -188,11 +201,13 @@ flowchart LR
 
 The flow is:
 1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
-2. Actor sends `POST /run` to the Agent Server
-3. Agent Server orchestrates the rollout via RolloutCollectionHelper
-4. Completed examples return to the Actor
+2. The actor calls Gym's `RolloutCollectionHelper.run_examples()` in its own process
+3. The collector resolves each row's destination and sends `POST /run` to its Environment Server, which executes or delegates the episode
+4. Completed examples return through the collector to the actor
 5. Actor post-processes and streams each completed example back with its original row index
 6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
+
+With `single_agent_turn`, the Environment Server owns Resources and Agent session seeding, Agent invocation, verification, and cleanup. Simple Agent still owns the model/tool loop within that invocation, which can include multiple model and tool calls. The `legacy_agent` Environment Server instead relays the request to the existing Agent `/run`; that Agent retains its rollout lifecycle.
 
 ## vLLM HTTP Server
 
@@ -235,6 +250,8 @@ sequenceDiagram
 
 ## Training Loop Control Flow
 
+The following sequence shows `single_agent_turn` with Simple Agent. For `legacy_agent`, the Environment Server delegates the episode to Agent `/run` instead.
+
 ```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 sequenceDiagram
@@ -246,7 +263,9 @@ sequenceDiagram
         participant Bridge as NemoGym Actor
     end
     box rgb(255, 243, 224) NeMo Gym
-        participant Agent as Agent Server
+        participant Collector as RolloutCollectionHelper
+        participant Environment as Environment Server
+        participant Agent as Simple Agent Server
         participant Model as Model Server
         participant Resource as Resource Server
     end
@@ -254,21 +273,39 @@ sequenceDiagram
     Loop->>Policy: Refit (trigger weight sync)
     Policy->>vLLM: Sync weights to vLLM
     Loop->>Bridge: streaming run_rollouts(batch)
-    Bridge->>Agent: POST /run
-    Agent->>Model: POST /v1/responses
-    Model->>vLLM: POST /v1/chat/completions
-    vLLM-->>Model: Response
-    Model-->>Agent: Responses API format
-    Agent->>Resource: Execute tool / compute reward
-    Resource-->>Agent: Tool result / reward
-    Agent-->>Bridge: Completed example + reward
+    Bridge->>Collector: run_examples(batch)
+    Collector->>Environment: POST /run (episode request)
+    Environment->>Resource: POST /seed_session
+    Resource-->>Environment: Resources session
+    Environment->>Agent: POST /v1/agent_sessions
+    Agent-->>Environment: Agent session
+    Environment->>Agent: Invoke /v1/responses
+    loop Model/tool loop
+        Agent->>Model: POST /v1/responses
+        Model->>vLLM: POST /v1/chat/completions
+        vLLM-->>Model: Response
+        Model-->>Agent: Responses API format
+        opt Model requests tools
+            Agent->>Resource: Execute tools
+            Resource-->>Agent: Tool results
+        end
+    end
+    Agent-->>Environment: Agent response
+    Environment->>Agent: POST /v1/agent_sessions/close
+    Agent-->>Environment: Session observations
+    Environment->>Resource: POST /verify
+    Resource-->>Environment: Verified result + reward
+    Environment->>Resource: POST /close_session
+    Environment-->>Collector: Episode response
+    Collector-->>Bridge: Completed row + result
     Bridge-->>Loop: Stream row index, token IDs, logprobs, reward
     Note over Loop,Bridge: Async GRPO emits each complete prompt group;<br/>sync paths drain all rows before continuing
     Loop->>Policy: Compute loss and train
 ```
 
-> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/v0.2.1/about/concepts/core-components/)):
-> - **Agent Server**: Orchestrates the rollout loop
+> **NeMo Gym server types** (see [Gym architecture](https://docs.nvidia.com/nemo/gym/main/about/architecture)):
+> - **Environment Server**: Runs the episode lifecycle; `single_agent_turn` manages sessions and verification, while `legacy_agent` delegates to Agent `/run`
+> - **Agent Server**: Implements agent behavior; Simple Agent runs the model/tool loop
 > - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
 > - **Resource Server**: Provides tools and rewards
 
@@ -278,8 +315,9 @@ sequenceDiagram
 |------|----------|-------------|
 | **Refit** | NeMo RL | Synchronizes policy weights to vLLM workers. For async RL, refit timing may differ—see {doc}`generation` for details. |
 | **Streaming `run_rollouts()`** | NeMo RL | Ray generator call from the rollout layer to the NemoGym actor; rows can arrive out of input order |
-| **POST /run** | NeMo RL → NeMo Gym | HTTP request from NemoGym actor to Agent Server subprocess |
-| **Rollout orchestration** | NeMo Gym | Agent calls Model Server and Resources Server via HTTP |
+| **POST /run** | NeMo Gym collector → Environment Server | The actor calls `RolloutCollectionHelper.run_examples()`; the collector dispatches each row to an Environment Server |
+| **Episode orchestration** | NeMo Gym | `single_agent_turn` seeds sessions, invokes the Agent, verifies, and cleans up; `legacy_agent` delegates to Agent `/run` |
+| **Model/tool loop** | NeMo Gym | Simple Agent calls Model Server and executes requested tools on Resources Server |
 | **POST /v1/chat/completions** | NeMo Gym → NeMo RL | Model Server proxies to NeMo RL's vLLM HTTP endpoint |
 | **Result processing** | NeMo RL | NemoGym actor extracts token IDs, logprobs, rewards |
 
@@ -317,9 +355,10 @@ flowchart LR
     end
     
     subgraph Gym["NeMo Gym"]
-        Example["Example Dict"]
+        Example["Flat Row or<br/>Materialized Task"]
         ReqResp["Responses API"]
         ReqChat["Chat Completions"]
+        GymResult["Rollout Result"]
     end
     
     subgraph RL2["NeMo RL Output"]
@@ -330,8 +369,8 @@ flowchart LR
     Example --> ReqResp
     ReqResp --> ReqChat
     ReqChat --> ReqResp
-    ReqResp --> Example
-    Example --> Result
+    ReqResp --> GymResult
+    GymResult --> Result
 
     style RL1 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style RL2 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
@@ -339,12 +378,15 @@ flowchart LR
 ```
 
 **Formats**:
-- **DatumSpec** (NeMo RL): Training-focused format with `prompt`, `prompt_token_ids`, and task metadata
-- **Example Dict** (NeMo Gym): Environment-focused format containing `responses_create_params` and `expected` answer
+- **DatumSpec** (NeMo RL): Carries the Gym row in `extra_env_info`; Gym constructs the actual conversation during rollout
+- **Flat row** (NeMo Gym): Contains top-level `responses_create_params`, task-specific fields, and `agent_ref` or `task_source` for routing
+- **Materialized task** (NeMo Gym): Contains structured `task_id` (`taskset` and `task_id`) and `task_input`. For `single_agent_turn`, `task_input` holds `responses_create_params` and task-specific fields, either flat or under `task_data`
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: DatumSpec is converted to Example Dict, which passes through to the Responses API with generation parameters (`temperature`, `top_p`) added for on-policy sampling. The Model Server translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). Results flow back with token IDs and logprobs extracted into the final Result.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. NeMo RL obtains the Agent reference for metrics and teacher attribution from the selected Environment Server's `agent_server` binding.
+
+The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 
 ## Tokenization and On-Policy Corrections
 
