@@ -2624,9 +2624,8 @@ def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     """Gym servers build their resource from `nemo.gym.*` and little else.
 
     Without the job identity their spans carry no campaign stage, so ingest
-    keyed on it drops them. `nv.dl.rank` is withheld on purpose: lens derives
-    `service.instance.id` from it, so one rank would collapse every server
-    onto a single instance id.
+    keyed on it drops them. The per-process keys are withheld because Gym sets
+    them for itself and lens resolves caller attributes over environment ones.
     """
     import os
     from types import SimpleNamespace as NS

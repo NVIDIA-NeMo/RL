@@ -831,8 +831,8 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
 
 
 # Withheld from the servers; everything else describes the job and is forwarded.
-# nv.dl.rank especially: lens derives service.instance.id as "<run id>-rank<n>",
-# so forwarding one rank would collapse every server onto a single instance id.
+# Gym sets rank, world size and pid for itself, and lens resolves caller
+# attributes over environment ones, so forwarding ours would be ignored anyway.
 _GYM_PER_PROCESS_RESOURCE_KEYS = frozenset(
     {
         "service.name",
