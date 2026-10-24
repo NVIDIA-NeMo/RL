@@ -2552,3 +2552,65 @@ def test_gym_span_groups_are_registered_before_telemetry_is_configured():
         "nemo_gym.telemetry is imported after init_telemetry_worker, so Gym's "
         "span groups register too late to be selectable"
     )
+
+
+def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
+    """Gym's server venvs and per-server telemetry both hang off this block.
+
+    Gym translates ``telemetry:`` into ``NEMO_GYM_OTEL_*`` before spawning, which
+    is what makes ``server_venv_requirements()`` add nemo-lens to every server
+    venv. Omitting it is why the actor exported while all 100+ servers stayed
+    silent. It must stay omitted when this process is not exporting, so a run
+    with telemetry off resolves the same venvs it resolves today.
+    """
+    from unittest.mock import MagicMock
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+
+    def spin_up(handle, **extra):
+        monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
+        cfg = {
+            "initial_global_config_dict": {},
+            "model_name": "policy",
+            "base_urls": ["http://127.0.0.1:1/v1"],
+            **extra,
+        }
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    # Telemetry off, and up but not exporting: the block must not appear at all.
+    assert "telemetry" not in spin_up(None)
+    assert "telemetry" not in spin_up(SimpleNamespace(is_exporting=False))
+
+    exporting = SimpleNamespace(is_exporting=True)
+    assert spin_up(exporting)["telemetry"] == {"enabled": True}
+
+    # Overrides ride along, and win over the default -- an explicit
+    # enabled: false is how a run opts out without turning off RL's own.
+    configured = spin_up(exporting, telemetry={"span_groups": "default,sandbox"})
+    assert configured["telemetry"] == {
+        "enabled": True,
+        "span_groups": "default,sandbox",
+    }
+    assert spin_up(exporting, telemetry={"enabled": False})["telemetry"] == {
+        "enabled": False
+    }

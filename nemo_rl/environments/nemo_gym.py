@@ -109,6 +109,7 @@ from nemo_rl.telemetry.instrumentation import (
     streaming_umbrella_span,
 )
 from nemo_rl.telemetry.setup import (
+    get_telemetry_handle,
     init_telemetry_worker,
     instrument_aiohttp_client,
     shutdown_telemetry,
@@ -435,6 +436,10 @@ class NemoGymConfig(TypedDict):
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
+    # Overrides merged into the `telemetry:` block projected into Gym's global
+    # config, e.g. {"span_groups": "default,sandbox"}. Only consulted when this
+    # process exports telemetry; see _gym_telemetry_block.
+    telemetry: NotRequired[Dict[str, Any]]
     invalid_tool_call_patterns: NotRequired[
         List[str] | None
     ]  # Substrings in assistant text content that indicate an invalid tool call
@@ -930,6 +935,27 @@ class NemoGym(EnvironmentInterface):
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
+
+        # Gym's per-server venvs install nemo-gym[dev], not nemo-gym[telemetry],
+        # and each server process reads its own telemetry settings rather than
+        # inheriting a handle. Both follow from this one block: Gym translates it
+        # into NEMO_GYM_OTEL_* before spawning anything, which is what lets
+        # server_venv_requirements() add nemo-lens to every server venv. Without
+        # it this actor exports while every server stays silent, which is the one
+        # configuration that yields a trace with a hole in the middle.
+        #
+        # Omitted entirely unless this process is exporting, so a run with
+        # telemetry off builds the same venvs it builds today. The endpoint is
+        # not restated here: Gym servers are children of this process and read
+        # OTEL_EXPORTER_OTLP_ENDPOINT from the environment they inherit.
+        telemetry_handle = get_telemetry_handle()
+        if telemetry_handle is not None and telemetry_handle.is_exporting:
+            from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
+
+            initial_global_config_dict.setdefault(
+                TELEMETRY_KEY_NAME,
+                {"enabled": True, **(self.cfg.get("telemetry") or {})},
+            )
 
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
