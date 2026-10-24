@@ -29,12 +29,14 @@ policy:
     mcore_generation_config:
       refit_backend: nccl
       transformer_impl: inference_optimized
-      inference_grouped_gemm_backend: torch
+      inference_grouped_gemm_backend: flashinfer
+      inference_flashinfer_mxfp8_token_capacity: 1024
       inference_moe_token_dispatcher_type: nvls
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 8
       sequence_parallel: true
       logprobs_mode: raw_logprobs
+      mamba_inference_ssm_states_dtype: float32
       fp8_cfg:
         enabled: true
         fp8: e4m3

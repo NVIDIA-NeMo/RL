@@ -203,11 +203,28 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Type of truncated importance sampling:
     #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
+    #   "adaptive-ppo-clip" – advantage-aware token filtering with an
+    #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
-    # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
+    # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
+    # seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
+    # adaptive-ppo-clip only; ignored by the other truncated importance
+    # sampling types. The positive-advantage upper bound is
+    # truncated_importance_sampling_ratio + k. After each training step, k rises
+    # by k_step if approx_entropy is below the target entropy and falls by k_step
+    # if it is above, clamped to [0, k_max]. Tokens with IS weight above
+    # outer_bound are dropped regardless of advantage sign.
+    truncated_importance_sampling_adaptive_target_entropy: float = Field(
+        default=0.3, ge=0.0
+    )
+    truncated_importance_sampling_adaptive_k_step: float = Field(default=0.25, gt=0.0)
+    truncated_importance_sampling_adaptive_k_max: float = Field(default=1.0, ge=0.0)
+    truncated_importance_sampling_adaptive_outer_bound: float = Field(
+        default=50.0, gt=0.0
+    )
 
     # --- On-policy ---
     # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
@@ -363,14 +380,29 @@ class ClippedPGLossFn(LossFunction):
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
         self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
-        # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
+        # Type of truncated importance sampling:
+        # "tis" | "icepop" | "adaptive-ppo-clip" | "seq-mask-tis"
         self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
         self.truncated_importance_sampling_ratio = (
             cfg.truncated_importance_sampling_ratio
         )
-        # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
+        # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
+        # seq-mask-tis filtering
         self.truncated_importance_sampling_ratio_min = (
             cfg.truncated_importance_sampling_ratio_min
+        )
+        # adaptive-ppo-clip controller settings
+        self.truncated_importance_sampling_adaptive_target_entropy = (
+            cfg.truncated_importance_sampling_adaptive_target_entropy
+        )
+        self.truncated_importance_sampling_adaptive_k_step = (
+            cfg.truncated_importance_sampling_adaptive_k_step
+        )
+        self.truncated_importance_sampling_adaptive_k_max = (
+            cfg.truncated_importance_sampling_adaptive_k_max
+        )
+        self.truncated_importance_sampling_adaptive_outer_bound = (
+            cfg.truncated_importance_sampling_adaptive_outer_bound
         )
         self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
         self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
@@ -397,10 +429,11 @@ class ClippedPGLossFn(LossFunction):
                 "use_cispo is incompatible with disable_ppo_ratio; "
                 "CISPO needs the pi_theta/pi_theta_old ratio but disable_ppo_ratio removes it"
             )
-            assert not self.force_on_policy_ratio, (
-                "use_cispo is incompatible with force_on_policy_ratio; "
-                "forcing ratio=1 removes the clipped IS-weight that CISPO optimizes"
-            )
+            if self.force_on_policy_ratio:
+                assert (
+                    self.use_importance_sampling_correction
+                    and self.truncated_importance_sampling_type == "tis"
+                ), "CISPO with force_on_policy_ratio requires IS correction with TIS"
             assert not self.sequence_level_importance_ratios, (
                 "use_cispo is incompatible with sequence_level_importance_ratios; "
                 "CISPO uses token-level importance weights"
@@ -420,9 +453,11 @@ class ClippedPGLossFn(LossFunction):
             assert self.truncated_importance_sampling_type in (
                 "tis",
                 "icepop",
+                "adaptive-ppo-clip",
                 "seq-mask-tis",
             ), (
-                f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
+                "truncated_importance_sampling_type must be 'tis', 'icepop', "
+                "'adaptive-ppo-clip', or 'seq-mask-tis', "
                 f"got {self.truncated_importance_sampling_type}"
             )
             assert (
@@ -437,15 +472,40 @@ class ClippedPGLossFn(LossFunction):
                     "truncated_importance_sampling_ratio_min must be <= "
                     "truncated_importance_sampling_ratio"
                 )
-            if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
+            if self.truncated_importance_sampling_type in (
+                "icepop",
+                "adaptive-ppo-clip",
+                "seq-mask-tis",
+            ):
                 assert self.truncated_importance_sampling_ratio_min is not None, (
-                    "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
+                    "truncated_importance_sampling_ratio_min should be set when "
+                    "truncated_importance_sampling_type is 'icepop', "
+                    "'adaptive-ppo-clip', or 'seq-mask-tis'"
                 )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
                 assert not self.sequence_level_importance_ratios, (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
+            if self.truncated_importance_sampling_type == "adaptive-ppo-clip":
+                assert self.force_on_policy_ratio, (
+                    "adaptive-ppo-clip is intended for async RL; set "
+                    "force_on_policy_ratio=True to use it"
+                )
+                assert self.metrics_level == "full", (
+                    "adaptive-ppo-clip adapts its upper bound from approx_entropy, "
+                    "which only metrics_level='full' computes"
+                )
+                assert not self.sequence_level_importance_ratios, (
+                    "adaptive-ppo-clip uses token-level advantage-aware filtering "
+                    "and is incompatible with sequence_level_importance_ratios=True"
+                )
+
+        # adaptive-ppo-clip controller state. The driver advances it once per
+        # training step; workers receive it with the serialized loss function.
+        self.cur_adaptive_ppo_clip_k: float | None = (
+            0.0 if self.has_adaptive_loss_state() else None
+        )
 
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
@@ -516,7 +576,8 @@ class ClippedPGLossFn(LossFunction):
             }
         if self.truncated_importance_sampling_type is not None:
             # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
-            # sequences (÷ global_valid_seqs); tis/icepop are token-level.
+            # sequences (÷ global_valid_seqs); tis/icepop/adaptive-ppo-clip
+            # are token-level.
             self.metric_normalizations["is_oob_ratio"] = (
                 MetricNormalizer.SEQUENCES
                 if self.truncated_importance_sampling_type == "seq-mask-tis"
@@ -541,6 +602,38 @@ class ClippedPGLossFn(LossFunction):
                         "opd_full_decomposition_error": MetricNormalizer.NONE,
                     }
                 )
+
+    def has_adaptive_loss_state(self) -> bool:
+        """Whether this loss carries controller state across training steps."""
+        return self.truncated_importance_sampling_type == "adaptive-ppo-clip"
+
+    def set_adaptive_ppo_clip_k(self, k: float) -> None:
+        """Set k, clamped to [0, k_max]; no-op without adaptive-ppo-clip."""
+        if not self.has_adaptive_loss_state():
+            return
+
+        self.cur_adaptive_ppo_clip_k = min(
+            self.truncated_importance_sampling_adaptive_k_max,
+            max(0.0, float(k)),
+        )
+
+    def update_adaptive_loss_state(self, entropy: float) -> None:
+        """Step k once after a training step to steer entropy toward the target.
+
+        Entropy above the target narrows the positive-advantage upper bound;
+        entropy below it widens the bound. k is clamped to [0, k_max].
+        """
+        if not self.has_adaptive_loss_state():
+            return
+
+        cur_k = self.cur_adaptive_ppo_clip_k
+        assert cur_k is not None
+        target_entropy = self.truncated_importance_sampling_adaptive_target_entropy
+        if entropy > target_entropy:
+            cur_k -= self.truncated_importance_sampling_adaptive_k_step
+        elif entropy < target_entropy:
+            cur_k += self.truncated_importance_sampling_adaptive_k_step
+        self.set_adaptive_ppo_clip_k(cur_k)
 
     @property
     def requires_survivor_normalization(self) -> bool:
@@ -617,6 +710,9 @@ class ClippedPGLossFn(LossFunction):
                 "curr_logprobs_unfiltered", curr_logprobs
             )
 
+        # Preserve the global-batch denominators when a microbatch has
+        # rows without response loss tokens.
+        sample_mask = sample_mask * token_mask.bool().any(dim=-1)
         mask = token_mask * sample_mask.unsqueeze(-1)
         full_metrics = self.metrics_level == "full"
         need_importance_weights = (
@@ -657,19 +753,7 @@ class ClippedPGLossFn(LossFunction):
             mask = token_mask * sample_mask.unsqueeze(-1)
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()
-            # A rejected nonfinite logprob must not poison a zero-weight loss.
-            curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
             prev_logprobs = curr_logprobs.detach()
-            generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
-            if self.reference_policy_kl_penalty != 0:
-                curr_logprobs_unfiltered = torch.where(
-                    mask.bool(),
-                    data.get("curr_logprobs_unfiltered", next_token_logprobs),
-                    0.0,
-                )
-                reference_policy_logprobs = torch.where(
-                    mask.bool(), data["reference_policy_logprobs"][:, 1:], 0.0
-                )
 
         # Reference KL uses the unfiltered policy and retains its own token set.
         # Actor support mismatches must not discard otherwise valid KL terms.
@@ -677,6 +761,15 @@ class ClippedPGLossFn(LossFunction):
         kl_sample_mask = sample_mask
         kl_mask = mask
         kl_generation_logprobs = torch.where(kl_mask.bool(), generation_logprobs, 0.0)
+        if self.reference_policy_kl_penalty != 0:
+            # Sanitize before KL arithmetic even without sequence rejection;
+            # multiplying a masked nonfinite result by zero is too late.
+            curr_logprobs_unfiltered = torch.where(
+                kl_mask.bool(), curr_logprobs_unfiltered, 0.0
+            )
+            reference_policy_logprobs = torch.where(
+                kl_mask.bool(), reference_policy_logprobs, 0.0
+            )
 
         # Keep support information until all three policy distributions are
         # available. Replacing -inf with zero earlier turns an impossible token
@@ -747,7 +840,7 @@ class ClippedPGLossFn(LossFunction):
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
         # -------------------------------------------------------------
-        _is_filter_metrics: dict = {}  # populated for icepop / seq-mask-tis
+        _is_filter_metrics: dict = {}  # populated for tis / icepop / adaptive-ppo-clip / seq-mask-tis
         # See: docs/guides/grpo.md#importance-sampling-correction
         if not need_importance_weights:
             # No objective or emitted metric needs the actor/generation
@@ -773,11 +866,16 @@ class ClippedPGLossFn(LossFunction):
         # ---- Truncated Importance Sampling ----
         # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
+        # "adaptive-ppo-clip"
+        #                – zero out A<0 tokens whose IS weight < min, A>0 tokens
+        #                  whose IS weight > max + k (k adapts to entropy), and
+        #                  every token whose IS weight exceeds the outer bound
+        #   Paper: https://microsoft.ai/pdf/mai-thinking-1.pdf
         # "seq-mask-tis" – zero out entire sequences whose geometric-mean
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
-        # is_oob_ratio: fraction of tokens (tis/icepop) or sequences (seq-mask-tis)
+        # is_oob_ratio: fraction of tokens (tis/icepop/adaptive-ppo-clip) or sequences (seq-mask-tis)
         # whose importance weight falls outside the truncation bounds. Each microbatch
         # contributes its out-of-bounds count divided by the *global* valid token/seq
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
@@ -809,6 +907,38 @@ class ClippedPGLossFn(LossFunction):
                 ) & (
                     actor_importance_weights_expanded
                     <= self.truncated_importance_sampling_ratio
+                )
+                _is_filter_metrics = {
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ),
+                }
+                actor_importance_weights_expanded = torch.where(
+                    token_kept_mask,
+                    actor_importance_weights_expanded,
+                    torch.zeros_like(actor_importance_weights_expanded),
+                )
+            elif self.truncated_importance_sampling_type == "adaptive-ppo-clip":
+                tis_min = self.truncated_importance_sampling_ratio_min
+                assert tis_min is not None
+                cur_k = self.cur_adaptive_ppo_clip_k
+                assert cur_k is not None
+                tis_max = self.truncated_importance_sampling_ratio + cur_k
+
+                within_outer_bound = (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_adaptive_outer_bound
+                )
+                negative_adv_kept = (advantages >= 0) | (
+                    actor_importance_weights_expanded >= tis_min
+                )
+                positive_adv_kept = (advantages <= 0) | (
+                    actor_importance_weights_expanded <= tis_max
+                )
+                token_kept_mask = (
+                    within_outer_bound & negative_adv_kept & positive_adv_kept
                 )
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
@@ -2113,8 +2243,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             [V_student, top_k]) or the sparse multi-token format
             (dict[(student_id, teacher_id)] -> count), loaded lazily on first
             call by each worker process. Runtime-injected by
-            ``xtoken_off_policy_distillation.setup`` from ``teachers[i]``; not a
-            user loss_fn key in YAML.
+            ``xtoken_off_policy_distillation.setup`` from
+            ``teachers[i].aligner.projection_matrix_path``; not a user loss_fn
+            key in YAML.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
             *uncommon* set (sorted L1).
@@ -2204,8 +2335,7 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
       ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
       (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
-      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``;
-      partition masks; ``num_chunks``).
+      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``).
     - Same-tokenizer teacher: no ``teacher_{i}_input_ids`` / ``alignment_{i}_*``;
       it reuses the student tokenization (identity 1:1 aligned).
     """

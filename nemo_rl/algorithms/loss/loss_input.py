@@ -98,7 +98,7 @@ def _prepare_opd_full_loss_input(
     if vocab_parallel_group is None:
         raise NotImplementedError(
             "opd_full currently requires the Megatron vocabulary-parallel path; "
-            "the DTensor-only logit path is not supported."
+            "the Automodel-only logit path is not supported."
         )
 
     payload_field = opd_full_payload_field(full_cfg)

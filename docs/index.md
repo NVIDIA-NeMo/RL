@@ -20,7 +20,7 @@ Learn about NeMo RL's architecture, design philosophy, and key features that mak
 :link: about/quick-start
 :link-type: doc
 
-Get up and running quickly with examples for both DTensor and Megatron Core training backends.
+Get up and running quickly with examples for both Automodel and Megatron Core training backends.
 :::
 
 :::{grid-item-card} {octicon}`download` Installation
@@ -55,7 +55,7 @@ Troubleshooting common issues including missing submodules and memory fragmentat
 :link: about/backends
 :link-type: doc
 
-Learn about DTensor and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
+Learn about Automodel and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
 :::
 
 :::{grid-item-card} {octicon}`workflow` Algorithms
@@ -69,7 +69,7 @@ Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy disti
 :link: about/evaluation
 :link-type: doc
 
-Learn how to evaluate your models using built-in evaluation datasets and custom evaluation pipelines.
+Measure model and agent capabilities with repeatable benchmarks and custom evaluations.
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
@@ -128,6 +128,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`rocket` Automodel Speculative Decoding
+:link: guides/automodel-speculative-decoding
+:link-type: doc
+
+Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the Automodel backend.
+:::
+
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
 :link: guides/grpo-audio
 :link-type: doc
@@ -160,7 +167,7 @@ Learn how to add support for new model architectures in NeMo RL.
 :link: guides/lora
 :link-type: doc
 
-Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron schema comparison, config examples, and recipes.
+Parameter-efficient fine-tuning with LoRA: backend support, Automodel vs Megatron schema comparison, config examples, and recipes.
 :::
 
 :::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
@@ -327,7 +334,6 @@ guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
-guides/eval.md
 guides/deepseek.md
 guides/models/index.md
 model-quirks.md
@@ -335,6 +341,7 @@ guides/async-grpo.md
 guides/single-controller.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
+guides/automodel-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
@@ -342,7 +349,7 @@ guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
 guides/muon-optimizer.md
-guides/dtensor-tp-accuracy.md
+guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md
 ```
 
@@ -381,12 +388,13 @@ design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/ppo-colocated-streaming.md
+design-docs/pd-disaggregation-rollout.md
 design-docs/dynamo-integration.md
 design-docs/sparse-delta-refit.md
 design-docs/checkpoint-engines.md
 design-docs/checkpointing.md
 design-docs/loss-functions.md
-design-docs/fsdp2-parallel-plan.md
+design-docs/automodel-parallel-plan.md
 design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md

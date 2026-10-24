@@ -25,6 +25,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -44,6 +45,10 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.router_replay import (
+    microbatch_replay_context,
+    router_replay_gates,
+)
 from nemo_rl.models.automodel.setup import (
     setup_distributed,
     setup_model_and_optimizer,
@@ -61,7 +66,8 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.generation.interfaces import RefitPayloadMode
+from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -69,6 +75,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    enable_deterministic_algorithms,
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
@@ -95,7 +102,15 @@ from nemo_rl.utils.timer import Timer
 def _refit_tensor_dtype(
     fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
 ) -> torch.dtype:
-    """Preserve the FP32 dtype used by inference-critical MoE router state."""
+    """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
+
+    Integer/bool buffers (e.g. the reduced-vocab draft's d2t index map) must
+    keep their dtype — token ids are not representable in bf16. FP32
+    ``e_score_correction_bias`` tensors are inference-critical MoE router
+    state and must also stay FP32.
+    """
+    if not tensor.is_floating_point():
+        return tensor.dtype
     is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
         "e_score_correction_bias"
     )
@@ -104,7 +119,7 @@ def _refit_tensor_dtype(
     return default_dtype
 
 
-def automodel_params_generator(
+def _module_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
@@ -118,8 +133,20 @@ def automodel_params_generator(
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
         the refit dtype and made contiguous.
     """
-    module_map = dict(model.named_modules())
-    for name, tensor in model.state_dict().items():
+    # Key the module map by the names ``state_dict()`` uses. With activation
+    # checkpointing Automodel wraps every decoder block in torch's
+    # ``CheckpointWrapper``, whose ``_checkpoint_wrapped_module.`` component
+    # ``state_dict()`` strips but ``named_modules()`` keeps; keyed by raw module
+    # names the lookup below missed every ``LinearLoRA`` inside a block and the
+    # refit silently streamed bare base weights (generation never saw the
+    # trained adapters). ``canonical_parameter_fqn`` is Automodel's own
+    # state-dict spelling, shared with its checkpoint and optimizer code.
+    module_map = {
+        canonical_parameter_fqn(name): module for name, module in model.named_modules()
+    }
+    state_dict = model.state_dict()
+    _assert_lora_modules_reachable(module_map, state_dict)
+    for name, tensor in state_dict.items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -136,6 +163,52 @@ def automodel_params_generator(
         del adapted_fqn_tensors
         del merged_tensor
         del full_tensor
+
+
+def automodel_params_generator(
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    draft_model: Optional[nn.Module] = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Policy weights, followed by ``draft.<name>`` weights when co-training.
+
+    The draft is a plain HF module (no LoRA, no state-dict adapter), so
+    ``_module_params_generator``'s merge/adapt steps are no-ops for it.
+    """
+    yield from _module_params_generator(model, target_dtype)
+    if draft_model is not None:
+        from nemo_rl.models.automodel.draft.runtime import draft_refit_export_name
+
+        for name, tensor in _module_params_generator(draft_model, target_dtype):
+            yield f"draft.{draft_refit_export_name(name)}", tensor
+
+
+def _assert_lora_modules_reachable(
+    module_map: dict[str, nn.Module], state_dict: dict[str, Any]
+) -> None:
+    """Fail loudly if a ``LinearLoRA`` has no matching ``state_dict`` weight.
+
+    A LoRA module the merge cannot find reaches the inference engine as its
+    bare base weight; nothing else reports it, and the only symptom is a
+    slowly growing train/generation logprob mismatch many steps later.
+
+    Only ``LinearLoRA`` is covered because it is the only adapter this file
+    merges. When the grouped-expert LoRA merge lands (#3353), extend this
+    check to those adapter modules too so that path keeps the same loud
+    failure instead of silently refitting base expert weights.
+    """
+    unreachable = sorted(
+        name
+        for name, module in module_map.items()
+        if isinstance(module, LinearLoRA) and f"{name}.weight" not in state_dict
+    )
+    if unreachable:
+        raise RuntimeError(
+            f"{len(unreachable)} LinearLoRA module(s) have no matching state_dict "
+            f"weight, so the refit would drop their LoRA update: {unreachable[:5]}. "
+            "A module wrapper is rewriting parameter names in a way "
+            "canonical_parameter_fqn does not undo."
+        )
 
 
 @torch.no_grad()
@@ -163,16 +236,16 @@ def _maybe_merge_lora_weight(
         if isinstance(module.lora_B.weight, DTensor)
         else module.lora_B.weight
     )
-    lora_a = lora_a.to(device=tensor.device, dtype=tensor.dtype)
-    lora_b = lora_b.to(device=tensor.device, dtype=tensor.dtype)
-    scale = getattr(module, "scale", None)
+    # LinearLoRA._init_adapter always sets ``scale = alpha / dim``.
+    scale = getattr(module, "scale", 1.0)
 
-    if scale is None and hasattr(module, "alpha") and hasattr(module, "dim"):
-        scale = module.alpha / module.dim
-    if scale is None:
-        scale = 1.0
-
-    return tensor + torch.matmul(lora_b, lora_a) * scale
+    # Merge in fp32 and round once: computing ``B @ A`` and the sum in the base
+    # dtype (bf16 in practice) rounds twice and can differ from an offline fp32
+    # merge of the same adapter by one bf16 ulp per element.
+    lora_a = lora_a.to(device=tensor.device, dtype=torch.float32)
+    lora_b = lora_b.to(device=tensor.device, dtype=torch.float32)
+    merged = tensor.to(torch.float32) + torch.matmul(lora_b, lora_a) * scale
+    return merged.to(tensor.dtype)
 
 
 def _maybe_adapt_tensor_to_hf(
@@ -229,6 +302,8 @@ class AutomodelPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the AutomodelPolicyWorker."""
+        if config["automodel_cfg"].get("deterministic"):
+            enable_deterministic_algorithms()
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
@@ -350,19 +425,42 @@ class AutomodelPolicyWorkerImpl(
             optimizer_path=None if defer_checkpoint_load else optimizer_path,
         )
 
-        # Set instance attributes from model and optimizer state (tuple unpacking)
-        (
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.is_hf_model,
-            self.is_moe_model,
-            self._is_reward_model,  # Note: using underscore prefix for internal naming
-            self.model_class,
-            self.model_config,
-            self.peft_config,
-            self.autocast_enabled,
-        ) = model_and_optimizer_state
+        # Set instance attributes from model and optimizer state. Access by
+        # field name (not positional unpacking) so optional fields appended to
+        # ModelAndOptimizerState stay backward compatible across workers.
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.is_hf_model = model_and_optimizer_state.is_hf_model
+        self.is_moe_model = model_and_optimizer_state.is_moe_model
+
+        self._is_reward_model = model_and_optimizer_state.is_reward_model
+        self.model_class = model_and_optimizer_state.model_class
+        self.model_config = model_and_optimizer_state.model_config
+        self.peft_config = model_and_optimizer_state.peft_config
+        self.autocast_enabled = model_and_optimizer_state.autocast_enabled
+        self.draft_model = model_and_optimizer_state.draft_model
+        self.composite_model = model_and_optimizer_state.composite_model
+
+        # Draft co-training runtime (draft loss, hidden capture, grad-norm
+        # reporting). Present when policy.draft is enabled on this backend:
+        # dspark/dflash share DSparkRuntime (dflash is the markov-free,
+        # confidence-free subset), eagle3 uses the TTT Eagle3Runtime. Built in
+        # setup_model_and_optimizer (mirrors Megatron, which attaches the
+        # draft during its own setup and has the worker only read it back).
+        self.draft_runtime = model_and_optimizer_state.draft_runtime
+
+        # R3: the policy's replayable MoE gates, fixed for the model's lifetime.
+        self._router_replay_gates = (
+            router_replay_gates(self.model) if router_replay_enabled(config) else None
+        )
+        if self._router_replay_gates == []:
+            raise RuntimeError(
+                "policy.router_replay.enabled but the model has no RouterReplay gates. R3 "
+                "needs an MoE model whose Automodel class builds its gates from "
+                "moe_overrides (enable_routing_replay), with "
+                "automodel_kwargs.backend.fake_balanced_gate off."
+            )
 
         # Initialize reference model if requested. With deferred loading the
         # model still holds the base (model_name) weights here, so the KL
@@ -404,7 +502,7 @@ class AutomodelPolicyWorkerImpl(
         return torch.autocast(device_type="cuda", dtype=self.dtype)
 
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        """Record the rollout engine's TP size for later use by weight-streaming refit."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("automodel_policy_worker/train")
@@ -435,6 +533,10 @@ class AutomodelPolicyWorkerImpl(
         # Validate sequence dimension
         sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
 
+        # Draft co-training is active only for real training steps; eval and
+        # logprob forwards never run capture hooks or the draft loss.
+        draft_runtime = self.draft_runtime if not eval_mode else None
+
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
@@ -442,6 +544,8 @@ class AutomodelPolicyWorkerImpl(
             ctx = nullcontext()
             # Ensure model is in training mode
             self.model.train()
+            if draft_runtime is not None:
+                self.draft_model.train()
 
         # Create loss post-processor
         loss_post_processor = LossPostProcessor(
@@ -452,6 +556,7 @@ class AutomodelPolicyWorkerImpl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            draft_runtime=draft_runtime,
         )
 
         # Setup cache clearing callback if configured
@@ -517,6 +622,7 @@ class AutomodelPolicyWorkerImpl(
                     num_global_batches=num_global_batches,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    router_replay_gates=self._router_replay_gates,
                 )
 
                 # Extract losses and metrics from results
@@ -528,6 +634,14 @@ class AutomodelPolicyWorkerImpl(
                         loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
                             0
                         ]["lr"]
+                        if self.draft_model is not None:
+                            # param_groups[0] is "policy" (see
+                            # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
+                            # lr is otherwise never logged anywhere, so its
+                            # schedule can't be verified from wandb/TB.
+                            loss_metrics["draft_lr"] = self.optimizer.param_groups[1][
+                                "lr"
+                            ]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
 
@@ -540,6 +654,10 @@ class AutomodelPolicyWorkerImpl(
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
+                    # The policy is clipped on its own (Megatron-path parity):
+                    # a shared global clip let the draft's larger gradients
+                    # scale down the policy's updates on every step. The draft
+                    # is clipped separately below.
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -560,6 +678,25 @@ class AutomodelPolicyWorkerImpl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
                     warn_if_inf_grad_norm(grad_norm)
+
+                    # Independent draft clip with the same max norm; the
+                    # returned pre-clip norm doubles as the reported metric.
+                    if draft_runtime is not None:
+                        draft_grad_norm = float(
+                            scale_grads_and_clip_grad_norm(
+                                self.max_grad_norm,
+                                [self.draft_model],
+                                norm_type=2.0,
+                                pp_enabled=False,
+                                device_mesh=self.device_mesh,
+                                moe_mesh=None,
+                                ep_axis_name=None,
+                                pp_axis_name=None,
+                                foreach=True,
+                                num_label_tokens=1,
+                                dp_group_size=self.dp_size * self.cp_size,
+                            )
+                        )
 
                     # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
@@ -584,17 +721,29 @@ class AutomodelPolicyWorkerImpl(
                 dp_group=self.dp_mesh.get_group(),
                 dtype=self.dtype,
             )
+            if draft_runtime is not None:
+                # Like grad_norm, this reflects the last global batch. Returned
+                # as a CPU tensor to match the Megatron worker's return type
+                # (the trainer calls .numpy() on it).
+                metrics["draft_grad_norm"] = torch.tensor(
+                    draft_grad_norm, device="cpu", dtype=torch.float32
+                )
 
             self.timer.stop("train")
             return metrics
 
     @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
-        self, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
-        Uses the configured logprob_batch_size to do microbatching.
+        Uses the configured logprob_batch_size to do microbatching. With
+        ``policy.router_replay.enabled``, the rollout ``routed_experts`` are replayed (R3)
+        unless ``require_router_replay`` is False (e.g. for the reference model).
 
         Input data is assumed to be right-padded. The method internally converts to
         left-padded format for computation, and returns outputs in right-padded format.
@@ -647,7 +796,15 @@ class AutomodelPolicyWorkerImpl(
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
-                with prepared.model_context_factory(), self._autocast_context():
+                replay_context = microbatch_replay_context(
+                    self._router_replay_gates if require_router_replay else None,
+                    processed_mb,
+                )
+                with (
+                    replay_context,
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
                     token_logprobs, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
@@ -1038,11 +1195,8 @@ class AutomodelPolicyWorkerImpl(
         return self.model.config
 
     @torch.no_grad()
-    def prepare_refit_info(
-        self, *, refit_payload_mode: RefitPayloadMode = "hf_export"
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        del refit_payload_mode
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
@@ -1058,6 +1212,16 @@ class AutomodelPolicyWorkerImpl(
                     adapted_fqn, adapted_tensor, self.dtype
                 )
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
+
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.runtime import draft_refit_export_name
+
+            # The draft is a native HF module: no adapter, no LoRA. DTensor
+            # .shape is already the global shape, so no gather is needed here.
+            for name, tensor in self.draft_model.state_dict().items():
+                fqn = draft_refit_export_name(name)
+                dtype = _refit_tensor_dtype(fqn, tensor, self.dtype)
+                state_dict_info[f"draft.{fqn}"] = (tensor.shape, dtype)
 
         return state_dict_info
 
@@ -1085,7 +1249,7 @@ class AutomodelPolicyWorkerImpl(
         """Stream model weights to peer process via ZMQ IPC socket."""
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         self.maybe_init_zmq()
@@ -1097,7 +1261,9 @@ class AutomodelPolicyWorkerImpl(
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=automodel_params_generator(self.model, self.dtype),
+            params_generator=automodel_params_generator(
+                self.model, self.dtype, draft_model=self.draft_model
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1114,7 +1280,7 @@ class AutomodelPolicyWorkerImpl(
         target_precision: str = "bf16",
         sglang_quantization_cfg: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
+        """Send Automodel weights to colocated SGLang engines via Ray CUDA IPC.
 
         Synchronous: each chunk is awaited via ``ray.get`` inside
         :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
@@ -1123,7 +1289,7 @@ class AutomodelPolicyWorkerImpl(
         """
         if target_precision != "bf16":
             raise NotImplementedError(
-                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                "The Automodel policy only supports BF16 SGLang refits; "
                 f"got target_precision={target_precision!r}."
             )
         del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
@@ -1150,7 +1316,9 @@ class AutomodelPolicyWorkerImpl(
     def _checkpoint_engine_params(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        return automodel_params_generator(self.model, self.dtype)
+        return automodel_params_generator(
+            self.model, self.dtype, draft_model=self.draft_model
+        )
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
@@ -1160,6 +1328,7 @@ class AutomodelPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         """Broadcast the weights for collective communication.
 
@@ -1178,6 +1347,7 @@ class AutomodelPolicyWorkerImpl(
                 kv_scales=kv_scales,
                 buffer_size_bytes=buffer_size_bytes,
                 num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
             )
         if guard.fired:
             # The aborted collective returned cleanly, so this is the only signal there is.
@@ -1192,10 +1362,11 @@ class AutomodelPolicyWorkerImpl(
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> None:
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
             )
 
         # Manually move model to cuda for cpu offload case
@@ -1210,12 +1381,15 @@ class AutomodelPolicyWorkerImpl(
         automodel_post_iter_func = lambda x: x[1]
 
         packed_broadcast_producer(
-            iterator=automodel_params_generator(self.model, self.dtype),
+            iterator=automodel_params_generator(
+                self.model, self.dtype, draft_model=self.draft_model
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=automodel_post_iter_func,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
 
         # Manually move model to cpu for cpu offload case
@@ -1289,6 +1463,9 @@ class AutomodelPolicyWorkerImpl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        # Release recompute activations that MoE dispatch state keeps alive;
+        # otherwise they pin cached segments and empty_cache() cannot free them.
+        release_moe_dispatcher_state(self.model)
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1351,17 +1528,38 @@ class AutomodelPolicyWorkerImpl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        self.checkpoint_manager.save_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            is_final_checkpoint=is_final_checkpoint,
-            peft_config=self.peft_config,
-        )
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                save_checkpoint_with_draft,
+            )
+
+            save_checkpoint_with_draft(
+                self.checkpoint_manager,
+                model=self.model,
+                draft_model=self.draft_model,
+                composite_model=self.composite_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+                peft_config=self.peft_config,
+                draft_config=self.cfg["draft"],
+            )
+        else:
+            self.checkpoint_manager.save_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+                peft_config=self.peft_config,
+            )
 
     def finalize_async_save(self) -> None:
         """Block until this worker's in-flight async checkpoint writes complete.
@@ -1380,13 +1578,30 @@ class AutomodelPolicyWorkerImpl(
         optimizer_path: Optional[str] = None,
     ) -> None:
         """Load a checkpoint into the model using Automodel Checkpointer."""
-        self.checkpoint_manager.load_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-        )
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                load_checkpoint_with_draft,
+            )
+
+            load_checkpoint_with_draft(
+                self.checkpoint_manager,
+                model=self.model,
+                draft_model=self.draft_model,
+                composite_model=self.composite_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                draft_config=self.cfg["draft"],
+            )
+        else:
+            self.checkpoint_manager.load_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
 
     def _init_checkpoint_manager(
         self,
