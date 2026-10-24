@@ -101,7 +101,7 @@ class UnitSlabStore:
              straight from ``slab_base + so`` and check the footer's blob tag.
              A mismatch (blob moved by a checkpoint restore) or a missing hint
              falls back to a directory lookup + ZMQ ``resolve`` pin.
-    - clear: 0 replies -- one ZMQ ``release_many`` per unit, fire-and-forget.
+    - clear: one awaited ZMQ ``release_rows`` per unit (row-wide).
 
     Ray remains only off the op path: the unit list at start (and if every
     cached unit refuses a put), and directory lookups for restored blobs.
@@ -232,8 +232,12 @@ class UnitSlabStore:
         n_entries: int,
         blob_id: str | None = None,
         deadline: float | None = None,
+        unit_id: int | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Write one blob of ``nbytes`` from scattered registered regions.
+
+        ``unit_id`` pins the blob to the unit that owns its rows (index
+        addressing); without it the placement picks any unit.
 
         ``segments`` are ``(local_addr, blob_off, n)``: a value sent zero-copy
         from the caller's own (registered) memory, or a run copied into a pool
@@ -253,9 +257,18 @@ class UnitSlabStore:
         refreshed = False
         while True:
             errs: list[Exception] = []
-            order = self.placement.order(
-                list(self._units.values()), node_id=self.node_id, nbytes=nbytes
-            )
+            if unit_id is not None:
+                if unit_id not in self._units:
+                    self._refresh_units()
+                if unit_id not in self._units:
+                    raise LostBlobs(
+                        [blob_id], f"unit {unit_id} unknown to the directory"
+                    )
+                order = [self._units[unit_id]]
+            else:
+                order = self.placement.order(
+                    list(self._units.values()), node_id=self.node_id, nbytes=nbytes
+                )
             # With the SSD tier on, every unit's RAM is tried before any unit spills.
             tries = [(c, True) for c in order]
             if self.ssd:
@@ -312,7 +325,7 @@ class UnitSlabStore:
                     )
                     errs.append(e)
                     continue
-                if self.ssd and not self._commit(u, blob_id, deadline, errs):
+                if not self._commit(u, blob_id, deadline, errs):
                     continue
                 self._blob_unit[blob_id] = unit_id
                 hint = {"u": unit_id, "g": self._gen(unit_id)}
@@ -337,22 +350,28 @@ class UnitSlabStore:
     def _commit(
         self, u: dict[str, Any], blob_id: str, deadline: float | None, errs: list
     ) -> bool:
-        """Awaited commit (design §4.1): the blob is durable once it returns True.
+        """Awaited commit: the blob's rows are published once it returns True.
 
         A blob the unit spilled to disk answers ``"pending"`` while its file is
-        written: ask again, inside the put deadline. On failure the blob is never
-        published; the unit drops it on abort.
+        written: ask again, inside the put deadline. Commit is idempotent on the
+        unit, so a call whose reply was lost is asked again too. On failure the
+        client aborts, which the unit ignores for a blob it did publish.
         """
         ok = False
         try:
             backoff = PENDING_POLL_S
             while True:
-                status = self.ctl.call(
-                    u["zmq"],
-                    "commit",
-                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
-                    blob_id=blob_id,
-                )
+                try:
+                    status = self.ctl.call(
+                        u["zmq"],
+                        "commit",
+                        timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                        blob_id=blob_id,
+                    )
+                except TransferError:
+                    if deadline is None:
+                        raise
+                    continue  # no reply: ask again until the deadline
                 if status != "pending":
                     break
                 backoff = busy_wait(deadline, backoff)
@@ -567,30 +586,82 @@ class UnitSlabStore:
                 self.ctl.notify(self._units[u]["zmq"], "unpin", pin_id=r["pin_id"])
         return {b: requests[b] for b in pending}
 
-    def release(
-        self, counts: dict[str, int], hints: dict[str, dict[str, Any]] | None = None
-    ) -> None:
-        """Drop live-entry counts: one ``release_many`` per unit, not awaited.
+    # -- index-addressed reads and clears (rows live on unit gidx % N)
+    def resolve_keys(
+        self, by_unit: dict[int, list[str]], deadline: float | None
+    ) -> dict[int, dict[str, Any]]:
+        """One ``resolve_keys`` per unit, in turn; pins what it finds.
 
-        ``hints`` maps blob -> its location meta. A live hint (stamp matches the
-        current unit instance) needs no lookup; anything else (restored blobs)
-        asks the directory, which the restore keeps current.
+        On a failure, units already resolved are unpinned before the error is
+        raised (``blob_ids`` of the error are the keys).
         """
-        hints = self._locate(list(counts), hints or {})
-        by_unit: dict[int, list[tuple[str, int]]] = {}
-        for b, n in counts.items():
-            u = hints.get(b, self._blob_unit.get(b))
-            if u is not None:
-                by_unit.setdefault(int(u), []).append((b, int(n)))
-        for u, items in by_unit.items():
+        resolved: dict[int, dict[str, Any]] = {}
+        for u, keys in by_unit.items():
             try:
-                self.ctl.notify(
-                    self._addr(u), "release_many", items=[[b, n] for b, n in items]
+                resolved[u] = self.ctl.call(
+                    self._addr(u),
+                    "resolve_keys",
+                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                    keys=keys,
                 )
-            except LostBlobs:
-                continue
-        for b in counts:
-            self._blob_unit.pop(b, None)
+            except (TransferError, LostBlobs, DataPlaneTimeout) as e:
+                self.unpin_all(resolved)
+                if isinstance(e, DataPlaneTimeout):
+                    raise
+                raise self._failed(u, keys, e) from e
+        return resolved
+
+    def read_entries(
+        self,
+        reads: dict[int, list[tuple[int, int, int]]],
+        keys_of: dict[int, list[str]],
+        deadline: float | None,
+    ) -> None:
+        """READ ``(slab_off, nbytes, local_addr)`` ranges, all units at once."""
+        ops = []
+        units = []
+        for u, ranges in reads.items():
+            uinfo = self._unit(u)
+            base = int(uinfo["slab_base"])
+            ops.append(
+                (
+                    "READ",
+                    [(laddr, n) for _, n, laddr in ranges],
+                    [(base + off, n) for off, n, _ in ranges],
+                    uinfo["agent_name"],
+                )
+            )
+            units.append(u)
+        errs = self.ep.transfer_many(ops, timeout_s=remaining(deadline, self.timeout_s))
+        for u, e in zip(units, errs):
+            if e is not None:
+                raise self._failed(u, keys_of[u], e) from e
+
+    def unpin_all(self, resolved: dict[int, dict[str, Any]]) -> None:
+        for u, r in resolved.items():
+            self.ctl.notify(self._addr(u), "unpin", pin_id=r["pin_id"])
+
+    def release_rows(
+        self, by_unit: dict[int, list[int]], deadline: float | None
+    ) -> None:
+        """Awaited row-wide clear: one ``release_rows`` per unit.
+
+        Rows on a dead unit are already gone, so clearing them succeeds; a live
+        unit that does not answer fails the clear (retryable).
+        """
+        for u, gidxs in by_unit.items():
+            try:
+                self.ctl.call(
+                    self._addr(u),
+                    "release_rows",
+                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
+                    gidxs=gidxs,
+                )
+            except (TransferError, LostBlobs) as e:
+                err = self._failed(u, [str(g) for g in gidxs], e)
+                if isinstance(err, LostBlobs):
+                    continue
+                raise err from e
 
     def close(self) -> None:
         self.ctl.close()

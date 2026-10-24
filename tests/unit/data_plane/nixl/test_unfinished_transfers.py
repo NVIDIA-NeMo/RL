@@ -259,7 +259,7 @@ def _plan_with_zero_copy_value():
 def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     from nemo_rl.data_plane.nixl.errors import UnitFull
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
         # The WRITE timed out: every local range it used is now unfinished.
         ep.unfinished.extend((a, n) for a, _, n in segments)
         raise UnitFull("no unit could take it")
@@ -267,7 +267,7 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
     with pytest.raises(UnitFull):
-        c._put_segments(p, "b", time.monotonic() + 60)
+        c._put_segments(p, "b", time.monotonic() + 60, 0)
     zc_addr = zc.data_ptr()
     assert zc_addr in ep.registered  # never deregistered
     assert [a for a, _, _ in c.retained_sources] == [zc_addr]
@@ -279,12 +279,12 @@ def test_zero_copy_source_of_in_flight_write_stays_registered_and_alive():
 
 
 def test_zero_copy_source_is_deregistered_after_a_clean_put():
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
         return blob_id, {"u": 0}
 
     c, ep = _client_with(put_segments)
     p, zc = _plan_with_zero_copy_value()
-    c._put_segments(p, "b", time.monotonic() + 60)
+    c._put_segments(p, "b", time.monotonic() + 60, 0)
     assert zc.data_ptr() not in ep.registered
     assert c.retained_sources == [] and c.pool.retired == []
 
@@ -294,28 +294,29 @@ def test_put_over_max_blob_bytes_is_split_at_key_boundaries():
 
     blobs = []
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
         blobs.append((blob_id, nbytes, n_entries))
         return blob_id, {"u": 0}
 
     c, _ = _client_with(put_segments)
     c.max_blob_bytes = 10_000  # 4 KiB values: at most 2 per blob
     keys = [f"k{i}" for i in range(5)]
-    metas = c._put_split(keys, [torch.ones(1024)] * 5, time.monotonic() + 60)
-    assert len(metas) == 5 and len(blobs) == 3
+    c._put_split(0, keys, [torch.ones(1024)] * 5, time.monotonic() + 60)
+    assert len(blobs) == 3
     assert all(n <= c.max_blob_bytes for _, n, _ in blobs)
     assert sum(k for _, _, k in blobs) == 5
-    assert {m["b"] for m in metas} == {b for b, _, _ in blobs}
 
 
-def test_failed_part_of_a_split_put_releases_the_parts_written():
+def test_failed_part_of_a_split_put_keeps_the_parts_written():
+    # SimpleStorage's policy: committed parts stay published; the put raises,
+    # TQ is not notified, and the next overwrite or clear of the rows frees them.
     import torch
 
     from nemo_rl.data_plane.nixl.errors import UnitFull
 
     calls, released = [], []
 
-    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None):
+    def put_segments(segments, nbytes, n_entries, blob_id, deadline=None, unit_id=None):
         calls.append(blob_id)
         if len(calls) == 2:
             raise UnitFull("no unit could take it")
@@ -325,8 +326,8 @@ def test_failed_part_of_a_split_put_releases_the_parts_written():
     c.store.release = lambda counts, hints=None: released.append(counts)
     c.max_blob_bytes = 5_000  # one 4 KiB value per blob
     with pytest.raises(UnitFull):
-        c._put_split(["a", "b"], [torch.ones(1024)] * 2, time.monotonic() + 60)
-    assert released == [{calls[0]: 1}]
+        c._put_split(0, ["a", "b"], [torch.ones(1024)] * 2, time.monotonic() + 60)
+    assert len(calls) == 2 and released == []
 
 
 def _store_with(ep_transfer_error: TransferError):

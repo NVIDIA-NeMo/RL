@@ -21,8 +21,11 @@ import threading
 
 import pytest
 
+import msgspec
+
 from nemo_rl.data_plane import nixl_storage_unit
-from tests.unit.data_plane._nixl_helpers import bare_unit
+from nemo_rl.data_plane.nixl import blob_format
+from tests.unit.data_plane._nixl_helpers import bare_unit, gidx_of, key_of, write_blob
 
 
 def _unit(slab_bytes: int = 1 << 16):
@@ -32,8 +35,15 @@ def _unit(slab_bytes: int = 1 << 16):
 
 def _put(u, blob_id: str, nbytes: int, fill: int) -> int:
     off = u.alloc(blob_id, nbytes, 1)
-    u.slab[off : off + nbytes] = fill
+    write_blob(u.slab, off, nbytes, key_of(blob_id), fill)
+    assert u.commit(blob_id) == "done"
     return off
+
+
+def _value(data) -> bytes:
+    """The value bytes of a one-key blob (everything before its index)."""
+    data = bytes(data)
+    return data[: blob_format._footer(memoryview(data))[0]]
 
 
 def _lock_is_free(u) -> bool:
@@ -63,7 +73,7 @@ def test_blob_released_mid_save_is_copied_then_freed(tmp_path, monkeypatch):
     def during_io(fd):
         # Step 4: file I/O runs without the unit lock; a clear arrives.
         seen["lock_free"] = _lock_is_free(u)
-        u.release_many([("b", 1)])
+        u.release_rows([gidx_of("b")])
         seen["free_mid_save"] = u.alloc_.free_bytes
         real_fsync(fd)
 
@@ -77,7 +87,7 @@ def test_blob_released_mid_save_is_copied_then_freed(tmp_path, monkeypatch):
     assert not u.checkpointing and not u._released_held
     data = (tmp_path / "unit-0.shard").read_bytes()
     off_b, n_b, _ = out["blobs"]["b"]
-    assert set(data[off_b : off_b + n_b]) == {0xBB}
+    assert set(_value(data[off_b : off_b + n_b])) == {0xBB}
 
 
 @pytest.mark.parametrize("where", ["open", "fsync", "replace"])
@@ -105,7 +115,7 @@ def test_release_outside_a_save_frees_at_once():
     u = _unit()
     _put(u, "a", 4096, 1)
     free_before = u.alloc_.free_bytes
-    u.release_many([("a", 1)])
+    u.release_rows([gidx_of("a")])
     assert u.alloc_.free_bytes == free_before + 4096
     assert u.clears_during_save == 0
 
@@ -118,11 +128,13 @@ def test_load_shard_fills_regions_outside_the_lock(tmp_path):
     res = dst.load_shard(str(tmp_path / "s"), out["blobs"])
     assert res == {"loaded": ["a"], "failed": []}
     rec = dst.blobs["a"]
-    assert set(dst.slab[rec.off : rec.off + rec.nbytes].tolist()) == {0x5A}
+    assert set(_value(dst.slab[rec.off : rec.off + rec.nbytes])) == {0x5A}
+    assert dst.rows[gidx_of("a")]["x"][0] == "a"  # its live key is indexed again
 
 
 def test_load_shard_short_read_frees_its_region(tmp_path):
     (tmp_path / "s").write_bytes(b"\x00" * 100)
+    (tmp_path / "s.rows").write_bytes(msgspec.msgpack.encode({"a": [key_of("a")]}))
     u = _unit()
     free_before = u.alloc_.free_bytes
     with pytest.raises(IOError, match="short read"):

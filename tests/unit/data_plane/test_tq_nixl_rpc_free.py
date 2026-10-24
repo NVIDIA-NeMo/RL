@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Hinted reads skip every RPC; stale hints fall back to the pinned path."""
+"""The store's hinted-read path: stale hints fall back to the pinned path.
+
+The TQ client no longer issues hinted reads (rows are index-addressed, see
+test_tq_nixl_index.py); this path goes away with them in a follow-up.
+"""
 
 from __future__ import annotations
 
@@ -41,23 +45,6 @@ def _client():
     from transfer_queue import interface as tq_interface
 
     return tq_interface._TQ_CLIENT.storage_manager.storage_client
-
-
-def test_hinted_reads_are_rpc_free_and_exact(sys_):
-    tq = sys_
-    store = _client().store
-    before = dict(store.stats)
-    keys = [f"k{i}" for i in range(8)]
-    data = torch.randn(8, 1000)
-    tq.kv_batch_put(keys, "train", fields=TensorDict({"x": data}, batch_size=[8]))
-    got = tq.kv_batch_get(keys, "train", select_fields=["x"])
-    assert torch.equal(dense(got["x"]), data)
-    assert store.stats["fast_reads"] > before["fast_reads"]
-    assert store.stats["slow_reads"] == before["slow_reads"]
-    assert (
-        store.stats["unit_refresh"] == before["unit_refresh"]
-    )  # puts did not refresh units
-    tq.kv_clear(keys, "train")
 
 
 def test_stale_hint_falls_back_and_stays_exact(sys_):
