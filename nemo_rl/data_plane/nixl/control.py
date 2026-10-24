@@ -19,8 +19,8 @@ thread; clients talk to it over a DEALER socket per unit. Ray is used only to
 start the units and to publish their addresses once (bootstrap).
 
 Messages are msgpack ``[op, request_id, args]``; replies ``[request_id, ok,
-result_or_error]``. ``notify`` sends ops that need no reply (``release_many``,
-``unpin``, ``abort``); the unit sends nothing back for those.
+result_or_error]``. ``notify`` sends ops that need no reply (``unpin``,
+``abort``); the unit sends nothing back for those.
 
 An error reply is ``{"kind", "msg", "reason", "blobs"}`` so the client can
 rebuild the exception the unit raised instead of reporting every failure the
@@ -59,7 +59,7 @@ log = logging.getLogger(__name__)
 _enc = msgspec.msgpack.Encoder()
 _dec = msgspec.msgpack.Decoder()
 
-NO_REPLY = {"release_many", "unpin", "abort"}
+NO_REPLY = {"unpin", "abort"}
 
 
 def error_reply(e: BaseException) -> dict[str, Any]:

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A2: TQ checkpoint save on N units, restore on N-1 units, byte-exact reads.
+"""A2: TQ checkpoint save on N units, restore on N or fewer units, byte-exact reads.
 
 Runs the real ``tq.save_checkpoint`` / ``tq.load_checkpoint`` path, so the
 controller state and our storage shards are exercised together, exactly as
@@ -85,7 +85,11 @@ def _check(tq, keys, expected: TensorDict):
     assert list(got["text"]) == list(expected["text"])
 
 
-def test_save_on_3_restore_on_2(ray_cluster, tmp_path_factory):
+@pytest.mark.parametrize("restore_units", [3, 2], ids=["same_units", "fewer_units"])
+def test_save_on_3_restore(ray_cluster, tmp_path_factory, restore_units):
+    """Same unit count restores each shard in place; a different count re-puts
+    every live key to its new owner. Either way overwritten and cleared keys
+    stay as they were at the save, though their old bytes are in the shards."""
     ckpt = (
         REPO / ".nvdp_store" / f"ckpt-{uuid.uuid4().hex[:8]}"
     )  # Lustre: visible to every actor
@@ -98,46 +102,58 @@ def test_save_on_3_restore_on_2(ray_cluster, tmp_path_factory):
     tq.kv_batch_put(
         keys, "train", fields=TensorDict({"advantages": adv}, batch_size=[N_KEYS])
     )
+    # an overwrite of one field of some rows: their old blob stays live for the rest
+    reward = torch.full((4,), 9.0)
+    tq.kv_batch_put(
+        keys[:4], "train", fields=TensorDict({"reward": reward}, batch_size=[4])
+    )
+    expected["reward"][:4] = reward
+    # a cleared row whose blobs other rows still use
+    tq.kv_clear(keys[-1:], "train")
+    keys, expected, adv = keys[:-1], expected[:-1], adv[:-1]
     _check(tq, keys, expected)
 
     tq.save_checkpoint(str(ckpt))
     meta = json.loads((ckpt / "metadata.json").read_text())
     assert meta["storage_saved"] is True
     manifest = json.loads((ckpt / "nixl_store" / "manifest.json").read_text())
+    assert manifest["version"] == 2 and manifest["unit_ids"] == [0, 1, 2]
     assert len(manifest["shards"]) == 3
-    n_blobs = sum(len(s["blobs"]) for s in manifest["shards"])
-    assert n_blobs >= 2
     _teardown(tq, conf)
 
-    # "restart" with one unit fewer: fresh actors, fresh controller
-    tq, conf = _system(2)
+    # "restart": fresh actors, fresh controller
+    tq, conf = _system(restore_units)
     tq.load_checkpoint(str(ckpt))
     _check(tq, keys, expected)
     got = tq.kv_batch_get(keys, "train", select_fields=["advantages"])
     assert torch.equal(dense(got["advantages"]), adv)
 
-    # restored blobs are owned by the new units: clearing frees them there
-    units = [ray.get_actor(f"NixlStorageUnit#{i}", namespace=NS) for i in range(2)]
-    before = sum(ray.get(h.stats.remote())["blobs"] for h in units)
-    assert before == n_blobs
-    tq.kv_clear(keys, "train")
-    import time
-
-    deadline = (
-        time.monotonic() + 10.0
-    )  # clears are not awaited: units release asynchronously
-    while True:
-        after = sum(ray.get(h.stats.remote())["blobs"] for h in units)
-        if after == 0 or time.monotonic() > deadline:
-            break
-        time.sleep(0.2)
-    assert after == 0
+    units = [
+        ray.get_actor(f"NixlStorageUnit#{i}", namespace=NS)
+        for i in range(restore_units)
+    ]
+    st = [ray.get(h.stats.remote()) for h in units]
+    assert sum(s["rows"] for s in st) == len(keys)  # the cleared row stayed gone
+    tq.kv_clear(keys, "train")  # awaited: the units are empty when it returns
+    assert sum(ray.get(h.stats.remote())["blobs"] for h in units) == 0
     _teardown(tq, conf)
 
 
-def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypatch):
-    """Each round sends every shard to its next unit before waiting on any;
-    a blob its home unit has no room for moves on to the next unit."""
+def test_old_format_checkpoint_is_rejected_before_any_change(tmp_path):
+    from types import SimpleNamespace
+
+    from nemo_rl.data_plane.adapters import tq_nixl_checkpoint as ck
+
+    root = tmp_path / ck.SUBDIR
+    root.mkdir()
+    (root / ck.MANIFEST).write_text(json.dumps({"version": 1, "shards": []}))
+    with pytest.raises(ValueError, match="version 1"):
+        ck.load_storage_checkpoint(SimpleNamespace(unit_ids=[0]), tmp_path)
+
+
+def test_in_place_restore_sends_every_shard_before_waiting_then_spills(monkeypatch):
+    """Each unit reloads its own shard: RAM first on all units, then the SSD tier
+    for what did not fit."""
     from types import SimpleNamespace
 
     from nemo_rl.data_plane.adapters import tq_nixl_checkpoint as ck
@@ -150,38 +166,36 @@ def test_restore_reads_all_shards_at_once_and_spills_what_does_not_fit(monkeypat
             self.load_shard = SimpleNamespace(remote=self._load)
 
         def _load(self, path, blobs, spill):
-            events.append(("send", self.u, path))
+            events.append(("send", self.u, spill))
             loaded, failed = [], []
             for b in blobs:
-                (loaded if self.room > 0 else failed).append(b)
-                self.room -= b in loaded
+                ok = spill or self.room > 0
+                self.room -= ok and not spill
+                (loaded if ok else failed).append(b)
             return {"loaded": loaded, "failed": failed}
 
     units = {0: Unit(0, room=1), 1: Unit(1, room=10)}
-    put = []
-    store = SimpleNamespace(
-        directory=SimpleNamespace(put_blobs=SimpleNamespace(remote=put.extend)),
-        _blob_unit={},
-    )
 
     def get(x):
         events.append(("wait",))
         return x
 
-    monkeypatch.setattr(ck, "_active_units", lambda s: [0, 1])
     monkeypatch.setattr(ck, "_unit_actor", lambda s, u: units[u])
     monkeypatch.setattr(ck, "ray", SimpleNamespace(get=get))
     manifest = {
+        "unit_ids": [0, 1],
         "shards": [
-            {"file": "unit-0.shard", "blobs": {"a": [0, 8, 1], "b": [8, 8, 1]}},
-            {"file": "unit-1.shard", "blobs": {"c": [0, 8, 1]}},
-        ]
+            {
+                "unit_id": 0,
+                "file": "unit-0.shard",
+                "blobs": {"a": [0, 8, 1], "b": [8, 8, 1]},
+            },
+            {"unit_id": 1, "file": "unit-1.shard", "blobs": {"c": [0, 8, 1]}},
+        ],
     }
-    ck._load_units(store, Path("/ckpt"), manifest)
-
+    ck._load_in_place(None, Path("/ckpt"), manifest)
     assert [e[0] for e in events[:2]] == ["send", "send"]  # both shards before a wait
-    assert store._blob_unit == {"a": 0, "c": 1, "b": 1}
-    assert sorted(put) == sorted(store._blob_unit.items())
+    assert ("send", 0, True) in events and ("send", 1, True) not in events
 
 
 def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(

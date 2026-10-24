@@ -28,7 +28,14 @@ from nemo_rl.data_plane.nixl import blobstore
 from nemo_rl.data_plane.nixl.errors import DataPlaneBusy, UnitFull
 from nemo_rl.data_plane import nixl_storage_unit
 from tests.unit.data_plane._nixl_helpers import StubCtl as _Ctl
-from tests.unit.data_plane._nixl_helpers import bare_unit, stub_store
+from nemo_rl.data_plane.nixl import blob_format
+from tests.unit.data_plane._nixl_helpers import (
+    bare_unit,
+    gidx_of,
+    key_of,
+    stub_store,
+    write_blob,
+)
 
 
 def _store(ctl, ssd=True):
@@ -66,9 +73,19 @@ def _commit(u, b):
     return status
 
 
+def _write(u, b, off, fill, n=BLOB):
+    """The client's WRITE: a valid one-key blob whose value bytes are ``fill``."""
+    write_blob(u.slab, off, n, key_of(b), fill)
+
+
+def _value(data):
+    """The value bytes of a one-key blob (everything before its index)."""
+    return data[: blob_format._footer(memoryview(data))[0]]
+
+
 def _put(u, b, fill, n=BLOB):
     off = u.alloc(b, n, 1)
-    u.slab[off : off + n] = fill
+    _write(u, b, off, fill, n)
     assert _commit(u, b) == "done"
     return off
 
@@ -85,7 +102,7 @@ def _read(u, b):
         r = u.resolve([b])
         if b in r["offsets"]:
             off = r["offsets"][b]
-            return bytes(u.slab[off : off + u.blobs[b].nbytes]), r["pin_id"]
+            return _value(bytes(u.slab[off : off + u.blobs[b].nbytes])), r["pin_id"]
         assert b in r["pending"] and time.monotonic() < end, r
         u.unpin(r["pin_id"])
         time.sleep(0.005)
@@ -117,7 +134,7 @@ def test_a_put_the_put_area_cannot_take_spills_and_reads_back(tmp_path):
     assert off >= u.staging_base  # the client wrote into the IO area
     rec = u.blobs["s"]
     assert not rec.in_slab and rec.disk is not None
-    assert set(os.pread(rec.disk, BLOB, 0)) == {7}
+    assert set(_value(os.pread(rec.disk, BLOB, 0))) == {7}
     assert not os.listdir(u.ssd_dir)  # unlinked at once: nothing left on disk
     assert u.staging_.used_bytes == 0  # the IO region went back at once
     assert u.stats()["spills"] == 1
@@ -149,7 +166,7 @@ def test_commit_is_pending_until_the_file_is_written_and_enqueues_once(
     _fill(u)
     go, entered = _gate_pwrite(monkeypatch)
     off = u.alloc("s", BLOB, 1)
-    u.slab[off : off + BLOB] = 5
+    _write(u, "s", off, 5)
     assert u.commit("s") == "pending"
     assert entered.wait(5)
     assert u.commit("s") == "pending" and u._io_jobs == 1  # asked again: no 2nd job
@@ -176,7 +193,7 @@ def test_a_failed_write_fails_the_put_and_frees_the_io_area(
     _fill(u)
     fds = _open_fds()
     monkeypatch.setattr(nixl_storage_unit.os, "pwrite", fail)
-    u.alloc("s", BLOB, 1)
+    _write(u, "s", u.alloc("s", BLOB, 1), 5)
     assert _commit(u, "s") == "lost"  # never acknowledged, so nothing is lost
     assert "s" not in u.blobs and u._io_jobs == 0
     assert u.staging_.used_bytes == 0 and u.stats()["spill_failures"] == 1
@@ -248,7 +265,7 @@ def test_commit_waits_when_too_many_io_jobs_are_running(tmp_path, monkeypatch):
     _fill(u)
     go, entered = _gate_pwrite(monkeypatch)
     for b in ("s0", "s1"):
-        u.alloc(b, 64 * KB, 1)
+        _write(u, b, u.alloc(b, 64 * KB, 1), 3, 64 * KB)
     assert u.commit("s0") == "pending" and entered.wait(5)
     assert u.commit("s1") == "pending" and not u.blobs["s1"].staging  # not queued yet
     go.set()
@@ -274,22 +291,16 @@ def test_abort_with_a_write_in_flight_retires_the_io_region(tmp_path):
     assert u.retired_bytes == cap and u.staging_.used_bytes == cap
 
 
-@pytest.mark.parametrize("how", ["abort", "release"])
-def test_abort_or_release_during_the_write_leaves_the_cleanup_to_the_job(
-    tmp_path, monkeypatch, how
-):
+def test_abort_during_the_write_leaves_the_cleanup_to_the_job(tmp_path, monkeypatch):
     u = _unit(tmp_path)
     _fill(u)
     fds = _open_fds()
     go, entered = _gate_pwrite(monkeypatch)
-    u.alloc("s", BLOB, 1)
+    _write(u, "s", u.alloc("s", BLOB, 1), 5)
     u.commit("s")
     assert entered.wait(5)
     used = u.staging_.used_bytes
-    if how == "abort":
-        u.abort("s", in_flight=False)  # the client gave up on a slow commit
-    else:
-        u.release("s", 1)
+    u.abort("s", in_flight=False)  # the client gave up on a slow commit
     assert u.staging_.used_bytes == used  # the job still reads the region
     go.set()
     _wait(lambda: u._io_jobs == 0)
@@ -302,25 +313,26 @@ def test_released_disk_blob_closes_its_file(tmp_path):
     _fill(u)
     _put(u, "s", 7)
     rec = u.blobs["s"]
-    u.release_many([("s", 1)])
-    assert rec.disk is None and "s" not in u.blobs
+    assert u.release_rows([gidx_of("s")]) == 1
+    assert rec.disk is None and "s" not in u.blobs and gidx_of("s") not in u.rows
 
 
-def test_abort_after_a_lost_commit_reply_frees_each_copy_once(tmp_path):
+def test_abort_after_a_lost_commit_reply_keeps_the_published_blob(tmp_path):
     u = _unit(tmp_path)
     _fill(u)
     _put(u, "s", 7)  # committed and on disk, but the client never saw "done"
     rec = u.blobs["s"]
-    u.abort("s", in_flight=False)
-    assert rec.disk is None and "s" not in u.blobs
-    assert u.staging_.used_bytes == 0 and u.alloc_.used_bytes == 6 * BLOB
+    u.abort("s", in_flight=False)  # its rows are live: only a clear drops them
+    assert u.blobs["s"] is rec and rec.disk is not None
+    assert u.commit("s") == "done"  # asking again is safe
+    assert u.release_rows([gidx_of("s")]) == 1 and rec.disk is None
 
 
 # ------------------------------------------------------------------ submit failure
 def test_a_failed_commit_submit_leaves_the_blob_reserved(tmp_path):
     u = _unit(tmp_path)
     _fill(u)
-    u.alloc("s", BLOB, 1)
+    _write(u, "s", u.alloc("s", BLOB, 1), 5)
     u._worker.shutdown(wait=True)
     with pytest.raises(RuntimeError):
         u.commit("s")
@@ -389,8 +401,9 @@ def test_freed_region_loses_its_footer():
 
     u = bare_unit(1 << 16)  # read_pin_s=0: freed at once
     off = u.alloc("a", 1000, 1)
-    u.slab[off : off + 1000] = 7
-    u.release("a", 1)
+    write_blob(u.slab, off, 1000, key_of("a"), 7)
+    assert u.commit("a") == "done"
+    u.release_rows([gidx_of("a")])
     assert not u.slab[off + 1000 - FOOTER_SIZE : off + 1000].any()
     assert u.slab[off] == 7  # only the footer is wiped
 
@@ -417,7 +430,7 @@ def test_checkpoint_saves_put_area_and_disk_blobs(tmp_path):
     raw = (tmp_path / "s").read_bytes()
     assert res["nbytes"] == len(raw) == 8 * BLOB
     for b, (off, n, refs) in res["blobs"].items():
-        assert set(raw[off : off + n]) == {_fill_of(b)} and refs == 1
+        assert set(_value(raw[off : off + n])) == {_fill_of(b)} and refs == 1
     assert all(r.holds == 0 for r in u.blobs.values())
 
 
@@ -444,8 +457,7 @@ def test_checkpoint_skips_a_spill_not_acknowledged_yet(tmp_path, monkeypatch):
     u = _unit(tmp_path / "u")
     _fill(u)
     go, entered = _gate_pwrite(monkeypatch)
-    off = u.alloc("s", BLOB, 1)
-    u.slab[off : off + BLOB] = 9
+    _write(u, "s", u.alloc("s", BLOB, 1), 9)
     assert u.commit("s") == "pending"
     assert entered.wait(5)
     res = u.save_shard(str(tmp_path / "s"))
@@ -490,13 +502,12 @@ def test_restore_with_a_full_disk_leaves_the_blob_to_another_unit(
 
 
 # ------------------------------------------------------------------ client
-def test_put_commits_only_with_ssd_on():
+@pytest.mark.parametrize("ssd", [True, False])
+def test_every_put_commits(ssd):
+    # The commit publishes the blob's rows on the unit, SSD tier or not.
     ctl = _Ctl({"alloc": lambda a: 64, "commit": lambda a: "done"})
-    _store(ctl).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
+    _store(ctl, ssd=ssd).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
     assert ctl.calls == ["alloc", "commit"]
-    ctl = _Ctl({"alloc": lambda a: 64})
-    _store(ctl, ssd=False).put_segments([(1000, 0, 8)], 8, 1, blob_id="b")
-    assert ctl.calls == ["alloc"]
 
 
 def test_commit_is_asked_again_while_the_unit_writes_the_file():

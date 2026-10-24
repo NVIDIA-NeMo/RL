@@ -71,6 +71,8 @@ class StubCtl:
 
     def call(self, address, op, *, timeout_s=None, **args):
         self.calls.append(op)
+        if op == "commit" and op not in self.replies:
+            return "done"  # every put commits (publishes its rows)
         r = self.replies[op](address)
         if isinstance(r, Exception):
             raise r
@@ -150,7 +152,10 @@ def bare_unit(
     u.slab = np.zeros(slab_bytes, dtype=np.uint8)
     u.slab_base = 0
     u.blobs = {}
+    u.rows = {}
     u._pins = {}
+    u._pin_exp = {}
+    u.alloc_lease_s = None
     u.retired_bytes = 0
     u._released_held = {}
     u.checkpointing = False
@@ -159,3 +164,39 @@ def bare_unit(
     u._init_ssd(slab_bytes, ssd_dir, staging_bytes, pickup_s)
     u._start_ticker()
     return u
+
+
+def key_of(name: str, field: str = "x") -> str:
+    """A TransferQueue key ``gidx@field`` derived from a test blob name."""
+    return f"{int.from_bytes(name.encode(), 'little') % 10**9}@{field}"
+
+
+def gidx_of(name: str) -> int:
+    return int(key_of(name).split("@")[0])
+
+
+def write_blob(slab, off: int, nbytes: int, key: str, fill: int) -> int:
+    """Make ``slab[off:off+nbytes]`` a valid blob of one ``key``.
+
+    The value bytes are ``fill``; the tail holds the blob's index and footer,
+    as a client's WRITE would. Returns the value length (bytes that are ``fill``).
+    """
+    import struct
+
+    import msgspec
+
+    from nemo_rl.data_plane.nixl import blob_format as bf
+
+    slab[off : off + nbytes] = fill
+    probe = msgspec.msgpack.encode([[key, 0, nbytes, bf.KIND_NUMPY, "|u1", [nbytes]]])
+    io = nbytes - bf.FOOTER_SIZE - len(probe)
+    index = msgspec.msgpack.encode([[key, 0, io, bf.KIND_NUMPY, "|u1", [io]]])
+    io = nbytes - bf.FOOTER_SIZE - len(index)
+    index = msgspec.msgpack.encode([[key, 0, io, bf.KIND_NUMPY, "|u1", [io]]])
+    assert io + len(index) + bf.FOOTER_SIZE == nbytes
+    slab[off + io : off + io + len(index)] = list(index)
+    footer = struct.pack(
+        bf._FOOTER_FMT, bf.MAGIC, bf.VERSION, 0, io, len(index), bf.NO_TAG
+    )
+    slab[off + nbytes - bf.FOOTER_SIZE : off + nbytes] = list(footer)
+    return io

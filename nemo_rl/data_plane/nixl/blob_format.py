@@ -278,10 +278,24 @@ def read_index(blob: memoryview) -> list[Entry]:
             raise ValueError("blob too small for a footer")
         raise ValueError("bad blob magic or unsupported blob version")
     io, il, _tag = f
-    raw = msgspec.msgpack.decode(bytes(blob[io : io + il]))
+    return _entries(bytes(blob[io : io + il]))
+
+
+def read_index_file(f: Any, off: int, nbytes: int) -> list[Entry]:
+    """:func:`read_index` of the blob stored at ``off`` in binary file ``f``."""
+    f.seek(off + nbytes - FOOTER_SIZE)
+    ft = _footer(memoryview(f.read(FOOTER_SIZE)))
+    if ft is None:
+        raise ValueError("bad blob magic or unsupported blob version")
+    io, il, _tag = ft
+    f.seek(off + io)
+    return _entries(f.read(il))
+
+
+def _entries(raw: bytes) -> list[Entry]:
     return [
         Entry(k, o, n, kind, d, tuple(s) if s is not None else None)
-        for k, o, n, kind, d, s in raw
+        for k, o, n, kind, d, s in msgspec.msgpack.decode(raw)
     ]
 
 

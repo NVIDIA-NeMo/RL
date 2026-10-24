@@ -161,7 +161,7 @@ class TestLifecycle:
         )
         assert not any(k in listing for k in keys)
         after = sum(s["blobs"] for s in _unit_stats(tq_system))
-        assert after == before - 1
+        assert after == before - 2  # one blob per owner unit
         # region is reusable once the read pin window has passed
         time.sleep(float(tq_system.backend.NixlStore.read_pin_s) + 0.2)
         stats = _unit_stats(tq_system)
