@@ -562,11 +562,12 @@ MAX_WORKER_PORT=2999
 VLLM_ENGINE_PORT=7000
 
 # getent first: hostname -I lists addresses in no fixed order and can put a
-# link-local 169.254.x first, which no other node can reach.
+# link-local 169.254.x first, which no other node can reach. A loopback answer
+# (127.0.1.1 from /etc/hosts) is unreachable too, so it falls through as well.
 head_node_ip() {
   local ip
   ip=$(getent ahostsv4 "$(hostname)" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
-  if [[ -z "${ip}" || "${ip}" == 169.254.* ]]; then
+  if [[ -z "${ip}" || "${ip}" == 169.254.* || "${ip}" == 127.* ]]; then
     ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9.]+$/ && !/^169\.254\./ { print; exit }' || true)
   fi
   printf '%s' "${ip}"
