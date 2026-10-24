@@ -25,8 +25,11 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/utils/deterministic_async.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
+  "nemo_rl/utils/determinism.py",
+  "nemo_rl/models/generation/megatron/deterministic.py",
   # TODO: enable these once we have 100 correctness
   #"nemo_rl/**/*.py",
   #"examples/**/*.py",

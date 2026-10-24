@@ -61,6 +61,7 @@ class NemoGymSourceIdentity:
 
 
 class DatumSpec(TypedDict):
+    sampling_seed: NotRequired[torch.Tensor]
     message_log: LLMMessageLogType | VLMMessageLogType
     length: int  # total (concatenated) length of the message tensors
     extra_env_info: Optional[dict[str, Any]]

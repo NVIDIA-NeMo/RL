@@ -567,3 +567,82 @@ def test_select_extracted_answer_never_raises(extracted_answer, impl, expected):
     from nemo_rl.environments.math_environment import _select_extracted_answer
 
     assert _select_extracted_answer(extracted_answer, impl) == expected
+
+
+def test_deterministic_verifier_disables_all_wall_clock_deadlines(monkeypatch):
+    from nemo_rl.environments import math_environment
+
+    parse_timeouts = []
+    verify_timeouts = []
+    real_parse = math_environment.parse
+    real_verify = math_environment.grader.verify
+
+    def parse(*args, **kwargs):
+        parse_timeouts.append(kwargs["parsing_timeout"])
+        return real_parse(*args, **kwargs)
+
+    def verify(*args, **kwargs):
+        verify_timeouts.append(kwargs["timeout_seconds"])
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(math_environment, "parse", parse)
+    monkeypatch.setattr(math_environment.grader, "verify", verify)
+    worker = math_environment.HFVerifyWorker.__ray_metadata__.modified_class()
+    scores, answers = worker.verify(
+        [r"The answer is \boxed{42}", "Nothing to extract", r"\boxed{137}"],
+        ["42", "42", "42"],
+        return_extracted_answer=True,
+        math_verify_impl="hf_math_verify",
+        deterministic=True,
+    )
+    assert scores == [1.0, 0.0, 0.0]
+    assert answers == ["42", None, "137"]
+    assert parse_timeouts == [None] * 6
+    assert verify_timeouts and all(timeout is None for timeout in verify_timeouts)
+
+
+def test_deterministic_verifier_rng_ignores_prior_requests(monkeypatch):
+    import random
+
+    from sympy.core.random import random as sympy_random
+
+    from nemo_rl.environments import math_environment
+
+    draws = []
+    real_parse = math_environment.parse
+
+    def parse(*args, **kwargs):
+        draws.append((random.random(), sympy_random()))
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(math_environment, "parse", parse)
+    worker = math_environment.HFVerifyWorker.__ray_metadata__.modified_class()
+    responses = [r"\boxed{42}", r"\boxed{x + x}"]
+    truths = ["42", "2x"]
+    expected = worker.verify(
+        responses,
+        truths,
+        math_verify_impl="hf_math_verify",
+        deterministic=True,
+    )
+    expected_draws = list(draws)
+    draws.clear()
+    for _ in range(17):
+        random.random()
+        sympy_random()
+    actual = worker.verify(
+        responses[::-1],
+        truths[::-1],
+        math_verify_impl="hf_math_verify",
+        deterministic=True,
+    )
+    assert actual[::-1] == expected
+    assert draws == expected_draws[2:] + expected_draws[:2]
+
+
+def test_verifier_actor_serialization_does_not_capture_sympy_cache():
+    import ray.cloudpickle
+
+    from nemo_rl.environments.math_environment import MathEnvironment
+
+    ray.cloudpickle.dumps(MathEnvironment.__ray_metadata__.modified_class)

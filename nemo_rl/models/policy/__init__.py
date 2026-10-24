@@ -379,6 +379,8 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
+    deterministic_mode: NotRequired[bool]
+    seed: NotRequired[int]
     env_vars: NotRequired[dict[str, str] | None]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable

@@ -20,7 +20,8 @@ import threading as _threading
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncGenerator
-from typing import Any, Optional, cast
+from functools import partial
+from typing import Any, Callable, Optional, cast
 
 import ray
 import torch
@@ -71,6 +72,8 @@ from nemo_rl.telemetry.instrumentation import (
 )
 from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.determinism import keyed_seed
+from nemo_rl.utils.deterministic_async import AsyncRolloutPlan, AsyncRolloutProgress
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
@@ -199,6 +202,18 @@ class AsyncTrajectoryCollector:
             )
         self.algorithm_config = algorithm_config
         self.async_config = async_config
+        self._deterministic_progress = (
+            AsyncRolloutProgress(
+                AsyncRolloutPlan(
+                    num_steps=algorithm_config.max_num_steps,
+                    prompts_per_step=algorithm_config.num_prompts_per_step,
+                    generations_per_prompt=algorithm_config.num_generations_per_prompt,
+                )
+            )
+            if isinstance(master_config, GRPOMasterConfig)
+            and algorithm_config.deterministic
+            else None
+        )
         self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
         self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
         self._max_rollout_turns = algorithm_config.max_rollout_turns
@@ -325,6 +340,8 @@ class AsyncTrajectoryCollector:
         Returns:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
+        if self._deterministic_progress is not None:
+            return self._deterministic_progress.plan.targets(generation_weight_version)
         generation_lead = self._generation_lead_steps
         if generation_weight_version == self.initial_weight_version:
             return [
@@ -486,6 +503,8 @@ class AsyncTrajectoryCollector:
 
     def _mark_collection_failed(self, error: Exception) -> None:
         """Record the first collection-loop failure."""
+        if self._deterministic_progress is not None:
+            self._deterministic_progress.fail(str(error))
         with self._failure_lock:
             if not self.collection_failed:
                 self.collection_failed = True
@@ -531,10 +550,10 @@ class AsyncTrajectoryCollector:
                         self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
-                # Check if generation limits require pausing collection
+                # Clear before checking: a version update concurrent with the
+                # predicate must leave a notification for the following wait.
+                self._generation_limit_cleared.clear()
                 if self._should_pause_for_generation_limits() and self.running:
-                    self._generation_limit_cleared.clear()
-
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
                         target_weights = self._calculate_target_weights(
@@ -604,6 +623,10 @@ class AsyncTrajectoryCollector:
             self._mark_collection_failed(e)
         finally:
             self.running = False
+            if self._deterministic_progress is not None:
+                self._deterministic_progress.fail(
+                    "Deterministic collection stopped before training finished"
+                )
             if dataloader_exhausted:
                 self.data_exhausted = True
                 print(
@@ -926,6 +949,25 @@ class AsyncTrajectoryCollector:
                 num_generations,
                 share_immutable_media=self._deduplicate_multimodal_data,
             )
+            if self._deterministic_progress is not None:
+                self._deterministic_progress.register(
+                    target=reserved_target,
+                    version=generation_weight_version,
+                    ordinals=dispatched_task_indices,
+                )
+                repeated_batch["sampling_seed"] = torch.tensor(
+                    [
+                        keyed_seed(
+                            self.master_config.grpo.seed,
+                            "async_train",
+                            ordinal,
+                            sibling,
+                        )
+                        for ordinal in dispatched_task_indices
+                        for sibling in range(num_generations)
+                    ],
+                    dtype=torch.int64,
+                )
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     repeated_batch,
@@ -1007,6 +1049,9 @@ class AsyncTrajectoryCollector:
             return leftover
 
         except Exception as e:
+            if self._deterministic_progress is not None:
+                self._deterministic_progress.fail(str(e))
+                raise
             if target_weight is not None and not worker_started:
                 self._release_target(target_weight)
             print(f"❌ Error processing batch: {e}")
@@ -1019,6 +1064,12 @@ class AsyncTrajectoryCollector:
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
+
+    def wait_for_deterministic_batch(self, target: int) -> None:
+        """Wait for exact batch completion; background collector threads notify us."""
+        if self._deterministic_progress is None:
+            raise RuntimeError("No deterministic rollout plan was configured")
+        self._deterministic_progress.wait_for_batch(target)
 
     def check_health(self) -> None:
         """Raise the stored fatal worker error, if any.
@@ -1055,6 +1106,10 @@ class AsyncTrajectoryCollector:
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
+        if self._deterministic_progress is not None:
+            self._deterministic_progress.wait_for_refit(self.current_weight_version)
+            self._refit_pause_cleared.clear()
+            return
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
@@ -1511,6 +1566,7 @@ class AsyncTrajectoryCollector:
         num_generations: int,
         use_nemo_gym: bool,
         task_index_to_group_index: dict[int, int],
+        on_generation_complete: Callable[[int], None] | None = None,
     ) -> AsyncGenerator[RolloutGroupResult, None]:
         """Yield prompt groups from either backend through one result type."""
         if use_nemo_gym:
@@ -1581,6 +1637,7 @@ class AsyncTrajectoryCollector:
             task_to_env=self.task_to_env,
             max_seq_len=self.master_config.policy["max_total_sequence_length"],
             num_generations=num_generations,
+            on_generation_complete=on_generation_complete,
             max_rollout_turns=self._max_rollout_turns,
             greedy=False,
             deduplicate_multimodal_data=self._deduplicate_multimodal_data,
@@ -1610,7 +1667,13 @@ class AsyncTrajectoryCollector:
             with self._failure_lock:
                 if self._fatal_error_message is None:
                     self._failure_count = 0
+        except asyncio.CancelledError:
+            if self._deterministic_progress is not None:
+                self._deterministic_progress.fail("Deterministic rollout was cancelled")
+            raise
         except Exception as error:
+            if self._deterministic_progress is not None:
+                self._deterministic_progress.fail(str(error))
             if not self.running:
                 return
 
@@ -1750,6 +1813,8 @@ class AsyncTrajectoryCollector:
             "rollout_metrics": rollout_metrics,
             "timestamp": time.time(),
         }
+        if self._deterministic_progress is not None:
+            trajectory_group["generation_weight_version"] = generation_weight_version
         group_task_index = rollout_result.task_index
         if group_task_index is None:
             # Native groups carry their ordinal on the stamped *input* rows,
@@ -1757,6 +1822,10 @@ class AsyncTrajectoryCollector:
             # a frontier restore report which prompts the retained buffer
             # already covers.
             group_task_index = input_task_index
+        if self._deterministic_progress is not None and group_task_index is None:
+            raise ValueError(
+                "Deterministic replay requires a prompt ordinal before enqueueing."
+            )
         if group_task_index is not None:
             trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = group_task_index
         backoff_delay = 0.01
@@ -1781,6 +1850,13 @@ class AsyncTrajectoryCollector:
                     target_weight_version,
                 )
                 if status == "success":
+                    if (
+                        self._deterministic_progress is not None
+                        and group_task_index is not None
+                    ):
+                        self._deterministic_progress.group_buffered(
+                            target_weight_version, group_task_index
+                        )
                     buffered_group_indices.add(rollout_result.group_index)
                     if group_task_index is not None:
                         # The cut now covers this ordinal via the buffer's
@@ -1879,6 +1955,16 @@ class AsyncTrajectoryCollector:
                     num_generations=num_generations,
                     use_nemo_gym=use_nemo_gym,
                     task_index_to_group_index=task_index_to_group_index,
+                    **(
+                        {
+                            "on_generation_complete": partial(
+                                self._deterministic_progress.generation_complete,
+                                target_weight_version,
+                            )
+                        }
+                        if self._deterministic_progress is not None
+                        else {}
+                    ),
                 ):
                     group_index = rollout_result.group_index
                     if group_index not in expected_group_indices:

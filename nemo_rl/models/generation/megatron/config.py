@@ -66,6 +66,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     """
 
     expose_http_server: bool
+    env_vars: NotRequired[dict[str, str]]
+    # Resolved by strict GRPO; distinct from MCore's kernel determinism flag.
+    request_seeded_sampling: NotRequired[bool]
     http_server_num_replicas: NotRequired[int]
     parsers: list[str]
     buffer_size_gb: int

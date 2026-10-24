@@ -90,6 +90,7 @@ from nemo_rl.models.generation.megatron.config import (
     MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.deterministic import preserve_megatron_rng
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
@@ -577,6 +578,7 @@ class MegatronGenerationMixin:
         engine_model = media_model if media_model is not None else self._gen_model()
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
+        request_seeded_sampling = mcore_generation_config.get("request_seeded_sampling")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -672,7 +674,7 @@ class MegatronGenerationMixin:
             "static_kv_memory_pointers": needs_static_kv_pointers,
             "use_cuda_graphs_for_non_decode_steps": use_cuda_graphs_for_non_decode_steps,
             "use_flashinfer_fused_rope": use_flashinfer_fused_rope,
-            "sampling_backend": "flashinfer",
+            "sampling_backend": "torch" if request_seeded_sampling else "flashinfer",
             "use_synchronous_zmq_collectives": True,
             "materialize_only_last_token_logits": materialize_only_last_token_logits,
             "enable_chunked_prefill": enable_chunked_prefill,
@@ -994,6 +996,14 @@ class MegatronGenerationMixin:
         log_gpu_memory("finish_generation END")
 
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
+        """Enter inference mode without consuming strict-mode training RNGs."""
+        if self.cfg["megatron_cfg"].get("deterministic_mode"):
+            with preserve_megatron_rng():
+                self._prepare_for_generation(tags=tags, **kwargs)
+        else:
+            self._prepare_for_generation(tags=tags, **kwargs)
+
+    def _prepare_for_generation(self, tags=None, **kwargs) -> None:
         """Enter inference mode and start (or wake) the inference engine.
 
         Idempotent wake: a plain call (no tags) on an already-serving engine returns immediately.
@@ -1185,6 +1195,7 @@ class MegatronGenerationMixin:
         stop_words: Optional[list[str]],
         *,
         return_prompt_tokens: bool = False,
+        sampling_seed: int | None = None,
     ) -> SamplingParams:
         """Build mcore SamplingParams for a single request."""
         top_k_cfg = self.cfg["generation"]["top_k"]
@@ -1195,6 +1206,17 @@ class MegatronGenerationMixin:
             0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
         )
 
+        extra = {}
+        if (
+            self.cfg["generation"]
+            .get("mcore_generation_config", {})
+            .get("request_seeded_sampling")
+        ):
+            if sampling_seed is None:
+                raise ValueError(
+                    "Deterministic generation requires sampling_seed for every request"
+                )
+            extra["seed"] = sampling_seed
         return SamplingParams(
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
@@ -1210,6 +1232,7 @@ class MegatronGenerationMixin:
             stop_words=stop_words,
             return_prompt_tokens=return_prompt_tokens,
             detokenize_stop_sequence=True,
+            **extra,
         )
 
     def _merge_stop_strings(
@@ -1223,7 +1246,7 @@ class MegatronGenerationMixin:
             for sample_ss in batch_stop_strings:
                 if sample_ss:
                     stop_set.update(sample_ss)
-        return list(stop_set) if stop_set else None
+        return sorted(stop_set) if stop_set else None
 
     def _sample_vision_tensors(self, data, index: int):
         """Return one sample's vision tensors from RL PackedTensors."""
@@ -1276,6 +1299,9 @@ class MegatronGenerationMixin:
                     greedy,
                     stop_words,
                     return_prompt_tokens=multi_modal_data is not None,
+                    sampling_seed=int(data["sampling_seed"][i])
+                    if "sampling_seed" in data
+                    else None,
                 )
             )
 

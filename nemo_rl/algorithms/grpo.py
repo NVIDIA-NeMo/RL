@@ -175,6 +175,11 @@ from nemo_rl.utils.checkpoint import (
     CheckpointingConfig,
     CheckpointManager,
 )
+from nemo_rl.utils.determinism import (
+    configure_grpo_determinism,
+    keyed_seed,
+)
+from nemo_rl.utils.deterministic_async import AsyncRolloutPlan
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import (
     Logger,
@@ -352,6 +357,8 @@ _REWARD_PENALTY_FLAGS = (
 
 
 class GRPOConfig(BaseModel, extra="allow"):
+    # Strict replay on fixed hardware/software; requires Megatron training/inference.
+    deterministic: bool = False
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
@@ -795,6 +802,7 @@ def setup(
             "full-vocabulary reverse KL."
         )
 
+    configure_grpo_determinism(master_config)
     # Set seed for all random number generators
     set_seed(grpo_config.seed)
 
@@ -809,6 +817,11 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if grpo_config.deterministic and last_checkpoint_path is not None:
+        raise ValueError(
+            "Deterministic checkpoint resume requires the follow-up state-restoration change"
+        )
+
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
     grpo_save_state = _get_grpo_save_state(loaded_state)
 
@@ -857,6 +870,13 @@ def setup(
             collate_fn=rl_collate_fn,
             drop_last=True,
             num_workers=data_config["num_workers"],
+            generator=(
+                torch.Generator().manual_seed(
+                    keyed_seed(grpo_config.seed, "train_dataloader", suffix)
+                )
+                if grpo_config.deterministic
+                else None
+            ),
         )
         if last_checkpoint_path is not None:
             load_dataloader_state(dataloader, last_checkpoint_path, data_config, suffix)
@@ -905,6 +925,13 @@ def setup(
             shuffle=False,
             collate_fn=rl_collate_fn,
             num_workers=data_config["num_workers"],
+            generator=(
+                torch.Generator().manual_seed(
+                    keyed_seed(grpo_config.seed, "validation_dataloader")
+                )
+                if grpo_config.deterministic
+                else None
+            ),
         )
         print(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
@@ -3419,6 +3446,16 @@ def _grpo_train_impl(
                             ),
                         )
                     )
+                    if master_config.grpo.deterministic:
+                        repeated_batch["sampling_seed"] = torch.tensor(
+                            [
+                                keyed_seed(
+                                    master_config.grpo.seed, "train", total_steps, i
+                                )
+                                for i in range(repeated_batch.size)
+                            ],
+                            dtype=torch.int64,
+                        )
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             repeated_batch,
@@ -4542,6 +4579,10 @@ def validate(
         evaluate_span("grpo", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
+        if master_config.grpo.deterministic:
+            val_dataloader.generator.manual_seed(
+                keyed_seed(master_config.grpo.seed, "validation_dataloader", step)
+            )
         # >= 1 is validated in setup().
         val_num_generations_per_prompt = (
             master_config.grpo.val_num_generations_per_prompt
@@ -4560,6 +4601,16 @@ def validate(
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
+            if master_config.grpo.deterministic:
+                val_batch["sampling_seed"] = torch.tensor(
+                    [
+                        keyed_seed(
+                            master_config.grpo.seed, "validation", step, batch_idx, i
+                        )
+                        for i in range(val_batch.size)
+                    ],
+                    dtype=torch.int64,
+                )
 
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
@@ -5220,8 +5271,11 @@ def async_grpo_train(
     # collecting. In particular, vLLM and Dynamo start with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
-    ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
-    print("📦 Started continuous background trajectory collection")
+    if not master_config.grpo.deterministic:
+        ray.get(
+            trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
+        )
+        print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
 
@@ -5263,6 +5317,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            if master_config.grpo.deterministic:
+                raise
             # Continue anyway since validation is optional
         finally:
             # Resume trajectory collection after initial validation
@@ -5295,6 +5351,10 @@ def async_grpo_train(
                 print(f"Error stopping replay buffer: {e}")
             return
 
+    if master_config.grpo.deterministic:
+        ray.get(
+            trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader))
+        )
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
     if policy_generation is not None:
@@ -5312,6 +5372,9 @@ def async_grpo_train(
         timer.start(INIT_TOTAL_CATEGORY)
         wait_iterations = 0
         while True:
+            if master_config.grpo.deterministic:
+                ray.get(trajectory_collector.wait_for_deterministic_batch.remote(step))
+                break
             buffer_size_current = ray.get(replay_buffer.size.remote())
             ray.get(trajectory_collector.check_health.remote())
             current_step_ready = ray.get(
@@ -5411,6 +5474,12 @@ def async_grpo_train(
 
                     # Sample the required number of per-prompt groups.
                     num_prompt_groups_needed = master_config.grpo.num_prompts_per_step
+                    if master_config.grpo.deterministic:
+                        ray.get(
+                            trajectory_collector.wait_for_deterministic_batch.remote(
+                                step
+                            )
+                        )
                     sample_result = ray.get(
                         replay_buffer.sample.remote(
                             num_prompt_groups=num_prompt_groups_needed,
@@ -5499,6 +5568,29 @@ def async_grpo_train(
 
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]
+                    if master_config.grpo.deterministic:
+                        trajectories.sort(
+                            key=lambda group: group[NEMO_GYM_TASK_INDEX_KEY]
+                        )
+                        plan = AsyncRolloutPlan(
+                            max_num_steps,
+                            num_prompts_per_step,
+                            master_config.grpo.num_generations_per_prompt,
+                        )
+                        plan.validate_batch(
+                            target=step,
+                            version=max(0, step - 1),
+                            ordinals=[
+                                group[NEMO_GYM_TASK_INDEX_KEY] for group in trajectories
+                            ],
+                        )
+                        if any(
+                            group["generation_weight_version"] != max(0, step - 1)
+                            for group in trajectories
+                        ):
+                            raise RuntimeError(
+                                "Replay returned the wrong generation policy version"
+                            )
                     avg_trajectory_age = sample_result["avg_trajectory_age"]
 
                     # Advance the trained frontier from the sampled groups'
@@ -5911,7 +6003,10 @@ def async_grpo_train(
                                     weight_version
                                 )
                             )
-                            ray.get(trajectory_collector.resume_after_refit.remote())
+                            if not master_config.grpo.deterministic:
+                                ray.get(
+                                    trajectory_collector.resume_after_refit.remote()
+                                )
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
@@ -6227,6 +6322,11 @@ def async_grpo_train(
                         policy.offload_after_refit()
                         policy_generation.prepare_for_generation()
                         ray.get(trajectory_collector.resume_after_refit.remote())
+
+                if master_config.grpo.deterministic and not (
+                    is_last_step or early_stop_message is not None
+                ):
+                    ray.get(trajectory_collector.resume_after_refit.remote())
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
