@@ -835,6 +835,11 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
         {"force_on_policy_ratio": True},
         {"ratio_clip_c": 3.0},
         {"sequence_level_importance_ratios": True, "token_level_loss": False},
+        {
+            "use_importance_sampling_correction": True,
+            "truncated_importance_sampling_type": "ipo",
+            "truncated_importance_sampling_ratio": 0.3,
+        },
     ],
 )
 def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
@@ -847,6 +852,7 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
       CISPO is defined over.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
       ClippedPGLossFn and would silently overwrite it.
+    - the ipo truncated importance sampling mask is not supported with CISPO.
     """
     cfg = ClippedPGLossConfig(
         reference_policy_kl_penalty=0.0,
@@ -1788,6 +1794,89 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
     expected_loss = -expected_weights.mean()
     torch.testing.assert_close(loss, expected_loss)
     assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
+
+
+def test_clipped_pg_loss_ipo_masks_tokens_by_probability_gap():
+    data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="ipo",
+        truncated_importance_sampling_ratio=0.3,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    # Probability gaps 0.1, 0.7 and 0.018: only the middle token exceeds 0.3.
+    data["advantages"][0, 1:] = torch.ones(3)
+    data["generation_logprobs"][0, 1:] = torch.log(torch.tensor([0.4, 0.2, 0.002]))
+    next_token_logprobs = torch.log(torch.tensor([[0.5, 0.9, 0.02]])).requires_grad_()
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+    loss.backward()
+
+    # Kept tokens keep their raw IS weights (1.25 and 10), the masked one gets 0.
+    torch.testing.assert_close(loss, -torch.tensor([1.25, 0.0, 10.0]).mean())
+    assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+    grad = next_token_logprobs.grad[0]
+    assert grad[1] == 0 and grad[0] != 0 and grad[2] != 0
+
+
+def test_clipped_pg_loss_ipo_matches_prime_rl_ipo_loss():
+    """With current == prev logprobs, the ipo mask, loss and gradient match prime-rl's
+    IPOLoss (prime_rl/trainer/rl/loss.py), normalized by the valid token count."""
+    torch.manual_seed(0)
+    data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
+        batch_size=4, seq_len=65, device="cpu"
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            use_importance_sampling_correction=True,
+            force_on_policy_ratio=True,
+            truncated_importance_sampling_type="ipo",
+            truncated_importance_sampling_ratio=0.3,
+        )
+    )
+    advantages = torch.randn(batch_size, seq_len - 1)
+    inference_logprobs = torch.log(torch.rand(batch_size, seq_len - 1).clamp(min=1e-4))
+    trainer_logprobs = (
+        inference_logprobs + torch.randn_like(inference_logprobs)
+    ).clamp(max=0.0)
+    data["advantages"][:, 1:] = advantages
+    data["generation_logprobs"][:, 1:] = inference_logprobs
+    next_token_logprobs = trainer_logprobs.clone().requires_grad_()
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+    )
+    loss.backward()
+
+    # prime-rl IPOLoss: mask on the probability gap, then -A * capped ratio over kept tokens.
+    lp = trainer_logprobs.clone().requires_grad_()
+    larger = torch.maximum(lp, inference_logprobs)
+    smaller = torch.minimum(lp, inference_logprobs)
+    is_masked = torch.exp(larger) * -torch.expm1(smaller - larger) > 0.3
+    log_ratio = lp - inference_logprobs
+    capped = log_ratio.detach().clamp(max=torch.tensor(1e4).log())
+    ratio = torch.exp(capped + (log_ratio - log_ratio.detach()))
+    prime_loss = (-advantages * ratio)[~is_masked].sum() / is_masked.numel()
+    prime_loss.backward()
+
+    assert 0 < is_masked.float().mean() < 1
+    assert metrics["is_oob_ratio"] == pytest.approx(is_masked.float().mean().item())
+    torch.testing.assert_close(loss, prime_loss)
+    torch.testing.assert_close(next_token_logprobs.grad, lp.grad)
+    assert torch.equal(next_token_logprobs.grad == 0, is_masked)
 
 
 def test_clipped_pg_loss_seq_mask_tis():
