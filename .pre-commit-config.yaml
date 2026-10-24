@@ -52,6 +52,16 @@ repos:
             curl --fail --location --silent --show-error --retry 3 --max-time 120 \
               "https://github.com/tamasfe/taplo/releases/download/$version/taplo-$os-$arch.gz" \
               --output "$download.gz"
+            # Release assets can be replaced and upstream publishes no checksums,
+            # so pin them here. Update these when bumping `version`.
+            case "$os-$arch" in
+              linux-x86_64) sha256=889efcfa067b179fda488427d3b13ce2d679537da8b9ed8138ba415db7da2a5e ;;
+              linux-aarch64) sha256=7c07379d3288fb5c26b1c29bbedec4f8d8f602d776bcc3a1578176733b6a857c ;;
+              darwin-x86_64) sha256=6b4180fe0518e3e68b9a421dbe50f62ede308767972c4c70c6bbe6651ea98641 ;;
+              darwin-aarch64) sha256=39b84d62d6a47855b2c64148cde9c9ca5721bf422b8c9fe9c92776860badde5f ;;
+            esac
+            # macOS has no sha256sum; shasum ships with both macOS and Ubuntu.
+            echo "$sha256  $download.gz" | shasum -a 256 -c - >/dev/null
             gzip -dc "$download.gz" > "$download"
             chmod 755 "$download"
 
