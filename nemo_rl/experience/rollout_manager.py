@@ -63,6 +63,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     Completion,
     PromptGroupRecord,
+    is_synthetic_unusable_rollout,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
@@ -1026,13 +1027,25 @@ class AsyncNemoGymRolloutImpl:
             # one identity set so rollout-matched media cannot be overwritten
             # through a second view after its marker is consumed.
             processed_target_ids: set[int] = set()
-            attach_static_multimodal_payload(
-                prompt_message_log,
-                source_message_log,
-                processed_target_ids=processed_target_ids,
-                tokenizer=self._tokenizer,
-            )
-            for completion in completions:
+            # The no-generation placeholder of env.nemo_gym.mask_unusable_rollouts
+            # is synthetic text with no media placeholder tokens: attaching the
+            # prompt's image tensors to it would fail a native VLM forward
+            # before its zero loss weight can exclude it. _run_rollouts takes
+            # the group prompt from a real sibling whenever one exists, so the
+            # prompt is synthetic only when every completion is.
+            real_completions = [
+                completion
+                for completion in completions
+                if not is_synthetic_unusable_rollout(completion.env_extras)
+            ]
+            if real_completions:
+                attach_static_multimodal_payload(
+                    prompt_message_log,
+                    source_message_log,
+                    processed_target_ids=processed_target_ids,
+                    tokenizer=self._tokenizer,
+                )
+            for completion in real_completions:
                 attach_static_multimodal_payload(
                     completion.message_log,
                     source_message_log,
@@ -1385,7 +1398,23 @@ class AsyncNemoGymRolloutImpl:
                 ],
             )
             # All N rollouts share the same input prompt; tensorize one copy.
-            prompt_message_log = completed_results[0]["input_message_log"]
+            # Prefer a result that still carries the Gym-authored prompt: the
+            # no-generation placeholder of env.nemo_gym.mask_unusable_rollouts
+            # replaces it with a fixed-length synthetic prompt, which must not
+            # stand in for the group (prompt length, prompt ids, media) while a
+            # real sibling exists. In such a mixed group record_to_train_batch
+            # cuts the placeholder's prompt_ids_for_adv row at the real prompt's
+            # length, so that row may span the placeholder's EOS generation
+            # token; this is safe because the single-controller baseline keys
+            # on GROUP_ID_TAG, not on prompt ids.
+            prompt_message_log = next(
+                (
+                    result["input_message_log"]
+                    for result in completed_results
+                    if not is_synthetic_unusable_rollout(result.get("full_result"))
+                ),
+                completed_results[0]["input_message_log"],
+            )
             _tensorize_by_key(prompt_message_log, "token_ids")
             # Apply penalties before Completion captures each result's reward, while
             # preserving the batch-level counts used by legacy Gym metrics.

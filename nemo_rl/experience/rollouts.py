@@ -74,6 +74,8 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
+    NEMO_GYM_UNUSABLE_ROLLOUT_KEY,
+    is_synthetic_unusable_rollout,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.reward_penalties import (
@@ -278,7 +280,18 @@ def _reattach_static_multimodal_payloads_to_result(
     source_message_log: list[dict[str, Any]],
     tokenizer: Any = None,
 ) -> None:
-    """Restore static media to each Gym-authored message-log representation."""
+    """Restore static media to each Gym-authored message-log representation.
+
+    The no-generation placeholder emitted under
+    ``env.nemo_gym.mask_unusable_rollouts`` is skipped: its message log is
+    synthetic text with no media placeholder tokens, and a native VLM forward
+    (Nemotron Omni pairs one text placeholder with each projected media feature)
+    rejects original image tensors attached to it before the row's zero loss
+    weight can exclude it. A non-contiguous rollout reduced to its contiguous
+    prefix keeps real tokens and still gets its media back.
+    """
+    if is_synthetic_unusable_rollout(result.get("full_result")):
+        return
     # input_message_log is commonly a slice of message_log, so the two views
     # can alias the same message dictionaries. Process each target once.
     processed_target_ids: set[int] = set()
@@ -392,6 +405,18 @@ def _add_r3_fallback_metrics(
     gen_metrics["r3/routed_experts_actual_token_routes"] = actual_routes
     gen_metrics["r3/routed_experts_fallback_token_route_fraction"] = (
         float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
+    )
+
+
+def _unusable_rollout_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
+    """Return True for NeMo-Gym placeholder samples that replaced an unusable rollout.
+
+    Unlike ``mask_sample`` this is not gated by ``env.should_mask_flagged_samples``:
+    a placeholder carries no real tokens, so its loss weight is always zeroed.
+    """
+    return torch.tensor(
+        [bool((extra or {}).get(NEMO_GYM_UNUSABLE_ROLLOUT_KEY)) for extra in extras],
+        dtype=torch.bool,
     )
 
 
@@ -3427,6 +3452,12 @@ def _postprocess_single_nemo_gym_group(
     )
     input_ids = batched_flat["token_ids"]
 
+    loss_multiplier = input_batch["loss_multiplier"]
+    unusable = _unusable_rollout_flags(result["full_result"] for result in results)
+    if unusable.any():
+        loss_multiplier = torch.as_tensor(loss_multiplier).clone()
+        loss_multiplier[unusable] = 0
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -3435,7 +3466,7 @@ def _postprocess_single_nemo_gym_group(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int

@@ -66,6 +66,30 @@ covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
 check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
 setting at configuration time rather than ignoring it).
 
+By default, a NeMo Gym result that yields no trainable tokens fails the rollout
+batch: a result with no generation data (for example, the first prompt already
+exceeds `max_model_len`, or the agent produced no assistant turn) raises a
+`ValueError`, and a token chain that is not contiguous across turns (for
+example, an agent harness that rewrites or compacts its history) raises an
+`AssertionError`. Set `env.nemo_gym.mask_unusable_rollouts: true` to replace such
+a rollout with a placeholder sample instead. The placeholder sets `mask_sample`
+(so it is excluded from the loss) and always has
+its `loss_multiplier` set to zero, even when `env.should_mask_flagged_samples` is
+`false`. Its reward leaves the group baseline only on the single-controller
+path, where `sample_mask` feeds the advantage stage's valid mask; the batched
+path's baseline still averages it in. A non-contiguous rollout keeps its
+contiguous prefix, including the
+media attached to those turns; a rollout with no generation data gets a fixed
+128-token text prompt and a single EOS token. That synthetic prompt holds no
+media placeholder tokens, so the prompt's original image tensors are never
+restored onto it (a native VLM forward such as Nemotron Omni pairs each text
+placeholder with exactly one projected media feature and rejects the mismatch
+before loss masking). Each replacement is logged with a
+`[nemo_gym] masking a rollout` line. The knob applies to the token-echo path
+only; combining it with the top-level single-controller `token_capture.enabled`
+(receipt mode) is rejected at setup, because receipt rollouts bypass the
+converter that emits the placeholder.
+
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
 ### Shard NeMo Gym across nodes
