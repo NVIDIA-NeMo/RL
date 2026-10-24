@@ -609,14 +609,18 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side is a change in the Gym repository, not
-this one. Gym's app already calls `nemo.lens.contrib.fastapi.instrument_fastapi`
-from `instrument_app_for_telemetry`, but that returns early unless the server
-process has telemetry up, and the per-server venvs Gym builds in
-`nemo_gym/cli/setup_command.py` carry neither `nemo-lens` nor an OTLP exporter.
-Until they do, the header arrives and is ignored, and Gym's internal spans stay
-in their own traces. Everything up to and including the client-side HTTP span
-still nests correctly.
+Completing the trace on the server side needs Gym's own servers to export.
+Gym's app already calls `nemo.lens.contrib.fastapi.instrument_fastapi` from
+`instrument_app_for_telemetry`, and Gym already installs `nemo-lens` into every
+per-server venv — but both hang off the `telemetry:` block in Gym's global
+config, which `NemoGym._spinup` projects only when this process is itself
+exporting. Without that block the actor exports while every server stays
+silent, which is the one configuration that yields a trace with a hole in the
+middle of it.
+
+Set `env.nemo_gym.telemetry` to pass options through to that block, for example
+`{span_groups: "default,sandbox"}`; `enabled` defaults to true and an explicit
+`false` opts the Gym side out without disabling NeMo-RL's own telemetry.
 
 Gym's own span groups are a separate concern from its exporters, and one this
 repository does control. `GymSpanGroup` registers into nemo-lens's
