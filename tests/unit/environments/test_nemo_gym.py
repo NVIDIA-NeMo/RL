@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import asyncio
 import inspect
 import json
+import textwrap
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -2511,3 +2513,42 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     without_key = spin_up(None)
     assert without_key["policy_api_key"] == "dummy_key"
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def test_gym_span_groups_are_registered_before_telemetry_is_configured():
+    """``nemo_gym.telemetry`` has to be imported before ``init_telemetry_worker``.
+
+    ``GymSpanGroup`` registers with nemo-lens as an import side effect, and lens
+    validates the span-group spec inside ``init_telemetry_worker``. A namespace
+    that registers after that point is not selectable, so every Gym span gate
+    returns False for the whole run. Lens only warns, so the regression is
+    silent at runtime and has to be caught here.
+
+    Asserted on the source rather than by constructing the actor because
+    ``nemo_gym`` is an optional extra: where it is absent the guarded import is
+    a no-op and a runtime check would pass for the wrong reason.
+    """
+    init = NemoGym.__ray_metadata__.modified_class.__init__
+    body = ast.parse(textwrap.dedent(inspect.getsource(init))).body[0].body
+
+    def index_of(predicate):
+        return next(
+            (i for i, node in enumerate(body) if any(map(predicate, ast.walk(node)))),
+            None,
+        )
+
+    imported_at = index_of(
+        lambda n: isinstance(n, ast.Import)
+        and any(a.name == "nemo_gym.telemetry" for a in n.names)
+    )
+    configured_at = index_of(
+        lambda n: isinstance(n, ast.Call)
+        and getattr(n.func, "id", None) == "init_telemetry_worker"
+    )
+
+    assert imported_at is not None, "NemoGym.__init__ must import nemo_gym.telemetry"
+    assert configured_at is not None, "NemoGym.__init__ must call init_telemetry_worker"
+    assert imported_at < configured_at, (
+        "nemo_gym.telemetry is imported after init_telemetry_worker, so Gym's "
+        "span groups register too late to be selectable"
+    )
