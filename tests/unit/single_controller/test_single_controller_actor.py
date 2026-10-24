@@ -71,6 +71,7 @@ from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GROUP_ID_TAG,
     ROLLOUT_METRICS,
+    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -88,6 +89,21 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+
+
+def test_train_fields_add_the_sampler_topk_for_score_centering():
+    without = single_controller._train_fields_for_step(
+        policy_logprobs_required=True,
+        reference_logprobs_required=False,
+        score_centering=False,
+    )
+    with_topk = single_controller._train_fields_for_step(
+        policy_logprobs_required=True,
+        reference_logprobs_required=False,
+        score_centering=True,
+    )
+    assert "reference_policy_logprobs" not in without
+    assert with_topk == without + SAMPLER_TOPK_FIELDS
 
 
 class FakeWeightSynchronizer:
@@ -2268,6 +2284,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
+        score_centering=False,
     )
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
@@ -2535,6 +2552,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
+        score_centering=False,
     )
     trainer = _LogprobRecordingTrainer()
     ctrl._trainer = trainer

@@ -632,6 +632,84 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     )
 
 
+def test_token_capture_top_logprobs_requires_capture_and_vllm_max_logprobs():
+    mc = _make_master_config()
+    mc.token_capture.top_logprobs = 4
+
+    with pytest.raises(ValueError, match="token_capture.enabled"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    with pytest.raises(ValueError, match="max_logprobs"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    validate_single_controller_config(mc)
+
+
+def test_token_capture_top_logprobs_rejects_megatron_generation():
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.token_capture.enabled = True
+    mc.token_capture.top_logprobs = 4
+    with pytest.raises(ValueError, match="vllm generation backend"):
+        validate_single_controller_config(mc)
+
+
+def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+
+    with pytest.raises(ValueError, match="token_capture.top_logprobs > 0"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    mc.token_capture.top_logprobs = 4
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    mc.policy["generation"]["top_p"] = 0.9
+    mc.policy["generation"]["temperature"] = 1.0
+    mc.policy["generation"]["top_k"] = None
+    with pytest.raises(ValueError, match="unfiltered sampling"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["top_p"] = 1.0
+    validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "temperature,mode,valid",
+    [
+        (1.0, None, True),
+        (1.0, "raw_logprobs", True),
+        (0.7, None, False),
+        (0.7, "raw_logprobs", False),
+        (0.7, "processed_logprobs", True),
+        (1.3, "processed_logprobs", True),
+        (0.0, "processed_logprobs", False),
+        (-1.0, "processed_logprobs", False),
+        (float("nan"), "processed_logprobs", False),
+        (float("inf"), "processed_logprobs", False),
+        (1.0, "raw_logits", False),
+        (1.0, "processed_logits", False),
+    ],
+)
+@pytest.mark.parametrize("source", ["vllm_cfg", "vllm_kwargs"])
+def test_score_centering_validates_sampler_distribution(
+    temperature, mode, valid, source
+):
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    mc.token_capture.top_logprobs = 4
+    generation = mc.policy["generation"]
+    generation.update(
+        temperature=temperature, top_p=1.0, top_k=None, vllm_kwargs={"max_logprobs": 4}
+    )
+    generation.setdefault(source, {})["logprobs_mode"] = mode
+    if valid:
+        validate_single_controller_config(mc)
+    else:
+        with pytest.raises(ValueError, match="score_centering requires"):
+            validate_single_controller_config(mc)
+
+
 @pytest.mark.parametrize(
     ("reference_policy_kl_penalty", "expected_init_reference_model"),
     [(0.0, False), (0.01, True)],
@@ -2951,8 +3029,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = (
-            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
+            ClippedPGLossFn(cfg, **kwargs)
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(

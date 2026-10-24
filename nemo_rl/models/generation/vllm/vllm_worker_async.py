@@ -54,6 +54,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
@@ -67,6 +68,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -297,6 +299,10 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
+        self._staging_sink: Any | None = None
+        # token_capture.top_logprobs: sampler top-k log-probs staged next to each
+        # captured call's delta; 0 leaves captured calls as they are.
+        self._capture_top_logprobs = 0
 
         super().__init__(
             config,
@@ -594,6 +600,7 @@ class VllmAsyncGenerationWorkerImpl(
         self,
         dp_cfg: dict[str, Any],
         staging_partition: str,
+        top_logprobs: int = 0,
         *,
         capture_media: bool = False,
     ) -> MediaColumnSpec | None:
@@ -605,6 +612,7 @@ class VllmAsyncGenerationWorkerImpl(
         vLLM adapter into this worker. Returns the media column spec this
         worker pinned the staging column to (``None`` for text-only capture
         and on non-model-owner ranks, which serve no HTTP and install nothing).
+        ``top_logprobs`` > 0 stages sampler top-k log-probs.
         """
         if not self.is_model_owner:
             return None
@@ -628,6 +636,8 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
+        self._staging_sink = sink
+        self._capture_top_logprobs = int(top_logprobs)
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
             # checks), captured_media.py (_processed_omni_tensors, pack_images,
@@ -727,6 +737,10 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        if self._capture_top_logprobs:
+            validate_score_centering_request(
+                request, num_candidates=self._capture_top_logprobs
+            )
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
@@ -910,7 +924,19 @@ class VllmAsyncGenerationWorkerImpl(
         coords vouch for both and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
         the worker->gate hop carries the completion and coords only.
+        Sampler tensors ride as opaque attachments in that same staging write.
         """
+        sampler_topk = None
+        for choice in content.get("choices") or []:
+            message = choice.get("message")
+            if isinstance(message, dict) and (
+                "sampler_topk_token_ids" in message
+                or "sampler_topk_logprobs" in message
+            ):
+                sampler_topk = (
+                    message.pop("sampler_topk_token_ids", None),
+                    message.pop("sampler_topk_logprobs", None),
+                )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
             return content
@@ -939,11 +965,22 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(
-            call,
-            payload,
-            attachments=state.media.tensors if state.media is not None else None,
-        )
+        attachments = dict(state.media.tensors) if state.media is not None else {}
+        if sampler_topk is not None:
+            attachments.update(
+                sampler_topk_token_ids=sampler_topk[0],
+                sampler_topk_logprobs=sampler_topk[1],
+            )
+        if self._capture_top_logprobs > 0 and sampler_topk is None:
+            coords = self.token_capture.fail_call(
+                call, reason="missing sampler top-k tensors"
+            )
+        else:
+            coords = self.token_capture.complete_call_from_response(
+                call,
+                payload,
+                attachments=attachments or None,
+            )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;
@@ -1371,6 +1408,14 @@ class VllmAsyncGenerationWorkerImpl(
                         response,
                         final_res,
                     )
+                    if request.ng_capture and worker_self._capture_top_logprobs:
+                        response = (
+                            attach_sampler_topk_logprobs_to_chat_response_choices(
+                                response,
+                                final_res,
+                                top_k=worker_self._capture_top_logprobs,
+                            )
+                        )
 
                 if worker_self._return_routed_experts_enabled():
                     response = attach_routed_experts_to_chat_response_choices(
