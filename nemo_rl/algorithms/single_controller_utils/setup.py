@@ -2251,6 +2251,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        stamp_dispatch_weight_version=gym_results_log is not None,
     )
 
     # Print setup timing metrics

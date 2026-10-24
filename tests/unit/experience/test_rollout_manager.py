@@ -952,6 +952,43 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert manager._impl._log_full_result_tables is True
 
 
+def test_rollout_manager_stamps_weight_version_only_when_gym_results_log_is_on():
+    """Gym rows carry the dispatch weight version only for the Gym-results log."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 2,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 100,
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+        },
+        "use_nemo_gym": True,
+    }
+    input_sample = {
+        "extra_env_info": {
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 0,
+            NEMO_GYM_GROUP_ID_KEY: "g",
+            "responses_create_params": {},
+        }
+    }
+
+    off = RolloutManager(**common)
+    assert off._impl._dispatch_weight_version is None
+    rows = off._impl._build_inputs(input_sample)
+    assert all(NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY not in row for row in rows)
+
+    on = RolloutManager(**common, stamp_dispatch_weight_version=True)
+    on._weight_version = 5
+    rows = on._impl._build_inputs(input_sample)
+    assert {row[NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY] for row in rows} == {5}
+
+
 def _nemo_gym_impl(
     mask_env_flagged_samples,
     reward_penalty_config=None,

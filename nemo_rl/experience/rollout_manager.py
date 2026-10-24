@@ -956,7 +956,7 @@ class AsyncNemoGymRolloutImpl:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         # Reads the trainer weight version at dispatch time; stamped on each row
-        # for the Gym-results log. None when constructed directly.
+        # for the Gym-results log. None when that log is off.
         dispatch_weight_version: Optional[Callable[[], int]] = None,
         **kwargs: Any,
     ) -> None:
@@ -1692,6 +1692,9 @@ class RolloutManager:
         retry_policy: Optional[RolloutRetryPolicy] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
+        # async_rl.gym_results_log.enabled: stamp each Gym row with the trainer
+        # weight version at dispatch, for the Gym-results log.
+        stamp_dispatch_weight_version: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -1740,7 +1743,11 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
-            dispatch_weight_version=lambda: self._weight_version,
+            dispatch_weight_version=(
+                (lambda: self._weight_version)
+                if stamp_dispatch_weight_version
+                else None
+            ),
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
