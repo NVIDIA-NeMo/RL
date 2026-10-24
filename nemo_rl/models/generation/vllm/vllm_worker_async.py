@@ -2457,7 +2457,8 @@ class VllmAsyncGenerationWorkerImpl(
 
         With ``clear_cache=True``, vLLM preempts every running request and resets
         the prefix cache when the pause finishes, in keep mode too.
-        ``test_keep_pause_clear_cache_resets_prefix_cache`` covers this contract.
+        ``test_keep_pause_clear_cache_resets_prefix_cache`` fails if a vLLM bump
+        changes that.
         """
         assert self.llm is not None, (
             "Attempting to pause generation with either an uninitialized vLLM or non-model-owner"
