@@ -105,6 +105,17 @@ apt install -y --only-upgrade gnupg
 # Upgrade rsync to address security vulnerabilities
 apt-get install -y --only-upgrade rsync
 
+# Upgrade openssl and libssl3t64 to address security vulnerabilities. --only-upgrade never
+# installs a package that is not already present, but a newer version can still declare new
+# dependencies, so simulate first and fail the build if apt would install or remove anything
+# other than these two packages.
+if apt-get install -s --only-upgrade --no-install-recommends openssl libssl3t64 \
+    | grep -E '^(Inst|Remv) ' | grep -vE '^Inst (openssl|libssl3t64) '; then
+    echo "[ERROR] upgrading openssl/libssl3t64 would change additional packages" >&2
+    exit 1
+fi
+apt-get install -y --only-upgrade --no-install-recommends openssl libssl3t64
+
 # Remove ffmpeg (from base image) to reduce attack surface
 apt-get remove -y --purge ffmpeg || true
 apt-get autoremove -y
@@ -250,7 +261,8 @@ COPY --from=nemo-rl --link \
     3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=bind,source=docker/install_mooncake.sh,target=/tmp/install_mooncake.sh <<"EOF" bash -exu
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -343,6 +355,15 @@ while IFS=$'\t' read -r venv_name stage extras; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+# Rebuild the Go library bundled in the mooncake-transfer-engine wheel (libetcd_wrapper.so)
+# with a patched Go toolchain and patched etcd/grpc/x-net/x-text; the upstream wheel ships
+# it built with versions that carry known CVEs. This must run HERE, in the layer that created
+# the venvs: the script overwrites each file in place, so the venvs that hardlink the uv cache
+# all share the patched inode, whereas patching in a later layer would make overlayfs copy
+# every path up separately. Venvs created later (release stage) hardlink/symlink the patched
+# file from the cache. See docker/install_mooncake.sh.
+bash /tmp/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
+
 apt-get purge -y libnvidia-ml-dev
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
@@ -353,6 +374,32 @@ rm -rf /var/lib/apt/lists/*
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Remove setuptools < 80.10.2 from the uv cache. Megatron-Bridge's [build-system] requires
+# setuptools<80, and [tool.uv] override-dependencies does not apply to isolated build
+# environments, so its build caches setuptools 79.x. That release vendors wheel 0.45.1 and
+# jaraco.context 5.3.0 (flagged CVEs); 80.10.2+ vendors wheel 0.46.3 and jaraco.context 6.1.0.
+# No venv uses the old copy (every venv resolves setuptools from uv.lock), so it is only
+# cache residue. The wheels-v6 index entries are removed too so uv has no dangling pointer
+# and simply re-downloads if it ever needs that version.
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache "${UV_CACHE_DIR}"
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -561,6 +608,26 @@ rm -rf /tmp/trtllm-build-venv
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Same for stale setuptools (see the comment in the preceding dependency layer).
+prune_stale_setuptools_cache() {
+    local cache="$1" min=80.10.2 path ver
+    for path in "${cache}"/archive-v0/*/setuptools-*.dist-info; do
+        [[ -d "${path}" ]] || continue
+        ver="${path##*/setuptools-}"; ver="${ver%.dist-info}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path%/*}"
+        fi
+    done
+    for path in "${cache}"/wheels-v6/pypi/setuptools/*-py3-none-any*; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        ver="${path##*/}"; ver="${ver%%-py3-none-any*}"
+        if [[ "$(printf '%s\n' "${ver}" "${min}" | sort -V | head -n1)" != "${min}" ]]; then
+            rm -rf "${path}"
+        fi
+    done
+}
+prune_stale_setuptools_cache "${UV_CACHE_DIR}"
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
