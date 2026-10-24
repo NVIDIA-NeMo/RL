@@ -2518,15 +2518,11 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 def test_gym_span_groups_are_registered_before_telemetry_is_configured():
     """``nemo_gym.telemetry`` has to be imported before ``init_telemetry_worker``.
 
-    ``GymSpanGroup`` registers with nemo-lens as an import side effect, and lens
-    validates the span-group spec inside ``init_telemetry_worker``. A namespace
-    that registers after that point is not selectable, so every Gym span gate
-    returns False for the whole run. Lens only warns, so the regression is
-    silent at runtime and has to be caught here.
+    Groups that register after the spec is validated are never selectable, and
+    lens only warns, so the regression is silent at runtime.
 
-    Asserted on the source rather than by constructing the actor because
-    ``nemo_gym`` is an optional extra: where it is absent the guarded import is
-    a no-op and a runtime check would pass for the wrong reason.
+    Asserted on the source because ``nemo_gym`` is an optional extra: where it
+    is absent a runtime check would pass for the wrong reason.
     """
     init = NemoGym.__ray_metadata__.modified_class.__init__
     body = ast.parse(textwrap.dedent(inspect.getsource(init))).body[0].body
@@ -2557,11 +2553,9 @@ def test_gym_span_groups_are_registered_before_telemetry_is_configured():
 def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
     """Gym's server venvs and per-server telemetry both hang off this block.
 
-    Gym translates ``telemetry:`` into ``NEMO_GYM_OTEL_*`` before spawning, which
-    is what makes ``server_venv_requirements()`` add nemo-lens to every server
-    venv. Omitting it is why the actor exported while all 100+ servers stayed
-    silent. It must stay omitted when this process is not exporting, so a run
-    with telemetry off resolves the same venvs it resolves today.
+    Omitting it is why the actor exported while all 100+ servers stayed silent.
+    It must stay omitted when this process is not exporting, so a telemetry-off
+    run resolves the same venvs it resolves today.
     """
     from unittest.mock import MagicMock
 
@@ -2619,11 +2613,10 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
 def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
     """Gym servers build their resource from `nemo.gym.*` and little else.
 
-    Without the job identity their spans carry no campaign stage, no slurm ids
-    and no run id, so a pipeline keyed on `nv.dl.campaign.stage` drops them
-    while this actor's own spans sail through. `nv.dl.rank` is withheld on
-    purpose: nemo-lens derives `service.instance.id` from it, so forwarding one
-    rank would collapse every Gym server onto a single instance id.
+    Without the job identity their spans carry no campaign stage, so ingest
+    keyed on it drops them. `nv.dl.rank` is withheld on purpose: lens derives
+    `service.instance.id` from it, so one rank would collapse every server
+    onto a single instance id.
     """
     import os
     from types import SimpleNamespace as NS
@@ -2674,8 +2667,7 @@ def test_spinup_forwards_job_identity_to_gym_servers_but_not_rank(monkeypatch):
 
     published = parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
 
-    # The job identity a Gym server cannot know, led by the one the ingest
-    # pipeline filters on.
+    # The job identity a server cannot know, led by the one ingest filters on.
     assert published["nv.dl.campaign.stage"] == "RL"
     assert published["slurm.job.id"] == "1416252"
     assert published["nemo.run.id"] == "a-run"
