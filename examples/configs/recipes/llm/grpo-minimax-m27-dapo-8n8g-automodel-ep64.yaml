@@ -28,7 +28,7 @@ checkpointing:
   save_period: 5
   checkpoint_must_save_by: 00:03:45:00
 policy:
-  make_sequence_length_divisible_by: 64
+  make_sequence_length_divisible_by: 512
   model_name: MiniMaxAI/MiniMax-M2.7
   hf_config_overrides:
     router_aux_loss_coef: 0
@@ -42,6 +42,7 @@ policy:
     kwargs:
       lr: 2.0e-06
       weight_decay: 0.1
+      foreach: false
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -55,6 +56,7 @@ policy:
   - milestones:
     - 5
   automodel_cfg:
+    context_parallel_size: 8
     expert_parallel_size: 64
     activation_checkpointing: true
     env_vars:
@@ -74,6 +76,7 @@ policy:
     enabled: false
   dynamic_batching:
     enabled: true
+    sequence_length_round: 512
   generation:
     max_new_tokens: 8192
     vllm_cfg:

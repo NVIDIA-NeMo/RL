@@ -54,6 +54,7 @@ from nemo_rl.algorithms.grpo import (
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
+    _restore_adaptive_loss_state,
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
@@ -256,6 +257,28 @@ def test_legacy_noncolocated_refit_syncs_policy_params_first(
     )
 
     assert events == ["sync", "broadcast"]
+
+
+@patch("nemo_rl.algorithms.grpo.ray")
+def test_legacy_megatron_refit_without_synchronizer_uses_collective_broadcast(
+    mock_ray: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MegatronWithoutSynchronizer:
+        weight_synchronizer = None
+
+        def __init__(self):
+            self.update_weights_from_collective = MagicMock(return_value=[True])
+
+    monkeypatch.setattr(grpo_mod, "MegatronGeneration", MegatronWithoutSynchronizer)
+    mock_ray.get.return_value = [True]
+    policy = MagicMock()
+    generation = MegatronWithoutSynchronizer()
+
+    refit_policy_generation(policy, generation, colocated_inference=False)
+
+    policy.broadcast_weights_for_collective.assert_called_once_with(kv_scales=None)
+    policy.swap_weights_via_reshard.assert_not_called()
+    generation.update_weights_from_collective.assert_called_once_with()
 
 
 @patch("nemo_rl.algorithms.grpo.ray")
@@ -595,6 +618,8 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "sampler_name": None,
         "trainer_version": None,
         "sampler_dispatch_index": None,
+        # None unless adaptive-ppo-clip is on.
+        "cur_adaptive_ppo_clip_k": None,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -3006,6 +3031,7 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
                     "role": "assistant",
                     "content": f"response_{i}",
                     "token_ids": torch.arange(length, dtype=torch.long),
+                    "generation_logprobs": torch.zeros(length, dtype=torch.float32),
                 },
             ]
         )
@@ -3073,6 +3099,66 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
 
 
+@pytest.mark.parametrize("kv_cache_mode", ["persist", "offload", "recompute"])
+@pytest.mark.parametrize(
+    ("async_enabled", "recompute"),
+    [(None, None), (False, False), (False, True), (True, False), (True, True)],
+)
+def test_setup_megatron_kv_consistency_only_applies_to_async_grpo(
+    mock_grpo_components: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_mode: str,
+    async_enabled: bool | None,
+    recompute: bool | None,
+) -> None:
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.grpo.async_grpo = (
+        None
+        if async_enabled is None
+        else AsyncGRPOConfig(
+            enabled=async_enabled,
+            recompute_kv_cache_after_weight_updates=recompute,
+        )
+    )
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="test-model",
+        automodel_cfg={"enabled": False},
+        megatron_cfg={"enabled": False},
+    )
+    master_config.policy["generation"].update(
+        backend="megatron",
+        mcore_generation_config={"kv_cache_management_mode": kv_cache_mode},
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class PolicyInitReached(Exception):
+        pass
+
+    policy_init = MagicMock(side_effect=PolicyInitReached)
+    monkeypatch.setattr(grpo_mod, "Policy", policy_init)
+    mismatch = async_enabled and recompute != (kv_cache_mode == "recompute")
+    with (
+        pytest.raises(ValueError, match="recompute_kv_cache_after_weight_updates")
+        if mismatch
+        else pytest.raises(PolicyInitReached)
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+    assert policy_init.call_count == int(not mismatch)
+
+
 @pytest.mark.parametrize(
     ("kv_cache_dtype", "precision", "error"),
     [
@@ -3131,6 +3217,62 @@ def test_setup_automodel_fp8_kv_cache_guard(
 
     assert generation_init.call_count == int(error is None)
     policy_init.assert_not_called()
+
+
+def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
+    mock_grpo_components, monkeypatch
+):
+    """Resuming restores the entropy controller saved in training_info."""
+    import nemo_rl.algorithms.grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy["train_global_batch_size"] = (
+        master_config.grpo.num_prompts_per_step
+        * master_config.grpo.num_generations_per_prompt
+    )
+    master_config.loss_fn = ClippedPGLossConfig(
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="adaptive-ppo-clip",
+        truncated_importance_sampling_ratio=1.0,
+        truncated_importance_sampling_ratio_min=0.5,
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = "/ckpt/step_4"
+    checkpointer.load_training_info.return_value = {
+        "current_step": 4,
+        "cur_adaptive_ppo_clip_k": 0.5,
+    }
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "load_dataloader_state", MagicMock())
+    built_losses = []
+
+    class RecordingLossFn(ClippedPGLossFn):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built_losses.append(self)
+
+    monkeypatch.setattr(grpo_mod, "ClippedPGLossFn", RecordingLossFn)
+
+    class ClusterReached(Exception):
+        pass
+
+    monkeypatch.setattr(
+        grpo_mod, "RayVirtualCluster", MagicMock(side_effect=ClusterReached)
+    )
+
+    # setup sets NRL_IGNORE_TP_ACCURACY_CHECK for force_on_policy_ratio; restore
+    # the environment so it does not leak into later tests.
+    with patch.dict(os.environ), pytest.raises(ClusterReached):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    (loss_fn,) = built_losses
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
@@ -3207,7 +3349,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
                 "tokenizer_cache": False,
                 "tokenizer_cache_bytes": 1024,
                 "router_mode": "kv",
-                "router_reset_states": True,
                 "extra_cli_args": [],
             },
         },
@@ -4048,7 +4189,7 @@ def test_setup_refits_noncolocated_megatron_while_nemo_gym_waits(
         },
         "mcore_generation_config": {
             "expose_http_server": True,
-            "kv_cache_management_mode": "persist",
+            "kv_cache_management_mode": "recompute",
         },
     }
     master_config.env = {"should_use_nemo_gym": True}
@@ -5191,6 +5332,81 @@ def test_early_stop_saves_final_checkpoint(mock_grpo_components, train_func, tmp
     assert checkpointer.shutdown.called
 
 
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train, grpo_train_sync])
+def test_adaptive_ppo_clip_state_advances_and_is_checkpointed(
+    mock_grpo_components, train_func, tmp_path
+):
+    """Each trainer advances the entropy controller once per step and saves it."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 2
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 2
+    master_config.checkpointing["metric_name"] = None
+    checkpointer = mock_grpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    checkpointer.checkpoint_dir = tmp_path
+    # Two microbatches whose per-token entropy sums to 0.1, below the 0.3 target.
+    mock_grpo_components["policy"].train.return_value["all_mb_metrics"][
+        "approx_entropy"
+    ] = [0.04, 0.06]
+    loss_config = ClippedPGLossConfig(
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="adaptive-ppo-clip",
+        truncated_importance_sampling_ratio=1.0,
+        truncated_importance_sampling_ratio_min=0.5,
+    )
+    loss_fn = ClippedPGLossFn(loss_config)
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with ExitStack() as stack:
+        _enter_stop_test_mocks(
+            stack,
+            train_func,
+            master_config,
+            mock_grpo_components,
+            mock_batch,
+            mock_rollout_metrics,
+        )
+        stack.enter_context(patch("nemo_rl.algorithms.grpo.torch.save"))
+        stack.enter_context(patch("nemo_rl.algorithms.grpo_sync.torch.save"))
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            loss_fn,
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    # Two steps below target -> k advanced twice by 0.25.
+    assert loss_fn.cur_adaptive_ppo_clip_k == 0.5
+    # Each step logs the k it trained with.
+    logged_k = [
+        call.args[0]["cur_adaptive_ppo_clip_k"]
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if "cur_adaptive_ppo_clip_k" in call.args[0]
+    ]
+    assert logged_k == [0.0, 0.25]
+    checkpointer.init_tmp_checkpoint.assert_called_once()
+    saved_state = checkpointer.init_tmp_checkpoint.call_args.args[1]
+    assert saved_state["cur_adaptive_ppo_clip_k"] == 0.5
+    # The saved state restores into a fresh loss function.
+    resumed = ClippedPGLossFn(loss_config)
+    _restore_adaptive_loss_state(resumed, _get_grpo_save_state(saved_state))
+    assert resumed.cur_adaptive_ppo_clip_k == 0.5
+
+
 def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):
     """grpo.stop_at_validation_metric=pass_k stops on pass_k, not accuracy."""
     master_config = mock_grpo_components["master_config"]
@@ -6307,6 +6523,11 @@ class TestValidateFunction:
 class TestComputeAndApplySeqLogprobErrorMasking:
     """Tests for the compute_and_apply_seq_logprob_error_masking function."""
 
+    @pytest.fixture(autouse=True)
+    def reset_env_calls(self):
+        # These pure tensor tests do not need the module's environment fixture.
+        yield
+
     def _create_train_data(
         self,
         batch_size: int,
@@ -6356,6 +6577,20 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         ]
         if masked_position:
             assert math.isfinite(result["max_seq_mult_prob_error"])
+
+    @pytest.mark.parametrize("threshold", [None, 2.0])
+    def test_support_filtered_tokenless_rows_are_excluded(self, threshold):
+        train_data = self._create_train_data(
+            2,
+            3,
+            torch.zeros(2, 3),
+            torch.zeros(2, 3),
+            token_mask=torch.tensor([[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]]),
+        )
+        compute_and_apply_seq_logprob_error_masking(
+            train_data, torch.ones(2), threshold
+        )
+        torch.testing.assert_close(train_data["sample_mask"], torch.tensor([0.0, 1.0]))
 
     def test_no_threshold_only_computes_metrics(self):
         """Test that when threshold is None, only metrics are computed (no masking)."""
@@ -6625,7 +6860,7 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
         assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
-        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""
@@ -6744,6 +6979,14 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["agent-a/truncation_rate"] == pytest.approx(0.5)
         assert result["agent-b/truncation_rate"] == pytest.approx(0.5)
+
+    def test_group_std_metrics_are_summarized(self):
+        result = aggregate_rollout_metrics(
+            {"reward_score_raw/std_in_group": [0.1, 0.2, 0.3]}
+        )
+        assert result["reward_score_raw/std_in_group/mean"] == pytest.approx(0.2)
+        assert result["reward_score_raw/std_in_group/p05"] == pytest.approx(0.11)
+        assert result["reward_score_raw/std_in_group/p95"] == pytest.approx(0.29)
 
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}

@@ -14,6 +14,7 @@
 
 import math
 import random
+import re
 import warnings
 from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Optional
@@ -31,6 +32,7 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
     should_use_deepseek_v4_chat_template,
 )
+from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.telemetry.vocabulary import (
     EFFICIENCY_PCT_KEY,
@@ -453,6 +455,12 @@ def get_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    def set_chat_template(chat_template: str) -> None:
+        """Keep placeholder-style processors synchronized with their tokenizer."""
+        tokenizer.chat_template = chat_template
+        if processor is not None and uses_image_placeholder(processor):
+            processor.chat_template = chat_template
+
     use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
     chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
     if chat_template_kwargs is not None:
@@ -467,7 +475,7 @@ def get_tokenizer(
     elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
-            tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
+            set_chat_template(COMMON_CHAT_TEMPLATES.passthrough_prompt_response)
         elif tokenizer_config["chat_template"].lower() == "default":
             print("Using tokenizer's default chat template")
         elif tokenizer_config["chat_template"].endswith(".jinja"):
@@ -475,10 +483,10 @@ def get_tokenizer(
             template_path = tokenizer_config["chat_template"]
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
-                tokenizer.chat_template = f.read()
+                set_chat_template(f.read())
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            set_chat_template(tokenizer_config["chat_template"])
     else:
         print("No chat template provided, using tokenizer's default")
 
@@ -1147,3 +1155,34 @@ def print_efficiency_summary(
     loggable[EFFICIENCY_PCT_PER_STEP_KEY] = float(pct_is_per_step)
 
     return loggable
+
+
+_DRAFT_RATIO_NUM_RE = re.compile(r"^(draft_.*)_num(@\d+)?$")
+
+
+def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Turn summed ``draft_*_num``/``draft_*_den`` metric pairs back into ratios, in place.
+
+    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/runtime.py``)
+    emit per-microbatch accuracy/rate metrics as raw num/den pairs instead of
+    pre-divided ratios, because the training loop's default per-key metric
+    reduction sums every metric not on its small mean-reduction allowlist
+    across all microbatches and DP ranks -- summing a pre-divided
+    per-microbatch ratio would produce a meaningless value (e.g. a
+    "draft_full_acc@0" of 240 instead of a rate in [0, 1]). Call this AFTER
+    that per-key reduction has summed the raw num/den pairs into global
+    totals, so the ratio it computes is the correct token-weighted global
+    rate. Deliberately dependency-free (no nemo_automodel import) so the
+    driver process can call it unconditionally.
+    """
+    for key in list(metrics.keys()):
+        match = _DRAFT_RATIO_NUM_RE.match(key)
+        if match is None:
+            continue
+        base, suffix = match.group(1), match.group(2) or ""
+        den_key = f"{base}_den{suffix}"
+        if den_key not in metrics:
+            continue
+        num = metrics.pop(key)
+        den = metrics.pop(den_key)
+        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0

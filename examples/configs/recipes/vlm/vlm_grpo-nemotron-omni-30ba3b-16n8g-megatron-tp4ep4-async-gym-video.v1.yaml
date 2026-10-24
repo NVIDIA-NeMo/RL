@@ -9,9 +9,6 @@ grpo:
   async_grpo:
     enabled: true
     in_flight_weight_updates: true
-    # vllm_cfg.enable_prefix_caching is off below, so keep in-flight requests on
-    # their pre-update KV (setting true would preempt and re-prefill them,
-    # and clear the encoder cache this recipe keeps, on every refit).
     recompute_kv_cache_after_weight_updates: false
 policy:
   model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16

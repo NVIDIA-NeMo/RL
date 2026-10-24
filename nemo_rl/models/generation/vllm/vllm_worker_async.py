@@ -72,6 +72,7 @@ from nemo_rl.models.generation.vllm.utils import (
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
@@ -1252,21 +1253,36 @@ class VllmAsyncGenerationWorkerImpl(
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
                 final_prompt_token_ids = splice.token_ids
-                media = await asyncio.to_thread(
-                    worker_self._capture_request_media,
-                    engine_prompt,
-                    admission=admission,
-                    splice=splice,
-                )
-                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
-
-                # Clamp after prefix replacement since the prompt length may have changed.
+                # Reject overflows before media validation can mask the length error.
                 if actual_request_max_tokens is not None:
                     self._clamp_max_tokens(
                         request,
                         actual_request_max_tokens,
                         final_prompt_token_ids,
                     )
+
+                media = await asyncio.to_thread(
+                    worker_self._capture_request_media,
+                    engine_prompt,
+                    admission=admission,
+                    splice=splice,
+                )
+                # Must precede the reassignment below: the remap reads the
+                # current value of prompt_token_ids as the template-coordinate
+                # sequence the placeholders were computed against. Reordering
+                # these two statements silently degrades to a no-op.
+                # Successful media capture already remapped these ranges.
+                if media is None and (
+                    mm_placeholders := engine_prompt.get("mm_placeholders")
+                ):
+                    engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
+                        template_token_ids=engine_prompt["prompt_token_ids"],
+                        final_token_ids=final_prompt_token_ids,
+                        mm_placeholders=mm_placeholders,
+                        splice=splice,
+                    )
+
+                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 # Token capture, token-in mode: the spliced prompt is the
                 # exact engine prompt; begin_call re-checks the prefix it
@@ -2228,9 +2244,20 @@ class VllmAsyncGenerationWorkerImpl(
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
         """Invalidate weight-dependent multimodal encoder outputs when enabled."""

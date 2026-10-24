@@ -34,7 +34,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 
 
 class IPCWeightSynchronizer(WeightSynchronizer):
@@ -109,8 +112,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         return self._stale
 
     def init_communicator(self) -> None:
-        state_dict_info = self._policy.prepare_refit_info()
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
     def shutdown(self) -> None:
         pass

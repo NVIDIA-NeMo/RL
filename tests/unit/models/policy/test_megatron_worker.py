@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import MagicMock, call
 
 import numpy as np
@@ -1361,6 +1361,55 @@ class _PastTheGuard(Exception):
     """Raised by the sentinel timer once the payload guard has been passed."""
 
 
+@pytest.mark.parametrize("full_vocab", [False, True])
+def test_full_vocab_logprobs_preserve_rollout_sampling(monkeypatch, full_vocab):
+    from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_mod
+
+    worker = object.__new__(worker_mod.MegatronPolicyWorkerImpl)
+    worker.timer = MagicMock()
+    worker.model = MagicMock()
+    worker.cfg = {"logprob_batch_size": 1, "megatron_cfg": {}}
+    worker.sampling_params = TrainingSamplingParams(top_k=3, top_p=0.9, temperature=0.6)
+    worker._opd_full_enabled = full_vocab
+    worker.media_placeholder_token_id = None
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    worker._router_replay_enabled = False
+    worker.defer_fp32_logits = False
+    monkeypatch.setattr(
+        worker_mod, "get_microbatch_iterator", lambda *a, **k: ([], 1, 1, 4, 4)
+    )
+    captured = {}
+
+    def capture_processor(**kwargs):
+        captured["processor"] = kwargs["sampling_params"]
+        return MagicMock()
+
+    def capture_forward(**kwargs):
+        captured["forward"] = kwargs["sampling_params"]
+        raise _PastTheGuard
+
+    monkeypatch.setattr(worker_mod, "LogprobsPostProcessor", capture_processor)
+    monkeypatch.setattr(worker_mod, "megatron_forward_backward", capture_forward)
+    with torch.enable_grad(), pytest.raises(_PastTheGuard):
+        worker.get_logprobs(
+            data=BatchedDataDict(input_ids=torch.zeros(1, 4, dtype=torch.long))
+        )
+
+    assert set(captured) == {"processor", "forward"}
+    for params in captured.values():
+        assert params.top_k == (None if full_vocab else 3)
+        assert params.top_p == (1.0 if full_vocab else 0.9)
+        assert params.temperature == 0.6
+    assert worker.sampling_params == TrainingSamplingParams(
+        top_k=3, top_p=0.9, temperature=0.6
+    )
+
+
 class _SentinelTimer:
     def start(self, name):
         raise _PastTheGuard(name)
@@ -1489,9 +1538,9 @@ def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
     logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
     bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
     dequantize = MagicMock(
-        side_effect=lambda tensor: logical_weight
-        if tensor is quantized_source
-        else tensor
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
     )
     monkeypatch.setattr(
         worker_module,
@@ -1616,8 +1665,9 @@ def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
     monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
     monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", single_decode)
     monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
-    spec = worker._default_param_spec(source, LocalHFParamSpec("gate", -2, 0, 2))
+    spec = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+        source, LocalHFParamSpec("gate", -2, 0, 2)
+    )
     assert spec.wire_dtype == torch.bfloat16
 
     for _ in range(2):
@@ -1644,7 +1694,6 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
 
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     sources = tuple(
         torch.arange(8, dtype=torch.uint8).reshape(4, 2) + offset for offset in (0, 16)
     )
@@ -1668,7 +1717,7 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
     prefix = "model.layers.0.mlp.experts"
     groups = {
         (prefix, proj): [
-            worker._default_param_spec(
+            worker_module.MegatronReshardParamSpecCollection._default_param_spec(
                 source,
                 LocalHFParamSpec(f"{prefix}.{index}.{proj}.weight", -2, split, 2),
             )
@@ -1681,7 +1730,9 @@ def test_megatron_refit_quantized_hooks_read_current_fused_source(
             assert member.base.tensor is source
             member.pre = MagicMock(side_effect=AssertionError("individual pre called"))
     grouped_specs = tuple(
-        worker._group_experts(proj, f"{prefix}.{proj}.weight", groups)
+        worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
+            proj, f"{prefix}.{proj}.weight", groups
+        )
         for proj in ("gate_proj", "up_proj")
     )
     grouped_decode.assert_not_called()
@@ -1782,7 +1833,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
                 name = f"{layer}.mlp.{proj}_proj.weight"
                 yield (
                     name,
-                    worker._default_param_spec(
+                    worker_module.MegatronReshardParamSpecCollection._default_param_spec(
                         source,
                         LocalHFParamSpec(name, -2, split_index, 2),
                     ),
@@ -1869,7 +1920,6 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
 
     import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
 
-    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         quantized_source = torch.arange(8, device="cuda", dtype=torch.uint8).reshape(
@@ -1888,11 +1938,11 @@ def test_megatron_refit_pre_hooks_use_current_cuda_stream(
         monkeypatch.setattr(
             worker_module, "_dequantize_refit_source_group", dequantize_group
         )
-        member = worker._default_param_spec(
+        member = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
             quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
         )
         prefix = "model.layers.0.mlp.experts"
-        grouped = worker._group_experts(
+        grouped = worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
             "gate_proj",
             f"{prefix}.gate_proj.weight",
             {(prefix, "gate_proj"): [member, member]},
@@ -2225,9 +2275,9 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(
     _disable_opd_full(worker)
     worker.model = _FakeTrainableModel()
     worker.model.eval = lambda: events.append("eval")
-    worker.cfg = (
-        {"generation": {"backend": generation_backend}} if generation_backend else {}
-    )
+    worker.cfg = {"megatron_cfg": {}}
+    if generation_backend:
+        worker.cfg["generation"] = {"backend": generation_backend}
     worker.is_generation_colocated = colocated
     worker.inference_model = object() if has_inference_model else None
     worker._colocated_reshard_plan = None
@@ -2462,6 +2512,353 @@ def test_megatron_move_model_does_not_serialize_extra_state():
     assert moved_model is model
     assert model.weight.device.type == "cpu"
     assert model.scale.device.type == "cpu"
+
+
+def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+        CheckpointEngineWeightSynchronizer,
+    )
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    weight = torch.randn(64, 64, dtype=torch.bfloat16)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = set()
+    worker._refit_param_info_hf = None
+    worker.fp8_cfg = None
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
+    )
+
+    def _prepare_refit_info() -> dict[str, Any]:
+        worker._refit_param_info_hf = {name: (weight.shape, weight.dtype)}
+        return worker._refit_param_info_hf
+
+    worker.prepare_refit_info = _prepare_refit_info
+    worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
+
+    class _Generation:
+        def __init__(self) -> None:
+            self.refit_info: list[dict[str, Any]] = []
+
+        def prepare_refit_info(
+            self, state_dict_info: dict[str, Any] | None
+        ) -> list[str] | None:
+            assert state_dict_info is not None
+            self.refit_info.append(state_dict_info)
+            return [name] if len(self.refit_info) == 1 else None
+
+    generation = _Generation()
+    synchronizer = CheckpointEngineWeightSynchronizer(worker, generation, {})
+    synchronizer._ensure_checkpoint_engine_ready = lambda: None
+
+    synchronizer.init_communicator()
+    exported = dict(worker._checkpoint_engine_weight_iterator())
+
+    scale_name = name + "_scale_from_checkpoint"
+    assert generation.refit_info[1][name][1] == torch.float8_e4m3fn
+    assert generation.refit_info[1][scale_name][1] == torch.uint8
+    assert exported[name].dtype == torch.float8_e4m3fn
+    assert exported[scale_name].dtype == torch.uint8
+    assert exported[scale_name].shape == (64, 2)
+
+
+def test_reference_model_swap_restores_state():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+            self.register_buffer("extra_state_cache", torch.tensor([2.0]))
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = Model()
+    worker.reference_state_dict = {
+        "weight": torch.tensor([11.0]),
+        "extra_state_cache": torch.tensor([12.0]),
+    }
+    worker.cfg = {
+        "megatron_cfg": {
+            "empty_unused_memory_level": 0,
+        }
+    }
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    for _ in range(2):
+        with worker.use_reference_model():
+            torch.testing.assert_close(worker.model.weight, torch.tensor([11.0]))
+            torch.testing.assert_close(
+                worker.model.extra_state_cache, torch.tensor([12.0])
+            )
+        torch.testing.assert_close(worker.model.weight, torch.tensor([1.0]))
+        torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
+
+
+def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cache_clear = MagicMock()
+
+    def forward():
+        return None
+
+    forward.cache_clear = cache_clear
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    dispatcher = SimpleNamespace(
+        probs=torch.ones(1),
+        routing_map=torch.ones(1),
+        reversed_local_input_permutation_mapping=torch.ones(1),
+        local_probs=torch.ones(1),
+        local_map=torch.ones(1),
+        non_tensor="keep",
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=lambda: [
+            SimpleNamespace(),
+            SimpleNamespace(token_dispatcher=None),
+            SimpleNamespace(token_dispatcher=dispatcher),
+        ]
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+    cache_clear.assert_called_once_with()
+    assert dispatcher.probs is None
+    assert dispatcher.routing_map is None
+    assert dispatcher.reversed_local_input_permutation_mapping is None
+    assert dispatcher.local_probs is None
+    assert dispatcher.local_map is None
+    assert dispatcher.non_tensor == "keep"
+
+
+def test_clear_rope_and_moe_dispatcher_caches_is_best_effort(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    def forward():
+        return None
+
+    forward.cache_clear = MagicMock(side_effect=RuntimeError("rotary cache"))
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=MagicMock(side_effect=RuntimeError("module traversal"))
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_maybe_prequantize_param_passthrough_when_not_selected(dtype):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = set()
+    tensor = torch.ones(2, 2, dtype=dtype)
+
+    result = list(worker._maybe_prequantize_param(name, tensor))
+
+    assert len(result) == 1
+    assert result[0][0] == name
+    assert result[0][1] is tensor
+
+
+def test_maybe_prequantize_param_rejects_fp8_trainer_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    tensor = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        list(worker._maybe_prequantize_param(name, tensor))
+
+
+def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_requires_prepare_refit_info():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = None
+
+    with pytest.raises(RuntimeError, match="prepare_refit_info"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_derives_metadata_without_export():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.a.weight": (torch.Size([4, 64]), torch.bfloat16),
+        "model.b.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    def _fail_iter(*_args, **_kwargs):
+        raise AssertionError("metadata derivation must not re-export weights")
+
+    worker._iter_params_with_optional_kv_scales = _fail_iter
+
+    info = worker.enable_refit_prequantize(["model.a.weight"])
+
+    assert info["model.a.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.a.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
+    assert info["model.b.weight"] == (torch.Size([4, 64]), torch.bfloat16)
+    assert worker._refit_prequant_names == {"model.a.weight"}
+
+
+def test_prepare_source_refit_info_resets_previous_prequantization_selection():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    worker._calculate_refit_param_info = lambda: {}
+
+    def _iter_params():
+        dtype = (
+            torch.float8_e4m3fn
+            if name in worker._refit_prequant_names
+            else torch.bfloat16
+        )
+        yield name, torch.ones(2, 64, dtype=dtype)
+
+    worker._iter_params_with_optional_kv_scales = _iter_params
+
+    info = worker._prepare_source_refit_info()
+
+    assert worker._refit_prequant_names == set()
+    assert info[name] == (torch.Size([2, 64]), torch.bfloat16)
+
+
+def test_enable_refit_prequantize_rejects_indivisible_last_dim():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 48]), torch.bfloat16),
+    }
+
+    with pytest.raises(ValueError, match="divisible"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = SimpleNamespace(eval=MagicMock())
+    worker.model = model
+    worker.move_model = MagicMock(return_value=model)
+    worker.cfg = {
+        "megatron_cfg": {
+            "clear_memory_caches_before_refit": True,
+        }
+    }
+    worker.fp8_cfg = {"force_clear_fp8_caches": True}
+    worker.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
+    worker._clear_fp8_caches = MagicMock()
+    worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = True
+    worker.move_optimizer = MagicMock()
+    worker.offload_before_refit = MagicMock()
+    worker.finalize_async_save = MagicMock()
+    collect = MagicMock()
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        torch,
+        "randn",
+        lambda *_args, **_kwargs: SimpleNamespace(cuda=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.gc.collect",
+        collect,
+    )
+
+    worker.offload_after_refit()
+
+    worker.finalize_async_save.assert_called_once_with()
+    worker.move_model.assert_called_once_with(
+        model, "cpu", move_params=True, move_grads=True
+    )
+    model.eval.assert_called_once_with()
+    worker.offload_before_refit.assert_called_once_with()
+    worker._clear_fp8_caches.assert_not_called()
+    worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+    collect.assert_not_called()
+    empty_cache.assert_not_called()
 
 
 def test_megatron_prepare_for_training_restores_optimizer():

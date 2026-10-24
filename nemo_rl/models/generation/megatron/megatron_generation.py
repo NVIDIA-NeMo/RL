@@ -723,7 +723,9 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
-    def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
         """Prepare Bridge conversion tasks on every dedicated inference worker."""
         if not self._owns_policy or self.uses_native_refit:
             return
