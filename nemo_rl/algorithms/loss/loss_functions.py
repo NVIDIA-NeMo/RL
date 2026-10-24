@@ -205,10 +205,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     #   "adaptive-ppo-clip" – advantage-aware token filtering with an
     #                         entropy-adaptive upper bound
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    #   "ipo"          – IPO (INTELLECT Policy Optimization) trust region from prime-rl:
-    #                    zero out tokens whose train/inference probability gap
-    #                    |p_train - p_infer| exceeds the ratio (0.3 suggested).
-    #                    Unrelated to the IPO preference-optimization loss.
+    #   "ipo"          – zero out tokens whose train/inference probability gap exceeds the ratio
+    #                    https://github.com/PrimeIntellect-ai/prime-rl/blob/2eb8e83aaf0db0a6ac51a095f20a43572731c479/docs/ipo.md
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
     # Lower bound for TIS clipping, or ICE-POP / adaptive-ppo-clip /
@@ -450,8 +448,7 @@ class ClippedPGLossFn(LossFunction):
                 "use_cispo requires token_level_loss=True (LossType.TOKEN_LEVEL)."
             )
             assert self.truncated_importance_sampling_type != "ipo", (
-                "use_cispo is incompatible with truncated_importance_sampling_type='ipo'. "
-                "Set use_cispo=False to use the ipo mask"
+                "use_cispo does not support truncated_importance_sampling_type='ipo'"
             )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
@@ -489,6 +486,10 @@ class ClippedPGLossFn(LossFunction):
                     "truncated_importance_sampling_ratio_min should be set when "
                     "truncated_importance_sampling_type is 'icepop', "
                     "'adaptive-ppo-clip', or 'seq-mask-tis'"
+                )
+            if self.truncated_importance_sampling_type == "ipo":
+                assert not self.sequence_level_importance_ratios, (
+                    "ipo does not support sequence_level_importance_ratios=True"
                 )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
                 assert not self.sequence_level_importance_ratios, (
@@ -883,12 +884,7 @@ class ClippedPGLossFn(LossFunction):
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
-        # "ipo"          – IPO (INTELLECT Policy Optimization) trust region: zero out
-        #                  tokens whose |exp(prev_logprobs) - exp(generation_logprobs)|
-        #                  > max (ref: 0.3). Kept tokens keep their raw IS weights.
-        #                  prime-rl masks on the current trainer logprobs, which equal
-        #                  prev_logprobs with force_on_policy_ratio. Not the IPO
-        #                  preference-optimization loss.
+        # "ipo"          – zero out tokens whose probability gap exceeds max   (ref: 0.3)
         #   Docs: https://github.com/PrimeIntellect-ai/prime-rl/blob/2eb8e83aaf0db0a6ac51a095f20a43572731c479/docs/ipo.md
         # is_oob_ratio: fraction of tokens (tis/icepop/adaptive-ppo-clip/ipo) or sequences (seq-mask-tis)
         # whose importance weight falls outside the truncation bounds. Each microbatch
@@ -936,8 +932,7 @@ class ClippedPGLossFn(LossFunction):
                     torch.zeros_like(actor_importance_weights_expanded),
                 )
             elif self.truncated_importance_sampling_type == "ipo":
-                # Same rule as prime-rl's IPOLoss: |e^a - e^b| computed as
-                # e^max(a, b) * -expm1(min(a, b) - max(a, b)) to avoid cancellation.
+                # |exp(a) - exp(b)| without cancellation, as in prime-rl
                 larger_logprobs = torch.maximum(prev_logprobs, generation_logprobs)
                 smaller_logprobs = torch.minimum(prev_logprobs, generation_logprobs)
                 probs_gap = torch.exp(larger_logprobs) * -torch.expm1(

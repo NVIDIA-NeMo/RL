@@ -852,7 +852,7 @@ def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
       CISPO is defined over.
     - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
       ClippedPGLossFn and would silently overwrite it.
-    - the ipo truncated importance sampling mask is not supported with CISPO.
+    - ipo is not supported with CISPO.
     """
     cfg = ClippedPGLossConfig(
         reference_policy_kl_penalty=0.0,
@@ -1796,10 +1796,12 @@ def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
     assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
 
 
-def test_clipped_pg_loss_ipo_masks_tokens_by_probability_gap():
+@pytest.mark.parametrize("token_level_loss", [True, False])
+def test_clipped_pg_loss_ipo_masks_tokens_by_probability_gap(token_level_loss):
     data, _, _, _ = _setup_clipped_pg_test_data(device="cpu")
     cfg = ClippedPGLossConfig(
         reference_policy_kl_penalty=0.0,
+        token_level_loss=token_level_loss,
         use_importance_sampling_correction=True,
         force_on_policy_ratio=True,
         truncated_importance_sampling_type="ipo",
@@ -1820,16 +1822,29 @@ def test_clipped_pg_loss_ipo_masks_tokens_by_probability_gap():
     )
     loss.backward()
 
-    # Kept tokens keep their raw IS weights (1.25 and 10), the masked one gets 0.
     torch.testing.assert_close(loss, -torch.tensor([1.25, 0.0, 10.0]).mean())
     assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
     grad = next_token_logprobs.grad[0]
     assert grad[1] == 0 and grad[0] != 0 and grad[2] != 0
 
 
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_clipped_pg_loss_ipo_rejects_sequence_level_importance_ratios(metrics_level):
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+        truncated_importance_sampling_type="ipo",
+        truncated_importance_sampling_ratio=0.3,
+        metrics_level=metrics_level,
+    )
+    with pytest.raises(AssertionError, match="sequence_level_importance_ratios"):
+        ClippedPGLossFn(cfg)
+
+
 def test_clipped_pg_loss_ipo_matches_prime_rl_ipo_loss():
-    """With current == prev logprobs, the ipo mask, loss and gradient match prime-rl's
-    IPOLoss (prime_rl/trainer/rl/loss.py), normalized by the valid token count."""
+    """With current == prev logprobs, ipo matches prime-rl's IPOLoss (prime_rl/trainer/rl/loss.py)."""
     torch.manual_seed(0)
     data, batch_size, seq_len, _ = _setup_clipped_pg_test_data(
         batch_size=4, seq_len=65, device="cpu"
@@ -1861,7 +1876,7 @@ def test_clipped_pg_loss_ipo_matches_prime_rl_ipo_loss():
     )
     loss.backward()
 
-    # prime-rl IPOLoss: mask on the probability gap, then -A * capped ratio over kept tokens.
+    # prime-rl's IPOLoss
     lp = trainer_logprobs.clone().requires_grad_()
     larger = torch.maximum(lp, inference_logprobs)
     smaller = torch.minimum(lp, inference_logprobs)
