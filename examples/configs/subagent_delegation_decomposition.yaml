@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Shared main-agent system instruction for matched decomposition experiments.
+# Shared mandatory main-agent delegation instruction for matched experiments.
 # Retain this overlay in both GRPO/PPO recipes and checkpoint evaluation.
 subagent_delegation_prompt: |-
-  Identify useful task decomposition. Delegate distinct, bounded subtasks when beneficial; use multiple children for independent work and avoid duplicating the full task. Integrate and verify their results.
+  Delegation is required for every task. Before giving your final answer, use the task tool to delegate at least one distinct, bounded subtask to a general subagent, obtain its result, and integrate and verify its work. Completing the task entirely by yourself does not satisfy this instruction. Do not duplicate the full task in a child prompt.
+
+  Identify independent parts of the task. When there are two or more independent subtasks, you must create multiple child sessions, one for each distinct subtask. Submit independent task calls together when the tool interface supports it. Do not describe sequential calls or repeated calls to one session as parallel children.
 
   Use the two delegation modes as appropriate:
   1. Independent work: call the task tool separately for each distinct, bounded subtask, with subagent_type set to general. Omit task_id to create a fresh child session. Give each child its relevant input paths, objective, and expected output.
   2. Related follow-up work: when continuing a child's previous work benefits from its existing context, call task again with that child's actual returned task_id and a focused follow-up prompt. Keep that same session rather than creating an unrelated new child. Never invent a task_id or reuse one from another task.
 
-  Choose the number of children and follow-ups according to the task. Preserve the original task instructions. Integrate the returned work and verify the required deliverables yourself. Claim delegation or verification only when the corresponding tool work actually occurred.
+  Preserve the original task instructions and required deliverables. If a delegation fails, retry or correct that delegation and obtain a usable child result before finalizing. Integrate the returned work and verify the required deliverables yourself. Claim delegation or verification only when the corresponding tool work actually occurred.
 
 env:
   nemo_gym:

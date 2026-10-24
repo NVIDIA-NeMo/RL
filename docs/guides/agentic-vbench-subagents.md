@@ -234,12 +234,20 @@ tool alone does not select this instruction. The canonical prompt is in
 
 Gym forwards `opencode_delegation_prompt` into OpenCode's main-agent system
 prompt. The parent receives the same instruction for both ClawEval and Agentic VBench.
-It may start distinct children with separate `task` calls that omit `task_id`,
-or continue an existing child with its actual returned `task_id` and a focused
-follow-up. Both modes use OpenCode's existing tools and session capture. The
-instruction asks for useful, bounded decomposition and integration of the
-results; it does not require a fixed number of children or add a delegation
-reward.
+The instruction requires at least one bounded child task and an obtained,
+integrated child result before the final answer. For two or more independent
+subtasks, it requires multiple child sessions. Create distinct children with
+separate `task` calls that omit `task_id`, or continue an existing child with its
+actual returned `task_id` and a focused follow-up. Independent calls should be
+submitted together when supported; repeated calls to one session do not count
+as multiple children. Both modes use OpenCode's existing tools and session capture.
+
+This replaces the earlier optional wording, "when beneficial." It is a mandatory
+system-prompt requirement, not a runtime guarantee: inspect captured Task calls,
+distinct child sessions, and returned results to measure compliance. These recipes
+add no delegation reward or rejection rule, so instruction violations remain
+visible in the native rollouts. Record the exact prompt for each experiment;
+historical checkpoints and already-running jobs retain their original prompt.
 
 These recipes inherit their paired baseline's model, dataset, rollout settings,
 context limits, admission masks, optimizer, loss, and TMPE calculation. They
