@@ -105,7 +105,6 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
-    should_dump_gym_results,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -145,6 +144,11 @@ from nemo_rl.models.value.tq_value import TQValue
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
+)
+from nemo_rl.utils.gym_results_log import (
+    RL_OUTCOMES_PREFIX,
+    JsonlAppender,
+    gym_results_dir,
 )
 from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
@@ -800,8 +804,51 @@ def _spinup_gym(
             if master_config.token_capture.enabled
             else None
         ),
+        gym_results_log=resolve_gym_results_log(master_config),
     )
     return shard_set, time.perf_counter() - t0
+
+
+def resolve_gym_results_log(master_config: MasterConfig) -> Optional[dict[str, Any]]:
+    """Validate ``async_rl.gym_results_log`` and resolve it for the NemoGym actors.
+
+    Returns:
+        None when the log is off; otherwise the config's fields plus ``dir``, the
+        absolute ``<log_dir>/gym_results`` every writer appends to.
+
+    Raises:
+        ValueError: The run does not use NeMo-Gym, or model calls were requested
+            without Gym's model-call capture, which is the only record of them.
+    """
+    log_cfg = master_config.async_rl.gym_results_log
+    if not log_cfg.enabled:
+        return None
+    if not should_use_nemo_gym(master_config):
+        raise ValueError(
+            "async_rl.gym_results_log.enabled logs NeMo-Gym rollouts, but this run "
+            "does not use NeMo-Gym (env.should_use_nemo_gym is false)."
+        )
+    if log_cfg.include_model_calls:
+        gym_cfg = master_config.env["nemo_gym"]
+        capture_dir = gym_cfg.get("model_call_capture_dir")
+        if not gym_cfg.get("observability_enabled") or not (
+            capture_dir and os.path.isabs(str(capture_dir))
+        ):
+            raise ValueError(
+                "async_rl.gym_results_log.include_model_calls=true merges Gym's "
+                "record of every model call, which Gym only writes when its "
+                "model-call capture is on. Add\n"
+                "  env:\n"
+                "    nemo_gym:\n"
+                "      observability_enabled: true\n"
+                "      model_call_capture_dir: /absolute/path/every/node/can/write\n"
+                "or set async_rl.gym_results_log.include_model_calls=false to log "
+                "only what each agent returns."
+            )
+    return {
+        "dir": gym_results_dir(master_config.logger.log_dir),
+        **log_cfg.model_dump(),
+    }
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -1282,6 +1329,8 @@ def setup_single_controller(
                 UserWarning,
                 stacklevel=2,
             )
+    # Fails before anything is built; resolved again where the actors are made.
+    resolve_gym_results_log(master_config)
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -2115,7 +2164,7 @@ def setup_single_controller(
     )
 
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
-    dump_gym_results = should_dump_gym_results(master_config)
+    gym_results_log = resolve_gym_results_log(master_config)
     tq_buffer = TQReplayBuffer(
         dp_client,
         partition_id=partition_id,
@@ -2128,7 +2177,11 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
-        include_gym_full_result=dump_gym_results,
+        outcome_log=(
+            JsonlAppender(gym_results_log["dir"], RL_OUTCOMES_PREFIX)
+            if gym_results_log is not None
+            else None
+        ),
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
@@ -2152,7 +2205,6 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
-                dump_gym_results=dump_gym_results,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
@@ -2190,12 +2242,6 @@ def setup_single_controller(
             wandb_enabled=master_config.logger.wandb_enabled,
             wandb_config=master_config.logger.wandb,
         ),
-        dump_gym_results=dump_gym_results,
-        gym_results_dir=(
-            os.path.join(master_config.logger.log_dir, "gym_results")
-            if use_nemo_gym and master_config.async_rl.log_gym_results
-            else None
-        ),
         reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
@@ -2205,6 +2251,7 @@ def setup_single_controller(
         ),
         retry_policy=_build_retry_policy(master_config),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        stamp_dispatch_weight_version=gym_results_log is not None,
     )
 
     # Print setup timing metrics

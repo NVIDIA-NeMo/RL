@@ -39,18 +39,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, cast
 
-import numpy as np
 import torch
 
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (
-    GYM_FULL_RESULT_FIELD,
-    MASK_SAMPLE,
-    ROUTE_PLAN_TAG,
-    TRUNCATED,
-)
+from nemo_rl.data_plane.schema import MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,
@@ -265,10 +259,8 @@ class RolloutReassembler:
         defer_routed_experts_to_policy: bool = False,
         capture_media: bool = False,
         media_columns: Optional[MediaColumnSpec] = None,
-        dump_gym_results: bool = False,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
-        self._dump_gym_results = dump_gym_results
         self._effort_config = effort_config
         self._dp_client = dp_client
         self._partition_id = partition_id
@@ -846,13 +838,6 @@ class RolloutReassembler:
                 )
             train_batch["routed_experts"] = self._build_routed_experts_tensor(
                 rows, max_len=max_len, metrics=metrics
-            )
-        if self._dump_gym_results:
-            # Every group publishes the column so the partition schema is
-            # uniform; "null" where a row has no result.
-            train_batch[GYM_FULL_RESULT_FIELD] = np.array(
-                [(c and c.full_result_json) or "null" for c in log_contexts],
-                dtype=object,
             )
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).

@@ -21,6 +21,11 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Gym's run-body rollout id. Token capture stamps its gate id; otherwise the
+# row builder derives a unique one, so every rollout has one capture key.
+NEMO_GYM_ROLLOUT_ID_KEY = "_ng_rollout_id"
+# Trainer weight version when the row was dispatched, for the Gym-results log.
+NEMO_GYM_DISPATCH_WEIGHT_VERSION_KEY = "_ng_dispatch_weight_version"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.

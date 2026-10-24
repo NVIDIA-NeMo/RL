@@ -52,12 +52,15 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_FIELD,
 )
 from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ATTEMPT_KEY,
+    NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
     RETAINED_TASK_INDICES_KEY,
     PromptGroupRecord,
 )
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.utils.gym_results_log import JsonlAppender, outcome_record
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 DATA_PLANE_CHECKPOINT_DIR = "data_plane"
@@ -1111,13 +1114,14 @@ class TQReplayBuffer:
         include_message_violation_fields: bool,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
-        include_gym_full_result: bool = False,
+        outcome_log: Optional[JsonlAppender] = None,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
+        # async_rl.gym_results_log: records each group this buffer evicts.
+        self._outcome_log = outcome_log
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
-        self._include_gym_full_result = include_gym_full_result
         # Token-capture mode only: the staging partition whose per-call delta
         # rows `remove` must clear alongside the canonical rows. None on the
         # legacy path.
@@ -1253,7 +1257,6 @@ class TQReplayBuffer:
             record,
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
-            include_gym_full_result=self._include_gym_full_result,
         )
         sample_ids, fields, tags = pack_payload(
             train_batch,
@@ -1312,6 +1315,20 @@ class TQReplayBuffer:
                 self.meta_list[idx] = meta
                 self.end_weight_list[idx] = end_weight_version
                 self.ready_list[idx] = True
+                if self._outcome_log is not None:
+                    # The TQ group id is minted per attempt on this path, so it
+                    # differs from the id the Gym rows carried; record the pair
+                    # so trained/evicted lines join the Gym-results log.
+                    gym_info = record.extra_env_info or {}
+                    self._outcome_log.append(
+                        outcome_record(
+                            outcome="buffered",
+                            group_id=group_id,
+                            weight_version=start_weight_version,
+                            gym_group_id=gym_info.get(NEMO_GYM_GROUP_ID_KEY),
+                            gym_group_attempt=gym_info.get(NEMO_GYM_GROUP_ATTEMPT_KEY),
+                        )
+                    )
                 return meta
             except BaseException as commit_error:
                 # put_samples may have written rows before raising. Roll back by the
@@ -1522,12 +1539,25 @@ class TQReplayBuffer:
         # removal may shift every list index while this task waits for the barrier
         # or for DataPlane cleanup.
         drop_group_ids = [self._group_ids[i] for i in drop_idxs]
+        drop_start_weights = [self.start_weight_list[i] for i in drop_idxs]
         async with self._data_plane_checkpoint_barrier.mutation(
             "group_removals"
         ) as cut:
-            return await self._remove_groups_unlocked(
+            removed = await self._remove_groups_unlocked(
                 cut, drop_group_ids, clear_data_plane=remove_in_dp
             )
+        if self._outcome_log is not None:
+            # Trained groups leave through claim_for_training; this path is
+            # stale eviction (and replay-free resume discarding restored groups).
+            for group_id, start_weight in zip(drop_group_ids, drop_start_weights):
+                self._outcome_log.append(
+                    outcome_record(
+                        outcome="evicted",
+                        group_id=group_id,
+                        weight_version=start_weight,
+                    )
+                )
+        return removed
 
     async def claim_for_training(self, idxs: list[int]) -> int:
         """Transfer ready groups from sampler ownership to an open train step.

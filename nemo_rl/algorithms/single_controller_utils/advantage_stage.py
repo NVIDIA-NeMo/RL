@@ -59,8 +59,14 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
-from nemo_rl.data_plane.schema import GYM_FULL_RESULT_FIELD, INPUT_IDS, INPUT_LENGTHS
+from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.gym_results_log import (
+    RL_OUTCOMES_PREFIX,
+    JsonlAppender,
+    gym_results_dir,
+    outcome_record,
+)
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
 if TYPE_CHECKING:
@@ -102,9 +108,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
-    # JSON-string object columns the dump copies per row (a Gym run's
-    # GYM_FULL_RESULT_FIELD); fetched only while the dump is on.
-    dump_object_fields: tuple[str, ...] = ()
+    # async_rl.gym_results_log: where the stage records each row it trains or
+    # masks, or None when the log is off.
+    outcome_log_dir: Optional[str] = None
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -122,7 +128,6 @@ class AdvantageStageConfig:
             algo_config,
             is_ppo_run,
         )
-        from nemo_rl.environments.nemo_gym import should_dump_gym_results
 
         is_ppo = is_ppo_run(master_config)
         algo_cfg = algo_config(master_config)
@@ -160,10 +165,10 @@ class AdvantageStageConfig:
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
-            dump_object_fields=(
-                (GYM_FULL_RESULT_FIELD,)
-                if should_dump_gym_results(master_config)
-                else ()
+            outcome_log_dir=(
+                gym_results_dir(master_config.logger.log_dir)
+                if master_config.async_rl.gym_results_log.enabled
+                else None
             ),
         )
 
@@ -204,7 +209,6 @@ class AdvantageStageConfig:
                     INPUT_LENGTHS,
                     adv_cfg.prompt_ids_field,
                     adv_cfg.generation_logprobs_field,
-                    *self.dump_object_fields,
                 ]
             )
         return list(dict.fromkeys(fields))
@@ -328,6 +332,11 @@ class AdvantageComputer:
         self._train_data_dump = (
             TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
             if config.train_data_dump_dir is not None
+            else None
+        )
+        self._outcome_log = (
+            JsonlAppender(config.outcome_log_dir, RL_OUTCOMES_PREFIX)
+            if config.outcome_log_dir is not None
             else None
         )
 
@@ -558,10 +567,29 @@ class AdvantageComputer:
                     # group-index key the estimator reduces over.
                     "prompt_ids": data[adv_cfg.prompt_ids_field],
                 },
-                objects={field: data[field] for field in cfg.dump_object_fields},
             )
             train_data_dump_s = time.perf_counter() - dump_started
             train_data_dump_rows = len(meta.sample_ids)
+
+        if self._outcome_log is not None:
+            assert request.train_step is not None
+            # Numbered like train_data_step<N>.jsonl, so the two logs line up.
+            train_step = request.train_step + 1
+            for sample_id, group_id, reward, keep in zip(
+                meta.sample_ids,
+                row_group_ids(meta),
+                rewards.reshape(-1).tolist(),
+                final_sample_mask.reshape(-1).tolist(),
+            ):
+                self._outcome_log.append(
+                    outcome_record(
+                        outcome="trained" if keep else "masked",
+                        group_id=group_id,
+                        sample_id=sample_id,
+                        train_step=train_step,
+                        final_reward=float(reward),
+                    )
+                )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):

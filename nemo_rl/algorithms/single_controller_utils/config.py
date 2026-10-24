@@ -475,13 +475,53 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class GymResultsLogConfig(BaseModel, extra="allow"):
+    """Debug log of every NeMo-Gym rollout and of what RL did with it.
+
+    Writes ``<log_dir>/gym_results/gym_results.<pid>.jsonl`` from each NemoGym
+    actor (one line per Gym result, before RL post-processing, plus an ``error``
+    line per failed rollout) and ``rl_outcomes.<pid>.jsonl`` from the processes
+    that train, mask, evict or discard rollouts. NeMo-Gym runs only.
+    """
+
+    # Turn both logs on. Debug-only; leave off for production runs.
+    enabled: bool = False
+    # Attach every model-server call of the rollout (request, response, timings,
+    # token counts) to its logged result, plus Gym's normalized ng_trajectory.
+    # Requires env.nemo_gym.observability_enabled and an absolute
+    # env.nemo_gym.model_call_capture_dir on storage every node can see.
+    include_model_calls: bool = True
+    # Keep each call's request/response bodies inline. False logs call metadata
+    # only and leaves the bodies in model_call_capture_dir.
+    include_payloads: bool = True
+    # Delete each rollout's capture file once it is merged into the log line.
+    # Needs include_payloads, since the file is otherwise the only copy of the bodies.
+    delete_capture_after_merge: bool = True
+    # Drop what a line repeats: the identity keys enrichment stamps on the result,
+    # the per-call list in ng_model_call_capture (same calls as
+    # ng_trajectory.model_calls), null fields, and any call input/tools/output equal
+    # to the agent's own result, which becomes a "=full_result...." reference.
+    # Every captured call keeps its entry and metadata. false logs Gym's record as is.
+    compact: bool = True
+
+    @model_validator(mode="after")
+    def _bodies_have_a_home(self) -> GymResultsLogConfig:
+        if self.delete_capture_after_merge and not self.include_payloads:
+            raise ValueError(
+                "async_rl.gym_results_log.delete_capture_after_merge=true with "
+                "include_payloads=false would delete the only copy of every call's "
+                "request/response bodies. Set include_payloads=true, or "
+                "delete_capture_after_merge=false to keep them in model_call_capture_dir."
+            )
+        return self
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
-    # Append every NeMo-Gym rollout result, including ones never trained on, to
-    # <log_dir>/gym_results/ as it arrives. Debug-only; disabled by default.
-    log_gym_results: bool = False
+    # Debug log of every NeMo-Gym rollout and of RL's decision about it.
+    gym_results_log: GymResultsLogConfig = Field(default_factory=GymResultsLogConfig)
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,

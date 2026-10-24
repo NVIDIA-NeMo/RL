@@ -4357,4 +4357,3 @@ def test_advantage_stage_config_reads_the_dump_dir_off_logger_config(tmp_path):
     stage_cfg = AdvantageStageConfig.from_master_config(cfg)
 
     assert stage_cfg.train_data_dump_dir == str(tmp_path / "logs")
-    assert stage_cfg.dump_object_fields == ()
