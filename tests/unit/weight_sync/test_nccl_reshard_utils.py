@@ -221,7 +221,7 @@ def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision,
         ),
         (
             {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
+            "policy.generation.backend must be 'vllm', 'megatron' or 'trtllm' (got 'sglang')",
         ),
     ],
 )
