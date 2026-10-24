@@ -453,6 +453,15 @@ class TQWorkerMixin:
             "the router-replay policy worker must provide route dimensions"
         )
 
+    def _routed_experts_full_layout(self) -> Optional[tuple[int, list[int]]]:
+        """``(total_num_layers, moe_layer_indices)`` for fragments in vLLM's full-layer layout, or None.
+
+        Hybrid models (NemotronH) make vLLM emit one route slot per decoder
+        layer; the worker that knows its layer map returns it so deferred
+        assembly can compress such fragments instead of falling back.
+        """
+        return None
+
     def _pad_value_dict(self) -> dict[str, Any]:
         """Per-field pad value used by :func:`materialize` to detile the jagged wire format.
 
@@ -783,6 +792,7 @@ class TQWorkerMixin:
 
         # The worker supplies real model dims — the authoritative shape check.
         num_moe_layers, top_k = self._routed_experts_dimensions()
+        full_layout = self._routed_experts_full_layout()
         input_lengths = data["input_lengths"].reshape(-1).cpu().long()
         offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
         values = torch.full(
@@ -798,6 +808,7 @@ class TQWorkerMixin:
                 fragments,
                 dims=(num_moe_layers, top_k),
                 canonical_len=canonical_len,
+                full_layout=full_layout,
             )
             if tensor is None:
                 # The row stays all-sentinel: the model falls back to its own

@@ -124,8 +124,43 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+_HYBRID_MOE_SYMBOL = "E"
+_HYBRID_PIPE_SYMBOL = "|"
+_HYBRID_MTP_SEPARATOR = "/"
+
+
+def _hybrid_main_pattern(model_config: Any) -> Optional[str]:
+    """Return the decoder part of a hybrid layer pattern, or None for non-hybrid models.
+
+    Megatron hybrid models (Mamba/attention/MoE stacks such as Nemotron-H) describe
+    their layers with a pattern string in which ``E`` marks an MoE layer, ``|``
+    separates pipeline stages and ``/`` introduces MTP depths. The bridge stores it
+    on the model config as ``hybrid_layer_pattern`` (older providers used
+    ``hybrid_override_pattern``). Hybrid layers are numbered 1..N in pattern order,
+    so MoE layer numbers are the 1-based positions of ``E`` in the main pattern.
+    """
+    for attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+        pattern = getattr(model_config, attr, None)
+        if isinstance(pattern, str) and pattern:
+            main = pattern.split(_HYBRID_MTP_SEPARATOR, 1)[0]
+            return main.replace(_HYBRID_PIPE_SYMBOL, "")
+    return None
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+    hybrid_pattern = _hybrid_main_pattern(model_config)
+    if hybrid_pattern is not None:
+        if len(hybrid_pattern) != num_layers:
+            raise ValueError(
+                f"hybrid layer pattern has {len(hybrid_pattern)} layers but "
+                f"num_layers={num_layers}: {hybrid_pattern!r}"
+            )
+        return [
+            idx + 1
+            for idx, symbol in enumerate(hybrid_pattern)
+            if symbol == _HYBRID_MOE_SYMBOL
+        ]
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):
@@ -154,6 +189,19 @@ def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
             f"num_moe_layers={num_moe_layers}, top_k={top_k}"
         )
     return num_moe_layers, top_k
+
+
+def router_replay_full_layout(model_config: Any) -> tuple[int, list[int]]:
+    """Return ``(total_num_layers, moe_layer_indices)`` for vLLM's full-transformer-layer route layout.
+
+    The indices are 0-based positions of the MoE layers in the decoder stack
+    (``_global_moe_layer_numbers`` is 1-based), i.e. the columns of a
+    ``[T, num_layers, K]`` payload that carry real routes.
+    """
+    total_num_layers = int(getattr(model_config, "num_layers"))
+    return total_num_layers, [
+        layer_number - 1 for layer_number in _global_moe_layer_numbers(model_config)
+    ]
 
 
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:

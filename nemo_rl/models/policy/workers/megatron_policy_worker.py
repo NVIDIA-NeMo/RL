@@ -106,6 +106,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import (
     router_replay_dimensions,
     router_replay_enabled,
+    router_replay_full_layout,
 )
 from nemo_rl.models.megatron.setup import (
     _distributed_timeout_minutes,
@@ -724,6 +725,10 @@ class MegatronPolicyWorkerImpl(
     def _routed_experts_dimensions(self) -> tuple[int, int]:
         """Return route dimensions from the initialized Megatron model config."""
         return router_replay_dimensions(self._get_model_config())
+
+    def _routed_experts_full_layout(self) -> Optional[tuple[int, list[int]]]:
+        """Layer map for vLLM's full-layer route payloads (hybrid models emit one slot per decoder layer)."""
+        return router_replay_full_layout(self._get_model_config())
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
