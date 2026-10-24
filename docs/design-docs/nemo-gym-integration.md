@@ -68,17 +68,22 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
-### Environment Server tasksets
+### Dataset formats and routing
 
-NeMo RL accepts Gym's materialized task rows, which contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name. The mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration.
+NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment Server:
 
-RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`. Existing flat rows remain supported through `agent_ref.name` or `task_source`, including through `legacy_agent`.
+- **Flat rows** identify the Agent through `agent_ref.name` or `task_source`. Gym resolves the Environment Server associated with that Agent, including through `legacy_agent`.
+- **Materialized task rows** contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name.
+
+The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`.
+
+See [Data Format Translation](#data-format-translation) for the field layout of each format.
 
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
 
-Each shard defines a self-contained Gym configuration. NeMo RL starts one actor for each shard replica and routes every prompt group to the shard that hosts its agent or task source.
+Each shard defines a self-contained Gym configuration. NeMo RL starts one actor for each shard replica and routes every prompt group to the shard that hosts its agent or task source, or, for a materialized task, its selected Environment Server.
 
 ```yaml
 env:
@@ -202,7 +207,7 @@ flowchart LR
 The flow is:
 1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
 2. The actor calls Gym's `RolloutCollectionHelper.run_examples()` in its own process
-3. The collector resolves each row's destination and sends `POST /run` to its Environment Server, which executes or delegates the episode
+3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes` before calling the collector; for flat rows, the collector resolves the server associated with the Agent
 4. Completed examples return through the collector to the actor
 5. Actor post-processes and streams each completed example back with its original row index
 6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
@@ -380,11 +385,11 @@ flowchart LR
 **Formats**:
 - **DatumSpec** (NeMo RL): Carries the Gym row in `extra_env_info`; Gym constructs the actual conversation during rollout
 - **Flat row** (NeMo Gym): Contains top-level `responses_create_params`, task-specific fields, and `agent_ref` or `task_source` for routing
-- **Materialized task** (NeMo Gym): Contains structured `task_id` (`taskset` and `task_id`) and `task_input`. For `single_agent_turn`, `task_input` holds `responses_create_params` and task-specific fields, either flat or under `task_data`
+- **Materialized task** (NeMo Gym): Contains structured `task_id` (`taskset` and `task_id`) and `task_input`. For `single_agent_turn`, `task_input` holds `responses_create_params` at its top level; task-specific fields sit beside it or under `task_data`
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. NeMo RL obtains the Agent reference for metrics and teacher attribution from the selected Environment Server's `agent_server` binding.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. For materialized tasks, NeMo RL obtains the Agent reference for metrics and teacher attribution from the selected Environment Server's `agent_server` binding.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 

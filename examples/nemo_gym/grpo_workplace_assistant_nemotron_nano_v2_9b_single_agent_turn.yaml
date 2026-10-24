@@ -1,0 +1,48 @@
+# Workplace Assistant GRPO with single_agent_turn Environment Server orchestration.
+# Inherits Nemotron Nano 9B v2, Megatron training, vLLM, and one node with eight GPUs.
+#
+# Prepare the existing train/validation splits as taskset rows (run from 3rdparty/Gym-workspace/Gym):
+#   uv run gym dataset collate --resources-server workplace_assistant \
+#     --mode train_preparation --download \
+#     --output-dir data/workplace_assistant_single_agent_turn \
+#     "++workplace_assistant_simple_agent.responses_api_agents.simple_agent.datasets=[\
+#       {name:train,type:train,taskset:workplace_assistant,\
+#        jsonl_fpath:resources_servers/workplace_assistant/data/train.jsonl,\
+#        huggingface_identifier:{repo_id:nvidia/Nemotron-RL-agent-workplace_assistant,artifact_fpath:train.jsonl},license:'Apache 2.0'},\
+#       {name:validation,type:validation,taskset:workplace_assistant,\
+#        jsonl_fpath:resources_servers/workplace_assistant/data/validation.jsonl,\
+#        huggingface_identifier:{repo_id:nvidia/Nemotron-RL-agent-workplace_assistant,artifact_fpath:validation.jsonl},license:'Apache 2.0'}]" \
+#     ++environment_server_routes.workplace_assistant=workplace_assistant_environment_server
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant_single_agent_turn/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/data/workplace_assistant_single_agent_turn/validation.jsonl
+
+env:
+  nemo_gym:
+    environment_server_routes:
+      workplace_assistant: workplace_assistant_environment_server
+    workplace_assistant_environment_server:
+      environment_servers:
+        # Replace the wrapper inherited from the existing recipe and Gym config.
+        _delete_key: legacy_agent
+        single_agent_turn:
+          entrypoint: app.py
+          cleanup_timeout_seconds: 180
+          resources_tool_transports: [direct_http]
+          resources_server:
+            type: resources_servers
+            name: workplace_assistant
+          agent_server:
+            type: responses_api_agents
+            name: workplace_assistant_simple_agent
+
+checkpointing:
+  checkpoint_dir: results/grpo-workplace-assistant-nemotron-nano-v2-9b-single-agent-turn
+logger:
+  log_dir: logs/grpo-workplace-assistant-nemotron-nano-v2-9b-single-agent-turn
+  wandb:
+    name: nemotron-nano-v2-9b-workplace-assistant-single-agent-turn
