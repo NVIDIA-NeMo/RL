@@ -1943,6 +1943,45 @@ class MPOLossFn(PreferenceLossFn):
         }
 
 
+def _jsd_student_logit_grad(
+    student_logprobs: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    mixture_logprobs: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Gradient of the generalized JSD w.r.t. the student logits, without cancellation.
+
+    Autograd builds this gradient from separately rounded student and teacher
+    softmaxes, so it loses precision as they converge and stays nonzero at
+    z_S == z_T. Following the softmax cancellation fix of
+    https://jonbarron.info/softmaxfix/, log(q / p) is computed from the logit
+    difference with expm1/log1p, which makes the gradient exactly zero there.
+
+    Args:
+        student_logprobs: Student log-probabilities q over the top-k, [..., k].
+        teacher_logprobs: Teacher log-probabilities p over the same top-k, [..., k].
+        mixture_logprobs: log(M) with M = beta * p + (1 - beta) * q, [..., k].
+        beta: JSD interpolation coefficient, strictly between 0 and 1.
+
+    Returns:
+        The gradient w.r.t. the student logits; it sums to zero over the top-k.
+    """
+    q, p = student_logprobs.exp(), teacher_logprobs.exp()
+    delta = student_logprobs - teacher_logprobs  # Logit difference, up to a shift.
+    d = delta - torch.sum(p * delta, dim=-1, keepdim=True)  # Center under p.
+    s = d - torch.log1p(torch.sum(p * torch.expm1(d), dim=-1, keepdim=True))  # log(q/p)
+    # dJSD/dz_S = (1 - beta) * q * (r - E_q[r]) with r = log(q / M), and
+    # q / M = 1 / (1 + beta * expm1(-s)). Use the direct log(q) - log(M) when
+    # |s| >= 1, where it is accurate and expm1(-s) could overflow.
+    r = torch.where(
+        s.abs() < 1,
+        -torch.log1p(beta * torch.expm1(-s.clamp(min=-1.0))),
+        student_logprobs - mixture_logprobs,
+    )
+    g = (1.0 - beta) * q * r
+    return g - q * torch.sum(g, dim=-1, keepdim=True)  # Ensure sum(g) = 0.
+
+
 class DistillationLossConfig(BaseModel, extra="allow"):
     kl_type: str = "mixed"
     mixed_kl_weight: float = 0.5
@@ -2064,6 +2103,19 @@ class DistillationLossFn(LossFunction):
                 per_token_kl = (
                     beta * kl_teacher_to_mixture + (1.0 - beta) * kl_student_to_mixture
                 )
+                if not self.zero_outside_topk:
+                    # Keep the forward value but substitute the cancellation-free
+                    # gradient. The top-k student logprobs are a log_softmax of the
+                    # top-k logits, whose backward passes a zero-sum gradient through.
+                    grad = _jsd_student_logit_grad(
+                        student_topk_logprobs.detach(),
+                        teacher_topk_logprobs,
+                        mixture_topk_logprobs.detach(),
+                        beta,
+                    )
+                    per_token_kl = per_token_kl.detach() + grad * (
+                        student_topk_logprobs - student_topk_logprobs.detach()
+                    )
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
