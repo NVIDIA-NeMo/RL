@@ -47,7 +47,12 @@ from nemo_rl.models.policy import (
     BLOCK_DRAFT_ALGOS,
     PolicyConfig,
 )
-from nemo_rl.models.policy.draft_config import coerce_draft_config
+from nemo_rl.models.policy.draft_config import (
+    MegatronDFlashDraftConfig,
+    MegatronDSparkDraftConfig,
+    coerce_draft_config,
+    draft_refit_enabled,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -218,37 +223,76 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             # Both-enabled and neither-enabled are already rejected above, so
             # exactly one of megatron_enabled/automodel_enabled is true below.
             draft_algo = draft_config.speculator_type
-            if draft_algo in BLOCK_DRAFT_ALGOS and not automodel_enabled:
+            megatron_draft = isinstance(
+                draft_config, (MegatronDFlashDraftConfig, MegatronDSparkDraftConfig)
+            )
+            if megatron_draft and not megatron_enabled:
+                raise ValueError(
+                    f"policy.draft.speculator_type={draft_algo} with "
+                    "target_hidden_state_layer_ids selects the Megatron draft "
+                    "provider, which requires policy.megatron_cfg.enabled=true. "
+                    "Drop target_hidden_state_layer_ids to use the Automodel one."
+                )
+            if (
+                draft_algo in BLOCK_DRAFT_ALGOS
+                and not megatron_draft
+                and not automodel_enabled
+            ):
                 raise ValueError(
                     f"policy.draft.speculator_type={draft_algo} requires the "
-                    "Automodel backend (policy.automodel_cfg.enabled=true)."
+                    "Automodel backend (policy.automodel_cfg.enabled=true), or "
+                    "set target_hidden_state_layer_ids to select the Megatron "
+                    "draft provider."
                 )
             if megatron_enabled:
                 # Megatron-specific guards (main #3463).
-                if config["megatron_cfg"]["context_parallel_size"] > 1:
-                    # Sequence packing itself is supported with the draft; CP
-                    # is not: the hidden-state capture and the per-segment
-                    # shifts assume each packed sequence lives whole on one
-                    # rank.
+                if (
+                    bool(config.get("sequence_packing", {}).get("enabled", False))
+                    and not draft_config.supports_sequence_packing
+                ):
                     raise ValueError(
-                        "policy.draft.enabled=true does not support context "
-                        "parallelism yet. Set "
-                        "policy.megatron_cfg.context_parallel_size=1 or disable "
-                        "policy.draft."
+                        "the configured draft provider does not support sequence "
+                        "packing. Disable policy.sequence_packing.enabled or "
+                        "select a capable Megatron draft provider."
                     )
                 if (
+                    config["megatron_cfg"]["context_parallel_size"] > 1
+                    and not draft_config.supports_context_parallel
+                ):
+                    # For a provider without CP support the hidden-state capture
+                    # and the per-segment shifts assume each packed sequence
+                    # lives whole on one rank.
+                    raise ValueError(
+                        "the configured draft provider does not support context "
+                        "parallelism. Set policy.megatron_cfg.context_parallel_size=1 "
+                        "or select a capable Megatron draft provider."
+                    )
+                if (
+                    bool(config["megatron_cfg"].get("sequence_parallel", False))
+                    and not draft_config.supports_target_sequence_parallel
+                ):
+                    # The captured target states are sequence-parallel shards;
+                    # a provider without target-SP support shifts them as if
+                    # each rank held the whole sequence.
+                    raise ValueError(
+                        "the configured draft provider does not support target "
+                        "sequence parallelism. Set "
+                        "policy.megatron_cfg.sequence_parallel=false or select a "
+                        "capable Megatron draft provider."
+                    )
+                if (
+                    draft_algo == "eagle3"
                     # sequence_packing is NotRequired in PolicyConfig, so
                     # tolerate its absence.
-                    bool(config.get("sequence_packing", {}).get("enabled", False))
+                    and bool(config.get("sequence_packing", {}).get("enabled", False))
                     and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
                 ):
-                    # The packed draft path re-embeds the per-segment-shifted
-                    # token ids via the model's embedding, which MCore
-                    # constructs only on the first pipeline stage while the
-                    # draft runs on the last.
+                    # The packed EAGLE-3 path rolls the captured embeddings per
+                    # segment on the last pipeline stage; it has not been
+                    # validated with the cross-stage capture gather yet.
                     raise ValueError(
-                        "policy.draft.enabled=true with sequence packing does "
-                        "not support pipeline parallelism yet. Set "
+                        "policy.draft with speculator_type=eagle3 and sequence "
+                        "packing does not support pipeline parallelism yet. Set "
                         "policy.megatron_cfg.pipeline_model_parallel_size=1, or "
                         "disable policy.sequence_packing or policy.draft."
                     )
@@ -722,7 +766,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 or not self.cfg["megatron_cfg"]["enabled"]
             ):
                 raise ValueError("Direct packed SFT rows require the Megatron backend")
-            if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
+            if draft_refit_enabled(self.cfg.get("draft")):
                 raise NotImplementedError(
                     "Direct packed SFT rows do not support draft training"
                 )

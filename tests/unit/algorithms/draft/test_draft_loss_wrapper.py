@@ -15,6 +15,7 @@
 import sys
 import types
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -114,6 +115,65 @@ def test_draft_loss_wrapper_reports_draft_loss_when_weight_is_zero(
     assert metrics["loss"] == policy_loss.item()
     assert metrics["total_loss"] == combined_loss.item()
     assert metrics["draft_loss"] == draft_loss.item()
+
+
+@pytest.mark.parametrize(
+    "output_key", ["dflash_output", "dspark_output", "eagle3_output"]
+)
+def test_draft_loss_wrapper_hides_transient_provider_output_from_policy_loss(
+    output_key: str,
+) -> None:
+    """Packed policy slicing must not index provider-owned transient outputs."""
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+
+    provider_output = object()
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            output_key: provider_output,
+        }
+    )
+
+    def policy_loss(
+        next_token_logits,
+        policy_data,
+        global_valid_seqs,
+        global_valid_toks,
+        **kwargs,
+    ):
+        del next_token_logits, global_valid_seqs, global_valid_toks, kwargs
+        assert output_key not in policy_data
+        policy_data.slice(0, 1)
+        return torch.tensor(3.0), {"loss": 3.0}
+
+    provider = MagicMock()
+    provider.config.speculator_type = output_key.removesuffix("_output")
+    provider.loss_stats.return_value = DraftLossStats(
+        numerators=torch.tensor([2.0]),
+        counts=torch.tensor([1.0]),
+        weights=torch.ones(1),
+    )
+    wrapper = DraftLossWrapper(
+        loss_fn=policy_loss,
+        prepare_fn=MagicMock(),
+        data_dict=data,
+        loss_weight=0.5,
+        draft_provider=provider,
+        draft_normalization_counts=torch.tensor([1.0]),
+    )
+
+    combined_loss, metrics = wrapper(
+        next_token_logits=torch.randn(1, 2, 3),
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+    )
+
+    assert combined_loss.item() == pytest.approx(4.0)
+    assert metrics["total_loss"] == pytest.approx(4.0)
+    assert data[output_key] is provider_output
+    assert provider.loss_stats.call_args.kwargs["data"] is data
 
 
 @patch("nemo_rl.algorithms.loss.wrapper.DraftCrossEntropyLossFn")
@@ -331,6 +391,45 @@ def _build_draft_batch(draft_vocab_size, d2t):
     }
 
 
+def _eagle3_draft_wrapper(d2t, *, defer_normalization=False):
+    from nemo_rl.algorithms.loss import prepare_loss_input
+    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+    from nemo_rl.models.megatron.draft.training import Eagle3Speculator
+
+    return DraftLossWrapper(
+        loss_fn=_zero_policy_loss,
+        prepare_fn=partial(
+            prepare_loss_input, sampling_params=None, d2t=d2t, chunk_size=None
+        ),
+        data_dict=BatchedDataDict({}),
+        defer_normalization=defer_normalization,
+        draft_provider=Eagle3Speculator(
+            config=SimpleNamespace(
+                speculator_type="eagle3",
+                token_chunk_size=DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+            )
+        ),
+    )
+
+
+def _packed_eagle3_data(batch):
+    from nemo_rl.models.megatron.draft.training import Eagle3PackedForwardOutput
+
+    return BatchedDataDict(
+        {
+            "token_mask": batch["data"]["token_mask"],
+            "sample_mask": batch["data"]["sample_mask"],
+            "eagle3_output": Eagle3PackedForwardOutput(
+                student_logits=batch["packed_student"],
+                cu_seqlens=batch["cu_seqlens"],
+                cu_seqlens_padded=batch["cu_seqlens_padded"],
+                d2t=batch["d2t"],
+            ),
+        }
+    )
+
+
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "draft_vocab_size,d2t",
     [
@@ -338,8 +437,9 @@ def _build_draft_batch(draft_vocab_size, d2t):
         (5, torch.tensor([0, 2, 4, 5, 6])),  # pruned draft vocab (d2t mapping)
     ],
 )
-def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
-    """The packed draft CE must equal the unpacked reference on the same batch."""
+def test_packed_eagle3_provider_loss_matches_unpacked(draft_vocab_size, d2t):
+    """The provider's packed draft CE must equal the unpacked reference."""
+    pytest.importorskip("megatron.core")
     from nemo_rl.algorithms.loss import prepare_loss_input
     from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
 
@@ -359,18 +459,9 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
         global_valid_toks=batch["global_valid_toks"],
     )
 
-    packed_wrapper = DraftLossWrapper(
-        loss_fn=_zero_policy_loss,
-        prepare_fn=None,
-        data_dict=batch["data"],
-        cu_seqlens_q=batch["cu_seqlens"],
-        cu_seqlens_q_padded=batch["cu_seqlens_padded"],
-        d2t=d2t,
-        student_logits=batch["packed_student"],
-    )
-    packed_loss, packed_metrics = packed_wrapper(
+    packed_loss, packed_metrics = _eagle3_draft_wrapper(d2t)(
         next_token_logits=batch["packed_logits"],
-        data=batch["data"],
+        data=_packed_eagle3_data(batch),
         global_valid_seqs=None,
         global_valid_toks=batch["global_valid_toks"],
     )
@@ -385,24 +476,38 @@ def test_packed_draft_loss_matches_unpacked(draft_vocab_size, d2t):
     assert packed_metrics["total_loss"] == pytest.approx(packed_loss.item())
 
 
-def test_packed_mode_rejects_deferred_normalization():
-    """The packed path emits no step payload, so deferral cannot be honored.
+@pytest.mark.mcore
+def test_packed_eagle3_deferred_payload_matches_synchronous_loss():
+    """Split-step training defers packed draft normalization to finish time.
 
-    Accepting the flag would leave the draft grads on the policy denominator
-    with no runtime symptom, so the combination fails at construction.
+    The payload must carry the same masked token counts as the unpacked batch,
+    so the finish-time normalization reproduces the synchronous loss.
     """
-    from nemo_rl.algorithms.loss.wrapper import DraftLossWrapper
+    pytest.importorskip("megatron.core")
+    from nemo_rl.models.megatron.draft.step_state import DRAFT_STEP_PAYLOAD_KEY
 
     batch = _build_draft_batch(11, None)
+    global_valid_toks = batch["global_valid_toks"]
 
-    with pytest.raises(ValueError, match="deferred draft normalization"):
-        DraftLossWrapper(
-            loss_fn=_zero_policy_loss,
-            prepare_fn=None,
-            data_dict=batch["data"],
-            cu_seqlens_q=batch["cu_seqlens"],
-            cu_seqlens_q_padded=batch["cu_seqlens_padded"],
-            d2t=None,
-            student_logits=batch["packed_student"],
-            defer_normalization=True,
-        )
+    sync_loss, _ = _eagle3_draft_wrapper(None)(
+        next_token_logits=batch["packed_logits"],
+        data=_packed_eagle3_data(batch),
+        global_valid_seqs=None,
+        global_valid_toks=global_valid_toks,
+    )
+    deferred_loss, metrics = _eagle3_draft_wrapper(None, defer_normalization=True)(
+        next_token_logits=batch["packed_logits"],
+        data=_packed_eagle3_data(batch),
+        global_valid_seqs=None,
+        global_valid_toks=global_valid_toks,
+    )
+
+    stats = metrics[DRAFT_STEP_PAYLOAD_KEY].stats
+    assert "total_loss" not in metrics
+    assert stats.counts.sum().item() == pytest.approx(global_valid_toks.item())
+    assert deferred_loss.item() == pytest.approx(
+        (stats.numerators * stats.weights).sum().item()
+    )
+    assert stats.normalized(
+        normalization_counts=global_valid_toks.reshape(1)
+    ).item() == pytest.approx(sync_loss.item(), rel=1e-5)
