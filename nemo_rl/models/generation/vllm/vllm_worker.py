@@ -1555,8 +1555,13 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
-    def reset_prefix_cache(self):
-        """Reset the prefix cache of vLLM engine."""
+    def reset_prefix_cache(self) -> bool:
+        """Reset the prefix cache of vLLM engine.
+
+        Returns:
+            vLLM's result: False when vLLM skipped the reset because a request
+            still holds KV blocks, so nothing was cleared.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -1566,9 +1571,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self.llm.llm_engine.reset_prefix_cache()
+        result = self.llm.llm_engine.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+        return result
 
     def sleep(self):
         """Put the vLLM engine to sleep."""
