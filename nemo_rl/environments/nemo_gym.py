@@ -445,9 +445,8 @@ class NemoGymConfig(TypedDict):
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
-    # Overrides merged into the `telemetry:` block projected into Gym's global
-    # config, e.g. {"span_groups": "default,sandbox"}. Only consulted when this
-    # process exports telemetry; see _gym_telemetry_block.
+    # Merged into the `telemetry:` block _spinup projects into Gym's global
+    # config. Ignored unless this process is exporting.
     telemetry: NotRequired[Dict[str, Any]]
     invalid_tool_call_patterns: NotRequired[
         List[str] | None
@@ -515,8 +514,7 @@ def _mask_undrained_receipt(receipt: dict) -> dict:
 # the token-capture secret: as an environment interpolation each server
 # resolves in its own process, never as a value in the serialized config.
 _POLICY_API_KEY_ENV = "NEMO_RL_POLICY_API_KEY"
-# Standard OTel channel. Named here rather than imported from nemo-lens so the
-# constant is available whether or not telemetry is installed.
+# Spelled out rather than imported from nemo-lens, which may not be installed.
 _OTEL_RESOURCE_ATTRIBUTES_ENV = "OTEL_RESOURCE_ATTRIBUTES"
 
 
@@ -832,14 +830,9 @@ def _shut_down_gym_servers(run_helper: Any) -> None:
                     raise
 
 
-# Resource attributes a Gym server must determine for itself. Everything else
-# this actor exports describes the job and is equally true of its servers, so it
-# is forwarded to them. ``nv.dl.rank`` is withheld deliberately: nemo-lens
-# derives ``service.instance.id`` from it as ``<run id>-rank<rank>``, so handing
-# every Gym server this actor's rank would collapse a hundred-odd processes onto
-# one instance id. Without a rank the SDK assigns each its own uuid instead,
-# which costs ``identity_valid`` on the Gym rows until Gym publishes a
-# per-server rank and instance id of its own.
+# Withheld from the servers; everything else describes the job and is forwarded.
+# nv.dl.rank especially: lens derives service.instance.id as "<run id>-rank<n>",
+# so forwarding one rank would collapse every server onto a single instance id.
 _GYM_PER_PROCESS_RESOURCE_KEYS = frozenset(
     {
         "service.name",
@@ -855,18 +848,10 @@ def _publish_gym_resource_identity() -> None:
     """Forward this actor's job identity to Gym's servers through the environment.
 
     Gym builds its servers' resource from ``nemo.gym.*`` and little else, so
-    without this their spans carry no campaign stage, no slurm ids and no run id
-    -- and a pipeline keyed on ``nv.dl.campaign.stage`` drops them on the floor
-    while the actor's own spans sail through.
+    their spans carry no campaign stage and ingest keyed on it drops them.
 
-    ``OTEL_RESOURCE_ATTRIBUTES`` is the channel because it is the only one that
-    survives a spawn, and because nemo-lens resolves caller attributes over
-    environment ones: a Gym server still wins on the few keys it sets itself.
     Composed with ``defaults=`` so a launcher that already published an
-    attribute keeps its value.
-
-    Silent when nemo-lens is absent or no provider carries a resource; losing
-    the Gym half of a trace is not a reason to fail a rollout.
+    attribute keeps its value. Silent if telemetry is unavailable.
     """
     try:
         from nemo.lens.resources.attributes import extend_otel_resource_attributes
@@ -898,11 +883,10 @@ class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
-        # Registers GymSpanGroup with nemo-lens before init_telemetry_worker
-        # validates the span-group spec. A namespace registered after that point
-        # is not selectable, so every Gym span gate returns False for the life of
-        # the process and nothing under nemo_gym is ever emitted. Guarded because
-        # nemo_gym is an optional extra, absent in non-gym runs.
+        # Registers GymSpanGroup before init_telemetry_worker validates the
+        # span-group spec. Groups registered after that are never selectable,
+        # so every Gym span gate would return False for this process's life.
+        # Guarded: nemo_gym is an optional extra.
         try:
             import nemo_gym.telemetry  # noqa: F401
         except ImportError:
@@ -1036,18 +1020,11 @@ class NemoGym(EnvironmentInterface):
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
 
-        # Gym's per-server venvs install nemo-gym[dev], not nemo-gym[telemetry],
-        # and each server process reads its own telemetry settings rather than
-        # inheriting a handle. Both follow from this one block: Gym translates it
-        # into NEMO_GYM_OTEL_* before spawning anything, which is what lets
-        # server_venv_requirements() add nemo-lens to every server venv. Without
-        # it this actor exports while every server stays silent, which is the one
-        # configuration that yields a trace with a hole in the middle.
-        #
-        # Omitted entirely unless this process is exporting, so a run with
-        # telemetry off builds the same venvs it builds today. The endpoint is
-        # not restated here: Gym servers are children of this process and read
-        # OTEL_EXPORTER_OTLP_ENDPOINT from the environment they inherit.
+        # Gym translates this block into NEMO_GYM_OTEL_* before spawning, which
+        # is what adds nemo-lens to every per-server venv; without it the
+        # servers stay silent while this actor exports. Omitted unless this
+        # process is exporting, so telemetry-off runs build today's venvs. The
+        # endpoint is inherited, so it is not restated here.
         telemetry_handle = get_telemetry_handle()
         if telemetry_handle is not None and telemetry_handle.is_exporting:
             from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
