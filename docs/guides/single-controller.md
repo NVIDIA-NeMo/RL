@@ -354,7 +354,7 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before the critic trains on the assembled full batch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
 
 ### Config → behavior map
 
@@ -422,7 +422,9 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
 3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
 4. **Train pump loop**: `sampler.evict` removes out-of-window groups, and `sampler.select` chooses the next chunk. For PPO, `_value_stage` computes critic values and `_advantage_stage` computes advantages. TQPolicy then updates the policy: full-batch PPO uses `ppo.ppo_epochs` updates, while streaming PPO accumulates gradients across chunks for one update. Streaming PPO refits the updated policy before `_value_train_epochs` trains the critic on the assembled full batch for `ppo.critic_ppo_epochs`. GRPO uses one TQPolicy optimizer step per RL step.
-5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, calls the weight synchronizer, and re-opens the rollout pump for the next version. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
+5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
+
+   For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
 
 ## Relation to Legacy Async GRPO
 
@@ -449,7 +451,7 @@ Do not carry `max_num_epochs: -1` across either. [ppo.md](./ppo.md#asynchronous-
 | `enabled: true` | Implicit — SC is always async; use `sampler.max_lookahead_versions: 0` for sync semantics, `>= 1` for async |
 | `max_trajectory_age_steps: N` | `sampler.name: in_order` with `sampler.max_lookahead_versions: N` |
 | `warmup_generation_lead_steps` (PPO) | `sampler.warmup_lookahead_versions` — the lookahead to use while critic warmup is in progress |
-| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same) |
+| `recompute_kv_cache_after_weight_updates` | `recompute_kv_cache_after_weight_updates` (same, defaults to `true` in both loops); when vLLM pauses natively, preserved requests recompute their KV cache after refit, repeating prefill. Set `false` to retain pre-update KV. For Megatron generation, pair `true` with `kv_cache_management_mode: recompute`, or `false` with `persist`/`offload`. |
 | `in_flight_weight_updates` | Always effectively true; `false`-equivalent behavior is not yet supported (drain-gate tracked in [issue #2625](https://github.com/NVIDIA-NeMo/RL/issues/2625)) |
 | *(no legacy equivalent — matches legacy full-batch train semantics)* | `min_groups_for_streaming_train: ${grpo.num_prompts_per_step}`, or `${ppo.num_prompts_per_step}` on a PPO run |
 | *(no legacy equivalent — matches legacy `max_trajectory_age + 1` batches in flight)* | `max_inflight_prompts: num_prompts_per_step × (max_lookahead_versions + 1)` |
@@ -463,9 +465,13 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   `policy.is_vlm: true`; see the
   [CLEVR Single-Controller recipe](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml).
 - NeMo-Gym token capture also supports Omni dynamic-resolution images and native video
-  rollouts with async vLLM generation and a Megatron learner. With
-  `token_capture.enabled: true` and the VLM processor configured, workers capture
-  the processed media used for inference together with each call's token delta.
+  rollouts with async vLLM generation and a Megatron learner, and with Megatron
+  Inference generation through the same media columns and finalizer (the
+  expanded-prefix splicing that backend adds is described in
+  [Token-capture ledger](../design-docs/token-capture-ledger.md#multimodal-rollouts-on-megatron-inference)).
+  With `token_capture.enabled: true` and the VLM processor configured, workers
+  capture the processed media used for inference together with each call's
+  token delta.
   RL hands the owned tensors (`imgs`, `imgs_sizes`, and optional `num_frames`)
   to Gym's `complete_call_from_response` as opaque attachments, and the TQ sink
   writes them in the same `put` as the token columns, so `staged` coordinates
@@ -506,7 +512,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   (required tensors, patch geometry, frame grouping); malformed or missing
   columns reject the rollout as `invalid_media_columns`, incompatible parts
   along a chain as `media_chain_incompatible`. Tensor contents are not hashed;
-  retained occurrences are checked by geometry and placeholder tokens. Media
+  retained occurrences are checked by geometry on both backends and
+  additionally by placeholder tokens on vLLM, the only engine that reports
+  them. Media
   must remain immutable for the rollout's lifetime and preprocessing must be
   deterministic. Same-shape pixel changes and corruption of stored pixel values
   are outside this check's coverage. Call
@@ -514,25 +522,32 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   transactional rollback: a failed combined write is discarded best-effort by
   the sink, and a failed discard is logged at ERROR.
   Upgrade the paired Gym and RL changes together. The GB200 functional shard
-  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes this path
-  end to end (CLEVR-style images through Gym `string_match`, native video
-  through Gym `mcqa`) and gates on `train/finalize/media_row_rate == 1`, the
-  metric that reports the fraction of learner rows built from captured media.
-  Media capture requires `policy.generation.backend: vllm`; Megatron inference
-  token capture is text-only. No new Megatron-LM pin is needed. Compaction,
-  mixed image/video conversations, native audio,
+  `L1_Functional_Tests_GB200_Vllm_Omni_Single_Controller.sh` smokes the vLLM
+  path end to end (CLEVR-style images through Gym `string_match`, native video
+  through Gym `mcqa`), and
+  `L1_Functional_Tests_GB200_Megatron_Omni_Single_Controller.sh` smokes the
+  Megatron Inference path on the same CLEVR-style images. Both gate on
+  `train/finalize/media_row_rate == 1`, the metric that reports the fraction
+  of learner rows built from captured media.
+  The Megatron Inference path relies on the pinned Megatron-LM carrying
+  `media_tensors` on the offloaded payload and expanded-prefix stitching
+  (NVIDIA/Megatron-LM#7598).
+  A group in which no rollout carried media (an all-text prompt in a mixed
+  dataset) is published with empty media rows in the partition's pinned pixel
+  dtype and patch width, so its keys can share a train fetch with media keys.
+  Compaction, mixed image/video conversations, native audio,
   video token pruning, static tiling (`image_num_patches`), other processor families,
   and `token_capture.defer_routed_experts_to_policy: true` are not supported.
 - Multi-Teacher On-Policy Distillation (MOPD) is supported for text-only NeMo
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes); SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
-- The drain gate in refit is not yet supported.
+- The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
 
 ### Full training-data dumps
 

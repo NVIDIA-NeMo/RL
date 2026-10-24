@@ -241,6 +241,7 @@ policy:
     enabled: false
     model_name: null
     loss_weight: 0.1
+    speculator_type: "eagle3"
     num_layers: null
     aux_layer_indices: null
 
@@ -271,7 +272,7 @@ policy:
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1e-8
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -300,10 +301,10 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
-      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
+      buffer_size_gb: 10  # On-GPU KV-cache block pool shared by all active requests
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
-      num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management

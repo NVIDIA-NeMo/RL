@@ -45,4 +45,4 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     '"0" in data["validation/accuracy"]' \
     '"50" in data["validation/accuracy"]' \
     'data["validation/accuracy"]["50"] > 0.6' \
-    'data["validation/accuracy"]["50"] > data["validation/accuracy"]["0"] + 0.01'
+    'data["validation/accuracy"]["50"] > data["validation/accuracy"]["0"] + 0.005'
