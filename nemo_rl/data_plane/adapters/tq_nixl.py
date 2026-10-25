@@ -574,7 +574,11 @@ class NixlKVClient(StorageKVClient):
                     cur = blob_format._align_up(cur + int(ent[1]))
                 with self._lock:
                     self.store.read_entries(reads, by_unit, deadline)
-                lview = memoryview(lbuf)
+                # One copy out of the pool buffer, then zero-copy views into it:
+                # a clone per key cost ~5 us x every key of a get.
+                owned = torch.empty(cur, dtype=torch.uint8)
+                owned.copy_(torch.from_numpy(lbuf[:cur]))
+                oview = memoryview(owned.numpy())
                 for (_u, k, ent), a in zip(found, at):
                     _off, n, kind, dtype, shape = ent
                     e = blob_format.Entry(
@@ -585,9 +589,7 @@ class NixlKVClient(StorageKVClient):
                         dtype,
                         tuple(shape) if shape is not None else None,
                     )
-                    out[pos_of[k]] = blob_format.materialize(
-                        blob_format.decode_entry(lview[a : a + int(n)], e)
-                    )
+                    out[pos_of[k]] = blob_format.decode_entry(oview[a : a + int(n)], e)
         finally:
             with self._lock:
                 self.store.unpin_all(resolved)
