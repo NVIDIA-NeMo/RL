@@ -72,6 +72,9 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 # sequence parallelism, so the run enables it. Its KV blocks are tiny (128 KiB),
 # so the recipe's 10 GB inference buffer would default max_requests to ~82k,
 # past max_tokens (16384), which MCore asserts against; 1 GB keeps it at ~8k.
+# CUDA-graph autotuning would then plan graphs up to ~8k-request decode
+# batches, each with a full-vocab logits buffer, and run the GPU out of
+# memory, so the graph count is pinned.
 MODEL_DIR=$DATA_DIR/tiny_qwen3_moe
 uv run python - "$MODEL_DIR" <<'PY'
 import sys
@@ -129,6 +132,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.mcore_generation_config.refit_backend=nccl \
     policy.generation.mcore_generation_config.kv_cache_management_mode=recompute \
     ++policy.generation.mcore_generation_config.buffer_size_gb=1 \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
     ++policy.generation.mcore_generation_config.async_sched_mode=async \
     policy.generation.max_new_tokens=128 \
     policy.max_total_sequence_length=512 \
