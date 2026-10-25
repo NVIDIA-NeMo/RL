@@ -14,11 +14,11 @@ variant.
 
 | Model | Task | Training backend | Training parallelism | Generation backend | Status |
 | --- | --- | --- | --- | --- | --- |
-| `google/gemma-4-E2B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM | Functionally Ready |
-| `google/gemma-4-E4B-it` | VLM GRPO | AutoModel (FSDP2) | CP1 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-12B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 | vLLM TP2 | Functionally Ready |
-| `google/gemma-4-26B-A4B-it` | Text-only DAPO | AutoModel (FSDP2) | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
-| `google/gemma-4-31B-it` | Text-only DAPO | AutoModel (FSDP2) | CP1 or CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-E2B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM | Functionally Ready |
+| `google/gemma-4-E4B-it` | VLM GRPO | Automodel | CP1 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-12B-it` | Text-only DAPO | Automodel | CP1 | vLLM TP2 | Functionally Ready |
+| `google/gemma-4-26B-A4B-it` | Text-only DAPO | Automodel | EP32 with CP1; EP16 with CP2 | vLLM TP4 | Functionally Ready |
+| `google/gemma-4-31B-it` | Text-only DAPO | Automodel | CP1 or CP2 | vLLM TP4 | Functionally Ready |
 
 ## Reference Recipes
 
@@ -26,14 +26,14 @@ Recipe YAML files under `examples/configs/recipes/` are the source of truth.
 
 | Model | Layout | Nodes and GPUs | Recipe |
 | --- | --- | --- | --- |
-| E2B | FSDP2, CP1 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-fsdp2-automodel.yaml) |
-| E2B | FSDP2, CP2 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-fsdp2cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-fsdp2cp2-automodel.yaml) |
+| E2B | FSDP2, CP1 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel.yaml) |
+| E2B | FSDP2, CP2 | 1n8g | [`dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-e2b-it-1n8g-automodel-cp2.yaml) |
 | E4B | VLM FSDP2, CP1 | 1n8g | [`vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-gemma4-e4b-geo3k-1n8g-automodel.yaml) |
-| 12B | FSDP2, CP1 | 2n8g | [`dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml) |
-| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2-automodel.yaml) |
-| 26B-A4B | FSDP2, EP16, CP2 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-fsdp2ep16cp2-automodel.yaml) |
-| 31B | FSDP2, CP1 | 4n8g | [`dapo-gemma4-31b-it-4n8g-fsdp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-fsdp2-automodel.yaml) |
-| 31B | FSDP2, CP2 | 4n8g | [`dapo-gemma4-31b-it-4n8g-fsdp2cp2-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-fsdp2cp2-automodel.yaml) |
+| 12B | FSDP2, CP1 | 2n8g | [`dapo-gemma4-12b-it-2n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-automodel.yaml) |
+| 26B-A4B | FSDP2, EP32, CP1 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep32.yaml) |
+| 26B-A4B | FSDP2, EP16, CP2 | 4n8g | [`dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-26ba4b-it-4n8g-automodel-ep16cp2.yaml) |
+| 31B | FSDP2, CP1 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel.yaml) |
+| 31B | FSDP2, CP2 | 4n8g | [`dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml`](../../../../examples/configs/recipes/llm/dapo-gemma4-31b-it-4n8g-automodel-cp2.yaml) |
 
 ## Run a Recipe
 
@@ -42,7 +42,7 @@ For example, run the 12B configuration with:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-fsdp2-automodel.yaml
+  --config examples/configs/recipes/llm/dapo-gemma4-12b-it-2n8g-automodel.yaml
 ```
 
 See the [GRPO guide](../../grpo.md) for algorithm and launch details.
@@ -52,7 +52,7 @@ See the [GRPO guide](../../grpo.md) for algorithm and launch details.
 Context Parallel support uses the refactored AutoModel CP interface introduced
 by [PR #3498](https://github.com/NVIDIA-NeMo/RL/pull/3498). The E2B and 31B CP2
 recipes are thin overrides of their CP1 parents that change
-`policy.dtensor_cfg.context_parallel_size` to `2`. The 26B-A4B CP2 recipe also
+`policy.automodel_cfg.context_parallel_size` to `2`. The 26B-A4B CP2 recipe also
 changes expert parallelism from EP32 to EP16 so the model-parallel product fits
 on the same four-node allocation. Other model, optimizer, sequence-length, and
 generation settings remain identical to their CP1 parents.
@@ -78,7 +78,7 @@ other metrics are plotted at every recorded training step.
 ### E2B Context Parallel Parity
 
 The E2B CP1 and CP2 runs use the same 100-step training configuration except
-for `policy.dtensor_cfg.context_parallel_size`. Their trajectories remain close
+for `policy.automodel_cfg.context_parallel_size`. Their trajectories remain close
 across the six metrics: the mean absolute difference in validation accuracy is
 0.0083 across six aligned validation points, while the mean absolute difference
 in generation KL error is 1.6e-5 across 100 aligned training points.
@@ -99,7 +99,7 @@ validation accuracies are 0.741 for EP32 × CP1 and 0.751 for EP16 × CP2.
 ### 31B Context Parallel Parity
 
 The 31B CP1 and CP2 runs use the same four-node training configuration except
-for `policy.dtensor_cfg.context_parallel_size`. Both runs complete 100 steps.
+for `policy.automodel_cfg.context_parallel_size`. Both runs complete 100 steps.
 The mean absolute difference in validation accuracy is 0.0099 across 20 aligned
 validation points, while the mean absolute difference in generation KL error is
 2.2e-5 across 100 aligned training points. The final validation accuracies are

@@ -125,6 +125,11 @@ git lfs install --skip-repo
 # `--branch` only accepts branch/tag names, not commit hashes.
 # Use init + fetch --depth=1 <hash> to get a shallow clone at a specific commit.
 echo "Cloning TensorRT-LLM..."
+# A private fork is cloned over ssh via the TRT-LLM RUN's --mount=type=ssh.
+# Inside Docker the known_hosts file is empty, so the host-key check would
+# fail. Exported because git lfs pull and git submodule update run after the
+# fetch and clone over the same transport.
+export GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 git init "$BUILD_DIR"
 git -C "$BUILD_DIR" remote add origin "$GIT_URL"
 git -C "$BUILD_DIR" fetch --depth=1 origin "$GIT_REF"
@@ -135,16 +140,29 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - bump modelopt pin to >=0.44.0a0 to match the runtime venv version; the
-#     venv already has 0.44.0a0 installed, so the TRT-LLM wheel build picks it
-#     up directly without a separate modelopt from-source build step.
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-assert_patch_target requirements.txt 'nvidia-modelopt[torch]~=0.37.0'
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
 assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
+
+#   - drop PyNvVideoCodec. The pinned ~=2.1.0 range admits only 2.1.0, which
+#     ships no cp313 wheel on any platform and no sdist, so build_wheel.py's
+#     `pip install -r requirements-dev.txt` aborts before cmake ever runs.
+#     Nothing in this build path decodes video. Not asserted: the pin only
+#     appeared after 1.3.0rc21, so older refs legitimately lack the line.
+sed -i '/^PyNvVideoCodec/d' requirements.txt
+
+#   - drop nvidia-modelopt (preventive). build_wheel.py installs
+#     requirements-dev.txt into the already-populated nemo-rl venv, so pip can
+#     mutate the runtime environment uv built. The rubin ref pins
+#     `nvidia-modelopt[torch]~=0.39.0` (i.e. <0.40) while the root pyproject
+#     installs modelopt from a git rev reporting 0.46.0.dev*, so pip would
+#     either fail to resolve or silently downgrade a package uv owns. modelopt
+#     is a runtime dependency the wheel build does not need pinned. Not
+#     asserted: refs after rc23 dropped the line, so it may legitimately not
+#     match.
+sed -i '/^nvidia-modelopt/d' requirements.txt
 
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
 # which (a) requires a setup.py shim and (b) the `--user` flag is invalid
@@ -159,12 +177,27 @@ sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND
 # _backend.py, which folds the same value into the wheel cache key (a change to
 # the arch list must invalidate the cached wheel). The default below MUST match
 # _backend.py's _DEFAULT_ARCH.
-#   90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels,
-#                     i.e. H100/GB200/B200 only (B200 is also sm_100) — other
-#                     SKUs (e.g. A100 sm_80, L40 sm_89, consumer Blackwell
-#                     RTX 50-series sm_120) need this list extended.
+#   90-real;100-real: Hopper (H100 sm_90) and Blackwell (GB200/B200 sm_100).
+#             Other SKUs (Blackwell-Ultra GB300/B300 sm_103, A100 sm_80,
+#             L40 sm_89, RTX 50-series sm_120, Rubin sm_107) need this list
+#             set via BUILD_CUSTOM_TRTLLM_ARCH (e.g. 103-real for GB300).
 ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-90-real;100-real}"
-JOBS="${TRTLLM_BUILD_JOBS:-24}"
+
+# nvshmem doesn't accept the 'f' suffix CMake >= 3.31 generates for Blackwell
+# ('100f-real'). Substitute bare archs, derived from ARCH, for the nvshmem cmake
+# call only; DeepEP kernels keep the full arch string for FP4 support.
+#
+# The semicolons MUST stay backslash-escaped. This lands inside the
+# CMAKE_CACHE_ARGS list of an ExternalProject_Add, where ';' is CMake's list
+# separator: an unescaped '90;100' would split into two arguments
+# ('-D...STRING=90' plus stray '100') instead of one cache entry
+# holding a two-element list. In the sed replacement below '\\;' emits '\;'.
+NVSHMEM_ARCHS=$(tr ';' '\n' <<<"$ARCH" | sed -E 's/-(real|virtual)$//; s/[af]$//' | paste -sd';')
+assert_patch_target cpp/tensorrt_llm/deep_ep/CMakeLists.txt \
+    '-DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}'
+sed -i "s|-DCMAKE_CUDA_ARCHITECTURES:STRING=\${DEEP_EP_CUDA_ARCHITECTURES}|-DCMAKE_CUDA_ARCHITECTURES:STRING=${NVSHMEM_ARCHS//;/'\\;'}|" \
+    cpp/tensorrt_llm/deep_ep/CMakeLists.txt
+JOBS="${TRTLLM_BUILD_JOBS:-64}"
 NPROC=$(nproc 2>/dev/null || echo "$JOBS")
 if (( JOBS > NPROC )); then
     JOBS=$NPROC
@@ -181,6 +214,27 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 show_ccache_status "before TRT-LLM build"
 ccache --zero-stats
 
+# With NIXL enabled the build emits tensorrt_llm_transfer_agent_binding, which
+# build_wheel.py imports to generate stubs. That module links torch but carries
+# no rpath to it, so the import fails on "libc10.so: cannot open shared object
+# file" and kills the build after the compile is already done. build_wheel.py
+# copies the ambient environment for the stub step, so exporting torch's lib
+# directory here is enough.
+TORCH_LIB_DIR="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+
+# NGC-style base images (the Rubin TRT-LLM image among them) ship
+# PIP_CONSTRAINT=/etc/pip/constraint.txt, pinning the exact versions baked into
+# the image's own Python. build_wheel.py's setup_venv() shells out to real pip
+# (`python3 -m pip install -r requirements-dev.txt`), which honours that file --
+# and those versions are vendored into the image rather than published, so they
+# are unreachable from any index. Concretely: the image pins
+# `cuda-python==13.4.0`, which was never published to PyPI (this venv already
+# has 13.4.1 from uv.lock), so `cuda-python>=13` -- otherwise satisfied
+# -- becomes unresolvable. This venv is uv-managed and owes the base image's
+# site-packages nothing, so drop the constraint for the build.
+unset PIP_CONSTRAINT
+
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
 set +x
@@ -192,8 +246,28 @@ TRTLLM_BUILD_CMD=(
     --use_ccache
     --nvrtc_dynamic_linking
     --job_count "$JOBS"
-    -D "ENABLE_UCX=OFF"
+    # PD disaggregation's cache transceiver: ENABLE_UCX builds the UCX wrapper
+    # the engine dlopen()s, and it also gates find_package(NIXL) in
+    # cpp/CMakeLists.txt, so NIXL rides along with it. With UCX off, every
+    # non-MPI backend is compiled out and the engine aborts on the first KV
+    # transfer.
+    -D "ENABLE_UCX=ON"
+    # Skip cpp/tests: they are not shipped in the wheel, so compiling them only
+    # adds build time and exposes the build to test-only link failures (e.g.
+    # tests/unit_tests/executor/ against the NIXL imported target).
+    -D "BUILD_TESTS=OFF"
 )
+# NIXL is what cache_transceiver_backend=DEFAULT resolves to, and it is
+# installed by docker/Dockerfile. Missing means the image is wrong, so fail here
+# rather than shipping a wheel whose default KV transport aborts at runtime.
+NIXL_ROOT_DIR="${NIXL_ROOT_DIR:-/opt/nvidia/nvda_nixl}"
+if [[ ! -f "${NIXL_ROOT_DIR}/include/nixl.h" ]]; then
+    echo "[ERROR] NIXL not found at ${NIXL_ROOT_DIR}. The image must install it" \
+         "(see the NIXL_VERSION block in docker/Dockerfile), or point" \
+         "NIXL_ROOT_DIR at an existing install." >&2
+    exit 1
+fi
+TRTLLM_BUILD_CMD+=(--nixl_root "${NIXL_ROOT_DIR}")
 set +e
 NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
     PYTHONUNBUFFERED=1 \
@@ -224,6 +298,23 @@ if ((TRTLLM_BUILD_STATUS != 0)); then
     echo "[ERROR] TensorRT-LLM build failed with exit code ${TRTLLM_BUILD_STATUS}."
     exit "$TRTLLM_BUILD_STATUS"
 fi
+# CMake drops UCX and NIXL without an error when it cannot find them --
+# find_package(ucx) only sets ENABLE_UCX=0, and find_package(NIXL) is not
+# REQUIRED -- so a wheel missing both wrappers builds, gets cached and is
+# reused, and only aborts at the first KV transfer. The guard above checks the
+# inputs; check the wheel itself before it is cached.
+python3 - "$BUILD_DIR"/build/tensorrt_llm-*.whl <<'PY'
+import sys, zipfile
+names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+libs = ("libtensorrt_llm_ucx_wrapper.so", "libtensorrt_llm_nixl_wrapper.so")
+missing = [lib for lib in libs if f"tensorrt_llm/libs/{lib}" not in names]
+if missing:
+    sys.exit(
+        f"[ERROR] {sys.argv[1]} is missing {missing}; "
+        "UCX/NIXL were not found at cmake time"
+    )
+PY
+
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
 

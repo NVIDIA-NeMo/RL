@@ -20,8 +20,7 @@ on:
 
 jobs:
   cherry-pick:
-    # TODO(kajalj): repin to a released tag once the v1.12.1 release/tag appears.
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@d0d41722daf38672f472b688c68c95616ef4869d
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@b7c7f7d585ad8f529a111e69afcbf14f0279663e # v1.12.2
     with:
       target-branch: main
       trigger-label: cherry-pick-to-main
@@ -30,9 +29,9 @@ jobs:
       app-id: ${{ vars.BOT_ID }}
     secrets:
       BOT_KEY: ${{ secrets.BOT_KEY }}
-      # Only used for the /ok to test comment -- copy-pr-bot doesn't trust
-      # the App identity for that specific call. Everything else (push, PR
-      # creation, labels, reviewer request) still uses the App token.
+      # Used for PR creation and the /ok to test comment -- copy-pr-bot
+      # doesn't trust the App identity for either of those. Push, labels,
+      # and reviewer request still use the App token.
       PAT: ${{ secrets.PAT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

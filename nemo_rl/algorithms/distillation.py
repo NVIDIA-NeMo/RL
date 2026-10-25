@@ -40,7 +40,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -74,7 +74,9 @@ from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -96,7 +98,11 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -264,25 +270,34 @@ def setup(
             )
         checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
-    # Disallow SP + packing for dtensor path
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+    )
+
+    # Disallow SP + packing for the Automodel path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
-        # This incompatibility is enforced in DTensor workers during initialization.
+        # Automodel sequence parallel is supported; ensure CP and SP are not enabled together
+        # This incompatibility is enforced in Automodel workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
-        dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
+        automodel_cfg = cfg.get("automodel_cfg") or {}
+        automodel_enabled = automodel_cfg.get("enabled", False)
         sequence_packing_enabled = (
             "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
         )
-        sequence_parallel_enabled = (
-            "sequence_parallel" in cfg["dtensor_cfg"]
-            and cfg["dtensor_cfg"]["sequence_parallel"]
-        )
+        sequence_parallel_enabled = bool(automodel_cfg.get("sequence_parallel"))
 
-        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+        if automodel_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
-                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
+                f"Distillation does not support Automodel sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
             )
 
@@ -540,6 +555,9 @@ def setup(
                     # Distillation does not configure vLLM for router replay.
                     enable_router_replay=False,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    # The workers enforce this key whenever the recipe asks for
+                    # one, so Gym's model server must send the same key.
+                    policy_api_key=deferred_vllm.http_server_api_key,
                 )
                 try:
                     validate_dataset_agent_coverage(
@@ -614,7 +632,8 @@ def setup(
         init_reference_model=False,
     )
 
-    if checkpoint_engine_config is not None:
+    managed_refit = checkpoint_engine_config is not None or offload_policy_before_refit
+    if managed_refit:
         assert isinstance(student_generation, VllmGeneration)
         student_generation.weight_synchronizer = create_weight_synchronizer(
             policy=student_policy,
@@ -626,13 +645,10 @@ def setup(
         )
         student_generation.weight_synchronizer.init_communicator()
     elif student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info(
-            refit_payload_mode=student_generation.get_refit_payload_mode()
-        )
-        student_generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(student_policy, student_generation)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and checkpoint_engine_config is None:
+    if not colocated_inference and not managed_refit:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -724,6 +740,7 @@ def _distillation_train_impl(
     val_at_start = master_config.distillation.val_at_start
     val_at_end = master_config.distillation.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     max_epochs = (
         master_config.distillation.max_num_epochs
     )  # max number of epochs to train for
@@ -736,7 +753,10 @@ def _distillation_train_impl(
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
-                student_policy, student_generation, colocated_inference
+                student_policy,
+                student_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -776,12 +796,13 @@ def _distillation_train_impl(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.distillation.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                    **{"rl.epoch": current_epoch + 1},
                 ),
             ):
                 # Prepare batch
@@ -812,6 +833,7 @@ def _distillation_train_impl(
                             student_policy,
                             student_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
@@ -881,10 +903,13 @@ def _distillation_train_impl(
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    # Train on generated assistant turns, excluding prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -920,12 +945,10 @@ def _distillation_train_impl(
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
                     if not colocated_inference:
-                        # The non-colocated refit path doesn't offload the student
-                        # optimizer (offload_before_refit only runs in the
-                        # colocated/Megatron path), so it's still on the train GPUs
-                        # from the previous training step. Offload it so the teacher
-                        # fits for top-k inference; prepare_for_training() below
-                        # reloads it.
+                        # Unless policy offload was requested for refit, optimizer
+                        # state may still be on the train GPUs from the previous
+                        # step. Offload it so the teacher fits for top-k inference;
+                        # prepare_for_training() below reloads it.
                         student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
@@ -959,7 +982,6 @@ def _distillation_train_impl(
                         RLSpanGroup.POLICY_UPDATE,
                         "rl.distillation.policy_training",
                         tracer=_tracer,
-                        **{"rl.iteration": total_steps + 1},
                     ),
                 ):
                     train_results = student_policy.train(
@@ -979,7 +1001,10 @@ def _distillation_train_impl(
                 ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1056,14 +1081,6 @@ def _distillation_train_impl(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -1116,10 +1133,7 @@ def _distillation_train_impl(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
-                        )
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=student_policy.finalize_async_save,
@@ -1288,7 +1302,7 @@ def validate(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("distillation", **{"rl.step": step}),
+        evaluate_span("distillation", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 

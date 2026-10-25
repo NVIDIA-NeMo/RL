@@ -40,6 +40,7 @@ def create_mock_batch_with_responses(
                 "role": "assistant",
                 "content": f"Response {i}",
                 "token_ids": assistant_tokens,
+                "generation_logprobs": torch.zeros(length),
             },
         ]
         message_logs.append(message_log)

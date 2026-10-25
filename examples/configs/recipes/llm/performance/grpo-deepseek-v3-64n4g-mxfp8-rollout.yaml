@@ -4,6 +4,7 @@ checkpointing:
 policy:
   generation:
     vllm_cfg:
+      gpu_memory_utilization: 0.4
       precision: "fp8"
       is_mx: true
       quantization_ignore_patterns:

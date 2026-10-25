@@ -288,11 +288,11 @@ def test_get_best_checkpoint_path_bias_recent_if_equal(
     # Force the checkpoint history into the adversarial (older-first) order so the
     # test fails deterministically without the recency tie-break, regardless of the
     # underlying filesystem's glob ordering.
-    import nemo_rl.utils.checkpoint as checkpoint_mod
+    import glob
 
-    orig_glob = checkpoint_mod.glob.glob
+    orig_glob = glob.glob
     monkeypatch.setattr(
-        checkpoint_mod.glob,
+        glob,
         "glob",
         lambda pattern: sorted(
             orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
@@ -480,7 +480,7 @@ def test_get_resume_paths_missing_optimizer(
 
 @pytest.mark.parametrize("model_component", ["policy", "value"])
 def test_get_resume_paths_separate_optimizer(checkpoint_dir, model_component):
-    """DTensor checkpoints use a physical optimizer directory."""
+    """Automodel checkpoints use a physical optimizer directory."""
     checkpoint_path = checkpoint_dir / "step_1"
     expected_weights_path = checkpoint_path / model_component / "weights"
     expected_optimizer_path = checkpoint_path / model_component / "optimizer"
@@ -537,7 +537,7 @@ def test_get_resume_paths_warns_when_megatron_optimizer_missing(
     assert optimizer_path is None
 
 
-def test_get_resume_paths_prefers_dtensor_optimizer(checkpoint_dir, monkeypatch):
+def test_get_resume_paths_prefers_automodel_optimizer(checkpoint_dir, monkeypatch):
     checkpoint_path = checkpoint_dir / "step_1"
     optimizer_path = checkpoint_path / "policy" / "optimizer"
     optimizer_path.mkdir(parents=True)
@@ -1176,7 +1176,7 @@ class TestContextManager:
 
 
 class TestRenameCheckpointSwap:
-    """Tests for _rename_checkpoint when the target step dir already exists."""
+    """Tests for publishing a checkpoint when the target step dir already exists."""
 
     def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
         """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
@@ -1428,3 +1428,23 @@ class TestFTKeepLatestK:
 
         # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
+
+
+def test_a_non_numeric_staging_name_costs_only_the_span_label(
+    checkpoint_manager, checkpoint_dir
+):
+    """The span's step is read from the directory name, so it must never raise.
+
+    ``_rename_checkpoint`` publishes whatever sits between the second and third
+    underscore, so ``tmp_step_final`` becomes ``step_final``. The span wants an
+    int and cannot have one here; it drops the label rather than failing the
+    finalization that carries it.
+    """
+    staged = checkpoint_dir / "tmp_step_final"
+    staged.mkdir(parents=True)
+
+    checkpoint_manager.begin_finalization(staged, wait_fn=None)
+    checkpoint_manager.finalize_pending()
+
+    assert (checkpoint_dir / "step_final").exists()
+    assert not staged.exists()

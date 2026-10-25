@@ -51,7 +51,8 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         train_cluster: Optional[Any] = None,
         inference_cluster: Optional[Any] = None,
         refit_timeout_s: Optional[float] = None,
-    ):
+        offload_policy_before_refit: bool = False,
+    ) -> None:
         if not colocated and (train_cluster is None or inference_cluster is None):
             raise ValueError(
                 "train_cluster and inference_cluster are required for "
@@ -67,6 +68,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
         self._refit_timeout_s = refit_timeout_s
+        self._offload_policy_before_refit = offload_policy_before_refit
         self._refit_backend: Optional[str] = None
         self._transport: Optional[WeightSynchronizer] = None
         if colocated:
@@ -163,9 +165,7 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
         # around the swap.
         with timed_phase("prepare_for_generation/suspend_for_refit"):
             self._generation.suspend_for_refit()
-        if self._generation.cfg["mcore_generation_config"][
-            "offload_policy_before_refit"
-        ]:
+        if self._offload_policy_before_refit:
             with timed_phase("prepare_for_generation/offload_policy"):
                 self._policy.offload_before_refit()
         with timed_phase("prepare_for_generation/prepare_weights"):

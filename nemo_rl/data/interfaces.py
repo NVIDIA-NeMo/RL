@@ -67,6 +67,10 @@ class DatumSpec(TypedDict):
     loss_multiplier: float  # multiplier for the loss for this datum. 0 to mask out (say the sample is invalid)
     idx: int
     task_name: NotRequired[str]
+    # One binary value per message; assistant turns only.
+    message_loss_mask: NotRequired[list[int]]
+    # Raw tool schemas for native chat rendering.
+    tools: NotRequired[list[dict[str, Any]]]
     stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
@@ -94,6 +98,7 @@ class TaskDataSpec:
     video_target_num_patches: Optional[int] = None
     video_temporal_patch_size: Optional[int] = None
     video_maintain_aspect_ratio: Optional[bool] = None
+    pad_audio_to_hop_length: Optional[bool] = None
     min_generation_tokens: Optional[int] = None
     image_max_num_tiles: Optional[int] = None
 
