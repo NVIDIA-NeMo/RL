@@ -30,8 +30,8 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _context_leg_response,
     _decode_request_body,
     _make_parse_tool_calls,
-    _prompt_opens_reasoning,
     _parse_disaggregated_params,
+    _prompt_opens_reasoning,
     _resolve_tool_parser_name,
     _tokens_for_response_text,
 )
