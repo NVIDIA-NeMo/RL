@@ -34,7 +34,7 @@ class AbstractPolicyWorker:
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
-        # DTensor policy parameters already contain the latest optimizer update.
+        # Automodel policy parameters already contain the latest optimizer update.
         # Megatron overrides this whenever the distributed optimizer overlaps the
         # parameter all-gather (MXFP8 shared-buffer and plain BF16 alike).
         pass
@@ -347,8 +347,11 @@ class AbstractPolicyWorker:
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         with self.use_reference_model():
+            # Rollout routes (R3) belong to the policy, never to the reference model.
             reference_logprobs = self.get_logprobs(
-                data=data, micro_batch_size=micro_batch_size
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
             )
 
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import threading
 import warnings
 from pathlib import Path
@@ -68,6 +69,9 @@ from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     SingleControllerActorArgs,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
+    AdvantageStageConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
@@ -164,10 +168,17 @@ def _make_master_config(
         # The megatron build path reads these before any generation factory runs.
         generation_config["mcore_generation_config"] = {
             "expose_http_server": False,
-            "kv_cache_management_mode": "persist",
+            "kv_cache_management_mode": "recompute",
         }
         policy_config["model_name"] = "test-model"
-    return MasterConfig.model_construct(
+    if backend == "dynamo":
+        # The fields DynamoGeneration.validate_settings reads, at accepted values.
+        generation_config["dynamo_cfg"] = {
+            "request_timeout_s": 900.0,
+            "control_timeout_s": 900.0,
+        }
+        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+    master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
             "impl": "transfer_queue",
@@ -213,6 +224,9 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+    if backend == "dynamo":
+        master_config.async_rl.generation_fleet_health.refit_timeout_s = None
+    return master_config
 
 
 def _native_tq_metadata(
@@ -350,6 +364,51 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
+def test_build_generation_constructs_dynamo_from_normalized_config():
+    """DynamoGeneration receives the generation config setup already validated."""
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    inference_cluster = MagicMock(name="inference_cluster")
+
+    with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
+        generation, _ = sc_setup_mod._build_generation(
+            inference_cluster,
+            master_config,
+        )
+
+    mock_dynamo.assert_called_once_with(
+        cluster=inference_cluster,
+        config=master_config.policy["generation"],
+    )
+    assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
+    generation.finish_generation.assert_called_once_with()
+
+
+def test_build_generation_rejects_deferred_dynamo_load():
+    master_config = _make_master_config(backend="dynamo")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+
+    with (
+        patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo,
+        pytest.raises(AssertionError, match="defer_model_load"),
+    ):
+        sc_setup_mod._build_generation(
+            MagicMock(name="inference_cluster"),
+            master_config,
+            defer_model_load=True,
+        )
+    mock_dynamo.assert_not_called()
+
+
+def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
+    assert (
+        sc_setup_mod._generation_max_seq_len(
+            {"backend": "dynamo", "vllm_cfg": {"max_model_len": 1024}}
+        )
+        == 1024
+    )
+
+
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
     master_config = _make_master_config(colocated=False, backend="trtllm")
@@ -373,7 +432,7 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, or megatron generation; got 'trtllm'",
+        match="only supports vllm, sglang, megatron, or dynamo generation; got 'trtllm'",
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -1244,6 +1303,37 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_msc_checkpoint_dir_replaces_native_tq_requirement_with_warning(
+        self, patched_factories, tmp_path, monkeypatch
+    ):
+        # setup builds a real CheckpointManager, which resolves the MSC profile.
+        (tmp_path / "objects").mkdir()
+        msc_config = tmp_path / "msc.json"
+        msc_config.write_text(
+            json.dumps(
+                {
+                    "profiles": {
+                        "profile": {
+                            "storage_provider": {
+                                "type": "file",
+                                "options": {"base_path": str(tmp_path / "objects")},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("MSC_CONFIG", str(msc_config))
+        mc = _make_master_config()
+        mc.checkpointing["enabled"] = True
+        mc.checkpointing["save_data_plane"] = False
+        mc.checkpointing["checkpoint_dir"] = "msc://profile/run"
+        mc.async_rl.sampler = WindowedSamplerConfig(max_staleness_versions=1)
+        mc.data_plane["backend"] = "simple"
+
+        with pytest.warns(UserWarning, match="msc:// checkpoint_dir"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
     def test_warns_when_custom_sampler_cannot_recover_buffered_rollouts(
         self, patched_factories
     ):
@@ -1434,6 +1524,11 @@ class TestSetup:
                 "defer_routed_experts_to_policy requires",
             ),
             (
+                "deferred_routes_on_automodel_policy",
+                NotImplementedError,
+                "only wired for the Megatron",
+            ),
+            (
                 "prompt_group_recovery_without_capture",
                 ValueError,
                 "non-default rollout_recovery policies require",
@@ -1470,16 +1565,20 @@ class TestSetup:
         elif invalid_case == "deferred_routes_without_capture":
             mc = _make_master_config()
             mc.token_capture.defer_routed_experts_to_policy = True
+        elif invalid_case == "deferred_routes_on_automodel_policy":
+            mc = _make_master_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
         elif invalid_case == "megatron_automodel_trainer":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=False
             )
         elif invalid_case == "megatron_recompute_mismatch":
-            # Flag says recompute; the engine mode (fixture default "persist") disagrees.
+            # The opt-out disagrees with the fixture's default recompute mode.
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
             )
-            mc.async_rl.recompute_kv_cache_after_weight_updates = True
+            mc.async_rl.recompute_kv_cache_after_weight_updates = False
         elif invalid_case == "megatron_fleet_health":
             mc = _make_master_config(
                 colocated=False, backend="megatron", megatron_enabled=True
@@ -1564,6 +1663,104 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+
+        with (
+            patch.object(
+                sc_setup_mod.DynamoConfig,
+                "model_validate",
+                side_effect=ValueError("bad dynamo config"),
+            ),
+            pytest.raises(ValueError, match="bad dynamo config"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("misconfigure", "match"),
+        [
+            pytest.param(
+                lambda mc: mc.policy.update(router_replay={"enabled": True}),
+                "does not return routed experts",
+                id="router_replay",
+            ),
+            pytest.param(
+                lambda mc: mc.policy.update(is_vlm=True),
+                "serves text prompts only",
+                id="vlm",
+            ),
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "enabled", True
+                ),
+                "Dynamo frontend owns request routing",
+                id="fleet_health",
+            ),
+            # 300.0 is the FleetHealthConfig default, so a Dynamo config that does
+            # not opt out would otherwise only fail at its first weight sync.
+            pytest.param(
+                lambda mc: setattr(
+                    mc.async_rl.generation_fleet_health, "refit_timeout_s", 300.0
+                ),
+                "refit_timeout_s must be null",
+                id="refit_deadline",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["dynamo_cfg"].update(
+                    control_timeout_s=600.0
+                ),
+                "must be >= request_timeout_s",
+                id="drain_timeout",
+            ),
+            pytest.param(
+                lambda mc: mc.policy["generation"]["vllm_cfg"].update(
+                    enable_vllm_metrics_logger=True
+                ),
+                "requires rollout_checkpointing.telemetry_interval_s",
+                id="unread_metrics_logger",
+            ),
+        ],
+    )
+    def test_unsupported_dynamo_settings_fail_before_clusters(
+        self, patched_factories, misconfigure, match
+    ):
+        mc = _make_master_config(backend="dynamo")
+        misconfigure(mc)
+
+        with (
+            patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate,
+            pytest.raises(ValueError, match=match),
+        ):
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_generation"].assert_not_called()
+
+    def test_dynamo_generation_config_is_normalized(self, patched_factories):
+        mc = _make_master_config(backend="dynamo")
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+        normalized = {
+            **mc.policy["generation"],
+            "vllm_kwargs": {"hf_overrides": {"rope_theta": 1.0}},
+        }
+
+        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
+            validate.return_value.model_dump.return_value = normalized
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (raw_config,), _ = validate.call_args
+        assert raw_config["vllm_kwargs"]["hf_overrides"] == {"rope_theta": 1.0}
+        assert mc.policy["generation"] is normalized
+        assert actor_args.gen_handle is patched_factories["fake_gen"]
+        _, sync_kwargs = patched_factories["create_weight_synchronizer"].call_args
+        assert sync_kwargs["generation_backend"] == "dynamo"
+        assert sync_kwargs["colocated"] is False
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()
@@ -2743,6 +2940,36 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+class TestAdaptiveLossRestore:
+    def test_resume_restores_adaptive_ppo_clip_state(self, tmp_path, patched_factories):
+        checkpoint_path = tmp_path / "step_3"
+        checkpoint_path.mkdir()
+        torch.save({}, checkpoint_path / "train_dataloader.pt")
+        save_state = _save_state()
+        save_state.cur_adaptive_ppo_clip_k = 0.5
+        checkpointer = MagicMock()
+        checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
+        checkpointer.load_training_info.return_value = vars(save_state)
+        checkpointer.get_resume_paths.return_value = (None, None)
+        patched_factories["ClippedPGLossFn"].side_effect = (
+            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        )
+        mc = _make_master_config(
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+                truncated_importance_sampling_type="adaptive-ppo-clip",
+                truncated_importance_sampling_ratio=1.0,
+                truncated_importance_sampling_ratio_min=0.5,
+            )
+        )
+
+        with patch.object(sc_setup_mod, "CheckpointManager", return_value=checkpointer):
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.loss_fn.cur_adaptive_ppo_clip_k == 0.5
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
@@ -3149,14 +3376,63 @@ class TestOPDFullValidation:
     until the first training forward.
     """
 
+    @pytest.mark.parametrize("full_vocab", [False, True])
+    def test_advantage_stage_config_derives_full_vocab_mode(self, full_vocab):
+        config = _load_fullvocab_master_config()
+        config.on_policy_distillation.full.enabled = full_vocab
+        config.grpo.seq_logprob_error_threshold = 2.0
+
+        stage_config = AdvantageStageConfig.from_master_config(config)
+
+        assert stage_config.opd_full_enabled == full_vocab
+        assert stage_config.algo.seq_logprob_error_threshold == 2.0
+
     def test_accepts_the_shipped_recipe(self):
         config = _load_fullvocab_master_config()
         _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_is_a_no_op_when_full_is_absent(self):
+    @pytest.mark.parametrize(
+        ("top_k", "top_p", "expected_warning"),
+        [
+            (20, 1.0, True),
+            (None, 0.95, True),
+            (20, 0.95, True),
+            (None, 1.0, False),
+            (-1, 1.0, False),
+            (0, 1.0, False),
+        ],
+    )
+    def test_rollout_filtering_warns_without_changing_config(
+        self,
+        top_k: int | None,
+        top_p: float,
+        expected_warning: bool,
+        recwarn: pytest.WarningsRecorder,
+    ) -> None:
+        config = _load_fullvocab_master_config()
+        generation_config = config.policy["generation"]
+        generation_config.update(top_k=top_k, top_p=top_p)
+
+        _validate_opd_full_config(config, config.on_policy_distillation)
+
+        assert len(recwarn) == int(expected_warning)
+        if expected_warning:
+            message = str(recwarn[0].message)
+            assert "does not apply top-k/top-p filtering to policy logprobs" in message
+            assert "still applied during rollout" in message
+        assert (generation_config["top_k"], generation_config["top_p"]) == (
+            top_k,
+            top_p,
+        )
+
+    def test_is_a_no_op_when_full_is_absent(
+        self, recwarn: pytest.WarningsRecorder
+    ) -> None:
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.full = None
+        config.policy["generation"].update(top_k=20, top_p=0.95)
         _validate_opd_full_config(config, config.on_policy_distillation)
+        assert not recwarn
 
     def test_rejects_fused_linear_logprobs(self):
         """The fused forward bypasses output_layer, so the capture hook never fires."""

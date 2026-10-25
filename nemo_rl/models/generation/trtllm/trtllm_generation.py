@@ -923,12 +923,17 @@ class TrtllmGeneration(GenerationInterface):
             print(f"Error in finish_generation: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        if state_dict_info is None:
+            return None
         futures = self._run_on_engines(
             "prepare_refit_info_async",
             state_dict_info=state_dict_info,
         )
         ray.get(futures)
+        return None
 
     def start_gpu_profiling(self) -> None:
         """Grpo profiling protocol: start nsys capture on the GPU workers."""

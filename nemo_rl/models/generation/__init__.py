@@ -26,6 +26,7 @@ from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     validate_nvfp4_pertoken_generation,
+    validate_vllm_quantization_config,
 )
 
 TokenizerType = PreTrainedTokenizerBase
@@ -112,12 +113,34 @@ def resolve_generation_class(
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def draft_full_refit_enabled(policy_cfg: dict) -> bool:
+    """Whether the trainer streams the drafter's FULL weight set on refit.
+
+    True for Automodel draft co-training (dspark/dflash/eagle3), which
+    exports the drafter's entire state_dict under the ``draft.`` prefix; the
+    megatron eagle3 path streams a partial set instead. Feeds the
+    ``draft_full_refit`` argument of :func:`configure_generation_config`.
+
+    automodel_cfg.enabled alone identifies the Automodel path.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    draft_config = coerce_draft_config(policy_cfg.get("draft"))
+    automodel_cfg = policy_cfg.get("automodel_cfg") or {}
+    return (
+        draft_config is not None
+        and bool(draft_config.enabled)
+        and bool(automodel_cfg.get("enabled", False))
+    )
+
+
 def configure_generation_config(
     config: GenerationConfig,
     tokenizer: TokenizerType,
     is_eval: bool = False,
     has_refit_draft_weights: bool = False,
     trains_mtp: bool = False,
+    draft_full_refit: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     if (
@@ -144,10 +167,17 @@ def configure_generation_config(
     # vLLM setting shared by the standard and managed Dynamo backends.
     if config["backend"] in ("vllm", "dynamo"):
         vllm_backed_config = cast(VllmConfig, config)
-        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # VLM training can require real startup weights for modules that are
+        # frozen and therefore never refitted (for example, the vision tower).
+        # Preserve an explicit recipe override while retaining the lightweight
+        # dummy default for ordinary training.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
@@ -188,6 +218,12 @@ def configure_generation_config(
         # loaded from the checkpoint.
         config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
+
+        # Whether the trainer streams the drafter's FULL weight set (incl.
+        # embed_tokens/lm_head) on every refit — true for Automodel draft
+        # co-training. The megatron eagle3 path streams a partial set and
+        # relies on drafter module sharing instead.
+        config["_draft_full_refit"] = draft_full_refit
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:

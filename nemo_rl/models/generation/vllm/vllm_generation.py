@@ -35,6 +35,7 @@ from ray.util.placement_group import PlacementGroup
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.fleet_health import (
@@ -50,6 +51,11 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    validate_vllm_quantization_config,
+)
+from nemo_rl.models.generation.vllm.draft_utils import (
+    DRAFT_DISABLE_MODULE_SHARING_ENV,
+    draft_module_sharing_disable_required,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
 from nemo_rl.models.generation.vllm.utils import (
@@ -219,6 +225,8 @@ class VllmGeneration(GenerationInterface):
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
         """
+        validate_vllm_quantization_config(config)
+
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
@@ -368,6 +376,15 @@ class VllmGeneration(GenerationInterface):
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
+
+        # Set via runtime_env (not a later os.environ mutation in __init__)
+        # because this actor's own vLLM engine spawns further Ray actors for
+        # each TP rank when tensor_parallel_size > 1 (e.g. RayWorkerProc); a
+        # parent actor's runtime os.environ changes are invisible to those
+        # child actors, but runtime_env.env_vars set here (via
+        # RayWorkerGroup(env_vars=...) below) is inherited by them.
+        if draft_module_sharing_disable_required(self.cfg):
+            env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -938,8 +955,8 @@ class VllmGeneration(GenerationInterface):
         """
         self._refit_membership = membership
 
-    def _refit_leader_workers(self) -> list[Any]:
-        """DP leaders that should receive refit calls, in rank order.
+    def _refit_leaders_by_shard(self) -> list[tuple[int, int, Any]]:
+        """Snapshot (shard index, leader index, worker) in refit rank order.
 
         Falls back to every leader when no membership has been recorded, which is the
         state for the entire life of a run that never loses a shard.
@@ -950,17 +967,24 @@ class VllmGeneration(GenerationInterface):
         membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
-            return [workers[idx * per_shard] for idx in range(self.dp_size)]
+            shard_indices = range(self.dp_size)
+        else:
+            per_shard = membership.workers_per_shard
+            shard_indices = membership.shard_prefixes
         leaders = []
-        for shard_idx in membership.shard_prefixes:
-            leader_idx = shard_idx * membership.workers_per_shard
+        for shard_idx in shard_indices:
+            leader_idx = shard_idx * per_shard
             if leader_idx >= len(workers):
                 raise RuntimeError(
                     f"shard {shard_idx} maps to worker {leader_idx}, but the group has "
                     f"{len(workers)} workers"
                 )
-            leaders.append(workers[leader_idx])
+            leaders.append((shard_idx, leader_idx, workers[leader_idx]))
         return leaders
+
+    def _refit_leader_workers(self) -> list[Any]:
+        """DP leaders that should receive refit calls, in rank order."""
+        return [worker for _, _, worker in self._refit_leaders_by_shard()]
 
     def rebuild_collective(
         self, membership: "RefitMembership", ip: str, port: int
@@ -1425,8 +1449,18 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns:
+            When MXFP8 trainer-side pre-quantization is enabled
+            (vllm_cfg.refit_prequantize), the parameter names the engine wants
+            quantized on the trainer before streaming. None otherwise.
+        """
+        if state_dict_info is None:
+            return None
         # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"
@@ -1448,7 +1482,19 @@ class VllmGeneration(GenerationInterface):
             getattr(worker, method_name).remote(state_dict_info=state_dict_info)
             for worker in self._refit_leader_workers()
         ]
-        ray.get(futures)
+
+        # Union the fp8-eligible parameter names across workers: replicas are
+        # equivalent, but with pipeline parallelism each worker only reports
+        # the parameters of its local shard.
+        names = sorted(
+            {name for result in ray.get(futures) if result for name in result}
+        )
+        if self.cfg["vllm_cfg"].get("refit_prequantize") and not names:
+            raise RuntimeError(
+                "vllm_cfg.refit_prequantize=true, but vLLM reported no "
+                "FP8-eligible parameters; check the FP8 config and ignored layers."
+            )
+        return names or None
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
@@ -1729,37 +1775,66 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
-    def pause_generation_for_refit(self, *, clear_cache: bool) -> bool:
+    def pause_generation_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float] = None
+    ) -> bool:
         """Pause every async vLLM engine while preserving in-flight requests."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError("pause_generation_for_refit requires async_engine=True")
-        if not self.worker_group or not self.worker_group.workers:
-            raise RuntimeError("Worker group is not initialized")
-
-        futures = self.worker_group.run_all_workers_single_data(
-            "pause_generation_async",
-            clear_cache=clear_cache,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to pause every async vLLM engine")
-        return True
-
-    def resume_generation_after_refit(self) -> bool:
-        """Resume every async vLLM engine paused for refit."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "resume_generation_after_refit requires async_engine=True"
+            return super().pause_generation_for_refit(
+                clear_cache=clear_cache, timeout_s=timeout_s
             )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
-        futures = self.worker_group.run_all_workers_single_data(
-            "resume_generation_async",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        if not all(ray.get(futures)):
-            raise RuntimeError("Failed to resume every async vLLM engine")
+        # Address surviving DP leaders directly. SingleController may have rebuilt the
+        # refit communicator after losing a shard; walking the whole worker group here
+        # would call the dead Ray actor and undo that recovery before the refit starts.
+        futures = [
+            worker.pause_generation_async.remote(clear_cache=clear_cache)
+            for worker in self._refit_leader_workers()
+        ]
+        try:
+            results = ray.get(futures, timeout=timeout_s)
+        except ray.exceptions.GetTimeoutError as exc:
+            raise RefitAborted(
+                f"vLLM generation pause did not return within {timeout_s}s"
+            ) from exc
+        if not all(results):
+            raise RuntimeError("Failed to pause every async vLLM engine")
+        return True
+
+    def resume_generation_after_refit(
+        self, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Resume surviving engines; fleet health excludes confirmed actor deaths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return super().resume_generation_after_refit(timeout_s=timeout_s)
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        leaders = self._refit_leaders_by_shard()
+        futures = [worker.resume_generation_async.remote() for _, _, worker in leaders]
+        # Settle all calls within one budget before inspecting failures. A dead leader
+        # must not prevent us from waiting for the surviving engines to resume.
+        _, pending = ray.wait(futures, num_returns=len(futures), timeout=timeout_s)
+        if pending:
+            raise RefitAborted(
+                f"vLLM generation resume did not return within {timeout_s}s"
+            )
+        for (shard_idx, leader_idx, worker), future in zip(leaders, futures):
+            try:
+                resumed = ray.get(future)
+            except ray.exceptions.ActorDiedError as exc:
+                if self.fleet_monitor is None:
+                    raise
+                # A late error from an old actor must not condemn its replacement.
+                if self.worker_group.workers[leader_idx] is worker:
+                    self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
+                continue
+            if not resumed:
+                raise RuntimeError("Failed to resume every async vLLM engine")
+        if self.fleet_monitor is not None:
+            self.fleet_monitor.raise_if_exhausted()
         return True
 
     @property

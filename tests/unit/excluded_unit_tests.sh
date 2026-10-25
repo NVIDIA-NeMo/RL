@@ -80,6 +80,9 @@ EXCLUDED_UNIT_TESTS=(
 
     --ignore=unit/models/generation/test_vllm_large_model.py
 
+    # TRT-LLM — a real TP=2 engine under a Slurm launcher env (~1-4 min)
+    --ignore=unit/models/generation/trtllm/test_trtllm_worker_startup.py
+
     # test_vllm_generation.py — keep 3 key expensive tests + the replace_prefix_tokens integration test
     # Kept: test_vllm_policy_generation (basic generation correctness),
     #        test_vllm_weight_update_and_prefix_cache_reset (weight sync),

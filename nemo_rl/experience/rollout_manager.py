@@ -75,6 +75,7 @@ from nemo_rl.experience.rollout_recovery import (
     SiblingSealResult,
 )
 from nemo_rl.experience.rollouts import (
+    _SHARED_GENRM_METRICS,
     EffortLevelsConfig,
     _apply_effort_shaping,
     _attach_routed_experts_to_message_log_prefix,
@@ -82,6 +83,7 @@ from nemo_rl.experience.rollouts import (
     _effort_shaping_metrics,
     _EffortShapingMetrics,
     _find_routed_experts_template,
+    _nemo_gym_group_metrics,
     _tensorize_by_key,
     apply_reward_penalties,
     attach_static_multimodal_payload,
@@ -1020,10 +1022,22 @@ class AsyncNemoGymRolloutImpl:
         )
         if not receipt_mode:
             source_message_log = input_sample["message_log"]
-            attach_static_multimodal_payload(prompt_message_log, source_message_log)
+            # Prompt and completion logs may alias message dictionaries. Share
+            # one identity set so rollout-matched media cannot be overwritten
+            # through a second view after its marker is consumed.
+            processed_target_ids: set[int] = set()
+            attach_static_multimodal_payload(
+                prompt_message_log,
+                source_message_log,
+                processed_target_ids=processed_target_ids,
+                tokenizer=self._tokenizer,
+            )
             for completion in completions:
                 attach_static_multimodal_payload(
-                    completion.message_log, source_message_log
+                    completion.message_log,
+                    source_message_log,
+                    processed_target_ids=processed_target_ids,
+                    tokenizer=self._tokenizer,
                 )
 
         timer.stop(f"{timer_prefix}/total")
@@ -1388,6 +1402,10 @@ class AsyncNemoGymRolloutImpl:
                     result.get("full_result") or {} for result in completed_results
                 ],
             )
+            # Receipt metrics come from their manifests, not token-bearing results.
+            receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
+            if not receipt_mode:
+                rollout_metrics.update(_nemo_gym_group_metrics(completed_results))
             # Same helper the batched path uses, so the two cannot drift apart.
             rollout_metrics.update(_effort_shaping_metrics(shaping))
             rollout_metrics.update(
@@ -1608,6 +1626,8 @@ class AsyncNemoGymRolloutImpl:
                 for c in completions
             ]
         for key in agent_extras[0].keys():
+            if key in _SHARED_GENRM_METRICS:
+                continue
             values = [
                 float(r[key])  # type: ignore
                 for r in agent_extras
