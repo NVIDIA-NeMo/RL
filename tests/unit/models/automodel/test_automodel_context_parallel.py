@@ -293,7 +293,7 @@ def test_standard_distillation_statistics_follow_automodel_sequence_layout() -> 
     legacy_cp_group = object()
 
     with patch("torch.distributed.get_world_size") as get_world_size:
-        student_logprobs, teacher_logprobs, entropy = (
+        student_logprobs, teacher_logprobs, entropy, _ = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=local_student_logits,
                 teacher_topk_logits=teacher_topk_logits,

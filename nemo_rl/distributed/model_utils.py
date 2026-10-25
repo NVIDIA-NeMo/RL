@@ -1871,8 +1871,8 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
-):
-    """Compute top-k log probabilities from logits."""
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Return student/teacher top-k logprobs, optional entropy, and the optional raw logit difference."""
     if teacher_topk_indices.shape[-1] <= 0:
         raise ValueError(
             f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
@@ -2008,11 +2008,15 @@ def get_distillation_topk_logprobs_from_logits(
                 dim=-1, index=indices_for_logits
             )
 
+        if cp_sharder is not None:
+            student_topk_logits = cp_sharder.gather_token_tensor(
+                student_topk_logits, seq_dim=1, trim=True
+            )
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
         )
 
-    if cp_sharder is not None:
+    if cp_sharder is not None and zero_outside_topk:
         student_topk_logprobs = cp_sharder.gather_token_tensor(
             student_topk_logprobs, seq_dim=1, trim=True
         )
@@ -2024,6 +2028,11 @@ def get_distillation_topk_logprobs_from_logits(
         student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
     )
     teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
+    logit_delta = None
+    if not zero_outside_topk:
+        logit_delta = (student_topk_logits.detach() - teacher_topk_logits.detach())[
+            :, :-1
+        ]
 
     # Single point of next-token alignment after TP/CP processing
     teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
@@ -2032,7 +2041,7 @@ def get_distillation_topk_logprobs_from_logits(
     if calculate_entropy:
         H_all = H_all[:, :-1]
 
-    return student_topk_logprobs, teacher_topk_logprobs, H_all
+    return student_topk_logprobs, teacher_topk_logprobs, H_all, logit_delta
 
 
 class ChunkedDistributedEntropy(torch.autograd.Function):

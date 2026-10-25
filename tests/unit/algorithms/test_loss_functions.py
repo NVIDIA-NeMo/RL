@@ -2643,6 +2643,7 @@ def test_distillation_loss_jsd_symmetric_beta():
         loss_input_overrides={
             "student_topk_logprobs": loss_input["teacher_topk_logprobs"],
             "teacher_topk_logprobs": loss_input["student_topk_logprobs"],
+            "student_teacher_logit_delta": -loss_input["student_teacher_logit_delta"],
         },
     )
 
@@ -2744,7 +2745,11 @@ def test_distillation_loss_jsd_zero_gradient_when_student_matches_teacher(jsd_be
 
 def test_distillation_loss_jsd_gradient_matches_fp64_reference():
     """Test the jsd gradient against an fp64 autograd reference."""
-    data, student_logits = setup_distillation_test_data(device="cpu")
+    data, student_logits = setup_distillation_test_data(topk=3, device="cpu")
+    data["teacher_topk_indices"][0, 0] = torch.arange(3)
+    data["teacher_topk_logits"][0, 0] = torch.tensor([2.0, 0.01, 0.0])
+    student_logits[0, 0, :3] = data["teacher_topk_logits"][0, 0]
+    student_logits[0, 0, 1] += 1e-8
     student_logits.requires_grad_(True)
     jsd_beta = 0.3
 
@@ -2781,6 +2786,12 @@ def test_distillation_loss_jsd_gradient_matches_fp64_reference():
     torch.testing.assert_close(loss.double(), expected_loss, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(
         student_logits.grad.double(), student_logits_ref.grad, atol=1e-7, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        student_logits.grad[0, 0, :3].double(),
+        student_logits_ref.grad[0, 0, :3],
+        atol=1e-15,
+        rtol=1e-5,
     )
 
 

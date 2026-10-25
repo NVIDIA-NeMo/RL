@@ -1948,6 +1948,8 @@ def _jsd_student_logit_grad(
     teacher_logprobs: torch.Tensor,
     mixture_logprobs: torch.Tensor,
     beta: float,
+    *,
+    logit_delta: torch.Tensor,
 ) -> torch.Tensor:
     """Gradient of the generalized JSD w.r.t. the student logits, without cancellation.
 
@@ -1962,13 +1964,13 @@ def _jsd_student_logit_grad(
         teacher_logprobs: Teacher log-probabilities p over the same top-k, [..., k].
         mixture_logprobs: log(M) with M = beta * p + (1 - beta) * q, [..., k].
         beta: JSD interpolation coefficient, strictly between 0 and 1.
+        logit_delta: Student minus teacher top-k logits before normalization.
 
     Returns:
         The gradient w.r.t. the student logits; it sums to zero over the top-k.
     """
     q, p = student_logprobs.exp(), teacher_logprobs.exp()
-    delta = student_logprobs - teacher_logprobs  # Logit difference, up to a shift.
-    d = delta - torch.sum(p * delta, dim=-1, keepdim=True)  # Center under p.
+    d = logit_delta - torch.sum(p * logit_delta, dim=-1, keepdim=True)
     s = d - torch.log1p(torch.sum(p * torch.expm1(d), dim=-1, keepdim=True))  # log(q/p)
     # dJSD/dz_S = (1 - beta) * q * (r - E_q[r]) with r = log(q / M), and
     # q / M = 1 / (1 + beta * expm1(-s)). Use the direct log(q) - log(M) when
@@ -2029,6 +2031,8 @@ class DistillationLossFn(LossFunction):
         data: DistillationLossDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
+        *,
+        student_teacher_logit_delta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
@@ -2107,11 +2111,13 @@ class DistillationLossFn(LossFunction):
                     # Keep the forward value but substitute the cancellation-free
                     # gradient. The top-k student logprobs are a log_softmax of the
                     # top-k logits, whose backward passes a zero-sum gradient through.
+                    assert student_teacher_logit_delta is not None
                     grad = _jsd_student_logit_grad(
                         student_topk_logprobs.detach(),
                         teacher_topk_logprobs,
                         mixture_topk_logprobs.detach(),
                         beta,
+                        logit_delta=student_teacher_logit_delta,
                     )
                     per_token_kl = per_token_kl.detach() + grad * (
                         student_topk_logprobs - student_topk_logprobs.detach()
