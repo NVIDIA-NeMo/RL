@@ -323,25 +323,37 @@ class UnitSlabStore:
     def resolve_keys(
         self, by_unit: dict[int, list[str]], deadline: float | None
     ) -> dict[int, dict[str, Any]]:
-        """One ``resolve_keys`` per unit, in turn; pins what it finds.
+        """One ``resolve_keys`` per unit, all units at once; pins what it finds.
 
-        On a failure, units already resolved are unpinned before the error is
-        raised (``blob_ids`` of the error are the keys).
+        Sent to every unit before any reply is read, so a get waits for the
+        slowest unit rather than the sum of them. On a failure, the units that
+        resolved are unpinned before the error is raised (``blob_ids`` of the
+        error are the keys).
         """
-        resolved: dict[int, dict[str, Any]] = {}
-        for u, keys in by_unit.items():
+        timeout_s = remaining(deadline, self.ctl.timeout_ms / 1000)
+        unit_of: dict[str, int] = {}
+        for u in by_unit:
             try:
-                resolved[u] = self.ctl.call(
-                    self._addr(u),
-                    "resolve_keys",
-                    timeout_s=remaining(deadline, self.ctl.timeout_ms / 1000),
-                    keys=keys,
-                )
-            except (TransferError, LostBlobs, DataPlaneTimeout) as e:
-                self.unpin_all(resolved)
-                if isinstance(e, DataPlaneTimeout):
-                    raise
-                raise self._failed(u, keys, e) from e
+                unit_of[self._addr(u)] = u
+            except LostBlobs as e:  # unknown to the directory: nothing pinned yet
+                raise self._failed(u, by_unit[u], e) from e
+        replies = self.ctl.call_many(
+            "resolve_keys",
+            {a: {"keys": by_unit[u]} for a, u in unit_of.items()},
+            timeout_s=timeout_s,
+        )
+        resolved = {
+            unit_of[a]: r for a, r in replies.items() if not isinstance(r, Exception)
+        }
+        failed = [
+            (unit_of[a], r) for a, r in replies.items() if isinstance(r, Exception)
+        ]
+        if failed:
+            self.unpin_all(resolved)
+            u, e = failed[0]
+            if isinstance(e, (TransferError, LostBlobs)):
+                raise self._failed(u, by_unit[u], e) from e
+            raise e
         return resolved
 
     def read_entries(
