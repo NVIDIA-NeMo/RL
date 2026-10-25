@@ -74,6 +74,7 @@ from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
+    GroupCriticAdvantageEstimator,
     GRPOAdvantageEstimator,
     PositiveLengthReweightStats,
     per_turn_length_reweight_config,
@@ -171,6 +172,7 @@ from nemo_rl.algorithms.single_controller_utils.sample_masks import (
 from nemo_rl.algorithms.single_controller_utils.segment_stats import (
     accumulate_segment_stats,
     broadcast_rollout_advantages,
+    canonical_row_of,
     check_chunk_completeness,
     new_segment_stats_accumulator,
     reduce_segment_stats,
@@ -6340,6 +6342,30 @@ class SingleControllerActor:
             )
             advantages = broadcast_rollout_advantages(
                 canonical_advantages, identity.row_to_canonical
+            )
+        elif has_valid_training_tokens and isinstance(
+            self._advantage_estimator, GroupCriticAdvantageEstimator
+        ):
+            # ppo.adv_estimator.name=group_critic: GRPO's leave-one-out advantage on the
+            # canonical rows minus the sibling-centred critic term; segment rows get the
+            # rollout's GRPO advantage and DP pad rows none. The estimator needs each
+            # row's canonical row (full-chunk index; -1 for a pad row) and the step.
+            self._advantage_estimator.current_step = self._train_steps + 1
+            # Off the event loop: ~1.5 s per million response tokens of per-group work.
+            advantages, returns = await asyncio.to_thread(
+                self._advantage_estimator.compute_advantage,
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                mask=estimator_mask,
+                values=kwargs["values"],
+                valid_mask=baseline_mask,
+                train_mask=mask,
+                canonical_of_row=canonical_row_of(
+                    identity, real_index, len(meta.sample_ids)
+                ),
+                position_mask=token_mask,
+                logprobs_policy=kwargs.get("logprobs_policy"),
+                logprobs_reference=kwargs.get("logprobs_reference"),
             )
         elif has_valid_training_tokens:
             result = self._advantage_estimator.compute_advantage(

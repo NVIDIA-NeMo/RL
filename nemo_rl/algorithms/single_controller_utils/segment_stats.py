@@ -399,6 +399,30 @@ def rollout_vote_mask(
     return votes[keys.index_select(0, index)]
 
 
+def canonical_row_of(
+    identity: "RowIdentity", real_index: torch.Tensor, num_rows: int
+) -> torch.Tensor:
+    """Each chunk row's canonical row, as an index into the full chunk (DP pad rows included).
+
+    Args:
+        identity: :class:`RowIdentity` of the chunk's real rows (``real_index`` order).
+        real_index: ``(R,)`` long; the chunk positions of the real (non-pad) rows.
+        num_rows: rows in the chunk, pad rows included.
+
+    Returns:
+        ``(num_rows,)`` long: for a real row, the chunk position of its rollout's canonical row (itself for a
+        canonical row); -1 for a DP pad row and for a row whose canonical row is not in the chunk.
+    """
+    out = torch.full((num_rows,), -1, dtype=torch.long)
+    real_index = real_index.to(dtype=torch.long)
+    canonical_rows = real_index.index_select(0, identity.canonical_index.to(torch.long))
+    has_canonical = identity.row_to_canonical >= 0
+    out[real_index[has_canonical]] = canonical_rows.index_select(
+        0, identity.row_to_canonical[has_canonical].to(torch.long)
+    )
+    return out
+
+
 def broadcast_rollout_advantages(
     advantages_canonical: torch.Tensor,
     row_to_canonical: torch.Tensor,

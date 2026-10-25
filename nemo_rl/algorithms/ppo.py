@@ -29,6 +29,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from nemo_rl.algorithms.advantage_estimator import (
     GAEConfig,
     GeneralizedAdvantageEstimator,
+    GroupCriticAdvantageEstimator,
     RawRewardAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
@@ -1213,9 +1214,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
     PPO's training loop consumes a `(advantages, returns)` pair from a
-    value-model-based estimator, so only `gae` and `raw_reward` are supported
-    here. Group-relative estimators like GRPO / Reinforce++ are not compatible
-    with PPO's loop and live in `grpo.py`.
+    value-model-based estimator, so only `gae`, `raw_reward` and `group_critic`
+    (GRPO's leave-one-out baseline plus a sibling-centred critic term, GAE's
+    returns for the critic; SingleController only) are supported here.
+    Group-relative estimators like GRPO / Reinforce++ are not compatible with
+    PPO's loop and live in `grpo.py`.
 
     Args:
         master_config: The master configuration dictionary.
@@ -1240,10 +1243,22 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "raw_reward":
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
+    elif adv_estimator_name == "group_critic":
+        if ppo_config.num_generations_per_prompt < 2:
+            raise ValueError(
+                "ppo.adv_estimator.name=group_critic needs prompt groups "
+                "(ppo.num_generations_per_prompt >= 2)"
+            )
+        adv_estimator = GroupCriticAdvantageEstimator(adv_estimator_config, loss_config)
+        gc = adv_estimator_config.group_critic
+        print(
+            "  ✓ Using group_critic advantage estimator (GRPO leave-one-out + sibling-centred critic term, "
+            f"weight={gc.weight}, ramp={gc.ramp_per_step}, position ranges {gc.position_boundaries})"
+        )
     else:
         raise ValueError(
             f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
-            f"PPO only supports 'gae' or 'raw_reward'."
+            f"PPO only supports 'gae', 'raw_reward' or 'group_critic'."
         )
 
     return adv_estimator

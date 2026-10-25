@@ -707,10 +707,68 @@ def reweight_positive_text_per_turn(
     return out, stats
 
 
+class GroupCriticConfig(BaseModel, extra="forbid"):
+    """Sibling-centred critic baseline on GRPO's leave-one-out baseline (``ppo.adv_estimator.name=group_critic``).
+
+    For token t of rollout i (its canonical row) in prompt group g:
+
+        A_{i,t} = [(R_i - L_i) - w_{g,r(t)} * (V_{i,t} - Vbar_{-i}(t))] / scale_i
+
+    - ``R_i - L_i`` and ``scale_i``: GRPO's leave-one-out advantage and per-sample normalisation, computed by the
+      same helper as :class:`GRPOAdvantageEstimator` (so ``w = 0`` reproduces GRPO exactly).
+    - ``Vbar_{-i}(t)``: mean over the group's other voting rollouts of their raw critic value at their own t-th
+      response token; a rollout with fewer than t + 1 response tokens holds its last value. A critic error shared by
+      the group at a position cancels.
+    - ``w_{g,r}``: least-squares weight of ``R - L`` on the critic term over the trained canonical tokens of the
+      chunk's other prompt groups with mixed rewards (leave one prompt group out; uniform groups, whose R - L is 0,
+      would only shrink it), per range ``r`` of the token's position, clipped to [0, 1] and capped by the ramp. It
+      falls towards 0 when the critic stops ranking siblings.
+    - The critic term is divided by ``max(scale_i, critic_scale_floor)``; in uniform groups by the chunk's mean GRPO
+      scale (see ``uniform_group_scale``), floored the same way.
+    - Positions and sibling values come from every response token (masked rollouts that vote stay siblings);
+      the weight is fitted on the tokens that carry loss.
+    - Segment rows (subagent traces) get the GRPO advantage, broadcast as in GRPO; DP pad rows get 0.
+    See research/ppo/docs/critic_loo_hybrid.md.
+    """
+
+    normalize_rewards: bool = True
+    use_leave_one_out_baseline: bool = True
+    # "fitted": leave-one-prompt-group-out least squares per position range; "constant": constant_weight everywhere.
+    weight: Literal["fitted", "constant"] = "fitted"
+    constant_weight: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    # Boundaries (response tokens) of the position ranges w is fitted per: [0, b0), [b0, b1), ..., [b_last, inf).
+    position_boundaries: list[int] = Field(default_factory=lambda: [8192, 32768])
+    # The weight is capped at min(1, ramp_per_step * step) (step is 1-based); None: no cap.
+    ramp_per_step: Optional[Annotated[float, Field(gt=0.0)]] = 0.1
+    # Scale of the critic term in groups whose voting rollouts all share one reward (GRPO leaves those
+    # unnormalised and their R - L is 0): "mean_normalized" = the chunk's mean GRPO scale over normalised rollouts,
+    # "none" = 1 (GRPO's own value there).
+    uniform_group_scale: Literal["mean_normalized", "none"] = "mean_normalized"
+    # The critic term is divided by max(scale, critic_scale_floor). GRPO's leave-one-out std can be tiny in a nearly
+    # uniform group with fractional rewards (GDPval: 15 x 0.5 and one 0.52 gives 0.005), which would blow the critic
+    # term up ~50x while GRPO's own term stays O(1). 0.25 is just below the smallest scale of a binary group of 16
+    # (one success: LOO std 0.258), so binary domains are unaffected; w = 0 stays exactly GRPO.
+    critic_scale_floor: Annotated[float, Field(ge=0.0)] = 0.25
+    # Logged only: hybrid/kill_switch_would_fire when the mean critic value moves more than this between steps.
+    kill_switch_value_jump: Annotated[float, Field(gt=0.0)] = 0.15
+
+    @field_validator("position_boundaries")
+    @classmethod
+    def _increasing_boundaries(cls, v: list[int]) -> list[int]:
+        if any(b <= 0 for b in v) or any(b2 <= b1 for b1, b2 in zip(v, v[1:])):
+            raise ValueError(
+                f"position_boundaries must be positive and strictly increasing, got {v}"
+            )
+        return v
+
+
 class GAEConfig(BaseModel, extra="allow"):
     """Configuration for the value-model advantage estimators (PPO)."""
 
-    name: Literal["gae", "raw_reward"] = "gae"
+    name: Literal["gae", "raw_reward", "group_critic"] = "gae"
+    # name == "group_critic" only: the sibling-centred hybrid (GRPO's leave-one-out baseline + critic term). GAE's
+    # fields below still define the critic's regression targets (returns).
+    group_critic: GroupCriticConfig = Field(default_factory=GroupCriticConfig)
     gae_lambda: float = 0.95
     gae_gamma: float = 1.0
     normalize_advantages: bool = True
@@ -1392,6 +1450,371 @@ class GeneralizedAdvantageEstimator:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         return advantages, returns
+
+
+def group_critic_advantages(
+    *,
+    prompt_ids: torch.Tensor,
+    rewards: torch.Tensor,
+    mask: torch.Tensor,
+    values: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    train_mask: Optional[torch.Tensor],
+    canonical_of_row: Optional[torch.Tensor],
+    config: GroupCriticConfig,
+    step: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Advantages of the sibling-centred hybrid (:class:`GroupCriticConfig`) and its ``hybrid/*`` metrics.
+
+    Args:
+        prompt_ids: ``(B, ...)`` prompt identity per row (rows of one prompt group share it).
+        rewards: ``(B,)`` rollout reward per row.
+        mask: ``(B, S)`` response-token mask; positions and critic values are read where it is 1.
+        values: ``(B, S)`` raw critic values, aligned with ``mask`` (as GAE reads them).
+        valid_mask: ``(B,)`` baseline vote per row (the controller's baseline mask); a rollout votes iff any of
+            its rows does. None: all rows vote.
+        train_mask: ``(B, S)`` tokens that carry loss (fit the weight on these). None: ``mask``.
+        canonical_of_row: ``(B,)`` long, the row index of each row's canonical (main-agent) row; the row itself
+            for a canonical row, -1 for a DP pad row. None: every row is canonical.
+        config: the estimator settings.
+        step: 1-based training step (for the ramp).
+
+    Returns:
+        ``(B, S)`` float32 advantages, 0 outside ``mask``, and the metrics.
+    """
+    num_rows, seq_len = mask.shape
+    advantages = torch.zeros(num_rows, seq_len, dtype=torch.float32, device=mask.device)
+    rows = torch.arange(num_rows, device=mask.device)
+    owner = (
+        rows.clone()
+        if canonical_of_row is None
+        else canonical_of_row.to(mask.device, torch.long)
+    )
+    is_canonical = owner == rows
+    canon_idx = torch.nonzero(is_canonical, as_tuple=False).reshape(-1)
+    if canon_idx.numel() == 0:
+        return advantages, {}
+    canon_pos = torch.full((num_rows,), -1, dtype=torch.long, device=mask.device)
+    canon_pos[canon_idx] = torch.arange(canon_idx.numel(), device=mask.device)
+
+    # A rollout votes iff any of its rows does (rollout_vote_mask); read at the canonical rows.
+    valid = (
+        torch.ones(num_rows, device=mask.device)
+        if valid_mask is None
+        else valid_mask.reshape(-1).to(mask.device).float()
+    )
+    has_owner = owner >= 0
+    votes_full = torch.zeros(num_rows, device=mask.device)
+    votes_full = votes_full.scatter_reduce(
+        0, owner[has_owner], valid[has_owner], reduce="amax", include_self=False
+    )
+    votes_c = votes_full[canon_idx]
+    pids_c = prompt_ids.index_select(0, canon_idx)
+    rewards_c = rewards.reshape(-1).index_select(0, canon_idx).float()
+
+    # GRPO's advantage, exactly as GRPOAdvantageEstimator computes it (float32).
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        pids_c,
+        rewards_c,
+        votes_c,
+        leave_one_out_baseline=config.use_leave_one_out_baseline,
+    )
+    grpo_c = rewards_c - baseline
+    if config.normalize_rewards:
+        normalized = (std > 0) & ~is_trivial
+        grpo_c[normalized] = grpo_c[normalized] / (std[normalized] + 1e-6)
+        scale_c = torch.where(
+            normalized, std.double() + 1e-6, torch.ones_like(std, dtype=torch.float64)
+        )
+    else:
+        normalized = torch.zeros_like(is_trivial)
+        scale_c = torch.ones_like(std, dtype=torch.float64)
+    y_c = (rewards_c - baseline).double()
+
+    if pids_c.dim() == 1:
+        _, group_of = torch.unique(pids_c, return_inverse=True)
+    else:
+        _, group_of = torch.unique(pids_c, dim=0, return_inverse=True)
+    num_groups = int(group_of.max().item()) + 1
+    boundaries = torch.tensor(
+        config.position_boundaries, dtype=torch.long, device=mask.device
+    )
+    num_ranges = len(config.position_boundaries) + 1
+    train = mask if train_mask is None else train_mask
+    voting = votes_c > 0
+    is_uniform = torch.zeros(num_groups, dtype=torch.bool)
+    fit_num = torch.zeros(num_groups, num_ranges, dtype=torch.float64)
+    fit_den = torch.zeros(num_groups, num_ranges, dtype=torch.float64)
+    # (canonical position, row, critic term as float32): positions, ranges and the trained mask are recomputed
+    # from the masks in the second pass, so a chunk holds one float per response token here.
+    per_row: list[tuple[int, int, torch.Tensor]] = []
+    value_sum = 0.0
+    value_count = 0
+    nonfinite = 0
+    for g in range(num_groups):
+        members = torch.nonzero(group_of == g, as_tuple=False).reshape(-1).tolist()
+        seqs = []
+        for k in members:
+            row = int(canon_idx[k])
+            pos = torch.nonzero(mask[row] > 0, as_tuple=False).reshape(-1)
+            seqs.append((k, row, pos, values[row].index_select(0, pos).double()))
+        voter_rewards = [float(rewards_c[k]) for k in members if voting[k]]
+        is_uniform[g] = len(voter_rewards) >= 2 and max(voter_rewards) == min(
+            voter_rewards
+        )
+        voters = [(k, v) for k, _, _, v in seqs if voting[k] and v.numel() > 0]
+        # The weight is fitted on groups with mixed rewards only (R - L carries signal there).
+        fit_group = len(voter_rewards) >= 2 and not bool(is_uniform[g])
+        longest = max((v.numel() for _, _, _, v in seqs), default=0)
+        if longest == 0:
+            continue
+        held = {}
+        if voters:
+            stack = []
+            for k, v in voters:
+                padded = (
+                    torch.cat([v, v[-1:].expand(longest - v.numel())])
+                    if v.numel() < longest
+                    else v
+                )
+                held[k] = padded
+                stack.append(padded)
+            total = torch.stack(stack).sum(dim=0)
+        for k, row, pos, v in seqs:
+            length = v.numel()
+            if length == 0:
+                continue
+            if k in held:
+                others = len(voters) - 1
+                sibling_mean = (
+                    (total[:length] - held[k][:length]) / others if others > 0 else None
+                )
+            else:
+                sibling_mean = total[:length] / len(voters) if voters else None
+            term = v - sibling_mean if sibling_mean is not None else torch.zeros_like(v)
+            bad = ~torch.isfinite(term)
+            if bool(bad.any()):
+                nonfinite += int(bad.sum())
+                term = torch.where(bad, torch.zeros_like(term), term)
+            ranges = torch.bucketize(
+                torch.arange(length, device=mask.device), boundaries, right=True
+            )
+            trained = train[row].index_select(0, pos) > 0
+            if bool(trained.any()):
+                if fit_group:
+                    y = float(y_c[k])
+                    t_term, t_ranges = term[trained], ranges[trained]
+                    fit_num[g].index_add_(0, t_ranges.cpu(), (y * t_term).cpu())
+                    fit_den[g].index_add_(0, t_ranges.cpu(), (t_term * t_term).cpu())
+                finite_v = v[trained][torch.isfinite(v[trained])]
+                value_sum += float(finite_v.sum())
+                value_count += int(finite_v.numel())
+            per_row.append((k, row, term.float()))
+
+    if config.weight == "constant":
+        weights = torch.full(
+            (num_groups, num_ranges), float(config.constant_weight), dtype=torch.float64
+        )
+    else:
+        num = fit_num.sum(dim=0, keepdim=True) - fit_num
+        den = fit_den.sum(dim=0, keepdim=True) - fit_den
+        weights = torch.where(
+            den > 1e-12,
+            (num / den.clamp(min=1e-12)).clamp(0.0, 1.0),
+            torch.zeros_like(den),
+        )
+    cap = (
+        1.0
+        if config.ramp_per_step is None
+        else min(1.0, config.ramp_per_step * max(int(step), 1))
+    )
+    weights = weights.clamp(max=cap)
+
+    uniform_scale = 1.0
+    if config.uniform_group_scale == "mean_normalized":
+        normalized_voting = normalized & voting
+        if bool(normalized_voting.any()):
+            uniform_scale = float(scale_c[normalized_voting].mean())
+
+    floor = float(config.critic_scale_floor)
+    sq_grpo = sq_hybrid = sq_w1 = abs_term = abs_part = max_part = 0.0
+    tokens = 0
+    mixed_tokens = 0
+    range_tokens = torch.zeros(num_ranges, dtype=torch.float64)
+    range_weight = torch.zeros(num_ranges, dtype=torch.float64)
+    for k, row, term32 in per_row:
+        g = int(group_of[k])
+        pos = torch.nonzero(mask[row] > 0, as_tuple=False).reshape(-1)
+        term = term32.double()
+        ranges = torch.bucketize(
+            torch.arange(term.numel(), device=mask.device), boundaries, right=True
+        )
+        trained = train[row].index_select(0, pos) > 0
+        w_tok = weights[g].to(term.device).index_select(0, ranges)
+        crit_scale = max(
+            uniform_scale if bool(is_uniform[g]) else float(scale_c[k]), floor
+        )
+        part = w_tok * term / crit_scale
+        advantages[row, pos] = (float(grpo_c[k]) - part).float()
+        if bool(trained.any()):
+            y = float(y_c[k])
+            t_term, t_w, t_r = term[trained], w_tok[trained], ranges[trained]
+            if not bool(is_uniform[g]):
+                # Noise vs GRPO on the groups the weight is fitted on (as the offline study).
+                sq_grpo += y * y * int(trained.sum())
+                sq_hybrid += float(((y - t_w * t_term) ** 2).sum())
+                sq_w1 += float(((y - t_term) ** 2).sum())
+                mixed_tokens += int(trained.sum())
+            abs_term += float(t_term.abs().sum())
+            t_part = part[trained].abs()
+            abs_part += float(t_part.sum())
+            max_part = max(max_part, float(t_part.max()))
+            tokens += int(trained.sum())
+            range_tokens.index_add_(
+                0, t_r.cpu(), torch.ones_like(t_w, dtype=torch.float64).cpu()
+            )
+            range_weight.index_add_(0, t_r.cpu(), t_w.cpu())
+
+    # Segment rows (subagent traces): the rollout's GRPO advantage, as the GRPO path broadcasts it.
+    for row in (
+        torch.nonzero(has_owner & ~is_canonical, as_tuple=False).reshape(-1).tolist()
+    ):
+        k = int(canon_pos[owner[row]])
+        if k < 0:
+            raise ValueError(
+                f"group_critic_advantages: row {row} names row {int(owner[row])}, which is not canonical"
+            )
+        row_mask = mask[row] > 0
+        advantages[row, row_mask] = float(grpo_c[k])
+
+    pooled_num, pooled_den = fit_num.sum(dim=0), fit_den.sum(dim=0)
+    metrics: dict[str, float] = {
+        "hybrid/weight_cap": cap,
+        "hybrid/uniform_group_frac": float(is_uniform.float().mean()),
+        "hybrid/uniform_scale": uniform_scale,
+        "hybrid/num_groups": float(num_groups),
+    }
+    for r in range(num_ranges):
+        metrics[f"hybrid/w_fit_pooled_r{r}"] = (
+            float((pooled_num[r] / pooled_den[r]).clamp(0.0, 1.0))
+            if pooled_den[r] > 1e-12
+            else 0.0
+        )
+        if range_tokens[r] > 0:
+            metrics[f"hybrid/w_used_r{r}"] = float(range_weight[r] / range_tokens[r])
+        if tokens:
+            metrics[f"hybrid/token_frac_r{r}"] = float(range_tokens[r]) / tokens
+    if mixed_tokens and sq_grpo > 0:
+        metrics["hybrid/noise_vs_grpo"] = sq_hybrid / sq_grpo
+        metrics["hybrid/noise_vs_grpo_w1"] = sq_w1 / sq_grpo
+    if tokens:
+        metrics["hybrid/critic_term_abs_mean"] = abs_term / tokens
+        # The part subtracted from the GRPO advantage (after the weight and scale), per trained token.
+        metrics["hybrid/critic_part_abs_mean"] = abs_part / tokens
+        metrics["hybrid/critic_part_abs_max"] = max_part
+    metrics["hybrid/nonfinite_values"] = float(nonfinite)
+    if value_count:
+        metrics["hybrid/value_mean"] = value_sum / value_count
+    return advantages, metrics
+
+
+class GroupCriticAdvantageEstimator(GeneralizedAdvantageEstimator):
+    """Sibling-centred hybrid: GRPO's leave-one-out advantage minus a weighted critic term (:class:`GroupCriticConfig`).
+
+    The critic's regression targets are GAE's returns, unchanged, so the critic trains exactly as under PPO's GAE;
+    only the policy advantages differ. Needs prompt groups (num_generations_per_prompt > 1), a terminal reward
+    (gamma 1, no KL in the reward) and the SingleController's per-row rollout identity (``canonical_of_row``).
+    The SingleController sets ``current_step`` (1-based) before each call.
+    """
+
+    def __init__(self, estimator_config: GAEConfig, loss_config: ClippedPGLossConfig):
+        super().__init__(estimator_config, loss_config)
+        if estimator_config.gae_gamma != 1.0:
+            raise ValueError(
+                "ppo.adv_estimator.name=group_critic needs gae_gamma 1 (terminal reward, no discount)"
+            )
+        if loss_config.use_kl_in_reward and loss_config.reference_policy_kl_penalty > 0:
+            raise ValueError(
+                "ppo.adv_estimator.name=group_critic does not support KL in the reward"
+            )
+        lam_value = self._resolve_lambda_value()
+        lam_policy = (
+            estimator_config.gae_lambda_policy
+            if estimator_config.gae_lambda_policy is not None
+            else estimator_config.gae_lambda
+        )
+        if estimator_config.length_adaptive_alpha > 0 or lam_policy != lam_value:
+            # GAE's policy advantages are discarded here; a decoupled lambda would only add a second pass.
+            raise ValueError(
+                "ppo.adv_estimator.name=group_critic computes GAE once, for the critic's returns: set "
+                "gae_lambda_policy == gae_lambda_value and length_adaptive_alpha 0"
+            )
+        self.group_critic = estimator_config.group_critic
+        self.current_step: int = 1
+        self._previous_value_mean: Optional[float] = None
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        values,
+        *,
+        valid_mask=None,
+        train_mask=None,
+        canonical_of_row=None,
+        position_mask=None,
+        logprobs_policy=None,
+        logprobs_reference=None,
+        **kwargs,
+    ):
+        """Return ``(advantages, returns)``: the hybrid's advantages and GAE's returns (the critic's targets).
+
+        ``mask`` is GAE's mask (the returns, as the PPO path computes them); ``position_mask`` (default ``mask``)
+        is every response token, for positions and sibling values; ``train_mask`` the tokens that carry loss;
+        ``canonical_of_row`` the SingleController's row identity (required: the legacy PPO loops do not pass it).
+        """
+        if canonical_of_row is None:
+            raise ValueError(
+                "ppo.adv_estimator.name=group_critic needs the SingleController's row identity "
+                "(canonical_of_row); the legacy PPO training loops are not supported"
+            )
+        _, returns = super().compute_advantage(
+            prompt_ids,
+            rewards,
+            mask,
+            values,
+            logprobs_policy=logprobs_policy,
+            logprobs_reference=logprobs_reference,
+        )
+        # adv_raw/* describe R - V (PPO's pre-whitening advantage): kept as critic diagnostics. The whitening
+        # gain does not apply to this estimator's advantages.
+        gae_metrics = {
+            k: v for k, v in self.last_metrics.items() if k != "adv_raw/whiten_gain"
+        }
+        advantages, metrics = group_critic_advantages(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask if position_mask is None else position_mask,
+            values=values,
+            valid_mask=valid_mask,
+            train_mask=train_mask,
+            canonical_of_row=canonical_of_row,
+            config=self.group_critic,
+            step=self.current_step,
+        )
+        value_mean = metrics.get("hybrid/value_mean")
+        if value_mean is not None and self._previous_value_mean is not None:
+            jump = abs(value_mean - self._previous_value_mean)
+            metrics["hybrid/value_jump"] = jump
+            # Log only (decided 2026-10-25): the fitted weight is the gate.
+            metrics["hybrid/kill_switch_would_fire"] = float(
+                jump > self.group_critic.kill_switch_value_jump
+            )
+        if value_mean is not None:
+            self._previous_value_mean = value_mean
+        self.last_metrics = {**gae_metrics, **metrics}
+        return advantages.to(returns.dtype), returns
 
 
 class OPDAdvantageEstimator:
