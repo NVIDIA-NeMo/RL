@@ -77,3 +77,18 @@ def test_units_per_node_and_spread(per_node_spread_system):
     assert torch.equal(t.flatten(), torch.arange(6 * n_nodes))
     tq.kv_clear(keys, "train")
     assert all(s["blobs"] == 0 for s in _stats(conf, n_units))
+
+
+@pytest.mark.parametrize(
+    "block, expected",
+    [
+        ({}, ["a", "b", "c"]),  # default: one unit per node
+        ({"num_storage_units": None}, ["a", "b", "c"]),
+        ({"num_storage_units": 4}, ["a", "b", "c", "a"]),
+        ({"storage_units_per_node": 2}, ["a", "a", "b", "b", "c", "c"]),
+    ],
+)
+def test_unit_count_defaults_to_one_per_node(block, expected):
+    from nemo_rl.data_plane.adapters.tq_nixl import unit_node_ids
+
+    assert unit_node_ids({"node_ids": ["a", "b", "c"], **block}) == expected
