@@ -34,16 +34,16 @@ policy:
     vllm_cfg: null
     vllm_kwargs: null
     mcore_generation_config: null
-    refit_transport: hf_checkpoint
-    refit_cfg:
-      hf_checkpoint:
-        # Same absolute path in training and serving processes/containers.
-        checkpoint_dir: ${oc.env:EXTERNAL_ROLLOUT_HF_EXPORT_DIR}
+    refit_transport: null
     remote_vllm_cfg:
       base_url: ${oc.env:EXTERNAL_ROLLOUT_VLLM_URL}
       served_model_name: policy
       max_model_len: ${policy.max_total_sequence_length}
       refit:
+        transport: nccl
+        nccl_num_engines: 1
+        # All TP/PP/DP GPU workers in the single serving deployment.
+        nccl_engine_world_size: 1
         inflight_policy: keep
         timeout_s: 1800.0
     colocated:

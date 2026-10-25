@@ -1,6 +1,6 @@
 # External rollout vLLM
 
-See [external vLLM rollout and HF-checkpoint refit](../../docs/guides/external-vllm.md)
+See [external vLLM rollout and NCCL refit](../../docs/guides/external-vllm.md)
 for configuration, service startup, exact multi-turn prefixes, token capture,
 and functional tests.
 
