@@ -610,10 +610,16 @@ def _stub_gym_resolved_config(resolved):
     package = types.ModuleType("nemo_gym")
     module = types.ModuleType("nemo_gym.global_config")
     module.get_global_config_dict = lambda: resolved
+    module.SERVER_TYPE_KEYS = (
+        "resources_servers",
+        "responses_api_agents",
+        "responses_api_models",
+        "environment_servers",
+    )
     with patch.dict(
         sys.modules, {"nemo_gym": package, "nemo_gym.global_config": module}
     ):
-        yield
+        yield module
 
 
 def _spun_up_actor():
@@ -631,6 +637,9 @@ def test_list_entries_reports_entry_names_and_server_types():
                 "responses_api_agents": {"simple_agent": {"entrypoint": "app.py"}}
             },
             "math_env": {"resources_servers": {"math": {"entrypoint": "app.py"}}},
+            "environment": {
+                "environment_servers": {"legacy_agent": {"entrypoint": "app.py"}}
+            },
             # An entry can carry more than one server type.
             "judge": {
                 "responses_api_models": {"local_vllm_model": {"entrypoint": "app.py"}},
@@ -649,8 +658,27 @@ def test_list_entries_reports_entry_names_and_server_types():
     assert entries == {
         "math_agent": ["responses_api_agents"],
         "math_env": ["resources_servers"],
-        "judge": ["responses_api_models", "resources_servers"],
+        "environment": ["environment_servers"],
+        "judge": ["resources_servers", "responses_api_models"],
     }
+
+
+def test_list_entries_uses_gym_server_type_keys() -> None:
+    resolved = DictConfig(
+        {
+            "mixed": {
+                "resources_servers": {"tools": {"entrypoint": "app.py"}},
+                "future_servers": {"future": {"entrypoint": "app.py"}},
+            },
+            "excluded": {"responses_api_agents": {"agent": {"entrypoint": "app.py"}}},
+        }
+    )
+
+    with _stub_gym_resolved_config(resolved) as gym_config:
+        gym_config.SERVER_TYPE_KEYS = ("future_servers", "resources_servers")
+        entries = _spun_up_actor().list_entries()
+
+    assert entries == {"mixed": ["future_servers", "resources_servers"]}
 
 
 def test_list_entries_skips_dicts_that_hold_no_server_type():

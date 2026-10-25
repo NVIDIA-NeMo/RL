@@ -115,15 +115,6 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
-# The three server-type keys Gym nests under a top-level config entry. Gym's
-# constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
-# list also appears in global_config.py, config_types.py, and cli/env.py.
-GYM_SERVER_TYPE_KEYS = (
-    "responses_api_agents",
-    "responses_api_models",
-    "resources_servers",
-)
-
 # Shard name used when the job is unsharded, so a single actor and a sharded
 # set have the same shape and callers need only one code path.
 DEFAULT_SHARD_NAME = "nemo_gym"
@@ -981,7 +972,8 @@ Depending on your data shape, you may want to change these values."""
                 "list_entries() needs a running Gym stack; call _spinup() first."
             )
 
-        from nemo_gym.global_config import get_global_config_dict
+        # Gym is installed only in the actor runtime.
+        from nemo_gym.global_config import SERVER_TYPE_KEYS, get_global_config_dict
         from omegaconf import DictConfig
 
         resolved = get_global_config_dict()
@@ -991,7 +983,7 @@ Depending on your data shape, you may want to change these values."""
                 continue
             # Fixed key order so the map is stable across actors and runs.
             types = []
-            for key in GYM_SERVER_TYPE_KEYS:
+            for key in SERVER_TYPE_KEYS:
                 server_group = entry.get(key)
                 if not isinstance(server_group, (dict, DictConfig)):
                     continue
