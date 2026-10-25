@@ -503,6 +503,11 @@ override-dependencies = [
   # av (PyAV) bundles FFmpeg-derived codecs that may incur royalties. Exclude it from the
   # shipped container; audio/video tests install it via tools/install_audio_deps.sh.
   "av; sys_platform == 'never'",
+  # pynvvideocodec (hard dependency of vllm 0.29.0) bundles FFmpeg 8.1.x shared libs and the
+  # FFmpeg source tarball (external/ffmpeg/). Exclude it from the shipped container for the
+  # same reason as av/opencv; vllm's video decoder backends (opencv/torchcodec/pynvvideocodec/
+  # deepstream) are selected at runtime and pynvvideocodec is not needed by default.
+  "pynvvideocodec; sys_platform == 'never'",
   # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
   # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
   "decord2; sys_platform == 'never'",

@@ -108,6 +108,7 @@ overrides = [
     { name = "opencv-python-headless", marker = "sys_platform == 'never'" },
     { name = "opentelemetry-api", specifier = ">=1.33.1" },
     { name = "outlines", specifier = ">=0.2.0" },
+    { name = "pynvvideocodec", marker = "sys_platform == 'never'" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "setuptools", specifier = ">=80.10.2" },
     { name = "timm", specifier = "<=1.0.22" },
@@ -6580,15 +6581,6 @@ crypto = [
 ]
 
 [[package]]
-name = "pynvvideocodec"
-version = "2.0.4"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/d6/8475720d4f0f8fc9e852e0092b308643b71f24d9495ba3bd03c38b16c28d/pynvvideocodec-2.0.4-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:fcb06ef6ef24ee33b8f34950696a4e01636f2d8cdb96c407cd692931d049ac3d", size = 43176124, upload-time = "2026-05-27T04:06:26.415Z" },
-    { url = "https://files.pythonhosted.org/packages/3d/28/33d2a4d69b48823801c0b02b1bfbeac04cd9d429ee698d248e7ba946c516/pynvvideocodec-2.0.4-cp313-cp313-manylinux_2_34_aarch64.whl", hash = "sha256:51724c6a0e3623c092cccdf93c8b09cced6881f3d0c76653f6ffbec0371f29cd", size = 35754919, upload-time = "2026-05-27T04:07:09.962Z" },
-]
-
-[[package]]
 name = "pyparsing"
 version = "3.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -9018,7 +9010,6 @@ dependencies = [
     { name = "py-cpuinfo" },
     { name = "pybase64" },
     { name = "pydantic" },
-    { name = "pynvvideocodec" },
     { name = "python-json-logger" },
     { name = "pyyaml" },
     { name = "pyzmq" },
