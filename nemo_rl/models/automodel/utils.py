@@ -22,6 +22,10 @@ from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForTextToWaveform,
 )
+from nemo_automodel.components.moe.megatron.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+)
+from torch import nn
 
 # Add an entry whenever a model's architecture isn't loadable via
 # NeMoAutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
@@ -51,3 +55,62 @@ def resolve_model_class(model_name: str) -> Any:
         model_name: Model type to resolve.
     """
     return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
+
+
+# Per-dispatch tensors that Automodel's flex token-dispatch managers (DeepEP,
+# HybridEP, UCCL-EP) keep as attributes. Each dispatch reassigns them, so none
+# is needed across steps.
+# TODO(https://github.com/NVIDIA-NeMo/Automodel/issues/4401): drop this workaround
+# once Automodel releases this state itself.
+_MOE_DISPATCH_STATE_ATTRS = (
+    "token_probs",
+    "token_indices",
+    "routing_map",
+    "handle",
+    "tokens_per_expert",
+    "num_permuted_tokens",
+    "dispatched_indices",
+    "dispatched_probs",
+    "dispatched_routing_map",
+    "reversed_mapping_for_combine",
+)
+
+
+def release_moe_dispatcher_state(model: nn.Module) -> int:
+    """Drop the per-dispatch tensors cached on the model's MoE dispatch managers.
+
+    The managers keep the last dispatch's routing tensors as attributes;
+    ``combine`` clears only ``handle`` (and HybridEP's ``num_permuted_tokens``).
+    After a backward with activation checkpointing, a manager's last dispatch
+    is a recompute, so ``token_probs`` and ``dispatched_probs`` carry a
+    ``grad_fn`` that keeps that recompute graph and its saved activations
+    alive. With the default manager shared by all layers that is the first MoE
+    layer (about 1 GB for Qwen3.5-35B-A3B at 9216 tokens per micro-batch); with
+    per-layer managers every layer keeps one. The live blocks pin cached
+    allocator segments, so ``torch.cuda.empty_cache()`` cannot return them
+    before colocated generation wakes up.
+
+    Args:
+        model: Model whose ``token_dispatcher`` attributes are scanned. A
+            manager shared across layers is cleared once.
+
+    Returns:
+        The number of attributes set to ``None``.
+    """
+    managers = {}
+    for module in model.modules():
+        # MoEFlexTokenDispatcher is a plain object held by the experts module,
+        # not a submodule, so model.modules() does not yield it.
+        dispatcher = getattr(module, "token_dispatcher", None)
+        if isinstance(dispatcher, MoEFlexTokenDispatcher):
+            manager = getattr(dispatcher, "_comm_manager", None)
+            if manager is not None:
+                managers[id(manager)] = manager
+
+    cleared = 0
+    for manager in managers.values():
+        for attr in _MOE_DISPATCH_STATE_ATTRS:
+            if getattr(manager, attr, None) is not None:
+                setattr(manager, attr, None)
+                cleared += 1
+    return cleared
