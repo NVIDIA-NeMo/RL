@@ -20,6 +20,7 @@ from nemo_rl.data.multimodal_utils import (
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
     _extract_input_images_from_message,
+    _has_image_before_first_trainable_output,
     _index_per_turn_images,
     _without_initial_media_sources,
 )
@@ -92,6 +93,28 @@ def test_extract_input_images_skips_unresolvable_sources(monkeypatch, capsys):
 
     assert _extract_input_images_from_message(item) == []
     assert "skipping non-image source in trajectory" in capsys.readouterr().out
+
+
+def test_pretrainable_tool_output_accepts_only_inline_images():
+    trainable_output = _assistant([1, 2])
+
+    assert _has_image_before_first_trainable_output(
+        [
+            {"type": "function_call_output", "output": _image((2, 2))},
+            trainable_output,
+        ]
+    )
+    for output in (
+        "https://example.com/tool-output",
+        "file:///tmp/tool-output",
+        '{"x": 0.5, "y": 0.5}',
+    ):
+        assert not _has_image_before_first_trainable_output(
+            [
+                {"type": "function_call_output", "output": output},
+                trainable_output,
+            ]
+        )
 
 
 def test_index_per_turn_images_bins_images():

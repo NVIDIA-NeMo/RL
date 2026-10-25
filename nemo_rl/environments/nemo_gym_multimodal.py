@@ -185,9 +185,6 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     return nemo_gym_examples
 
 
-# WARNING: A function-call output beginning with HTTP(S) is accepted here and
-# passed to ``resolve_to_image``, which performs an outbound request during
-# postprocessing even when the tool result is not actually an image.
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
@@ -253,7 +250,7 @@ def _has_image_before_first_trainable_output(output: list[dict]) -> bool:
             continue
         if item.get("type") == "function_call_output":
             source = item.get("output")
-            if isinstance(source, str) and _looks_like_image_src(source):
+            if isinstance(source, str) and source.startswith("data:image/"):
                 return True
         content = item.get("content") or []
         if not isinstance(content, list):
