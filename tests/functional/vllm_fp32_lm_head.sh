@@ -25,11 +25,14 @@ assert_grep() {
 }
 
 cd "$PROJECT_ROOT"
-uv run --extra vllm coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
-    "$PROJECT_ROOT/tests/functional/vllm_nemotron_h_fp32_lm_head.py" \
-    "$@" \
-    2>&1 | tee "$RUN_LOG"
+# A tied-embedding dense model and a hybrid Mamba model (the old Nemotron-H-only path).
+for MODEL in Qwen/Qwen3-0.6B nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16; do
+    uv run --extra vllm coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
+        "$PROJECT_ROOT/tests/functional/vllm_fp32_lm_head.py" \
+        --model "$MODEL" \
+        "$@" \
+        2>&1 | tee -a "$RUN_LOG"
+done
 
-assert_grep "Resolved architecture: NemotronHForCausalLM" "$RUN_LOG"
-assert_grep "\\[fp32_lm_head\\] NemotronH vLLM lm_head.forward casts input and weight to fp32" "$RUN_LOG"
-assert_grep "\\[PASS\\] Nemotron-H fp32 lm_head generated text" "$RUN_LOG"
+assert_grep "\\[PASS\\] Qwen/Qwen3-0.6B fp32 lm_head" "$RUN_LOG"
+assert_grep "\\[PASS\\] nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 fp32 lm_head" "$RUN_LOG"

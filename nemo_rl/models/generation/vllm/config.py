@@ -72,9 +72,10 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
-    # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
-    # trainer.
+    # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
+    # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
+    # unquantized). Pair this with policy.megatron_cfg.fp32_lm_head when using
+    # a Megatron trainer.
     fp32_lm_head: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
@@ -141,10 +142,15 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
-def vllm_nemotron_h_fp32_lm_head_enabled(
+# Read by the removed Nemotron-H fp32 LM-head source patch. Rejected in configs
+# so recipes that still set it fail instead of silently running a bf16 head.
+LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+
+
+def vllm_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    """Return whether vLLM should compute logits with an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
 
 
