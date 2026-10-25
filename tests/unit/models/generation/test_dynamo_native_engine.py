@@ -46,13 +46,13 @@ from nemo_rl.models.generation.openai_server_utils import (  # noqa: E402
     derive_prefix_eos_count,
     splice_prefix_tokens,
 )
-from nemo_rl.models.generation.vllm.utils import chat_routed_experts  # noqa: E402
 from nemo_rl.models.generation.vllm.request_pipeline import (  # noqa: E402
     rollout_output,
     rollout_result,
     rollout_result_from_wire,
     rollout_result_to_wire,
 )
+from nemo_rl.models.generation.vllm.utils import chat_routed_experts  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
