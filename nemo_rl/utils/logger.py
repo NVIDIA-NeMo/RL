@@ -46,9 +46,6 @@ from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.telemetry.host_memory import RAY_NODE_MEM_TOTAL, RAY_NODE_MEM_USED
-from nemo_rl.telemetry.metrics import (
-    TELEMETRY_WALL_TIME_METRIC as TELEMETRY_WALL_TIME_METRIC,
-)
 from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 from nemo_rl.utils.train_data_dump import json_safe_nonfinite
 

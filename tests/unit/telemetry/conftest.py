@@ -86,17 +86,6 @@ def _reset_rl_telemetry() -> None:
     # every test after it in the session.
     metrics_mod._REGISTRATION_FAILED = False
     metrics_mod._WARNED.clear()
-    # In a standalone ``tests/unit/telemetry`` run, the first exporting test
-    # freezes the vocabulary (``ensure_metric_group_registered`` ->
-    # ``freeze_metrics``) before ``_import_teed_metric_owners`` first imports
-    # ``nemo_rl.algorithms.ppo`` / the vLLM owner, whose module-level
-    # ``register_teed_metrics`` would then raise. A full ``tests/unit`` run
-    # hides this because the algorithm suites import those owners at
-    # collection time. Reset the lifecycle guard alongside the lens registry
-    # above; the declarations themselves stay.
-    from nemo_rl.telemetry import vocabulary
-
-    vocabulary._FROZEN = False
     try:
         from nemo.lens.instruments import unregister_metric_group
 

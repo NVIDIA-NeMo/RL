@@ -694,11 +694,34 @@ def _leaf_name(node: ast.expr) -> str | None:
 def _dict_keys_assigned_to(tree: ast.AST, name: str) -> set[str]:
     """String keys that reach the dict held under *name* within *tree*.
 
-    Both ``name = {...}`` (including a literal inside a conditional expression)
-    and ``name["key"] = ...``.
+    ``name = {...}`` (including a literal inside a conditional expression),
+    ``name["key"] = ...``, ``name.update({...}, key=...)`` and ``name |= {...}``.
     """
     keys: set[str] = set()
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            and _leaf_name(node.func.value) == name
+        ):
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    keys |= {
+                        key.value for key in arg.keys if isinstance(key, ast.Constant)
+                    }
+            keys |= {kw.arg for kw in node.keywords if kw.arg is not None}
+            continue
+        if (
+            isinstance(node, ast.AugAssign)
+            and isinstance(node.op, ast.BitOr)
+            and _leaf_name(node.target) == name
+            and isinstance(node.value, ast.Dict)
+        ):
+            keys |= {
+                key.value for key in node.value.keys if isinstance(key, ast.Constant)
+            }
+            continue
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
@@ -837,61 +860,6 @@ def test_rollout_checkpoint_mapping_matches_logged_keys():
         "rl.checkpoint.* mapping names keys the controller no longer logs: "
         f"{sorted(stale)}"
     )
-
-
-def _literal_values(source: Path, name: str) -> tuple[str, ...]:
-    """The string values of ``name = Literal[...]`` at module level."""
-    for node in ast.parse(source.read_text()).body:
-        if (
-            isinstance(node, ast.Assign)
-            and any(_leaf_name(target) == name for target in node.targets)
-            and isinstance(node.value, ast.Subscript)
-        ):
-            values = node.value.slice
-            elements = values.elts if isinstance(values, ast.Tuple) else [values]
-            return tuple(
-                element.value
-                for element in elements
-                if isinstance(element, ast.Constant)
-            )
-    raise AssertionError(f"{name} = Literal[...] not found in {source}")
-
-
-def _module_tuple(source: Path, name: str) -> tuple[str, ...]:
-    """The string values of ``name = (...)`` at module level."""
-    for node in ast.parse(source.read_text()).body:
-        if (
-            isinstance(node, ast.Assign)
-            and any(_leaf_name(target) == name for target in node.targets)
-            and isinstance(node.value, ast.Tuple)
-        ):
-            return tuple(
-                element.value
-                for element in node.value.elts
-                if isinstance(element, ast.Constant)
-            )
-    raise AssertionError(f"{name} = (...) not found in {source}")
-
-
-def test_checkpoint_attempt_labels_match_the_controller_literals():
-    """An outcome or reason the tee does not know is never counted.
-
-    The tee decodes one-hot flags, so a new controller reason would make the
-    attempt look malformed and drop it from ``rl.checkpoint.attempts`` -- the
-    very series meant to show why snapshots are not completing.
-    """
-    controller = _ALGORITHMS / "single_controller_utils" / "rollout_checkpoint.py"
-    metrics = _REPO / "nemo_rl" / "telemetry" / "metrics.py"
-    for copied, literal in (
-        ("CHECKPOINT_ATTEMPT_OUTCOMES", "RolloutCheckpointAttemptOutcome"),
-        ("CHECKPOINT_ATTEMPT_REASONS", "RolloutCheckpointAttemptReason"),
-    ):
-        tee = _module_tuple(metrics, copied)
-        logged = _literal_values(controller, literal)
-        assert tee == logged, (
-            f"nemo_rl/telemetry/metrics.py _{copied} {tee} differs from "
-            f"{literal} {logged}; attempts with the missing values are dropped"
-        )
 
 
 def _span_names_in(markdown: str) -> set[str]:

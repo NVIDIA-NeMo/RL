@@ -2,52 +2,32 @@
 
 NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
 
-Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver for most series, and the Single-Controller actor for `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
+Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
-Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The declarations live in one table in `nemo_rl/telemetry/metrics.py`, so adding a series needs no lens release and no agreement on field names. `record_metrics` never raises into the caller and skips `None`.
+Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a consumer-driven metric registry: NeMo-RL calls `register_metric_group("rl", [...])` once per process with a `MetricSpec` per series, then records against it with `record_metrics(meter, "rl", ...)`. The series the tee derives itself are declared in `_metric_specs()` in `nemo_rl/telemetry/metrics.py`; the teed training and vLLM rows are declared next to the code that logs their keys (see below). Either way, adding a series needs no lens release and no agreement on field names. This page names where each family is declared rather than copying the lists, so the code stays the one source of truth. `record_metrics` never raises into the caller and skips `None`.
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the driver's per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 
 ## Training scalars
 
-Mirrored from the keys the algorithms already log, one row per series in `_TRAIN_SCALARS`:
+Mirrored as gauges from the keys the algorithms already log. Each series is a `TeedMetric` row pairing a logger key with an `rl.*` name, declared in the module that logs the key:
 
-| Metric | Type | Logger key |
-|---|---|---|
-| `rl.reward.mean` | Gauge | `reward` |
-| `rl.kl.divergence` | Gauge | `kl_penalty` |
-| `rl.policy.loss` | Gauge | `loss` |
-| `rl.value.loss` | Gauge | `critic/loss` (PPO) |
-| `rl.entropy` | Gauge | `approx_entropy` |
-| `rl.response.length.mean` | Gauge (`{token}`) | `mean_gen_tokens_per_sample` |
-| `rl.grad_norm` | Gauge | `grad_norm` |
-| `rl.learning_rate` | Gauge | `lr` |
-
-SFT v2 logs from its controller actor, which initializes telemetry before its
-first metric is logged. The controller's fixed step measurements are also teed:
-
-| Metric | Type | Logger key |
-|---|---|---|
-| `rl.sft_v2.loader.latency.max` | Gauge (`s`) | `loader_latency_max` |
-| `rl.sft_v2.policy.duration` | Gauge (`s`) | `policy_time` |
-| `rl.sft_v2.step.duration` | Gauge (`s`) | `total_step_time` |
-| `rl.sft_v2.valid_tokens_per_second` | Gauge (`{token}/s`) | `valid_tokens_per_second` |
+- `TRAINING_TEED_METRICS` in `nemo_rl/algorithms/metric_utils.py`: the scalars every training loop logs (reward, policy loss, gradient norm, learning rate, response length).
+- `LOSS_TEED_METRICS` in `nemo_rl/algorithms/loss/loss_functions.py`: KL divergence and entropy.
+- `CRITIC_TEED_METRICS` in `nemo_rl/algorithms/ppo.py`: the PPO value loss.
+- `SFT_V2_TEED_METRICS` in `nemo_rl/algorithms/sft_v2.py`: the SFT v2 controller's step timings and throughput. SFT v2 logs from its controller actor, which initializes telemetry before its first metric is logged.
 
 `kl_penalty` is named for the penalty but holds the divergence — the coefficient is divided back out in `loss_functions.py` — which is why the metric is named `rl.kl.divergence`.
 
-Each row is declared in the module that logs its key, using the same constant the logging site uses, so a rename cannot leave a gauge silently reporting nothing.
+Each row uses the same key constant as its logging site, so a rename cannot leave a gauge silently reporting nothing.
 
 ## Startup phases
 
-Every algorithm's `setup()` already timed its startup phases and logged them under the `timing/setup` prefix at step 0 (`SetupTimingMetrics` in `nemo_rl/algorithms/metric_utils.py`). Those are teed as one dimensioned gauge:
-
-| Metric | Type | Attributes | Description |
-|---|---|---|---|
-| `rl.setup.duration` | Gauge (`s`) | `rl.setup.phase` | Wall clock spent in one startup phase |
+Every algorithm's `setup()` already timed its startup phases and logged them under the `timing/setup` prefix at step 0 (`SetupTimingMetrics` in `nemo_rl/algorithms/metric_utils.py`). Those are teed as one dimensioned gauge, `rl.setup.duration` (`RL_SETUP_DURATION_METRIC` in `nemo_rl/telemetry/metrics.py`), with the phase in `rl.setup.phase`.
 
 Dimensioned rather than one series per phase because the phase set is not knowable at declaration time: alongside its declared fields `SetupTimingMetrics` carries a free-form `extras` dict, and the sparse-refit transports add `vllm_<transport>_sparse_init_time_s` to it at runtime. A row per phase would silently drop whatever it had not been taught about.
 
@@ -101,15 +81,12 @@ The rollout checkpoint benchmark focuses on the following questions:
 4. Did scheduled checkpoint attempts succeed at the intended cadence?
 5. How much completed rollout work was reused after restart?
 
-| Prefix | Important fields | Meaning |
-|---|---|---|
-| `rollout/throughput` | `generation_output_tokens_per_second`, `committed_output_tokens_per_second`, `committed_groups_per_second` | Raw backend decoding throughput compared with output committed for training. The raw metric is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without token capture, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs. |
-| `rollout/throughput` | `checkpoint_blocked_mutations`, `checkpoint_mutation_wait_seconds_p95`, `checkpoint_mutation_wait_seconds_max` | Number and latency of live data-plane mutations delayed by an exclusive checkpoint. |
-| `timing/rollout_checkpoint` | `total_save_seconds`, `tq_save_seconds`, `barrier_wait_seconds`, `exclusive_hold_seconds`, `sidecar_save_seconds`, `snapshot_commit_seconds` | End-to-end save latency and its storage, fencing, controller-sidecar, and atomic-publication components. |
-| `timing/rollout_checkpoint` | `snapshot_rows`, `replay_rows`, `staging_rows`, `replay_groups`, `ledger_groups`, `controller_sidecar_bytes` | Logical volume captured by the snapshot. `controller_sidecar_bytes` excludes the native TQ payload because the current TQ checkpoint API does not report bytes written. NeMo-RL deliberately does not recursively scan the shared checkpoint directory because that scan would perturb the benchmark. |
-| `rollout/checkpoint_outcome` | `completed`, `skipped`, `failed`, `reason_*`, `seconds_since_previous_success`, `seconds_since_last_success` | Result, actionable reason, and effective cadence of every scheduled checkpoint attempt. |
-| `timing/rollout_recovery` | `snapshot_resolution_seconds`, `dataloader_load_seconds`, `tq_load_seconds`, `replay_metadata_load_seconds`, `recovery_prepare_seconds`, `total_load_seconds` | Rollout-state restore latency. `total_load_seconds` is the sum of these non-overlapping restore phases. |
-| `timing/rollout_recovery` | `groups_complete_restored`, `groups_unfinished_found`, `siblings_reused`, `siblings_rerun`, `redispatch_schedule_seconds` | Training-ready groups restored without generation, unfinished groups found for redispatch, and sibling work preserved or rerun after restart. |
+Each prefix is one dictionary built in `nemo_rl/algorithms/single_controller.py`; the fields are the keys of that dictionary:
+
+- `rollout/throughput`, from `_collect_and_log_rollout_throughput_metrics`: raw backend decoding throughput compared with output committed for training, plus how many live data-plane mutations an exclusive checkpoint delayed and for how long. The raw throughput is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without it, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs.
+- `timing/rollout_checkpoint`, from `_save_rollout_checkpoint`: end-to-end save latency and its storage, fencing, controller-sidecar and atomic-publication components, and the logical volume the snapshot captured. `controller_sidecar_bytes` excludes the native TQ payload, because the current TQ checkpoint API does not report bytes written; NeMo-RL deliberately does not scan the shared checkpoint directory, because that scan would perturb the benchmark.
+- `rollout/checkpoint_outcome`, from `_log_rollout_checkpoint_outcome`: the result, reason and effective cadence of every scheduled snapshot attempt.
+- `timing/rollout_recovery`, from `_log_rollout_restore_metrics` and `_redispatch_restored_rollouts` (the load timings start in `single_controller_utils/setup.py`): restore latency, where `total_load_seconds` is the sum of the disjoint restore phases, then the training-ready groups restored without generation, the unfinished groups found for redispatch, and the sibling work preserved or rerun.
 
 Recovery counters describe work reconstructed at restore time, not a promise
 that every restored group will eventually train. After recovery, the configured
@@ -133,42 +110,12 @@ The `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries
 described above also reach Lens. They reuse the controller's existing
 measurements; telemetry does not retime the save or restore.
 
-| Metric | Kind / unit | Dimensions and meaning |
-|---|---|---|
-| `rl.checkpoint.duration` | Histogram / seconds | `rl.checkpoint.operation` (`save`, `restore`) and `rl.checkpoint.phase` |
-| `rl.checkpoint.rows` | Gauge / rows | Latest replay, staging, or total snapshot rows |
-| `rl.checkpoint.groups` | Gauge / groups | Saved replay/ledger groups or restored complete/unfinished groups |
-| `rl.checkpoint.siblings` | Gauge / rollouts | Sealed siblings reused or unfinished siblings redispatched |
-| `rl.checkpoint.sidecar_bytes` | Gauge / bytes | Controller sidecar size |
-
-Every point carries `rl.checkpoint.operation`. Durations add
-`rl.checkpoint.phase`; the other series add `rl.checkpoint.category`:
-
-| Logger key | Metric | `operation` | `phase` / `category` |
-|---|---|---|---|
-| `total_save_seconds` | `rl.checkpoint.duration` | `save` | `total` |
-| `tq_save_seconds` | `rl.checkpoint.duration` | `save` | `tq` |
-| `barrier_wait_seconds` | `rl.checkpoint.duration` | `save` | `barrier_wait` |
-| `exclusive_hold_seconds` | `rl.checkpoint.duration` | `save` | `exclusive_hold` |
-| `sidecar_save_seconds` | `rl.checkpoint.duration` | `save` | `sidecar_save` |
-| `snapshot_commit_seconds` | `rl.checkpoint.duration` | `save` | `publication` |
-| `total_load_seconds` | `rl.checkpoint.duration` | `restore` | `total` |
-| `snapshot_resolution_seconds` | `rl.checkpoint.duration` | `restore` | `snapshot_resolution` |
-| `dataloader_load_seconds` | `rl.checkpoint.duration` | `restore` | `dataloader_load` |
-| `tq_load_seconds` | `rl.checkpoint.duration` | `restore` | `tq` |
-| `replay_metadata_load_seconds` | `rl.checkpoint.duration` | `restore` | `replay_metadata_load` |
-| `recovery_prepare_seconds` | `rl.checkpoint.duration` | `restore` | `recovery_prepare` |
-| `redispatch_schedule_seconds` | `rl.checkpoint.duration` | `restore` | `redispatch_schedule` |
-| `replay_rows` | `rl.checkpoint.rows` | `save` | `replay` |
-| `staging_rows` | `rl.checkpoint.rows` | `save` | `staging` |
-| `snapshot_rows` | `rl.checkpoint.rows` | `save` | `snapshot` |
-| `replay_groups` | `rl.checkpoint.groups` | `save` | `replay` |
-| `ledger_groups` | `rl.checkpoint.groups` | `save` | `ledger` |
-| `groups_complete_restored` | `rl.checkpoint.groups` | `restore` | `complete_restored` |
-| `groups_unfinished_found` | `rl.checkpoint.groups` | `restore` | `unfinished` |
-| `siblings_reused` | `rl.checkpoint.siblings` | `restore` | `reused` |
-| `siblings_rerun` | `rl.checkpoint.siblings` | `restore` | `rerun` |
-| `controller_sidecar_bytes` | `rl.checkpoint.sidecar_bytes` | `save` | `controller` |
+Each series, with its kind and unit, is declared in `_metric_specs()` in
+`nemo_rl/telemetry/metrics.py`. The mapping from logger key to
+`rl.checkpoint.phase` / `rl.checkpoint.category` is `_CHECKPOINT_DURATION_PHASES`
+and `_CHECKPOINT_LEVELS` in the same file. Every point carries
+`rl.checkpoint.operation` (`save` or `restore`); durations add
+`rl.checkpoint.phase`, and the other series add `rl.checkpoint.category`.
 
 Missing phases are absent, not zero. Save phases nest inside `total` (barrier
 wait, exclusive hold, sidecar save and publication all overlap it, and `tq` sits
@@ -178,8 +125,13 @@ goodput**. Restore phases are disjoint and `total` is their sum, excluding
 The restore total is not allocation-to-ready wall time. These metrics describe
 completed operations, not a pending checkpoint's current phase.
 
-All points come from the Single-Controller actor process. Percentile resolution
-depends on the SDK/exporter's aggregation and bucket boundaries. No step,
+All points come from the Single-Controller actor process. The two duration
+histograms use the SDK's default bucket bounds (0, 5, 10, 25, ... seconds), so
+every phase under 5 s and every skipped attempt land in one bucket. For useful
+percentiles, set
+`OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION=base2_exponential_bucket_histogram`
+in the launch environment (Ray passes it to every actor); the backend must accept
+exponential histograms (Prometheus only with native histograms on). No step,
 checkpoint, rollout, or model-call IDs are metric labels.
 
 To find *which* save was slow, each completed save also emits one trace-only
@@ -191,29 +143,33 @@ sequence and trainer step. See
 
 The series above report completed operations only. Every periodic snapshot
 attempt, including skipped and failed ones, is also exported from the
-`rollout/checkpoint_outcome` dictionary:
-
-| Metric | Kind / unit | Dimensions and meaning |
-|---|---|---|
-| `rl.checkpoint.attempts` | Counter / attempts | `rl.checkpoint.outcome` (`completed`, `skipped`, `failed`) and `rl.checkpoint.reason` (`completed`, `missing_trainer_anchor`, `no_data_plane_mutations`, `optimizer_commit_in_progress`, `trainer_state_changed`, `timeout`, `io_error`, `invariant_error`) |
-| `rl.checkpoint.attempt_duration` | Histogram / seconds | `rl.checkpoint.outcome`; skips return quickly, so read completed attempts separately |
-| `rl.checkpoint.seconds_since_last_success` | Gauge / seconds | Age of the newest completed snapshot at each attempt; `0` on success, absent until the first success |
+`rollout/checkpoint_outcome` dictionary. `_metric_specs()` in
+`nemo_rl/telemetry/metrics.py` declares the three series:
+`rl.checkpoint.attempts`, counted by `rl.checkpoint.outcome` and
+`rl.checkpoint.reason` (their values are `RolloutCheckpointAttemptOutcome` and
+`RolloutCheckpointAttemptReason` in `nemo_rl/algorithms/metric_utils.py`);
+`rl.checkpoint.attempt_duration`, by outcome (skips return quickly, so read
+completed attempts separately); and `rl.checkpoint.seconds_since_last_success`.
+That gauge is this controller's time since its last completed snapshot, recorded
+only when an attempt finishes: `0` on success, and absent until the first
+success after a (re)start. It gets no new point while an attempt is stuck, so do
+not alert on it.
 
 Skipping is expected: a snapshot is only valid while the trainer is at a durable
 checkpoint step, so attempts after the next optimizer commit skip with
 `missing_trainer_anchor` until the following trainer checkpoint. If
 `outcome=skipped` climbs while `outcome=completed` stays at zero, snapshots are
 not completing; compare the snapshot interval with the trainer checkpoint
-cadence and step time. No attempts at all means the pump or telemetry is off.
+cadence and step time. No attempts for several intervals means the pump is off,
+telemetry is off, or an attempt is stuck (the save has no timeout). To alert on
+stale snapshots, count completed attempts over a window of several snapshot
+intervals, e.g. in Prometheus, where the attribute becomes the
+`rl_checkpoint_outcome` label:
+`increase(rl_checkpoint_attempts_total{rl_checkpoint_outcome="completed"}[30m]) == 0`.
 
 ## Async efficiency metrics (`rl.efficiency.*`)
 
-Async GRPO measures where wall time goes with a `Timer` and logs the result as `efficiency/*` scalars (`print_efficiency_summary` in `nemo_rl/algorithms/utils.py`). Those same values are teed to OTel as one **dimensioned** gauge rather than one instrument per category, so adding a category needs no instrument change.
-
-| Metric | Type | Attributes | Description |
-|---|---|---|---|
-| `rl.efficiency.seconds` | Gauge (`s`) | `rl.efficiency.category`, `rl.efficiency.measurement`, `rl.efficiency.window`, `rl.bucket` | Time attributed to one efficiency category |
-| `rl.efficiency.pct` | Gauge (`%`) | `rl.efficiency.measurement`, `rl.efficiency.window` | Productive share of driver-side wall clock over the window named by `rl.efficiency.window` |
+Async GRPO measures where wall time goes with a `Timer` and logs the result as `efficiency/*` scalars (`print_efficiency_summary` in `nemo_rl/algorithms/utils.py`). Those same values are teed to OTel as one **dimensioned** gauge rather than one instrument per category, so adding a category needs no instrument change: `rl.efficiency.seconds`, one point per category in `rl.efficiency.category`, and `rl.efficiency.pct`, the productive share of driver-side wall clock. Both are declared in `_metric_specs()` in `nemo_rl/telemetry/metrics.py` (`RL_EFFICIENCY_SECONDS_METRIC`, `RL_EFFICIENCY_PCT_METRIC`); the attributes they carry are explained below.
 
 The single-controller path reuses two of these category names — `idle/buffer_starvation` for the wait when the training fleet is stalled on the buffer, and `idle/refit_bubble` for `weight_sync` — so a goodput rollup reads the same vocabulary on both paths. Both are spans only there; the single controller logs no `efficiency/*` scalars of its own.
 
@@ -253,14 +209,7 @@ Two deliberate metric/span disagreements to know about before comparing a metric
 
 Read from the vLLM engine's own Prometheus registry, delta'd per step. `snapshot_step_metrics()` takes a baseline before generation and `get_step_metrics()` a second reading after, both fanned out to the DP-leader workers; the same snapshot pair also feeds the spec-decode metrics, so the wider coverage costs no extra RPC.
 
-| Metric | Type | Source series |
-|---|---|---|
-| `rl.vllm.prompt_tokens` | Counter (`{token}`) | `vllm:prompt_tokens` |
-| `rl.vllm.generation_tokens` | Counter (`{token}`) | `vllm:generation_tokens` |
-| `rl.vllm.prompt_length.mean` | Gauge (`{token}`) | `vllm:request_prompt_tokens` histogram |
-| `rl.vllm.generation_length.mean` | Gauge (`{token}`) | `vllm:request_generation_tokens` histogram |
-| `rl.vllm.generations.ok` | Counter (`{generation}`) | `vllm:request_success{finished_reason}` |
-| `rl.vllm.generations.failed` | Counter (`{generation}`) | `vllm:request_success{finished_reason}` |
+Each series, its kind and the vLLM family it is derived from are declared in `VLLM_TEED_METRICS` in `nemo_rl/models/generation/vllm/metric_names.py`: prompt and generation token counters, mean prompt and generation lengths, and counters of `ok` and `failed` generations.
 
 The counters carry the step's delta, so summing them across steps reconstructs the run total. The means come from each histogram's `sum`/`count` delta, so they are exact rather than bucket-interpolated; a step in which the engine served no request omits them rather than reporting a zero-length sequence.
 
@@ -286,10 +235,7 @@ These ride the normal `http/protobuf` OTLP path and reach the same backend as ev
 
 Every raylet publishes its node's memory on its own Prometheus endpoint. `HostMemoryMonitor` in `nemo_rl/telemetry/host_memory.py` scrapes all of them from the driver on a timer and records one point per node — the same source `RayGpuMonitorLogger` already reads for the W&B `ray/node.*.mem_gb` rows, but keeping the node's identity instead of flattening it into the metric name.
 
-| Metric | Type | Attributes | Source series |
-|---|---|---|---|
-| `rl.host.memory.used` | Observable gauge (`By`) | `host.name`, `rl.worker_groups` | `ray_node_mem_used` |
-| `rl.host.memory.total` | Observable gauge (`By`) | `host.name`, `rl.worker_groups` | `ray_node_mem_total` |
+The two series, `rl.host.memory.used` and `rl.host.memory.total`, are observable gauges declared in `HOST_MEMORY_RECORDED_METRICS` in the same module, read from the raylet's `RAY_NODE_MEM_USED` / `RAY_NODE_MEM_TOTAL` series and labelled with `host.name` and `rl.worker_groups`.
 
 Bytes, not the gigabytes the W&B path reports. The interval follows `logger.gpu_monitoring.collection_interval` so the host-memory and GPU series line up, but collection is **not** gated on `logger.monitor_gpus`: that flag governs what reaches W&B, and an OTel series should not vanish when someone turns off an unrelated W&B feature. It is gated on telemetry exporting, and on nothing else.
 

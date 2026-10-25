@@ -8,6 +8,10 @@ import logging
 import pytest
 
 from nemo_rl.telemetry.metrics import map_efficiency_seconds
+from nemo_rl.telemetry.vocabulary import (
+    TELEMETRY_TRAIN_STEP_KEY,
+    TELEMETRY_WALL_TIME_METRIC,
+)
 
 
 def _import_teed_metric_owners() -> None:
@@ -200,8 +204,8 @@ def test_checkpoint_save_and_restore_emit_separate_phase_histograms():
             "controller_sidecar_bytes": 4096,
             # Added to every checkpoint dict by _log_telemetry_metrics; neither
             # is a phase, and neither may become a label.
-            "train_step": 7,
-            "telemetry/wall_time_seconds": 1.7e9,
+            TELEMETRY_TRAIN_STEP_KEY: 7,
+            TELEMETRY_WALL_TIME_METRIC: 1.7e9,
         },
         "timing/rollout_checkpoint",
     )
@@ -242,8 +246,8 @@ def _tee_completed_save(**overrides):
         "snapshot_commit_seconds": 0.25,
         "snapshot_sequence": 99.0,
         "replay_rows": 256.0,
-        "train_step": 7.0,
-        "telemetry/wall_time_seconds": _SAVE_END_SECONDS,
+        TELEMETRY_TRAIN_STEP_KEY: 7.0,
+        TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
     }
     metrics.update(overrides)
     tee_rl_metrics_to_otel(
@@ -288,7 +292,7 @@ def test_checkpoint_save_emits_one_unbucketed_span_from_logged_timings():
     "overrides",
     [
         pytest.param({"total_save_seconds": None}, id="no-total"),
-        pytest.param({"telemetry/wall_time_seconds": None}, id="no-wall-time"),
+        pytest.param({TELEMETRY_WALL_TIME_METRIC: None}, id="no-wall-time"),
         pytest.param({"total_save_seconds": float("nan")}, id="nan-total"),
     ],
 )
@@ -337,7 +341,7 @@ def test_checkpoint_restore_emits_no_span():
     tee_rl_metrics_to_otel(
         {
             "total_load_seconds": 8.0,
-            "telemetry/wall_time_seconds": _SAVE_END_SECONDS,
+            TELEMETRY_WALL_TIME_METRIC: _SAVE_END_SECONDS,
         },
         "timing/rollout_recovery",
     )
@@ -346,16 +350,20 @@ def test_checkpoint_restore_emits_no_span():
 
 def _attempt_outcome(outcome, reason, **extra):
     """An attempt dict shaped like ``_log_rollout_checkpoint_outcome``'s."""
-    from nemo_rl.telemetry.metrics import (
-        _CHECKPOINT_ATTEMPT_OUTCOMES,
-        _CHECKPOINT_ATTEMPT_REASONS,
+    from nemo_rl.algorithms.metric_utils import (
+        ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES,
+        ROLLOUT_CHECKPOINT_ATTEMPT_REASONS,
+        rollout_checkpoint_reason_key,
     )
 
     return {
         "attempt": 1.0,
         "configured_interval_seconds": 60.0,
-        **{f"reason_{r}": float(r == reason) for r in _CHECKPOINT_ATTEMPT_REASONS},
-        **{o: float(o == outcome) for o in _CHECKPOINT_ATTEMPT_OUTCOMES},
+        **{
+            rollout_checkpoint_reason_key(r): float(r == reason)
+            for r in ROLLOUT_CHECKPOINT_ATTEMPT_REASONS
+        },
+        **{o: float(o == outcome) for o in ROLLOUT_CHECKPOINT_ATTEMPT_OUTCOMES},
         **extra,
     }
 
