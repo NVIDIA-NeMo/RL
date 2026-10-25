@@ -46,6 +46,7 @@ from nemo_rl.models.generation.openai_server_utils import (  # noqa: E402
     derive_prefix_eos_count,
     splice_prefix_tokens,
 )
+from nemo_rl.models.generation.vllm.utils import chat_routed_experts  # noqa: E402
 from nemo_rl.models.generation.vllm.request_pipeline import (  # noqa: E402
     rollout_output,
     rollout_result,
@@ -229,7 +230,7 @@ def test_rollouts_are_served_like_generate_async() -> None:
     }
 
 
-def test_router_replay_routes_reach_the_driver_as_generate_async_returns_them() -> None:
+def test_router_replay_routes_reach_rollouts_and_gym_calls_as_natively() -> None:
     routes = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
     final = _output(
         [1, 2, 3],
@@ -264,6 +265,29 @@ def test_router_replay_routes_reach_the_driver_as_generate_async_returns_them() 
     assert "routed_experts" in shipped
     for key in native:
         assert torch.equal(shipped[key], native[key]), key
+
+    # A Gym call without capture carries the routes in engine_data, as the
+    # native chat endpoint attaches them to the response.
+    gym_final = _output(
+        [1, 3, 4],
+        _completion([10, 11], "stop", routed_experts=routes[3:]),
+        prompt_routed_experts=routes[:3],
+    )
+    gym_host = _host(
+        _FakeLLM([gym_final]), vllm_kwargs={"enable_return_routed_experts": True}
+    )
+    gym_engine = native_engine.NativeVllmEngine(gym_host, leader_worker_idx=0)
+
+    (gym_chunk,) = _collect(gym_engine, _gym_request())
+
+    assert gym_chunk["engine_data"]["routed_experts"] == chat_routed_experts(
+        gym_final,
+        gym_final.outputs[0],
+        prompt_token_count=3,
+        device=torch.device("cpu"),
+        logger=native_engine.LOGGER,
+        routed_experts_dtype=torch.int16,
+    )
 
 
 def test_a_rollout_with_no_room_returns_the_prompt_untruncated() -> None:
@@ -300,7 +324,13 @@ def test_openai_requests_map_onto_sampling_params_as_vllms_server_does() -> None
     )
 
     assert (params.temperature, params.top_k, params.seed, params.n) == (0.6, 5, 7, 2)
-    assert params.max_tokens == 9
+    # The request's max_tokens, capped by the context; the generation config's
+    # max_tokens applies only when the request leaves it unset.
+    assert params.max_tokens == MAX_MODEL_LEN - 4
+    unset = native_engine.build_sampling_params(
+        _openai_request(), {"max_tokens": 9}, output_room=MAX_MODEL_LEN - 4
+    )
+    assert unset.max_tokens == 9
     assert sorted(params.stop_token_ids) == [2, 9]
     assert params.logprobs == 2
     assert params.allowed_token_ids == [5, 6]
@@ -502,6 +532,33 @@ def test_an_endpoint_that_stops_serving_reports_why() -> None:
     ]
 
 
+def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
+    llm = _FakeLLM()
+    llm.vllm_config.cache_config = SimpleNamespace(block_size=16, num_gpu_blocks=64)
+    llm.vllm_config.scheduler_config = SimpleNamespace(
+        max_num_seqs=8, max_num_batched_tokens=256
+    )
+
+    async def call_utility_async(method):
+        assert method == "get_kv_cache_group_metadata"
+        # A hybrid model: the Mamba group's block size is not the attention one.
+        return [
+            {"kind": "mamba", "block_size": 1056},
+            {"kind": "full_attention", "block_size": 528},
+        ]
+
+    llm.engine_core = SimpleNamespace(call_utility_async=call_utility_async)
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    registration = asyncio.run(engine.start(worker_id=0)).llm
+
+    # The KV router hashes events in blocks of the main-attention group; a
+    # wrong size would quietly turn KV routing into load-only routing.
+    assert registration.kv_cache_block_size == 528
+    assert registration.total_kv_blocks == 64
+    assert registration.context_length == MAX_MODEL_LEN
+
+
 def test_a_prompt_that_fills_the_context_is_refused_as_natively() -> None:
     llm = _FakeLLM()
     engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
@@ -559,6 +616,9 @@ def test_media_is_loaded_and_processed_as_vllms_chat_parser_does() -> None:
             },
             "Cannot load image_url",
         ),
+        # vLLM's own request errors (not ValueErrors) keep their message, as the
+        # native server's 4xx does, instead of becoming a bare 500.
+        ({"stop_conditions": {"min_tokens": 10, "max_tokens": 5}}, "min_tokens"),
     ],
 )
 def test_prompts_the_engine_cannot_serve_are_refused(fields, error) -> None:
@@ -742,5 +802,6 @@ def test_engines_publish_kv_events_only_where_the_kv_router_can_use_them(
     assert (config is not None) is publishes
     if publishes:
         assert config["enable_kv_cache_events"] and config["publisher"] == "zmq"
-        # vLLM's publisher binds only a wildcard endpoint; Dynamo's source connects.
-        assert config["endpoint"].startswith("tcp://*:")
+        # A per-engine abstract socket, which vLLM's publisher binds and Dynamo's
+        # source connects to: no port for two engines on a node to collide on.
+        assert config["endpoint"].startswith("ipc://@")

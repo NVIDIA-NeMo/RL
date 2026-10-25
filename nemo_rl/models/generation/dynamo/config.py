@@ -82,7 +82,9 @@ class DynamoCfg(BaseModel, extra="forbid"):
     # Bounds etcd/NATS/frontend start-up and every engine's registration.
     startup_timeout_s: PositiveFloat = 600.0
     # Timeout for one NeMo RL rollout routed through the frontend, in place of
-    # NRL_VLLM_ASYNC_TIMEOUT_SECONDS; a timed-out rollout is not retried.
+    # NRL_VLLM_ASYNC_TIMEOUT_SECONDS. A timeout fails the attempt as a native one
+    # does (GenerationUnavailable), and the rollout retry policy re-dispatches it
+    # (SingleController: async_rl.rollout_failure.max_infra_attempts_per_prompt).
     # NeMo-Gym's own calls keep Gym's timeouts.
     request_timeout_s: PositiveFloat = 900.0
     worker_args: DynamoWorkerArgs = Field(default_factory=DynamoWorkerArgs)

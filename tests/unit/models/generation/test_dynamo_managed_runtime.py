@@ -132,7 +132,15 @@ def test_managed_service_and_frontend_environments_are_runtime_owned(
     assert "NATS_STALE_SETTING" not in service_env
     assert service_env["NCCL_DEBUG"] == "INFO"
 
+    runtime._started = True
+    engine_env = runtime.engine_env
+    assert engine_env["DYN_NAMESPACE"] == "managed"
+    # Each engine serves its own model card, so a frontend on another node can
+    # read a chat template that exists only on the engine's node.
+    assert engine_env["DYN_SYSTEM_PORT"] == "0"
+
     frontend_env = runtime._frontend_env()
+    assert "DYN_SYSTEM_PORT" not in frontend_env
     assert frontend_env["DYN_TOKENIZER"] == "fastokens"
     assert frontend_env["DYN_TOKENIZER_CACHE"] == "1"
     assert frontend_env["DYN_TOKENIZER_CACHE_BYTES"] == "4096"

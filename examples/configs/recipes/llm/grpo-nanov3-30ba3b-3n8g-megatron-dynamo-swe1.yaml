@@ -82,7 +82,6 @@ policy:
   sequence_packing:
     fuse_loss: true
   generation:
-    backend: vllm
     dynamo: true
     dynamo_cfg:
       startup_timeout_s: 1800

@@ -27,8 +27,9 @@ independent.
 With `dynamo: true`:
 
 - `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's
-  `AsyncLLM`. Every rollout path the sync engine supports also runs on the async
-  one.
+  `AsyncLLM`. Settings the async engine does not run, such as data parallelism
+  inside vLLM (`expert_parallel_size > tensor_parallel_size`), are rejected at
+  startup.
 - The driver starts etcd, NATS and `dynamo.frontend`. The frontend runs from the
   vLLM workers' own venv, so it is the same ai-dynamo release.
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
@@ -50,7 +51,7 @@ shows them all:
 | Key | Default | Meaning |
 |---|---|---|
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
-| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timed-out rollout is not retried; NeMo-Gym's calls keep Gym's timeouts |
+| `request_timeout_s` | 900 | Timeout for one NeMo RL rollout through the frontend, in place of `NRL_VLLM_ASYNC_TIMEOUT_SECONDS`. A timeout fails the attempt as a native timeout does, and the rollout retry policy applies; NeMo-Gym's calls keep Gym's timeouts |
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
@@ -102,6 +103,8 @@ chat endpoint does:
 - Stop strings stop vLLM itself, so the token IDs match the native endpoint's.
 - The response carries `prompt_token_ids`, `completion_token_ids` and
   `completion_logprobs` in `nvext.engine_data`, which Gym lifts onto the message.
+  With router replay on, it also carries the call's `routed_experts`, as the
+  native endpoint attaches them.
 - Images, video and audio in the messages are processed as on the native
   endpoint. The frontend passes each media URL through with one unexpanded
   placeholder per item. The engine loads the media with vLLM's media connector
@@ -145,9 +148,8 @@ Startup rejects these with `dynamo: true`:
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
   URL.
 - `vllm_cfg.http_server_api_key_required`: the frontend checks no bearer token.
-- On the SingleController, router replay with Gym but without token capture:
-  Gym's dialect does not return routed experts in responses. Other entrypoints
-  do not check this, and such rollouts replay no routes.
+- `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
+  parallelism inside vLLM, which the async engine Dynamo serves does not.
 - Parser plugins with no Dynamo parser, and the chat settings above that the
   frontend has no counterpart for.
 - `dynamo: true` on a backend other than vLLM, and a `dynamo_cfg` block without

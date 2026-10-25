@@ -53,12 +53,15 @@ def get_dynamo_service_executable(name: str) -> str:
         if executable.is_file() and os.access(executable, os.X_OK):
             return str(executable)
         raise FileNotFoundError(
-            f"{name} is not an executable file in NEMO_RL_DYNAMO_BIN_DIR={bin_dir}."
+            f"{name} is not an executable file in NEMO_RL_DYNAMO_BIN_DIR={bin_dir}. "
+            "Build the image with --build-arg BUILD_DYNAMO=1, or install etcd and "
+            "nats-server there with docker/dynamo/install.sh."
         )
     found = shutil.which(name)
     if found is None:
         raise FileNotFoundError(
-            f"{name} is not on PATH. Install it, or set NEMO_RL_DYNAMO_BIN_DIR to "
-            "the directory that holds etcd and nats-server."
+            f"{name} is not on PATH. Install etcd and nats-server with "
+            "docker/dynamo/install.sh and set NEMO_RL_DYNAMO_BIN_DIR to their "
+            "directory, or build the image with --build-arg BUILD_DYNAMO=1."
         )
     return found

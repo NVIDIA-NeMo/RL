@@ -206,9 +206,20 @@ def configure_generation_config(
                     "sleeps while the policy trains, and the Dynamo frontend would "
                     "keep routing requests to it."
                 )
+            vllm_cfg = config["vllm_cfg"]
+            if vllm_cfg["expert_parallel_size"] > vllm_cfg["tensor_parallel_size"]:
+                # VllmGeneration refuses the async engine with DP inside vLLM.
+                raise ValueError(
+                    "policy.generation.dynamo=true serves the async vLLM engine, "
+                    "which does not run data parallelism inside vLLM "
+                    "(vllm_cfg.expert_parallel_size > tensor_parallel_size, see "
+                    "https://github.com/NVIDIA-NeMo/RL/issues/1101). Set "
+                    "expert_parallel_size <= tensor_parallel_size, or remove "
+                    "policy.generation.dynamo."
+                )
             if not config["vllm_cfg"]["async_engine"]:
-                # Dynamo serves the engine's AsyncLLM. The async engine runs every
-                # rollout path the sync one does, so turning it on is the switch.
+                # Dynamo serves the engine's AsyncLLM, so turning the async engine
+                # on is the switch; settings it cannot run are rejected above.
                 print(
                     "  [Dynamo] policy.generation.dynamo=true: using the async "
                     "vLLM engine (vllm_cfg.async_engine=true)",

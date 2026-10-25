@@ -119,7 +119,9 @@ class ManagedDynamoRuntime:
         """The environment each engine's Dynamo worker needs to register."""
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
-        return dict(self._manager_env)
+        # An OS-assigned system port makes each engine serve its own model-card
+        # files (a custom chat template included) to a frontend on another node.
+        return {**self._manager_env, "DYN_SYSTEM_PORT": "0"}
 
     def start(self) -> None:
         """Start etcd, NATS and the frontend."""

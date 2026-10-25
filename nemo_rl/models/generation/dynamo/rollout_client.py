@@ -111,4 +111,12 @@ async def post_rollout(
             format_dynamo_error(response),
         )
         await asyncio.sleep(_HTTP_RETRY_DELAY_S)
+    if "timeout_error" in response:
+        # Name the setting, as the native path's timeout message names its own.
+        raise RuntimeError(
+            f"Dynamo rollout request to {url} failed: {response['timeout_error']}. "
+            "For longer sequences, increase "
+            "policy.generation.dynamo_cfg.request_timeout_s, e.g. to "
+            f"{int(timeout_s * 2)}."
+        )
     return parse_rollout_response(response, url=url)

@@ -15,7 +15,8 @@ policy:
       # Bounds etcd/NATS/frontend start-up and every engine's registration.
       startup_timeout_s: 600
       # Timeout for one rollout routed through the frontend (in place of
-      # NRL_VLLM_ASYNC_TIMEOUT_SECONDS); a timed-out rollout is not retried.
+      # NRL_VLLM_ASYNC_TIMEOUT_SECONDS). A timeout fails the attempt as a native
+      # timeout does, and the rollout retry policy applies.
       request_timeout_s: 900
       worker_args:
         # Dynamo's built-in parser names. null follows the native server's

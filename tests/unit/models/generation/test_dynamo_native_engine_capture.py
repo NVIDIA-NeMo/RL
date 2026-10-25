@@ -27,6 +27,8 @@ import torch
 pytestmark = [pytest.mark.nemo_gym, pytest.mark.vllm]
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
+# The vLLM lanes import this module without the nemo_gym extra.
+pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
 from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
@@ -35,6 +37,9 @@ from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
     DYNAMO_PREFIX_ANNOTATION_PREFIX,
 )
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission  # noqa: E402
+from responses_api_models.vllm_model.app import (  # noqa: E402
+    _DYNAMO_ENGINE_DATA_FIELDS,
+)
 
 from nemo_rl.data.captured_media import CapturedMedia  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
@@ -46,12 +51,12 @@ from tests.unit.models.generation.test_dynamo_native_engine import (  # noqa: E4
     IMAGE_PLACEHOLDER,
     IMAGE_TOKEN,
     IMAGE_TOKENS,
-    _image_url,
     _collect,
     _completion,
     _FakeLLM,
     _gym_request,
     _host,
+    _image_url,
     _output,
     _Tokenizer,
 )
@@ -100,7 +105,7 @@ def _captured_request(admission: CaptureAdmission, **fields) -> dict:
     return request
 
 
-def test_annotations_are_the_ones_gyms_dynamo_dialect_sends() -> None:
+def test_annotations_and_engine_data_are_the_ones_gyms_dynamo_dialect_uses() -> None:
     assert native_engine.GYM_ROLLOUT_ANNOTATION == DYNAMO_GYM_REQUEST_ANNOTATION
     assert native_engine.GYM_CAPTURE_ANNOTATION_PREFIX == (
         DYNAMO_CAPTURE_ANNOTATION_PREFIX
@@ -108,6 +113,10 @@ def test_annotations_are_the_ones_gyms_dynamo_dialect_sends() -> None:
     assert native_engine.GYM_PREFIX_ANNOTATION_PREFIX == (
         DYNAMO_PREFIX_ANNOTATION_PREFIX
     )
+    # The engine_data keys Gym requires on a call without capture.
+    engine = native_engine.NativeVllmEngine(_host(_FakeLLM()), leader_worker_idx=0)
+    final = _output([1, 3, 4], _completion([10], "stop"))
+    assert engine._gym_token_data(final).keys() == _DYNAMO_ENGINE_DATA_FIELDS.keys()
 
 
 def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:

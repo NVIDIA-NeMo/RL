@@ -40,7 +40,12 @@ def _vllm_config(**overrides) -> dict:
         "model_name": "Qwen/Qwen3-0.6B",
         "stop_token_ids": None,
         "stop_strings": None,
-        "vllm_cfg": {"async_engine": False, "max_model_len": 512},
+        "vllm_cfg": {
+            "async_engine": False,
+            "max_model_len": 512,
+            "tensor_parallel_size": 1,
+            "expert_parallel_size": 1,
+        },
     }
     config.update(overrides)
     return config
@@ -76,6 +81,19 @@ def test_without_dynamo_the_vllm_config_is_untouched() -> None:
         (_vllm_config(dynamo=True, backend="sglang"), "backend=vllm"),
         # dynamo_cfg alone would be ignored.
         (_vllm_config(dynamo_cfg={}), "dynamo is not true"),
+        # The async engine Dynamo serves runs no data parallelism inside vLLM.
+        (
+            _vllm_config(
+                dynamo=True,
+                vllm_cfg={
+                    "async_engine": False,
+                    "max_model_len": 512,
+                    "tensor_parallel_size": 1,
+                    "expert_parallel_size": 2,
+                },
+            ),
+            "expert_parallel_size <= tensor_parallel_size",
+        ),
     ],
 )
 def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
@@ -133,6 +151,8 @@ def _serving(**serving_chat_kwargs) -> dict:
         vllm_cfg={
             "async_engine": True,
             "max_model_len": 512,
+            "tensor_parallel_size": 1,
+            "expert_parallel_size": 1,
             "http_server_serving_chat_kwargs": serving_chat_kwargs,
         },
     )

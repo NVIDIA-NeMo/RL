@@ -54,7 +54,7 @@ from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, Zm
 from dynamo.llm.exceptions import HttpError, InvalidArgument
 from vllm import envs as vllm_envs
 from vllm.entrypoints.chat_utils import load_chat_template
-from vllm.exceptions import GracefulHTTPError
+from vllm.exceptions import GracefulHTTPError, VLLMClientError
 from vllm.inputs import TokensPrompt
 from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
 from vllm.sampling_params import (
@@ -63,14 +63,10 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.transformers_utils.processor import get_video_processor_cls_name
+from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
 
 from nemo_rl.data.captured_media import MediaCaptureRejected
-from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
-    DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
-    _get_free_port_local,
-)
 from nemo_rl.models.generation.dynamo.config import (
     DynamoCfg,
     dynamo_cfg,
@@ -150,16 +146,15 @@ def dynamo_kv_events_config(
     """
     if cfg.frontend_args.router_mode != "kv" or not prefix_caching:
         return None
-    port = _get_free_port_local(
-        DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW, DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH
-    )
     return {
         "enable_kv_cache_events": True,
         "publisher": "zmq",
-        # A wildcard host makes vLLM's publisher bind; any other TCP endpoint
-        # makes it connect, and Dynamo's ZMQ source connects too, so no event
-        # would flow. kv_event_sources subscribes on 127.0.0.1.
-        "endpoint": f"tcp://*:{port}",
+        # A Linux abstract-namespace socket (no port, no file): vLLM binds any
+        # ipc:// endpoint and this process's Dynamo worker connects to it, so
+        # engines on one node cannot collide. Random rather than the pid, since
+        # containers sharing the host network share these names. vLLM rejects
+        # ipc:// only at data_parallel_rank != 0, which Dynamo rejects at startup.
+        "endpoint": f"ipc://@nemo-rl-kv-events-{os.urandom(8).hex()}",
     }
 
 
@@ -243,13 +238,14 @@ def build_sampling_params(
         {key: sampling[key] for key in _SAMPLING_KEYS if sampling.get(key) is not None}
     )
     kwargs["n"] = n
+    # As vLLM's get_max_tokens: the generation config's max_tokens applies only
+    # when the request leaves max_tokens unset.
+    requested_max_tokens = stop.get("max_tokens")
+    if requested_max_tokens is None:
+        requested_max_tokens = defaults.get("max_tokens")
     kwargs["max_tokens"] = min(
         limit
-        for limit in (
-            max(1, output_room),
-            stop.get("max_tokens"),
-            defaults.get("max_tokens"),
-        )
+        for limit in (max(1, output_room), requested_max_tokens)
         if limit is not None
     )
     if stop.get("min_tokens") is not None:
@@ -354,7 +350,12 @@ class NativeVllmEngine(LLMEngine):
         for group in await self._llm.engine_core.call_utility_async(
             "get_kv_cache_group_metadata"
         ):
-            if group.get("kind") in ("full_attention", "mla_attention"):
+            # vLLM's main-attention kinds, as Dynamo's own vLLM backend counts them.
+            if group.get("kind") in (
+                KVCacheSpecKind.FULL_ATTENTION,
+                KVCacheSpecKind.MLA_ATTENTION,
+                KVCacheSpecKind.SINK_FULL_ATTENTION,
+            ):
                 block_size = group["block_size"]
                 break
         SnapshotStatLogger.num_gpu_blocks = cache.num_gpu_blocks or 0
@@ -377,6 +378,17 @@ class NativeVllmEngine(LLMEngine):
         )
 
     async def generate(
+        self, request: GenerateRequest, context: Context
+    ) -> AsyncGenerator[GenerateChunk, None]:
+        try:
+            async for chunk in self._generate(request, context):
+                yield chunk
+        except VLLMClientError as error:
+            # vLLM's request errors are not ValueErrors; the native server
+            # answers them with a 4xx that carries the message.
+            raise InvalidArgument(str(error)) from error
+
+    async def _generate(
         self, request: GenerateRequest, context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
         if request.get("prompt_embeds"):
@@ -655,6 +667,11 @@ class NativeVllmEngine(LLMEngine):
                 final_output = output
             if final_output is None:
                 raise RuntimeError(f"No output received for request {context.id()}")
+            if admission is not None and context.is_stopped():
+                # Dynamo aborts the vLLM request on a disconnect but never
+                # cancels this generator: fail the capture (below), as the
+                # native endpoint's cancellation does, instead of staging it.
+                return
             completion = final_output.outputs[0]
             chunk: GenerateChunk = {
                 "token_ids": list(completion.token_ids),
@@ -771,16 +788,24 @@ class NativeVllmEngine(LLMEngine):
                 "output tokens."
             )
 
-    @staticmethod
-    def _gym_token_data(final_output: Any) -> dict[str, Any]:
-        """The token arrays Gym's dialect lifts onto the message, as the native endpoint reports them."""
+    def _gym_token_data(self, final_output: Any) -> dict[str, Any]:
+        """The token fields Gym's dialect lifts onto the message, as the native endpoint reports them."""
+        completion = final_output.outputs[0]
         token_data: dict[str, Any] = {
             "prompt_token_ids": list(final_output.prompt_token_ids),
-            "completion_token_ids": list(final_output.outputs[0].token_ids),
+            "completion_token_ids": list(completion.token_ids),
         }
-        if final_output.outputs[0].logprobs is not None:
-            _, token_data["completion_logprobs"] = chat_generation_tokens(
-                final_output.outputs[0]
+        if completion.logprobs is not None:
+            _, token_data["completion_logprobs"] = chat_generation_tokens(completion)
+        if self._host._return_routed_experts_enabled():
+            # Full prompt + generation rows, as the native endpoint attaches them.
+            token_data["routed_experts"] = chat_routed_experts(
+                final_output,
+                completion,
+                prompt_token_count=len(final_output.prompt_token_ids),
+                device=torch.device("cpu"),
+                logger=LOGGER,
+                routed_experts_dtype=self._host.routed_experts_dtype,
             )
         return token_data
 
@@ -826,7 +851,7 @@ class NativeVllmEngine(LLMEngine):
         kv_events = self._llm.vllm_config.kv_events_config
         if kv_events is None or not kv_events.enable_kv_cache_events:
             return []
-        return [ZmqSource(endpoint=kv_events.endpoint.replace("*", "127.0.0.1"))]
+        return [ZmqSource(endpoint=kv_events.endpoint)]
 
     def component_metrics_dp_ranks(self) -> list[int]:
         return [0]

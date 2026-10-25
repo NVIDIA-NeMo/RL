@@ -56,15 +56,15 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     validate_vllm_quantization_config,
 )
-from nemo_rl.models.generation.vllm.request_pipeline import (
-    rollout_output,
-    rollout_result_from_wire,
-)
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
     draft_module_sharing_disable_required,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
+from nemo_rl.models.generation.vllm.request_pipeline import (
+    rollout_output,
+    rollout_result_from_wire,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_reload_refit_config_supported,
@@ -188,10 +188,6 @@ class VllmGeneration(GenerationInterface):
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
         if dynamo_enabled(generation_config):
-            # Deferred: the NeMo-Gym environment module is heavy and optional.
-            from nemo_rl.environments.nemo_gym import should_use_nemo_gym
-            from nemo_rl.models.megatron.router_replay import router_replay_enabled
-
             if master_config.async_rl.generation_router.enabled:
                 raise ValueError(
                     "async_rl.generation_router.enabled=true does not apply with "
@@ -205,17 +201,6 @@ class VllmGeneration(GenerationInterface):
                     "with policy.generation.dynamo=true yet: the Dynamo frontend "
                     "picks engines itself, and a restarted shard does not register "
                     "with it. Disable fleet health."
-                )
-            if (
-                should_use_nemo_gym(master_config)
-                and router_replay_enabled(master_config.policy)
-                and not master_config.token_capture.enabled
-            ):
-                raise ValueError(
-                    "Router replay with NeMo-Gym and policy.generation.dynamo=true "
-                    "requires token_capture.enabled=true: the engine stages routed "
-                    "experts with the captured call, and NeMo-Gym's Dynamo dialect "
-                    "does not return them in responses."
                 )
 
     @staticmethod

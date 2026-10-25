@@ -2427,61 +2427,78 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     VllmGeneration.validate_settings(master_config)
 
 
-def _dynamo_master_config(
-    *,
-    router=False,
-    fleet_health=False,
-    nemo_gym=True,
-    router_replay=False,
-    token_capture=False,
-):
+def _dynamo_master_config(*, router=False, fleet_health=False):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["dynamo"] = True
     vllm_config["vllm_cfg"]["async_engine"] = True
     vllm_config["vllm_cfg"]["expose_http_server"] = True
     return types.SimpleNamespace(
-        policy={"generation": vllm_config, "router_replay": {"enabled": router_replay}},
-        env={"should_use_nemo_gym": nemo_gym},
+        policy={"generation": vllm_config},
         async_rl=types.SimpleNamespace(
             generation_router=types.SimpleNamespace(enabled=router),
             generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
         ),
-        token_capture=types.SimpleNamespace(enabled=token_capture),
-    )
-
-
-def test_vllm_validate_settings_accepts_dynamo_with_nemo_gym():
-    VllmGeneration.validate_settings(_dynamo_master_config())
-    VllmGeneration.validate_settings(
-        _dynamo_master_config(router_replay=True, token_capture=True)
-    )
-    VllmGeneration.validate_settings(
-        _dynamo_master_config(router_replay=True, nemo_gym=False)
     )
 
 
 @pytest.mark.parametrize(
     ("settings", "error"),
     [
+        ({}, None),
         ({"router": True}, "routes the whole fleet behind one URL"),
         ({"fleet_health": True}, "Disable fleet health"),
-        ({"router_replay": True}, "requires token_capture.enabled=true"),
     ],
 )
 def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):
+    master_config = _dynamo_master_config(**settings)
+    if error is None:
+        VllmGeneration.validate_settings(master_config)
+        return
     with pytest.raises(ValueError, match=error):
-        VllmGeneration.validate_settings(_dynamo_master_config(**settings))
+        VllmGeneration.validate_settings(master_config)
 
 
 @pytest.mark.parametrize("dynamo", [False, True])
-def test_vllm_client_base_urls_name_the_dynamo_frontend_when_it_serves(dynamo):
+def test_vllm_token_rollouts_and_clients_use_the_dynamo_frontend_when_it_serves(
+    dynamo,
+):
     generation = object.__new__(VllmGeneration)
     generation.dp_openai_server_base_urls = ["http://a/v1", "http://b/v1"]
     generation.dynamo_frontend_url = "http://frontend/v1" if dynamo else None
+    tokens = BatchedDataDict({"input_ids": torch.tensor([[1]])})
+    # The frontend request carries token IDs only, so media prompts stay native.
+    media = BatchedDataDict({"input_ids": torch.tensor([[1]]), "vllm_content": [None]})
 
     assert generation.client_base_urls == (
         ["http://frontend/v1"] if dynamo else ["http://a/v1", "http://b/v1"]
     )
+    assert generation._dynamo_serves(tokens) is dynamo
+    assert not generation._dynamo_serves(media)
+
+
+def test_vllm_dynamo_frontend_failures_are_generation_unavailable(monkeypatch):
+    from nemo_rl.experience.failures import GenerationUnavailable
+    from nemo_rl.models.generation.dynamo import rollout_client
+
+    async def frontend_down(url, payload, timeout_s):
+        raise RuntimeError(f"Dynamo rollout request to {url} failed: HTTP 503")
+
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend_down)
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"max_model_len": 16},
+    }
+    generation.dynamo_frontend_url = "http://frontend/v1"
+    data = BatchedDataDict(
+        {"input_ids": torch.tensor([[5, 6, 0]]), "input_lengths": torch.tensor([2])}
+    )
+
+    # An infrastructure failure is re-dispatched; an unmapped RuntimeError would
+    # count as a DATA failure against the prompt.
+    with pytest.raises(GenerationUnavailable, match="HTTP 503"):
+        asyncio.run(anext(generation.generate_async(data)))
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

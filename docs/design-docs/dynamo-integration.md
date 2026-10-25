@@ -54,9 +54,10 @@ implements its `LLMEngine` over the worker's `AsyncLLM`:
   publishes no token budget. The engine owns the context check and the output
   cap, because a prefix splice changes the prompt after the frontend has seen it.
 - `kv_event_sources` points Dynamo at the engine's own vLLM KV-event ZMQ
-  publisher. It is set only when the engine caches prefixes, and it binds a
-  wildcard endpoint, because vLLM binds only wildcard endpoints. A vLLM stat
-  logger publishes the router's per-engine load signal.
+  publisher. It is set only when the engine caches prefixes. Each engine binds
+  its own Linux abstract-namespace socket (`ipc://@...`), so engines on one node
+  need no port and cannot collide. A vLLM stat logger publishes the router's
+  per-engine load signal.
 
 Because the Worker runs on the actor's own loop, the worker's other methods
 interleave with Dynamo requests exactly as with native requests:
@@ -104,3 +105,11 @@ functional overlays fail if the engines published events but none were
 applied (`tests/functional/check_dynamo_overlay.sh`).
 
 `ai-dynamo-runtime` caps pydantic, which pins the vLLM venvs' pydantic version.
+Dependency bounds like this one can still block a vLLM bump, and the import
+guard does not see them: `ai-dynamo-runtime` 1.5.1 requires
+`pydantic>=2.10.6,<=2.13`, and `ai-dynamo` caps `aiohttp<4`,
+`prometheus-client<1` and `zstandard<1`. A vLLM release that needs a version
+outside one of these bounds does not lock with the pinned `ai-dynamo`. Until a
+Dynamo release lifts the bound, override it under
+`[tool.uv] override-dependencies` (as `aisimulate` and `kubernetes` are), and
+let the vLLM-lane Dynamo unit tests catch a real break.
