@@ -681,6 +681,42 @@ class TestAgentLossWeights:
                 train_global_batch_size=2,
             )
 
+    def test_task_source_keys_apply_and_the_agent_name_wins(self):
+        # Rows routed by task_source never show the resolved agent name in the
+        # data, so the dataset's key is accepted too; an agent-name key takes
+        # precedence over a task_source key for the same row.
+        train_data = self._train_data([10, 10, 10], [1.0, 1.0, 1.0])
+        agent_refs = [{"name": "math_agent"}] * 3
+        task_sources = ["math_with_judge", "math_with_judge", "math_plain"]
+
+        metrics = _apply_agent_loss_weights(
+            train_data,
+            agent_refs,
+            {"math_with_judge": 3.0},
+            train_global_batch_size=3,
+            task_sources=task_sources,
+        )
+
+        # Weights 3, 3, 1 -> normalizer 30 / 70; metrics report the agent name.
+        torch.testing.assert_close(
+            train_data["sample_mask"], torch.tensor([9 / 7, 9 / 7, 3 / 7])
+        )
+        assert metrics["agent_loss_weights/math_agent/weight"] == pytest.approx(7 / 3)
+        assert "agent_loss_weights/math_with_judge/weight" not in metrics
+
+        train_data = self._train_data([10, 10], [1.0, 1.0])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # the task_source key counts as present
+            _apply_agent_loss_weights(
+                train_data,
+                [{"name": "math_agent"}] * 2,
+                {"math_agent": 2.0, "math_with_judge": 8.0},
+                train_global_batch_size=2,
+                task_sources=["math_with_judge", "math_plain"],
+            )
+        # Both rows resolve to the agent key (2.0), so they stay equal.
+        torch.testing.assert_close(train_data["sample_mask"], torch.tensor([1.0, 1.0]))
+
     def test_unset_weights_are_a_noop(self):
         train_data = self._train_data([4, 4], [1.0, 1.0])
 
@@ -5340,7 +5376,12 @@ def test_grpo_train_applies_agent_loss_weights(
     calls = []
 
     def recording_apply(
-        train_data, agent_refs, agent_loss_weights, *, train_global_batch_size
+        train_data,
+        agent_refs,
+        agent_loss_weights,
+        *,
+        train_global_batch_size,
+        task_sources=None,
     ):
         calls.append(
             (list(agent_refs), dict(agent_loss_weights), train_global_batch_size)

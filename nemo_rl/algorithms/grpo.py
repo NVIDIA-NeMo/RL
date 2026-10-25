@@ -392,7 +392,8 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
-    # NeMo-Gym loss weights keyed by resolved agent_ref.name. Values must be
+    # NeMo-Gym loss weights keyed by resolved agent_ref.name or, for rows routed
+    # by task_source, by task_source (the agent name wins). Values must be
     # finite and >= 0; unlisted agents keep 1, and zero excludes a row's loss.
     # Each nonempty optimizer step must retain a positive-weight trained row.
     # Weights are relative; baselines and advantages are unchanged.
@@ -639,9 +640,9 @@ def _validate_agent_loss_weights(master_config: MasterConfig) -> None:
         return
     if not should_use_nemo_gym(master_config):
         raise ValueError(
-            "grpo.agent_loss_weights keys on each rollout's agent_ref.name, which "
-            "only NeMo-Gym rollouts carry; set env.should_use_nemo_gym=true or "
-            "remove grpo.agent_loss_weights."
+            "grpo.agent_loss_weights keys on each rollout's agent_ref.name (or its "
+            "task_source), which only NeMo-Gym rollouts carry; set "
+            "env.should_use_nemo_gym=true or remove grpo.agent_loss_weights."
         )
     if (master_config.data_plane or {}).get("enabled", False):
         raise NotImplementedError(
@@ -2733,12 +2734,16 @@ def _apply_agent_loss_weights(
     agent_loss_weights: Optional[dict[str, float]],
     *,
     train_global_batch_size: int,
+    task_sources: Optional[list[Any]] = None,
 ) -> dict[str, float]:
     """Reweight each sample's loss weight by its agent without moving the token mass.
 
     Multiplies ``train_data["sample_mask"]`` row-wise by
-    ``grpo.agent_loss_weights[agent_ref.name]`` (agents not listed keep 1.0;
-    already-masked rows stay 0), then rescales the product within every
+    ``grpo.agent_loss_weights[agent_ref.name]``, falling back to
+    ``grpo.agent_loss_weights[task_source]`` for a row whose resolved agent name
+    is not a key (a dataset routed by ``task_source`` never shows the resolved
+    agent name in its rows; the agent name wins when both match). Agents not
+    listed keep 1.0 and already-masked rows stay 0. It then rescales the product within every
     optimizer-step global batch so that ``sum(token_mask[:, 1:] * sample_mask)``
     is unchanged. A nonempty step whose trained rows all have weight 0 raises
     before changing the mask or reaching the policy update: an empty weighted
@@ -2791,10 +2796,20 @@ def _apply_agent_loss_weights(
         str(ref.get("name", "")) if isinstance(ref, dict) else str(ref or "")
         for ref in agent_refs
     ]
+    if task_sources is None or len(task_sources) != num_samples:
+        sources = [""] * num_samples
+    else:
+        sources = [str(source or "") for source in task_sources]
+    configured_weights = [
+        float(
+            agent_loss_weights[name]
+            if name in agent_loss_weights
+            else agent_loss_weights.get(source, 1.0)
+        )
+        for name, source in zip(names, sources)
+    ]
     weights = torch.tensor(
-        [float(agent_loss_weights.get(name, 1.0)) for name in names],
-        dtype=sample_mask.dtype,
-        device=sample_mask.device,
+        configured_weights, dtype=sample_mask.dtype, device=sample_mask.device
     )
     # Same convention as process_global_batch: position 0 has no prediction.
     trained_tokens = (
@@ -2829,18 +2844,31 @@ def _apply_agent_loss_weights(
     # zero samples and warn; an agent can legitimately be absent from one step's
     # prompt mix, so this is not a setup-time error.
     configured = set(agent_loss_weights)
-    absent = sorted(configured - set(names))
+    present_sources = {source for source in sources if source}
+    absent = sorted(configured - set(names) - present_sources)
     if absent:
+        present = sorted(set(names) | present_sources)
         warnings.warn(
-            f"grpo.agent_loss_weights names {absent} match no agent_ref.name in "
-            f"this training batch (present: {sorted(set(names))}); check for typos.",
+            f"grpo.agent_loss_weights names {absent} match no agent_ref.name or "
+            f"task_source in this training batch (present: {present}); check for "
+            "typos.",
             stacklevel=2,
         )
+    # Metrics are keyed by the resolved agent name; a weight that reached an
+    # agent through a task_source key is reported under that agent. Keys that
+    # match a task_source only are reported under the agents they weighted.
     metrics: dict[str, float] = {}
-    for name in sorted(set(names) | configured):
+    for name in sorted(set(names) | (configured - present_sources)):
         rows = torch.tensor([n == name for n in names])
         key = f"agent_loss_weights/{name or 'unknown'}"
-        metrics[f"{key}/weight"] = float(agent_loss_weights.get(name, 1.0))
+        metrics[f"{key}/weight"] = (
+            float(
+                sum(w for w, n in zip(configured_weights, names) if n == name)
+                / int(rows.sum())
+            )
+            if rows.any()
+            else float(agent_loss_weights.get(name, 1.0))
+        )
         metrics[f"{key}/effective_weight"] = (
             float(effective_weights[rows].mean()) if rows.any() else 0.0
         )
@@ -4148,6 +4176,7 @@ def _grpo_train_impl(
                     train_global_batch_size=master_config.policy[
                         "train_global_batch_size"
                     ],
+                    task_sources=repeated_batch.get("task_source"),
                 )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -5992,6 +6021,7 @@ def async_grpo_train(
                     train_global_batch_size=master_config.policy[
                         "train_global_batch_size"
                     ],
+                    task_sources=repeated_batch.get("task_source"),
                 )
 
                 print("▶ Preparing for training...")

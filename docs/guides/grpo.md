@@ -656,7 +656,7 @@ grpo:
   agent_loss_weights: null  # default; e.g. {short_tool_use_agent: 8.0}
 ```
 
-Keys are the **resolved agent name** that Gym dispatches to (`agent_ref.name`), not the dataset's `task_source`. Use the agent names in the rollout metrics. Unlisted agents keep weight 1. Weights must be finite and nonnegative; zero sets that agent's sample loss weight to zero. A configured name absent from the batch produces a warning listing the names present.
+Keys are the **resolved agent name** that Gym dispatches to (`agent_ref.name`, the names used in the per-agent rollout metrics) or, for datasets routed by `task_source`, the row's `task_source`; when both match a row the agent name wins. Unlisted agents keep weight 1. Weights must be finite and nonnegative; zero sets that agent's sample loss weight to zero. A configured name absent from the batch produces a warning listing the names present.
 
 **Choosing a weight.** For a target trained-token share $s$ for agent A, set $w_A = \frac{s}{1-s} \cdot \frac{T_\text{other}}{T_A}$, where $T_A$ and $T_\text{other}$ are their unweighted trained-token counts. In the example above, weight 8 increases the tool-use share from 7% to about 39%. Setting weights proportional to the inverse mean episode length approximates equal per-rollout weighting. Weights only rebalance agents sharing an optimizer step (`policy.train_global_batch_size` rows).
 
