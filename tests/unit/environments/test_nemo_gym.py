@@ -870,7 +870,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
