@@ -86,10 +86,8 @@ policy:
       context_parallel_size: 1
       tensor_model_parallel_size: 2
       buffer_size_gb: 20
-      num_cuda_graphs: -1
       max_tokens: ${policy.max_total_sequence_length}
       expose_http_server: true
-      enable_prefix_caching: true
       image_dynamic_resolution: true
       logprobs_mode: raw_logprobs
       megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper

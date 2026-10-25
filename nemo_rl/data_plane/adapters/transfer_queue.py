@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import ctypes
+import functools
 import glob
 import importlib
 import ipaddress
@@ -35,6 +36,7 @@ import resource
 import socket
 import threading
 import time
+import types
 import warnings
 import weakref
 from collections.abc import Callable
@@ -42,6 +44,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, cast
 
+import psutil
 import torch
 
 # Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
@@ -60,6 +63,7 @@ from nemo_rl.data_plane.interfaces import (
     data_plane_supports_checkpointing,
     storage_unit_placement,
 )
+from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
 LOGGER = logging.getLogger(__name__)
@@ -506,6 +510,55 @@ def _patch_scalar_field_schema() -> None:
 # without ever running __init__, so import is the earliest point that covers
 # every user of this module.
 _patch_scalar_field_schema()
+
+
+def _with_cached_cpu_count(psutil_module: Any) -> types.SimpleNamespace:
+    """``psutil_module`` with ``cpu_count`` cached per argument.
+
+    Every other attribute is the module's own, so TQ code that uses more of
+    ``psutil`` keeps working.
+    """
+    return types.SimpleNamespace(
+        **{
+            **vars(psutil_module),
+            "cpu_count": functools.lru_cache(maxsize=None)(psutil_module.cpu_count),
+        }
+    )
+
+
+def _patch_physical_core_count() -> None:
+    """Count the host's physical cores once per process, not on every TQ put/get.
+
+    Upstream ``limit_pytorch_auto_parallel_threads`` wraps every client
+    ``async_put`` / ``async_get_data`` and calls
+    ``psutil.cpu_count(logical=False)`` each time. On Linux that globs
+    ``/sys/devices/system/cpu`` and opens a topology file per CPU, and every
+    one of those accesses releases the GIL. In a process whose GIL is held by
+    a busy thread, such as a vLLM worker's engine loop, each access waits to
+    get it back: the count took 0.2–8 s per call there instead of ~1.5 ms,
+    and was most of the time of every TQ write the worker made.
+
+    The physical core count cannot change while a process runs, so the module's
+    ``psutil`` is swapped for one whose ``cpu_count`` is cached. TQ's own
+    controller and storage-unit actors never import this module and keep
+    counting per call.
+
+    ``tests/unit/data_plane/test_tq_core_count_patch.py`` drives TQ's context
+    manager, so a TQ pin that stops counting through this module fails there.
+    """
+    try:
+        from transfer_queue.utils import common as _common
+    except ImportError:
+        return
+    if getattr(_common, "_nrl_core_count_cached", False):
+        return
+    # pyrefly: ignore[bad-assignment]  the namespace stands in for the module on purpose
+    _common.psutil = _with_cached_cpu_count(psutil)
+    _common._nrl_core_count_cached = True
+
+
+# At import for the same reason as _patch_scalar_field_schema.
+_patch_physical_core_count()
 
 
 def _patch_mooncake_staging_buffers(max_bytes: int) -> None:
@@ -1010,6 +1063,11 @@ def _from_wire(td: TensorDict) -> TensorDict:
     the dense value then fails the ``is_nested`` check in
     ``codec.materialize`` and reaches ``get_multimodal_dict`` unreassembled.
     ``codec.materialize`` applies the same exclusion.
+
+    Fields padded per microbatch also stay nested, even for a single row.
+    The worker intentionally skips their batch-wide padding; densifying
+    them here would expose a short dense sequence to Megatron's batch
+    validation before microbatch padding can run.
     """
     # NonTensorData / NonTensorStack leaves are only visible via td.keys(),
     # not keys(leaves_only=True) -- iterating the latter would silently drop
@@ -1030,6 +1088,7 @@ def _from_wire(td: TensorDict) -> TensorDict:
                 isinstance(v, torch.Tensor)
                 and v.is_nested
                 and field_name not in PACKED_MULTIMODAL_FIELDS
+                and field_name not in MICROBATCH_PADDED_FIELDS
             ):
                 rows = list(v.unbind())
                 if rows and all(row.shape == rows[0].shape for row in rows[1:]):

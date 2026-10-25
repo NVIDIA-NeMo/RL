@@ -3349,7 +3349,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
                 "tokenizer_cache": False,
                 "tokenizer_cache_bytes": 1024,
                 "router_mode": "kv",
-                "router_reset_states": True,
                 "extra_cli_args": [],
             },
         },
