@@ -669,7 +669,7 @@ data_plane:
   nixl:
     # NIXL data plane TQ backend (nemo_rl.data_plane.nixl, NixlStore): CPU storage units own pinned DRAM,
     # clients transfer with one-sided NIXL RDMA. See nemo_rl/data_plane/interfaces.py.
-    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # round-robin over nodes
+    num_storage_units: null          # null: one per node; N: round-robin N over nodes
     storage_units_per_node: null     # set N to place N units on every node instead
     storage_unit_placement: all      # with storage_units_per_node: inference | train | all
     unit_slab_bytes: 17179869184     # 16 GiB pinned per unit

@@ -132,14 +132,16 @@ class NixlStoreConfig(BaseModel, extra="allow"):
     backend honours those env vars over its own params.
 
     Unit placement, as in SimpleStorage or the Mooncake storage units:
-    ``num_storage_units`` round-robins units over Ray nodes;
-    ``storage_units_per_node`` + ``storage_unit_placement`` puts that many on
-    each node of the selected virtual clusters instead. With ``numa="auto"`` the
-    k-th unit on a multi-socket node is pinned (CPUs + slab memory) to socket
-    ``k % sockets``; single-socket nodes are unaffected.
+    ``num_storage_units`` round-robins units over Ray nodes (``None``: one per
+    node); ``storage_units_per_node`` + ``storage_unit_placement`` puts that
+    many on each node of the selected virtual clusters instead. One unit per
+    node is enough: a unit's CPU only serves small control calls while RDMA
+    moves the bytes, and 2x the units measured no faster at 86 nodes. With
+    ``numa="auto"`` the k-th unit on a multi-socket node is pinned (CPUs + slab
+    memory) to socket ``k % sockets``; single-socket nodes are unaffected.
     """
 
-    num_storage_units: int = 2
+    num_storage_units: PositiveInt | None = None
     storage_units_per_node: PositiveInt | None = None
     storage_unit_placement: Literal["inference", "train", "all"] = "all"
     unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit

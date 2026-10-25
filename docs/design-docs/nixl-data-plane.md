@@ -51,7 +51,7 @@ data_plane:
   impl: transfer_queue
   backend: nixl
   nixl:
-    num_storage_units: 68          # e.g. one per Ray node
+    num_storage_units: null        # default: one per Ray node (2x measured no faster)
     unit_slab_bytes: 17179869184   # 16 GiB pinned per unit
 ```
 

@@ -36,7 +36,7 @@ event loop.
 **Bootstrap.** Called once by ``transfer_queue.init`` in the process that
 creates the TQ controller: starts the BlobDirectory and the storage units
 (:mod:`nemo_rl.data_plane.nixl_storage_unit`). Placement is SimpleStorage style
-(``num_storage_units`` round-robin over eligible nodes) or per node
+(``num_storage_units`` round-robin over eligible nodes, default one per node) or per node
 (``storage_units_per_node`` on each node of ``node_ids``, which the caller
 resolves from ``storage_unit_placement``). ``transfer_queue.close`` does not stop
 third-party backends, so the owner calls :func:`shutdown` after it.
@@ -697,8 +697,8 @@ def unit_node_ids(cfg: dict[str, Any]) -> list[str]:
     per_node = cfg.get("storage_units_per_node")
     if per_node:
         return [n for n in nodes for _ in range(int(per_node))]
-    total = int(cfg.get("num_storage_units", 2))
-    return [nodes[i % len(nodes)] for i in range(total)]
+    total = cfg.get("num_storage_units") or len(nodes)  # None: one per node
+    return [nodes[i % len(nodes)] for i in range(int(total))]
 
 
 # ----------------------------------------------------------------------------- lifecycle
