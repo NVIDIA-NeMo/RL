@@ -78,6 +78,15 @@ class StubCtl:
             raise r
         return r
 
+    def call_many(self, op, args_by_address, *, timeout_s=None):
+        out = {}
+        for address, args in args_by_address.items():
+            try:
+                out[address] = self.call(address, op, timeout_s=timeout_s, **args)
+            except Exception as e:  # noqa: BLE001 - reported per address, as UnitClient does
+                out[address] = e
+        return out
+
     def notify(self, address, op, **args):
         self.notified.append((op, args))
 

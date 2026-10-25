@@ -108,6 +108,28 @@ def test_reply_wait_honours_the_callers_budget(server):
         cli.close()
 
 
+def test_call_many_overlaps_the_units_and_reports_errors_per_address(server):
+    def nap():
+        time.sleep(0.5)
+        return "ok"
+
+    others = [control.UnitServer({"slow": nap}, threading.Lock()) for _ in range(2)]
+    cli = control.UnitClient(timeout_s=5)
+    try:
+        addrs = [s.address for s in others]
+        t0 = time.monotonic()
+        got = cli.call_many("slow", {a: {} for a in addrs})
+        assert got == {a: "ok" for a in addrs}
+        assert time.monotonic() - t0 < 0.9  # both naps overlapped, not 1.0 s in turn
+        got = cli.call_many("full", {server.address: {}, addrs[0]: {}})
+        assert isinstance(got[server.address], UnitFull)
+        assert isinstance(got[addrs[0]], TransferError)  # no "full" op there
+    finally:
+        cli.close()
+        for s in others:
+            s.close()
+
+
 def test_malformed_op_does_not_stop_the_unit_serving(server):
     import zmq
 

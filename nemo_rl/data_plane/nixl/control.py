@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import socket
 import threading
+import time
 import uuid
 from typing import Any, Callable
 
@@ -204,9 +205,47 @@ class UnitClient:
         ``TransferError`` when no reply comes within ``timeout_s`` (default: the
         client's timeout; callers pass their remaining operation budget).
         """
-        timeout_ms = self.timeout_ms
-        if timeout_s is not None:
-            timeout_ms = max(1, min(timeout_ms, int(timeout_s * 1000)))
+        timeout_ms = self._timeout_ms(timeout_s)
+        rid = self._send(address, op, args, timeout_ms)
+        return self._recv(address, op, rid, time.monotonic() + timeout_ms / 1000)
+
+    def call_many(
+        self,
+        op: str,
+        args_by_address: dict[str, dict[str, Any]],
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """``call`` to every address at once: all requests go out before any reply is read.
+
+        Returns each address's result, or the exception its call raised, so the
+        caller decides what one failure means for the others. ``timeout_s``
+        bounds the whole batch, not each call.
+        """
+        timeout_ms = self._timeout_ms(timeout_s)
+        end = time.monotonic() + timeout_ms / 1000
+        out: dict[str, Any] = {}
+        rids: dict[str, str] = {}
+        for address, args in args_by_address.items():
+            try:
+                rids[address] = self._send(address, op, args, timeout_ms)
+            except Exception as e:  # noqa: BLE001 - reported per address
+                out[address] = e
+        for address, rid in rids.items():
+            try:
+                out[address] = self._recv(address, op, rid, end)
+            except Exception as e:  # noqa: BLE001 - reported per address
+                out[address] = e
+        return out
+
+    def _timeout_ms(self, timeout_s: float | None) -> int:
+        if timeout_s is None:
+            return self.timeout_ms
+        return max(1, min(self.timeout_ms, int(timeout_s * 1000)))
+
+    def _send(
+        self, address: str, op: str, args: dict[str, Any], timeout_ms: int
+    ) -> str:
         rid = uuid.uuid4().hex[:12]
         s = self._sock(address)
         # A unit that stopped reading fills the send queue: wait no longer
@@ -219,12 +258,15 @@ class UnitClient:
                 f"unit {address} send queue stayed full for {op} "
                 f"({timeout_ms / 1000:.1f}s)"
             ) from None
+        return rid
+
+    def _recv(self, address: str, op: str, rid: str, end: float) -> Any:
+        s = self._sock(address)
         while True:
-            if not s.poll(timeout_ms, zmq.POLLIN):
+            wait_ms = max(0, int((end - time.monotonic()) * 1000))
+            if not s.poll(wait_ms, zmq.POLLIN):
                 self._drop(address)  # a late reply must not reach the next caller
-                raise TransferError(
-                    f"unit {address} did not answer {op} within {timeout_ms / 1000:.1f}s"
-                )
+                raise TransferError(f"unit {address} did not answer {op} in time")
             got_rid, ok, result = _dec.decode(s.recv())
             if got_rid != rid:
                 continue  # stale reply from an earlier timed-out call
