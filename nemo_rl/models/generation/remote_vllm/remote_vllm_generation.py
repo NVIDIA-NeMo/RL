@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 
+from nemo_rl.data_plane.factory import build_data_plane_client
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     CollectiveSenderSpec,
@@ -39,6 +40,7 @@ from nemo_rl.models.generation.remote_vllm_config import RemoteVllmServiceConfig
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 
 class RemoteVllmGeneration(GenerationInterface):
@@ -152,10 +154,9 @@ class RemoteVllmGeneration(GenerationInterface):
 
     def setup_token_capture(
         self,
-        dp_cfg: dict[str, Any],
+        dp_cfg: "DataPlaneConfig",
         staging_partition: str,
         *,
-        dp_client: Any,
         capture_media: bool = False,
     ) -> None:
         """Bridge external serving processes to controller-owned token staging."""
@@ -163,13 +164,13 @@ class RemoteVllmGeneration(GenerationInterface):
             raise NotImplementedError(
                 "remote_vllm token capture does not support media"
             )
-        del dp_cfg
         if (
             self._token_capture_bridge is not None
             or self._token_capture_bridge_url is not None
         ):
             raise RuntimeError("remote vLLM token capture is already configured")
         auth_token = secrets.token_hex(32)
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         bridge = RemoteVllmTokenCaptureBridge(
             dp_client=dp_client,
             staging_partition=staging_partition,

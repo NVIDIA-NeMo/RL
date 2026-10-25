@@ -97,6 +97,12 @@ def test_remote_fleet_health_validation(refit_timeout_s: float | None) -> None:
         RemoteVllmGeneration.validate_settings(config)
 
 
+def test_remote_capture_validation_accepts_nccl() -> None:
+    config = _master_config(None)
+    config.token_capture.enabled = True
+    RemoteVllmGeneration.validate_settings(config)
+
+
 def test_weight_transfer_requests_match_vllm_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

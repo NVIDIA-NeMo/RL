@@ -30,6 +30,9 @@ from nemo_rl.models.generation.remote_vllm import (
     RemoteVllmServiceConfig,
     preflight_remote_vllm_service,
 )
+from nemo_rl.models.generation.remote_vllm import (
+    remote_vllm_generation as generation_mod,
+)
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 from nemo_rl.weight_sync.remote_vllm_nccl_weight_synchronizer import (
     RemoteVllmNcclWeightSynchronizer,
@@ -319,6 +322,43 @@ def test_token_capture_configuration_uses_service_endpoint(
         "bridge_url": "http://10.0.0.1:12345",
         "auth_token": "secret",
     }
+
+
+def test_capture_setup_uses_generation_interface_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dp_client = object()
+    build_client = MagicMock(return_value=dp_client)
+    bridge = MagicMock(base_url="http://bridge.test:12345")
+    build_bridge = MagicMock(return_value=bridge)
+    monkeypatch.setattr(generation_mod, "build_data_plane_client", build_client)
+    monkeypatch.setattr(generation_mod, "RemoteVllmTokenCaptureBridge", build_bridge)
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": _config().model_dump()})
+    generation.client.configure_token_capture = MagicMock()
+
+    assert generation.setup_token_capture({}, "staging") is None
+
+    build_client.assert_called_once_with({}, bootstrap=False)
+    assert build_bridge.call_args.kwargs["dp_client"] is dp_client
+    assert build_bridge.call_args.kwargs["staging_partition"] == "staging"
+    bridge.start.assert_called_once_with()
+    generation.client.configure_token_capture.assert_called_once_with(
+        bridge_url=bridge.base_url,
+        auth_token=build_bridge.call_args.kwargs["auth_token"],
+    )
+
+
+def test_capture_setup_rejects_media_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    build_client = MagicMock()
+    monkeypatch.setattr(generation_mod, "build_data_plane_client", build_client)
+    generation = RemoteVllmGeneration({"remote_vllm_cfg": _config().model_dump()})
+
+    with pytest.raises(NotImplementedError, match="does not support media"):
+        generation.setup_token_capture({}, "staging", capture_media=True)
+
+    build_client.assert_not_called()
 
 
 def test_generation_serializes_bridge_coordinates_not_live_server(
