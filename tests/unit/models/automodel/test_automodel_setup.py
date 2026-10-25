@@ -53,7 +53,7 @@ def mock_config():
         "max_grad_norm": 1.0,
         "offload_optimizer_for_logprob": False,
         "sequence_packing": {"enabled": False},
-        "dtensor_cfg": {
+        "automodel_cfg": {
             "cpu_offload": False,
             "tensor_parallel_size": 1,
             "context_parallel_size": 1,
@@ -214,7 +214,7 @@ class TestValidateAndPrepareConfig:
     ):
         """Test that CP with sequence packing raises ValueError."""
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
 
         with pytest.raises(
             ValueError, match="Context parallel is not supported for sequence packing"
@@ -241,8 +241,8 @@ class TestValidateAndPrepareConfig:
         mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
         mock_resolve_class.return_value = Mock
 
-        mock_config["dtensor_cfg"]["sequence_parallel"] = True
-        mock_config["dtensor_cfg"]["tensor_parallel_size"] = 1
+        mock_config["automodel_cfg"]["sequence_parallel"] = True
+        mock_config["automodel_cfg"]["tensor_parallel_size"] = 1
 
         # Should not raise an error, just print a warning
         result = validate_and_prepare_config(
@@ -277,18 +277,18 @@ class TestValidateAndPrepareConfig:
 
         # Test FA2 for sequence packing with cp=1
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "flash_attention_2"
 
         # Test SDPA for cp > 1
         mock_config["sequence_packing"]["enabled"] = False
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 2
+        mock_config["automodel_cfg"]["context_parallel_size"] = 2
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl == "sdpa"
 
         # Test None for cp=1 without sequence packing
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
         result = validate_and_prepare_config(mock_config, None, 0)
         assert result.attn_impl is None
 
@@ -540,7 +540,7 @@ class TestValidateAndPrepareConfig:
         mock_resolve_class.return_value = Mock
 
         mock_config["sequence_packing"]["enabled"] = True
-        mock_config["dtensor_cfg"]["context_parallel_size"] = 1
+        mock_config["automodel_cfg"]["context_parallel_size"] = 1
 
         result = validate_and_prepare_config(
             config=mock_config,
@@ -822,7 +822,7 @@ class TestSetupDistributed:
         mock_mesh_context.build.return_value = SimpleNamespace(
             device_mesh=mock_device_mesh, moe_mesh=None
         )
-        mock_config["dtensor_cfg"]["dp_replicate_size"] = 2
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 2
 
         setup_distributed(mock_config, mock_runtime_config)
 
@@ -860,7 +860,7 @@ class TestSetupDistributed:
         mock_torch_dist.get_world_size.return_value = 6
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_config["dtensor_cfg"]["dp_replicate_size"] = 4
+        mock_config["automodel_cfg"]["dp_replicate_size"] = 4
 
         with pytest.raises(ValueError, match="dp_replicate_size"):
             setup_distributed(mock_config, mock_runtime_config)
@@ -1040,7 +1040,7 @@ class TestSetupModelAndOptimizer:
     ):
         """restore_from with LoRA disabled must fail loudly, not silently no-op."""
         mock_get_rank.return_value = 0
-        mock_config["dtensor_cfg"]["lora_cfg"] = {
+        mock_config["automodel_cfg"]["lora_cfg"] = {
             "enabled": False,
             "restore_from": "/donor/step_5/policy/weights",
         }
@@ -1782,7 +1782,7 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["automodel_kwargs"] = {
+        mock_config["automodel_cfg"]["automodel_kwargs"] = {
             "backend": {
                 "_target_": "some.backend.Class",
                 "param1": "value1",
@@ -1842,7 +1842,7 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["lora_cfg"] = {
+        mock_config["automodel_cfg"]["lora_cfg"] = {
             "enabled": True,
             "use_triton": False,
             "rank": 8,
@@ -1903,7 +1903,7 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        mock_config["dtensor_cfg"]["activation_checkpointing"] = True
+        mock_config["automodel_cfg"]["activation_checkpointing"] = True
 
         with patch(
             "nemo_rl.models.automodel.setup.torch.backends.cuda"

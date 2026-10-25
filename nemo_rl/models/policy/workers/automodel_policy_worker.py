@@ -1,0 +1,1633 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import gc
+import warnings
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Any, Generator, Iterable, Optional
+
+import ray
+import torch
+from nemo_automodel.components._peft.lora import LinearLoRA
+from nemo_automodel.components.distributed.tensor_utils import (
+    get_cpu_state_dict,
+    to_local_if_dtensor,
+)
+from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from torch import nn
+from torch.distributed.tensor import DTensor
+
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+)
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.checkpoint import (
+    AutomodelCheckpointManager,
+    build_checkpoint_config,
+)
+from nemo_rl.models.automodel.data import (
+    check_sequence_dim,
+    get_microbatch_iterator,
+    process_global_batch,
+)
+from nemo_rl.models.automodel.router_replay import (
+    microbatch_replay_context,
+    router_replay_gates,
+)
+from nemo_rl.models.automodel.setup import (
+    setup_distributed,
+    setup_model_and_optimizer,
+    setup_reference_model_state,
+    validate_and_prepare_config,
+)
+from nemo_rl.models.automodel.train import (
+    FullLogitsPostProcessor,
+    LogprobsPostProcessor,
+    LossPostProcessor,
+    ScorePostProcessor,
+    TopkLogitsPostProcessor,
+    aggregate_training_statistics,
+    automodel_forward_backward,
+    forward_with_post_processing_fn,
+    prepare_model_forward,
+)
+from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
+    LogprobOutputSpec,
+    ScoreOutputSpec,
+)
+from nemo_rl.models.policy.utils import (
+    enable_deterministic_algorithms,
+    ensure_teacher_ipc_buffer,
+    get_runtime_env_for_policy_worker,
+)
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    AutomodelCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
+from nemo_rl.models.policy.workers.patches import (
+    apply_transformer_engine_patch,
+)
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    traced_worker_init,
+)
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.tensor_ops import pad_and_concat
+from nemo_rl.utils.timer import Timer
+
+
+def _refit_tensor_dtype(
+    fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
+) -> torch.dtype:
+    """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
+
+    Integer/bool buffers (e.g. the reduced-vocab draft's d2t index map) must
+    keep their dtype — token ids are not representable in bf16. FP32
+    ``e_score_correction_bias`` tensors are inference-critical MoE router
+    state and must also stay FP32.
+    """
+    if not tensor.is_floating_point():
+        return tensor.dtype
+    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
+        "e_score_correction_bias"
+    )
+    if is_router_correction_bias and tensor.dtype == torch.float32:
+        return tensor.dtype
+    return default_dtype
+
+
+def _module_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+
+    Args:
+        model: The model whose parameters to generate.
+        target_dtype: The default dtype for refit tensors. Source-FP32
+            ``e_score_correction_bias`` tensors retain FP32.
+
+    Yields:
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to
+        the refit dtype and made contiguous.
+    """
+    # Key the module map by the names ``state_dict()`` uses. With activation
+    # checkpointing Automodel wraps every decoder block in torch's
+    # ``CheckpointWrapper``, whose ``_checkpoint_wrapped_module.`` component
+    # ``state_dict()`` strips but ``named_modules()`` keeps; keyed by raw module
+    # names the lookup below missed every ``LinearLoRA`` inside a block and the
+    # refit silently streamed bare base weights (generation never saw the
+    # trained adapters). ``canonical_parameter_fqn`` is Automodel's own
+    # state-dict spelling, shared with its checkpoint and optimizer code.
+    module_map = {
+        canonical_parameter_fqn(name): module for name, module in model.named_modules()
+    }
+    state_dict = model.state_dict()
+    _assert_lora_modules_reachable(module_map, state_dict)
+    for name, tensor in state_dict.items():
+        if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            continue
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
+
+        adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
+        for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+            refit_dtype = _refit_tensor_dtype(adapted_fqn, adapted_tensor, target_dtype)
+            yield (
+                adapted_fqn,
+                adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
+            )
+            del adapted_tensor
+        del adapted_fqn_tensors
+        del merged_tensor
+        del full_tensor
+
+
+def automodel_params_generator(
+    model: nn.Module,
+    target_dtype: torch.dtype,
+    draft_model: Optional[nn.Module] = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Policy weights, followed by ``draft.<name>`` weights when co-training.
+
+    The draft is a plain HF module (no LoRA, no state-dict adapter), so
+    ``_module_params_generator``'s merge/adapt steps are no-ops for it.
+    """
+    yield from _module_params_generator(model, target_dtype)
+    if draft_model is not None:
+        from nemo_rl.models.automodel.draft.runtime import draft_refit_export_name
+
+        for name, tensor in _module_params_generator(draft_model, target_dtype):
+            yield f"draft.{draft_refit_export_name(name)}", tensor
+
+
+def _assert_lora_modules_reachable(
+    module_map: dict[str, nn.Module], state_dict: dict[str, Any]
+) -> None:
+    """Fail loudly if a ``LinearLoRA`` has no matching ``state_dict`` weight.
+
+    A LoRA module the merge cannot find reaches the inference engine as its
+    bare base weight; nothing else reports it, and the only symptom is a
+    slowly growing train/generation logprob mismatch many steps later.
+
+    Only ``LinearLoRA`` is covered because it is the only adapter this file
+    merges. When the grouped-expert LoRA merge lands (#3353), extend this
+    check to those adapter modules too so that path keeps the same loud
+    failure instead of silently refitting base expert weights.
+    """
+    unreachable = sorted(
+        name
+        for name, module in module_map.items()
+        if isinstance(module, LinearLoRA) and f"{name}.weight" not in state_dict
+    )
+    if unreachable:
+        raise RuntimeError(
+            f"{len(unreachable)} LinearLoRA module(s) have no matching state_dict "
+            f"weight, so the refit would drop their LoRA update: {unreachable[:5]}. "
+            "A module wrapper is rewriting parameter names in a way "
+            "canonical_parameter_fqn does not undo."
+        )
+
+
+@torch.no_grad()
+def _maybe_merge_lora_weight(
+    module_map: dict[str, nn.Module],
+    fqn: str,
+    tensor: torch.Tensor,
+) -> torch.Tensor:
+    if not fqn.endswith(".weight"):
+        return tensor
+    module_name = fqn[: -len(".weight")]
+    module = module_map.get(module_name)
+    if not isinstance(module, LinearLoRA):
+        return tensor
+    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+        return tensor
+
+    lora_a = (
+        module.lora_A.weight.full_tensor()
+        if isinstance(module.lora_A.weight, DTensor)
+        else module.lora_A.weight
+    )
+    lora_b = (
+        module.lora_B.weight.full_tensor()
+        if isinstance(module.lora_B.weight, DTensor)
+        else module.lora_B.weight
+    )
+    # LinearLoRA._init_adapter always sets ``scale = alpha / dim``.
+    scale = getattr(module, "scale", 1.0)
+
+    # Merge in fp32 and round once: computing ``B @ A`` and the sum in the base
+    # dtype (bf16 in practice) rounds twice and can differ from an offline fp32
+    # merge of the same adapter by one bf16 ulp per element.
+    lora_a = lora_a.to(device=tensor.device, dtype=torch.float32)
+    lora_b = lora_b.to(device=tensor.device, dtype=torch.float32)
+    merged = tensor.to(torch.float32) + torch.matmul(lora_b, lora_a) * scale
+    return merged.to(tensor.dtype)
+
+
+def _maybe_adapt_tensor_to_hf(
+    model_part: nn.Module, fqn: str, tensor: torch.Tensor, quantization: bool = False
+) -> list[tuple[str, torch.Tensor]]:
+    adapter = getattr(model_part, "state_dict_adapter", None)
+    if adapter:
+        return adapter.convert_single_tensor_to_hf(
+            fqn,
+            tensor,
+            exclude_key_regex=r".*_extra_state.*",
+            quantization=quantization,
+        )
+    return [(fqn, tensor)]
+
+
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class AutomodelPolicyWorkerImpl(
+    TQWorkerMixin,
+    AutomodelCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
+):
+    def __repr__(self) -> str:
+        """Customizes the actor's prefix in the Ray logs.
+
+        This makes it easier to identify which worker is producing specific log messages.
+        """
+        if torch.distributed.is_initialized():
+            return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
+        else:
+            return f"{self.__class__.__qualname__}"
+
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = flattened (cp, tp) sub-mesh — see V1 worker."""
+        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+
+    def _local_coords(self) -> dict[str, int]:
+        return {
+            "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
+            "context_parallel": self.device_mesh["cp"].get_local_rank(),
+        }
+
+    @traced_worker_init("rl.policy.load_model", **{"rl.backend": "automodel"})
+    def __init__(
+        self,
+        config: PolicyConfig,
+        weights_path: Optional[str] = None,
+        optimizer_path: Optional[str] = None,
+        init_optimizer: bool = True,
+        init_reference_model: bool = True,
+        **kwargs: Any,
+    ):
+        """Initialize the AutomodelPolicyWorker."""
+        if config["automodel_cfg"].get("deterministic"):
+            enable_deterministic_algorithms()
+        # Apply TE patch until TE is upgraded to 2.10.0
+        apply_transformer_engine_patch()
+
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin to this worker's GPU-local CPUs/memory before model load; FSDP's
+        # D2H paths (weight refit, optimizer/checkpoint offload) benefit.
+        # ray.get_gpu_ids()[0] is the physical GPU index that keys the affinity
+        # file, and reading it does not initialize CUDA.
+        bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
+        # Store configuration
+        self.cfg = config
+
+        # Reconstruct tokenizer/processor locally to avoid pickling across
+        # incompatible transformers versions (v4 head node → v5 worker).
+        from nemo_rl.models.automodel.setup import get_tokenizer
+
+        use_processor = config["tokenizer"].get("use_processor", False)
+        result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+        if use_processor:
+            self.processor = result
+            self.tokenizer = result.tokenizer
+        else:
+            self.tokenizer = result
+            self.processor = None
+        self.is_vlm = self.processor is not None
+        self.lora_enabled = (
+            config["automodel_cfg"].get("lora_cfg", {}).get("enabled", False)
+        )
+
+        print(f"Initializing AutomodelPolicyWorker with is_vlm={self.is_vlm}")
+
+        # Initialize checkpoint manager
+        self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
+
+        # Persistent CUDA IPC buffer for cross-tokenizer teacher logits.
+        # Allocated once on first ``get_full_logits_ipc`` call (or
+        # reallocated if dims grow), with fresh logits ``.copy_()``-ed into
+        # each microbatch slot per step and exposed via a stable IPC handle
+        # captured at allocation. Persistent storage means the producer never
+        # frees between steps, so the consumer can safely hold a view into the
+        # IPC-imported storage without pinning an orphaned producer allocation.
+        self._teacher_ipc_storage: Optional[torch.Tensor] = None
+        self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
+
+        # Validate configuration and prepare runtime settings
+        runtime_config = validate_and_prepare_config(
+            config=config,
+            processor=self.processor,
+            rank=0,  # Temporary, will be updated after distributed init
+        )
+
+        # Set up distributed environment (returns DistributedContext)
+        distributed_context = setup_distributed(
+            config=config,
+            runtime_config=runtime_config,
+        )
+        # Set instance attributes from distributed context
+        self.rank = torch.distributed.get_rank()
+        self.timer = Timer(context={"worker": "automodel_policy", "rank": self.rank})
+        self.device_mesh = distributed_context.device_mesh
+        self.dp_mesh = self.device_mesh["dp"]
+        self.tp_mesh = self.device_mesh["tp"]
+        self.cp_mesh = self.device_mesh["cp"]
+        self.moe_mesh = distributed_context.moe_mesh
+        self.dp_size = distributed_context.dp_size
+        self.tp_size = distributed_context.tp_size
+        self.cp_size = distributed_context.cp_size
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
+
+        # Initialize checkpoint manager now that distributed is set up
+        requires_synchronous_checkpoint = (
+            getattr(runtime_config.model_config, "model_type", None) == "deepseek_v4"
+        )
+        automodel_cfg = config["automodel_cfg"]
+        checkpoint_config = build_checkpoint_config(
+            automodel_cfg,
+            model_repo_id=config["model_name"],
+            dequantize_base_checkpoint=config.get("dequantize_base_checkpoint", False),
+            is_peft=self.lora_enabled,
+            # Automodel's process-based async DCP cannot serialize the
+            # HF-adapted DeepSeek-V4 DTensor/view state. Other v2 models keep
+            # the pre-existing async checkpoint path.
+            is_async=not requires_synchronous_checkpoint,
+        )
+        self._init_checkpoint_manager(
+            config_updates=checkpoint_config,
+        )
+
+        # Set up model and optimizer.
+        # When a reference policy is needed on a resumed run, defer the NeMo RL
+        # checkpoint load: setup_model_and_optimizer restores `weights_path`
+        # internally, and capturing the reference from the restored model would
+        # re-anchor the KL reference to the resumed step on every resume (a
+        # rolling anchor), granting the policy a fresh drift budget per resume.
+        # Instead, build the model from the pristine base weights, capture the
+        # reference, then load the checkpoint below.
+        defer_checkpoint_load = init_reference_model and bool(weights_path)
+        if defer_checkpoint_load:
+            print(
+                "Deferring NeMo RL checkpoint load until after the KL reference "
+                "is captured from base weights; the 'No weights path provided' "
+                "message from setup_model_and_optimizer is expected on this path."
+            )
+        model_and_optimizer_state = setup_model_and_optimizer(
+            config=config,
+            tokenizer=self.tokenizer,
+            runtime_config=runtime_config,
+            distributed_context=distributed_context,
+            checkpoint_manager=self.checkpoint_manager,
+            is_vlm=self.is_vlm,
+            init_optimizer=init_optimizer,
+            weights_path=None if defer_checkpoint_load else weights_path,
+            optimizer_path=None if defer_checkpoint_load else optimizer_path,
+        )
+
+        # Set instance attributes from model and optimizer state. Access by
+        # field name (not positional unpacking) so optional fields appended to
+        # ModelAndOptimizerState stay backward compatible across workers.
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.is_hf_model = model_and_optimizer_state.is_hf_model
+        self.is_moe_model = model_and_optimizer_state.is_moe_model
+
+        self._is_reward_model = model_and_optimizer_state.is_reward_model
+        self.model_class = model_and_optimizer_state.model_class
+        self.model_config = model_and_optimizer_state.model_config
+        self.peft_config = model_and_optimizer_state.peft_config
+        self.autocast_enabled = model_and_optimizer_state.autocast_enabled
+        self.draft_model = model_and_optimizer_state.draft_model
+        self.composite_model = model_and_optimizer_state.composite_model
+
+        # Draft co-training runtime (draft loss, hidden capture, grad-norm
+        # reporting). Present when policy.draft is enabled on this backend:
+        # dspark/dflash share DSparkRuntime (dflash is the markov-free,
+        # confidence-free subset), eagle3 uses the TTT Eagle3Runtime. Built in
+        # setup_model_and_optimizer (mirrors Megatron, which attaches the
+        # draft during its own setup and has the worker only read it back).
+        self.draft_runtime = model_and_optimizer_state.draft_runtime
+
+        # R3: the policy's replayable MoE gates, fixed for the model's lifetime.
+        self._router_replay_gates = (
+            router_replay_gates(self.model) if router_replay_enabled(config) else None
+        )
+        if self._router_replay_gates == []:
+            raise RuntimeError(
+                "policy.router_replay.enabled but the model has no RouterReplay gates. R3 "
+                "needs an MoE model whose Automodel class builds its gates from "
+                "moe_overrides (enable_routing_replay), with "
+                "automodel_kwargs.backend.fake_balanced_gate off."
+            )
+
+        # Initialize reference model if requested. With deferred loading the
+        # model still holds the base (model_name) weights here, so the KL
+        # reference stays anchored to the same policy across resumes.
+        self.reference_model_state_dict = None
+        if init_reference_model:
+            self.reference_model_state_dict = setup_reference_model_state(self.model)
+
+        if defer_checkpoint_load:
+            self.load_checkpoint(weights_path, optimizer_path)
+
+        # Set instance attributes from runtime config (tuple unpacking)
+        (
+            self.model_class,  # Already set above, but includes in tuple for completeness
+            self.model_config,  # Already set above, but includes in tuple for completeness
+            self.hf_config_overrides,
+            self.allow_flash_attn_args,
+            self.attn_impl,
+            self.dtype,
+            self.enable_seq_packing,
+            self.max_grad_norm,
+            self.cpu_offload,
+            self.offload_optimizer_for_logprob,
+            self.is_generation_colocated,
+            self.sampling_params,
+            _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
+        ) = runtime_config
+
+    def _update_moe_gate_bias_if_supported(self) -> None:
+        """Update the non-gradient MoE routing bias after the optimizer step."""
+        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
+        if update_moe_gate_bias is not None:
+            update_moe_gate_bias()
+
+    def _autocast_context(self) -> AbstractContextManager[Any]:
+        """Return the worker-owned precision context for one microbatch."""
+        if not self.autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.dtype)
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use by weight-streaming refit."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
+    @wrap_with_nvtx_name("automodel_policy_worker/train")
+    def train(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if mbs is None:
+            mbs = self.cfg["train_micro_batch_size"]
+        local_gbs = gbs // self.dp_size
+        total_dataset_size = torch.tensor(data.size, device="cuda")
+        torch.distributed.all_reduce(
+            total_dataset_size,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.dp_mesh.get_group(),
+        )
+        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        # Validate sequence dimension
+        sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
+
+        # Draft co-training is active only for real training steps; eval and
+        # logprob forwards never run capture hooks or the draft loss.
+        draft_runtime = self.draft_runtime if not eval_mode else None
+
+        if eval_mode:
+            ctx: AbstractContextManager[Any] = torch.no_grad()
+            self.model.eval()
+        else:
+            ctx = nullcontext()
+            # Ensure model is in training mode
+            self.model.train()
+            if draft_runtime is not None:
+                self.draft_model.train()
+
+        # Create loss post-processor
+        loss_post_processor = LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+            draft_runtime=draft_runtime,
+        )
+
+        # Setup cache clearing callback if configured
+        empty_cache_steps = self.cfg.get("automodel_cfg", {}).get(
+            "clear_cache_every_n_steps"
+        )
+        if empty_cache_steps:
+            warnings.warn(
+                f"Emptying cache every {empty_cache_steps} microbatches; doing so unnecessarily would incur a large performance overhead.",
+            )
+
+        def on_microbatch_start(mb_idx):
+            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                torch.cuda.empty_cache()
+
+        with ctx:
+            # Get data from batch and move to device
+            data = data.to("cuda")
+
+            losses = []
+            all_mb_metrics = []
+            for gb_idx in range(num_global_batches):
+                # Process global batch and compute normalization factors
+                gb_result = process_global_batch(
+                    data,
+                    loss_fn,
+                    self.dp_mesh.get_group(),
+                    batch_idx=gb_idx,
+                    batch_size=local_gbs,
+                )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
+
+                self.optimizer.zero_grad()
+
+                # Get microbatch iterator based on batching strategy
+                processed_iterator, iterator_len = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    mbs,
+                    self.dp_mesh,
+                    tokenizer=self.tokenizer,
+                )
+
+                # Use automodel_forward_backward for the training loop
+                mb_results = automodel_forward_backward(
+                    model=self.model,
+                    data_iterator=processed_iterator,
+                    post_processing_fn=loss_post_processor,
+                    device_mesh=self.device_mesh,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    autocast_context_factory=self._autocast_context,
+                    forward_only=eval_mode,
+                    is_reward_model=self._is_reward_model,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                    global_valid_seqs=global_valid_seqs,
+                    global_valid_toks=global_valid_toks,
+                    sampling_params=self.sampling_params,
+                    sequence_dim=sequence_dim,
+                    dp_size=self.dp_size,
+                    cp_size=self.cp_size,
+                    num_global_batches=num_global_batches,
+                    num_valid_microbatches=iterator_len,
+                    on_microbatch_start=on_microbatch_start,
+                    router_replay_gates=self._router_replay_gates,
+                )
+
+                # Extract losses and metrics from results
+                mb_losses = []
+                for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+                    # Only process valid (non-dummy) batches for metrics
+                    if mb_idx < iterator_len:
+                        num_valid_samples = loss_metrics["num_valid_samples"]
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
+                        if self.draft_model is not None:
+                            # param_groups[0] is "policy" (see
+                            # DSPARK_OPTIMIZER_GROUP_NAMES); the draft's own
+                            # lr is otherwise never logged anywhere, so its
+                            # schedule can't be verified from wandb/TB.
+                            loss_metrics["draft_lr"] = self.optimizer.param_groups[1][
+                                "lr"
+                            ]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+
+                        if num_valid_samples > 0:
+                            # Metrics were materialized together by the loss;
+                            # undo this worker's per-global-batch scaling without
+                            # synchronizing the loss tensor again.
+                            mb_losses.append(loss_metrics["loss"] * num_global_batches)
+                            all_mb_metrics.append(loss_metrics)
+
+                grad_norm: Optional[float | torch.Tensor] = None
+                if not eval_mode:
+                    # The policy is clipped on its own (Megatron-path parity):
+                    # a shared global clip let the draft's larger gradients
+                    # scale down the policy's updates on every step. The draft
+                    # is clipped separately below.
+                    grad_norm = scale_grads_and_clip_grad_norm(
+                        self.max_grad_norm,
+                        [self.model],
+                        norm_type=2.0,
+                        pp_enabled=False,
+                        device_mesh=self.device_mesh,
+                        moe_mesh=self.moe_mesh,
+                        ep_axis_name="ep"
+                        if self.moe_mesh is not None
+                        and "ep" in self.moe_mesh.mesh_dim_names
+                        else None,
+                        pp_axis_name=None,
+                        foreach=True,
+                        num_label_tokens=1,
+                        dp_group_size=self.dp_size * self.cp_size,
+                    )
+                    grad_norm = torch.tensor(
+                        grad_norm, device="cpu", dtype=torch.float32
+                    )
+                    warn_if_inf_grad_norm(grad_norm)
+
+                    # Independent draft clip with the same max norm; the
+                    # returned pre-clip norm doubles as the reported metric.
+                    if draft_runtime is not None:
+                        draft_grad_norm = float(
+                            scale_grads_and_clip_grad_norm(
+                                self.max_grad_norm,
+                                [self.draft_model],
+                                norm_type=2.0,
+                                pp_enabled=False,
+                                device_mesh=self.device_mesh,
+                                moe_mesh=None,
+                                ep_axis_name=None,
+                                pp_axis_name=None,
+                                foreach=True,
+                                num_label_tokens=1,
+                                dp_group_size=self.dp_size * self.cp_size,
+                            )
+                        )
+
+                    # Update parameters and the non-gradient MoE routing bias.
+                    self.optimizer.step()
+                    self._update_moe_gate_bias_if_supported()
+
+                losses.append(torch.tensor(mb_losses).sum().item())
+
+            # release gradient memory before rollouts
+            self.optimizer.zero_grad()
+            # increment scheduler after all batches in rollout are processed
+            if not eval_mode:
+                self.scheduler.step()
+            # dynamic batch and sequence dims causes alot of fragmentation, so clear
+            # the memory allocator before moving on
+            torch.cuda.empty_cache()
+
+            # Aggregate training statistics across microbatches and ranks
+            metrics = aggregate_training_statistics(
+                losses=losses,
+                all_mb_metrics=all_mb_metrics,
+                grad_norm=grad_norm,
+                dp_group=self.dp_mesh.get_group(),
+                dtype=self.dtype,
+            )
+            if draft_runtime is not None:
+                # Like grad_norm, this reflects the last global batch. Returned
+                # as a CPU tensor to match the Megatron worker's return type
+                # (the trainer calls .numpy() on it).
+                metrics["draft_grad_norm"] = torch.tensor(
+                    draft_grad_norm, device="cpu", dtype=torch.float32
+                )
+
+            self.timer.stop("train")
+            return metrics
+
+    @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
+    def get_logprobs(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get the logprobs of the model for a batch of data.
+
+        Uses the configured logprob_batch_size to do microbatching. With
+        ``policy.router_replay.enabled``, the rollout ``routed_experts`` are replayed (R3)
+        unless ``require_router_replay`` is False (e.g. for the reference model).
+
+        Input data is assumed to be right-padded. The method internally converts to
+        left-padded format for computation, and returns outputs in right-padded format.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        self.timer.start("get_logprobs")
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        # Validate sequence dimension
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+
+        all_log_probs = []
+        self.model.eval()
+
+        # Create logprobs post-processor
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+        )
+
+        with torch.no_grad():
+            data.to("cuda")
+            # Get microbatch iterator based on batching strategy
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                logprob_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+            )
+
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+
+                replay_context = microbatch_replay_context(
+                    self._router_replay_gates if require_router_replay else None,
+                    processed_mb,
+                )
+                with (
+                    replay_context,
+                    prepared.model_context_factory(),
+                    self._autocast_context(),
+                ):
+                    # Use forward_with_post_processing_fn for forward pass and post-processing
+                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=logprobs_post_processor,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+
+                # skip keeping the logprobs for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
+                all_log_probs.append(token_logprobs)
+
+        # Concatenate all batches
+        return_data = BatchedDataDict[LogprobOutputSpec]()
+
+        return_data["logprobs"] = pad_and_concat(
+            all_log_probs, target_len=seq_dim_size
+        ).cpu()
+
+        self.timer.stop("get_logprobs")
+        return return_data
+
+    @wrap_with_nvtx_name("automodel_policy_worker/score")
+    def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        global_batch_size = min(self.cfg["batch_size"], data.size)
+
+        # Validate sequence dimension
+        sequence_dim, _ = check_sequence_dim(data)
+
+        self.model.eval()
+        print("Begin to batch datas")
+
+        # Create score post-processor
+        score_post_processor = ScorePostProcessor(cfg=self.cfg)
+
+        with torch.no_grad():
+            data.to("cuda")
+            # Get microbatch iterator based on batching strategy
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                global_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+            )
+
+            all_rm_scores = []
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=True,
+                    allow_flash_attn_args=False,
+                )
+
+                with prepared.model_context_factory(), self._autocast_context():
+                    # Use forward_with_post_processing_fn for forward pass and post-processing
+                    rm_scores, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=score_post_processor,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+
+                # skip keeping the scores for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
+                all_rm_scores.append(rm_scores)
+
+        all_rm_scores = torch.cat(all_rm_scores, dim=0)
+        all_rm_scores = all_rm_scores.squeeze(-1).cpu()
+        return_data = BatchedDataDict[ScoreOutputSpec](
+            {
+                "scores": all_rm_scores,
+            }
+        )
+        return return_data
+
+    @wrap_with_nvtx_name("automodel_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        """Return per-position top-k logits and corresponding global indices.
+
+        Notes:
+        - Return shapes are [B, S, k].
+        - Computes top-k over the full sequence (no trimming of the last position).
+        - If alignment with next-token targets is required, the caller should handle it.
+        - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
+        - Supports context parallelism with proper CP gather.
+        - Otherwise, computes local top-k on full-vocab tensor.
+        """
+        topk_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        # Validate sequence dimension
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+
+        out_topk_vals = []
+        out_topk_idx = []
+        self.model.eval()
+
+        # Create top-k post-processor
+        topk_post_processor = TopkLogitsPostProcessor(
+            cfg=self.cfg,
+            tp_mesh=self.tp_mesh,
+            k=k,
+            enable_seq_packing=self.enable_seq_packing,
+        )
+
+        with torch.no_grad():
+            data.to("cuda")
+            # Get microbatch iterator based on batching strategy
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                topk_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+            )
+
+            for batch_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+
+                with prepared.model_context_factory(), self._autocast_context():
+                    # Use forward_with_post_processing_fn for forward pass and post-processing
+                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=topk_post_processor,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+
+                # skip keeping the topk values for the dummy batches
+                if batch_idx >= iterator_len:
+                    continue
+
+                # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
+                # Shapes remain [B, S, k].
+                out_topk_vals.append(vals.cpu())
+                out_topk_idx.append(idx.cpu())
+
+        ret = BatchedDataDict[Any]()
+        # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
+        ret["topk_logits"] = pad_and_concat(
+            out_topk_vals, target_len=seq_dim_size
+        ).cpu()
+        ret["topk_indices"] = pad_and_concat(
+            out_topk_idx, target_len=seq_dim_size
+        ).cpu()
+        return ret
+
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
+
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Each microbatch writes into slot
+        ``self._teacher_ipc_storage[buf_idx]`` and shares one cached IPC
+        handle. Returns ``{"per_sample_handles": list, "dp_rank": int}`` where
+        each handle carries ``buf_idx`` and ``sample_index_in_buf`` for the
+        consumer to index the slot view, plus the TP/CP shard metadata
+        (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
+        route shards across heterogeneous teacher/student TP/CP.
+        """
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        target_local_seq = (
+            seq_dim_size // self.cp_size if self.cp_size > 1 else seq_dim_size
+        )
+
+        self.model.eval()
+
+        post_processor = FullLogitsPostProcessor(
+            cfg=self.cfg,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            enable_seq_packing=self.enable_seq_packing,
+        )
+
+        tp_rank = self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0
+        cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+        dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
+        world_rank = torch.distributed.get_rank()
+        full_seq_len = target_local_seq * self.cp_size
+        global_seq_start = cp_rank * full_seq_len // self.cp_size
+
+        per_sample_handles: list[dict[str, Any]] = []
+        storage: Optional[torch.Tensor] = None
+        payload_ipc: Optional[tuple[Any, ...]] = None
+        with torch.no_grad():
+            data.to("cuda")
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                forward_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+            )
+            for buf_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                prepared = prepare_model_forward(
+                    self.model,
+                    processed_inputs,
+                    device_mesh=self.device_mesh,
+                    cp_size=self.cp_size,
+                    padding_token_id=self.tokenizer.pad_token_id or 0,
+                    is_reward_model=False,
+                    allow_flash_attn_args=self.allow_flash_attn_args,
+                )
+                with prepared.model_context_factory(), self._autocast_context():
+                    vals, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        prepared=prepared,
+                        post_processing_fn=post_processor,
+                        processed_mb=processed_mb,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+                if buf_idx >= iterator_len:
+                    continue
+                # Pad to canonical seq so the cached IPC handle stays shape-stable.
+                pad_needed = target_local_seq - vals.shape[1]
+                if pad_needed > 0:
+                    vals = torch.nn.functional.pad(
+                        vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                    )
+                batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
+
+                self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                    ensure_teacher_ipc_buffer(
+                        self._teacher_ipc_storage,
+                        self._teacher_ipc_handle,
+                        iterator_len,
+                        batch_size_mb,
+                        target_local_seq,
+                        local_vocab_size,
+                        vals.dtype,
+                        vals.device,
+                    )
+                )
+                storage = self._teacher_ipc_storage
+                payload_ipc = self._teacher_ipc_handle
+                storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
+                    vals
+                )
+                del vals
+                full_vocab_size = local_vocab_size * self.tp_size
+                vocab_start_index = tp_rank * local_vocab_size
+                vocab_end_index = (tp_rank + 1) * local_vocab_size
+                for sample_index_in_buf in range(batch_size_mb):
+                    per_sample_handles.append(
+                        {
+                            "payload_ipc": payload_ipc,
+                            "buf_idx": buf_idx,
+                            "sample_index_in_buf": sample_index_in_buf,
+                            "storage_shape": tuple(storage.shape),
+                            "actual_shape": (target_local_seq, local_vocab_size),
+                            "dtype": storage.dtype,
+                            "tp_rank": tp_rank,
+                            "cp_rank": cp_rank,
+                            "tp_size": self.tp_size,
+                            "cp_size": self.cp_size,
+                            "world_rank": world_rank,
+                            "vocab_start_index": vocab_start_index,
+                            "vocab_end_index": vocab_end_index,
+                            "global_seq_start": global_seq_start,
+                            "full_vocab_size": full_vocab_size,
+                            "full_seq_len": full_seq_len,
+                            "vocab_sharded": self.tp_size > 1,
+                            "sequence_sharded": self.cp_size > 1,
+                        }
+                    )
+        # The storage copies above are async on the current stream; force them
+        # to complete before the IPC handles are consumed by the student
+        # process, so the consumer can't observe a partially written buffer
+        # (ports the sync added upstream for the single-buffer export path).
+        torch.cuda.synchronize()
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def release_ipc_buffer(self) -> None:
+        """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
+        self._teacher_ipc_storage = None
+        self._teacher_ipc_handle = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @contextmanager
+    def use_reference_model(self) -> Generator[None, None, None]:
+        """Context manager that temporarily swaps the reference model and active model.
+
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        """
+        with torch.no_grad():
+            # Save train model state_dict
+            curr_state_dict = get_cpu_state_dict(
+                self.model.state_dict().items(), pin_memory=True
+            )
+
+            # Swap reference model state_dict to self.model
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(self.reference_model_state_dict[k])
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
+                )
+            else:
+                self.sampling_params = None
+
+            # - self.model is the original reference_model, now on CUDA
+            # - curr_state_dict is the train model, now on CPU
+            yield
+
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
+
+            # Restore train model state_dict
+            for k, v in self.model.state_dict().items():
+                val = to_local_if_dtensor(v)
+                val.copy_(curr_state_dict[k])
+
+    def _add_noise_to_weights(self) -> None:
+        """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
+        noise_std = 0.01  # Standard deviation for the noise
+        for p in self.model.parameters():
+            if p.requires_grad:
+                noise = torch.randn_like(p.data) * noise_std
+                p.data.add_(noise)  # Add noise in-place
+        torch.cuda.synchronize()
+
+    def return_state_dict(self):
+        return self.model.state_dict()
+
+    def return_model_config(self) -> dict[str, Any]:
+        """Return the model configuration as a dictionary.
+
+        Returns:
+            dict: Model configuration dictionary
+        """
+        return self.model.config
+
+    @torch.no_grad()
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
+        state_dict_info = {}
+        for name, tensor in self.model.state_dict().items():
+            if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                continue
+            full_tensor = (
+                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            )
+            adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(
+                self.model, name, full_tensor
+            )
+            for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
+                refit_dtype = _refit_tensor_dtype(
+                    adapted_fqn, adapted_tensor, self.dtype
+                )
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, refit_dtype)
+
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.runtime import draft_refit_export_name
+
+            # The draft is a native HF module: no adapter, no LoRA. DTensor
+            # .shape is already the global shape, so no gather is needed here.
+            for name, tensor in self.draft_model.state_dict().items():
+                fqn = draft_refit_export_name(name)
+                dtype = _refit_tensor_dtype(fqn, tensor, self.dtype)
+                state_dict_info[f"draft.{fqn}"] = (tensor.shape, dtype)
+
+        return state_dict_info
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Placeholder for FP8 Q/K/V scale calibration, not implemented for AutomodelPolicyWorker."""
+        raise NotImplementedError(
+            "calibrate_qkv_fp8_scales is not implemented for AutomodelPolicyWorker"
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("automodel_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int = 0,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
+            )
+
+        self.maybe_init_zmq()
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        # Use the shared implementation
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=automodel_params_generator(
+                self.model, self.dtype, draft_model=self.draft_model
+            ),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("automodel_policy_worker/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Send Automodel weights to colocated SGLang engines via Ray CUDA IPC.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
+        sent, so trainer-side IPC tensors stay alive until the engine has
+        copied them and per-chunk engine failures surface immediately.
+        """
+        if target_precision != "bf16":
+            raise NotImplementedError(
+                "The Automodel policy only supports BF16 SGLang refits; "
+                f"got target_precision={target_precision!r}."
+            )
+        del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
+
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        from nemo_rl.models.policy.utils import (
+            iter_named_tensor_buckets,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
+
+        bucket_iter = iter_named_tensor_buckets(
+            automodel_params_generator(self.model, self.dtype),
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=self._refit_transport_state("sglang_ipc"),
+        )
+
+    def _checkpoint_engine_params(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        return automodel_params_generator(
+            self.model, self.dtype, draft_model=self.draft_model
+        )
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
+    ) -> None:
+        """Broadcast the weights for collective communication.
+
+        Guarded exactly as the Megatron worker is, and for the same reason: a generation
+        rank that dies mid-broadcast leaves this call blocked in NCCL with no timeout and
+        no error. Disarmed unless refit_timeout_s is set, so the default path is
+        unchanged.
+        """
+        from nemo_rl.distributed.refit_watchdog import (
+            RefitAborted,
+            RefitAbortWatchdog,
+        )
+
+        with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
+            self._broadcast_weights_for_collective(
+                kv_scales=kv_scales,
+                buffer_size_bytes=buffer_size_bytes,
+                num_buffers=num_buffers,
+                use_legacy_packing=use_legacy_packing,
+            )
+        if guard.fired:
+            # The aborted collective returned cleanly, so this is the only signal there is.
+            raise RefitAborted(
+                f"refit broadcast exceeded {refit_timeout_s}s and was aborted; "
+                "a generation rank most likely stopped participating"
+            )
+
+    def _broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
+    ) -> None:
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for the Automodel path, we will support it in the future."
+            )
+
+        # Manually move model to cuda for cpu offload case
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        # param_iterator will return (name, tensor), we only need tensor
+        automodel_post_iter_func = lambda x: x[1]
+
+        packed_broadcast_producer(
+            iterator=automodel_params_generator(
+                self.model, self.dtype, draft_model=self.draft_model
+            ),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=automodel_post_iter_func,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
+        )
+
+        # Manually move model to cpu for cpu offload case
+        # cpu offload needs model on CPU before model forward
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_lp_inference")
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the model in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave the optimizer state on CUDA because a train
+                step is already open. This backend accumulates gradients in
+                ``param.grad`` and never offloads them, so unlike the Megatron
+                backend there is nothing here that could discard them; the flag
+                only suppresses the per-chunk optimizer round trip.
+        """
+        # onload model to cuda
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            self.model = self.move_buffer_to_device(self.model, "cuda")
+
+        self.model.eval()
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if (
+            not keep_train_buffers
+            and self.optimizer is not None
+            and self.offload_optimizer_for_logprob
+        ):
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @wrap_with_nvtx_name("automodel_policy_worker/prepare_for_training")
+    def prepare_for_training(self, *args, **kwargs) -> None:
+        # onload models and optimizer state to cuda
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            # when cpu offload is enabled, the buffers do not get moved
+            # to cuda automatically, so we need to do that manually
+            self.model = self.move_buffer_to_device(self.model, "cuda")
+
+        self.model.train()
+        # Training expects optimizer state on CUDA. Restore unconditionally rather
+        # than tracking which path offloaded it; move_optimizer_to_device is a no-op
+        # when the state is already resident.
+        if self.optimizer is not None and not self.cpu_offload:
+            self.move_optimizer_to_device("cuda")
+
+        torch.cuda.empty_cache()
+
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference. Only used in PPO."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_before_refit")
+    def offload_before_refit(self) -> None:
+        """Offload the optimizer to the CPU."""
+        torch.randn(1).cuda()  # wake up torch allocator
+        if self.optimizer is not None:
+            self.move_optimizer_to_device("cpu")
+
+        # Release recompute activations that MoE dispatch state keeps alive;
+        # otherwise they pin cached segments and empty_cache() cannot free them.
+        release_moe_dispatcher_state(self.model)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("automodel_policy_worker/offload_after_refit")
+    def offload_after_refit(self) -> None:
+        """Offload as much as possible on the CPU."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+        torch.randn(1).cuda()  # wake up torch allocator
+        self.offload_before_refit()  # rerun the old offload function
+
+        # Print memory stats after offloading
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+
+    def move_optimizer_to_device(self, device: str | torch.device) -> None:
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, (DTensor, torch.Tensor)):
+                    state[k] = v.to(device)
+
+    def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
+        model = self.move_buffer_to_device(model, device)
+        return model.to(device)
+
+    def move_buffer_to_device(
+        self, model: nn.Module, device: str | torch.device
+    ) -> nn.Module:
+        # FSDP modules do not move buffers to the device automatically
+        for v in model.buffers():
+            torch.utils.swap_tensors(v, v.to(device))
+
+        return model
+
+    def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
+        model = self.move_to_device(model, "cuda")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return model
+
+    def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
+        model = self.move_to_device(model, "cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return model
+
+    def save_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
+        *,
+        is_final_checkpoint: bool,
+    ) -> None:
+        """Save a checkpoint of the model.
+
+        the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
+        """
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                save_checkpoint_with_draft,
+            )
+
+            save_checkpoint_with_draft(
+                self.checkpoint_manager,
+                model=self.model,
+                draft_model=self.draft_model,
+                composite_model=self.composite_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+                peft_config=self.peft_config,
+                draft_config=self.cfg["draft"],
+            )
+        else:
+            self.checkpoint_manager.save_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+                peft_config=self.peft_config,
+            )
+
+    def finalize_async_save(self) -> None:
+        """Block until this worker's in-flight async checkpoint writes complete.
+
+        Overrides the base no-op: this worker initializes the checkpoint manager
+        with ``is_async=True``, so the caller-side rename of ``tmp_step_N`` to
+        ``step_N`` must wait for the staged writes to land.
+        """
+        if self.checkpoint_manager is None:
+            return
+        self.checkpoint_manager.finalize_async_save()
+
+    def load_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+    ) -> None:
+        """Load a checkpoint into the model using Automodel Checkpointer."""
+        if self.draft_model is not None:
+            from nemo_rl.models.automodel.draft.checkpoint import (
+                load_checkpoint_with_draft,
+            )
+
+            load_checkpoint_with_draft(
+                self.checkpoint_manager,
+                model=self.model,
+                draft_model=self.draft_model,
+                composite_model=self.composite_model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                draft_config=self.cfg["draft"],
+            )
+        else:
+            self.checkpoint_manager.load_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+            )
+
+    def _init_checkpoint_manager(
+        self,
+        config_updates: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Initialize the AutomodelCheckpointManager for this worker.
+
+        This creates the checkpoint manager bound to this worker's device meshes
+        and initializes its underlying checkpointer.
+
+        Args:
+            config_updates: Automodel checkpoint fields to set during initialization.
+        """
+        if self.checkpoint_manager is None:
+            self.checkpoint_manager = AutomodelCheckpointManager(
+                dp_mesh=self.dp_mesh,
+                tp_mesh=self.tp_mesh,
+                moe_mesh=self.moe_mesh,
+            )
+            self.checkpoint_manager.init_checkpointer(
+                config_updates=config_updates,
+            )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
+)  # pragma: no cover
+class AutomodelPolicyWorker(AutomodelPolicyWorkerImpl):
+    pass

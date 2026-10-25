@@ -19,7 +19,6 @@ from functools import partial
 from typing import Any, Optional
 
 import numpy as np
-import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -30,7 +29,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -41,7 +40,9 @@ from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
     evaluate_span,
+    iteration_scope,
     managed_span,
     umbrella_span,
     umbrella_trace_fn,
@@ -150,16 +151,16 @@ def setup(
     policy_config = master_config.policy
 
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove once CP is supported for RM training.
-    dtensor_cfg = policy_config.get("dtensor_cfg", {})
+    automodel_cfg = policy_config.get("automodel_cfg", {})
     if (
-        dtensor_cfg.get("enabled", False)
-        and dtensor_cfg.get("context_parallel_size", 1) > 1
+        automodel_cfg.get("enabled", False)
+        and automodel_cfg.get("context_parallel_size", 1) > 1
     ):
         raise ValueError(
             "Context parallelism (context_parallel_size > 1) is not supported for reward model "
-            "training on the DTensor backend. The log_sigmoid operator used in the RM loss does "
+            "training on the Automodel backend. The log_sigmoid operator used in the RM loss does "
             "not have a DTensor sharding strategy registered for CP meshes. "
-            "Please set policy.dtensor_cfg.context_parallel_size=1. "
+            "Please set policy.automodel_cfg.context_parallel_size=1. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
         )
 
@@ -375,7 +376,7 @@ def validate_one_dataset(
     timer = Timer()
     with (
         timer.time("total_validation_time"),
-        evaluate_span("rm"),
+        evaluate_span("rm", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -548,12 +549,12 @@ def rm_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
                 umbrella_span(
                     RLSpanGroup.U_STEP,
                     "rl.rm.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1},
                 ),
             ):
                 # Prepare batch and generate responses
@@ -654,14 +655,6 @@ def rm_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -709,9 +702,8 @@ def rm_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,

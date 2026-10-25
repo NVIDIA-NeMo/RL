@@ -15,12 +15,12 @@ policy:
   max_total_sequence_length: 4096
   precision: "bfloat16"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
-  scheduler: null # remove default FSDP scheduler
+  scheduler: null # remove default Automodel scheduler
 
   megatron_cfg:
     enabled: true

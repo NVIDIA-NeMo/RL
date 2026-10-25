@@ -33,7 +33,7 @@ policy:
 value:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   train_micro_batch_size: 4
-  dtensor_cfg:
+  automodel_cfg:
     tensor_parallel_size: 2
     sequence_parallel: true
 data:

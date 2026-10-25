@@ -144,6 +144,8 @@ VALUE_SEED_FIELDS = LP_SEED_FIELDS
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
+# Per-token fields padded per microbatch instead of per batch: field -> pad value.
+MICROBATCH_PADDED_FIELDS: dict[str, int | float] = {ROUTED_EXPERTS_FIELD: -1}
 ROUTED_LEN_FIELD = "routed_len"
 ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
 ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"

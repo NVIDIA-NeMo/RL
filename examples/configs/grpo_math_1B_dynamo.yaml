@@ -28,7 +28,7 @@ policy:
   max_total_sequence_length: 512
   sequence_packing:
     enabled: false
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
     cpu_offload: false
     activation_checkpointing: false
@@ -62,7 +62,6 @@ policy:
         tokenizer_cache: false
         tokenizer_cache_bytes: 52428800
         router_mode: kv
-        router_reset_states: true
         extra_cli_args: []
     vllm_cfg:
       async_engine: true

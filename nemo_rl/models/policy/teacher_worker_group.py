@@ -165,13 +165,13 @@ class TeacherWorkerGroup:
 
         # Teachers run Megatron inference-only. Don't let the student's other
         # backend or parameter-adding features leak onto the frozen teacher.
-        if cfg.get("dtensor_cfg", {}).get("enabled", False):
+        if cfg.get("automodel_cfg", {}).get("enabled", False):
             raise ValueError(
                 f"Teacher '{self.alias}': only the Megatron backend is supported "
-                "for teachers, but the policy config has dtensor_cfg.enabled=True."
+                "for teachers, but the policy config has automodel_cfg.enabled=True."
             )
-        if "dtensor_cfg" in cfg:
-            cfg["dtensor_cfg"]["enabled"] = False
+        if "automodel_cfg" in cfg:
+            cfg["automodel_cfg"]["enabled"] = False
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         cfg.pop("draft", None)

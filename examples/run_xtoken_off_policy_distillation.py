@@ -35,6 +35,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -64,13 +65,14 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
+    check_outdated_config(config)
 
+    config = MasterConfig(**config)
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
-    # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
-    # cross-tokenizer). The consistency check (a same-vocab teacher must
-    # actually share the student's vocab) needs the real tokenizers and lives
-    # in `setup()` — comparing tokenizer *names* here is wrong, e.g.
+    # `teachers[i].aligner.projection_matrix_path` (null => same-vocab direct
+    # KL; set => cross-tokenizer). The consistency check (a same-vocab teacher
+    # must actually share the student's vocab) needs the real tokenizers and
+    # lives in `setup()` — comparing tokenizer *names* here is wrong, e.g.
     # Llama-3.2-3B and Llama-3.2-1B have different names but the same vocab.
 
     print("Final config:")
