@@ -48,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
+    ClippedPGLossFn,
     DraftRuntimeLossWrapper,
     SequencePackingLossWrapper,
     prepare_loss_input,
@@ -343,6 +344,14 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
+    # Score centering optimizes the raw policy; temperature belongs to the sampler.
+    if (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and isinstance(post_processing_fn.loss_fn, ClippedPGLossFn)
+        and post_processing_fn.loss_fn.score_centering_top_k
+    ):
+        sampling_params = None
+
     # Extract the processed components
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs

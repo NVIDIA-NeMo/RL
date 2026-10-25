@@ -42,6 +42,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
+    ClippedPGLossFn,
     DraftLossWrapper,
     NLLLossFn,
     SequencePackingFusionLossWrapper,
@@ -337,6 +338,14 @@ def forward_with_post_processing_fn(
             - output_tensor: Raw model outputs (logits)
             - post_processing_fn_wrapped: Function to create output post-processing function when called
     """
+    # Shared by ordinary and split training: center scores of the raw policy.
+    if (
+        isinstance(post_processing_fn, LossPostProcessor)
+        and isinstance(post_processing_fn.loss_fn, ClippedPGLossFn)
+        and post_processing_fn.loss_fn.score_centering_top_k
+    ):
+        sampling_params = None
+
     # Get the pre-processed microbatch from the iterator
     processed_mb = next(data_iterator)
 

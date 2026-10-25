@@ -581,6 +581,8 @@ Setting `score_centering_top_k` to `0` disables the method. It works with direct
 
 The training policy uses its ordinary unscaled logits as the target distribution. If rollout temperature differs from `1.0`, vLLM's processed probabilities still represent the actual sampling distribution, so the ratio includes that temperature difference.
 
+With filtered sampling, both training and validation must use a positive temperature. Validation must keep the training `top_k`; NeMo-Gym can still override `val_temperature` and `val_top_p`. Greedy or unbounded validation is rejected during setup because vLLM enables sampling-mask collection for the whole engine, including evaluation requests.
+
 #### Adaptive PPO clip
 
 `truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:

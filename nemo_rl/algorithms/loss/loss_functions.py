@@ -1032,7 +1032,8 @@ class ClippedPGLossFn(LossFunction):
                 (curr_logprobs.detach() - generation_logprobs).clamp(-20, 20).exp()
             )
             ratios = (curr_logprobs.detach() - prev_logprobs).clamp(-20, 20).exp()
-            ratios_clamped = ratios.clamp(self.ratio_clip_min, self.ratio_clip_max)
+            # Score centering uses REINFORCE, so no PPO ratio clipping is applied.
+            ratios_clamped = ratios
             if self.truncated_importance_sampling_ratio is not None:
                 low = self.truncated_importance_sampling_ratio_min or 0.0
                 _is_filter_metrics["is_oob_ratio"] = masked_mean(

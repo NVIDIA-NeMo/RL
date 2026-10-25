@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from types import SimpleNamespace
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from nemo_rl.algorithms.grpo import add_grpo_token_loss_masks_and_generation_logprobs
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.clipped_pg import score_centered_actor_objective
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import NemoGym
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
@@ -137,7 +139,16 @@ def test_score_centering_uses_policy_head_logprobs(support_replay):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_score_centering_grpo_loss_backpropagates():
+@pytest.mark.parametrize("metrics_level", ["minimal", "full"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "loss",
+        pytest.param("automodel", marks=pytest.mark.automodel),
+        pytest.param("megatron", marks=pytest.mark.mcore),
+    ],
+)
+def test_score_centering_grpo_loss_backpropagates(metrics_level, backend, monkeypatch):
     logits = torch.randn(1, 3, 8, device="cuda", requires_grad=True)
     data = BatchedDataDict(
         {
@@ -166,20 +177,97 @@ def test_score_centering_grpo_loss_backpropagates():
             truncated_importance_sampling_type="icepop",
             truncated_importance_sampling_ratio_min=0.5,
             truncated_importance_sampling_ratio=5.0,
-            metrics_level="minimal",
+            metrics_level=metrics_level,
         )
     )
+    counts = {
+        "global_valid_seqs": torch.tensor(1.0, device="cuda"),
+        "global_valid_toks": torch.tensor(2.0, device="cuda"),
+    }
     loss_input, prepared = prepare_loss_input(logits, data, loss_fn)
-    loss, metrics = loss_fn(
-        **loss_input,
-        data=prepared,
-        global_valid_seqs=torch.tensor(1.0, device="cuda"),
-        global_valid_toks=torch.tensor(2.0, device="cuda"),
-    )
+    expected_loss, expected_metrics = loss_fn(**loss_input, data=prepared, **counts)
+    expected_grad = torch.autograd.grad(expected_loss, logits, retain_graph=True)[0]
+    sampling_params = TrainingSamplingParams(temperature=0.7)
+    if backend == "loss":
+        loss, metrics = expected_loss, expected_metrics
+    elif backend == "automodel":
+        # Deferred: each backend has its own optional dependencies and test marker.
+        from nemo_rl.models.automodel import train
+        from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
+
+        inputs = ProcessedInputs(input_ids=data["input_ids"], seq_len=3)
+        mb = ProcessedMicrobatch(
+            data, inputs, original_batch_size=1, original_seq_len=3
+        )
+        model = torch.nn.Identity()
+        monkeypatch.setattr(train, "model_forward", lambda *_: logits)
+        monkeypatch.setattr(train, "extract_logits", lambda _, output: output)
+        processor = train.LossPostProcessor(
+            loss_fn,
+            {},
+            cp_mesh=None,
+            cp_size=1,
+            dp_size=1,
+            sampling_params=sampling_params,
+        )
+        loss, metrics, _ = train.forward_with_post_processing_fn(
+            model,
+            train.prepare_model_forward(
+                model,
+                inputs,
+                device_mesh=None,
+                cp_size=1,
+                padding_token_id=0,
+                is_reward_model=False,
+                allow_flash_attn_args=False,
+            ),
+            processor,
+            mb,
+            sampling_params=sampling_params,
+            **counts,
+        )
+    else:
+        from nemo_rl.models.megatron import train
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+
+        mb = ProcessedMicrobatch(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            input_ids_cp_sharded=data["input_ids"],
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+        )
+        monkeypatch.setattr(train, "model_forward", lambda *args, **kwargs: logits)
+        monkeypatch.setattr(train, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(train, "get_tensor_model_parallel_group", lambda: None)
+        monkeypatch.setattr(train, "get_context_parallel_group", lambda: None)
+        monkeypatch.setattr(train, "get_context_parallel_world_size", lambda: 1)
+        processor = train.LossPostProcessor(
+            loss_fn,
+            {"sequence_packing": {"enabled": False}},
+            sampling_params=sampling_params,
+        )
+        output, finish = train.forward_with_post_processing_fn(
+            iter([mb]),
+            torch.nn.Identity(),
+            processor,
+            sampling_params=sampling_params,
+            **counts,
+        )
+        loss, metrics = finish(output)
+
+    torch.testing.assert_close(loss, expected_loss)
     assert torch.isfinite(loss)
     assert "score_centering_head_mass" in metrics
+    if metrics_level == "full":
+        torch.testing.assert_close(
+            metrics["probs_ratio_clamped"], metrics["probs_ratio"]
+        )
     loss.backward()
     assert torch.isfinite(logits.grad).all()
+    torch.testing.assert_close(logits.grad, expected_grad)
 
 
 def test_score_centering_requires_reinforce_and_logits():

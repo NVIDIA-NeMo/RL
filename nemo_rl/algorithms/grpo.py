@@ -642,6 +642,64 @@ def _shutdown_completed_nemo_gym_startup(
     shard_set.shutdown()
 
 
+def _validate_validation_sampling(master_config: MasterConfig) -> None:
+    """Check train and validation sampling against the shared rollout engine."""
+    generation_config = master_config.policy["generation"]
+    assert generation_config is not None
+    score_centering_replay = bool(
+        master_config.loss_fn.score_centering_top_k
+        and need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(
+                top_k=generation_config["top_k"], top_p=generation_config["top_p"]
+            )
+        )
+    )
+    if score_centering_replay:
+        if generation_config["temperature"] <= 0:
+            raise ValueError("Filtered score centering requires temperature > 0")
+        grpo_config = master_config.grpo
+        if (
+            grpo_config.val_period > 0
+            or grpo_config.val_at_start
+            or grpo_config.val_at_end
+        ):
+            # vLLM enables sampling-mask collection for the entire engine, including
+            # evaluation requests. Gym only overrides temperature/top_p per request.
+            if (
+                generation_config["val_temperature"] <= 0
+                or generation_config["val_top_k"] is None
+                or generation_config["val_top_k"] <= 0
+                or generation_config["val_top_k"] != generation_config["top_k"]
+            ):
+                raise ValueError(
+                    "Filtered score centering requires val_temperature > 0 and "
+                    "val_top_k equal to the positive training top_k. The shared "
+                    "vLLM sampling-mask engine cannot serve greedy or unbounded "
+                    "validation requests."
+                )
+
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if val_sampling_overridden:
+        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
+            master_config
+        ), (
+            "generation.val_temperature/val_top_p/val_top_k differing from the "
+            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+        )
+        assert not generation_config["val_top_k"] or (
+            score_centering_replay
+            and generation_config["val_top_k"] == generation_config["top_k"]
+        ), (
+            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
+            "only honors val_temperature/val_top_p. Leave val_top_k null, or "
+            "keep the training top_k for filtered score centering."
+        )
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -737,28 +795,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
-
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
+    _validate_validation_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )

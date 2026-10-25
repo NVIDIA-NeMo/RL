@@ -674,6 +674,7 @@ def attach_token_information_to_chat_response_choices(
         choice.message.generation_log_probs = generation_log_probs
 
         if score_centering_top_k and generation_token_ids:
+            assert generation_logprob_details is not None
             from nemo_rl.models.generation.vllm.vllm_worker import (
                 BaseVllmGenerationWorker,
             )
