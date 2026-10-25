@@ -178,6 +178,31 @@ vllm = [
   "flashinfer-jit-cache==0.6.18",
   "nvidia-cutlass-dsl[cu13]==4.6.2",
 ]
+# Managed Dynamo backend. The dynamo.vllm workers load NeMo RL's vLLM worker
+# extension for refit, so this must stay the vllm extra above plus the Dynamo
+# runtime (tests/unit/test_dependency_pins.py enforces this). Only the
+# base ai-dynamo package is installed: its [vllm] extra pins vLLM 0.28.0.
+# Resolved in its own fork (see conflicts) because ai-dynamo-runtime caps pydantic.
+dynamo = [
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "transformers==5.12.1",
+  "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "cuda-python",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  "vllm==0.29.0",
+  "num2words>=0.5.14",
+  "flashinfer-python==0.6.18",
+  "flashinfer-cubin==0.6.18",
+  "flashinfer-jit-cache==0.6.18",
+  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "ai-dynamo==1.5.1",
+  "ai-dynamo-runtime==1.5.1",
+  # Imported by dynamo.vllm / dynamo.frontend; normally pulled in by ai-dynamo[vllm].
+  "uvloop",
+  "blake3>=1.0.0,<2.0.0",
+]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
   # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
@@ -453,7 +478,7 @@ override-dependencies = [
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
-  # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
+  # Applies to the dynamo extra too, so trainers and Dynamo workers share one NCCL.
   "nvidia-nccl-cu13==2.30.7",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
@@ -586,6 +611,13 @@ conflicts = [
   # Spelled nemo_gym (the raw extras-table key): uv < 0.12 compares conflict
   # entries against unnormalized extra names and rejects "nemo-gym".
   [{ extra = "nemo_gym" }, { extra = "sglang" }],
+  # dynamo needs its own fork: ai-dynamo-runtime 1.5.1 caps pydantic below the
+  # version the other environments resolve.
+  [{ extra = "dynamo" }, { extra = "vllm" }],
+  [{ extra = "dynamo" }, { extra = "sglang" }],
+  [{ extra = "dynamo" }, { extra = "mcore" }],
+  [{ extra = "dynamo" }, { extra = "automodel" }],
+  [{ extra = "dynamo" }, { extra = "trtllm" }],
 ]
 
 

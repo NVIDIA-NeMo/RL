@@ -12,80 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
-import pickle
-import sys
-import threading
-import types
 from typing import Optional
 
 import torch
-from nccl.core import SUM
 from nccl.core.communicator import Communicator
 from nccl.core.utils import UniqueId, get_unique_id
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 
 _NEMO_UNIQUE_ID_KEY = "nccl_unique_id"
-_VLLM_UNIQUE_ID_KEY = "broadcast_from/0/0"
-_VLLM_NCCL_MODULE = "vllm.distributed.device_communicators.pynccl_wrapper"
-_VLLM_PICKLE_LOCK = threading.Lock()
-
-
-class _VllmNcclUniqueId(ctypes.Structure):
-    _fields_ = [("internal", ctypes.c_byte * 128)]
-
-
-_VllmNcclUniqueId.__module__ = _VLLM_NCCL_MODULE
-_VllmNcclUniqueId.__name__ = "ncclUniqueId"
-_VllmNcclUniqueId.__qualname__ = "ncclUniqueId"
-
-
-def _pickle_vllm_unique_id(unique_id_bytes: bytes) -> bytes:
-    """Serialize an NCCL unique ID in vLLM's metadata wire format.
-
-    vLLM's stateless process group pickles its ``ncclUniqueId`` ctypes
-    structure. Training workers do not install vLLM, so construct the same
-    ctypes type under its canonical module name only while serializing.
-    """
-    if len(unique_id_bytes) != 128:
-        raise ValueError(
-            f"Expected a 128-byte NCCL unique ID, got {len(unique_id_bytes)} bytes."
-        )
-
-    module_names = [
-        "vllm",
-        "vllm.distributed",
-        "vllm.distributed.device_communicators",
-        _VLLM_NCCL_MODULE,
-    ]
-    with _VLLM_PICKLE_LOCK:
-        previous_modules = {name: sys.modules.get(name) for name in module_names}
-        modules = {name: types.ModuleType(name) for name in module_names}
-        for name in module_names[:-1]:
-            modules[name].__path__ = []
-
-        modules["vllm"].distributed = modules["vllm.distributed"]
-        modules["vllm.distributed"].device_communicators = modules[
-            "vllm.distributed.device_communicators"
-        ]
-        modules["vllm.distributed.device_communicators"].pynccl_wrapper = modules[
-            _VLLM_NCCL_MODULE
-        ]
-
-        modules[_VLLM_NCCL_MODULE].ncclUniqueId = _VllmNcclUniqueId
-
-        try:
-            sys.modules.update(modules)
-            unique_id = _VllmNcclUniqueId.from_buffer_copy(unique_id_bytes)
-            payload = pickle.dumps(unique_id)
-        finally:
-            for name, previous_module in previous_modules.items():
-                if previous_module is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = previous_module
-        return payload
 
 
 class StatelessProcessGroup:
@@ -155,19 +90,12 @@ class StatelessProcessGroup:
         if communicator is not None:
             communicator.abort()
 
-    def init_nccl_communicator(self, device: int, *, peer: str = "nemo") -> None:
-        """Initialize NCCL using the metadata and warmup protocol of the peer.
+    def init_nccl_communicator(self, device: int) -> None:
+        """Initialize NCCL over this group's rendezvous store.
 
-        ``peer="nemo"`` publishes the raw 128-byte unique ID under
-        ``nccl_unique_id`` and warms up with a rank-zero broadcast.
-        ``peer="vllm"`` additionally publishes vLLM's pickled ``ncclUniqueId``
-        under ``broadcast_from/0/0`` and warms up with an all-reduce, matching
-        ``PyNcclCommunicator``. The receiver protocol is not negotiable, so a
-        generation backend must select the peer it implements.
+        Rank 0 publishes the raw 128-byte unique ID under ``nccl_unique_id``, and a
+        rank-zero broadcast warms the communicator up.
         """
-        if peer not in ("nemo", "vllm"):
-            raise ValueError(f"Unsupported NCCL peer protocol: {peer!r}.")
-
         if self.tcp_store is None:
             raise RuntimeError(
                 "StatelessProcessGroup has no rendezvous store: the group was aborted. "
@@ -176,7 +104,6 @@ class StatelessProcessGroup:
 
         if self.rank == 0:
             unique_id = get_unique_id()
-            unique_id_bytes = unique_id.as_bytes
             # The torch stub types `value` as str, but TCPStore.set accepts bytes and
             # round-trips them byte-for-byte (verified directly). Bytes is also required
             # here, not incidental: a NCCL UniqueId is binary and would not survive a
@@ -184,19 +111,11 @@ class StatelessProcessGroup:
             # does not check this file, which is why upstream carries no annotation.
             self.tcp_store.set(
                 _NEMO_UNIQUE_ID_KEY,
-                unique_id_bytes,  # pyrefly: ignore[bad-argument-type]
+                unique_id.as_bytes,  # pyrefly: ignore[bad-argument-type]
             )
-            if peer == "vllm":
-                self.tcp_store.set(
-                    _VLLM_UNIQUE_ID_KEY,
-                    _pickle_vllm_unique_id(
-                        unique_id_bytes
-                    ),  # pyrefly: ignore[bad-argument-type]
-                )
         else:
             self.tcp_store.wait([_NEMO_UNIQUE_ID_KEY])
-            unique_id_bytes = self.tcp_store.get(_NEMO_UNIQUE_ID_KEY)
-            unique_id = UniqueId.from_bytes(unique_id_bytes)
+            unique_id = UniqueId.from_bytes(self.tcp_store.get(_NEMO_UNIQUE_ID_KEY))
 
         with torch.cuda.device(device):
             self.nccl_communicator = Communicator.init(
@@ -205,24 +124,13 @@ class StatelessProcessGroup:
                 unique_id=unique_id,
             )
             stream = torch.cuda.current_stream()
-            if peer == "vllm":
-                # Match PyNcclCommunicator's first collective exactly.
-                data = torch.zeros(1, device=device)
-                self.nccl_communicator.allreduce(
-                    sendbuf=data,
-                    recvbuf=data,
-                    op=SUM,
-                    stream=int(stream.cuda_stream),
-                )
+            if self.rank == 0:
+                data = torch.ones(1, device=device)
             else:
-                if self.rank == 0:
-                    data = torch.ones(1, device=device)
-                else:
-                    data = torch.zeros(1, device=device)
-                self.broadcast(data, 0, stream=stream)
+                data = torch.zeros(1, device=device)
+            self.broadcast(data, 0, stream=stream)
             stream.synchronize()
-            if peer == "nemo":
-                assert torch.allclose(data, torch.ones(1, device=device))
+            assert torch.allclose(data, torch.ones(1, device=device))
 
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None

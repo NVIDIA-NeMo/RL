@@ -421,39 +421,6 @@ def test_the_generation_reshard_hook_accepts_what_the_synchronizer_sends():
     "synchronizer",
     ["collective_weight_synchronizer.py", "nccl_reshard_weight_synchronizer.py"],
 )
-def test_the_rebuild_bootstraps_with_the_same_peer_protocol_as_the_first_build(
-    synchronizer,
-):
-    """A rebuilt communicator must not silently fall back to the "nemo" default.
-
-    The receiver's bootstrap is not negotiable: "nemo" publishes a raw unique ID and warms
-    up with a rank-0 broadcast, "vllm" adds a pickled ID key and warms up with an
-    all-reduce. Mismatched warmups on one communicator HANG rather than error -- the exact
-    failure the rebuild exists to remove, reappearing inside the recovery.
-    """
-    path = REPO_ROOT / "nemo_rl" / "weight_sync" / synchronizer
-    tree = ast.parse(path.read_text())
-    calls = [
-        call
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "init_collective"
-        and isinstance(call.func.value, ast.Attribute)
-        and call.func.value.attr == "_policy"
-    ]
-    assert calls, "no policy.init_collective call found"
-    for call in calls:
-        assert "nccl_peer" in {kw.arg for kw in call.keywords}, (
-            "every policy.init_collective must pass nccl_peer; the rebuild omitted it and "
-            "silently bootstrapped with the wrong protocol."
-        )
-
-
-@pytest.mark.parametrize(
-    "synchronizer",
-    ["collective_weight_synchronizer.py", "nccl_reshard_weight_synchronizer.py"],
-)
 def test_a_failed_refit_waits_for_stragglers_before_it_propagates(synchronizer):
     """The caller rebuilds on this failure, and a rebuild needs every rank out first.
 

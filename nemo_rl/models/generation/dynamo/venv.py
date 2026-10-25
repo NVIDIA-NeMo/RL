@@ -12,33 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Resolve executables installed by the optional Dynamo environment."""
+"""Resolve the interpreter and service binaries the managed Dynamo runtime launches."""
 
 import os
+import shutil
 from pathlib import Path
 
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.utils.venvs import create_local_venv
 
-def get_dynamo_venv_dir() -> Path:
-    """Return the configured Dynamo virtual-environment directory."""
-    configured = os.environ.get("NEMO_RL_DYNAMO_VENV_DIR")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    repo_root = Path(__file__).resolve().parents[4]
-    return repo_root / "venvs" / "dynamo"
-
-
-def get_dynamo_executable(name: str) -> str:
-    """Return an executable in the Dynamo environment, failing if absent."""
-    executable = get_dynamo_venv_dir() / "bin" / name
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise FileNotFoundError(
-            f"Dynamo executable {executable} is unavailable. Build with "
-            "BUILD_DYNAMO=1 or run docker/dynamo/install.sh with "
-            "NEMO_RL_DYNAMO_VENV_DIR set."
-        )
-    return str(executable)
+DYNAMO_WORKER_FQN = "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker"
 
 
 def get_dynamo_python() -> str:
-    """Return the validated Python interpreter for ``ai-dynamo``."""
-    return get_dynamo_executable("python")
+    """Return the Dynamo actor venv's Python on this node, building the venv if needed.
+
+    The driver launches ``dynamo.frontend`` with it. The ``dynamo.vllm`` workers
+    use their actor's own interpreter, which is the same venv.
+    """
+    py_executable = get_actor_python_env(DYNAMO_WORKER_FQN)
+    if py_executable.startswith("uv"):
+        return create_local_venv(py_executable, DYNAMO_WORKER_FQN)
+    return py_executable
+
+
+def get_dynamo_service_executable(name: str) -> str:
+    """Return the etcd or nats-server binary the runtime starts.
+
+    Looks in ``NEMO_RL_DYNAMO_BIN_DIR`` when it is set, otherwise on ``PATH``.
+    """
+    bin_dir = os.environ.get("NEMO_RL_DYNAMO_BIN_DIR")
+    if bin_dir:
+        executable = Path(bin_dir).expanduser() / name
+        if executable.is_file() and os.access(executable, os.X_OK):
+            return str(executable)
+        raise FileNotFoundError(
+            f"{name} is not an executable file in NEMO_RL_DYNAMO_BIN_DIR={bin_dir}."
+        )
+    found = shutil.which(name)
+    if found is None:
+        raise FileNotFoundError(
+            f"{name} is not on PATH. Install it, or set NEMO_RL_DYNAMO_BIN_DIR to "
+            "the directory that holds etcd and nats-server."
+        )
+    return found

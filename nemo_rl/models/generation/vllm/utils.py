@@ -133,6 +133,51 @@ def assert_reload_refit_config_supported(config: VllmConfig) -> None:
         )
 
 
+def spec_decode_max_tokens(
+    base_max_tokens: int,
+    input_len: int,
+    max_model_len: int,
+    spec_lookahead: int,
+) -> int:
+    """Clamp max_tokens so speculative decoding never reads past max_model_len.
+
+    The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+    at least `spec_lookahead + 1` tokens before the boundary.
+    """
+    return max(
+        1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+    )
+
+
+def mtp_drafter_setup(
+    speculative_config: Optional[dict[str, Any]],
+    *,
+    load_format: str,
+    weights_from_refit: bool,
+) -> tuple[bool, bool]:
+    """Decide how an engine's MTP drafter gets its weights.
+
+    A drafter the trainer co-trains is fed by every refit. Otherwise refit does
+    not cover the draft layer, so a dummy-loaded engine reads it from the
+    checkpoint once after start (``load_mtp_weights_from_disk``).
+
+    Args:
+        speculative_config: ``vllm_kwargs.speculative_config``, if any.
+        load_format: The engine's effective vLLM load format.
+        weights_from_refit: Whether the trainer co-trains the MTP layer.
+
+    Returns:
+        Whether the engine runs an MTP drafter, and whether it must load the
+        drafter's weights from disk.
+    """
+    enabled = (
+        isinstance(speculative_config, dict)
+        and speculative_config.get("method") in ("deepseek_mtp", "mtp")
+        and speculative_config.get("num_speculative_tokens") != 0
+    )
+    return enabled, enabled and load_format == "dummy" and not weights_from_refit
+
+
 def is_grouped_moe_expert_weight_name(name: str) -> bool:
     """Return whether a checkpoint key is a grouped MoE expert slab."""
     return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)

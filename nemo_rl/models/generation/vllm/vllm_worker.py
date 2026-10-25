@@ -57,7 +57,9 @@ from nemo_rl.models.generation.vllm.utils import (
     HISTOGRAM_SUM_PART,
     encode_counter_key,
     format_prompt_for_vllm_generation,
+    mtp_drafter_setup,
     pad_and_align_routed_expert_indices,
+    spec_decode_max_tokens,
     validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.video_utils import (
@@ -173,52 +175,6 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     if enable_prefix_caching is None:
         enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
     return enable_prefix_caching
-
-
-def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
-    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
-
-    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
-    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
-    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
-    update and merge it separately so that fp8's ``quantization_config`` is the
-    base while user overrides (e.g. ``max_position_embeddings``) survive and take
-    precedence. Required FP8 ignore entries are combined with user-provided ignore
-    entries so generated safety exclusions cannot be removed. This regression was
-    reintroduced once already; see #1413/#2904.
-    """
-    fp8_kwargs = dict(fp8_kwargs)
-    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
-    vllm_kwargs.update(fp8_kwargs)
-    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
-    merged_hf_overrides = {**fp8_hf_overrides, **existing_hf_overrides}
-
-    fp8_quantization_config = fp8_hf_overrides.get("quantization_config")
-    existing_quantization_config = existing_hf_overrides.get("quantization_config")
-    if existing_quantization_config is None:
-        if fp8_quantization_config is not None:
-            merged_hf_overrides["quantization_config"] = fp8_quantization_config
-    elif not isinstance(existing_quantization_config, dict):
-        raise ValueError("hf_overrides.quantization_config must be a mapping")
-    elif isinstance(fp8_quantization_config, dict):
-        merged_quantization_config = {
-            **fp8_quantization_config,
-            **existing_quantization_config,
-        }
-        for key in ("ignore", "ignored_layers"):
-            generated_values = fp8_quantization_config.get(key, [])
-            user_values = existing_quantization_config.get(key, [])
-            if not isinstance(generated_values, list) or not isinstance(
-                user_values, list
-            ):
-                raise ValueError(f"quantization_config.{key} must be a list")
-            if generated_values or user_values:
-                merged_quantization_config[key] = list(
-                    dict.fromkeys([*generated_values, *user_values])
-                )
-        merged_hf_overrides["quantization_config"] = merged_quantization_config
-
-    vllm_kwargs["hf_overrides"] = merged_hf_overrides
 
 
 def _validate_worker_extension_cls(
@@ -635,20 +591,11 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
-        # MTP speculative decoding with load_format="dummy" gets its policy
-        # weights via refit, but the MTP draft layer is not covered by refit, so
-        # those layers are loaded directly from the checkpoint after engine init
-        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
-        spec_cfg = vllm_kwargs.get("speculative_config")
-        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
-        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
-            "method"
-        ) in ("deepseek_mtp", "mtp")
-        self._mtp_weights_from_refit = mtp_weights_from_refit
-        self._mtp_load_from_disk: bool = (
-            load_format == "dummy"
-            and self._mtp_speculative_enabled
-            and not mtp_weights_from_refit
+        self._mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled, self._mtp_load_from_disk = mtp_drafter_setup(
+            vllm_kwargs.get("speculative_config"),
+            load_format=load_format,
+            weights_from_refit=self._mtp_weights_from_refit,
         )
 
         if (
@@ -668,6 +615,9 @@ class BaseVllmGenerationWorker:
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
+            from nemo_rl.models.generation.vllm.quantization.fp8_kwargs import (
+                merge_fp8_kwargs,
+            )
 
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
@@ -675,7 +625,7 @@ class BaseVllmGenerationWorker:
 
             # Merge (rather than replace) so fp8's quantization_config coexists
             # with user-supplied hf_overrides, which take precedence.
-            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
+            merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
@@ -884,22 +834,6 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
-    @staticmethod
-    def _spec_decode_max_tokens(
-        base_max_tokens: int,
-        input_len: int,
-        max_model_len: int,
-        spec_lookahead: int,
-    ) -> int:
-        """Clamp max_tokens so speculative decoding never reads past max_model_len.
-
-        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
-        at least `spec_lookahead + 1` tokens before the boundary.
-        """
-        return max(
-            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
-        )
-
     @classmethod
     def _request_max_new_tokens(
         cls,
@@ -919,7 +853,7 @@ class BaseVllmGenerationWorker:
                 max_model_len=max_model_len,
             )
         if spec_lookahead > 0:
-            max_new_tokens = cls._spec_decode_max_tokens(
+            max_new_tokens = spec_decode_max_tokens(
                 max_new_tokens,
                 input_length,
                 max_model_len,

@@ -28,6 +28,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitFleetShape,
     agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
@@ -474,6 +475,13 @@ class MegatronGeneration(GenerationInterface):
             sub_world_size=sub_world_size,
         )
 
+    def get_refit_fleet_shape(self) -> RefitFleetShape:
+        """Return the DP shards of this backend's worker group."""
+        return RefitFleetShape(
+            dp_size=self.worker_group.dp_size,
+            total_gen_workers=len(self.worker_group.workers),
+        )
+
     def set_refit_membership(self, membership: "RefitMembership") -> None:
         """Record the inference ranks participating in nccl_reshard refits."""
         self._refit_membership = membership
@@ -518,7 +526,6 @@ class MegatronGeneration(GenerationInterface):
                     world_size=membership.world_size,
                     train_world_size=membership.train_world_size,
                     rank_offset=membership.train_world_size + rank - original_rank,
-                    nccl_peer=self.get_collective_sender_spec().nccl_peer,
                 )
             )
         return futures

@@ -46,6 +46,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitFleetShape,
     agreed_media_columns,
 )
 from nemo_rl.models.generation.vllm.config import (
@@ -943,6 +944,13 @@ class VllmGeneration(GenerationInterface):
         if shard_idx < len(self.dp_openai_server_base_urls):
             self.dp_openai_server_base_urls[shard_idx] = url
         return url
+
+    def get_refit_fleet_shape(self) -> RefitFleetShape:
+        """Return the DP shards of this backend's worker group."""
+        return RefitFleetShape(
+            dp_size=self.worker_group.dp_size,
+            total_gen_workers=len(self.worker_group.workers),
+        )
 
     def set_refit_membership(self, membership: "RefitMembership") -> None:
         """Record which shards take part in refits from now on.

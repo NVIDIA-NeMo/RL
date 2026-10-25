@@ -628,13 +628,17 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         )
 
     # Generation backends with a destination-side HFToLocalParamMap adapter.
+    # Managed Dynamo runs vLLM engines that load the same NeMo RL worker extension,
+    # so every vLLM destination rule below applies to it too.
     backend = generation.get("backend")
-    if backend not in ("vllm", "megatron"):
+    if backend not in ("vllm", "dynamo", "megatron"):
         violations.append(
-            f"policy.generation.backend must be 'vllm' or 'megatron' (got {backend!r})."
+            "policy.generation.backend must be 'vllm', 'dynamo' or 'megatron' "
+            f"(got {backend!r})."
         )
+    vllm_destination = backend in ("vllm", "dynamo")
 
-    if backend == "vllm" and vllm_kwargs.get("enable_eplb"):
+    if vllm_destination and vllm_kwargs.get("enable_eplb"):
         violations.append(
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
@@ -678,7 +682,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
 
         # ETP with vLLM generation has not been fully tested yet.
-        if backend == "vllm" and etp not in (1, None):
+        if vllm_destination and etp not in (1, None):
             violations.append(
                 "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
                 f"for vLLM generation until ETP is fully tested (got {etp})."
@@ -713,7 +717,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
                 "policy.megatron_cfg.fp8_cfg.enabled=True."
             )
-        if backend == "vllm":
+        if vllm_destination:
             gen_precision = vllm_cfg.get("precision", None)
             if gen_precision not in (
                 None,
@@ -814,7 +818,7 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     # Megatron ETP. The vLLM backend shards experts by index across
     # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
     # (EP-sharded). PP is not yet supported gen-side.
-    if backend == "vllm":
+    if vllm_destination:
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)

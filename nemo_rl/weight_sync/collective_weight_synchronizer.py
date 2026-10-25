@@ -141,13 +141,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
         with timer_context:
-            sender_spec = self._generation.get_collective_sender_spec()
             futures_train = self._policy.broadcast_weights_for_collective(
                 kv_scales=kv_scales,
                 refit_timeout_s=self._refit_timeout_s,
-                buffer_size_bytes=sender_spec.buffer_size_bytes,
-                num_buffers=sender_spec.num_buffers,
-                use_legacy_packing=sender_spec.use_legacy_packing,
             )
             futures_inference = self._generation.update_weights_from_collective(
                 refit_timeout_s=self._refit_timeout_s
@@ -188,35 +184,28 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     def _desired_membership(
         self, absent_shards: Sequence[int], train_world_size: int
     ) -> Optional[RefitMembership]:
-        """The membership to track, or None for a backend that owns no DP worker group.
+        """The membership to track, or None for a backend with no DP shards.
 
-        NOT every GenerationInterface has one. vLLM and TRT-LLM do; Dynamo, Megatron and
-        SGLang do not, and the interface declares nothing either way -- so reading
-        ``self._generation.worker_group`` assumes a vLLM shape that this synchronizer is
-        not entitled to assume. It holds a GenerationInterface, and Dynamo reaches it
-        through the ordinary non-colocated branch of the factory.
-
-        That assumption broke L1_Functional_Tests_Dynamo on the plain grpo.py path:
-
-            grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
-            AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+        The backend reports its shards through ``get_refit_fleet_shape``. SGLang has
+        none, and reading ``worker_group`` directly assumed a vLLM shape this
+        synchronizer is not entitled to assume: that once broke
+        L1_Functional_Tests_Dynamo with an AttributeError in ``init_communicator``.
 
         None means "this backend has no shards to track", which is the same thing an
         unrecorded membership already meant: every reconcile falls through to "nothing to
         do", exactly as it behaved before membership tracking existed. Re-admission is only
         meaningful where shards exist.
 
-        Deliberately NOT mirrored on the reshard synchronizer. nccl_reshard is a vLLM-only
-        transport that REQUIRES a worker group, so a missing one there is a
-        misconfiguration that should fail loudly rather than silently degrade.
+        Deliberately NOT mirrored on the reshard synchronizer, which builds its plan per
+        generation rank and so fails loudly when a backend reports no shards.
         """
-        worker_group = getattr(self._generation, "worker_group", None)
-        if worker_group is None:
+        shape = self._generation.get_refit_fleet_shape()
+        if shape is None:
             return None
         return desired_membership(
             absent_shards=absent_shards,
-            dp_size=worker_group.dp_size,
-            total_gen_workers=len(worker_group.workers),
+            dp_size=shape.dp_size,
+            total_gen_workers=shape.total_gen_workers,
             train_world_size=train_world_size,
         )
 
@@ -233,13 +222,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             inference_world_size = self._inference_cluster.world_size()
         world_size = train_world_size + inference_world_size
 
-        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
             ip,
             port,
             world_size,
             train_world_size=train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.init_collective(
             ip, port, world_size, train_world_size=train_world_size
@@ -340,19 +327,11 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # already have it is cheap and removes the need to track who is new.
         initialize_refit_metadata(self._policy, self._generation)
 
-        # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
-        # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0
-        # broadcast, "vllm" adds a pickled ID key and warms up with an all-reduce. Omitting
-        # it here silently rebuilt with the "nemo" default, and mismatched warmups on one
-        # communicator HANG rather than error -- the exact failure this path exists to
-        # remove, reappearing inside the recovery.
-        sender_spec = self._generation.get_collective_sender_spec()
         futures_train = self._policy.init_collective(
             ip,
             port,
             membership.world_size,
             train_world_size=membership.train_world_size,
-            nccl_peer=sender_spec.nccl_peer,
         )
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)

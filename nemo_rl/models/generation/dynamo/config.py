@@ -25,12 +25,6 @@ from pydantic import (
     model_validator,
 )
 
-# Packed weight-transfer geometry. NeMo RL declares it to each Dynamo worker in
-# the NCCL init info, and the trainer packs with the same values, so both sides
-# recompute identical chunk boundaries.
-VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
-VLLM_PACKED_NUM_BUFFERS = 2
-
 DYNAMO_VLLM_FLAGS: dict[str, str] = {
     "tensor_parallel_size": "--tensor-parallel-size",
     "pipeline_parallel_size": "--pipeline-parallel-size",
@@ -62,11 +56,33 @@ _VLLM_CFG_UNSUPPORTED = {
     # Enforced by NeMo RL's own HTTP server; the managed Dynamo frontend checks
     # no bearer token, so a truthy value is rejected below rather than warned.
     "http_server_api_key_required",
+    "skip_tokenizer_init",
+}
+
+# Read by the vLLM backend's FP8 builder when precision='fp8'; the Dynamo worker
+# actor turns its result into engine arguments, and NeMo RL's worker extension
+# applies the matching patches inside each engine.
+_VLLM_CFG_FP8 = {
     "is_mx",
     "num_first_layers_in_bf16",
     "num_last_layers_in_bf16",
-    "skip_tokenizer_init",
+    "pow2_activation_scaling_factors",
+    "pow2_weight_scaling_factors",
+    "quantization_ignore_patterns",
+    "quantization_ignored_layer_kws",
+    "refit_prequantize",
     "use_deep_gemm",
+}
+
+# Applied by the Dynamo worker actor as a vLLM source patch plus the engine
+# environment variable that enables it, as the vLLM backend does.
+_VLLM_CFG_ENGINE_PATCHES = {
+    "fp32_lm_head",
+}
+
+# Read by NeMo RL's worker extension inside each engine at refit time.
+_VLLM_CFG_REFIT = {
+    "refit_with_reload_api",
 }
 
 _VLLM_CFG_MANAGED_RUNTIME = {
@@ -219,40 +235,38 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
                 "backend='dynamo' requires expert_parallel_size to be 1 or "
                 "equal tensor_parallel_size"
             )
-        if self.precision.lower() not in {
-            "bf16",
-            "bfloat16",
-        }:
+        if self.precision not in {"bfloat16", "fp8"}:
             raise ValueError(
                 f"policy.generation.vllm_cfg.precision={self.precision!r} is not "
-                "supported by backend='dynamo'; managed weight refit currently "
-                "supports BF16 generation only"
+                "supported by backend='dynamo'; use 'bfloat16' or 'fp8'"
             )
+        # FP8 KV-cache scales are refit only with synchronous rollouts, and managed
+        # Dynamo always rolls out asynchronously.
         if self.kv_cache_dtype != "auto":
             raise ValueError(
                 f"policy.generation.vllm_cfg.kv_cache_dtype={self.kv_cache_dtype!r} "
                 "is not supported by backend='dynamo'; use 'auto'"
             )
         extra = self.model_extra or {}
-        if extra.get("is_mx"):
-            raise ValueError(
-                "policy.generation.vllm_cfg.is_mx is not supported by "
-                "backend='dynamo'; use backend='vllm' for MXFP8 generation"
-            )
         if extra.get("http_server_api_key_required"):
             raise ValueError(
                 "policy.generation.vllm_cfg.http_server_api_key_required is not "
                 "supported by backend='dynamo'; the managed Dynamo frontend checks "
                 "no bearer token, so the exposed server would stay open"
             )
-        if (
-            int(extra.get("num_first_layers_in_bf16") or 0) != 0
-            or int(extra.get("num_last_layers_in_bf16") or 0) != 0
-        ):
+        if extra.get("refit_prequantize"):
             raise ValueError(
-                "mixed BF16/FP8 generation is not supported by backend='dynamo'; "
-                "use backend='vllm'"
+                "policy.generation.vllm_cfg.refit_prequantize is not supported by "
+                "backend='dynamo'; managed Dynamo requests no trainer-side MXFP8 "
+                "pre-quantization"
             )
+        if self.precision != "fp8":
+            active_fp8_fields = sorted(key for key in _VLLM_CFG_FP8 if extra.get(key))
+            if active_fp8_fields:
+                raise ValueError(
+                    f"policy.generation.vllm_cfg.{active_fp8_fields} require "
+                    "precision='fp8' when backend='dynamo'"
+                )
         logprobs_mode = extra.get("logprobs_mode")
         if logprobs_mode not in (None, "processed_logprobs"):
             raise ValueError(
@@ -281,6 +295,9 @@ class DynamoVllmConfig(BaseModel, extra="allow"):
             | set(_VLLM_CFG_MOVED)
             | _VLLM_CFG_UNSUPPORTED
             | _VLLM_CFG_MANAGED_RUNTIME
+            | _VLLM_CFG_REFIT
+            | _VLLM_CFG_ENGINE_PATCHES
+            | _VLLM_CFG_FP8
             | _VLLM_CFG_INAPPLICABLE
             | _VLLM_SINGLE_RANK_ONLY_FIELDS
         )
@@ -339,10 +356,12 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.colocated.enabled must be false when "
                 "backend='dynamo'"
             )
-        if extra.get("refit_transport") is not None:
+        refit_transport = extra.get("refit_transport")
+        if refit_transport not in (None, "nccl_reshard"):
             raise ValueError(
-                "policy.generation.refit_transport must be null when "
-                "backend='dynamo'; managed Dynamo supports NCCL collective refit only"
+                f"policy.generation.refit_transport={refit_transport!r} is not "
+                "supported when backend='dynamo'; use null (NCCL collective refit) "
+                "or 'nccl_reshard'"
             )
         for quantization_field in ("quant_cfg", "real_quant"):
             if extra.get(quantization_field):
@@ -350,21 +369,29 @@ class DynamoConfig(BaseModel, extra="allow"):
                     f"policy.generation.{quantization_field} is not supported "
                     "when backend='dynamo'"
                 )
-        speculative_config = self.vllm_kwargs.get("speculative_config") or (
-            self.vllm_cfg.model_extra or {}
-        ).get("speculative_config")
-        if speculative_config:
+        if (self.vllm_cfg.model_extra or {}).get("speculative_config"):
             raise ValueError(
-                "policy.generation.vllm_kwargs.speculative_config is not "
-                "supported by backend='dynamo' because draft weights are not "
-                "refit after step 0"
+                "policy.generation.vllm_cfg.speculative_config is not read by the "
+                "Dynamo backend; set policy.generation.vllm_kwargs.speculative_config"
             )
         if self.vllm_kwargs.get("quantization") is not None:
             raise ValueError(
                 "policy.generation.vllm_kwargs.quantization is not supported "
                 "when backend='dynamo'"
             )
+        if self.vllm_kwargs.get("worker_extension_cls") is not None:
+            raise ValueError(
+                "policy.generation.vllm_kwargs.worker_extension_cls is not supported "
+                "when backend='dynamo'; managed engines always load NeMo RL's worker "
+                "extension, which every refit relies on"
+            )
         vllm_extra = self.vllm_cfg.model_extra or {}
+        if vllm_extra.get("reset_encoder_cache_after_weight_update"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update "
+                "is not supported when backend='dynamo'; Dynamo exposes no route to "
+                "reset the multimodal encoder cache after a refit"
+            )
         for field in sorted(_VLLM_SINGLE_RANK_ONLY_FIELDS):
             for source, value in (
                 ("vllm_cfg", vllm_extra.get(field)),
