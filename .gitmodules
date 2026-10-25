@@ -10,6 +10,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://github.com/kashif/gym.git
+	url = https://github.com/kashif/nemo-gym.git
 	branch = main
 	shallow = true
