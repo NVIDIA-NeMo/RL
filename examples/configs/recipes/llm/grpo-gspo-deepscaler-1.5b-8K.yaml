@@ -15,7 +15,7 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   max_total_sequence_length: 8192
-  dtensor_cfg:
+  automodel_cfg:
     cpu_offload: true
     sequence_parallel: true
     activation_checkpointing: true
@@ -27,10 +27,10 @@ policy:
     kwargs:
       lr: 2.0e-06
   generation:
-    vllm_cfg:
-      enforce_eager: true
     vllm_kwargs:
+      # CUDA graphs (backend: eager) instead of enforce_eager (~2x faster generation), see #4569
       compilation_config:
+        backend: eager
         custom_ops: ["all", "-rotary_embedding"]
 data:
   train:

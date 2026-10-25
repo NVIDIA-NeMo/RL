@@ -23,6 +23,7 @@ from nemo_rl.models.megatron.draft.utils import (
     draft_model_detached,
     export_eagle_weights_to_hf,
     load_hf_weights_to_eagle,
+    validate_dflash_export_state_dict,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "load_hf_weights_to_eagle",
     "export_eagle_weights_to_hf",
     "get_eagle3_aux_hidden_state_layers",
+    "validate_dflash_export_state_dict",
 ]

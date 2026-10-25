@@ -47,7 +47,10 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
@@ -56,6 +59,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 from nemo_rl.utils.timer import Timer
 
 
@@ -147,6 +151,7 @@ def main() -> None:
             config = parse_hydra_overrides(config, overrides)
 
         config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
         config = MasterConfig(**config)
         materialize_vllm_video_config(config.policy, config.data)
         print("Applied CLI overrides")
@@ -182,6 +187,7 @@ def main() -> None:
             tokenizer,
             has_refit_draft_weights=has_refit_draft_weights,
             trains_mtp=trains_mtp,
+            draft_full_refit=draft_full_refit_enabled(config.policy),
         )
         if is_vlm and "vllm_cfg" in config.policy["generation"]:
             assert not config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"], (
@@ -195,12 +201,27 @@ def main() -> None:
     # We assert here since this is right after the final config has been materialized.
     assert should_use_nemo_gym(config)
 
+    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
+    # before setup() so it is not forwarded into NeMo-Gym's global config. It
+    # also determines whether the validation dataset is the collection input.
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].pop("is_trajectory_collection", False)
+    )
+    should_load_validation = is_trajectory_collection or (
+        config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
+    )
+
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
     with rl_init_timer.time("data"):
         print("\n▶ Setting up data...")
         data_tokenizer = processor if processor is not None else tokenizer
+        if not should_load_validation and config.data.get("validation") is not None:
+            print("  - Skipping validation dataset because validation is disabled.")
         train_dataset, val_dataset = setup_response_data(
-            data_tokenizer, config.data, env_configs=None
+            data_tokenizer,
+            config.data,
+            env_configs=None,
+            load_validation=should_load_validation,
         )
 
     # Validation dataset config setup.
@@ -228,13 +249,6 @@ The validation set you pass in will directly be used for validation with no addi
         # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
         maybe_configure_data_plane_env(config.data_plane)
         init_ray()
-
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
 
     with rl_init_timer.time("setup"):
         (

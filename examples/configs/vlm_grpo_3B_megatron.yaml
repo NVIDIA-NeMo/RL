@@ -1,6 +1,6 @@
 defaults: vlm_grpo_3B.yaml
 policy:
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   dynamic_batching:
     enabled: false

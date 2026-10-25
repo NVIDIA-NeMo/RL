@@ -15,7 +15,6 @@
 import os
 from typing import Any, Callable, Optional, Union, cast
 
-import torch
 import yaml
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -36,6 +35,12 @@ from nemo_rl.data.interfaces import (
 from nemo_rl.data.processors import preference_preprocessor
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+from nemo_rl.utils.path_utils import (
+    load_checkpoint_object,
+    open_path,
+    path_exists,
+    save_checkpoint_object,
+)
 
 
 def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
@@ -61,6 +66,22 @@ def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
     return None
 
 
+def save_dataloader_state(
+    dataloader_state: Any,
+    checkpoint_path: str | os.PathLike[str],
+    suffix: str = "",
+) -> None:
+    """Save a dataloader state to ``{checkpoint_path}/train_dataloader{suffix}.pt``.
+
+    Counterpart of :func:`load_dataloader_state`; works for local paths and
+    ``msc://`` checkpoint locations, so algorithms share one save path.
+    """
+    save_checkpoint_object(
+        dataloader_state,
+        os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt"),
+    )
+
+
 def load_dataloader_state(
     dataloader: Any,
     checkpoint_path: str,
@@ -83,13 +104,13 @@ def load_dataloader_state(
     read out of the sibling ``config.yaml`` so every existing checkpoint is
     automatically compatible.
     """
-    saved_state = torch.load(
+    saved_state = load_checkpoint_object(
         os.path.join(checkpoint_path, f"train_dataloader{suffix}.pt")
     )
 
     config_path = os.path.join(checkpoint_path, "config.yaml")
-    if os.path.exists(config_path):
-        with open(config_path) as f:
+    if path_exists(config_path):
+        with open_path(config_path) as f:
             saved_config = yaml.safe_load(f) or {}
         saved_name = get_train_dataset_name(saved_config.get("data"))
         current_name = get_train_dataset_name(data_config)
@@ -147,6 +168,8 @@ def setup_response_data(
     data_config: DataConfig,
     env_configs: Optional[dict[str, Any]] = None,
     is_vlm: bool = False,
+    *,
+    load_validation: bool = True,
 ) -> Union[
     tuple[
         Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
@@ -171,6 +194,8 @@ def setup_response_data(
             - Algorithms like SFT which do not need environments.
             - Environments like NeMo-Gym which need to handle the environment creation outside of this function.
         is_vlm: Whether to use VLM training or not.
+        load_validation: Whether to load validation data configured directly or
+            split from a training dataset.
 
     Returns:
         If env_configs is not None:
@@ -178,11 +203,6 @@ def setup_response_data(
         If env_configs is None:
             A tuple of (train dataset, validation dataset).
     """
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#dataset "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
-    )
-
     # ==========================
     # Setup Environments
     # ==========================
@@ -269,25 +289,32 @@ def setup_response_data(
     val_agent_name_source_sets = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
-    for data in data_list:
-        if hasattr(data, "val_dataset") and data.val_dataset is not None:
-            val_data_list.append(data.val_dataset)
-            val_agent_name_source_sets.append(getattr(data, "agent_name_sources", None))
-            print(
-                f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
-            )
-            # bind task_name to task_data_processors and task_to_env
-            task_name = data.task_name
-            val_task_data_processors[task_name] = task_data_processors[task_name]
-            if task_name in task_data_preprocessors:
-                val_task_data_preprocessors[task_name] = task_data_preprocessors[
-                    task_name
-                ]
-            if has_envs:
-                val_task_to_env[task_name] = task_to_env[task_name]
+    if load_validation:
+        for data in data_list:
+            if hasattr(data, "val_dataset") and data.val_dataset is not None:
+                val_data_list.append(data.val_dataset)
+                val_agent_name_source_sets.append(
+                    getattr(data, "agent_name_sources", None)
+                )
+                print(
+                    f"  - Loaded validation dataset {data.task_name} with {len(data.val_dataset)} samples."
+                )
+                # bind task_name to task_data_processors and task_to_env
+                task_name = data.task_name
+                val_task_data_processors[task_name] = task_data_processors[task_name]
+                if task_name in task_data_preprocessors:
+                    val_task_data_preprocessors[task_name] = task_data_preprocessors[
+                        task_name
+                    ]
+                if has_envs:
+                    val_task_to_env[task_name] = task_to_env[task_name]
 
     # validation dataset from config
-    if "validation" in data_config and data_config["validation"] is not None:
+    if (
+        load_validation
+        and "validation" in data_config
+        and data_config["validation"] is not None
+    ):
         if isinstance(data_config["validation"], dict):
             data_config["validation"] = [data_config["validation"]]
 
@@ -354,11 +381,6 @@ def setup_preference_data(
     Returns:
         A tuple of (train dataset, validation dataset).
     """
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/dpo.md#datasets "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1763 to update the dataset config."
-    )
-
     print("\n▶ Setting up data...")
     # setup train dataset
     if "default" in data_config:

@@ -31,6 +31,7 @@ from nemo_rl.data.multimodal_utils import (
     IMAGE_CONTENT_TYPES,
     VIDEO_CONTENT_TYPES,
     PackedTensor,
+    attach_processor_media_token_validity_mask,
     extract_input_media_sources_from_responses_messages,
     extract_multimodal_model_inputs,
     get_responses_content_part_url,
@@ -184,9 +185,6 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     return nemo_gym_examples
 
 
-# WARNING: A function-call output beginning with HTTP(S) is accepted here and
-# passed to ``resolve_to_image``, which performs an outbound request during
-# postprocessing even when the tool result is not actually an image.
 def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
     """Pull PIL images out of a non-assistant Responses-API item.
 
@@ -252,7 +250,7 @@ def _has_image_before_first_trainable_output(output: list[dict]) -> bool:
             continue
         if item.get("type") == "function_call_output":
             source = item.get("output")
-            if isinstance(source, str) and _looks_like_image_src(source):
+            if isinstance(source, str) and source.startswith("data:image/"):
                 return True
         content = item.get("content") or []
         if not isinstance(content, list):
@@ -869,6 +867,7 @@ def nemo_gym_example_to_video_datum_spec(
     if "imgs_sizes" in processed and "num_frames" not in processed:
         processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
     user_message.update(extract_multimodal_model_inputs(processor, processed))
+    attach_processor_media_token_validity_mask(user_message, processor)
 
     length = len(user_message["token_ids"])
     loss_multiplier = 1.0
@@ -893,10 +892,17 @@ def nemo_gym_example_to_video_datum_spec(
         _inject_vllm_mm_processor_kwargs(extra_env_info, mm_processor_kwargs)
 
     if max_seq_length is not None and length >= max_seq_length:
+        # Don't train on rows that exceed the max sequence length.
         for key, value in list(user_message.items()):
             if isinstance(value, PackedTensor):
+                # Empty the data.
                 user_message[key] = PackedTensor.empty_like(value)
         user_message["token_ids"] = user_message["token_ids"][: min(4, max_seq_length)]
+        # Zero out the media validity mask, none of these dummy tokens are
+        # associated with injected multimodal embeddings.
+        user_message["media_token_validity_mask"] = torch.zeros_like(
+            user_message["token_ids"], dtype=torch.bool
+        )
         length = len(user_message["token_ids"])
         loss_multiplier = 0.0
         extra_env_info = _make_overlength_filtered_video_example(nemo_gym_example)

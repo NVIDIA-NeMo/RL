@@ -14,9 +14,9 @@
 
 #!/bin/bash
 # Shard: Model tests not covered by mcore/automodel/generation shards
-# Picks up base (unmarked) tests from models/policy/, models/dtensor/, models/huggingface/
-# Tests in models/megatron/ (all mcore) and models/automodel/ (all automodel) are excluded
-# by conftest.py filtering since this is a base run.
+# Picks up base (unmarked) tests from every models/ subdirectory except generation/
+# Tests carrying the mcore or automodel marker are excluded by conftest.py filtering,
+# since this is a base run.
 
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 

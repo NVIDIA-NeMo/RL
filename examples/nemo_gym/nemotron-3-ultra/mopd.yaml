@@ -31,6 +31,8 @@
 # vLLM parallelism: TP=8, EP=8.
 # =============================================================================
 
+defaults: ../legacy_environment_servers/ultra_rlvr.yaml
+
 # =============================================================================
 # Cluster — overridden by launch script
 # =============================================================================
@@ -165,8 +167,10 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
     cpu_offload: false
     sequence_parallel: false
@@ -404,6 +408,49 @@ env:
   # true: skip expensive train_data_step*.jsonl (recommended for large Gym runs); false: write full jsonl.
   should_log_nemo_gym_responses: true
   nemo_gym:
+    swe_pivot_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: swe_pivot_tool_simulation_agent
+    terminal_multi_harness_stirrup_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_stirrup_agent
+    terminal_multi_harness_agent006_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_agent006_agent
+    terminal_multi_harness_opencode_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_opencode_agent
+    terminal_multi_harness_codex_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: terminal_multi_harness_codex_agent
+    litmus_agent_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: rdkit_chemistry_agent
+
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
     num_gpu_nodes: 12
