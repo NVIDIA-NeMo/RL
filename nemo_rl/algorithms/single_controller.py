@@ -161,6 +161,11 @@ from nemo_rl.algorithms.single_controller_utils.masking_stats import (
     new_masking_stats_accumulator,
     reduce_masking_stats,
 )
+from nemo_rl.algorithms.single_controller_utils.pass_rate_filter import (
+    PassRateFilterStats,
+    pass_rate_filter_config,
+    pass_rate_filter_weights,
+)
 from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     accumulate_rollout_stats,
     new_rollout_stats_accumulator,
@@ -905,6 +910,17 @@ class SingleControllerActor:
         # This step's grpo.adv_estimator.positive_length_reweight statistics, merged from every
         # advantage-stage call; None until a call reports some (the reweighting is off).
         self._length_reweight_stats: Optional[PositiveLengthReweightStats] = None
+        # <algo>.pass_rate_filter (None when off); parsed here so a bad block fails at startup.
+        self._pass_rate_filter = pass_rate_filter_config(self._algo_cfg)
+        self._pass_rate_filter_stats: Optional[PassRateFilterStats] = None
+        if (
+            self._pass_rate_filter is not None
+            and int(getattr(self._algo_cfg, "num_generations_per_prompt", 1)) < 2
+        ):
+            raise ValueError(
+                "pass_rate_filter needs num_generations_per_prompt >= 2 (with one rollout per "
+                "prompt every group's pass rate is 0 or 1 and the filter would zero the batch)"
+            )
 
         # Seeded here rather than in run(): on resume _trainer_version is the
         # checkpoint's step, so a run resuming mid-warmup needs the widened
@@ -3815,6 +3831,9 @@ class SingleControllerActor:
                 if self._length_reweight_stats is not None:
                     step_metrics.update(self._length_reweight_stats.to_metrics())
                     self._length_reweight_stats = None
+                if self._pass_rate_filter_stats is not None:
+                    step_metrics.update(self._pass_rate_filter_stats.to_metrics())
+                    self._pass_rate_filter_stats = None
                 if self._teacher_coordinator is not None:
                     step_metrics.update(self._teacher_coordinator.drain_metrics())
 
@@ -6438,6 +6457,27 @@ class SingleControllerActor:
                     self._algo_cfg.malformed_thinking_advantage
                 ),
             )
+
+        # <algo>.pass_rate_filter: groups whose pass rate is outside [lower, upper] get their
+        # advantages scaled by out_of_band_weight (0 = no policy gradient). Applied to the final
+        # advantages; masks untouched, so the critic still trains on every rollout.
+        if self._pass_rate_filter is not None and has_valid_training_tokens:
+            row_weights, filter_stats = pass_rate_filter_weights(
+                prompt_ids=prompt_ids,
+                rewards=rewards,
+                vote_mask=baseline_mask,
+                canonical_of_row=canonical_row_of(
+                    identity, real_index, len(meta.sample_ids)
+                ),
+                train_mask=mask,
+                config=self._pass_rate_filter,
+            )
+            advantages = advantages * row_weights.to(
+                device=advantages.device, dtype=advantages.dtype
+            ).unsqueeze(-1)
+            if self._pass_rate_filter_stats is None:
+                self._pass_rate_filter_stats = PassRateFilterStats()
+            self._pass_rate_filter_stats.merge(filter_stats)
 
         response_advantages = torch.masked_select(advantages, mask.bool())
         self._step_log_dict["rewards"].append(rewards.detach().cpu())
