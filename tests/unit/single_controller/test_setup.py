@@ -3665,7 +3665,7 @@ class TestRewardScalingValidation:
     inverted interval would surface as inf/nan or sign-flipped advantages a
     whole rollout later, with nothing naming the config key that caused it.
 
-    The check reads the shaping block off whichever algorithm block is
+    The check reads the scaling block off whichever algorithm block is
     present, so GRPO alone covers it.
     """
 

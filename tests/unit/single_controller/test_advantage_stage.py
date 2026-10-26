@@ -874,8 +874,18 @@ class TestRewardScaling:
 
     def test_sharding_is_unaffected(self) -> None:
         # Per-row, so it must not make the stage shard-dependent.
-        _, adv_local, metrics_local = _run_with_scaling(self.COLLAPSING, 0)
-        _, adv_pool, metrics_pool = _run_with_scaling(self.COLLAPSING, 3)
+        recipe = RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        )
+        _, _, unscaled = _run_with_scaling(None, 0)
+        _, adv_local, metrics_local = _run_with_scaling(recipe, 0)
+        _, adv_pool, metrics_pool = _run_with_scaling(recipe, 3)
+        # The remap moves the logged reward, so the comparison below depends on the scale.
+        assert metrics_local[REWARD_KEY] != pytest.approx(unscaled[REWARD_KEY])
         torch.testing.assert_close(adv_pool, adv_local)
         assert metrics_pool == pytest.approx(metrics_local)
 
