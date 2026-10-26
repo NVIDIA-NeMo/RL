@@ -1286,7 +1286,9 @@ Depending on your data shape, you may want to change these values."""
         # Close before the first snapshot: an empty pending set alone does not
         # prevent a queued request from starting after finalization/cleanup.
         method, operation = (
-            ("POST", "close") if self._forest_training else ("GET", "manifest")
+            ("POST", "close-admission")
+            if self._forest_training
+            else ("GET", "manifest")
         )
         while True:
             manifest = await self._control(
@@ -1391,7 +1393,7 @@ Depending on your data shape, you may want to change these values."""
             )
         manifest = await self._drained_manifest(owner)
         parsed = RolloutManifest.model_validate(manifest)
-        if parsed.rollout_id != owner:
+        if parsed.capture_key != owner:
             raise ValueError("Capture manifest belongs to another dispatched attempt")
         by_call = {r.model_call_id: r for r in parsed.records}
         # Cancellation can follow a durable commit. Only that settled failure
@@ -1633,7 +1635,7 @@ Depending on your data shape, you may want to change these values."""
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
         return {
-            "rollout_id": rollout_id,
+            "capture_key": rollout_id,
             "reward": reward,
             "attempted_call_ids": manifest.get("attempted_call_ids", []),
             "pending_call_ids": manifest.get("pending_call_ids", []),

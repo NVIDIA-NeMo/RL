@@ -48,7 +48,7 @@ def _request() -> ReassemblyRequest:
         canonical_sample_ids=("group_g0",),
         receipts=(
             {
-                "rollout_id": "group_g0",
+                "capture_key": "group_g0",
                 "manifest": [
                     {
                         "call_id": "call",

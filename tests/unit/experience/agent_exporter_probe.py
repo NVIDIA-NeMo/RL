@@ -92,7 +92,7 @@ def selected_chain_plan(records: list, response: dict) -> tuple[tuple[str, ...],
         selected, tuple(ActionOutputFlags(False, False) for _ in selected)
     )
     receipt = {
-        "rollout_id": owner,
+        "capture_key": owner,
         "manifest": [record.model_dump(mode="json") for record in records],
         "terminal_model_call_id": terminal.model_call_id,
         "terminal_selection": "declared",

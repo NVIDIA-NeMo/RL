@@ -50,7 +50,7 @@ def _record(
     cum_len = prev_len + delta_len
     extras_digest = compute_extras_digest(None)
     values = {
-        "rollout_id": rollout_id,
+        "capture_key": rollout_id,
         "model_call_id": model_call_id,
         "parent_call_id": parent_call_id,
         "mode": mode,
@@ -139,7 +139,7 @@ def build_fixture_artifacts(
             )
         )
     receipt = RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         terminal_model_call_id=records[-1].model_call_id,
         manifest=[_manifest(record) for record in records],
         terminal_selection="declared",

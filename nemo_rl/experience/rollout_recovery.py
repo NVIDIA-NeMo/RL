@@ -331,7 +331,7 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
                 "staging_key values"
             )
         staging_keys.append(entry["staging_key"])
-    owner = receipt.get("rollout_id")
+    owner = receipt.get("capture_key")
     if not pending.issubset(receipt.get("attempted_call_ids", [])) or any(
         entry.get("model_call_id") in pending for entry in manifest
     ):
@@ -641,10 +641,10 @@ class RolloutRecoveryLedger:
                 "streamed rollout identity mismatch: "
                 f"result={gate_rollout_id!r}, expected={expected_gate_rollout_id!r}"
             )
-        if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
+        if receipt is not None and receipt.get("capture_key") != gate_rollout_id:
             raise ValueError(
                 "receipt rollout identity mismatch: "
-                f"receipt={receipt.get('rollout_id')!r}, expected={gate_rollout_id!r}"
+                f"receipt={receipt.get('capture_key')!r}, expected={gate_rollout_id!r}"
             )
         if attempt.status == RolloutAttemptStatus.SEALED:
             if (
@@ -724,11 +724,11 @@ class RolloutRecoveryLedger:
                 )
             if (
                 result.receipt is not None
-                and result.receipt.get("rollout_id") != expected_gate_rollout_id
+                and result.receipt.get("capture_key") != expected_gate_rollout_id
             ):
                 raise ValueError(
                     "receipt rollout identity mismatch: "
-                    f"receipt={result.receipt.get('rollout_id')!r}, "
+                    f"receipt={result.receipt.get('capture_key')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
             if not isinstance(result.mask_sample, bool):
@@ -1152,7 +1152,7 @@ class RolloutRecoveryLedger:
                                 "sealed missing-receipt attempt cannot own staging keys"
                             )
                     elif isinstance(receipt, dict):
-                        if receipt.get("rollout_id") != gate_id:
+                        if receipt.get("capture_key") != gate_id:
                             raise ValueError("sealed receipt identity mismatch")
                         if _receipt_staging_keys(receipt) != staging_keys:
                             raise ValueError("sealed receipt staging manifest mismatch")

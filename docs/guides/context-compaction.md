@@ -83,6 +83,10 @@ Candidate admission reconstructs staging ancestry from existing call parent link
 
 `/context/{attempt}/measure` uses the same Responses conversion, candidate admission, RL preprocessing and splice decision as generation. It returns a count and an explicit feature acknowledgement, never tokens. It creates no call intent, staged record, or capture acknowledgement. Model/template/processor configuration must remain fixed during an attempt.
 
+Staging wire models use `capture_key` for the current capture attempt. Restored calls use
+`source_capture_key` for their earlier staging owner. Gym and RL must upgrade together; logical
+rollout IDs and the storage-key and digest formats stay unchanged.
+
 The existing ledger tracks exact attempted call IDs. A missing worker acknowledgement remains pending, even if the HTTP request has ended, because the worker may still have written or be writing. After the agent returns, RL closes new admissions under the ledger lock, then waits up to 300 seconds for already-admitted calls without recorded failures to resolve. A recorded failure ends the wait for that call without acknowledging its writes. If capture remains incomplete, RL masks that entire logical rollout, including any partial history; a first-call failure needs no accepted-response witness. Healthy siblings can still train. A group with no valid input layout is dropped. Pending calls are excluded from immediate cleanup, and their possible late writes remain isolated under the original attempt ID until staging-partition teardown. They cannot become a parent or be reused by a fresh attempt. Repeated ambiguous failures can therefore retain staging storage until teardown.
 
 ![Native recency-agent scheduling and token-guard outcomes, including early chunk closure and current failure handling.](../assets/context-compaction/compaction-trigger.svg)

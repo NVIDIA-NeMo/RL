@@ -64,7 +64,7 @@ def _segment(
     parent_hash = None
     for ordinal in range(2 if child else 1):
         admission = {
-            "rollout_id": scope,
+            "capture_key": scope,
             "model_call_id": f"c{first + ordinal}",
             "parent_call_id": f"c{first}" if ordinal else None,
             "mode": "token_in" if ordinal else "text",
@@ -101,11 +101,11 @@ def _segment(
             update={"response_id": f"{scope}/{record.model_call_id}"}
         )
         for record in sink.records
-        if record.rollout_id == scope
+        if record.capture_key == scope
     ]
     ids = [f"{scope}/{record.model_call_id}" for record in sink.records[first:]]
     receipt = RolloutReceipt(
-        rollout_id=scope,
+        capture_key=scope,
         manifest=manifest,
         terminal_model_call_id=manifest[-1].model_call_id,
         terminal_selection="declared",

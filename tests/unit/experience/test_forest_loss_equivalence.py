@@ -187,7 +187,7 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
     ) -> CommitCoords:
         # Observe full worker inputs BEFORE staging/materialization. The oracle
         # must not reconstruct its prompts by splitting the finalizer's output.
-        calls.append((call.admission.rollout_id, deepcopy(kwargs)))
+        calls.append((call.admission.capture_key, deepcopy(kwargs)))
         return complete_call(capture, call, **kwargs)
 
     monkeypatch.setattr(RolloutTokenCapture, "complete_call", record)

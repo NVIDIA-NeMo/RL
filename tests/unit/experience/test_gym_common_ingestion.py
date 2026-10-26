@@ -561,7 +561,7 @@ def test_capture_evidence_roundtrip_restart_and_conflict(
         item = message("original") | {"id": "native"}
         saved = call(1, [item])
         commit = CaptureLedgerCommit(
-            rollout_id="owner", record=saved, request_items=[], response_items=[item]
+            capture_key="owner", record=saved, request_items=[], response_items=[item]
         )
         await store.record(commit)
         if file:

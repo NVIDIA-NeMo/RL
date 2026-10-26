@@ -128,7 +128,7 @@ def test_twenty_turn_shared_client_to_replay_and_advantages(
             transport = MagicMock(spec=ServerClient)
 
             async def post(**kwargs: Any) -> Any:
-                assert kwargs["_retry"] is False
+                assert kwargs["_resend_after_disconnect"] is False
                 response = harness.client.post(
                     kwargs["url_path"],
                     json=kwargs["json"].model_dump(mode="json"),

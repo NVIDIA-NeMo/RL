@@ -36,7 +36,7 @@ def _env(harness):
 
     async def control(method, path):
         capture_id = path.split("/")[-2]
-        if method == "POST" and path.endswith("/close"):
+        if method == "POST" and path.endswith("/close-admission"):
             return await harness.ledger.close_admissions(capture_id)
         assert method == "GET" and path.endswith("/manifest")
         return await harness.ledger.manifest(capture_id)
@@ -144,11 +144,11 @@ def test_forest_seals_failed_owner_without_claiming_its_pending_write():
     ):
         receipts = [
             {
-                "rollout_id": rollout_ids[0],
+                "capture_key": rollout_ids[0],
                 "manifest": [{"staging_key": f"{rollout_ids[0]}/good"}],
             },
             {
-                "rollout_id": rollout_ids[1],
+                "capture_key": rollout_ids[1],
                 "manifest": [],
                 "capture_poisoned": True,
                 "attempted_call_ids": ["failed"],

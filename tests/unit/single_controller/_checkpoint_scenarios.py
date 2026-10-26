@@ -379,7 +379,7 @@ async def _round_trip(
                     generation_index=generation_index,
                     gate_rollout_id=gate_rollout_id,
                     receipt={
-                        "rollout_id": gate_rollout_id,
+                        "capture_key": gate_rollout_id,
                         "manifest": [{"staging_key": staging_key}],
                     },
                     reward=float(generation_index),

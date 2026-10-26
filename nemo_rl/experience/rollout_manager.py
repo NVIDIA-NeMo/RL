@@ -2453,10 +2453,10 @@ class RolloutManager:
                     f"result={gate_rollout_id!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            if receipt is not None and receipt.get("rollout_id") != gate_rollout_id:
+            if receipt is not None and receipt.get("capture_key") != gate_rollout_id:
                 raise ValueError(
                     "receipt rollout identity mismatch: "
-                    f"receipt={receipt.get('rollout_id')!r}, "
+                    f"receipt={receipt.get('capture_key')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
             mask_sample = bool(

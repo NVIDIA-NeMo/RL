@@ -458,8 +458,8 @@ class RolloutReassembler:
         except (TypeError, ValueError) as error:
             return rejected(f"invalid_receipt:{error}", [])
         staging_keys = [record.staging_key for record in parsed.manifest]
-        if parsed.rollout_id != rollout_id:
-            return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
+        if parsed.capture_key != rollout_id:
+            return rejected(f"identity_mismatch:{parsed.capture_key}", staging_keys)
         if parsed.failure_reason is not None:
             return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
         if parsed.capture_poisoned:
@@ -1353,7 +1353,7 @@ class RolloutReassembler:
         ):
             parsed = RolloutReceipt.model_validate(receipt)
             _receipt_staging_keys(receipt)
-            if parsed.rollout_id != owner or any(
+            if parsed.capture_key != owner or any(
                 record.staging_key != staging_key(owner, record.model_call_id)
                 for record in parsed.manifest
             ):
@@ -1537,7 +1537,7 @@ class RolloutReassembler:
                     else None
                 )
                 if parsed is not None:
-                    if parsed.rollout_id != expected_id or any(
+                    if parsed.capture_key != expected_id or any(
                         record.staging_key
                         != staging_key(expected_id, record.model_call_id)
                         for record in parsed.manifest
@@ -1641,7 +1641,7 @@ class RolloutReassembler:
                 # Only recover grouping identity, never training validity, from
                 # a sound selected root when a later call poisoned segment zero.
                 root_receipt = RolloutReceipt(
-                    rollout_id=segments[0].capture_rollout_id,
+                    capture_key=segments[0].capture_rollout_id,
                     manifest=roots,
                     terminal_model_call_id=roots[0].model_call_id,
                     terminal_selection="declared",

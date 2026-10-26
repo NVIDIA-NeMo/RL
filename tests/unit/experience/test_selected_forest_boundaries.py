@@ -102,7 +102,7 @@ def ordinary(replies: list[dict], *, terminal: str | None = None) -> dict:
 
 def receipt(records: list, *, terminal: Any) -> dict:
     return {
-        "rollout_id": "attempt",
+        "capture_key": "attempt",
         "manifest": [r.model_dump() for r in records],
         "terminal_model_call_id": terminal.model_call_id,
         "terminal_selection": "declared",

@@ -43,7 +43,7 @@ def test_rejected_first_and_middle_responses_never_enter_selected_traces(
         transport = MagicMock(spec=ServerClient)
 
         async def post(**kwargs: Any) -> Any:
-            assert kwargs["_retry"] is False
+            assert kwargs["_resend_after_disconnect"] is False
             response = harness.client.post(
                 kwargs["url_path"],
                 json=kwargs["json"].model_dump(mode="json"),

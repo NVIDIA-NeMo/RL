@@ -199,7 +199,7 @@ def test_terminus_real_transcript_and_existing_decision_references(
     else:
         assert selected_response_ids(records, {"output": raw}) == selected
     receipt = {
-        "rollout_id": "owner",
+        "capture_key": "owner",
         "manifest": [r.model_dump(mode="json") for r in records],
         "terminal_model_call_id": records[-1].model_call_id,
         "terminal_selection": "declared",
@@ -226,7 +226,7 @@ def test_interleaved_conversations_become_one_segment_each() -> None:
     ]
     selected = ("response-1", "response-4", "response-2", "response-3")
     receipt = {
-        "rollout_id": "owner",
+        "capture_key": "owner",
         "manifest": [r.model_dump(mode="json") for r in records],
         "terminal_model_call_id": "call-4",
         "terminal_selection": "declared",

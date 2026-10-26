@@ -1294,7 +1294,7 @@ async def test_context_refusal_acknowledges_unstaged_capture(
     serving_chat.create_chat_completion = refuse
     request = _fake_chat_request()
     request.ng_capture = {
-        "rollout_id": "r1",
+        "capture_key": "r1",
         "model_call_id": "refused",
         "mode": "text",
     }
@@ -1335,14 +1335,14 @@ async def test_unknown_length_error_does_not_acknowledge_unstaged_capture(monkey
     serving_chat.create_chat_completion = fail
     request = _fake_chat_request()
     request.ng_capture = {
-        "rollout_id": "r1",
+        "capture_key": "r1",
         "model_call_id": "uncertain",
         "mode": "text",
     }
     _track_request_capture(worker, request)
     response = await chat_handler(request, MagicMock())
     assert response.status_code == 400  # Existing error translation is unchanged.
-    assert "x-nemo-gym-capture-refused" not in response.headers
+    assert "x-ng-capture-refused" not in response.headers
 
 
 @pytest.mark.asyncio

@@ -94,7 +94,7 @@ class ReassemblyRequest:
             _receipt_staging_keys(receipt)
             if not selection.response_ids and not parsed.capture_poisoned:
                 raise ValueError("Trainable capture requires a nonempty selection")
-            if parsed.rollout_id != owner or any(
+            if parsed.capture_key != owner or any(
                 record.staging_key != staging_key(owner, record.model_call_id)
                 for record in parsed.manifest
             ):

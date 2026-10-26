@@ -151,7 +151,7 @@ def stage(
     prev_len = parent.cum_len if parent is not None else 0
     media = capture_processed_media(prompt, prev_len=prev_len, retained=retained)
     admission = CaptureAdmission(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         model_call_id=call_id,
         mode="text" if parent is None else "token_in",
         parent_call_id=parent.model_call_id if parent else None,
@@ -182,7 +182,7 @@ def stage(
     if expect != "staged":
         return coords, media
     record = CallRecord(
-        **coords.model_dump(exclude={"rollout_id", "disposition"}),
+        **coords.model_dump(exclude={"capture_key", "disposition"}),
         mode=admission.mode,
         response_id=f"response-{call_id}",
     )
@@ -217,7 +217,7 @@ class RecordingClient:
 
 def receipt(*records, rollout_id="r0", terminal=None):
     return RolloutReceipt(
-        rollout_id=rollout_id,
+        capture_key=rollout_id,
         manifest=list(records),
         terminal_model_call_id=terminal or records[-1].model_call_id,
         terminal_selection="declared",
@@ -731,7 +731,7 @@ def test_worker_restart_validates_retained_media(
     )
     prefix = [10, 18, 18, 11, 31, 2]
     admission = CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=len(prefix),
@@ -785,7 +785,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
         adapter=VLLMCaptureAdapter(),
     )
     request = SimpleNamespace(
-        ng_capture={"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+        ng_capture={"capture_key": "r0", "model_call_id": "c1", "mode": "text"}
     )
     descriptor = capture_processed_media(
         engine_prompt([18, 18], [(Span(0, 2), torch.ones(3, 2, 3))]),
@@ -1075,7 +1075,7 @@ def retained_call(dp):
     )
     prefix = [10, 18, 18, 11, 31, 2]
     admission = CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=len(prefix),
@@ -1170,7 +1170,7 @@ def test_worker_bounds_cyclic_inline_chain_lookup(retained_call):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("rollout_id", "other"),
+        ("capture_key", "other"),
         ("parent_call_id", "other"),
         ("prev_len", 1),
         ("chain_hash", "invalid"),
@@ -1743,7 +1743,7 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_me
         ),
     )
     admission = CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c2",
         mode="token_in",
         parent_call_id=root.model_call_id,

@@ -783,7 +783,7 @@ class VllmAsyncGenerationWorkerImpl(
                             raise MediaCaptureRejected("Cycle in retained media chain")
                         visited.add(parent)
                         call = source.fetch_for_finalization(
-                            [staging_key(admission.rollout_id, parent)],
+                            [staging_key(admission.capture_key, parent)],
                             include_route_fragments=verify_retained_media,
                         )[0]
                         calls.append(call)
@@ -797,7 +797,7 @@ class VllmAsyncGenerationWorkerImpl(
             for call in calls:
                 snapshot = call.snapshot
                 if (
-                    snapshot.rollout_id != admission.rollout_id
+                    snapshot.capture_key != admission.capture_key
                     or snapshot.parent_call_id != parent
                     or snapshot.prev_len != length
                     or snapshot.chain_hash
@@ -1358,7 +1358,7 @@ class VllmAsyncGenerationWorkerImpl(
         ):
             required_prefix_token_ids: Optional[List[int]] = None
             # Ledger-authoritative token capture: the call identity the ledger
-            # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
+            # attaches (capture_key, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through

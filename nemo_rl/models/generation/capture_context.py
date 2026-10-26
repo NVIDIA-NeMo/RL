@@ -42,7 +42,7 @@ def decide_capture_input(
     if admission.mode != "candidate" and admission.request_replay is None:
         return CaptureInputDecision(admission, admission, False)
     root = CaptureAdmission(
-        rollout_id=admission.rollout_id,
+        capture_key=admission.capture_key,
         model_call_id=admission.model_call_id,
         mode="text",
     )
@@ -79,7 +79,7 @@ def decide_capture_input(
         )
         return CaptureInputDecision(root, None, True)
     serving = CaptureAdmission(
-        rollout_id=admission.rollout_id,
+        capture_key=admission.capture_key,
         model_call_id=admission.model_call_id,
         mode="token_in",
         parent_call_id=admission.parent_call_id,

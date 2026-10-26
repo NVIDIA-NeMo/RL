@@ -592,7 +592,7 @@ def _stage_root(
 ):
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, partition, media=media))
     root = nemo_gym.CaptureAdmission(
-        rollout_id=rollout_id, model_call_id=model_call_id, mode="text"
+        capture_key=rollout_id, model_call_id=model_call_id, mode="text"
     )
     result = stager.stage(
         "minf-response-1",
@@ -730,12 +730,12 @@ def _example_admission(record, parent_coords=None):
     """The Gym admission for a fixture record; a child chains off its parent's coords."""
     if parent_coords is None:
         return nemo_gym.CaptureAdmission(
-            rollout_id=record.rollout_id,
+            capture_key=record.capture_key,
             model_call_id=record.model_call_id,
             mode="text",
         )
     return nemo_gym.CaptureAdmission(
-        rollout_id=record.rollout_id,
+        capture_key=record.capture_key,
         model_call_id=record.model_call_id,
         parent_call_id=record.parent_call_id,
         prev_len=record.prev_len,
@@ -949,7 +949,7 @@ def test_megatron_stager_writes_routed_experts_with_the_canonical_row(
         ),
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1063,7 +1063,7 @@ def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition)
         TQTokenSink(tq_client, staging_partition=staging_partition)
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1092,7 +1092,7 @@ def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partiti
         require_routed_experts=True,
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=3,
@@ -1141,7 +1141,7 @@ def test_megatron_stager_requires_routes_when_router_replay_is_enabled(
         require_routed_experts=True,
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1195,7 +1195,7 @@ def test_fetch_prefix_chains_counts_media_items_from_columns(
     for call_id, media in (("c1", still), ("c2", None), ("c3", video)):
         call = capture.begin_call(
             nemo_gym.CaptureAdmission(
-                rollout_id="r0", model_call_id=call_id, mode="text"
+                capture_key="r0", model_call_id=call_id, mode="text"
             )
         )
         coords = capture.complete_call(
@@ -1304,7 +1304,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         }
 
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=prev_len,
@@ -1381,7 +1381,7 @@ def test_megatron_stager_rejects_a_resized_retained_image(tq_client, media_parti
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=7,
@@ -1448,7 +1448,7 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
         tq_client, media_partition, _minf_payload(multimodal=True), media=True
     )
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=7,
@@ -1479,7 +1479,7 @@ def test_megatron_prompt_preparer_rejects_inconsistent_media_prefix(
 def test_megatron_prompt_preparer_rejects_malformed_eos_ids(eos):
     """Only an int or a non-empty list of ints is a usable EOS set."""
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=2,
@@ -1516,7 +1516,7 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     a reported count the params pass through unchanged.
     """
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0", model_call_id="c1", mode="text"
+        capture_key="minf-r0", model_call_id="c1", mode="text"
     )
     prompt = [80, 99, 81, 13, 2, 20, 99, 21]
     offload_params = {
@@ -1550,7 +1550,7 @@ def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
     """
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1662,7 +1662,7 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
             _new_media_tensors(payload, minf_params)
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1701,7 +1701,7 @@ def test_megatron_stager_declines_ineligible_requests(
 ):
     stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
     admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
+        capture_key="minf-r0",
         model_call_id="c1",
         mode="text",
     )
@@ -1816,7 +1816,7 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
     assert isinstance(preparer._chain_prefix, ChainPrefixCache)
 
     child = nemo_gym.CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c2",
         parent_call_id="c1",
         prev_len=2,
@@ -1825,7 +1825,7 @@ def test_megatron_preparer_resolves_chains_through_the_shared_cache():
         parent_chain_hash="a" * 64,
     )
     grandchild = nemo_gym.CaptureAdmission(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c3",
         parent_call_id="c2",
         prev_len=4,

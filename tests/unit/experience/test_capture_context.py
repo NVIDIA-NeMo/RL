@@ -24,7 +24,7 @@ OBSERVATION = {"role": "user", "content": "next observation"}
 
 def candidate(items=None, **overrides):
     values = dict(
-        rollout_id="attempt",
+        capture_key="attempt",
         model_call_id="next",
         mode="candidate",
         requires_empty_tool_content_equivalence=False,
@@ -62,7 +62,7 @@ def test_an_unproven_response_boundary_roots_a_new_segment():
 
 
 def test_ordinary_admission_is_unchanged():
-    admission = CaptureAdmission(rollout_id="a", model_call_id="c", mode="text")
+    admission = CaptureAdmission(capture_key="a", model_call_id="c", mode="text")
     decision = decide_capture_input(admission, messages=[])
     assert decision.storage is admission
     assert decision.serving is admission
@@ -131,7 +131,7 @@ def test_candidate_requires_parent_and_root_cannot_carry_candidate_proof():
         )
     with pytest.raises(ValidationError):
         CaptureAdmission(
-            rollout_id="a",
+            capture_key="a",
             model_call_id="b",
             mode="text",
             requires_empty_tool_content_equivalence=False,
@@ -140,7 +140,7 @@ def test_candidate_requires_parent_and_root_cannot_carry_candidate_proof():
 
 def test_managed_root_preserves_media_verification_without_serving_prefix():
     admission = CaptureAdmission(
-        rollout_id="a",
+        capture_key="a",
         model_call_id="b",
         mode="text",
         request_replay=replay_context(HISTORY, render_digest="b" * 64),
@@ -300,7 +300,7 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
 
     monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", render, raising=False)
     admission = CaptureAdmission(
-        rollout_id="a",
+        capture_key="a",
         model_call_id="b",
         mode="text",
         request_replay=replay_context(HISTORY, render_digest="b" * 64),
