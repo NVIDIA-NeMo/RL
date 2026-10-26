@@ -2071,10 +2071,7 @@ class CSDLossFn(LossFunction):
         student_log_z: torch.Tensor,
         teacher_log_z: torch.Tensor,
         temperature: float,
-        reverse_kl: bool,
-        loss_fn: str = "kl",
-        jsd_beta: float = 0.5,
-        alm_bce_tau: float = 1.0,
+        loss_fn: str,
         teacher_sparse: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         teacher_sparse_keep_realized: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -2473,32 +2470,9 @@ class CSDLossFn(LossFunction):
         valid_row = support_mask.sum(dim=-1) >= 1.0  # (K,) bool
 
         # ---- Batched partition loss ----
-        if loss_fn == "bce":
-            kl_per_pos = self._binary_power_bce_from_logp(
-                s_logp_with_rest,
-                t_logp_with_rest,
-                tau=alm_bce_tau,
-            )
-        elif loss_fn == "jsd":
-            kl_per_pos = _generalized_jsd(
-                s_logp_with_rest,
-                t_logp_with_rest,
-                jsd_beta,
-            )
-        elif not reverse_kl:
-            kl_per_pos = torch.nn.functional.kl_div(
-                s_logp_with_rest,
-                t_logp_with_rest,
-                reduction="none",
-                log_target=True,
-            )
-        else:
-            kl_per_pos = torch.nn.functional.kl_div(
-                t_logp_with_rest,
-                s_logp_with_rest,
-                reduction="none",
-                log_target=True,
-            )
+        kl_per_pos = self._partition_divergence(
+            s_logp_with_rest, t_logp_with_rest, loss_fn
+        )
         # Mask padded support columns to zero (REST column stays).
         rest_one = torch.ones((K, 1), device=device, dtype=accum_dtype)
         full_mask = torch.cat([support_mask, rest_one], dim=-1)
@@ -2594,10 +2568,7 @@ class CSDLossFn(LossFunction):
         # Per-teacher CSD settings.
         kl_chunk_shift = bool(cfg.kl_chunk_shift)
         temperature = float(cfg.temperature)
-        reverse_kl = bool(cfg.reverse_kl)
-        csd_loss_fn = str(cfg.csd_loss_fn or "kl")
-        csd_jsd_beta = float(cfg.csd_jsd_beta)
-        csd_alm_bce_tau = float(cfg.csd_alm_bce_tau)
+        csd_loss_fn = str(cfg.csd_loss_fn)
         csd_last_pos_loss_fn_cfg = cfg.csd_last_pos_loss_fn
         pure_alm = bool(cfg.csd_pure_alm)
         realized_only_mismatch = bool(cfg.csd_realized_only_mismatch)
@@ -3232,32 +3203,9 @@ class CSDLossFn(LossFunction):
                 teacher_loss_logp = self._append_rest_bucket_logp(
                     teacher_common_logp,
                 )
-                if csd_loss_fn == "bce":
-                    per_elem = self._binary_power_bce_from_logp(
-                        student_loss_logp,
-                        teacher_loss_logp,
-                        tau=csd_alm_bce_tau,
-                    )
-                elif csd_loss_fn == "jsd":
-                    per_elem = _generalized_jsd(
-                        student_loss_logp,
-                        teacher_loss_logp,
-                        csd_jsd_beta,
-                    )
-                elif not reverse_kl:
-                    per_elem = torch.nn.functional.kl_div(
-                        student_loss_logp,
-                        teacher_loss_logp,
-                        reduction="none",
-                        log_target=True,
-                    )
-                else:
-                    per_elem = torch.nn.functional.kl_div(
-                        teacher_loss_logp,
-                        student_loss_logp,
-                        reduction="none",
-                        log_target=True,
-                    )
+                per_elem = self._partition_divergence(
+                    student_loss_logp, teacher_loss_logp, csd_loss_fn
+                )
                 if support_mask is not None:
                     rest_one = torch.ones(
                         (support_mask.shape[0], 1),
@@ -3488,10 +3436,7 @@ class CSDLossFn(LossFunction):
                     student_log_z,
                     teacher_log_z,
                     temperature,
-                    reverse_kl,
                     loss_fn=effective_last_pos_loss_fn,
-                    jsd_beta=csd_jsd_beta,
-                    alm_bce_tau=csd_alm_bce_tau,
                     teacher_sparse=(
                         None
                         if teacher_sparse_payload is None
