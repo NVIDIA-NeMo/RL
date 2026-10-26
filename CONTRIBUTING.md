@@ -154,6 +154,17 @@ If you have write access to the repository (NVIDIA contributors):
       - A bot will acknowledge the comment with a thumbs-up and begin the CI.
       - It is possible to simplify the comment to `/ok to test` without the commit-sha. However, this is only allowed if all commits are from a trusted Nvidia developer and [cryptographically signed](https://docs.github.com/en/authentication/managing-commit-signature-verification).
 
+### Re-running CI After a Failure
+
+When a CI run fails and you want to retry the same commit (for example, after a flaky test or an infrastructure error), re-run **only the failed jobs**:
+
+- In the GitHub UI, open the workflow run and choose **Re-run jobs → Re-run failed jobs**.
+- From the command line: `gh run rerun <run-id> --failed --repo NVIDIA-NeMo/RL`.
+
+Do **not** use **Re-run all jobs**. It repeats every GPU job, including the ones that already passed on that commit, and gives you no new information. Re-running only the failed jobs keeps the passing results, and it also re-runs any jobs that were skipped because they depended on the failure.
+
+Before re-running, read the failure log (`gh run view <run-id> --log-failed --repo NVIDIA-NeMo/RL`). If the failure comes from your change, push a fix instead; a new commit needs a new `/ok to test <sha>` comment.
+
 ### Design Documentation Requirement
 
 **Important**: All new key features (ex: enabling a new parallelization technique, enabling a new RL algorithm) must include documentation update (either a new doc or updating an existing one). This document update should:

@@ -25,6 +25,10 @@ IGNORE=(
     "--ignore=unit/algorithms/"
     "--ignore=unit/data/"
     "--ignore=unit/distributed/"
+    # CPU-only config checks; the cpu-config-tests job in cicd-main.yml runs these
+    # on a GitHub-hosted runner before any GPU job starts.
+    "--ignore=unit/test_recipes_and_test_suites.py"
+    "--ignore=unit/test_config_validation.py"
 )
 
 uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "test_mxfp8_rollout_recipes.py" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
