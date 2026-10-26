@@ -483,7 +483,7 @@ def test_ordinary_capture_reconstructs_without_framework_output_metadata(
         monkeypatch,
         tmp_path,
         decide_input=decide_capture_input,
-        framework_owned_context=False,
+        parent_resolution_mode="fingerprint",
     )
     history = [{"role": "user", "content": "task"}]
     first = gym.assert_clean(harness.post("attempt", history))

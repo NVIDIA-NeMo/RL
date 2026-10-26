@@ -895,7 +895,9 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
                 "external_staging_backend": _external_staging_backend(token_capture),
-                "framework_owned_context": self._forest_training,
+                "parent_resolution": "source_history"
+                if self._forest_training
+                else "fingerprint",
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep

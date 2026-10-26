@@ -80,7 +80,7 @@ def test_ledger_growth_and_restart_preserve_segment_chains(
                 token_sink=None,
                 lineage_store=ledger,
                 external_staging=True,
-                framework_owned_context=True,
+                parent_resolution_mode="source_history",
             )
             token = set_token_sink(context)
             try:
