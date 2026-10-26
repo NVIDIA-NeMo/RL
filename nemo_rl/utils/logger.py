@@ -15,6 +15,7 @@
 
 import atexit
 import glob
+import importlib
 import json
 import logging
 import os
@@ -107,6 +108,8 @@ class LoggerConfig(BaseModel, extra="allow"):
     monitor_gpus: bool = True
     gpu_monitoring: GPUMonitoringConfig = Field(default_factory=GPUMonitoringConfig)
     num_val_samples_to_print: int = 0
+    # LoggerInterface subclasses as "pkg.module.Class", constructed without arguments.
+    extra_backends: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _require_block_for_enabled_backends(self) -> "LoggerConfig":
@@ -1295,6 +1298,11 @@ class Logger(LoggerInterface):
                 os.makedirs(mlflow_log_dir, exist_ok=True)
             mlflow_logger = MLflowLogger(cfg.mlflow, log_dir=mlflow_log_dir)
             self.loggers.append(mlflow_logger)
+
+        for name in cfg.extra_backends:
+            module_name, class_name = name.rsplit(".", 1)
+            backend_cls = getattr(importlib.import_module(module_name), class_name)
+            self.loggers.append(backend_cls())
 
         # Initialize GPU monitoring if requested
         self.gpu_monitor = None

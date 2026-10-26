@@ -1870,6 +1870,19 @@ class TestLogger:
         mock_tb_logger.assert_not_called()
         mock_wandb_logger.assert_not_called()
 
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    def test_init_extra_backends(self, mock_tb_logger, temp_dir):
+        """Test initialization with an extra backend loaded by name."""
+        cfg = LoggerConfig(
+            monitor_gpus=False,
+            log_dir=temp_dir,
+            extra_backends=["nemo_rl.utils.logger.TensorboardLogger"],
+        )
+        logger = Logger(cfg)
+
+        assert logger.loggers == [mock_tb_logger.return_value]
+        mock_tb_logger.assert_called_once_with()
+
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")
     def test_init_wandb_only(self, mock_tb_logger, mock_wandb_logger, temp_dir):
