@@ -1781,9 +1781,12 @@ def test_install_native_lora_rejects_unapplied_runtime_module(monkeypatch):
         "model.typo.lora_B.weight": torch.ones(4, 2),
     }
 
-    with pytest.raises(RuntimeError, match="vLLM cannot apply"):
+    with pytest.raises(RuntimeError, match="vLLM cannot apply") as exc_info:
         ext._install_native_lora(tensors)
 
+    assert "match_all_linear: false" in str(exc_info.value)
+    assert 'exclude_modules: ["*lm_head*"]' in str(exc_info.value)
+    assert "policy.generation.lora_refit_mode: merged" in str(exc_info.value)
     adapter_manager.add_adapter.assert_not_called()
 
 

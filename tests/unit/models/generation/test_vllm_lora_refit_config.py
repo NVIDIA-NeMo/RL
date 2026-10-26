@@ -70,11 +70,11 @@ def test_native_lora_refit_materializes_vllm_adapter_config() -> None:
         "alpha": 64,
     }
 
-    # match_all_linear also selects lm_head in Automodel, but Qwen2 and some
-    # other vLLM models do not expose the output head as a LoRA runtime module.
+    # Model-specific module support is checked against the constructed vLLM
+    # runtime. Configuration must not drop a trainable module preemptively.
     lora_config = policy_config["automodel_cfg"]["lora_cfg"]
-    assert lora_config["match_all_linear"] is False
-    assert lora_config["exclude_modules"] == ["*lm_head*"]
+    assert lora_config["match_all_linear"] is True
+    assert lora_config["exclude_modules"] == []
 
 
 def test_native_lora_refit_preserves_explicit_target_modules() -> None:

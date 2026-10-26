@@ -1473,7 +1473,11 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if unexpected_runtime_modules:
             raise RuntimeError(
                 "Native LoRA refit received modules that vLLM cannot apply: "
-                f"{unexpected_runtime_modules[:8]}"
+                f"{unexpected_runtime_modules[:8]}. For a model whose vLLM "
+                "implementation does not support lm_head LoRA, configure "
+                "Automodel LoRA with match_all_linear: false and "
+                'exclude_modules: ["*lm_head*"], or set '
+                "policy.generation.lora_refit_mode: merged."
             )
 
         incomplete_runtime_modules = sorted(
