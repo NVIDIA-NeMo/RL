@@ -15,6 +15,7 @@
 """Qualify local-vocabulary loss chunking through the AutoModel loss boundary."""
 
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import pytest
@@ -31,6 +32,7 @@ import nemo_rl.distributed.model_utils as model_utils
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.data import ProcessedInputs
 from nemo_rl.models.automodel.train import LossPostProcessor
 
 BATCH, SEQ, VOCAB = 2, 37, 257
@@ -170,3 +172,91 @@ def test_nonpositive_chunk_size_is_rejected(
     """A chunk size straight from YAML is unvalidated upstream, so reject it here."""
     with pytest.raises(ValueError, match="logprob_chunk_size must be positive"):
         _run(singleton_tp_mesh, chunk_size=chunk_size)
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_local_loss_preserves_values_gradients_and_chunking(
+    singleton_tp_mesh: DeviceMesh, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Packed sequences must retain vocabulary groups and chunk independently."""
+    lengths = (5, 7)
+    torch.manual_seed(42)
+    logits = torch.randn(1, sum(lengths), VOCAB, device="cuda").requires_grad_()
+    reference_logits = logits.detach().clone().requires_grad_()
+    input_ids = torch.randint(VOCAB, (2, max(lengths)), device="cuda")
+    weights = torch.randn(2, max(lengths), device="cuda")
+    data = BatchedDataDict({"input_ids": input_ids, "weights": weights})
+
+    class PackedTokenLoss:
+        input_type = LossInputType.LOGPROB
+
+        def __init__(self) -> None:
+            self.selected: list[torch.Tensor] = []
+
+        def __call__(
+            self, *, data: Any, next_token_logprobs: torch.Tensor, **kwargs: Any
+        ) -> tuple[torch.Tensor, dict[str, Any]]:
+            self.selected.append(next_token_logprobs.detach())
+            return (
+                (next_token_logprobs * data["weights"][:, :-1]).sum(),
+                {},
+            )
+
+    @dataclass
+    class PackedFlashAttnKwargs:
+        cu_seqlens_q: torch.Tensor
+
+    processed_inputs = ProcessedInputs(
+        input_ids=torch.cat(
+            [input_ids[i, :length] for i, length in enumerate(lengths)]
+        ).unsqueeze(0),
+        seq_len=sum(lengths),
+        flash_attn_kwargs=PackedFlashAttnKwargs(
+            cu_seqlens_q=torch.tensor([0, 5, 12], dtype=torch.int32)
+        ),
+    )
+    loss_fn = PackedTokenLoss()
+    processor = LossPostProcessor(
+        loss_fn=loss_fn,
+        cfg={"logprob_chunk_size": 3},
+        cp_mesh=None,
+        cp_size=1,
+        dp_size=1,
+        enable_seq_packing=True,
+        tp_mesh=singleton_tp_mesh,
+    )
+    seen: list[int] = []
+    original = model_utils._compute_distributed_selected_logprobs
+
+    def spy(logits: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        seen.append(int(logits.shape[1]))
+        return original(logits, **kwargs)
+
+    monkeypatch.setattr(model_utils, "_compute_distributed_selected_logprobs", spy)
+    loss, _ = processor(
+        logits,
+        data,
+        processed_inputs,
+        torch.tensor(2, device="cuda"),
+        torch.tensor(sum(lengths) - 2, device="cuda"),
+        cp_sharder=None,
+    )
+    # Assert before backward: recomputation also invokes the spied kernel.
+    assert seen == [3, 2, 3, 3, 1], seen
+    assert len(loss_fn.selected) == len(lengths)
+    reference_losses = []
+    start = 0
+    for i, length in enumerate(lengths):
+        dense_logprobs = reference_logits[:, start : start + length - 1].log_softmax(-1)
+        selected = dense_logprobs.gather(
+            -1, input_ids[i : i + 1, 1:length].unsqueeze(-1)
+        ).squeeze(-1)
+        torch.testing.assert_close(loss_fn.selected[i], selected, rtol=1e-5, atol=1e-6)
+        reference_losses.append((selected * weights[i : i + 1, : length - 1]).sum())
+        start += length
+    reference_loss = torch.stack(reference_losses).sum()
+    torch.testing.assert_close(loss, reference_loss, rtol=1e-5, atol=1e-6)
+    loss.backward()
+    reference_loss.backward()
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=1e-5, atol=1e-7)
