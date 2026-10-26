@@ -48,6 +48,10 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.algorithms.single_controller_utils.sample_table import (
+    TableChunk,
+    summarize_chunk,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -102,6 +106,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # async_rl.sample_table.enabled: summarize each call's rows for the per-step
+    # sample table.
+    sample_table: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -156,6 +163,7 @@ class AdvantageStageConfig:
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
+            sample_table=master_config.async_rl.sample_table.enabled,
         )
 
     def input_fields(self) -> list[str]:
@@ -197,6 +205,8 @@ class AdvantageStageConfig:
                     adv_cfg.generation_logprobs_field,
                 ]
             )
+        if self.sample_table:
+            fields.extend([INPUT_LENGTHS, adv_cfg.generation_logprobs_field])
         return list(dict.fromkeys(fields))
 
 
@@ -290,6 +300,9 @@ class AdvantageOutcome:
     # Rows this call wrote to its shard's part file, so the controller's merge
     # can tell a missing part from an empty one.
     train_data_dump_rows: int = 0
+    # These rows' sample-table columns when async_rl.sample_table is on: a few
+    # scalars per row, never tensors.
+    sample_table: Optional[TableChunk] = None
 
 
 class AdvantageComputer:
@@ -515,11 +528,11 @@ class AdvantageComputer:
 
         train_data_dump_s = 0.0
         train_data_dump_rows = 0
-        if self._train_data_dump is not None:
-            assert request.train_step is not None
-            dump_started = time.perf_counter()
+        sample_table = None
+        if self._train_data_dump is not None or cfg.sample_table:
+            # What the dump writes and the sample table summarizes.
+            input_lengths = tensor_field(data, INPUT_LENGTHS)
             sequences = {
-                "token_ids": tensor_field(data, INPUT_IDS),
                 "token_loss_mask": token_mask,
                 "advantages": advantages,
                 "generation_logprobs": tensor_field(
@@ -532,25 +545,42 @@ class AdvantageComputer:
                 )
             if cfg.teacher_logprobs_required:
                 sequences["teacher_logprobs"] = kwargs["teacher_logprobs"]
-            await asyncio.to_thread(
-                self._train_data_dump.add_chunk,
-                step=request.train_step,
-                sample_ids=list(meta.sample_ids),
-                tags=meta.tags,
-                input_lengths=tensor_field(data, INPUT_LENGTHS),
-                sequences=sequences,
-                scalars={
-                    "sample_loss_mask": final_sample_mask,
-                    "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
-                    "rewards": rewards,
-                    # Raw column: jagged when the chunk mixes prompt
-                    # lengths, so rows carry no zero padding. Not the
-                    # group-index key the estimator reduces over.
-                    "prompt_ids": data[adv_cfg.prompt_ids_field],
-                },
-            )
-            train_data_dump_s = time.perf_counter() - dump_started
-            train_data_dump_rows = len(meta.sample_ids)
+            scalars = {
+                "sample_loss_mask": final_sample_mask,
+                "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                "rewards": rewards,
+            }
+            if self._train_data_dump is not None:
+                assert request.train_step is not None
+                dump_started = time.perf_counter()
+                await asyncio.to_thread(
+                    self._train_data_dump.add_chunk,
+                    step=request.train_step,
+                    sample_ids=list(meta.sample_ids),
+                    tags=meta.tags,
+                    input_lengths=input_lengths,
+                    sequences={"token_ids": tensor_field(data, INPUT_IDS), **sequences},
+                    scalars={
+                        **scalars,
+                        # Raw column: jagged when the chunk mixes prompt
+                        # lengths, so rows carry no zero padding. Not the
+                        # group-index key the estimator reduces over.
+                        "prompt_ids": data[adv_cfg.prompt_ids_field],
+                    },
+                )
+                train_data_dump_s = time.perf_counter() - dump_started
+                train_data_dump_rows = len(meta.sample_ids)
+            if cfg.sample_table:
+                sample_table = summarize_chunk(
+                    sample_ids=list(meta.sample_ids),
+                    tags=meta.tags,
+                    input_lengths=input_lengths,
+                    token_mask=token_mask,
+                    sequences={
+                        k: v for k, v in sequences.items() if k != "token_loss_mask"
+                    },
+                    scalars=scalars,
+                )
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):
@@ -581,4 +611,5 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_rows=train_data_dump_rows,
+            sample_table=sample_table,
         )

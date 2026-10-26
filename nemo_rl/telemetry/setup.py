@@ -44,6 +44,7 @@ import importlib.metadata
 import logging
 import os
 import threading
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, cast
 
@@ -813,12 +814,17 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
     # Deferred to break the cycle: host_memory reads get_telemetry_handle from
     # this module.
     from nemo_rl.telemetry.host_memory import stop_host_memory_monitoring
+    from nemo_rl.telemetry.tables import stop_table_emitter
 
     # Called before the early return below, and before the flush: the monitor
     # records through the providers this is about to shut down, so leaving it
     # sampling would have it writing into a closed meter for a whole interval.
 
     stop_host_memory_monitoring()
+    # Same for queued table rows; they get half the budget, the flush the rest.
+    started = time.monotonic()
+    stop_table_emitter(timeout_ms / 2000)
+    remaining_s = max(0.0, timeout_ms / 1000 - (time.monotonic() - started))
 
     global _TELEMETRY_HANDLE
     handle = _TELEMETRY_HANDLE
@@ -837,7 +843,7 @@ def shutdown_telemetry(timeout_ms: int = 5000) -> None:
 
     flusher = threading.Thread(target=_flush, name="nemo-lens-shutdown", daemon=True)
     flusher.start()
-    flusher.join(timeout_ms / 1000)
+    flusher.join(remaining_s)
     if flusher.is_alive():
         logger.warning(
             "nemo-lens: telemetry flush exceeded %dms and was abandoned; "

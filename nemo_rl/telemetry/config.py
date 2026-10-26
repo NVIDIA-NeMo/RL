@@ -88,3 +88,8 @@ class TelemetryConfig(BaseModel, extra="allow"):
     knob. Switch it on to debug a few steps, not for a training run. For engine
     behaviour in aggregate the ``vllm/*`` metrics are on by default and cost two
     RPCs per step (a snapshot before generation and a read after)."""
+
+
+def lens_logs_enabled(telemetry: "TelemetryConfig | None") -> bool:
+    """Whether the run exports OTel log records to NeMo Lens."""
+    return bool(telemetry is not None and telemetry.enabled and telemetry.logs_enabled)
