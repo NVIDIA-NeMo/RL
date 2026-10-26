@@ -78,6 +78,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     PrefixSplice,
     splice_prefix_tokens,
 )
+from nemo_rl.telemetry.runtime import monitor_app_event_loop, run_in_thread
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
@@ -1607,8 +1608,11 @@ class VllmAsyncGenerationWorkerImpl(
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
                 try:
-                    content = await asyncio.to_thread(
-                        worker_self._finish_request_capture, request, content
+                    content = await run_in_thread(
+                        "generation_terminal",
+                        worker_self._finish_request_capture,
+                        request,
+                        content,
                     )
                 except asyncio.CancelledError:
                     # Queued executor work may never start after cancellation.
@@ -1732,6 +1736,9 @@ class VllmAsyncGenerationWorkerImpl(
         http_server_api_key = self.cfg["vllm_cfg"].get("http_server_api_key")
         if http_server_api_key:
             install_http_server_api_key_check(app, http_server_api_key)
+
+        # Last, so the probe wraps the lifespan that API/refit setup installed.
+        monitor_app_event_loop(app, "vllm_http")
 
         ########################################
         # Server spinup

@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from nemo_rl.telemetry.runtime import run_in_thread
+
 
 async def call_data_plane(
     client: Any,
@@ -48,7 +50,7 @@ async def call_data_plane(
     if remote is not None:
         return await remote(**kwargs)
     if offload_sync:
-        result = await asyncio.to_thread(method, **kwargs)
+        result = await run_in_thread(f"data_plane.{method_name}", method, **kwargs)
     else:
         result = method(**kwargs)
     if asyncio.iscoroutine(result):

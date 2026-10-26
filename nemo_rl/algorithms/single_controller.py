@@ -208,6 +208,7 @@ from nemo_rl.telemetry.instrumentation import (
     start_efficiency_span,
     umbrella_span,
 )
+from nemo_rl.telemetry.runtime import monitor_event_loop, run_in_thread
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     shutdown_telemetry,
@@ -803,13 +804,14 @@ class SingleControllerActor:
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
         try:
-            with umbrella_span(
-                RLSpanGroup.U_JOB,
-                "rl.sc.job",
-                tracer=self._tracer,
-                **{RL_ALGORITHM: "ppo" if self._is_ppo else "grpo"},
-            ):
-                result = await self._run_pumps()
+            async with monitor_event_loop("controller"):
+                with umbrella_span(
+                    RLSpanGroup.U_JOB,
+                    "rl.sc.job",
+                    tracer=self._tracer,
+                    **{RL_ALGORITHM: "ppo" if self._is_ppo else "grpo"},
+                ):
+                    result = await self._run_pumps()
         finally:
             # Outside the span so the job span is flushed too, and off the
             # event loop because the exporter's flush blocks. Shielded, and a
@@ -1072,8 +1074,8 @@ class SingleControllerActor:
         print(f"📦 Restoring replay buffer metadata: {metadata_path}")
         # weights_only=False: the replay metadata file contains pickled KVBatchMeta
         # objects but no rollout tensor payloads. It is a trusted same-job artifact.
-        buffer_state = await asyncio.to_thread(
-            torch.load, metadata_path, weights_only=False
+        buffer_state = await run_in_thread(
+            "checkpoint_replay_load", torch.load, metadata_path, weights_only=False
         )
         if self._data_plane_checkpoint_metadata is None:
             raise RuntimeError(

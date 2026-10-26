@@ -24,6 +24,9 @@ class _LocalClient:
     def thread_id(self) -> int:
         return threading.get_ident()
 
+    def thread_and_value(self, *, value: int) -> tuple[int, int]:
+        return threading.get_ident(), value
+
     async def async_value(self, *, value: int) -> int:
         return value
 
@@ -58,6 +61,17 @@ def test_sync_call_can_be_offloaded() -> None:
     )
 
     assert result != caller_thread_id
+
+
+def test_offloaded_sync_call_forwards_keyword_arguments() -> None:
+    caller_thread_id = threading.get_ident()
+
+    thread_id, value = asyncio.run(
+        call_data_plane(_LocalClient(), "thread_and_value", offload_sync=True, value=5)
+    )
+
+    assert thread_id != caller_thread_id
+    assert value == 5
 
 
 def test_local_coroutine_result_is_awaited() -> None:
