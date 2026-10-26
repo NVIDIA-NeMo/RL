@@ -21,6 +21,7 @@ from threading import Event
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 import ray
@@ -518,6 +519,7 @@ def mock_grpo_components():
                 "precision": "bfloat16",
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_policy_before_refit": False,
                 "max_total_sequence_length": 2048,
                 "make_sequence_length_divisible_by": 1,
                 "generation": {
@@ -3458,6 +3460,9 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             return "127.0.0.1", 1234
 
     class DummyPolicy:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
         def print_node_ip_and_gpu_id(self):
             pass
 
@@ -3480,7 +3485,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
     ):
         del (
             cluster,
-            config,
             tokenizer,
             processor,
             weights_path,
@@ -3488,7 +3492,7 @@ def test_setup_auto_enables_skip_reference_logprobs_with_policy_factory(
             init_optimizer,
             init_reference_model,
         )
-        return DummyPolicy()
+        return DummyPolicy(config)
 
     class DummySGLangGeneration:
         num_gpus_per_engine = 1
@@ -3957,6 +3961,116 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         and call.kwargs.get("prefix") == "refit"
         for call in mock_grpo_components["logger"].log_metrics.call_args_list
     )
+
+
+@pytest.mark.parametrize(
+    ("discard_enabled", "expected_finish_calls", "expected_calls_before_advantages"),
+    [
+        (
+            False,
+            [mock_call(discard_weights=False), mock_call(discard_weights=False)],
+            [0, 1],
+        ),
+        (
+            True,
+            [mock_call(discard_weights=False), mock_call(discard_weights=True)],
+            [0, 1],
+        ),
+    ],
+)
+def test_grpo_train_waits_for_dynamic_sampling_before_finishing_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+    discard_enabled: bool,
+    expected_finish_calls: list[Any],
+    expected_calls_before_advantages: list[int],
+) -> None:
+    policy_generation = MagicMock()
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    rollout_metrics = {"gen_kl_error": 0.0, "mean_gen_tokens_per_sample": 2.0}
+    mock_rollout = MagicMock(return_value=(mock_batch, rollout_metrics))
+    mock_refit = MagicMock()
+    sampling_round = 0
+    calls_before_advantages = []
+
+    def fake_calculate_baseline(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        calls_before_advantages.append(policy_generation.finish_generation.call_count)
+        return (
+            torch.tensor([0.1]),
+            torch.tensor([1.0]),
+            torch.tensor([False]),
+        )
+
+    def fake_dynamic_sampling(
+        repeated_batch: BatchedDataDict,
+        _std: torch.Tensor,
+        _baseline: torch.Tensor,
+        _dynamic_sampling_num_gen_batches: int,
+        _master_config: MasterConfig,
+        _timer: Timer,
+        batch_cache: BatchedDataDict | None,
+        **_kwargs: Any,
+    ) -> tuple[BatchedDataDict, bool, BatchedDataDict | None, dict[str, Any]]:
+        nonlocal sampling_round
+        sampling_round += 1
+        repeated_batch["filtered_reward"] = repeated_batch["total_reward"]
+        repeated_batch["baseline"] = torch.tensor([0.1])
+        repeated_batch["std"] = torch.tensor([1.0])
+        return repeated_batch, sampling_round == 2, repeated_batch, {}
+
+    monkeypatch.setattr(grpo_mod, "should_use_async_rollouts", lambda *_: False)
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", mock_rollout)
+    monkeypatch.setattr(
+        grpo_mod,
+        "calculate_baseline_and_std_per_prompt",
+        fake_calculate_baseline,
+    )
+    monkeypatch.setattr(grpo_mod, "dynamic_sampling", fake_dynamic_sampling)
+    monkeypatch.setattr(grpo_mod, "refit_policy_generation", mock_refit)
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.policy["generation"]["vllm_cfg"]["discard_weights_on_sleep"] = (
+        discard_enabled
+    )
+
+    with _patched_logprob_phase(mock_grpo_components["policy"]):
+        grpo_mod.grpo_train(
+            mock_grpo_components["policy"],
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy_generation.finish_generation.call_args_list == expected_finish_calls
+    assert calls_before_advantages == expected_calls_before_advantages
+    assert mock_refit.call_count == 1
+    assert mock_rollout.call_count == 2
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
@@ -6626,6 +6740,30 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl_reshard", "offload_policy", "expected"),
+    [
+        ("vllm", False, False, False),
+        ("vllm", False, True, True),
+        ("vllm", True, False, True),
+        ("dynamo", False, False, True),
+    ],
+)
+def test_noncolocated_refit_synchronizer_selection(
+    backend, nccl_reshard, offload_policy, expected
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    assert (
+        grpo_mod._uses_managed_noncolocated_refit(
+            generation_backend=backend,
+            nccl_reshard_refit_enabled=nccl_reshard,
+            offload_policy_before_refit=offload_policy,
+        )
+        is expected
+    )
 
 
 def test_grpo_train_shuts_down_environments_after_failure():
