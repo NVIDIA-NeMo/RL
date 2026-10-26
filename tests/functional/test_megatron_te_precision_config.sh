@@ -103,7 +103,7 @@ model_cfg = apply_precision_config(matching_recipe)
 assert model_cfg.quant_recipe.matchers
 
 expect_value_error(mismatch_recipe, "mixed FP8 precision recipes")
-expect_value_error(fp8_param_recipe, "fp8_cfg.fp8_param is not enabled")
+expect_value_error(fp8_param_recipe, "fp8_param or fp4_param")
 
 model_cfg = apply_precision_config(disabled_fp8_param_recipe)
 assert model_cfg.quant_recipe.matchers == []

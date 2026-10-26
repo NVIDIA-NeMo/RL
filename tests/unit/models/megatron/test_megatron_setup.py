@@ -1499,35 +1499,42 @@ class TestApplyPrecisionConfig:
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     @pytest.mark.parametrize(
-        ("fp8_cfg_param", "expect_error"), [(True, False), (False, True)]
+        ("zero_train_gen_mismatch", "fp8_cfg_param", "error_match"),
+        [
+            (True, True, None),
+            (True, False, "only with megatron_cfg.fp8_cfg.fp8_param enabled"),
+            (False, True, "sets fp8_param or fp4_param"),
+            (False, False, "sets fp8_param or fp4_param"),
+        ],
     )
-    def test_te_precision_config_fp8_param_must_match_fp8_cfg(
-        self, mock_load_recipe, tmp_path, fp8_cfg_param, expect_error
+    def test_te_precision_config_fp8_param_only_under_zero_kl(
+        self,
+        mock_load_recipe,
+        tmp_path,
+        zero_train_gen_mismatch,
+        fp8_cfg_param,
+        error_match,
     ):
-        """A per-module fp8_param is accepted only when fp8_cfg.fp8_param is on."""
+        """A per-module fp8_param needs zero_train_gen_mismatch and fp8_cfg.fp8_param."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         recipe_file = tmp_path / "te_precision.yaml"
         recipe_file.write_text("{}")
         model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        block = {
+            "fp8_quantization_recipe": "mxfp8",
+            "fp8_param": True,
+            "override_quantized_autocast": True,
+            "override_nonquantized_autocast": True,
+        }
         mock_load_recipe.return_value = self._quant_recipe(
-            {
-                "mxfp8": {
-                    "training_recipe": {
-                        "fp8_quantization_recipe": "mxfp8",
-                        "fp8_param": True,
-                    },
-                    "evaluation_recipe": {
-                        "fp8_quantization_recipe": "mxfp8",
-                        "fp8_param": True,
-                    },
-                }
-            }
+            {"mxfp8": {"training_recipe": block, "evaluation_recipe": dict(block)}}
         )
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
                 "te_precision_config_file": str(recipe_file),
+                "zero_train_gen_mismatch": zero_train_gen_mismatch,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -1538,8 +1545,8 @@ class TestApplyPrecisionConfig:
         }
 
         with pytest.warns(UserWarning, match="fp8_cfg"):
-            if expect_error:
-                with pytest.raises(ValueError, match="fp8_cfg.fp8_param"):
+            if error_match:
+                with pytest.raises(ValueError, match=error_match):
                     _apply_precision_config(model_cfg, config, torch.bfloat16)
             else:
                 _apply_precision_config(model_cfg, config, torch.bfloat16)

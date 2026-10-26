@@ -1548,12 +1548,15 @@ def _validate_te_precision_config(
         _quant_recipe_name(fp8_cfg.get("fp8_recipe")) if fp8_cfg_enabled else None
     )
 
-    # A matched module's fp8_model_init comes from its own recipe block rather than
-    # from fp8_cfg.fp8_param, so a recipe that quantizes a module must repeat
-    # fp8_param to keep that module's primary weights in FP8. Only the value already
-    # configured in fp8_cfg is accepted: NeMo-RL derives sequence padding, refit
-    # export, and reshard validation from fp8_cfg, and a recipe that disagreed would
-    # send weights to the inference engine in a precision NeMo-RL does not expect.
+    # A recipe can store primary weights in FP8/FP4 through its own
+    # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
+    # NeMo-RL derives sequence padding, refit export, and reshard validation
+    # from fp8_cfg alone, so such weights would reach the inference engine as
+    # if they were BF16. Reject until the refit path understands them.
+    # zero_train_gen_mismatch is the exception for fp8_param: a matched module's
+    # fp8_model_init comes from its own recipe block rather than from
+    # fp8_cfg.fp8_param, so its MXFP8 recipe must repeat fp8_param to keep FP8
+    # primary weights, and that is accepted only when fp8_cfg.fp8_param agrees.
     fp8_cfg_param = bool(fp8_cfg_enabled and fp8_cfg.get("fp8_param", False))
     for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
         payload = quant_recipe.configs.get(config_key) or {}
@@ -1577,18 +1580,22 @@ def _validate_te_precision_config(
                 )
         for block in ("training_recipe", "evaluation_recipe"):
             block_cfg = payload.get(block) or {}
-            if block_cfg.get("fp4_param"):
+            fp8_param = block_cfg.get("fp8_param")
+            if block_cfg.get("fp4_param") or (
+                fp8_param and not zero_train_gen_mismatch
+            ):
                 raise ValueError(
-                    "megatron_cfg.te_precision_config_file sets fp4_param in "
-                    f"'{config_key}.{block}'. NeMo-RL reads megatron_cfg.fp8_cfg "
-                    "for all FP8/FP4 parameter storage, so these weights would be "
-                    "sent to the inference engine as BF16."
+                    "megatron_cfg.te_precision_config_file sets fp8_param or "
+                    f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
+                    "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
+                    "weights would be sent to the inference engine as BF16. "
+                    "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
                 )
-            if block_cfg.get("fp8_param") and not fp8_cfg_param:
+            if fp8_param and not fp8_cfg_param:
                 raise ValueError(
-                    "megatron_cfg.te_precision_config_file sets fp8_param in "
-                    f"'{config_key}.{block}', but megatron_cfg.fp8_cfg.fp8_param "
-                    "is not enabled. Enable megatron_cfg.fp8_cfg.fp8_param so FP8 "
+                    "zero_train_gen_mismatch accepts fp8_param in "
+                    f"'{config_key}.{block}' of megatron_cfg.te_precision_config_file "
+                    "only with megatron_cfg.fp8_cfg.fp8_param enabled, so FP8 "
                     "parameter storage stays consistent with the padding and refit "
                     "behavior NeMo-RL derives from fp8_cfg."
                 )
