@@ -1278,6 +1278,10 @@ def test_reduce_mb_metric_means_per_chunk_diagnostics_and_sums_shares():
         assert reduce_mb_metric(f"{key}_t0", acc) == pytest.approx(0.8)
         assert reduce_mb_metric(f"{key}_t11", acc) == pytest.approx(0.8)
     assert reduce_mb_metric("kl_loss_scale", [4.0] * n_mb) == pytest.approx(4.0)
+    # Teacher weights and the selected-teacher index are per-microbatch values.
+    assert reduce_mb_metric("weight_t0", [1.0] * 64) == pytest.approx(1.0)
+    assert reduce_mb_metric("weight_t1", [0.25, 0.75]) == pytest.approx(0.5)
+    assert reduce_mb_metric("selected_teacher", [0, 1, 1, 1]) == pytest.approx(0.75)
     # Sum-reduced: global-denominator loss shares and counts, suffixed or not.
     assert reduce_mb_metric("kl_loss", [0.5] * 4) == pytest.approx(2.0)
     assert reduce_mb_metric("kl_loss_t0", [0.5] * 4) == pytest.approx(2.0)

@@ -164,6 +164,9 @@ MEAN_REDUCED_MB_METRICS = frozenset(
         "kl_common_per_chunk",
         "kl_partition_last_per_chunk",
         "top1_acc_per_chunk",
+        # Per-microbatch teacher weights and selected-teacher index.
+        "weight",
+        "selected_teacher",
     }
 )
 
