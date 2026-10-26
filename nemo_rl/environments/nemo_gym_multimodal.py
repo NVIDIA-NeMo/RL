@@ -214,7 +214,7 @@ def _extract_input_images_from_message(item: dict) -> list[Image.Image]:
         if isinstance(src, dict):
             src = src.get("url")
         if src is not None:
-            _append_resolved_image(images, src)
+            images.append(resolve_to_image(src))
     return images
 
 
