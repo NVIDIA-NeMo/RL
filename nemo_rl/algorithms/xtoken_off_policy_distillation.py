@@ -898,6 +898,12 @@ def validate_csd_router_replay_setup(master_config: MasterConfig) -> None:
             "the Megatron student policy backend; DTensor cannot consume "
             "routed_experts."
         )
+    cp_size = int(master_config.policy["megatron_cfg"]["context_parallel_size"])
+    if cp_size > 1 and not _sequence_packing_enabled(master_config.policy):
+        raise ValueError(
+            "policy.router_replay.enabled=true with Megatron context_parallel_size > 1 "
+            "requires policy.sequence_packing.enabled=true."
+        )
 
 
 def _sequence_packing_enabled(cfg: PolicyConfig) -> bool:
