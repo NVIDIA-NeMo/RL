@@ -1,6 +1,6 @@
 ---
 name: review-pr-team-verify-followup
-description: After a published PR review, check the author's fixes, close fixed threads, stage follow-ups
+description: After a published PR review, check the author's fixes, scan the new commits for major issues, close fixed threads, stage follow-ups
 user-invocable: true
 argument-hint: <pr-number> [owner/repo]
 ---
@@ -9,7 +9,8 @@ argument-hint: <pr-number> [owner/repo]
 
 Run this when the author has pushed fixes after your review. It checks every open thread you
 opened against evidence, closes the ones that are cleanly fixed, and turns partial fixes into
-short follow-up comments the author can resolve with one click. It works for reviews from
+short follow-up comments the author can resolve with one click. It also checks the new commits for
+major issues they introduced, since nobody has reviewed them yet. It works for reviews from
 `/review-pr-team` or by hand.
 
 Default repo: `NVIDIA-NeMo/RL`. "You" / "the reviewer" = the `gh`-authenticated user
@@ -89,7 +90,22 @@ Verdicts:
 
 Show the user a table (thread link, one-line finding, **what the author's reply claims**, verdict,
 evidence with permalinks at the new head, the commit that did it), plus CI status. Putting the
-author's claim next to your verdict makes any disagreement between them visible. **Stop and ask for confirmation** before step 3.
+author's claim next to your verdict makes any disagreement between them visible.
+
+### 2b. Check the new commits for new major issues
+
+Closing the old threads is only half the job: the fix commits are new code that nobody has reviewed,
+and they are where a new bug most often lands. Review what changed since the reviewed commit (for a
+rebase, the PR's own change before and after, as above), plus anything that code now reaches.
+
+- **Major only:** bugs and missing tests for changed behaviour. Style and nits were the first
+  review's job.
+- **Don't re-raise an open thread.** That is step 2's verdict.
+- Each finding cites file:line at the new head and is verified before it is shown, same as a
+  `/review-pr-team` finding.
+
+Show them under the step 2 table as a separate list. **Stop and ask for confirmation** before step 3;
+the user picks which new findings to stage.
 
 ### 3. Close the fixed threads (published directly)
 
@@ -113,8 +129,9 @@ why it no longer applies is fine. Verify each thread shows `isResolved: true` af
 ### 4. Stage follow-ups for partial fixes (PENDING)
 
 Create ONE pending review (or add to the user's existing one) holding **one new inline comment
-per partial item**, anchored on the current head at the line where the remaining work is. Do not
-reply inside the old thread yet.
+per partial item and per new finding the user picked in step 2b**, anchored on the current head at
+the line where the remaining work is. Do not reply inside the old thread yet. A new finding is a
+normal `/review-pr-team` comment; the **Fixed:** / **Still open:** shape below is for partial items.
 
 Each follow-up is written for the author, who has not read your notes. Follow the same comment rules as
 `/review-pr-team`:
@@ -156,6 +173,5 @@ Tell the user:
 - which threads were closed as fixed (and by which commit);
 - which follow-ups were posted (with links);
 - which were **not addressed** (no reply was posted on those, by design);
+- which new findings from step 2b were staged, and which the user dropped;
 - the CI status on the new head.
-
-Mention anything you noticed that is new and not part of the old review, but don't post it without asking.
