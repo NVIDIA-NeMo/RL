@@ -30,7 +30,7 @@ import ray
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.opd import TeacherResourceConfig
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
 from nemo_rl.data_plane.column_io import round_up
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
@@ -319,7 +319,7 @@ class TeacherWorkerGroup:
         teacher_meta = replace(
             meta,
             task_name=f"teacher_lp:{self.alias}",
-            fields=[*TEACHER_LP_FIELDS, *present_multimodal_fields(meta)],
+            fields=[*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)],
             extra_info={
                 **dict(meta.extra_info or {}),
                 GLOBAL_FORWARD_PAD_SEQLEN: round_up(

@@ -446,7 +446,9 @@ def test_tq_teacher_enrichment_skips_padding_for_dp_divisible_batch(monkeypatch)
     assert "teacher_reference_logprobs" in enriched.fields
 
 
-@pytest.mark.parametrize("media_rows", [[True], [False, True], [True, False]])
+@pytest.mark.parametrize(
+    "media_rows", [[True], [False, True], [True, False], [False, False]]
+)
 @pytest.mark.parametrize("teacher_fails", [False, True])
 def test_tq_teacher_padding_preserves_media_wire_rows(
     media_rows: list[bool], teacher_fails: bool
@@ -482,6 +484,16 @@ def test_tq_teacher_padding_preserves_media_wire_rows(
             dim_to_pack=0,
         ),
     }
+    if not any(media_rows):
+        # Capture publishes zero-row tensors to preserve the partition schema.
+        for key, shape in {
+            "pixel_values": (0, 3, 2, 2),
+            "imgs_sizes": (0, 2),
+            "num_frames": (0,),
+        }.items():
+            media[key] = PackedTensor(
+                [torch.empty(shape) for _ in media_rows], dim_to_pack=0
+            )
     fields = {
         "input_ids": torch.nested.as_nested_tensor(
             list(torch.arange(n * 3).reshape(n, 3).unbind()), layout=torch.jagged
@@ -508,7 +520,9 @@ def test_tq_teacher_padding_preserves_media_wire_rows(
         batch_size=[1],
     )
     client = MagicMock()
-    client.get_samples.return_value = source
+    client.get_samples.side_effect = lambda **kwargs: source.select(
+        *kwargs["select_fields"]
+    )
 
     class Teacher:
         sharding_annotations = _MockShardingAnnotations(4)
@@ -518,11 +532,17 @@ def test_tq_teacher_padding_preserves_media_wire_rows(
             assert padded_meta.sample_ids[:n] == meta.sample_ids
             assert padded_meta.tags == meta.tags + [meta.tags[-1]] * (4 - n)
             written = client.put_samples.call_args.kwargs["fields"]
-            assert set(written.keys()) == set(fields)
+            expected_fields = set(fields) - (
+                set(media) if not any(media_rows) else set()
+            )
+            assert set(written.keys()) == expected_fields
             # Exercise the production wire decoder, including an all-empty
             # padding slice when the original batch ends in a text-only row.
             decoded = materialize(written, tags=padded_meta.tags[n:])
             for key, value in media.items():
+                if not any(media_rows):
+                    assert key not in decoded
+                    continue
                 assert decoded[key].logical_segment_counts_by_row() == [
                     int(media_rows[-1])
                 ] * (4 - n)
@@ -565,11 +585,9 @@ def test_tq_teacher_padding_preserves_media_wire_rows(
         select_fields=[
             "input_ids",
             "input_lengths",
-            "imgs_sizes",
-            "num_frames",
-            "pixel_values",
-            "token_type_ids",
-        ],
+        ]
+        + (["imgs_sizes", "num_frames", "pixel_values"] if any(media_rows) else [])
+        + ["token_type_ids"],
     )
     temporary_ids = client.put_samples.call_args.kwargs["sample_ids"]
     client.clear_samples.assert_called_once_with(

@@ -33,7 +33,7 @@ import torch
 from pydantic import BaseModel, Field, model_validator
 from tensordict import TensorDict
 
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
@@ -479,7 +479,7 @@ class TQTeacherLogprobCoordinator:
             if remainder:
                 pad_count = dp_size - remainder
                 source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
-                teacher_fields = [*TEACHER_LP_FIELDS, *present_multimodal_fields(meta)]
+                teacher_fields = [*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)]
                 # Clone the wire row directly: decoding/re-encoding packed media
                 # would omit empty columns when the last row is text-only.
                 source_data = self._dp_client.get_samples(
