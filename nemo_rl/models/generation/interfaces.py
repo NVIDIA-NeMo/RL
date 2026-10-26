@@ -539,6 +539,10 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Dispatch the optional complete-GRPO capture contract."""
+        raise NotImplementedError("Four-phase capture requires the vLLM backend")
+
     def pause_generation(self, mode: str) -> None:
         """Pause in-flight generation on the backend."""
         raise NotImplementedError

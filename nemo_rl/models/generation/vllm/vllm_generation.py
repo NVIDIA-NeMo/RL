@@ -65,6 +65,11 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.models.profiling import (
+    ROLLOUT_PROFILER_CLASS_ENV,
+    actor_profiler_selected,
+    validate_rollout_profiler_topology,
+)
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
@@ -235,6 +240,15 @@ class VllmGeneration(GenerationInterface):
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.model_parallel_size = self.tp_size * self.pp_size
+        self._rollout_profiler_enabled = actor_profiler_selected(
+            ROLLOUT_PROFILER_CLASS_ENV, self.cfg["vllm_cfg"].get("env_vars")
+        )
+        if self._rollout_profiler_enabled:
+            validate_rollout_profiler_topology(
+                tensor_parallel_size=self.tp_size,
+                pipeline_parallel_size=self.pp_size,
+                expert_parallel_size=self.ep_size,
+            )
 
         assert cluster.world_size() % self.model_parallel_size == 0, (
             "World size must be a multiple of model parallel size. "
@@ -775,6 +789,26 @@ class VllmGeneration(GenerationInterface):
                 "vllm_step_metrics_snapshot", "failed to snapshot vLLM step metrics"
             )
             self._step_metrics_snapshot = None
+
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Forward capture control through model owners to the GPU workers."""
+        if not self._rollout_profiler_enabled:
+            raise RuntimeError(
+                f"Four-phase capture requires {ROLLOUT_PROFILER_CLASS_ENV} "
+                "in the vLLM worker environment"
+            )
+        method_name = (
+            "full_step_profile_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "full_step_profile"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            command=command,
+            **kwargs,
+        )
+        ray.get(futures)
 
     def get_step_metrics(self) -> dict[str, float]:
         """Get the vLLM engine metrics delta since snapshot_step_metrics().

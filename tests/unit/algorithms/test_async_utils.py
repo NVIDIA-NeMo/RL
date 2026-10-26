@@ -1360,6 +1360,7 @@ class TestAsyncTrajectoryCollector:
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal=None,
         resume_covered_task_indices=None,
+        profile_full_run: bool = False,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1384,6 +1385,7 @@ class TestAsyncTrajectoryCollector:
             ordinals_frontier_aligned=ordinals_frontier_aligned,
             resume_frontier_ordinal=resume_frontier_ordinal,
             resume_covered_task_indices=resume_covered_task_indices,
+            profile_full_run=profile_full_run,
         )
 
     def _prime_collection_loop(self, collector):
@@ -2786,6 +2788,133 @@ class TestAsyncTrajectoryCollector:
             collector.resume_after_refit()
 
         assert not collector._refit_pause_cleared.is_set()
+
+    def _four_phase_collector(self, *, native_pause: bool = True):
+        """Async-engine collector whose rollout capture commands are recorded."""
+        collector = self.create_local_collector(profile_full_run=True)
+        collector.master_config.policy["generation"] = {
+            "backend": "vllm",
+            "vllm_cfg": {"async_engine": True},
+        }
+        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
+        collector.wait_for_pending_generations = mock.Mock()
+        generation = collector.policy_generation
+        generation.pause_generation_for_refit_supported = native_pause
+        events = []
+        pause = generation.pause_generation_for_refit
+
+        def record_pause(*, clear_cache):
+            events.append(("pause", {}))
+            return pause(clear_cache=clear_cache)
+
+        generation.pause_generation_for_refit = record_pause
+        generation.full_step_profile = mock.Mock(
+            side_effect=lambda command, **kwargs: events.append((command, kwargs))
+        )
+        collector.set_weight_version(3)
+        collector.begin_rollout_profile_epoch(3)
+        collector.resume_after_refit()
+        return collector, events
+
+    def test_four_phase_epoch_hands_over_after_native_pause(self):
+        collector, events = self._four_phase_collector()
+
+        collector.prepare_for_refit()
+        # Without resumed generation, another pause is not a new epoch.
+        collector.prepare_for_refit()
+
+        assert [command for command, _ in events] == [
+            "begin_step",
+            "begin_phase",
+            "pause",
+            "end_phase",
+            "finish_step",
+            "begin_step",
+            "pause",
+        ]
+        assert events[0][1]["step_id"] == "generation3"
+        assert events[1][1]["labels"] == {
+            "weight_version": 3,
+            "eligible_target_weight_versions": collector._calculate_target_weights(3),
+            "ownership": "process_epoch",
+            "request_assignment": "may_cross_weight_epochs",
+        }
+        assert events[5][1] == {
+            "step_id": "generation4",
+            "attempt": 0,
+            "weight_version": 4,
+        }
+
+    def test_four_phase_epoch_requires_native_pause(self):
+        collector, events = self._four_phase_collector(native_pause=False)
+
+        with pytest.raises(RuntimeError, match="native generation pause"):
+            collector.prepare_for_refit()
+
+        assert "finish_step" not in [command for command, _ in events]
+
+    def test_four_phase_shutdown_quiesces_before_separate_save(self):
+        collector, events = self._four_phase_collector()
+        collector.running = True
+        events.clear()
+
+        with pytest.raises(RuntimeError, match="not quiesced"):
+            collector.finalize_rollout_profiler_shutdown()
+        collector.drain_for_rollout_profiler_shutdown()
+
+        assert [command for command, _ in events] == ["pause", "end_phase"]
+        assert collector.running is False
+        collector.finalize_rollout_profiler_shutdown()
+        assert [command for command, _ in events] == [
+            "pause",
+            "end_phase",
+            "finish_step",
+        ]
+
+    @pytest.mark.parametrize(
+        ("failure", "reason"),
+        [
+            ("pause", "async_epoch_shutdown_failed"),
+            ("finish_step", "async_epoch_save_failed"),
+        ],
+    )
+    def test_four_phase_shutdown_failure_aborts_epoch(self, failure, reason):
+        collector, events = self._four_phase_collector()
+        record = collector.policy_generation.full_step_profile.side_effect
+
+        def fail(command, **kwargs):
+            record(command, **kwargs)
+            if command == failure:
+                raise RuntimeError("capture failed")
+
+        collector.policy_generation.full_step_profile.side_effect = fail
+        if failure == "pause":
+            collector.policy_generation.pause_generation_for_refit = mock.Mock(
+                side_effect=RuntimeError("capture failed")
+            )
+
+        with pytest.raises(RuntimeError, match="capture failed"):
+            collector.drain_for_rollout_profiler_shutdown()
+            collector.finalize_rollout_profiler_shutdown()
+
+        assert events[-1] == ("abort_step", {"reason": reason})
+        assert collector.running is False
+        with pytest.raises(RuntimeError, match="not quiesced"):
+            collector.finalize_rollout_profiler_shutdown()
+
+    def test_disabled_four_phase_leaves_refit_and_shutdown_untouched(self):
+        collector = self.create_local_collector()
+        collector.policy_generation.full_step_profile = mock.Mock()
+        collector.running = True
+
+        collector.begin_rollout_profile_epoch(0)
+        collector.resume_after_refit()
+        collector.prepare_for_refit()
+        collector.drain_for_rollout_profiler_shutdown()
+        collector.finalize_rollout_profiler_shutdown()
+
+        collector.policy_generation.full_step_profile.assert_not_called()
+        assert collector.running is True
 
     def test_resume_after_refit_invalidates_cache_without_in_flight_updates(self):
         """Test resume after refit invalidates cache without in-flight updates."""

@@ -57,6 +57,7 @@ from nemo_rl.algorithms.grpo import (
     _save_async_replay_buffer_checkpoint,
     _shutdown_completed_nemo_gym_startup,
     _startup_pipeline_ready,
+    _stop_async_collection,
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
@@ -126,6 +127,144 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.weight_synchronizer.is_stale = True
     policy_generation.weight_synchronizer.sync_weights.return_value = {}
     return policy_generation
+
+
+@pytest.fixture
+def four_phase_env(monkeypatch):
+    monkeypatch.setenv("NRL_NTRACE_FOUR_PHASE", "1")
+    monkeypatch.setenv("NRL_POLICY_PROFILER_CLASS", "plugin.Policy")
+    monkeypatch.setenv("NRL_ROLLOUT_PROFILER_CLASS", "plugin.Rollout")
+    monkeypatch.setenv("NTRACE_RUN_ID", "run")
+
+
+def _record_capture(target, role, events):
+    target.full_step_profile.side_effect = lambda command, **kwargs: events.append(
+        (role, command, kwargs.get("name"))
+    )
+
+
+def test_four_phase_rejects_transfer_queue_before_allocating_workers(
+    four_phase_env,
+):
+    with (
+        patch("nemo_rl.algorithms.grpo.RayVirtualCluster") as cluster,
+        pytest.raises(ValueError, match="data_plane.enabled=false"),
+    ):
+        grpo_mod.setup(SimpleNamespace(data_plane={"enabled": True}), None, None, None)
+
+    cluster.assert_not_called()
+
+
+@pytest.mark.parametrize("scenario", ["disabled", "saved", "drain_timeout"])
+def test_async_collection_stop_bounds_quiescence_then_saves_and_reaps(scenario):
+    events = []
+    collector, replay_buffer = MagicMock(), MagicMock()
+    collector.drain_for_rollout_profiler_shutdown.remote.return_value = "drain"
+    collector.finalize_rollout_profiler_shutdown.remote.return_value = "save"
+    capture = MagicMock(enabled=scenario != "disabled")
+
+    def close():
+        events.append("close")
+        if scenario == "drain_timeout":
+            raise RuntimeError("capture incomplete")
+
+    capture.close.side_effect = close
+
+    def get(ref, timeout=None):
+        events.append((ref, timeout))
+        if ref == "drain" and scenario == "drain_timeout":
+            raise ray.exceptions.GetTimeoutError("drain timed out")
+
+    with (
+        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get),
+        patch(
+            "nemo_rl.algorithms.grpo.ray.kill",
+            side_effect=lambda actor: events.append(actor),
+        ),
+    ):
+        error = _stop_async_collection(
+            collector,
+            replay_buffer,
+            capture,
+            flush_telemetry=lambda: events.append("flush"),
+        )
+
+    reap = ["flush", collector, replay_buffer, "close"]
+    if scenario == "disabled":
+        assert (events, error) == (reap, None)
+    elif scenario == "saved":
+        assert (events, error) == ([("drain", 40.0), ("save", None), *reap], None)
+    else:
+        # A timed-out drain never starts the save, and cleanup still runs.
+        assert events == [("drain", 40.0), *reap]
+        assert isinstance(error, ray.exceptions.GetTimeoutError)
+        assert any("capture incomplete" in note for note in error.__notes__)
+
+
+def test_sync_four_phase_capture_brackets_rollout_refit_and_validation(
+    mock_grpo_components, four_phase_env
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 1
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    events = []
+    _record_capture(policy, "policy", events)
+    _record_capture(policy_generation, "rollout", events)
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, {"mean_gen_tokens_per_sample": 10.0}),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.validate", return_value=({"accuracy": 0.5}, {})),
+    ):
+        grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    refit = [
+        ("policy", "begin_phase", "weight_refit"),
+        ("rollout", "begin_phase", "weight_refit"),
+        ("rollout", "end_phase", None),
+        ("policy", "end_phase", None),
+    ]
+    assert events == [
+        ("policy", "configure_capture", None),
+        ("rollout", "configure_capture", None),
+        ("policy", "begin_step", None),
+        ("rollout", "begin_step", None),
+        *refit,
+        ("rollout", "begin_phase", "vllm_generation"),
+        ("rollout", "end_phase", None),
+        # Validation after the update refits and generates inside the step.
+        *refit,
+        ("rollout", "begin_phase", "validation_generation"),
+        ("rollout", "end_phase", None),
+        ("rollout", "finish_step", None),
+        ("policy", "finish_step", None),
+        ("policy", "close", None),
+        ("rollout", "close", None),
+    ]
 
 
 def test_save_async_replay_buffer_checkpoint(tmp_path):
@@ -1326,6 +1465,18 @@ class StubAsyncTrajectoryCollector:
         return self._remote_method("resume_after_refit")
 
     @property
+    def begin_rollout_profile_epoch(self):
+        return self._remote_method("begin_rollout_profile_epoch")
+
+    @property
+    def drain_for_rollout_profiler_shutdown(self):
+        return self._remote_method("drain_for_rollout_profiler_shutdown")
+
+    @property
+    def finalize_rollout_profiler_shutdown(self):
+        return self._remote_method("finalize_rollout_profiler_shutdown")
+
+    @property
     def get_status(self):
         """Return a healthy collector status with no reserved targets."""
         mock = MagicMock()
@@ -2019,6 +2170,68 @@ def test_async_checkpoint_persists_lowered_cut_not_trained_frontier(
         range(lowered_cut, trained_frontier)
     )
     assert rollouts_state[RESUME_BASE_ORDINAL_KEY] == 0
+
+
+def test_async_four_phase_capture_owns_policy_steps_and_rollout_epochs(
+    mock_grpo_components, four_phase_env
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    policy = mock_grpo_components["policy"]
+    policy_generation = _mock_policy_generation()
+    events = []
+    _record_capture(policy, "policy", events)
+    _record_capture(policy_generation, "rollout", events)
+
+    collector_cls = MagicMock()
+    collector_cls.options.return_value.remote.return_value = (
+        StubAsyncTrajectoryCollector(events=events)
+    )
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {"mean_gen_tokens_per_sample": 2.0}),
+        patch("nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector", collector_cls),
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+        )
+
+    assert collector_cls.options.return_value.remote.call_args.kwargs[
+        "profile_full_run"
+    ]
+    assert events == [
+        ("policy", "configure_capture", None),
+        ("rollout", "configure_capture", None),
+        # Step 1 and the first rollout epoch include the bootstrap refit.
+        ("policy", "begin_step", None),
+        "begin_rollout_profile_epoch",
+        "set_weight_version",
+        "start_collection",
+        "set_weight_version",
+        "resume_after_refit",
+        ("policy", "finish_step", None),
+        # Bounded quiescence, then the separately awaited save, then close.
+        "drain_for_rollout_profiler_shutdown",
+        "finalize_rollout_profiler_shutdown",
+        ("policy", "close", None),
+        ("rollout", "close", None),
+    ]
 
 
 def test_async_resume_plumbs_frontier_metadata_into_collector(

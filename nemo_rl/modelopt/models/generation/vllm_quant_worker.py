@@ -26,6 +26,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.models.profiling import ROLLOUT_PROFILER_CONFIG_KEY
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
@@ -80,6 +81,11 @@ def _configure_quant_engine_kwargs(
         )
         llm_kwargs["quantization"] = quantization_method_for_mode(mode)
     else:
+        # Fake quantization replaces the internal worker that hosts profiling.
+        if ROLLOUT_PROFILER_CONFIG_KEY in (llm_kwargs.get("additional_config") or {}):
+            raise ValueError(
+                "Rollout profiling does not support ModelOpt fake quantization"
+            )
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
         )

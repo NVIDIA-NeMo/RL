@@ -19,6 +19,7 @@ import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
+from nemo_rl.models.profiling import WorkerCapture
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -311,6 +312,14 @@ class AbstractPolicyWorker:
             # actor and this never runs, so worker telemetry relies on the batch
             # processor's periodic export.
             shutdown_telemetry()
+
+    _four_phase_capture: WorkerCapture | None = None
+
+    def full_step_profile(self, command: str, **kwargs: Any) -> None:
+        """Dispatch capture commands inside the policy GPU actor."""
+        if self._four_phase_capture is None:
+            raise RuntimeError("Four-phase capture requires a profiled policy worker")
+        self._four_phase_capture.dispatch(command, **kwargs)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
