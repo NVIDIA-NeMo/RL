@@ -43,6 +43,10 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -89,6 +93,7 @@ class AdvantageStageConfig:
     policy_logprobs_required: bool
     reference_logprobs_required: bool
     teacher_logprobs_required: bool
+    opd_full_enabled: bool
     message_level_advantage_penalties_enabled: bool
     shardable: bool
     # Where the per-step training dump writes, or None when it is disabled.
@@ -96,6 +101,7 @@ class AdvantageStageConfig:
     # the untruncated tensors: the controller stopped fetching them when the
     # computation moved here.
     train_data_dump_dir: Optional[str]
+    filtering_on: bool = False
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -118,6 +124,12 @@ class AdvantageStageConfig:
         algo_cfg = algo_config(master_config)
         loss_cfg = master_config.loss_fn
         return cls(
+            filtering_on=need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=master_config.policy["generation"]["top_k"],
+                    top_p=master_config.policy["generation"]["top_p"],
+                )
+            ),
             advantage=AdvantageConfig(),
             algo=algo_cfg,
             is_ppo=is_ppo,
@@ -132,6 +144,7 @@ class AdvantageStageConfig:
                 and not algo_cfg.skip_reference_policy_logprobs_calculation
             ),
             teacher_logprobs_required=opd_module.is_opd_enabled(master_config),
+            opd_full_enabled=opd_module.get_opd_full_config(master_config) is not None,
             message_level_advantage_penalties_enabled=(
                 algo_cfg.invalid_tool_call_advantage is not None
                 or algo_cfg.malformed_thinking_advantage is not None
@@ -348,6 +361,7 @@ class AdvantageComputer:
         if cfg.algo.overlong_filtering:
             final_sample_mask = final_sample_mask * (~truncated).to(sample_mask.dtype)
 
+        final_sample_mask = final_sample_mask * token_mask[:, 1:].bool().any(dim=-1)
         pre_seq_error_sample_mask = final_sample_mask.clone()
 
         seq_error_metrics: Optional[dict[str, float]] = None
@@ -355,6 +369,11 @@ class AdvantageComputer:
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
         if cfg.policy_logprobs_required:
+            # Full KL compares unfiltered policy with possibly filtered rollout
+            # logprobs. Their normalization gap remains diagnostic.
+            seq_logprob_error_threshold = (
+                None if cfg.opd_full_enabled else cfg.algo.seq_logprob_error_threshold
+            )
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
@@ -377,7 +396,8 @@ class AdvantageComputer:
             seq_error_metrics = compute_and_apply_seq_logprob_error_masking(
                 train_data=masking_data,
                 rewards=rewards,
-                seq_logprob_error_threshold=cfg.algo.seq_logprob_error_threshold,
+                seq_logprob_error_threshold=seq_logprob_error_threshold,
+                filtering_on=cfg.filtering_on,
             )
             final_sample_mask = masking_data["sample_mask"]
             num_valid_seqs_after = float(

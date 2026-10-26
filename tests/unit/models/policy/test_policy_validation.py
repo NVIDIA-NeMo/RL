@@ -39,6 +39,30 @@ def test_shutdown_succeeds_before_worker_group_is_initialized(capsys) -> None:
     assert capsys.readouterr().out == ""
 
 
+def test_enable_refit_prequantize_forwards_names_and_returns_metadata(
+    monkeypatch,
+) -> None:
+    policy = Policy.__new__(Policy)
+    futures = [object()]
+    updated_info = {
+        "model.weight": ((2, 2), "float8_e4m3fn"),
+        "model.weight_scale_from_checkpoint": ((2, 1), "uint8"),
+    }
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_single_data.return_value = futures
+    ray_get = MagicMock(return_value=[updated_info])
+    monkeypatch.setattr("nemo_rl.models.policy.lm_policy.ray.get", ray_get)
+
+    result = policy.enable_refit_prequantize(["model.weight"])
+
+    assert result is updated_info
+    policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "enable_refit_prequantize",
+        param_names=["model.weight"],
+    )
+    ray_get.assert_called_once_with(futures)
+
+
 def create_mock_cluster(world_size: int):
     """Create a mock cluster with the specified world size."""
     cluster = MagicMock()
@@ -305,13 +329,13 @@ def test_policy_rejects_mismatched_vllm_and_megatron_fp32_lm_head(
     worker_group.assert_not_called()
 
 
-def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
+def test_policy_rejects_vllm_fp32_lm_head_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="DTensor has no matching"),
+        pytest.raises(ValueError, match="Automodel has no matching"),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
@@ -322,7 +346,7 @@ def test_policy_rejects_vllm_fp32_lm_head_with_dtensor_trainer():
     worker_group.assert_not_called()
 
 
-def test_policy_accepts_vllm_fp32_lm_head_disabled_with_dtensor_trainer():
+def test_policy_accepts_vllm_fp32_lm_head_disabled_with_automodel_trainer():
     config = create_automodel_config("test-model", tp=1)
     set_vllm_generation(config, {})
 
@@ -436,7 +460,7 @@ def test_policy_flops_tracker_uses_hf_config_overrides() -> None:
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_nvfp4_pertoken_rejects_dtensor_training_backend(
+def test_nvfp4_pertoken_rejects_automodel_training_backend(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -580,7 +604,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
-        # Valid cases - DTensor backend (PP is always 1 for DTensor)
+        # Valid cases - Automodel backend (PP is always 1 for Automodel)
         (8, 8, 1, True, None, "Valid: DP=1, TP=8, PP=1, CP=1"),
         (16, 8, 1, True, None, "Valid: DP=2, TP=8, PP=1, CP=1"),
         (8, 4, 2, True, None, "Valid: DP=1, TP=4, PP=1, CP=2"),
@@ -597,7 +621,7 @@ def test_policy_rejects_unregistered_worker_extension(from_config: bool) -> None
     ],
 )
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_world_size_validation_dtensor(
+def test_world_size_validation_automodel(
     mock_ray_worker_group,
     tiny_llama_model_path,
     world_size,
@@ -607,16 +631,16 @@ def test_world_size_validation_dtensor(
     expected_error_type,
     description,
 ):
-    """Test world_size validation with DTensor backend.
+    """Test world_size validation with Automodel backend.
 
-    Note: DTensor backend always uses PP=1 (no pipeline parallelism support).
+    Note: Automodel backend always uses PP=1 (no pipeline parallelism support).
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     """
     cluster = create_mock_cluster(world_size)
     tokenizer = create_mock_tokenizer()
     config = create_automodel_config(
         tiny_llama_model_path, tp, pp=1, cp=cp
-    )  # DTensor always has PP=1
+    )  # Automodel always has PP=1
 
     # Mock RayWorkerGroup to prevent actual worker creation
     mock_worker_group_instance = MagicMock()
@@ -627,7 +651,7 @@ def test_world_size_validation_dtensor(
         try:
             policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
             # Verify the calculated DP makes sense
-            expected_dp = world_size // (1 * cp * tp)  # PP=1 for DTensor
+            expected_dp = world_size // (1 * cp * tp)  # PP=1 for Automodel
             assert expected_dp >= 1, f"Expected DP should be >= 1, got {expected_dp}"
             # Verify that worker group was created (validation passed)
             mock_ray_worker_group.assert_called_once()
@@ -658,7 +682,7 @@ def test_world_size_validation_dtensor(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_dp_replicate_size_sets_batching_dp(
+def test_automodel_dp_replicate_size_sets_batching_dp(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -676,7 +700,7 @@ def test_dtensor_dp_replicate_size_sets_batching_dp(
 
 
 @patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
-def test_dtensor_hsdp_dispatches_distinct_batches(
+def test_automodel_hsdp_dispatches_distinct_batches(
     mock_ray_worker_group,
     tiny_llama_model_path,
 ):
@@ -788,7 +812,7 @@ def test_world_size_validation_megatron(
 ):
     """Test world_size validation with Megatron backend.
 
-    Megatron backend supports pipeline parallelism (PP > 1) unlike DTensor.
+    Megatron backend supports pipeline parallelism (PP > 1) unlike Automodel.
     Tests the constraint: world_size = DP * PP * CP * TP where DP >= 1 and DP must be integer.
     Note: Expert Parallelism (EP) is handled internally by Megatron-Core, not at the worker level.
     """

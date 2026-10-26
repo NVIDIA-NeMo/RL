@@ -23,6 +23,7 @@ from copy import copy, deepcopy
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
+from urllib.parse import unquote
 
 import requests
 import torch
@@ -46,6 +47,12 @@ AUDIO_CONTENT_TYPES = frozenset({"input_audio", "audio", "audio_url"})
 MULTIMODAL_CONTENT_TYPES = frozenset(
     {*IMAGE_CONTENT_TYPES, *VIDEO_CONTENT_TYPES, *AUDIO_CONTENT_TYPES}
 )
+# Provenance marker set on user messages whose media tensors were attached
+# rollout-matched (repaired to the rollout's per-image placeholder runs). The
+# driver-side static reattach must not overwrite such media; key presence
+# alone is not provenance (targets may carry placeholder or stale payloads
+# that the reattach is expected to replace).
+ROLLOUT_MATCHED_MEDIA_KEY = "_rollout_matched_media"
 
 # List of allowed placeholder strings for different media types in the dataset string
 # e.g. "This is an example of <image>"
@@ -71,6 +78,7 @@ _PLACEHOLDER_STYLE_PROCESSOR_NAMES = frozenset(
         "NemotronNanoVLV2Processor",
         "NemotronH_Nano_Omni_Reasoning_V3Processor",
         "NemotronH_Omni_Reasoning_V3Processor",
+        "NemotronH_Super_Omni_Reasoning_V3Processor",
     }
 )
 
@@ -125,6 +133,8 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+        # Which tokens are allowed to be replaced by multimodal embeddings.
+        "media_token_validity_mask",
     }
 )
 
@@ -1489,10 +1499,29 @@ def resolve_to_image(image_path_or_image: str | Image.Image) -> Image.Image:
         image_data = base64.b64decode(encoded)
         return Image.open(BytesIO(image_data)).convert("RGB")
     elif image_path_or_image.startswith("file://"):
-        return Image.open(image_path_or_image.removeprefix("file://")).convert("RGB")
+        image_path = unquote(image_path_or_image.removeprefix("file://"))
+        return Image.open(image_path).convert("RGB")
     else:
         # Handle local file path
         return Image.open(image_path_or_image).convert("RGB")
+
+
+def image_size_from_source(source: str | Image.Image) -> tuple[int, int]:
+    """Return ``(width, height)`` for an image source."""
+    if isinstance(source, Image.Image):
+        return source.width, source.height
+    if source.startswith("data:"):
+        _, encoded = source.split(",", 1)
+        with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+            return image.width, image.height
+    if source.startswith("file://"):
+        with Image.open(source.removeprefix("file://")) as image:
+            return image.width, image.height
+    if not source.startswith(("http://", "https://")):
+        with Image.open(source) as image:
+            return image.width, image.height
+    image = resolve_to_image(source)
+    return image.width, image.height
 
 
 def image_to_data_url(image: Image.Image, fmt: str = "PNG") -> str:
@@ -1635,16 +1664,37 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 continue
 
 
+def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
+    value = processed.get("num_tokens")
+    if value is None:
+        raise ValueError(
+            "Processor output has no per-image 'num_tokens'; cannot verify "
+            "image parity with the rollout tokens."
+        )
+    if isinstance(value, torch.Tensor):
+        return [int(item) for item in value.tolist()]
+    return [int(item) for item in value]
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
     images: list[Image.Image],
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
+    expected_num_tokens_per_image: Sequence[int] | None = None,
 ) -> None:
-    """Attach processor-owned image tensors without replacing rollout tokens."""
+    """Attach image tensors while preserving rollout-token/media parity."""
     if not images or processor is None:
         return
+    if expected_num_tokens_per_image is not None and len(
+        expected_num_tokens_per_image
+    ) != len(images):
+        raise ValueError(
+            f"Got {len(images)} images but {len(expected_num_tokens_per_image)} "
+            "rollout placeholder runs for this turn. Refusing to train on "
+            "misaligned media."
+        )
 
     image_token = getattr(processor, "image_token", "<image>")
     # Processors that emit dynamic per-image resolutions return a ragged CHW list
@@ -1658,6 +1708,17 @@ def attach_image_model_inputs_to_message(
         return_tensors=None if allow_ragged_output else "pt",
     )
     processed = dict(processed)
+    if expected_num_tokens_per_image is not None:
+        expected = [int(count) for count in expected_num_tokens_per_image]
+        if _image_num_tokens_from_processed(processed) != expected:
+            # Local import: exact-count repair is Nemotron-processor-specific.
+            from nemo_rl.environments.nemotron_utils import (
+                reprocess_images_at_rollout_budgets,
+            )
+
+            processed = reprocess_images_at_rollout_budgets(processor, images, expected)
+            # Corrected tiles may be ragged even when the originals were not.
+            allow_ragged_output = len(images) > 1
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
@@ -1668,6 +1729,38 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    attach_processor_media_token_validity_mask(message, processor)
+    if expected_num_tokens_per_image is not None:
+        message[ROLLOUT_MATCHED_MEDIA_KEY] = True
+
+
+def attach_processor_media_token_validity_mask(
+    message: dict[str, Any], processor: Any
+) -> None:
+    """Record which rollout tokens are processor-owned media placeholders."""
+    # TODO: Add support for audio placeholder masks. This function only
+    # handles image (and video) placeholder tokens.
+    token_ids = message.get("token_ids")
+    image_token = getattr(processor, "image_token", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if (
+        not isinstance(token_ids, torch.Tensor)
+        or not isinstance(image_token, str)
+        or not callable(convert_token)
+    ):
+        return
+
+    media_token_id = convert_token(image_token)
+    if isinstance(media_token_id, bool) or not isinstance(media_token_id, int):
+        return
+    if media_token_id == getattr(tokenizer, "unk_token_id", None):
+        # An unknown-token fallback does not prove that the processor owns
+        # those positions; masking every literal UNK as media would corrupt text.
+        return
+    # Construct the media placeholder token validity mask, which represents
+    # which tokens are permitted substitutes of multimodal embeddings.
+    message["media_token_validity_mask"] = token_ids.eq(media_token_id)
 
 
 _VIDEO_EXT_TO_MIME = {
@@ -1686,7 +1779,7 @@ def video_path_to_data_url(video_path: str) -> str:
         return video_path
 
     resolved = (
-        video_path.removeprefix("file://")
+        unquote(video_path.removeprefix("file://"))
         if video_path.startswith("file://")
         else str(Path(video_path).expanduser().resolve())
     )
@@ -1899,20 +1992,40 @@ def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
 
 
 def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
-    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+    """Attach a ``[B, S]`` mask of media-token positions that anchor media features.
 
     Builds the mask while rows still are samples. Sequence packing later
     concatenates those rows into one THD sequence, after which no per-row
-    question can be asked, so the packing step carries this through the same
-    transform as ``input_ids`` rather than deriving it downstream.
+    information can be recovered, so the packing step carries this through
+    the same transform as ``input_ids`` rather than deriving it downstream.
 
-    The batch is duck-typed rather than annotated as ``BatchedDataDict``:
-    that module imports this one, so naming it here would be circular.
+    Args:
+        batch: Batch with ``[B, S]`` ``input_ids``.
+        media_token_id: Media placeholder token ID, or None if the model does not
+            accept the mask, in which case any existing mask is removed. The
+            Megatron policy worker passes None when
+            ``_model_accepts_media_token_validity_mask`` is False.
     """
     if media_token_id is None:
+        batch.pop("media_token_validity_mask", None)
         return
     input_ids = batch.get("input_ids", None)
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
+        return
+    existing_mask = batch.get("media_token_validity_mask", None)
+    if existing_mask is not None:
+        if not isinstance(existing_mask, torch.Tensor):
+            raise TypeError(
+                "media_token_validity_mask must be a torch.Tensor, got "
+                f"{type(existing_mask).__name__}."
+            )
+        if existing_mask.shape != input_ids.shape:
+            raise ValueError(
+                "media_token_validity_mask must align with input_ids: "
+                f"mask={tuple(existing_mask.shape)}, "
+                f"input_ids={tuple(input_ids.shape)}."
+            )
+        batch["media_token_validity_mask"] = existing_mask.bool()
         return
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:

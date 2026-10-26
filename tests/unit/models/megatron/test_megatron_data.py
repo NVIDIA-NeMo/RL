@@ -1509,6 +1509,41 @@ class TestProcessMicrobatch:
             torch.tensor([[0, 0, 1, 0], [0, 1, 0, 0]]),
         )
 
+    @pytest.mark.parametrize(
+        "pack_sequences, delegate_pack_to_model",
+        [
+            # Qwen2.5-VL: its forward has no media_token_validity_mask kwarg.
+            (False, False),
+            # Qwen3-VL: packs internally, which rejects a caller-side mask.
+            (True, True),
+        ],
+    )
+    def test_process_microbatch_drops_grpo_mask_for_unsupported_models(
+        self, pack_sequences, delegate_pack_to_model
+    ):
+        """A GRPO-attached mask must not reach a model that cannot consume it."""
+        from nemo_rl.data.multimodal_utils import attach_media_token_validity_mask
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        data = {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([3, 2]),
+            "media_token_validity_mask": torch.ones_like(input_ids, dtype=torch.bool),
+        }
+        # Unsupported models resolve no media placeholder id at worker setup.
+        attach_media_token_validity_mask(data, None)
+
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=pack_sequences,
+            delegate_pack_to_model=delegate_pack_to_model,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.media_token_validity_mask is None
+
 
 @pytest.mark.mcore
 class TestPrepareVlmBatchForMegatron:

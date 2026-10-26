@@ -46,7 +46,6 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-# Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
@@ -57,11 +56,19 @@ from nemo_rl.algorithms.grpo import (
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
+    _save_adaptive_loss_state,
     _should_log_nemo_gym_responses,
+    _update_adaptive_loss_state,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
+)
+
+# Re-imports from grpo so this file is a thin trainer-only fork.
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossDataDict,
@@ -76,6 +83,7 @@ from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
+    finalize_draft_ratio_metrics,
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
@@ -83,6 +91,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
@@ -376,6 +385,7 @@ def _compute_seq_logprob_error_metrics(
     generation_logprobs: torch.Tensor,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
+    filtering_on: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     # Thin BDD for the data-driven masking call: take
     # the slice you need, transform, write delta back.
@@ -391,6 +401,7 @@ def _compute_seq_logprob_error_metrics(
         train_data=masking_data,
         rewards=rewards,
         seq_logprob_error_threshold=seq_logprob_error_threshold,
+        filtering_on=filtering_on,
     )
     seq_logprob_error_metrics = seq_error_result
     if "num_masked_seqs" in seq_logprob_error_metrics:
@@ -515,6 +526,7 @@ def grpo_train_sync(
     val_period = master_config.grpo.val_period
     val_start_at = master_config.grpo.val_start_at
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
 
@@ -580,7 +592,12 @@ def grpo_train_sync(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -715,6 +732,7 @@ def grpo_train_sync(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -1008,6 +1026,12 @@ def grpo_train_sync(
                             generation_logprobs=generation_logprobs,
                             rewards=rewards,
                             seq_logprob_error_threshold=seq_logprob_error_threshold,
+                            filtering_on=need_top_k_or_top_p_filtering(
+                                TrainingSamplingParams(
+                                    top_k=master_config.policy["generation"]["top_k"],
+                                    top_p=master_config.policy["generation"]["top_p"],
+                                )
+                            ),
                         )
                     )
 
@@ -1152,6 +1176,7 @@ def grpo_train_sync(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
@@ -1240,6 +1265,7 @@ def grpo_train_sync(
                         )
                     elif k in {
                         "lr",
+                        "draft_lr",
                         "wd",
                         "reward",
                         "filtered_reward",
@@ -1252,7 +1278,9 @@ def grpo_train_sync(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+                finalize_draft_ratio_metrics(metrics)
 
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -1290,6 +1318,7 @@ def grpo_train_sync(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -1342,17 +1371,14 @@ def grpo_train_sync(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            torch.save(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         checkpointer.begin_finalization(
                             checkpoint_path,
@@ -1411,6 +1437,12 @@ def grpo_train_sync(
                     },
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
+                    filtering_on=need_top_k_or_top_p_filtering(
+                        TrainingSamplingParams(
+                            top_k=master_config.policy["generation"]["top_k"],
+                            top_p=master_config.policy["generation"]["top_p"],
+                        )
+                    ),
                 )
             if (
                 master_config.policy["generation"]

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import gc
 import os
 from collections import defaultdict
@@ -66,6 +67,7 @@ from nemo_rl.models.megatron.data import (
     process_global_batch,
 )
 from nemo_rl.models.megatron.setup import (
+    _distributed_timeout_minutes,
     finalize_megatron_setup,
     handle_model_import,
     make_policy_like_config,
@@ -90,6 +92,7 @@ from nemo_rl.telemetry.setup import (
     traced_worker_init,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.path_utils import maybe_enable_msc
 from nemo_rl.utils.sequence_lengths import CpuIntTuple, to_cpu_int_tuple
 from nemo_rl.utils.tensor_ops import pad_and_concat
 
@@ -284,10 +287,17 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
         )
         all_dp_ranks = my_replica_ranks_t.tolist()
 
+        timeout_minutes = _distributed_timeout_minutes(self.cfg)
         groups: dict[int, Any] = {}
         for dp in sorted(set(all_dp_ranks)):
             ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
-            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            grp = torch.distributed.new_group(
+                ranks=ranks,
+                backend="nccl",
+                timeout=None
+                if timeout_minutes is None
+                else datetime.timedelta(minutes=timeout_minutes),
+            )
             groups[dp] = grp
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
@@ -344,6 +354,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
             init_optimizer: Whether to initialize the optimizer.
             worker_sharding_annotations: Sharding topology for distributed training.
         """
+        # Resume loads from weights_path/optimizer_path during setup, before any
+        # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
+        maybe_enable_msc(weights_path, optimizer_path)
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
         gpu_ids = ray.get_gpu_ids()
@@ -934,6 +947,8 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
                 "Distributed process group is not initialized. Cannot save checkpoint."
             )
 
+        maybe_enable_msc(weights_path)
+
         original_save_path = self.mcore_state.cfg.checkpoint.save
 
         try:
@@ -1009,6 +1024,9 @@ class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
 
     def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
+        # MambaMixer.train(False), called by eval(), refreshes its inference cache
+        # from A_log (-torch.exp(A_log.float())). Do this before model offload frees
+        # CUDA parameter storage; refreshing afterward would read invalid storage.
         self.model.eval()
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True

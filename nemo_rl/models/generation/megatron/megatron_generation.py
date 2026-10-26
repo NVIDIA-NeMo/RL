@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
@@ -27,7 +28,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
+    agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
 from nemo_rl.models.generation.megatron.config import (
@@ -40,6 +41,7 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
@@ -224,6 +226,7 @@ class MegatronGeneration(GenerationInterface):
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
+
         # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
         # the loop-level flag must agree with that mode, and setup errors on a mismatch.
         kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
@@ -387,10 +390,6 @@ class MegatronGeneration(GenerationInterface):
     def uses_native_refit(self) -> bool:
         """Whether non-colocated refit uses Megatron Core's native mechanism."""
         return self.cfg.get("refit_transport") == "mcore"
-
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Megatron inference receives logical weights on every refit path."""
-        return "logical_weights"
 
     @property
     def worker_group(self) -> "RayWorkerGroup":
@@ -601,10 +600,14 @@ class MegatronGeneration(GenerationInterface):
         futures = worker.generate_async._remote(
             kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
         )
-        async for result_ref in futures:
-            index, result_batch = await result_ref
-            result_batch["gen_leader_worker_idx"] = [0]
-            yield index, result_batch
+        try:
+            async for result_ref in futures:
+                index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(futures)
+            raise
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
@@ -645,13 +648,12 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
-    ) -> None:
-        """Install MInf's canonical prompt and completion capture hooks."""
-        if capture_media:
-            raise NotImplementedError(
-                "Media token capture is only implemented for the vLLM generation "
-                "backend; the MInf stager writes text-only rows"
-            )
+    ) -> "Optional[MediaColumnSpec]":
+        """Install MInf's canonical prompt and completion capture hooks.
+
+        Returns the media column spec the coordinators pinned (``None`` for
+        text-only capture).
+        """
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."
@@ -661,8 +663,9 @@ class MegatronGeneration(GenerationInterface):
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
+            capture_media=capture_media,
         )
-        ray.get(futures)
+        return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the policy epoch stamped by MInf on subsequent requests."""
@@ -720,7 +723,9 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
-    def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
         """Prepare Bridge conversion tasks on every dedicated inference worker."""
         if not self._owns_policy or self.uses_native_refit:
             return

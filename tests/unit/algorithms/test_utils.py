@@ -29,7 +29,6 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_trivial_reward_distributions,
     get_tokenizer,
-    mask_out_neg_inf_logprobs,
     maybe_pad_last_batch,
     print_efficiency_summary,
     print_performance_metrics,
@@ -151,6 +150,66 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     formatted = tokenizer.apply_chat_template(conversation_messages, tokenize=False)
     expected = get_format_with_simple_role_header(conversation_messages)
     assert formatted == expected
+
+
+def test_get_processor_custom_template_updates_processor_and_tokenizer():
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "stale-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "new-template"
+
+
+def test_get_processor_custom_template_preserves_native_multimodal_template():
+    class Qwen2_5_VLProcessor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = Qwen2_5_VLProcessor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "native-multimodal-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "native-multimodal-template"
 
 
 def test_get_tokenizer_forwards_tokenizer_kwargs():
@@ -1059,25 +1118,6 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
-
-
-def test_mask_out_neg_inf_logprobs_finite_mask_and_zeroing(capsys):
-    """finite_mask ignores the caller's mask; logprobs are zeroed where mask * finite_mask is 0."""
-    neg_inf = -float("inf")
-    logprobs = torch.tensor(
-        [[-0.5, neg_inf, -1.0, -2.0], [neg_inf, -0.1, -0.2, neg_inf]]
-    )
-    mask = torch.tensor([[1.0, 1.0, 0.0, 1.0], [0.0, 1.0, 1.0, 1.0]])
-
-    masked, finite_mask = mask_out_neg_inf_logprobs(logprobs, mask, "curr_logprobs")
-
-    # finite_mask is 0 exactly at -inf positions, whether or not the mask keeps them.
-    assert torch.equal(finite_mask, (~torch.isinf(logprobs)).float())
-    effective = mask * finite_mask
-    assert torch.all(masked[effective == 0] == 0)
-    assert torch.equal(masked[effective == 1], logprobs[effective == 1])
-    # The warning counts only -inf positions the caller's mask still treats as valid.
-    assert "2/6 valid tokens have -inf in curr_logprobs" in capsys.readouterr().out
 
 
 class TestPrintEfficiencySummary:

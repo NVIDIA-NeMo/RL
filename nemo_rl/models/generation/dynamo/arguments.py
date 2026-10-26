@@ -234,11 +234,6 @@ def build_dynamo_frontend_argv(
         dynamo_cfg.frontend_args.router_mode,
         source="dynamo_cfg.frontend_args.router_mode",
     )
-    builder.add(
-        "--router-reset-states",
-        dynamo_cfg.frontend_args.router_reset_states,
-        source="dynamo_cfg.frontend_args.router_reset_states",
-    )
     builder.add_raw(
         dynamo_cfg.frontend_args.extra_cli_args,
         source="dynamo_cfg.frontend_args.extra_cli_args",

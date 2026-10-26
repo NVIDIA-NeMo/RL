@@ -20,12 +20,14 @@ broadcasts its weights, and generation workers receive them via the
 established NCCL process group.
 
 Lifecycle per sync:
-  1. policy.broadcast_weights_for_collective()    -- send via NCCL
+  1. policy.offload_before_refit()                 -- optional trainer memory release
+  2. policy.broadcast_weights_for_collective()    -- send via NCCL
      generation.update_weights_from_collective()  -- receive via NCCL
-  2. Verify transfer success
+  3. Verify transfer success
 
-No offload/restore steps are needed since policy and generation run on
-separate GPUs with dedicated memory.
+Policy and generation run on separate GPUs. Trainer offload is disabled by
+default, but large quantized exports can opt in when their temporary tensors
+need more trainer GPU headroom.
 """
 
 from collections.abc import Sequence
@@ -35,7 +37,10 @@ from typing import Any, Optional
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 from nemo_rl.weight_sync.membership import (
     RefitMembership,
     desired_membership,
@@ -95,6 +100,8 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             arms a watchdog and aborts its own communicator when it expires, which is
             what lets the controller rebuild over the survivors instead of blocking in
             NCCL forever. ``None`` disarms it entirely, so the hang protection is lost.
+        offload_policy_before_refit: Whether to run the policy's existing refit
+            offload lifecycle before exporting weights.
     """
 
     def __init__(
@@ -104,7 +111,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         train_cluster: Any,
         inference_cluster: Any,
         refit_timeout_s: Optional[float] = None,
-    ):
+        *,
+        offload_policy_before_refit: bool = False,
+    ) -> None:
         # None disarms the abort watchdog in every worker, which is the default and
         # reproduces the pre-existing behaviour exactly.
         self._refit_timeout_s = refit_timeout_s
@@ -112,6 +121,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._generation = generation
         self._train_cluster = train_cluster
         self._inference_cluster = inference_cluster
+        self._offload_policy_before_refit = offload_policy_before_refit
         self._stale = True
         # What the communicator was last built over. None until init_communicator.
         self._built_membership: Optional[RefitMembership] = None
@@ -122,6 +132,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        if self._offload_policy_before_refit:
+            self._policy.offload_before_refit()
+
         timer_context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer is not None
@@ -134,6 +147,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
                 refit_timeout_s=self._refit_timeout_s,
                 buffer_size_bytes=sender_spec.buffer_size_bytes,
                 num_buffers=sender_spec.num_buffers,
+                use_legacy_packing=sender_spec.use_legacy_packing,
             )
             futures_inference = self._generation.update_weights_from_collective(
                 refit_timeout_s=self._refit_timeout_s
@@ -210,10 +224,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # prepare_refit_info is called before init_collective. This matches
         # distillation.py ordering. Neither call depends on the other today,
         # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info(
-            refit_payload_mode=self._generation.get_refit_payload_mode()
-        )
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()
@@ -327,14 +338,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         # state_dict_info at all -- update_weights_from_collective asserts on it -- and
         # this is metadata rather than weights, so redistributing it to shards that
         # already have it is cheap and removes the need to track who is new.
-        #
-        # Same payload mode as init_communicator: the policy has required it since #3739,
-        # and this call shipped without it, so every collective-transport recovery died
-        # here with a TypeError before touching NCCL (PR #3929 validation, job 18689836).
-        state_dict_info = self._policy.prepare_refit_info(
-            refit_payload_mode=self._generation.get_refit_payload_mode()
-        )
-        self._generation.prepare_refit_info(state_dict_info)
+        initialize_refit_metadata(self._policy, self._generation)
 
         # nccl_peer, exactly as init_communicator passes it. The receiver's bootstrap is
         # not negotiable: "nemo" publishes a raw unique ID and warms up with a rank-0

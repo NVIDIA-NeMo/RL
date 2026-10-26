@@ -30,7 +30,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
     drop_incomplete_targets_on_restore: false
 
   reward_shaping:
@@ -78,6 +78,11 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  # Only used by adaptive-ppo-clip.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
@@ -117,6 +122,8 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   automodel_cfg:
     enabled: false
@@ -172,7 +179,12 @@ policy:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
@@ -255,10 +267,9 @@ policy:
     stop_strings: null
     mcore_generation_config:
       buffer_size_gb: 20
-      buffer_guaranteed_fraction: 0.1
       cuda_graph_sizing_distribution: hybrid
       cuda_graph_max_tokens: 512
-      num_cuda_graphs: 16
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
@@ -267,12 +278,10 @@ policy:
       prefix_caching_coordinator_policy: longest_prefix
       prefix_cache_ttl_seconds: 300.0
       prefix_caching_routing_alpha: 1.0
-      unified_memory_level: 0
       max_tokens: 16384
       refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
       refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      offload_policy_before_refit: false
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
@@ -371,7 +380,12 @@ value:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
