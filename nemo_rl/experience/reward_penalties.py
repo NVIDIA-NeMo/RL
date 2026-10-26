@@ -279,7 +279,11 @@ class CaptureRewardSettings:
 
 @dataclass(frozen=True)
 class RewardLogContext:
-    """Agent identity and optional full-result table data, without raw reward."""
+    """Agent identity and the optional whole Gym result.
+
+    ``full_result_json`` feeds the W&B full-result table, which overwrites
+    ``reward`` with the final reward, and the training-data dump.
+    """
 
     agent_name: str
     full_result_json: str | None

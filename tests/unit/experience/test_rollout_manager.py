@@ -955,6 +955,8 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    dump_gym_results=False,
+    gym_results_dir=None,
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -972,6 +974,8 @@ def _nemo_gym_impl(
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
         log_full_result_tables=log_full_result_tables,
+        dump_gym_results=dump_gym_results,
+        gym_results_dir=gym_results_dir,
         reward_penalty_config=reward_penalty_config,
     )
 
@@ -1115,9 +1119,12 @@ def test_result_to_completion_truncated_on_length_incomplete_response(
     assert completion.truncated is expected_truncated
 
 
-@pytest.mark.parametrize("log_full_result_tables", [False, True])
+@pytest.mark.parametrize(
+    ("log_full_result_tables", "dump_gym_results"),
+    [(False, False), (True, False), (False, True)],
+)
 def test_streamed_receipt_callback_uses_current_completion_conversion(
-    log_full_result_tables,
+    log_full_result_tables, dump_gym_results
 ):
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
@@ -1140,7 +1147,11 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
 
             return stream()
 
-    impl = _nemo_gym_impl(False, log_full_result_tables=log_full_result_tables)
+    impl = _nemo_gym_impl(
+        False,
+        log_full_result_tables=log_full_result_tables,
+        dump_gym_results=dump_gym_results,
+    )
     env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
     results = [None]
     shaping = [None]
@@ -1168,9 +1179,48 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert "mask_sample" not in completion.env_extras["instance_config"]
     context = completion.env_extras["ng_reward_log_context"]
     assert context.agent_name == "resolved-agent"
-    assert (context.full_result_json is not None) is log_full_result_tables
-    if log_full_result_tables:
-        assert "reward" not in json.loads(context.full_result_json)
+    wants_result = log_full_result_tables or dump_gym_results
+    assert (context.full_result_json is not None) is wants_result
+    if wants_result:
+        assert json.loads(context.full_result_json)["reward"] == 1.0
+
+
+@pytest.mark.parametrize("receipt", [False, True])
+def test_every_gym_result_is_logged_as_it_lands(tmp_path, receipt):
+    result = _mask_gate_receipt_result() if receipt else _mask_gate_result()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            async def result_ref():
+                return (0, {"name": "agent"}, result, None)
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False, gym_results_dir=str(tmp_path / "gym_results"))
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    row = {
+        "_rowidx": 0,
+        NEMO_GYM_GROUP_ID_KEY: "group",
+        NEMO_GYM_GROUP_ATTEMPT_KEY: 1,
+        NEMO_GYM_ROLLOUT_INDEX_KEY: 0,
+    }
+    _run(impl._stream_rows(env, [row], [None], [None], 1, "timing/test"))
+
+    [path] = (tmp_path / "gym_results").glob("gym_results.*.jsonl")
+    [line] = path.read_text().splitlines()
+    assert json.loads(line) == {
+        "group_id": "group",
+        "group_attempt": 1,
+        "rollout_index": 0,
+        "rollout_id": None,
+        "full_result": result["full_result"],
+    }
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

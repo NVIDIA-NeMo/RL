@@ -52,6 +52,9 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
+  # NeMo-Gym runs: append every Gym rollout result, trained on or not, to
+  # gym_results/ in the log dir (debug).
+  log_gym_results: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

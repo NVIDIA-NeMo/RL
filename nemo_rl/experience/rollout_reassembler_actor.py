@@ -74,6 +74,7 @@ class RolloutReassemblerActorConfig:
     media_columns: Optional[MediaColumnSpec]
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
+    dump_gym_results: bool = False
 
 
 @ray.remote(
@@ -103,6 +104,7 @@ class RolloutReassemblerActor:  # pragma: no cover
             media_columns=config.media_columns,
             reward_penalty_config=config.reward_penalty_config,
             effort_config=config.effort_config,
+            dump_gym_results=config.dump_gym_results,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

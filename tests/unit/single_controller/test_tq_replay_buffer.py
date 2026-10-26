@@ -57,8 +57,10 @@ def _stub_record_to_train_batch(
     *,
     pad_value_dict: Any,
     include_message_violation_fields: bool,
+    include_gym_full_result: bool,
 ) -> BatchedDataDict[Any]:
     del record, pad_value_dict, include_message_violation_fields
+    del include_gym_full_result
     return BatchedDataDict[Any](
         {
             "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
