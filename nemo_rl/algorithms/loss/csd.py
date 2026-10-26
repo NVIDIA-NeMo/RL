@@ -399,9 +399,7 @@ class CSDLossFn(LossFunction):
         # None selects the static per-teacher weights.
         self.sum_weights_metric = cfg.sum_weights_metric
         # Per-teacher metadata: parallel lists (one entry per ``teachers[i]``),
-        # injected by ``xtoken_off_policy_distillation.setup``. Every teacher ships
-        # full-vocab logits (the loss derives the top-k subset student-side), so
-        # there is no per-teacher ``send_full_logits`` flag.
+        # injected by ``xtoken_off_policy_distillation.setup``.
         self.projection_matrix_paths: list[Optional[str]] = (
             list(cfg.projection_matrix_paths)
             if cfg.projection_matrix_paths is not None
