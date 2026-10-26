@@ -544,7 +544,6 @@ constraint-dependencies = [
   "aiohttp>=3.14.5",                          # Security fixes (server request timeout, multipart fd exhaustion)
   "virtualenv>=21.14.11",                     # Security fixes (activation script / launcher command injection)
   "gitpython>=3.2.1",                         # Security fix (submodule .git path validation)
-  "pillow>=13.0.0",                           # Security fixes (JPEG comment overflow, WMF/EMF over-read)
 ]
 
 # NOTE: do not exclude `nvidia-cutlass-dsl-libs-base` again. The 4.5.x workaround for
