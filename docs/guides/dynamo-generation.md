@@ -173,10 +173,12 @@ docker buildx build \
   .
 ```
 
-For a local checkout, install the binaries with:
+For a local checkout, install the binaries and keep the variable set for the
+runs that follow. The runtime looks for etcd and nats-server there, or else on `PATH`:
 
 ```bash
-NEMO_RL_DYNAMO_BIN_DIR=$PWD/venvs/dynamo-bin bash docker/dynamo/install.sh
+export NEMO_RL_DYNAMO_BIN_DIR="$PWD/venvs/dynamo-bin"
+bash docker/dynamo/install.sh
 ```
 
 ## Run

@@ -149,11 +149,7 @@ def dynamo_kv_events_config(
     return {
         "enable_kv_cache_events": True,
         "publisher": "zmq",
-        # A Linux abstract-namespace socket (no port, no file): vLLM binds any
-        # ipc:// endpoint and this process's Dynamo worker connects to it, so
-        # engines on one node cannot collide. Random rather than the pid, since
-        # containers sharing the host network share these names. vLLM rejects
-        # ipc:// only at data_parallel_rank != 0, which Dynamo rejects at startup.
+        # A random abstract-namespace socket per engine (dynamo-integration.md).
         "endpoint": f"ipc://@nemo-rl-kv-events-{os.urandom(8).hex()}",
     }
 
@@ -363,11 +359,7 @@ class NativeVllmEngine(LLMEngine):
         return EngineConfig(
             model=model,
             served_model_name=model,
-            # No token budget: the engine owns prompt overflow and the output
-            # cap, as the native server does. A budget would make the frontend
-            # fill an omitted max_tokens from the prompt it rendered, which a
-            # NeMo-Gym prefix splice then changes, and refuse NeMo RL's own
-            # rollouts that fill the context.
+            # No token budget: the engine owns overflow (dynamo-integration.md).
             llm=LlmRegistration(
                 context_length=self._max_model_len,
                 kv_cache_block_size=block_size,

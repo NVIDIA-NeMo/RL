@@ -52,12 +52,17 @@ implements its `LLMEngine` over the worker's `AsyncLLM`:
 - Registration advertises the context length, the KV block size (from vLLM's
   KV-cache group metadata), the block count and the scheduler limits. It
   publishes no token budget. The engine owns the context check and the output
-  cap, because a prefix splice changes the prompt after the frontend has seen it.
+  cap, as the native server does. With a budget, the frontend would fill an
+  omitted `max_tokens` from the prompt it rendered, which a prefix splice then
+  changes, and would refuse NeMo RL's own rollouts that fill the context.
 - `kv_event_sources` points Dynamo at the engine's own vLLM KV-event ZMQ
   publisher. It is set only when the engine caches prefixes. Each engine binds
   its own Linux abstract-namespace socket (`ipc://@...`), so engines on one node
-  need no port and cannot collide. A vLLM stat logger publishes the router's
-  per-engine load signal.
+  need no port and cannot collide. The name is random rather than the pid,
+  because containers that share the host network share these names. vLLM refuses
+  `ipc://` only above data-parallel rank 0, and vLLM data parallelism is rejected
+  at startup with Dynamo. A vLLM stat logger publishes the router's per-engine
+  load signal.
 
 Because the Worker runs on the actor's own loop, the worker's other methods
 interleave with Dynamo requests exactly as with native requests:

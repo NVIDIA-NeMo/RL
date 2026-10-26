@@ -604,12 +604,11 @@ def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
     assert vllm_cfg["async_engine"] is True
     assert vllm_cfg["expose_http_server"] is True
     assert should_use_nemo_gym(config) is True
-    policy_model = config.env["nemo_gym"].get("policy_model") if dynamo else None
     if dynamo:
-        assert policy_model["responses_api_models"]["vllm_model"] == {
-            "dynamo_frontend": True,
-            # The frontend refuses reasoning under both of Gym's keys.
-            "reasoning_field": "reasoning_content",
+        # A NeMo RL key each actor applies to its composed config, not a
+        # policy_model overlay a sharded plan would need an owner for.
+        assert config.env["nemo_gym"] == {
+            "dynamo_dialect": {"default_chat_template_kwargs": {}}
         }
     else:
         assert "nemo_gym" not in config.env
@@ -633,12 +632,17 @@ def test_setup_nemo_gym_config_vllm_speaks_dynamo_dialect_only_with_dynamo(
         ),
     ],
 )
-def test_setup_nemo_gym_config_dynamo_sends_the_native_default_template_kwargs(
+def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
     vllm_model: dict, expected: dict
 ) -> None:
     """The native server's default template kwargs sit under the ones Gym sends."""
     from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
+    from nemo_rl.environments.nemo_gym import (
+        build_nemo_gym_config,
+        setup_nemo_gym_config,
+    )
+
+    user_vllm_model = copy.deepcopy(vllm_model)
 
     config = MasterConfig.model_construct(
         env={
@@ -665,5 +669,19 @@ def test_setup_nemo_gym_config_dynamo_sends_the_native_default_template_kwargs(
     )
 
     setup_nemo_gym_config(config, tokenizer=None)
+    gym_config = build_nemo_gym_config(
+        config.env,
+        base_urls=["http://frontend"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+    )["initial_global_config_dict"]
 
-    assert vllm_model["chat_template_kwargs"] == expected
+    composed = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+    assert composed["dynamo_frontend"] is True
+    # The frontend refuses reasoning under both of Gym's keys.
+    assert composed["reasoning_field"] == "reasoning_content"
+    assert composed["chat_template_kwargs"] == expected
+    assert "dynamo_dialect" not in gym_config
+    # The user's overlay is left as written.
+    assert vllm_model == user_vllm_model
