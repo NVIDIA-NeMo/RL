@@ -1546,13 +1546,14 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before claiming groups for training"
             )
-        claim_idxs = sorted(idxs, reverse=True)
-        if claim_idxs[0] >= len(self.meta_list):
+        if max(idxs) >= len(self.meta_list):
             raise IndexError(
                 "TQReplayBuffer.claim_for_training: indices out of range: "
-                f"{claim_idxs[0]}; size={len(self.meta_list)}"
+                f"{max(idxs)}; size={len(self.meta_list)}"
             )
-        claim_group_ids = [self._group_ids[i] for i in claim_idxs]
+        # Preserve sampler order in the checkpoint-visible training claims.
+        # _remove_groups_unlocked sorts list slots separately for safe deletion.
+        claim_group_ids = [self._group_ids[i] for i in idxs]
         async with self._data_plane_checkpoint_barrier.mutation(
             "group_removals"
         ) as cut:
@@ -1564,7 +1565,7 @@ class TQReplayBuffer:
             )
 
     def training_owned_replay_groups(self) -> list[TQReplayGroupMetadata]:
-        """Return metadata for canonical rows owned by the open train step."""
+        """Return open-step canonical metadata in sampler selection order."""
         return copy.deepcopy(list(self._training_claims.values()))
 
     def training_owned_group_ids(self) -> set[str]:
@@ -1712,7 +1713,9 @@ class TQReplayBuffer:
         checkpoint pump runs concurrently with ``_train_pump``.
         In-flight reservations are intentionally omitted. ``additional_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
-        streamed optimizer step.
+        streamed optimizer step. These groups are saved first, in selection
+        order, so a restore retries the interrupted batch before waiting groups.
+        They restore as ordinary ready groups, not as orphaned training claims.
         """
         groups: list[TQReplayGroupMetadata] = []
         for i, ready in enumerate(self.ready_list):
@@ -1750,6 +1753,12 @@ class TQReplayBuffer:
             groups.append(copy.deepcopy(group))
             existing_group_ids.add(group_id)
             existing_sample_ids.update(group["meta"].sample_ids)
+        # Additional groups were already selected for the interrupted step.
+        # Prioritize them without changing live ownership or adding any waits.
+        # Bind the final order to the native snapshot with the normal digest.
+        additional_count = len(additional_groups or [])
+        if additional_count:
+            groups = groups[-additional_count:] + groups[:-additional_count]
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
