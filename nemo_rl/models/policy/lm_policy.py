@@ -42,9 +42,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    BLOCK_DRAFT_ALGOS,
+    PolicyConfig,
+)
 from nemo_rl.models.policy.draft_config import coerce_draft_config
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -68,6 +70,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_sharded_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.path_utils import checkpoint_abspath
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -146,9 +149,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             get_actor_python_env(extension_fqn)
 
         if weights_path:
-            weights_path = os.path.abspath(weights_path)
+            weights_path = checkpoint_abspath(weights_path)
         if optimizer_path:
-            optimizer_path = os.path.abspath(optimizer_path)
+            optimizer_path = checkpoint_abspath(optimizer_path)
 
         worker_builder_cls_fqn: str
         tp_size = 1
@@ -174,10 +177,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "policy.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
                 "and no longer disables anything."
             )
+        if not megatron_enabled and not automodel_enabled:
+            raise ValueError(
+                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
+            )
         if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
             raise ValueError(
                 "generation.nvfp4_pertoken_rollout requires the Megatron "
-                "training backend (policy.megatron_cfg.enabled=true); DTensor "
+                "training backend (policy.megatron_cfg.enabled=true); Automodel "
                 "does not implement TE NVFP4 training."
             )
         validate_fp32_lm_head_config(
@@ -206,50 +214,119 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "reserved_http_server_ports is only supported by the Megatron "
                 "worker (policy.megatron_cfg.enabled=true)."
             )
-        if draft_enabled and not megatron_enabled:
-            raise ValueError(
-                "policy.draft.enabled=true is only supported with the Megatron backend. "
-                "Set policy.megatron_cfg.enabled=true or disable policy.draft."
+        if draft_enabled:
+            # Both-enabled and neither-enabled are already rejected above, so
+            # exactly one of megatron_enabled/automodel_enabled is true below.
+            draft_algo = draft_config.speculator_type
+            if draft_algo in BLOCK_DRAFT_ALGOS and not automodel_enabled:
+                raise ValueError(
+                    f"policy.draft.speculator_type={draft_algo} requires the "
+                    "Automodel backend (policy.automodel_cfg.enabled=true)."
+                )
+            if megatron_enabled:
+                # Megatron-specific guards (main #3463).
+                if config["megatron_cfg"]["context_parallel_size"] > 1:
+                    # Sequence packing itself is supported with the draft; CP
+                    # is not: the hidden-state capture and the per-segment
+                    # shifts assume each packed sequence lives whole on one
+                    # rank.
+                    raise ValueError(
+                        "policy.draft.enabled=true does not support context "
+                        "parallelism yet. Set "
+                        "policy.megatron_cfg.context_parallel_size=1 or disable "
+                        "policy.draft."
+                    )
+                if (
+                    # sequence_packing is NotRequired in PolicyConfig, so
+                    # tolerate its absence.
+                    bool(config.get("sequence_packing", {}).get("enabled", False))
+                    and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+                ):
+                    # The packed draft path re-embeds the per-segment-shifted
+                    # token ids via the model's embedding, which MCore
+                    # constructs only on the first pipeline stage while the
+                    # draft runs on the last.
+                    raise ValueError(
+                        "policy.draft.enabled=true with sequence packing does "
+                        "not support pipeline parallelism yet. Set "
+                        "policy.megatron_cfg.pipeline_model_parallel_size=1, or "
+                        "disable policy.sequence_packing or policy.draft."
+                    )
+                if bool(
+                    # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+                    config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+                ):
+                    # The fused path returns per-token logprobs and never
+                    # materializes the full next-token logits the draft's
+                    # teacher distribution needs, in either the packed or the
+                    # unpacked layout.
+                    raise ValueError(
+                        "policy.draft.enabled=true is not supported with "
+                        "policy.megatron_cfg.use_fused_linear_logprobs=true: "
+                        "draft training needs the full next-token logits for "
+                        "the teacher, which the fused path never materializes. "
+                        "Disable one of the two."
+                    )
+            else:
+                # Automodel draft (eagle3 TTT, dspark, dflash).
+                automodel_cfg = config["automodel_cfg"]
+                if draft_config.model_name is None:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} requires a "
+                        "pretrained draft checkpoint; set policy.draft.model_name "
+                        "(from-scratch draft init is not supported)."
+                    )
+                unsupported = {
+                    # Under sequence parallelism the layer outputs seen by the
+                    # hidden-capture hooks are bare sequence-sharded local tensors
+                    # (no DTensor wrapper), which cannot be detected or gathered.
+                    "sequence_parallel": bool(
+                        automodel_cfg.get("sequence_parallel", False)
+                    ),
+                    "lora_cfg.enabled": bool(
+                        automodel_cfg.get("lora_cfg", {}).get("enabled", False)
+                    ),
+                    "sequence_packing.enabled": bool(
+                        config.get("sequence_packing", {}).get("enabled", False)
+                    ),
+                    # The draft shares the policy's optimizer, but
+                    # prepare_for_training skips the CUDA restore of optimizer
+                    # state under cpu_offload (correct for the policy's
+                    # CPUOffloadPolicy, not for the draft, whose fully_shard
+                    # params/grads stay on CUDA) -- the draft's Adam state is
+                    # left on CPU after offload_before_refit, causing a device
+                    # mismatch in optimizer.step() on the next training step.
+                    "cpu_offload": bool(automodel_cfg.get("cpu_offload", False)),
+                }
+                enabled_unsupported = [name for name, on in unsupported.items() if on]
+                if enabled_unsupported:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} does not "
+                        f"support: {', '.join(enabled_unsupported)}. Disable "
+                        "these options to co-train a draft."
+                    )
+
+            # Draft co-training streams draft.* keys only through the full-param
+            # refit paths (colocated CUDA-IPC, collective broadcast, and
+            # checkpoint-engine). The sparse transports bypass the extension's
+            # draft split entirely and nccl_reshard's suffix-based bulk routing
+            # would misdirect draft FFN keys, leaving the serving drafter
+            # silently stale — reject those combinations up front.
+            from nemo_rl.models.generation.vllm.config import (
+                VLLM_SPARSE_REFIT_TRANSPORTS,
             )
-        if draft_enabled and config["megatron_cfg"]["context_parallel_size"] > 1:
-            # Sequence packing itself is supported with the draft; CP is not:
-            # the hidden-state capture and the per-segment shifts assume each
-            # packed sequence lives whole on one rank.
-            raise ValueError(
-                "policy.draft.enabled=true does not support context parallelism "
-                "yet. Set policy.megatron_cfg.context_parallel_size=1 or disable "
-                "policy.draft."
-            )
-        if (
-            draft_enabled
-            # sequence_packing is NotRequired in PolicyConfig, so tolerate its
-            # absence; the parallel sizes are required megatron_cfg keys.
-            and bool(config.get("sequence_packing", {}).get("enabled", False))
-            and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        ):
-            # The packed draft path re-embeds the per-segment-shifted token ids
-            # via the model's embedding, which MCore constructs only on the
-            # first pipeline stage while the draft runs on the last.
-            raise ValueError(
-                "policy.draft.enabled=true with sequence packing does not "
-                "support pipeline parallelism yet. Set "
-                "policy.megatron_cfg.pipeline_model_parallel_size=1, or disable "
-                "policy.sequence_packing or policy.draft."
-            )
-        if draft_enabled and bool(
-            # use_fused_linear_logprobs is NotRequired in MegatronConfig.
-            config["megatron_cfg"].get("use_fused_linear_logprobs", False)
-        ):
-            # The fused path returns per-token logprobs and never materializes
-            # the full next-token logits the draft's teacher distribution
-            # needs, in either the packed or the unpacked layout.
-            raise ValueError(
-                "policy.draft.enabled=true is not supported with "
-                "policy.megatron_cfg.use_fused_linear_logprobs=true: draft "
-                "training needs the full next-token logits for the teacher, "
-                "which the fused path never materializes. Disable one of the "
-                "two."
-            )
+
+            refit_transport = (config.get("generation") or {}).get("refit_transport")
+            if refit_transport == "nccl_reshard" or (
+                refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS
+            ):
+                raise ValueError(
+                    "policy.draft.enabled=true does not support "
+                    f"policy.generation.refit_transport={refit_transport!r}: draft "
+                    "weights are streamed only via the full-parameter refit paths. "
+                    "Use refit_transport=null (collective/CUDA-IPC) or a "
+                    "checkpoint-engine transport ('nixl' / 'module:ClassName')."
+                )
         if megatron_enabled:
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
@@ -268,12 +345,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
 
         else:
-            if not automodel_enabled:
-                raise ValueError(
-                    "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
-                    "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
-                )
-
+            # automodel_enabled is guaranteed here: both-enabled and
+            # neither-enabled are already rejected above.
             worker_builder_cls_fqn = resolve_policy_worker_cls(
                 "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
                 config,
@@ -310,11 +383,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sep_line = "\n" + ("-" * 80)
             assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
                 f"{sep_line}\n"
-                "There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.\n"
-                "See https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause for more details.\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause for more details.\n"
                 "\n"
                 "Please choose either of the following solutions to avoid this issue:\n"
-                "1. Set tp_size to 1 or 2. (tensor_parallel_size for DTensor, or tensor_model_parallel_size for Megatron)\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for Automodel, or tensor_model_parallel_size for Megatron)\n"
                 "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
                 "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
                 "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
@@ -373,7 +446,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
 
         if automodel_enabled:
-            # DTensor workers reconstruct tokenizer/processor locally to avoid
+            # Automodel workers reconstruct tokenizer/processor locally to avoid
             # pickling across incompatible transformers versions (v4 head → v5 worker).
             config["tokenizer"]["use_processor"] = processor is not None
         else:
@@ -1153,21 +1226,29 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
-    def prepare_refit_info(
-        self,
-        *,
-        refit_payload_mode: RefitPayloadMode,
-    ) -> Optional[dict[str, Any]]:
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare the info for refit.
 
         Returns:
             dict: A dictionary containing the info for refit.
         """
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info", refit_payload_mode=refit_payload_mode
-        )
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Enable trainer-side MXFP8 quantization of the listed params for refit.
+
+        Returns:
+            dict: Refit info updated with quantized dtypes and scale entries.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "enable_refit_prequantize", param_names=param_names
+        )
+        results = ray.get(futures)
         return results[0]
 
     def finish_inference(self) -> None:
@@ -1269,7 +1350,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> None:
         """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Called by the SGLang colocated refit drivers (Megatron and FSDP)
+        Called by the SGLang colocated refit drivers (Megatron and Automodel)
         whenever engines are added or recovered.
         """
         futures = self.worker_group.run_all_workers_single_data(
@@ -1340,6 +1421,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         *,
         buffer_size_bytes: Optional[int] = None,
         num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1348,6 +1430,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             refit_timeout_s=refit_timeout_s,
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
@@ -1382,8 +1465,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_parallelism: dict[str, Any],
         train_world_size: int,
         gen_world_size: int,
-        *,
-        refit_payload_mode: RefitPayloadMode,
     ) -> dict[str, Any]:
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -1392,7 +1473,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
-            refit_payload_mode=refit_payload_mode,
         )
         results = ray.get(futures)
         return results[0]
@@ -1442,7 +1522,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         With Megatron async_save=True, this returns after D2H staging. The caller
         must call finalize_async_save() before renaming the checkpoint directory.
 
-        DTensor checkpoint resources are configured when the Policy is
+        Automodel checkpoint resources are configured when the Policy is
         constructed. ``weights_path`` selects the destination for each save.
         """
         if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):

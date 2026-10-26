@@ -1,0 +1,61 @@
+defaults: ../../grpo_math_1B_trtllm.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated
+policy:
+  model_name: Qwen/Qwen3.5-35B-A3B-Base
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 16
+  optimizer: null
+  scheduler: null
+  automodel_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    moe_router_dtype: fp32
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+    trtllm_cfg:
+      tensor_parallel_size: 4
+      moe_expert_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      precision: fp8
+      is_mx: true
+    trtllm_kwargs:
+      kv_cache_config:
+        mamba_ssm_cache_dtype: bfloat16
+        # TODO: migrate to KVCM V2
+        use_kv_cache_manager_v2: false
+      disable_mm_encoder: true
+logger:
+  log_dir: logs/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 2

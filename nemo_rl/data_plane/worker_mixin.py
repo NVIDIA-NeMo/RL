@@ -57,7 +57,11 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
-from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    RouteLayout,
+    execute_route_plan,
+)
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -440,17 +444,17 @@ class TQWorkerMixin:
         """NCCL group of TP×CP×PP siblings within this DP rank.
 
         ``None`` means "no siblings" (TP=CP=PP=1). Subclasses must
-        override using their parallelism state (DTensor ``device_mesh``,
+        override using their parallelism state (Automodel ``device_mesh``,
         Megatron ``parallel_state``). Returning ``None`` makes
         :meth:`_fetch` use independent fetch; returning a group makes
         it use leader-fetch + NCCL broadcast.
         """
         return None
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
         raise NotImplementedError(
-            "the router-replay policy worker must provide route dimensions"
+            "the router-replay policy worker must provide the route layout"
         )
 
     def _pad_value_dict(self) -> dict[str, Any]:
@@ -781,8 +785,11 @@ class TQWorkerMixin:
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
         )
 
-        # The worker supplies real model dims — the authoritative shape check.
-        num_moe_layers, top_k = self._routed_experts_dimensions()
+        # The worker supplies the real model layout — the authoritative shape
+        # check, and what lets a full-layer vLLM fragment be reduced to the
+        # MoE columns a hybrid model trains.
+        layout = self._routed_experts_layout()
+        num_moe_layers, top_k = layout.dims
         input_lengths = data["input_lengths"].reshape(-1).cpu().long()
         offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
         values = torch.full(
@@ -796,7 +803,7 @@ class TQWorkerMixin:
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
-                dims=(num_moe_layers, top_k),
+                layout=layout,
                 canonical_len=canonical_len,
             )
             if tensor is None:
@@ -897,7 +904,7 @@ class TQWorkerMixin:
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
 
-        Subclasses MUST override: DTensor reads ``device_mesh``,
+        Subclasses MUST override: Automodel reads ``device_mesh``,
         Megatron reads ``parallel_state``. There's no honest default —
         a missing impl would silently make every rank a writeback
         leader and re-create the ``-601 ILLEGAL_CLIENT`` duplicate-write

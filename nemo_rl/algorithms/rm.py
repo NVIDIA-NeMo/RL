@@ -19,7 +19,6 @@ from functools import partial
 from typing import Any, Optional
 
 import numpy as np
-import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -30,7 +29,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -159,7 +158,7 @@ def setup(
     ):
         raise ValueError(
             "Context parallelism (context_parallel_size > 1) is not supported for reward model "
-            "training on the DTensor backend. The log_sigmoid operator used in the RM loss does "
+            "training on the Automodel backend. The log_sigmoid operator used in the RM loss does "
             "not have a DTensor sharding strategy registered for CP meshes. "
             "Please set policy.automodel_cfg.context_parallel_size=1. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
@@ -703,9 +702,8 @@ def rm_train(
                             ),
                             is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,
