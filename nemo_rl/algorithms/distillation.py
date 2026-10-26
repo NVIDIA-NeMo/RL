@@ -202,9 +202,9 @@ def check_vocab_equality(
         f"Effective vocab sizes differ between student and teacher. {skip_hint}"
     )
 
-    # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
-    student_config = AutoConfig.from_pretrained(student_model_name)
-    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    # 3) Compare text vocabulary sizes, including nested multimodal configs.
+    student_config = AutoConfig.from_pretrained(student_model_name).get_text_config()
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name).get_text_config()
     assert student_config.vocab_size == teacher_config.vocab_size, (
         f"Model config vocab sizes differ between student and teacher. {skip_hint}"
     )
