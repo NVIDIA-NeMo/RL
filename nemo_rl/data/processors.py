@@ -33,6 +33,7 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.multimodal_utils import VIDEO_CONTENT_TYPES
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -922,7 +923,7 @@ def _gym_row_has_video_media(extra_env_info: dict[str, Any]) -> bool:
                 continue
             if part.get("_is_video_frame"):
                 return True
-            if part.get("type") in ("input_video", "video", "video_url"):
+            if part.get("type") in VIDEO_CONTENT_TYPES:
                 return True
     return False
 
