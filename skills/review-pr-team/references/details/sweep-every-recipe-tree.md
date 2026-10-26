@@ -14,8 +14,9 @@ name lingers in schemas, fixtures, docs and test-suite labels.
 2. Grep the old key or value outside the YAMLs too: schema declarations in `nemo_rl/`, fixtures in
    `tests/`, `docs/`, and the labels in `tests/test_suites/*.txt`.
 3. If the PR adds a guard test, check its glob root. An invariant over every config belongs in
-   `tests/unit/test_config_validation.py`, parametrized over its existing `config_files` with
-   `load_config_with_inheritance`; `config_files` already includes `recipes/vlm/`.
+   `tests/unit/test_config_validation.py` with `load_config_with_inheritance`: parametrize an old-value
+   guard over `full_config_files` (every shipped tree, including `examples/nemo_gym/` and `research/`), and a
+   schema check over `config_files` (`examples/configs` only, which includes `recipes/vlm/`).
 4. In the comment, list each file left behind with its line, and say which trees you checked.
 
 **Seen:** #4037 a DeepEP to HybridEP migration whose guard test globbed only `recipes/llm`, leaving three AutoModel EP VLM recipes on `dispatcher: deepep`; `enable_deepep` stayed in the schema and a guide and nightly labels still said DeepEP (team)
