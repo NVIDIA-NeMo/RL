@@ -156,15 +156,21 @@ class CSDCrossTokenizerCollator(CrossTokenizerCollator):
         ]
         for i, aligner in enumerate(self.aligners):
             teacher_tokenizer = self.teacher_tokenizers[i]
+            ctx_length = self.ctx_length_teachers[i]
             if aligner is None or teacher_tokenizer is None:
-                # Same-tokenizer teachers reuse the student tokenization.
-                teacher_lengths = student_lengths
-            else:
-                teacher_lengths = lengths(teacher_tokenizer)
+                # Same-tokenizer teachers reuse the student tokenization, padded
+                # to the student's divisor (packed rows pad to the teacher's).
+                sides.append(
+                    (student_lengths, ctx_length, self.make_seq_div_by_student)
+                )
+                sides.append(
+                    (student_lengths, ctx_length, self.make_seq_div_by_teachers[i])
+                )
+                continue
             sides.append(
                 (
-                    teacher_lengths,
-                    self.ctx_length_teachers[i],
+                    lengths(teacher_tokenizer),
+                    ctx_length,
                     self.make_seq_div_by_teachers[i],
                 )
             )
