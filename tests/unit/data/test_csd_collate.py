@@ -523,6 +523,12 @@ def test_text_rows_carry_special_tokens_and_pad_to_the_longest_row():
             "alpha beta gamma ",
             id="same-tokenizer-teacher-after-rounding",
         ),
+        pytest.param(
+            {"ctx_length_teachers": [64, 6], "make_seq_div_by_student": 4},
+            "alpha beta gamma delta",
+            "alpha beta gamma ",
+            id="same-tokenizer-teacher-after-student-rounding",
+        ),
     ],
 )
 def test_text_overlength_rows_are_clipped_to_a_shared_prefix(sizes, text, prefix):
