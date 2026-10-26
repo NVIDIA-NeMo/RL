@@ -242,7 +242,6 @@ project-includes = [
   "nemo_rl/models/automodel/draft/hidden_capture.py",
   "nemo_rl/models/automodel/router_replay.py",
   "nemo_rl/models/automodel/utils.py",
-  "nemo_rl/models/automodel/nemotron_h_cp.py",
   "nemo_rl/models/generation/__init__.py",
   "nemo_rl/models/generation/constants.py",
   "nemo_rl/models/generation/dynamo/__init__.py",
