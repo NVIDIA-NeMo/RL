@@ -1281,7 +1281,7 @@ class TestTQReplayBufferStateDict:
 
         periodic_state = buf.metadata_state_dict(
             saved_capacity=8,
-            additional_groups=claims,
+            already_claimed_groups=claims,
         )
         assert [group["meta"].sample_ids for group in periodic_state["groups"]] == [
             list(claimed_meta.sample_ids)
@@ -1319,7 +1319,9 @@ class TestTQReplayBufferStateDict:
             await buf.claim_for_training([1])  # Original slot 3 after removal.
             claims = buf.training_owned_replay_groups()
             expected = [metas[i].sample_ids for i in (2, 0, 3, 1, 4, 5)]
-            state = buf.metadata_state_dict(saved_capacity=6, additional_groups=claims)
+            state = buf.metadata_state_dict(
+                saved_capacity=6, already_claimed_groups=claims
+            )
             assert [group["meta"].sample_ids for group in state["groups"]] == expected
             assert state["manifest_digest"] == replay_manifest_digest(state["groups"])
             assert buf.group_ids == tuple(_group_id_of(metas[i]) for i in (1, 4, 5))
@@ -1339,7 +1341,7 @@ class TestTQReplayBufferStateDict:
             _add_group(buf, weight=3)
         _run(buf.claim_for_training([0, 1]))
         state = buf.metadata_state_dict(
-            saved_capacity=8, additional_groups=buf.training_owned_replay_groups()
+            saved_capacity=8, already_claimed_groups=buf.training_owned_replay_groups()
         )
         state["groups"].reverse()
         restored = _make_buffer(FakeDataPlaneClient())
@@ -1348,14 +1350,16 @@ class TestTQReplayBufferStateDict:
         assert restored.size() == 0
 
     @pytest.mark.parametrize("duplicate_id", [True, False])
-    def test_snapshot_rejects_duplicate_additional_groups(self, duplicate_id):
+    def test_snapshot_rejects_duplicate_already_claimed_groups(self, duplicate_id):
         buf = _make_buffer(FakeDataPlaneClient())
         _add_group(buf, weight=3)
         duplicate = buf.metadata_state_dict(saved_capacity=8)["groups"][0].copy()
         if not duplicate_id:
             duplicate["group_id"] = "different-group-same-samples"
         with pytest.raises(ValueError, match="duplicates"):
-            buf.metadata_state_dict(saved_capacity=8, additional_groups=[duplicate])
+            buf.metadata_state_dict(
+                saved_capacity=8, already_claimed_groups=[duplicate]
+            )
         assert buf.size() == 1
         assert buf.training_owned_replay_groups() == []
 
@@ -1373,7 +1377,7 @@ class TestTQReplayBufferStateDict:
 
         with pytest.raises(ValueError, match="duplicates"):
             buf.metadata_state_dict(
-                saved_capacity=8, additional_groups=[*claims, duplicate]
+                saved_capacity=8, already_claimed_groups=[*claims, duplicate]
             )
 
         assert buf.size() == 0
@@ -1396,7 +1400,8 @@ class TestTQReplayBufferStateDict:
             # omitted from the snapshot. Selection must not wait for admission.
             await buf.claim_for_training(list(range(claimed_count)))
             state = buf.metadata_state_dict(
-                saved_capacity=8, additional_groups=buf.training_owned_replay_groups()
+                saved_capacity=8,
+                already_claimed_groups=buf.training_owned_replay_groups(),
             )
             restored = _make_buffer(dp)
             await restored.load_state_dict(

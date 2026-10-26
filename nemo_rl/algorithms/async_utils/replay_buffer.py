@@ -1694,7 +1694,7 @@ class TQReplayBuffer:
         self,
         *,
         saved_capacity: int,
-        additional_groups: Optional[list[TQReplayGroupMetadata]] = None,
+        already_claimed_groups: Optional[list[TQReplayGroupMetadata]] = None,
     ) -> TQReplayMetadataState:
         """Capture the controller index for ready groups without tensor payloads.
 
@@ -1709,7 +1709,7 @@ class TQReplayBuffer:
         not required to originate specifically from :meth:`commit`.
         The advantage stage also takes a mutation slot because the periodic
         checkpoint pump runs concurrently with ``_train_pump``.
-        In-flight reservations are intentionally omitted. ``additional_groups``
+        In-flight reservations are intentionally omitted. ``already_claimed_groups``
         is used by periodic snapshots to re-index rows claimed by an unfinished
         streamed optimizer step. These groups are saved first, in selection
         order, so a restore retries the interrupted batch before waiting groups.
@@ -1736,7 +1736,7 @@ class TQReplayBuffer:
             existing_sample_ids.update(entry["meta"].sample_ids)
 
         # Retry the interrupted batch before groups still waiting for training.
-        for group in additional_groups or []:
+        for group in already_claimed_groups or []:
             append_group(copy.deepcopy(group))
 
         for i, ready in enumerate(self.ready_list):
