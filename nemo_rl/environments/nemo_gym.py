@@ -1738,7 +1738,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                 "token_ids": torch.tensor(new_prompt_token_ids),
             }
             if routed_experts is not None:
-                user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+                # Own the emitted span so serialization cannot retain the full turn.
+                user_message["routed_experts"] = routed_experts[
+                    prompt_start:prompt_end
+                ].clone()
             nemo_rl_message_log.append(user_message)
 
             if processor is not None and not media_geometry_failed:
@@ -1807,8 +1810,10 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end
-                ]
+                ].clone()
             nemo_rl_message_log.append(assistant_message)
+            # Release the full decoded turn before decoding the next one.
+            del routed_experts, routed_experts_raw
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
