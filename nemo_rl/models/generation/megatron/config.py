@@ -122,8 +122,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     refit_execution_batch_bytes: int | None
     num_speculative_tokens: int
 
-    mamba_inference_ssm_states_dtype: NotRequired[str]
-    mamba_inference_conv_states_dtype: NotRequired[str]
+    # Hybrid (Mamba) inference state dtypes; None keeps the model dtype.
+    mamba_inference_ssm_states_dtype: NotRequired[str | None]
+    mamba_inference_conv_states_dtype: NotRequired[str | None]
     # GPU budget for cached Mamba states; null disables it (MCore default).
     prefix_caching_mamba_gb: NotRequired[float | None]
 
@@ -170,9 +171,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     multimodal_prompt_config: NotRequired[MultimodalPromptConfigOverrides]
 
     # KV cache lifecycle across suspend/resume:
-    # - "persist": cache stays allocated; CUDA graphs remain valid (default)
+    # - "persist": cache stays allocated; CUDA graphs remain valid
     # - "offload": cache is moved off-GPU between iterations
-    # - "recompute": cache is dropped and rebuilt on resume
+    # - "recompute": cache is dropped and rebuilt on resume (default)
     kv_cache_management_mode: Literal["persist", "offload", "recompute"]
 
     logging_step_interval: NotRequired[int]
@@ -184,6 +185,8 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.
     fp8_cfg: NotRequired[Fp8Config]
+    # Megatron Bridge provider fields without a first-class NeMo-RL setting.
+    model_overrides: NotRequired[dict[str, Any]]
 
 
 class MCoreGenerationConfig(GenerationConfig):

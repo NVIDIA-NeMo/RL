@@ -61,7 +61,11 @@ payload raises at startup so misconfiguration surfaces immediately.
 The supported worker types are:
 - **AutomodelPolicyWorker**: Pattern matched against `"automodel_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **VllmAsyncGenerationWorker**: Pattern matched against `"vllm_async_generation_worker"` (used when `async_engine` is `true`)
 - **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
+
+> [!IMPORTANT]
+> For the async vLLM engine, match `vllm_async_generation_worker` exactly. Do not use `*vllm*` or `*generation_worker`: they also match `vllm_generation_worker`, which sets `ray_workers_use_nsight=True` for the inner TP workers. Those workers then use vLLM's own always-on nsight config instead of the deferred-capture one, so the capture range is lost. With the async engine the inner TP workers inherit their nsight config from the outer `VllmAsyncGenerationWorker`, which is why its name must match.
 
 ## Example Usage
 
@@ -113,6 +117,7 @@ When profiling is enabled, it generates the following logs and files:
    ```
    automodel_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   vllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```

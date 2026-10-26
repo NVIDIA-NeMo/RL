@@ -51,7 +51,7 @@ Try:
 - modest increases in per-device batch size
 - tensor, pipeline, and context parallel changes only when the model size justifies the overhead
 - retuning learning rate and warmup after changing batch layout
-- backend comparisons across Megatron, DTensor, and automodel when the recipe supports them
+- backend comparisons across Megatron and Automodel when the recipe supports them
 
 Favor it when:
 - one to four GPUs
@@ -126,6 +126,6 @@ Turn these into commit-scoped experiments:
 - `Prompt: replace verbose instructions with a compact answer schema and stricter delimiters.`
 - `Batching: raise microbatch size and lower grad accumulation to improve throughput at similar memory.`
 - `Precision: switch fp16 to bf16 before changing model scale or rollout count.`
-- `Backend: compare DTensor, Megatron, or automodel to separate tuning effects from framework effects.`
+- `Backend: compare Automodel and Megatron to separate tuning effects from framework effects.`
 - `Async: split actor and learner resources if rollout latency is leaving GPUs idle.`
 - `Reward: retune scaling or clipping when completions look better than the score suggests.`

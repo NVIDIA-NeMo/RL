@@ -32,6 +32,7 @@ from nemo_rl.data.llm_message_utils import (
     get_formatted_message_log,
     get_keys_from_message_log,
     message_log_to_flat_messages,
+    validate_precomputed_loss_masks,
 )
 from nemo_rl.data.multimodal_utils import PackedTensor
 
@@ -858,6 +859,51 @@ def test_add_loss_mask_to_chat_message_log(
     assert torch.equal(
         tokenized_chat_message_log[0][2]["token_loss_mask"], torch.tensor([1, 1])
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bool, torch.int64, torch.float32])
+def test_validate_precomputed_loss_masks_preserves_messages(dtype: torch.dtype) -> None:
+    message_logs = [
+        [
+            {
+                "token_ids": torch.tensor([1, 2]),
+                "token_loss_mask": torch.tensor([1, 0], dtype=dtype),
+            },
+            {
+                "token_ids": torch.empty(0, dtype=torch.long),
+                "token_loss_mask": torch.empty(0, dtype=dtype),
+            },
+        ],
+        [
+            {
+                "token_ids": torch.tensor([3]),
+                "token_loss_mask": torch.tensor([0], dtype=dtype),
+            }
+        ],
+    ]
+    originals = [
+        {key: value.clone() for key, value in message.items()}
+        for log in message_logs
+        for message in log
+    ]
+
+    validate_precomputed_loss_masks(message_logs)
+
+    for message, original in zip(
+        (message for log in message_logs for message in log), originals
+    ):
+        for key, value in original.items():
+            assert torch.equal(message[key], value)
+
+
+def test_validate_precomputed_loss_masks_checks_later_conversations() -> None:
+    message_logs = [
+        [{"token_ids": torch.tensor([1]), "token_loss_mask": torch.tensor([1])}],
+        [{"token_ids": torch.tensor([2]), "token_loss_mask": torch.tensor([0.5])}],
+    ]
+
+    with pytest.raises(ValueError, match="binary vectors"):
+        validate_precomputed_loss_masks(message_logs)
 
 
 def test_get_first_index_that_differs():

@@ -32,6 +32,7 @@ from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource  # noqa:
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin  # noqa: E402
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
 from nemo_rl.experience.route_assembly import (  # noqa: E402
+    RouteLayout,
     execute_route_plan,
     verify_route_fragment_integrity,
 )
@@ -85,8 +86,8 @@ class _PolicyWorker(TQWorkerMixin):
         self._dp_client = client
         self._route_fallback_counts = Counter()
 
-    def _routed_experts_dimensions(self):
-        return 1, 2
+    def _routed_experts_layout(self):
+        return RouteLayout.compressed(num_moe_layers=1, top_k=2)
 
 
 @pytest.fixture
@@ -227,7 +228,10 @@ def test_served_capture_bypasses_codec_through_route_consumers(
         expected_token_length=length,
     )
     assembled, error = execute_route_plan(
-        plan, {key: fragment}, dims=(1, 2), canonical_len=length
+        plan,
+        {key: fragment},
+        layout=RouteLayout.compressed(num_moe_layers=1, top_k=2),
+        canonical_len=length,
     )
     assert error is None
     assert torch.equal(assembled, expected_assembled)
@@ -305,7 +309,10 @@ def test_capture_stages_and_verifies_native_routes_without_codec(
         expected_token_length=3,
     )
     assembled, error = execute_route_plan(
-        plan, {coords.staging_key: fragment}, dims=(1, 2), canonical_len=3
+        plan,
+        {coords.staging_key: fragment},
+        layout=RouteLayout.compressed(num_moe_layers=1, top_k=2),
+        canonical_len=3,
     )
     assert error is None
     assert torch.equal(assembled, routes.to(torch.int16))

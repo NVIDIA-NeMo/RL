@@ -149,7 +149,7 @@ def _make_process_group(monkeypatch):
 
 
 def test_vllm_peer_uses_vllm_metadata_and_allreduce_warmup(monkeypatch):
-    # Coupled to vLLM 0.23.0's stateless process-group wire protocol. Reverify
+    # Coupled to vLLM 0.28.0's stateless process-group wire protocol. Reverify
     # this literal whenever the isolated Dynamo vLLM pin changes.
     assert spg._VLLM_UNIQUE_ID_KEY == "broadcast_from/0/0"
     group, store, stream, communicator, unique_id_bytes = _make_process_group(

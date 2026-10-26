@@ -33,6 +33,7 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
 from nemo_rl.data_plane.schema import ROUTE_ENCODING_TENSOR  # noqa: E402
 from nemo_rl.experience.route_assembly import (  # noqa: E402
     RouteFragment,
+    RouteLayout,
     boundary_route_rows,
     execute_route_plan,
 )
@@ -94,7 +95,10 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
         expected_token_length=total_len,
     )
     routed, reason = execute_route_plan(
-        plan, fragments, dims=(1, 2), canonical_len=total_len
+        plan,
+        fragments,
+        layout=RouteLayout.compressed(num_moe_layers=1, top_k=2),
+        canonical_len=total_len,
     )
     assert reason is None, reason
     return routed

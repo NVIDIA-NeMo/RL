@@ -22,17 +22,23 @@ one makes /tokenize render differently from /v1/chat/completions on the same
 conversation.
 
 These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
-module tree and inspect what each consumer was constructed with.
+module tree, inspect consumer configuration, and exercise captured raw responses.
 """
 
 import asyncio
 import sys
 import types
+from collections.abc import AsyncIterator
+from copy import deepcopy
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -91,6 +97,7 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.engine",
         "vllm.entrypoints.serve.tokenize",
+        "vllm.entrypoints.serve.utils",
         "vllm.reasoning",
         "vllm.renderers",
         "vllm.tool_parsers",
@@ -149,11 +156,17 @@ def _install_fake_vllm(monkeypatch):
         "vllm.entrypoints.serve.tokenize.serving",
         ServingTokenization=_ServingTokenization,
     )
-    module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
     module(
-        "vllm.exceptions",
-        VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
+        "vllm.entrypoints.serve.utils.api_utils",
+        with_cancellation=lambda handler: handler,
     )
+    module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
+
+    class ValidationError(ValueError):
+        def __init__(self, message, **kwargs):
+            super().__init__(message)
+
+    module("vllm.exceptions", VLLMValidationError=ValidationError)
     module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=type(
@@ -172,7 +185,7 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=()):
+def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
@@ -193,9 +206,143 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=()):
     worker._capture_calls = {id(request): None for request in capture_requests}
     worker.routed_experts_dtype = torch.int16
 
-    worker._setup_vllm_openai_api_server(_FakeApp())
+    worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "admitted,marker,stream,token_ids,default_token_ids,logprobs,bypass,invalid_raw",
+    [
+        (True, True, False, True, False, True, True, False),
+        (True, True, False, None, True, True, True, False),
+        (False, True, False, True, False, True, False, False),
+        (False, False, False, True, False, True, False, False),
+        (True, True, True, True, False, True, False, False),
+        (True, True, False, False, True, True, False, False),
+        (True, True, False, True, False, False, False, False),
+        (True, True, False, True, False, True, True, True),
+    ],
+    ids=[
+        "captured-raw",
+        "server-default-token-ids",
+        "unadmitted-marker",
+        "ordinary",
+        "streaming",
+        "no-raw-arrays",
+        "no-logprobs",
+        "invalid-raw-logprobs",
+    ],
+)
+async def test_captured_chat_logprobs_bypass(
+    monkeypatch: Any,
+    admitted: bool,
+    marker: bool,
+    stream: bool,
+    token_ids: bool | None,
+    default_token_ids: bool,
+    logprobs: bool,
+    bypass: bool,
+    invalid_raw: bool,
+) -> None:
+    """Drive the real serving MRO and retain engine-native arrays unchanged."""
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_return_routed_experts_enabled",
+        lambda _self: False,
+    )
+    request = types.SimpleNamespace(
+        ng_capture={} if marker else None,
+        stream=stream,
+        logprobs=logprobs,
+        top_logprobs=0,
+        return_tokens_as_token_ids=token_ids,
+    )
+    _, chats, _ = _build_server(
+        monkeypatch, {}, capture_requests=[request] if admitted else []
+    )
+    serving = chats[0]
+    serving.return_tokens_as_token_ids = default_token_ids
+    serving.renderer = types.SimpleNamespace(tokenizer=None)
+    original_request_fields = vars(request).copy()
+    ordinary_logprobs = object()
+    builder = MagicMock(return_value=ordinary_logprobs)
+    monkeypatch.setattr(
+        _OpenAIServingChat, "_create_chat_logprobs", builder, raising=False
+    )
+
+    async def format_response(
+        self: Any,
+        upstream_request: Any,
+        results: AsyncIterator[Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        assert upstream_request is request
+        async for output in results:
+            final_output = output
+        response_type = sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionResponse
+        response = response_type()
+        response.usage = None
+        response.choices = [
+            types.SimpleNamespace(
+                index=0,
+                message=types.SimpleNamespace(),
+                logprobs=self._create_chat_logprobs(
+                    token_ids=final_output.outputs[0].token_ids,
+                    top_logprobs=final_output.outputs[0].logprobs,
+                )
+                if upstream_request.logprobs
+                else None,
+            )
+        ]
+        return response
+
+    monkeypatch.setattr(
+        _OpenAIServingChat,
+        "chat_completion_full_generator",
+        format_response,
+        raising=False,
+    )
+
+    async def results() -> AsyncIterator[Any]:
+        for token, probability in [(7, -0.5)]:
+            yield types.SimpleNamespace(
+                prompt_token_ids=[1, 2],
+                outputs=[
+                    types.SimpleNamespace(
+                        index=0,
+                        token_ids=[token],
+                        logprobs=[
+                            {}
+                            if invalid_raw
+                            else {token: types.SimpleNamespace(logprob=probability)}
+                        ],
+                        text="tail",
+                        finish_reason="stop",
+                        stop_reason=None,
+                    )
+                ],
+            )
+
+    if invalid_raw:
+        with pytest.raises(RuntimeError, match="did not include the selected token"):
+            await serving.chat_completion_full_generator(request, results())
+        assert builder.call_count == 0
+        return
+
+    response = await serving.chat_completion_full_generator(request, results())
+    choice = response.choices[0]
+    assert (choice.logprobs is None) == (bypass or not logprobs)
+    assert builder.call_count == (0 if bypass or not logprobs else 1)
+    assert vars(request) == original_request_fields
+    if logprobs and (token_ids if token_ids is not None else default_token_ids):
+        assert choice.message.prompt_token_ids == [1, 2]
+        assert choice.message.generation_token_ids == [7]
+        assert choice.message.generation_log_probs == [-0.5]
 
 
 @pytest.mark.parametrize(
@@ -387,3 +534,166 @@ def test_capture_bypasses_upstream_route_encoding_without_changing_plain_request
             assert result.outputs[0].routed_experts.tolist() == [
                 [[request_index * 10 + step, request_index * 10 + step + 1]]
             ]
+
+
+@pytest.mark.parametrize("capture_media", [False, True])
+def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
+    """Captured and ordinary requests must use the same final image positions."""
+
+    @dataclass(frozen=True)
+    class Span:
+        offset: int
+        length: int
+        is_embed: object = None
+
+    template_tokens = [10, 31, 2, 11, 18, 18, 12]
+    final_tokens = [10, 77, 31, 2, 11, 18, 18, 12]
+    prompt = {
+        "prompt_token_ids": template_tokens,
+        "mm_placeholders": {"image": [Span(4, 2)]},
+        "mm_kwargs": {
+            "image": [
+                SimpleNamespace(
+                    get_data=lambda: {
+                        "pixel_values_flat": torch.zeros(3, 1, 2),
+                        "imgs_sizes": torch.tensor([1, 2]),
+                        "num_tokens_per_image": 2,
+                    }
+                )
+            ]
+        },
+    }
+    captured = []
+    admission = SimpleNamespace(mode="token_in", prev_len=4) if capture_media else None
+
+    async def preprocess(self, *, messages, **kwargs):
+        rendered = (
+            deepcopy(prompt)
+            if len(messages) == 2
+            else {
+                "prompt_token_ids": [10, 31, 2],
+            }
+        )
+        return (None, [rendered])
+
+    def capture(self, engine_prompt, *, admission, splice=None):
+        if not capture_media:
+            return None
+        media = capture_processed_media(
+            engine_prompt,
+            prev_len=admission.prev_len,
+            splice=splice,
+            patch_size=1,
+        )
+        captured.append(media)
+        return media
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", capture_media, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_admission",
+        lambda self, request: admission,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda self, admission: [10, 77, 31, 2],
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_begin_request_capture", MagicMock()
+    )
+    renderers, _, _ = _build_server(monkeypatch, {})
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    request = SimpleNamespace(required_prefix_token_ids=[10, 77, 31, 2])
+    request.model_copy = lambda **kwargs: request
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request,
+            [{"role": "assistant"}, {"role": "tool"}],
+            None,
+            None,
+            {},
+        )
+    )
+
+    engine_prompt = result[1][0]
+    assert engine_prompt["prompt_token_ids"] == final_tokens
+    assert engine_prompt["mm_placeholders"]["image"][0].offset == 5
+    if capture_media:
+        assert captured[0].items[0].placeholder_offset == 5
+
+
+@pytest.mark.parametrize("overflows", [False, True])
+@pytest.mark.parametrize("failure_stage", ["capture", "remap"])
+def test_prefix_overflow_precedes_media_validation(
+    monkeypatch, overflows, failure_stage
+):
+    """An overflowing exact prefix must retain the normal context-length error."""
+    app = _FakeApp()
+
+    async def preprocess(self, *, messages, **kwargs):
+        prompt = {"prompt_token_ids": [10, 31, 2]}
+        if len(messages) == 2:
+            prompt = {
+                "prompt_token_ids": [10, 31, 2, 11, 18, 18, 12],
+                "mm_placeholders": {"image": [SimpleNamespace(offset=4, length=2)]},
+            }
+        return None, [prompt]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, request: None
+    )
+    capture = MagicMock(
+        side_effect=ValueError("retiled media") if failure_stage == "capture" else None,
+        return_value=None,
+    )
+    remap = MagicMock(side_effect=ValueError("retiled media"))
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.remap_multimodal_placeholders",
+        remap,
+    )
+    renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)
+    endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request = endpoint.__annotations__["request"]()
+    request.required_prefix_token_ids = [10, 77, 31, 2]
+    request.max_tokens, request.max_completion_tokens = 4, None
+    request.model_copy = lambda **kwargs: request
+    message = "maximum context length" if overflows else "retiled media"
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            renderer.preprocess_chat(
+                request, [{"role": "assistant"}, {"role": "tool"}], None, None, {}
+            )
+        )
+
+    if overflows:
+        capture.assert_not_called()
+        remap.assert_not_called()
+    else:
+        capture.assert_called_once()
+        assert remap.call_count == (failure_stage == "remap")
