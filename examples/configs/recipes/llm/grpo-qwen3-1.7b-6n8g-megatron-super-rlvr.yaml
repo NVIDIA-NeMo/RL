@@ -54,6 +54,7 @@ env:
   nemo_gym:
     uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
     num_gpu_nodes: 5
+    server_spinup_timeout_seconds: 1800  # Gym defaults to 600s; the 235B judge models take longer to load
     genrm_compare_resources_server:
       resources_servers:
         genrm_compare:
