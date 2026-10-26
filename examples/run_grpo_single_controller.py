@@ -24,18 +24,17 @@ import argparse
 import os
 import pprint
 import sys
-import time
-from typing import Any
 
-import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
-    WatchdogConfig,
     is_ppo_run,
     setup_single_controller,
+)
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    run_with_controller_liveness_watch,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
@@ -204,7 +203,7 @@ def main() -> None:
             actor_args=actor_args,
             setup_timing_metrics=setup_timing_metrics,
         )
-        result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
+        result = run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
         print(f"SC run complete: {result}")
     finally:
         # None when setup raised before building them.
@@ -239,48 +238,6 @@ def main() -> None:
         # actor flushes its own spans -- this covers the driver's side. No-op
         # when telemetry is inactive.
         shutdown_telemetry()
-
-
-def _run_with_controller_liveness_watch(
-    sc: ray.actor.ActorHandle, watchdog_config: WatchdogConfig
-) -> dict[str, Any]:
-    """Await the SC run, polling ping() so a frozen event loop cannot hide.
-
-    The in-actor watchdog is an asyncio task on the SC's own event loop, so it cannot
-    observe that loop being blocked -- by a synchronous Ray call into a wedged worker,
-    say. The driver is a separate process that already holds the handle, which makes it
-    the cheapest possible external observer; no supervisor actor required.
-
-    ping() returning is the liveness signal. A slow reply is not a freeze, so the check
-    only escalates once the loop has been unresponsive for the same budget the in-actor
-    watchdog uses to call a stall.
-    """
-    run_ref = sc.run.remote()
-    last_pong_at = time.monotonic()
-
-    while True:
-        ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
-        if ready:
-            return ray.get(run_ref)
-
-        try:
-            ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
-        except Exception as error:
-            unresponsive_s = time.monotonic() - last_pong_at
-            print(
-                f"SingleController ping failed after {unresponsive_s:.0f}s "
-                f"unresponsive: {type(error).__name__}: {error}",
-                flush=True,
-            )
-            if unresponsive_s > watchdog_config.stall_timeout_s:
-                raise RuntimeError(
-                    "SingleController event loop has been unresponsive for "
-                    f"{unresponsive_s:.0f}s (stall_timeout_s="
-                    f"{watchdog_config.stall_timeout_s}); its in-actor watchdog runs "
-                    "on that loop and cannot report this."
-                ) from error
-        else:
-            last_pong_at = time.monotonic()
 
 
 if __name__ == "__main__":

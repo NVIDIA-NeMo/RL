@@ -77,6 +77,7 @@ project-includes = [
   "nemo_rl/utils/train_data_dump.py",
   "nemo_rl/algorithms/single_controller_utils/rollout_checkpoint.py",
   "nemo_rl/algorithms/single_controller_utils/setup.py",
+  "nemo_rl/algorithms/single_controller_utils/simulator.py",
   "nemo_rl/algorithms/single_controller_utils/utils.py",
   "nemo_rl/algorithms/utils.py",
   "nemo_rl/algorithms/x_token/__init__.py",

@@ -31,6 +31,7 @@ import torch
 from omegaconf import OmegaConf
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+import nemo_rl.algorithms.single_controller_utils.simulator as sc_simulator_mod
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     OPDAdvantageEstimator,
@@ -66,7 +67,10 @@ from nemo_rl.algorithms.opd import (
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
+    CpuTrainer,
     MasterConfig,
+    NoOpWeightSynchronizer,
+    SimulatorSettings,
     SingleControllerActorArgs,
     setup_single_controller,
 )
@@ -2997,8 +3001,8 @@ class TestAdaptiveLossRestore:
         checkpointer.get_latest_checkpoint_path.return_value = str(checkpoint_path)
         checkpointer.load_training_info.return_value = vars(save_state)
         checkpointer.get_resume_paths.return_value = (None, None)
-        patched_factories["ClippedPGLossFn"].side_effect = (
-            lambda cfg, **kwargs: ClippedPGLossFn(cfg, **kwargs)
+        patched_factories["ClippedPGLossFn"].side_effect = lambda cfg, **kwargs: (
+            ClippedPGLossFn(cfg, **kwargs)
         )
         mc = _make_master_config(
             loss_cfg=ClippedPGLossConfig(
@@ -3828,3 +3832,212 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+# ── simulator (rollout_only): inference-only cluster, cpu trainer, no-op refit ──
+
+
+class _FakeClusterRecorder:
+    """Stand-in for RayVirtualCluster that records its constructor kwargs."""
+
+    constructed: list["_FakeClusterRecorder"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _FakeClusterRecorder.constructed.append(self)
+
+
+@pytest.fixture
+def fake_cluster_cls(monkeypatch):
+    _FakeClusterRecorder.constructed = []
+    monkeypatch.setattr(sc_setup_mod, "RayVirtualCluster", _FakeClusterRecorder)
+    return _FakeClusterRecorder
+
+
+def _inference_only_master_config(
+    *, num_nodes: int, gpus_per_node: int, segment_size: int | None = None, tp: int = 1
+) -> MasterConfig:
+    master_config = _make_master_config(colocated=False)
+    master_config.cluster = ClusterConfig(
+        num_nodes=num_nodes, gpus_per_node=gpus_per_node, segment_size=segment_size
+    )
+    master_config.policy["generation"]["colocated"]["resources"] = {
+        "gpus_per_node": gpus_per_node,
+        "num_nodes": num_nodes,
+    }
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "tensor_parallel_size": tp,
+        "pipeline_parallel_size": 1,
+    }
+    return master_config
+
+
+def test_build_inference_only_cluster_gives_every_node_to_generation(
+    fake_cluster_cls,
+):
+    master_config = _inference_only_master_config(num_nodes=2, gpus_per_node=8)
+
+    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
+        master_config
+    )
+
+    assert len(fake_cluster_cls.constructed) == 1
+    assert inference_cluster.kwargs["name"] == "sc_inference_cluster"
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [8, 8]
+    assert inference_cluster.kwargs["num_gpus_per_node"] == 8
+    assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+    assert inference_cluster.kwargs["segment_size"] is None
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
+    assert teacher_topology is None
+
+
+def test_build_inference_only_cluster_pins_multi_node_instances_to_a_domain(
+    fake_cluster_cls, monkeypatch
+):
+    """TP8 over 4-GPU nodes spans two nodes; four nodes make two pinned instances."""
+    master_config = _inference_only_master_config(
+        num_nodes=4, gpus_per_node=4, segment_size=2, tp=8
+    )
+    constraints = [{"domain-a": 1.0}] * 4
+    node_topology = {f"node{i}": ("domain-a", i) for i in range(5)}
+    seen: dict[str, Any] = {}
+
+    def fake_prepare(segment_size, num_nodes, *, topology=None, role="training"):
+        seen.update(segment_size=segment_size, num_nodes=num_nodes, role=role)
+        return constraints, ["node4"], dict(node_topology)
+
+    monkeypatch.setattr(sc_setup_mod, "prepare_segment_topology", fake_prepare)
+
+    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
+        master_config
+    )
+
+    assert seen == {"segment_size": 2, "num_nodes": 4, "role": "inference"}
+    assert inference_cluster.kwargs["segment_size"] == 2
+    assert inference_cluster.kwargs["node_resource_constraints"] is constraints
+    assert teacher_topology == {"node4": ("domain-a", 4)}
+
+
+def test_build_inference_only_cluster_skips_topology_when_nodes_do_not_divide(
+    fake_cluster_cls, monkeypatch, capsys
+):
+    master_config = _inference_only_master_config(
+        num_nodes=3, gpus_per_node=4, segment_size=2, tp=8
+    )
+    prepare = MagicMock(name="prepare_segment_topology")
+    monkeypatch.setattr(sc_setup_mod, "prepare_segment_topology", prepare)
+
+    inference_cluster, teacher_topology = sc_setup_mod._build_inference_only_cluster(
+        master_config
+    )
+
+    prepare.assert_not_called()
+    assert inference_cluster.kwargs["segment_size"] is None
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
+    assert teacher_topology is None
+    assert "not divisible" in capsys.readouterr().out
+
+
+def test_build_inference_only_cluster_rejects_colocated_generation(fake_cluster_cls):
+    master_config = _make_master_config(colocated=True)
+    with pytest.raises(ValueError, match="colocated.enabled=false"):
+        sc_setup_mod._build_inference_only_cluster(master_config)
+    assert fake_cluster_cls.constructed == []
+
+
+class TestSimulatorRolloutOnlySetup:
+    """setup_single_controller with simulator settings: no trainer, no transport."""
+
+    def _rollout_only_config(self) -> MasterConfig:
+        mc = _make_master_config(colocated=False)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 2,
+        }
+        mc.policy["generation"]["vllm_cfg"] = {}
+        return mc
+
+    def test_builds_cpu_trainer_and_noop_refit_without_a_training_cluster(
+        self, patched_factories, monkeypatch
+    ):
+        mc = self._rollout_only_config()
+        inference_cluster = MagicMock(name="inference_cluster")
+        build_inference_only = MagicMock(return_value=(inference_cluster, None))
+        monkeypatch.setattr(
+            sc_setup_mod, "_build_inference_only_cluster", build_inference_only
+        )
+        # CpuTrainer bootstraps TQ through its own module's import of the
+        # factory, so it needs the same mock the fixture gave setup.py.
+        monkeypatch.setattr(
+            sc_simulator_mod,
+            "build_data_plane_client",
+            patched_factories["build_data_plane_client"],
+        )
+        settings = SimulatorSettings(train_time_s=30.0, refit_time_s=1.5)
+
+        actor_args, _ = setup_single_controller(
+            mc, MagicMock(pad_token_id=0), simulator=settings
+        )
+
+        build_inference_only.assert_called_once_with(mc)
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["_build_trainer"].assert_not_called()
+        patched_factories["create_weight_synchronizer"].assert_not_called()
+        assert actor_args.train_cluster is None
+        assert actor_args.inference_cluster is inference_cluster
+        assert actor_args.simulator is settings
+        assert isinstance(actor_args.trainer_handle, CpuTrainer)
+        assert actor_args.trainer_handle.cfg is mc.policy
+        assert isinstance(actor_args.weight_synchronizer, NoOpWeightSynchronizer)
+        assert actor_args.weight_synchronizer.refit_time_s == 1.5
+        # The engine is handed the no-op transport, as it is handed the real one.
+        assert patched_factories["fake_gen"].weight_synchronizer is (
+            actor_args.weight_synchronizer
+        )
+        # The cpu trainer bootstraps TQ where TQPolicy would; the driver connects.
+        bootstrap_flags = [
+            call.kwargs.get("bootstrap")
+            for call in patched_factories["build_data_plane_client"].call_args_list
+        ]
+        assert bootstrap_flags == [True, False]
+        assert actor_args.trainer_handle.dp_client is (
+            patched_factories["build_data_plane_client"].return_value
+        )
+
+    def test_rejects_checkpointing_before_any_factory_runs(self, patched_factories):
+        mc = self._rollout_only_config()
+        mc.checkpointing["enabled"] = True
+
+        with pytest.raises(ValueError, match="checkpointing.enabled=false"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings()
+            )
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+        patched_factories["build_data_plane_client"].assert_not_called()
+
+    def test_rejects_non_vllm_generation_before_any_factory_runs(
+        self, patched_factories
+    ):
+        mc = _make_master_config(colocated=False, backend="sglang")
+
+        with pytest.raises(NotImplementedError, match="vllm"):
+            setup_single_controller(
+                mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings()
+            )
+
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_training_run_still_builds_the_real_trainer(self, patched_factories):
+        """No simulator settings: the pre-existing wiring is untouched."""
+        mc = _make_master_config(colocated=False)
+
+        actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_clusters"].assert_called_once()
+        patched_factories["_build_trainer"].assert_called_once()
+        patched_factories["create_weight_synchronizer"].assert_called_once()
+        assert actor_args.trainer_handle is patched_factories["fake_policy"]
+        assert actor_args.simulator is None

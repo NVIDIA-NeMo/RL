@@ -426,6 +426,30 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 
    For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
 
+## Rollout-Only Simulator
+
+`examples/run_single_controller_simulator.py` runs one side of the SC loop with the other side mocked, on the same pumps, data plane, sampler and refit lifecycle as a training run. Only `--mode rollout_only` is implemented: generation, the environments (NeMo-Gym or native) and the TransferQueue data plane are real, while the trainer is a `CpuTrainer` (`--train-backend cpu`) that uses no GPU. Every node of the allocation serves generation.
+
+```bash
+uv run examples/run_single_controller_simulator.py --config <your-sc.yaml> \
+    --num-steps 20 --num-nodes 4 --train-time-s 300 --refit-time-s 20 \
+    <hydra overrides...>
+```
+
+The recipe is used as-is and must be an SC recipe (`data_plane.enabled: true`, `async_rl:`, `grpo.async_grpo: null`). The driver overrides only what a rollout-only run owns: `--num-steps` sets `max_num_steps` (and widens `max_num_epochs` so a short dataset cannot clamp it), `--num-nodes` sets the generation node count, and `data.validation` is dropped. The engine loads the real checkpoint (`vllm_cfg.load_format: auto`, as `is_eval`) instead of dummy weights plus a first refit.
+
+What the stand-ins do, per step:
+
+- The rollout pump, `RolloutManager`, `TQReplayBuffer` and the configured sampler run unchanged, so admission is gated on the trainer version exactly as in training.
+- The train pump selects the step's groups and runs the advantage stage; the `CpuTrainer` copies `generation_logprobs` into `prev_logprobs` / `reference_policy_logprobs` (so `gen_kl_error` reads 0), accepts the chunk, and holds `--train-time-s` where `policy.train()` would run. Generation keeps serving during the hold. The hold ends early once no rollout is in flight; `train/simulated_train_idle_skipped_s` reports how much was skipped, so the e2e step time is `total_step_time + simulated_train_idle_skipped_s`.
+- `_sync_weights` runs its full lifecycle -- dispatch gate, `pause_generation_for_refit(clear_cache=recompute_kv_cache_after_weight_updates)`, resume -- around a `NoOpWeightSynchronizer` that moves nothing and holds `--refit-time-s`. The trainer version advances, which releases the sampler's next target.
+
+Everything on the rollout side is available: `generation_router`, `generation_fleet_health` (probes and shard restarts), the stall watchdog, token capture, and the `NRL_NSYS_*` profiling hooks.
+
+`tests/functional/grpo_async_gym_single_controller_rollout_only.sh` is the smoke for this path: the SC NeMo-Gym recipe above with the trainer stubbed out, gated on a scored rollout and on the stand-in's metrics.
+
+Not supported by `rollout_only`: PPO, non-vLLM generation backends (Megatron generation serves the trainer's own weights; TRT-LLM, SGLang and Dynamo are not validated under the SC refit lifecycle), checkpointing, on-policy distillation, `token_capture.defer_routed_experts_to_policy`, refittable fp8 KV caches, adaptive-ppo-clip, and online quantization (`precision: fp8`, `nvfp4_pertoken_rollout`, `quant_cfg`, `real_quant`): those quantize at refit, which this run has none of. Setup rejects each before any engine starts. The `train_only` mode and the `cpu` rollout backend are tracked in [issue #4860](https://github.com/NVIDIA-NeMo/RL/issues/4860).
+
 ## Relation to Legacy Async GRPO
 
 The [legacy async GRPO](./async-grpo.md) (`grpo.async_grpo.enabled: true` under `run_grpo.py`) and the SC path both target the same async training problem but partition responsibilities differently:
