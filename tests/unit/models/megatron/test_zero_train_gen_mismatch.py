@@ -434,7 +434,9 @@ def test_validate_provider_requires_mamba_chunk_aligned_packing(
     if accepted:
         zgm.validate_zero_train_gen_model_provider(config, model_cfg)
     else:
-        with pytest.raises(ValueError, match="multiple of 128 \\(mamba_chunk_size=128\\)"):
+        with pytest.raises(
+            ValueError, match="multiple of 128 \\(mamba_chunk_size=128\\)"
+        ):
             zgm.validate_zero_train_gen_model_provider(config, model_cfg)
 
 
