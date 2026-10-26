@@ -1157,13 +1157,10 @@ def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
             "the truncation penalty instead."
         )
 
-    # Complete is not usable. Stricter than apply_reward_shaping, which only
-    # asserts the penalty: the buffer is the divisor in
-    # min(-exceed / buffer * penalty, 0), evaluated for every row rather than
-    # only overlong ones. 0 raises ZeroDivisionError on the batch's first row,
-    # and a negative buffer inverts the shaping -- the ratio's sign flips, so
-    # min(..., 0) zeroes the penalty for overlong rows and penalizes SHORT
-    # ones instead.
+    # Stricter than apply_reward_shaping, which asserts only the penalty. The
+    # buffer divides every row in min(-exceed / buffer * penalty, 0): 0 raises
+    # on the first one, and a negative buffer flips the ratio's sign, so
+    # overlong rows go unpenalized and SHORT ones are penalized instead.
     if buffer_length <= 0:
         raise ValueError(
             f"reward_shaping.overlong_buffer_length={buffer_length} must be "
