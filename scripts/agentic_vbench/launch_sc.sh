@@ -12,6 +12,9 @@ code_dir="$(cd "${script_dir}/../.." && pwd)"
 
 export SLURM_ACCOUNT="${SLURM_ACCOUNT:-nemotron_n4_omni}"
 export SLURM_PARTITION="${SLURM_PARTITION:-batch_long}"
+# This launcher submits exclusive GPU nodes. Let each nested Ray srun use the
+# memory already reserved by its parent job instead of Slurm's tiny step default.
+export NRL_RAY_SRUN_MEM="${NRL_RAY_SRUN_MEM:-0}"
 
 env_file="${ENV_FILE:-${HOME}/.venv}"
 if [[ -f "${env_file}" ]]; then

@@ -257,6 +257,16 @@ else
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
+# A parent allocation can reserve the full node while Slurm gives a nested
+# srun only its small default memory limit. Allow exclusive training jobs to
+# pass their allocation through to the Ray head and workers explicitly.
+if [[ -n "${NRL_RAY_SRUN_MEM:-}" ]]; then
+  if [[ ! "$NRL_RAY_SRUN_MEM" =~ ^[0-9]+([KMG])?$ ]]; then
+    echo "Error: NRL_RAY_SRUN_MEM must be a Slurm memory size or 0." >&2
+    exit 1
+  fi
+  COMMON_SRUN_ARGS+=" --mem=$NRL_RAY_SRUN_MEM"
+fi
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
