@@ -2527,8 +2527,9 @@ class CSDLossFn(LossFunction):
         TP chunks and gathered across CP only after reducing to ``[B,T]``;
         arbitrary support values use bounded owner reductions. Production
         supplies ``global_valid_chunks`` from the full batch; direct callers
-        retain a WORLD-reduced fallback. Collectives are no-ops at world size 1
-        (single-GPU byte-exact).
+        retain an in-loss DP×CP-count fallback, which is correct only for
+        callers that do not divide the loss by CP themselves. Collectives are
+        no-ops at world size 1 (single-GPU byte-exact).
 
         Returns ``(loss, metrics_dict)``.
         """
@@ -3457,7 +3458,13 @@ class CSDLossFn(LossFunction):
         # ----- Combine + T^2 scale -----------
         effective_mismatch_count = len(support_sizes)
         effective_count = len(common_chunks) + effective_mismatch_count
-        # DP×CP-global valid-chunk count, computed in-loss. Reduce over the full
+        # Fallback when the caller passes no count: the DP×CP-global valid-chunk
+        # count, computed in-loss. Every CP rank holds the same replicated
+        # chunks, so each chunk is counted once per CP rank. That is the right
+        # denominator for a caller that does not divide the loss by CP (the
+        # Automodel worker passes the same DP count × CP). A caller that does
+        # divide by CP (Megatron's cp_normalize wrapper) must pass the DP count
+        # instead, or the KD weight drops by 1/CP. Reduce over the full
         # mesh (WORLD), then divide out the TP replication: the chunk count is
         # identical on every TP rank (chunks are vocab-independent), so
         # ``WORLD-sum == tp_world × (DP×CP-sum)`` exactly, and dividing by
