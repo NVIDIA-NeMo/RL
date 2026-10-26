@@ -796,8 +796,8 @@ class TestApplyParallelismConfig:
         assert model_cfg.sequence_parallel is True
         assert model_cfg.context_parallel_size == 1
 
-    def test_context_parallel_without_sequence_packing(self):
-        """Context parallelism > 1 is accepted with sequence packing disabled."""
+    def test_context_parallel_requires_sequence_packing(self):
+        """Test that context parallelism > 1 requires sequence packing."""
         from nemo_rl.models.megatron.setup import _apply_parallelism_config
 
         model_cfg = MagicMock()
@@ -809,6 +809,29 @@ class TestApplyParallelismConfig:
                 "num_layers_in_last_pipeline_stage": None,
                 "sequence_parallel": False,
                 "context_parallel_size": 2,
+            },
+            "sequence_packing": {"enabled": False},
+        }
+
+        with pytest.raises(AssertionError) as exc_info:
+            _apply_parallelism_config(model_cfg, config)
+
+        assert "Sequence Packing must be enabled" in str(exc_info.value)
+
+    def test_context_parallel_without_sequence_packing_when_allowed(self):
+        """Unpacked context parallelism is accepted once the caller opts in."""
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        model_cfg = MagicMock()
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "sequence_parallel": False,
+                "context_parallel_size": 2,
+                "allow_unpacked_context_parallel": True,
             },
             "sequence_packing": {"enabled": False},
         }

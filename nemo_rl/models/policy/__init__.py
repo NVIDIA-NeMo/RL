@@ -592,6 +592,9 @@ class MegatronConfig(TypedDict):
     mtp_loss_scaling_factor: NotRequired[float]
     # Populated by the algorithm before Megatron setup to size the LR scheduler.
     train_iters: NotRequired[int]
+    # Populated by cross-tokenizer distillation before Megatron setup: allow
+    # context_parallel_size > 1 without sequence packing.
+    allow_unpacked_context_parallel: NotRequired[bool]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.

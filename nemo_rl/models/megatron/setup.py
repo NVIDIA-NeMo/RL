@@ -1350,7 +1350,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         #   * sequence packing off, NeMo-RL CP-shards the [B, S] batch directly
         #     (process_microbatch's unpacked branch) -- used by cross-tokenizer
         #     distillation, whose per-sample teacher/alignment payload has no
-        #     packed representation.
+        #     packed representation. Logprob, top-k and full-payload export do
+        #     not support this layout, so only callers that set
+        #     allow_unpacked_context_parallel may use it.
+        assert config["sequence_packing"]["enabled"] or config["megatron_cfg"].get(
+            "allow_unpacked_context_parallel"
+        ), "Sequence Packing must be enabled to use Context Parallelism with MCore."
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )

@@ -1759,11 +1759,15 @@ def setup(
         distillation_config["max_num_steps"],
         distillation_config["max_num_epochs"] * len(train_dataloader),
     )
+    # CSD runs Megatron CP without sequence packing (the [B, S] batch is
+    # CP-sharded directly), which Megatron setup otherwise rejects.
     for tc in teacher_configs:
         if "megatron_cfg" in tc and tc["megatron_cfg"]["enabled"]:
             tc["megatron_cfg"]["train_iters"] = total_train_iters
+            tc["megatron_cfg"]["allow_unpacked_context_parallel"] = True
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_config["megatron_cfg"]["allow_unpacked_context_parallel"] = True
 
     val_dataloader: Optional[StatefulDataLoader] = None
     if val_dataset is not None and (
