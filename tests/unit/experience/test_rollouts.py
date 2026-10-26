@@ -125,7 +125,9 @@ def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
     processor = _Processor()
     calls = []
 
-    def fake_attach(message, *, images, processor, pad_dynamic_image_shapes=False):
+    def fake_attach(
+        message, *, images, processor, pad_dynamic_image_shapes=False, pixel_dtype=None
+    ):
         calls.append((message, images, processor, pad_dynamic_image_shapes))
         message["pixel_values"] = attached
 

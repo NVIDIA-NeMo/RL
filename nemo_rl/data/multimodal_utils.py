@@ -1676,6 +1676,9 @@ def _image_num_tokens_from_processed(processed: dict[str, Any]) -> list[int]:
     return [int(item) for item in value]
 
 
+_PIXEL_TENSOR_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
+
+
 def attach_image_model_inputs_to_message(
     message: dict[str, Any],
     *,
@@ -1683,8 +1686,15 @@ def attach_image_model_inputs_to_message(
     processor: Any,
     pad_dynamic_image_shapes: bool = False,
     expected_num_tokens_per_image: Sequence[int] | None = None,
+    pixel_dtype: torch.dtype | None = None,
 ) -> None:
-    """Attach image tensors while preserving rollout-token/media parity."""
+    """Attach image tensors while preserving rollout-token/media parity.
+
+    ``pixel_dtype`` stores the floating-point pixel tensors in that dtype (e.g.
+    bfloat16, half of the processor's float32) to cut the host memory rollouts
+    hold until training; integer image metadata is never cast. None keeps the
+    processor's dtype.
+    """
     if not images or processor is None:
         return
     if expected_num_tokens_per_image is not None and len(
@@ -1724,7 +1734,11 @@ def attach_image_model_inputs_to_message(
     model_inputs = extract_multimodal_model_inputs(processor, processed)
     message.update(
         {
-            key: value
+            key: (
+                value.to_dtype(pixel_dtype)
+                if pixel_dtype is not None and key in _PIXEL_TENSOR_KEYS
+                else value
+            )
             for key, value in model_inputs.items()
             if isinstance(value, PackedTensor)
         }

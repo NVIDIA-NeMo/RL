@@ -418,6 +418,13 @@ class NemoGymConfig(TypedDict):
     pad_dynamic_image_shapes: NotRequired[
         bool
     ]  # Preserve heterogeneous shapes for native-resolution patchification
+    # Store rollout pixel tensors in this dtype: "bfloat16", "float16" or
+    # "float32". Absent/None keeps the processor's float32. Rollouts hold their
+    # image tensors from the env actor through the replay buffer until the train
+    # batch casts them to policy.precision; storing them in that precision from
+    # the start (e.g. bfloat16) halves the host memory and the actor-to-driver
+    # payload, without changing what the policy sees.
+    pixel_values_dtype: NotRequired[Optional[str]]
     # Ledger-authoritative token capture (token_capture.enabled): the dumped
     # TokenCaptureConfig. Turns on external staging in Gym's policy model
     # server, switches run_rollouts to receipt mode, and assembles receipts
@@ -655,6 +662,37 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
+_PIXEL_VALUES_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
+def resolve_pixel_values_dtype(name: Optional[str]) -> Optional[torch.dtype]:
+    """Map a ``pixel_values_dtype`` setting to a torch dtype (None keeps the processor's)."""
+    if name is None:
+        return None
+    if name not in _PIXEL_VALUES_DTYPES:
+        raise ValueError(
+            f"nemo_gym.pixel_values_dtype must be one of {sorted(_PIXEL_VALUES_DTYPES)} "
+            f"or null, got {name!r}"
+        )
+    return _PIXEL_VALUES_DTYPES[name]
+
+
+def get_pixel_values_dtype(env_config: Mapping[str, Any]) -> Optional[torch.dtype]:
+    """Return nemo_gym's pixel_values_dtype from an env config as a torch dtype, or None.
+
+    Like get_pad_dynamic_image_shapes: the driver's initial-payload attach reads
+    it here so both attach paths store pixels in the same dtype.
+    """
+    nemo_gym_config = env_config.get("nemo_gym") if env_config else None
+    if not nemo_gym_config:
+        return None
+    return resolve_pixel_values_dtype(nemo_gym_config.get("pixel_values_dtype"))
+
+
 # Fail fast rather than restart. The servers this actor owns are started in
 # _spinup, which Ray does not re-run after a restart, so a restarted actor is
 # permanently broken: _require_spinup() rejects every later rollout call, and
@@ -688,6 +726,9 @@ class NemoGym(EnvironmentInterface):
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
+        self._pixel_values_dtype = resolve_pixel_values_dtype(
+            cfg.get("pixel_values_dtype")
+        )
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -760,6 +801,7 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        initial_global_config_dict.pop("pixel_values_dtype", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         # The Gym model server sends this as the bearer token of every request to
@@ -1640,6 +1682,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
                             self, "_pad_dynamic_image_shapes", False
                         ),
                         expected_num_tokens_per_image=expected_num_tokens,
+                        pixel_dtype=getattr(self, "_pixel_values_dtype", None),
                     )
                 except RolloutGeometryUnderdetermined as exc:
                     media_geometry_failed = True
@@ -2000,11 +2043,17 @@ def _build_gym_actor_config(
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
-    multimodal_flags: dict[str, bool] = {}
+    multimodal_flags: dict[str, Any] = {}
     for _flag in ("pad_dynamic_image_shapes",):
         _value = nemo_gym_dict.pop(_flag, None)
         if _value is not None:
             multimodal_flags[_flag] = bool(_value)
+    _pixel_values_dtype = nemo_gym_dict.pop("pixel_values_dtype", None)
+    if _pixel_values_dtype is not None:
+        resolve_pixel_values_dtype(
+            _pixel_values_dtype
+        )  # fail at setup, not in the actor
+        multimodal_flags["pixel_values_dtype"] = _pixel_values_dtype
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.

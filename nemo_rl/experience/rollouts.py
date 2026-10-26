@@ -65,6 +65,7 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
+    get_pixel_values_dtype,
 )
 from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
@@ -164,6 +165,7 @@ def attach_initial_nemo_gym_image_payloads(
     the shapes are read.
     """
     pad_dynamic_image_shapes = get_pad_dynamic_image_shapes(env_config)
+    pixel_dtype = get_pixel_values_dtype(env_config)
     for message_log, extra_env_info in zip(
         batch["message_log"], batch["extra_env_info"]
     ):
@@ -200,6 +202,7 @@ def attach_initial_nemo_gym_image_payloads(
             images=images,
             processor=processor,
             pad_dynamic_image_shapes=pad_dynamic_image_shapes,
+            pixel_dtype=pixel_dtype,
         )
 
 
