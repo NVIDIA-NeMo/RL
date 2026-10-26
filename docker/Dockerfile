@@ -97,6 +97,10 @@ echo "deb [signed-by=/usr/share/keyrings/nvidia-devtools.asc] ${NSYS_REPO}/ /" \
     | tee /etc/apt/sources.list.d/nvidia-devtools.list
 apt update
 apt install -y --no-install-recommends "nsight-systems-cli-${NSYS_RELEASE}=${NSYS_VERSION}"
+# Remove EFA metrics plugins bundled with a vulnerable Go toolchain.
+# Match NVIDIA-NeMo/Automodel#4172 for both supported architectures.
+rm -rf "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-x64/plugins/efa_metrics" \
+    "/opt/nvidia/nsight-systems-cli/${NSYS_RELEASE}/target-linux-sbsa-armv8/plugins/efa_metrics"
 rm -f /etc/apt/sources.list.d/nvidia-devtools.list /usr/share/keyrings/nvidia-devtools.asc
 
 # To fix CVE-2025-68973
@@ -243,6 +247,8 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl docker/prune_setuptools_cache.sh /usr/local/libexec/prune_setuptools_cache.sh
+COPY --from=nemo-rl docker/install_mooncake.sh /usr/local/libexec/install_mooncake.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -343,6 +349,9 @@ while IFS=$'\t' read -r venv_name stage extras; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+# Patch Mooncake libraries in the layer that creates the cache and venvs.
+bash /usr/local/libexec/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
+
 apt-get purge -y libnvidia-ml-dev
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
@@ -353,6 +362,15 @@ rm -rf /var/lib/apt/lists/*
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Remove setuptools < 80.10.2 from the uv cache. Megatron-Bridge's [build-system] requires
+# setuptools<80, and [tool.uv] override-dependencies does not apply to isolated build
+# environments, so its build caches setuptools 79.x. That release vendors wheel 0.45.1 and
+# jaraco.context 5.3.0 (flagged CVEs); 80.10.2+ vendors wheel 0.46.3 and jaraco.context 6.1.0.
+# No venv uses the old copy (every venv resolves setuptools from uv.lock), so it is only
+# cache residue. The wheels-v6 index entries are removed too so uv has no dangling pointer
+# and simply re-downloads if it ever needs that version.
+bash /usr/local/libexec/prune_setuptools_cache.sh "${UV_CACHE_DIR}"
 
 echo "${CACHE_KEY}" > "${UV_CACHE_DIR}/.cache-key"
 
@@ -552,6 +570,9 @@ while IFS=$'\t' read -r venv_name stage extras; do
         uv sync --frozen $extras --no-install-project
 done < /opt/actor_venvs.tsv
 
+# Patch Mooncake libraries in the layer that creates the cache and venvs.
+bash /usr/local/libexec/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
+
 # The main venv was never touched (the build ran in the throwaway venv), so
 # the previous "restore the default environment" sync is no longer needed.
 rm -rf /tmp/trtllm-build-venv
@@ -561,6 +582,9 @@ rm -rf /tmp/trtllm-build-venv
 find "${UV_CACHE_DIR}" -type d \
     \( -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" \
        -o -path "*ray/_private/runtime_env/agent/thirdparty_files/yarl*" \) -exec rm -rf {} +
+
+# Same for stale setuptools (see the comment in the preceding dependency layer).
+bash /usr/local/libexec/prune_setuptools_cache.sh "${UV_CACHE_DIR}"
 
 # Hand this layer's new cache and venv entries to the runtime UID. Entries from the dependency
 # layer already belong to it, so only files created here change owner and none is copied up.
@@ -699,6 +723,11 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
+# Patch any Mooncake copies added by release-stage installs or Gym prefetch.
+bash /usr/local/libexec/install_mooncake.sh "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR}"
+# Release-stage editable installs and Gym prefetch can cache old build-only
+# setuptools again. Prune after the final uv install, not just backend warmups.
+bash /usr/local/libexec/prune_setuptools_cache.sh "${UV_CACHE_DIR}"
 EOF
 # ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
 # (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
