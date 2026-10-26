@@ -14,4 +14,4 @@ NeMo-RL CI and test facts.
 - **When a PR deletes a CI check, compare its trigger conditions with the claimed replacement.** `cicd-main.yml` jobs wait for `/ok to test` (#3235). Details: [deleted-ci-guard-verify-replacement](details/deleted-ci-guard-verify-replacement.md).
 - **To test a binary the PR installs in the image, ask for a unit test in the existing lane, not a new CI step.** (#4375) Details: [check-in-the-image-ci-already-builds](details/check-in-the-image-ci-already-builds.md).
 - **New files and tests follow their siblings' location and shape; also flag unit tests that assert nothing and YAMLs with local model, tokenizer or dataset paths.** (#3286)
-- **Check that a test actually reaches the code it covers: a fake that bypasses the wrapper, a `spec=` mock that makes a new predicate truthy, or a skip that always fires in CI all hide it.** (#2884, #3785)
+- **Check that a test actually reaches the code it covers: a fake that bypasses the wrapper, a `spec=` mock that makes a new predicate truthy, or a skip that always fires in CI all hide it.** (#2884, #3785) Details: [test-reaches-the-code-it-covers](details/test-reaches-the-code-it-covers.md).
