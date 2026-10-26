@@ -25,6 +25,8 @@ loss_fn:
   csd_mismatch_loss_beta: 5.0
   csd_noise_filter_topk: 0
   csd_realized_only_mismatch: false
+  csd_pure_alm: false
+  csd_alm_bce_tau: 1.0
   teacher_topk_ipc_k: 128             # 0 sends dense teacher logits
   teacher_topk_ipc_support_mode: row_topk
   teacher_topk_ipc_keep_realized: true
