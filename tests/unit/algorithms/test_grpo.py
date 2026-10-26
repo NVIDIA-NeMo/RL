@@ -3218,6 +3218,32 @@ def test_setup_automodel_fp8_kv_cache_guard(
     policy_init.assert_not_called()
 
 
+def test_setup_rejects_megatron_router_replay_before_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["router_replay"] = {"enabled": True}
+    master_config.policy["generation"]["backend"] = "megatron"
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError,
+            match="only supported on the SingleController token-capture path",
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
+
+
 def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     mock_grpo_components, monkeypatch
 ):
@@ -3348,7 +3374,6 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
                 "tokenizer_cache": False,
                 "tokenizer_cache_bytes": 1024,
                 "router_mode": "kv",
-                "router_reset_states": True,
                 "extra_cli_args": [],
             },
         },

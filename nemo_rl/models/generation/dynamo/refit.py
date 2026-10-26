@@ -76,7 +76,7 @@ def _update_worker_weights(  # pragma: no cover
 ) -> bool:
     common = {"allow_unpaused": True, "reset_prefix_cache": False}
     steps: tuple[tuple[str, dict[str, Any]], ...] = (
-        ("start_weight_update", {"is_checkpoint_format": True}),
+        ("start_weight_update", {}),
         ("update_weights", {"update_info": update_info}),
         ("finish_weight_update", {}),
     )
@@ -123,12 +123,19 @@ class DynamoRefitChannel:
         self._update_info: dict[str, Any] | None = None
 
     def client_copy(self) -> "DynamoRefitChannel":
-        """Return a serializable endpoint-only channel for rollout actors."""
-        return DynamoRefitChannel(
+        """Return a serializable copy without the driver-owned worker validator.
+
+        The prepared update metadata travels with the copy: SingleController
+        prepares refit on the driver and then pickles the synchronizer (and
+        this generation client) into its actor, which issues every update.
+        """
+        copy = DynamoRefitChannel(
             self._workers,
             engine_world_size=self._engine_world_size,
             control_timeout_s=self._control_timeout_s,
         )
+        copy._update_info = self._update_info
+        return copy
 
     def _validated_workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
         if self._validate_workers is None:
@@ -142,12 +149,17 @@ class DynamoRefitChannel:
         return endpoints
 
     @property
+    def workers(self) -> tuple[DynamoWorkerEndpoint, ...]:
+        """Return the managed workers' endpoints, as fixed at collective setup."""
+        return self._workers
+
+    @property
     def inference_world_size(self) -> int:
         return len(self._workers) * self._engine_world_size
 
     @property
     def sender_spec(self) -> CollectiveSenderSpec:
-        """Return vLLM's non-negotiated peer and packing contract."""
+        """Return the peer and packing geometry declared to workers at init."""
         return CollectiveSenderSpec(
             nccl_peer="vllm",
             buffer_size_bytes=VLLM_PACKED_BUFFER_SIZE_BYTES,
@@ -169,7 +181,6 @@ class DynamoRefitChannel:
             "names": names,
             "dtype_names": dtype_names,
             "shapes": shapes,
-            "packed": True,
         }
 
     def init_collective(
@@ -199,6 +210,11 @@ class DynamoRefitChannel:
                         "rank_offset": train_world_size
                         + worker_index * self._engine_world_size,
                         "world_size": world_size,
+                        # vLLM reads packing once at init and defaults it off;
+                        # omitting it desynchronizes the packed broadcast.
+                        "packed": True,
+                        "packed_buffer_size_bytes": VLLM_PACKED_BUFFER_SIZE_BYTES,
+                        "packed_num_buffers": VLLM_PACKED_NUM_BUFFERS,
                     },
                 },
                 timeout_s=self._control_timeout_s,
@@ -220,13 +236,15 @@ class DynamoRefitChannel:
             for worker in self._validated_workers()
         ]
 
-    def flush_cache(self) -> bool:
-        """Drain, clear, and resume every worker using immutable endpoints."""
+    def _pause_workers(
+        self, *, clear_cache: bool
+    ) -> tuple[list[DynamoWorkerEndpoint], list[str]]:
+        """Drain in-flight requests, optionally clear caches; new requests wait."""
         pause_futures = [
             _post_worker_route.remote(
                 system_url=worker.system_url,
                 route="pause_generation",
-                payload={"mode": "wait", "clear_cache": True},
+                payload={"mode": "wait", "clear_cache": clear_cache},
                 timeout_s=self._control_timeout_s,
             )
             for worker in self._workers
@@ -240,7 +258,9 @@ class DynamoRefitChannel:
                 pause_errors.append(f"{worker.system_url}: {error}")
             else:
                 paused_workers.append(worker)
+        return paused_workers, pause_errors
 
+    def _resume_workers(self, workers: Sequence[DynamoWorkerEndpoint]) -> list[str]:
         resume_futures = [
             (
                 worker,
@@ -251,7 +271,7 @@ class DynamoRefitChannel:
                     timeout_s=self._control_timeout_s,
                 ),
             )
-            for worker in paused_workers
+            for worker in workers
         ]
         resume_errors: list[str] = []
         for worker, future in resume_futures:
@@ -259,6 +279,34 @@ class DynamoRefitChannel:
                 ray.get(future)
             except Exception as error:
                 resume_errors.append(f"{worker.system_url}: {error}")
+        return resume_errors
+
+    def pause(self, *, clear_cache: bool) -> None:
+        """Drain and pause every worker ahead of a weight update.
+
+        Workers that confirmed the pause are resumed if any peer fails.
+        """
+        paused_workers, pause_errors = self._pause_workers(clear_cache=clear_cache)
+        if pause_errors:
+            resume_errors = self._resume_workers(paused_workers)
+            details = "pause/clear failed for " + "; ".join(pause_errors)
+            if resume_errors:
+                details += "; resume failed for " + "; ".join(resume_errors)
+            raise RuntimeError(f"Dynamo pause before weight update failed: {details}")
+
+    def resume(self) -> None:
+        """Resume every worker after a weight update."""
+        resume_errors = self._resume_workers(self._workers)
+        if resume_errors:
+            raise RuntimeError(
+                "Dynamo resume after weight update failed for "
+                + "; ".join(resume_errors)
+            )
+
+    def flush_cache(self) -> bool:
+        """Drain, clear, and resume every worker using immutable endpoints."""
+        paused_workers, pause_errors = self._pause_workers(clear_cache=True)
+        resume_errors = self._resume_workers(paused_workers)
 
         if pause_errors or resume_errors:
             details = []
