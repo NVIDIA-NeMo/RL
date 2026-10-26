@@ -57,6 +57,41 @@ except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
 
 
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_automodel_get_logprobs_uses_the_microbatch_hook(monkeypatch):
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.timer = MagicMock()
+    worker.cfg = {"logprob_batch_size": 2}
+    worker.model = MagicMock()
+    worker.enable_seq_packing = False
+    worker.sampling_params = None
+    worker.dp_mesh = MagicMock()
+    worker.tokenizer = MagicMock()
+    worker._router_replay_gates = None
+    worker._make_logprobs_post_processor = MagicMock(return_value="postprocessor")
+    worker._logprobs_for_microbatch = MagicMock(return_value=torch.zeros(2, 3))
+    microbatch = object()
+    data = MagicMock()
+
+    monkeypatch.setattr(worker_mod, "check_sequence_dim", lambda _data: (1, 3))
+    monkeypatch.setattr(
+        worker_mod,
+        "get_microbatch_iterator",
+        lambda *args, **kwargs: ([microbatch], 1),
+    )
+
+    output = AutomodelPolicyWorkerImpl.get_logprobs(worker, data)
+
+    worker._logprobs_for_microbatch.assert_called_once_with(
+        processed_mb=microbatch,
+        post_processing_fn="postprocessor",
+        sequence_dim=1,
+    )
+    torch.testing.assert_close(output["logprobs"], torch.zeros(2, 3))
+
+
+@pytest.mark.automodel
 def create_test_config(
     model_name: str,
     tp: int = 1,
