@@ -707,6 +707,14 @@ def setup(
     real_quant = generation_config["backend"] == "vllm" and bool(
         generation_config.get("real_quant")
     )
+    if (
+        router_replay_enabled(policy_config)
+        and generation_config["backend"] == "megatron"
+    ):
+        raise NotImplementedError(
+            "Megatron-generation router replay is only supported on the "
+            "SingleController token-capture path"
+        )
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))

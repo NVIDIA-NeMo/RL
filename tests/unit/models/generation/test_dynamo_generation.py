@@ -71,7 +71,6 @@ def _config(*, tp: int = 1, expose_http_server: bool = False) -> dict[str, Any]:
                 "tokenizer_cache": False,
                 "tokenizer_cache_bytes": 50 * 1024 * 1024,
                 "router_mode": "kv",
-                "router_reset_states": True,
                 "extra_cli_args": [],
             },
         },
@@ -318,12 +317,28 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
         5,
     ]
     assert all(call["timeout_s"] == 10 for call in init_calls)
+    # vLLM reads packing from the init info only (worker default is unpacked).
+    for call in init_calls:
+        init_info = call["payload"]["init_info"]
+        assert init_info["packed"] is True
+        assert init_info["packed_buffer_size_bytes"] == 1024**3
+        assert init_info["packed_num_buffers"] == 2
     assert generation.update_weights_from_collective() == [True, True]
-    assert update_calls[0]["update_info"]["packed"] is True
+    assert update_calls[0]["update_info"] == {
+        "names": ["weight"],
+        "dtype_names": ["bfloat16"],
+        "shapes": [[4, 8]],
+    }
     assert all(call["timeout_s"] == 10 for call in update_calls)
 
     restored = pickle.loads(pickle.dumps(generation))
     assert restored.frontend_url == generation.frontend_url
+    # SingleController prepares refit on the driver, then pickles the
+    # generation client into its actor, which issues the weight updates.
+    expected_update_info = update_calls[0]["update_info"]
+    update_calls.clear()
+    assert restored.update_weights_from_collective() == [True, True]
+    assert [call["update_info"] for call in update_calls] == [expected_update_info] * 2
     monkeypatch.setattr(
         refit_module._post_worker_route,
         "remote",
@@ -342,6 +357,16 @@ def test_refit_rank_offsets_update_and_pickled_cache_invalidation(monkeypatch) -
         for call in cache_calls[:2]
     )
     assert restored._managed_runtime is None
+
+    # The metrics sampler starts in the process that reads it: the driver starts
+    # none, and the SingleController's telemetry pump starts it in the copy.
+    monkeypatch.setattr(metrics_module, "_http_get_text", lambda *args: None)
+    assert generation._metrics_sampler is None
+    assert not any(restored.drain_latest_logger_metrics().values())
+    assert restored._metrics_sampler is not None
+    assert restored._metrics_sampler._workers == restored._refit_channel.workers
+    assert restored.shutdown()
+    assert restored._metrics_sampler is None
 
 
 def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
@@ -379,6 +404,74 @@ def test_cache_invalidation_resumes_workers_that_paused_before_peer_failure(
     ]
 
 
+@pytest.mark.parametrize("clear_cache", [True, False])
+def test_refit_pause_drains_every_worker_and_resume_restores_them(
+    monkeypatch, clear_cache: bool
+) -> None:
+    workers = [
+        {"instance_id": "a", "system_url": "http://10.0.0.2:4000"},
+        {"instance_id": "b", "system_url": "http://10.0.0.3:4000"},
+    ]
+    _patch_runtime(monkeypatch, workers=workers)
+    calls = []
+    monkeypatch.setattr(
+        refit_module._post_worker_route,
+        "remote",
+        lambda **kwargs: calls.append(kwargs) or True,
+    )
+    monkeypatch.setattr(refit_module.ray, "get", lambda refs: refs)
+
+    # SingleController drives the pause from its own pickled client copy.
+    generation = pickle.loads(
+        pickle.dumps(DynamoGeneration(cluster=object(), config=_config()))
+    )
+    assert generation.pause_generation_for_refit(clear_cache=clear_cache)
+    assert [(call["route"], call["payload"]) for call in calls] == [
+        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
+        ("pause_generation", {"mode": "wait", "clear_cache": clear_cache}),
+    ]
+
+    calls.clear()
+    assert generation.resume_generation_after_refit()
+    assert [(call["route"], call["system_url"]) for call in calls] == [
+        ("resume_generation", "http://10.0.0.2:4000"),
+        ("resume_generation", "http://10.0.0.3:4000"),
+    ]
+
+
+def test_failed_pause_resumes_the_workers_that_paused(monkeypatch) -> None:
+    calls = []
+
+    def remote(**kwargs):
+        calls.append(kwargs)
+        return (kwargs["route"], kwargs["system_url"])
+
+    def get(ref):
+        if ref == ("pause_generation", "http://worker-b:4000"):
+            raise RuntimeError("pause refused")
+        return True
+
+    monkeypatch.setattr(refit_module._post_worker_route, "remote", remote)
+    monkeypatch.setattr(refit_module.ray, "get", get)
+    channel = DynamoRefitChannel(
+        [
+            {"instance_id": "a", "system_url": "http://worker-a:4000"},
+            {"instance_id": "b", "system_url": "http://worker-b:4000"},
+        ],
+        engine_world_size=1,
+        control_timeout_s=10,
+    )
+
+    with pytest.raises(RuntimeError, match="pause before weight update failed"):
+        channel.pause(clear_cache=True)
+
+    assert [(call["route"], call["system_url"]) for call in calls] == [
+        ("pause_generation", "http://worker-a:4000"),
+        ("pause_generation", "http://worker-b:4000"),
+        ("resume_generation", "http://worker-a:4000"),
+    ]
+
+
 def test_native_refit_transaction_keeps_cache_mode_external(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
@@ -397,6 +490,9 @@ def test_native_refit_transaction_keeps_cache_mode_external(monkeypatch) -> None
         "finish_weight_update",
     ]
     assert all(call["reset_prefix_cache"] is False for call in calls)
+    # vLLM's Worker.start_weight_update takes no arguments; Dynamo forwards
+    # every non-reserved key, so any extra key would raise in the engine.
+    assert set(calls[0]) == {"engine_rpc", "allow_unpaused", "reset_prefix_cache"}
 
 
 def test_metrics_parser_and_sampler_aliases() -> None:
@@ -424,6 +520,11 @@ def test_metrics_parser_and_sampler_aliases() -> None:
     assert metrics["generation_tokens"] == {0: [7.0]}
     assert "vllm_gpu_cache_usage_perc" not in parsed
     assert "python_gc_objects_collected_total" not in parsed
+
+    # Rollout telemetry drains to each worker's latest sample, which it keeps.
+    sampler._samples["vllm_generation_tokens_total"][0].append(9.0)
+    for _ in range(2):
+        assert sampler.drain_latest()["generation_tokens"] == {0: [9.0]}
 
 
 def test_metrics_http_errors_are_ignored(monkeypatch) -> None:
