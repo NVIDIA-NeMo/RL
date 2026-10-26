@@ -214,6 +214,11 @@ class DynamoRefitChannel:
         return len(self._workers)
 
     @property
+    def shard_widths(self) -> tuple[int, ...]:
+        """Every Dynamo-managed vLLM engine spans the same TP x PP ranks."""
+        return (self._engine_world_size,) * self.num_engines
+
+    @property
     def _init_timeout_s(self) -> float:
         return self._control_timeout_s + _INIT_ROUTE_CLIENT_MARGIN_S
 

@@ -730,6 +730,29 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
+    def attach_dynamo_adapter(self, *, parent_event_address: str, role: str) -> None:
+        """Serve this dedicated engine through a Megatron Dynamo adapter.
+
+        Only meaningful before the first ``prepare_for_generation``; the workers
+        refuse it once the engine exists.
+        """
+        assert self._owns_policy, "Dynamo adapters attach to dedicated engines only."
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data(
+                "attach_dynamo_adapter",
+                parent_event_address=parent_event_address,
+                role=role,
+            )
+        )
+
+    def dynamo_coordinator_address(self) -> Optional[str]:
+        """This engine's coordinator address once it is listening, else None."""
+        return ray.get(
+            self._policy.worker_group.run_single_worker_single_data(
+                method_name="dynamo_coordinator_address", worker_idx=0
+            )
+        )
+
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:

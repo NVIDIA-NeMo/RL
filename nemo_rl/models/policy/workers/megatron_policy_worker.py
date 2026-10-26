@@ -70,6 +70,9 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.config import (
+    generation_runs_megatron_engines,
+)
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -3439,7 +3442,7 @@ class MegatronPolicyWorkerImpl(
 
     def _generation_needs_logical_weights(self) -> bool:
         """Megatron's existing non-bulk export consumes logical model weights."""
-        return (self.cfg.get("generation") or {}).get("backend") == "megatron"
+        return generation_runs_megatron_engines(self.cfg.get("generation") or {})
 
     def _build_bulk_refit_conversion_tasks(self) -> list[Any]:
         """Use standard Bridge mappings and live parameters for bulk refit."""
