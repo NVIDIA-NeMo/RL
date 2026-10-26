@@ -3767,8 +3767,10 @@ class TestRewardShapingValidation:
     missing check.
 
     ``_validate_reward_shaping`` takes the shaping block rather than the master
-    config, so the surrounding algorithm block is irrelevant and GRPO alone
-    covers it.
+    config, so the surrounding algorithm block cannot change what it accepts
+    and GRPO alone covers the boundaries. That a PPO run reaches it at all is
+    covered by ``test_accepts_dapo_reward_shaping_on_a_ppo_run`` in
+    test_ppo_setup.py, which is where the PPO config fixture lives.
     """
 
     @staticmethod
@@ -3818,10 +3820,12 @@ class TestRewardShapingValidation:
     @pytest.mark.parametrize(
         ("field", "value"),
         [
-            # The divisor: 0 is a ZeroDivisionError on the first overlong row.
+            # The divisor, and it is evaluated for every row rather than only
+            # overlong ones, so 0 raises ZeroDivisionError on the first row.
             ("overlong_buffer_length", 0),
-            # Negative flips the ratio's sign, so min(..., 0) clamps every
-            # penalty to 0 and the shaping silently does nothing.
+            # Negative inverts the shaping: the ratio's sign flips, so
+            # min(..., 0) zeroes the penalty for overlong rows and penalizes
+            # short ones instead.
             ("overlong_buffer_length", -1),
             # Asserted in apply_reward_shaping, one rollout too late.
             ("overlong_buffer_penalty", -1),

@@ -1116,9 +1116,11 @@ def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
 
     The advantage stage applies the block, so it is supported -- but
     ``apply_reward_shaping`` only rejects a bad one at the first advantage
-    call, a whole round of rollouts and logprobs later. Every check here
-    mirrors one there and admits exactly what it admits, so a config that
-    reaches the stage is one the stage can run.
+    call, a whole round of rollouts and logprobs later. Each check here mirrors
+    one there and admits exactly what it admits, with one deliberate
+    exception: ``overlong_buffer_length`` must be positive, which that function
+    never asserts. It is the penalty's divisor, so a non-positive one is a
+    crash or an inverted penalty rather than a config it can honour.
 
     The two modes are mutually exclusive: ``stop_properly_penalty_coef``
     short-circuits, and the DAPO trio is only read when it is unset.
@@ -1155,10 +1157,13 @@ def _validate_reward_shaping(shaping_cfg: RewardShapingConfig) -> None:
             "the truncation penalty instead."
         )
 
-    # Complete is not usable. The buffer is the penalty's divisor: 0 is a
-    # ZeroDivisionError on the first overlong row, and a negative one flips the
-    # ratio's sign so min(..., 0) clamps every penalty to 0 and the shaping
-    # silently does nothing.
+    # Complete is not usable. Stricter than apply_reward_shaping, which only
+    # asserts the penalty: the buffer is the divisor in
+    # min(-exceed / buffer * penalty, 0), evaluated for every row rather than
+    # only overlong ones. 0 raises ZeroDivisionError on the batch's first row,
+    # and a negative buffer inverts the shaping -- the ratio's sign flips, so
+    # min(..., 0) zeroes the penalty for overlong rows and penalizes SHORT
+    # ones instead.
     if buffer_length <= 0:
         raise ValueError(
             f"reward_shaping.overlong_buffer_length={buffer_length} must be "

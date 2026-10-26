@@ -368,9 +368,13 @@ class AdvantageComputer:
         # After scale_rewards and ahead of every other reader of `rewards`,
         # the order v1 uses: the penalty is subtracted from the reward, so its
         # magnitude is only meaningful against the scaled range. Per-row, so
-        # the stage stays shardable. token_mask.sum(-1) IS
-        # response_token_lengths -- see
-        # test_token_mask_sum_is_the_response_token_length.
+        # the stage stays shardable.
+        #
+        # token_mask.sum(-1) IS response_token_lengths on the payload.py
+        # producer -- see test_token_mask_sum_is_the_response_token_length,
+        # which pins the two functions that build them. rollout_reassembler's
+        # token-capture path fills token_mask from Gym's own deltas instead,
+        # and that one is unpinned.
         rewards = apply_reward_shaping(
             BatchedDataDict(
                 {
