@@ -628,7 +628,7 @@ uv run python -m tools.csd.validate_subtoks_tables \
     --teacher-to-student cross_tokenizer_data/csd/teacher_to_student.pt
 ```
 
-Pass `--student-revision` and `--teacher-revision` when the tables were built with pinned revisions. The validator checks tokenizer fingerprints, tensor shapes and dtypes, destination ID ranges, padding, special-token roles, and every mapped event, and exits with an error on an inconsistent table. Training does not re-check the tables against the runtime tokenizers, so validate every table pair and rebuild both directions whenever either tokenizer changes. Tables are loaded with `torch.load(weights_only=False)`; use only trusted files.
+Pass `--student-revision` and `--teacher-revision` when the tables were built with pinned revisions. The validator checks tokenizer fingerprints, tensor shapes and dtypes, destination ID ranges, padding, special-token roles, and every mapped event, and exits with an error on an inconsistent table. Training does not re-check the tables against the runtime tokenizers, so validate every table pair and rebuild both directions whenever either tokenizer changes.
 
 To inspect the mapping coverage of a pair:
 

@@ -1475,7 +1475,7 @@ class CSDLossFn(LossFunction):
                 f"teacher {i}: forward pseudo-target table required "
                 f"(student_to_teacher_table_paths[{i}]); got {fwd_path!r}."
             )
-        fwd = torch.load(fwd_path, map_location="cpu", weights_only=False)
+        fwd = torch.load(fwd_path, map_location="cpu", weights_only=True)
         table = (fwd["subtoks"].long(), fwd["lengths"].long())
         self._csd_fwd_subtoks_per_teacher[i] = table
         return table
@@ -1495,7 +1495,7 @@ class CSDLossFn(LossFunction):
                 f"teacher {i}: reverse pseudo-target table required "
                 f"(teacher_to_student_table_paths[{i}]); got {rev_path!r}."
             )
-        rev = torch.load(rev_path, map_location="cpu", weights_only=False)
+        rev = torch.load(rev_path, map_location="cpu", weights_only=True)
         table = (rev["subtoks"].long(), rev["lengths"].long())
         self._csd_rev_subtoks_per_teacher[i] = table
         return table
