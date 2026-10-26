@@ -213,17 +213,7 @@ class SFTSingleControllerActor:
         self._loader_states = actor_args.loader_states
         self._logger = Logger(master_config.logger)  # type: ignore[arg-type]
         self._logger.log_hyperparams(master_config.model_dump())
-        # Driver-side timings, logged here because the Logger lives in this
-        # actor. The prefix tees them to rl.setup.duration, the one startup
-        # number safe to sum -- the rl.setup.* spans nest and the worker builds
-        # run concurrently. Not routed through print_setup_timing_summary: that
-        # asserts a generation-init phase, which this algorithm has no backend
-        # for.
-        self._logger.log_metrics(
-            actor_args.setup_timing.to_metrics_dict(),
-            step=0,
-            prefix=SETUP_TIMING_PREFIX,
-        )
+        self._log_setup_timing(actor_args.setup_timing)
         self._checkpointer = CheckpointManager(master_config.checkpointing)
         # Also built here, not on the driver: TimeoutChecker starts its
         # wall clock in __init__, so a driver-built one would count the
@@ -456,6 +446,21 @@ class SFTSingleControllerActor:
             )
         return {metric_name: float(metrics[key])}
 
+    def _log_setup_timing(self, setup_timing: SetupTimingMetrics) -> None:
+        """Log the driver's setup phases, which only this actor's Logger can.
+
+        The prefix tees them to ``rl.setup.duration``, whose ``phase=total_setup``
+        is the one value that cannot double-count: the phases nest and the worker
+        builds run concurrently, so summing across phases multiplies startup
+        rather than measuring it.
+
+        Not routed through ``print_setup_timing_summary``: that asserts a
+        generation-init phase, which this algorithm has no backend for.
+        """
+        self._logger.log_metrics(
+            setup_timing.to_metrics_dict(), step=0, prefix=SETUP_TIMING_PREFIX
+        )
+
     def _save_checkpoint(self, metric: dict[str, float]) -> None:
         # The workers would wait for a still-pending save anyway; publish it first.
         self._finish_pending_save(blocking=True)
@@ -661,6 +666,12 @@ def setup_sft_v2(
         segment_size=segment_size,
         node_resource_constraints=node_constraints,
     )
+    # Placement is lazy: __init__ only stores fields, and the bundles are
+    # scheduled on the first get_placement_groups(), which blocks on
+    # pg.ready(). Called here so the wait is measured rather than charged to
+    # policy_init, where RayWorkerGroup would otherwise trigger it. Idempotent,
+    # so RayWorkerGroup reuses these groups.
+    cluster.get_placement_groups()
     cluster_seconds = time.monotonic() - cluster_started
     megatron_config = cast(dict[str, Any], master_config.policy["megatron_cfg"])
     megatron_config["train_iters"] = _max_train_steps(master_config)
@@ -702,9 +713,9 @@ def setup_sft_v2(
     loss_fn = NLLLossFn(
         use_fused_linear_logprobs=megatron_config["use_fused_linear_logprobs"]
     )
-    # policy_init covers the worker builds and the model load, the bulk of a
-    # large-MoE start; the remainder is cluster placement plus this function's
-    # own validation and resume reads.
+    # cluster_init is the placement-group wait; policy_init covers the worker
+    # builds and the model load, the bulk of a large-MoE start. What is left of
+    # total_setup is this function's own validation and resume reads.
     setup_timing = SetupTimingMetrics(
         policy_init_time_s=policy_seconds,
         total_setup_time_s=time.monotonic() - setup_started,
