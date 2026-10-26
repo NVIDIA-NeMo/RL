@@ -255,7 +255,7 @@ def _make_nvfp4_moe_input_scales_writable(model: torch.nn.Module) -> None:
             scale.data = scale.detach().clone()
 
 
-def _process_nvfp4_moe_reload(
+def _process_moe_reload(
     layer: torch.nn.Module,
     *,
     quant_method: Any,
@@ -275,13 +275,13 @@ def _process_nvfp4_moe_reload(
             previous = getattr(previous_config, name)
             if current is None or previous is None:
                 if current is not previous:
-                    raise ValueError("NVFP4 MoE scale metadata changed during refit")
+                    raise ValueError("MoE scale metadata changed during refit")
             elif (
                 current.shape != previous.shape
                 or current.dtype != previous.dtype
                 or current.device != previous.device
             ):
-                raise ValueError("NVFP4 MoE scale metadata changed during refit")
+                raise ValueError("MoE scale metadata changed during refit")
     for name in ("a1_gscale", "a2_gscale"):
         scale = getattr(config, name)
         if scale is not None:
@@ -294,27 +294,40 @@ def _process_nvfp4_moe_reload(
         quant_method.moe_kernel = previous_kernel
 
 
-def _preserve_nvfp4_moe_reload_scales(model: torch.nn.Module) -> None:
-    """Keep CUDA-graph scale storage stable across native NVFP4 MoE reloads."""
+def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
+    """Keep CUDA-graph scale storage stable across native ModelOpt MoE reloads."""
     # These backend types are optional outside vLLM's real-quant worker.
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptFp8MoEMethod,
+        ModelOptNvFp4FusedMoE,
+    )
 
     for layer in model.modules():
         method = getattr(layer, "quant_method", None)
-        if not isinstance(method, ModelOptNvFp4FusedMoE):
+        if isinstance(method, ModelOptNvFp4FusedMoE):
+            if method.nvfp4_backend not in (
+                NvFp4MoeBackend.VLLM_CUTLASS,
+                NvFp4MoeBackend.FLASHINFER_TRTLLM,
+                NvFp4MoeBackend.FLASHINFER_CUTLASS,
+                NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
+                NvFp4MoeBackend.MARLIN,
+            ):
+                raise ValueError(
+                    "Graph-safe ModelOpt real-quant refit does not support NVFP4 MoE "
+                    f"backend {method.nvfp4_backend.name}. Choose a supported MoE backend."
+                )
+        elif isinstance(method, ModelOptFp8MoEMethod):
+            # Static FP8 on these backends also creates unregistered reciprocals.
+            # Other FP8 backends keep their native storage lifecycle unchanged.
+            if method.fp8_backend not in (
+                Fp8MoeBackend.FLASHINFER_CUTLASS,
+                Fp8MoeBackend.HPC,
+            ):
+                continue
+        else:
             continue
-        if method.nvfp4_backend not in (
-            NvFp4MoeBackend.VLLM_CUTLASS,
-            NvFp4MoeBackend.FLASHINFER_TRTLLM,
-            NvFp4MoeBackend.FLASHINFER_CUTLASS,
-            NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
-            NvFp4MoeBackend.MARLIN,
-        ):
-            raise ValueError(
-                "Graph-safe ModelOpt real-quant refit does not support NVFP4 MoE "
-                f"backend {method.nvfp4_backend.name}. Choose a supported MoE backend."
-            )
         # Install after cold loading: checkpoint metadata excludes these derived
         # buffers. Persistent buffers participate in native reload copy-back;
         # nonpersistent buffers absent from the checkpoint would be skipped.
@@ -323,14 +336,14 @@ def _preserve_nvfp4_moe_reload_scales(model: torch.nn.Module) -> None:
             if scale is not None:
                 layer.register_buffer(f"_nrl_{name}", scale)
         method.process_weights_after_loading = partial(
-            _process_nvfp4_moe_reload,
+            _process_moe_reload,
             quant_method=method,
             process_weights=method.process_weights_after_loading,
         )
 
 
 class RealQuantWorker(NixlVllmWorker):
-    """vLLM worker with graph-safe native NVFP4 MoE reloads."""
+    """vLLM worker with graph-safe native ModelOpt MoE reloads."""
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
@@ -338,7 +351,7 @@ class RealQuantWorker(NixlVllmWorker):
         if hasattr(model, "unwrap"):
             model = model.unwrap()
         _make_nvfp4_moe_input_scales_writable(model)
-        _preserve_nvfp4_moe_reload_scales(model)
+        _preserve_moe_reload_scales(model)
 
 
 class FakeQuantWorker(NixlVllmWorker):

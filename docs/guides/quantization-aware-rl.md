@@ -137,6 +137,8 @@ Real-quant rollout exercises deployment-style vLLM kernels during RL, not only t
 
 NVFP4 W4A4 and W4A16 are supported recipe examples of this general path; see the validation matrix above for their current status. The policy recipe must select only formats and tensors supported by the target model and pinned vLLM loader; no separate generation-side recipe or ignore list is applied.
 
+`policy.generation.real_quant_ignore` has been removed and is rejected at startup, even when empty or null. Move its exclusions into the ModelOpt recipe selected by `policy.quant_cfg`, so training and real-quant rollout use the same selection. The shipped Nano3, Nemotron3 Super, and Qwen3 MoE real-quant recipes already use `nvfp4_experts_weightonly.yaml` (W4A16) or `nvfp4_experts.yaml` (W4A4). These recipes enable only routed-expert quantizers and explicitly exclude MTP; attention, shared experts, and other non-routed-expert paths remain in their native dtype.
+
 For NVFP4 MoE refit, the resolved vLLM backend must be `VLLM_CUTLASS`, `FLASHINFER_TRTLLM`, `FLASHINFER_CUTLASS`, `FLASHINFER_CUTEDSL_BATCHED`, or `MARLIN`. Other backends are rejected at model load because their CUDA-graph scale storage is not preserved by the refit integration. This restriction also applies when CUDA graphs are disabled.
 
 ### Minimal Configuration

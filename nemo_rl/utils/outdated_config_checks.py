@@ -177,6 +177,23 @@ def reject_outdated_mcore_generation_keys(config: dict[str, Any]) -> None:
             )
 
 
+def reject_outdated_real_quant_ignore(config: dict[str, Any]) -> None:
+    """Fail when generation still contains the removed real-quant ignore list.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    policy = config.get("policy")
+    if not isinstance(policy, dict):
+        return
+    generation = policy.get("generation")
+    if isinstance(generation, dict) and "real_quant_ignore" in generation:
+        raise ValueError(
+            "policy.generation.real_quant_ignore was removed. Move quantization "
+            "exclusions into the ModelOpt recipe referenced by policy.quant_cfg."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -193,3 +210,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
+    reject_outdated_real_quant_ignore(config)

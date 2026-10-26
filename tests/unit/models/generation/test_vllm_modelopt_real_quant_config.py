@@ -387,7 +387,7 @@ def test_real_quant_moe_scales_use_native_reload_copyback(backend):
     # The real model loader records checkpoint metadata before cold processing.
     record_metadata_for_reloading(layer)
     process_weights(layer)
-    patch_mod._preserve_nvfp4_moe_reload_scales(layer)
+    patch_mod._preserve_moe_reload_scales(layer)
     config, kernel = method.moe_quant_config, method.moe_kernel
     if backend != "MARLIN":
         assert layer._nrl_a1_gscale is config.a1_gscale
@@ -435,7 +435,125 @@ def test_real_quant_moe_rejects_unhandled_reload_backends() -> None:
         method.nvfp4_backend = backend
         layer.quant_method = method
         with pytest.raises(ValueError, match=backend.name):
-            patch_mod._preserve_nvfp4_moe_reload_scales(layer)
+            patch_mod._preserve_moe_reload_scales(layer)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("backend", ["FLASHINFER_CUTLASS", "HPC"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_real_quant_fp8_moe_scales_survive_native_reload(
+    backend: str, device: str
+) -> None:
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend,
+        make_fp8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8MoEMethod
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        get_layerwise_info,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
+
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
+    )
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA graph scale-storage regression requires a GPU")
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones(2, device=device), requires_grad=False)
+    method = object.__new__(ModelOptFp8MoEMethod)
+    method.fp8_backend = Fp8MoeBackend[backend]
+    layer.quant_method = method
+
+    def process_weights(target: torch.nn.Module) -> None:
+        target.weight = torch.nn.Parameter(target.weight.clone(), requires_grad=False)
+        method.moe_quant_config = make_fp8_moe_quant_config(
+            fp8_backend=method.fp8_backend,
+            w1_scale=target.weight,
+            w2_scale=target.weight,
+            a1_scale=target.weight,
+            a2_scale=target.weight * 2,
+            layer=target,
+        )
+        method.moe_kernel = object()
+
+    method.process_weights_after_loading = process_weights
+    with torch.device(device):
+        record_metadata_for_reloading(layer)
+    process_weights(layer)
+    patch_mod._preserve_moe_reload_scales(layer)
+    config, kernel = method.moe_quant_config, method.moe_kernel
+    assert layer._nrl_a1_gscale is config.a1_gscale
+    assert layer._nrl_a2_gscale is config.a2_gscale
+    assert not get_layerwise_info(layer).restore_metadata[1]
+
+    def consume_scales() -> torch.Tensor:
+        return config.a1_gscale + config.a2_gscale + config.g1_alphas + config.g2_alphas
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = consume_scales()
+
+    for value in (2.0, 3.0, 1.0):
+        initialize_layerwise_reload(layer)
+        assert not layer._buffers
+        assert get_layerwise_info(layer).load_numel_total == 2
+        layer.weight.weight_loader(layer.weight, torch.full((2,), value, device=device))
+        finalize_layerwise_reload(layer, None)
+        assert method.moe_quant_config is config and method.moe_kernel is kernel
+        assert layer._nrl_a1_gscale is config.a1_gscale
+        assert layer._nrl_a2_gscale is config.a2_gscale
+        assert config.w1_scale is layer.weight
+        assert config.g1_alphas is layer.g1_alphas
+        assert config.g2_alphas is layer.g2_alphas
+        torch.testing.assert_close(
+            config.a1_gscale, torch.full((2,), 1 / value, device=device)
+        )
+        torch.testing.assert_close(
+            config.a2_gscale, torch.full((2,), 1 / (2 * value), device=device)
+        )
+        eager = consume_scales()
+        torch.testing.assert_close(
+            eager,
+            torch.full((2,), 1 / value + 1 / (2 * value) + 3 * value**2, device=device),
+        )
+        if device == "cuda":
+            graph.replay()
+            torch.testing.assert_close(captured, eager)
+
+
+@pytest.mark.vllm
+def test_real_quant_other_fp8_moe_backends_keep_native_processing() -> None:
+    # Optional native dependencies are installed only in the vLLM test environment.
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8MoEMethod
+
+    from nemo_rl.modelopt.models.generation import (
+        vllm_quant_patch as patch_mod,
+    )
+
+    for backend in set(Fp8MoeBackend) - {
+        Fp8MoeBackend.FLASHINFER_CUTLASS,
+        Fp8MoeBackend.HPC,
+    }:
+        layer = torch.nn.Module()
+        method = object.__new__(ModelOptFp8MoEMethod)
+        method.fp8_backend = backend
+        method.process_weights_after_loading = object()
+        layer.quant_method = method
+        original_process = method.process_weights_after_loading
+
+        patch_mod._preserve_moe_reload_scales(layer)
+
+        assert method.process_weights_after_loading is original_process
+        assert not layer._buffers
 
 
 @pytest.mark.vllm

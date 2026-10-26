@@ -382,6 +382,55 @@ def test_no_shipped_config_is_outdated(config_file):
         raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
 
 
+@pytest.mark.parametrize(
+    ("recipe", "quant_recipe", "activation_quantized"),
+    [
+        (
+            "grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml",
+            "nvfp4_experts_weightonly.yaml",
+            False,
+        ),
+        (
+            "grpo-nemotron3-super-120BA12B-16n4g-megatron-qa-nvfp4-w4a16-real-300step.yaml",
+            "nvfp4_experts_weightonly.yaml",
+            False,
+        ),
+        (
+            "grpo-nemotron3-super-120BA12B-16n4g-megatron-qa-nvfp4-w4a4-real-300step.yaml",
+            "nvfp4_experts.yaml",
+            True,
+        ),
+        (
+            "grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml",
+            "nvfp4_experts.yaml",
+            True,
+        ),
+    ],
+)
+def test_real_quant_moe_recipes_share_policy_quantization_selection(
+    recipe: str, quant_recipe: str, activation_quantized: bool
+) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    config = load_config_with_inheritance(
+        repo_root / "examples/configs/recipes/llm" / recipe
+    )
+    policy = config.policy
+    assert policy.generation.real_quant is True
+    assert "real_quant_ignore" not in policy.generation
+    assert policy.generation.quant_cfg is None
+    assert policy.quant_cfg == f"examples/modelopt/quant_configs/{quant_recipe}"
+
+    quant_config = OmegaConf.load(repo_root / policy.quant_cfg).quantize.quant_cfg
+    # Deny all first, enable only routed experts, and exclude MTP last.
+    assert quant_config[0] == {"quantizer_name": "*", "enable": False}
+    assert quant_config[-1] == {"quantizer_name": "*mtp*", "enable": False}
+    enabled = [rule.quantizer_name for rule in quant_config if rule.enable]
+    expected = ["*.experts.*weight_quantizer"]
+    if activation_quantized:
+        expected.append("*.experts.*input_quantizer")
+    assert enabled == expected
+
+
 # Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
 DEEPEP_FALLBACK_RECIPES = {
     Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
