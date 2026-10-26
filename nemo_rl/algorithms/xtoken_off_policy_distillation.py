@@ -1576,7 +1576,7 @@ def setup(
             ):
                 if not _teacher_is_cross_tokenizer(master_config, teacher):
                     continue
-                if not teacher_config["automodel_cfg"]["enabled"]:
+                if _megatron_enabled(teacher_config):
                     raise ValueError(
                         "Sparse teacher IPC with an Automodel student requires "
                         "Automodel cross-tokenizer teachers; teachers[{i}] is not "
@@ -2090,7 +2090,7 @@ def build_csd_lockstep_packing_plan(
     student_capacity = int(student_packing["train_mb_tokens"])
     student_physical_size_fn = None
     if (
-        student_config["automodel_cfg"]["enabled"]
+        not _megatron_enabled(student_config)
         and int(student_config["automodel_cfg"]["tensor_parallel_size"]) > 1
     ):
         # Generic Automodel packing pads TP>1 training microbatches to the

@@ -529,6 +529,16 @@ def test_setup_router_replay_requires_megatron_student():
     assert mock_cluster.call_count == 0
 
 
+def test_setup_sparse_ipc_rejects_megatron_teacher_without_automodel_cfg_block():
+    cfg = _make_master_config()
+    cfg.loss_fn.teacher_topk_ipc_k = 128
+    delattr(cfg.teachers[0], "automodel_cfg")
+    cfg.teachers[0].megatron_cfg = _megatron_cfg()
+
+    with pytest.raises(ValueError, match="teachers\\[0\\] is not Automodel"):
+        _patched_setup_call(cfg)
+
+
 def test_setup_router_replay_with_megatron_cp_requires_packing():
     cfg = _make_master_config()
     cfg.policy["automodel_cfg"]["enabled"] = False
@@ -2158,6 +2168,25 @@ def test_dtensor_tp_student_plan_preserves_fixed_training_tail():
     # The inference-only teacher does not inherit the student's TP training
     # tail; its side-local physical geometry remains independently minimal.
     assert plan.sides["teacher_0"].physical_tokens_by_bin == (16,)
+
+
+def test_megatron_student_plan_needs_no_automodel_cfg_block():
+    cfg = _make_master_config()
+    _enable_lockstep_packing(cfg, global_batch_size=2, capacity=64)
+    del cfg.policy["automodel_cfg"]
+    cfg.policy["megatron_cfg"] = _megatron_cfg()
+    batch = _make_batch(batch_size=2, t_student=4, t_teacher=6)
+
+    plan = build_csd_lockstep_packing_plan(
+        batch,
+        cfg,
+        batch_uid=10,
+        data_parallel_size=1,
+    )
+
+    assert plan is not None
+    # A Megatron student has no Automodel TP training tail.
+    assert plan.sides["student"].physical_tokens_by_bin[0] < 64
 
 
 def test_lockstep_telemetry_proves_multi_sample_bins(capsys):
