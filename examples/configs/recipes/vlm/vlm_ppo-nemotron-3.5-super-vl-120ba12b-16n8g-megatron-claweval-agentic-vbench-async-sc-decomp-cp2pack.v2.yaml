@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Actor CP2 with native packing, qualified against the same full-context
+# AVB actor/critic input as the CP1 PPO baseline. Keep the critic unchanged.
+defaults: ./vlm_ppo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp.v1.yaml
+
+policy:
+  make_sequence_length_divisible_by: 32
+  megatron_cfg:
+    context_parallel_size: 2
+    cp_comm_type: all_gather
+    offload_logprob_logits_to_cpu: false
+  sequence_packing:
+    enabled: true
+
+value:
+  make_sequence_length_divisible_by: 16
+  megatron_cfg:
+    offload_logprob_logits_to_cpu: true
+  sequence_packing:
+    algorithm: ${policy.sequence_packing.algorithm}
+    enabled: false
+    logprob_mb_tokens: ${policy.sequence_packing.logprob_mb_tokens}
+    microbatch_order: ${policy.sequence_packing.microbatch_order}
+    sequence_length_round: ${policy.sequence_packing.sequence_length_round}
+    train_mb_tokens: ${policy.sequence_packing.train_mb_tokens}
+
+checkpointing:
+  checkpoint_dir: results/ppo-super-claweval-agentic-vbench-async-decomp-cp2pack
+
+logger:
+  log_dir: logs/ppo-super-claweval-agentic-vbench-async-decomp-cp2pack
+  wandb:
+    name: ${oc.env:WANDB_NAME,claweval_agentic_vbench_subagents_super_ppo_async16_cp2pack_cluster-${oc.env:CLUSTER_NAME,${oc.env:SLURM_CLUSTER_NAME,unknown}}}
