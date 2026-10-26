@@ -288,7 +288,9 @@ jobs:
             echo "megatron_lm_commit=${MEGATRON_LM_COMMIT,,}"
           } | tee -a "$GITHUB_OUTPUT"
 
-          # Determine image tag: Lfast and docs reuse a prebuilt container, workflow_dispatch can override.
+          # Determine image tag: Lfast reuses a prebuilt container, workflow_dispatch can override.
+          # docs runs no container job (doc tests run on a GitHub-hosted runner); a non-empty tag
+          # is still set for it because that is what skips the container build.
           # Lfast and docs on a release-branch PR reuse that branch's container (published only by builds of
           # the release branch itself after merges) because the main container carries main's TRT-LLM wheel,
           # not the release branch's. PR builds never overwrite it.
@@ -640,9 +642,14 @@ jobs:
 
   # Doc tests are a Sphinx doctest build. None of them need a GPU, so they run on a
   # GitHub-hosted runner against a plain `uv sync` instead of the GPU test image.
+  # No GPU job waits for them; on a PR run, a failure cancels the rest of the run.
   cicd-doc-tests:
     name: Docs_Tests
     needs: [pre-flight, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      actions: write # cancel the run on failure
+    timeout-minutes: 45
     if: >-
       ${{
         (
@@ -667,6 +674,7 @@ jobs:
         with:
           ref: ${{ needs.pre-flight.outputs.test_sha }}
           submodules: recursive
+          persist-credentials: false
       - name: Read uv version from Dockerfile
         id: uv-version
         run: |
@@ -688,6 +696,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --group docs --group test
       - name: Run doc tests
+        env:
+          # Some doctests load tokenizers of gated Hugging Face models.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: bash tests/docs/Docs_Tests.sh
       - name: Upload coverage
         if: always()
@@ -697,13 +708,23 @@ jobs:
           path: tests/.coverage
           include-hidden-files: true
           if-no-files-found: ignore
+      - name: Cancel the rest of the run
+        if: ${{ failure() && startsWith(github.ref, 'refs/heads/pull-request/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
 
   # CPU-only config and test-suite checks (recipe configs resolve, nightly GPU-hour
   # budget, schema validation). They are the most frequent cause of red unit runs and
-  # need no GPU, so they run first on a GitHub-hosted runner; GPU test jobs wait for them.
+  # need no GPU, so they run on a GitHub-hosted runner in parallel with the container
+  # build. No GPU job waits for them; on a PR run, a failure cancels the rest of the run.
   cpu-config-tests:
     name: CPU config checks
     needs: [pre-flight, cicd-wait-in-queue]
+    permissions:
+      contents: read
+      actions: write # cancel the run on failure
+    timeout-minutes: 45
     if: >-
       ${{
         always() &&
@@ -725,6 +746,7 @@ jobs:
         with:
           ref: ${{ needs.pre-flight.outputs.test_sha }}
           submodules: recursive
+          persist-credentials: false
       - name: Read uv version from Dockerfile
         id: uv-version
         run: |
@@ -753,6 +775,11 @@ jobs:
           uv run --no-sync pytest \
             unit/test_recipes_and_test_suites.py \
             unit/test_config_validation.py
+      - name: Cancel the rest of the run
+        if: ${{ failure() && startsWith(github.ref, 'refs/heads/pull-request/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run cancel "${{ github.run_id }}" --repo "${{ github.repository }}"
 
   cicd-unit-tests:
     strategy:
@@ -760,7 +787,7 @@ jobs:
       max-parallel: 16
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.unit_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-doc-tests, cpu-config-tests, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         (
@@ -775,9 +802,7 @@ jobs:
             needs.cicd-wait-in-queue.result == 'success' ||
             !startsWith(github.ref, 'refs/heads/pull-request/')
           ) &&
-          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-          (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped') &&
-          needs.cpu-config-tests.result == 'success'
+          (needs.build-container.result == 'success' || needs.build-container.result == 'skipped')
         ) && !cancelled()
       }}
 
@@ -900,7 +925,7 @@ jobs:
       max-parallel: 16
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, cpu-config-tests, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}
     if: >-
       ${{
@@ -924,7 +949,6 @@ jobs:
           )
         ) &&
         needs.functional-test-script-check.result == 'success' &&
-        needs.cpu-config-tests.result == 'success' &&
         !cancelled()
       }}
     name: ${{ matrix.script }}
@@ -951,7 +975,7 @@ jobs:
       max-parallel: 16
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.gb200_functional_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, build-container-gb200, cicd-unit-tests, functional-test-script-check, cpu-config-tests, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     runs-on: ${{ vars.GB200_RUNNER }}
     if: >-
       ${{
@@ -977,7 +1001,6 @@ jobs:
           )
         ) &&
         needs.functional-test-script-check.result == 'success' &&
-        needs.cpu-config-tests.result == 'success' &&
         !cancelled()
       }}
     name: gb200_${{ matrix.script }}
@@ -1004,7 +1027,7 @@ jobs:
       fail-fast: false
       matrix:
         script: ${{ fromJSON(needs.pre-flight.outputs.h100_functional_test_scripts) }}
-    needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, cpu-config-tests, org-member-pre-flight, cicd-wait-in-queue]
+    needs: [pre-flight, prepare-megatron-lock, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
     if: >-
       ${{
         always() &&
@@ -1019,7 +1042,6 @@ jobs:
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         needs.functional-test-script-check.result == 'success' &&
-        needs.cpu-config-tests.result == 'success' &&
         !cancelled()
       }}
     runs-on: ${{ startsWith(needs.org-member-pre-flight.outputs.runner_prefix, 'ephe-v2-') && format('{0}-a{1}', needs.org-member-pre-flight.outputs.runner_prefix, github.run_attempt) || needs.org-member-pre-flight.outputs.runner_prefix }}

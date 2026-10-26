@@ -86,7 +86,7 @@ Common failure patterns:
 | `semantic-pull-request` fails | PR title doesn't follow Conventional Commits | Fix PR title; see `contributing` skill |
 | Linting fails | Style violation | Run `uv run ruff check --fix . && uv run ruff format .` |
 | Unit test failure | Code regression or missing dependency | Reproduce locally; see `testing` skill |
-| `CPU config checks` fails and no GPU job starts | A recipe config, test-suite list or nightly GPU-hour budget check failed (`tests/unit/test_recipes_and_test_suites.py`, `tests/unit/test_config_validation.py`) | Reproduce with `cd tests && uv run pytest unit/test_recipes_and_test_suites.py unit/test_config_validation.py`; these run on a CPU runner before GPU jobs |
+| `CPU config checks` fails (on a PR, the rest of the run is cancelled) | A recipe config, test-suite list or nightly GPU-hour budget check failed (`tests/unit/test_recipes_and_test_suites.py`, `tests/unit/test_config_validation.py`) | Reproduce with `cd tests && uv run --group test pytest unit/test_recipes_and_test_suites.py unit/test_config_validation.py`; the job runs on a GitHub-hosted CPU runner |
 
 ---
 

@@ -1,6 +1,6 @@
 # nightly-recipe-must-bump-gpu-hour-cap
 
-> Any NeMo-RL PR that adds a line to tests/test_suites/nightly.txt must also bump test_nightly_compute_stays_below_NNNN_hours (function name + assert + message) in the same commit, or that test goes red in the CPU config checks job and no GPU test job starts
+> Any NeMo-RL PR that adds a line to tests/test_suites/nightly.txt must also bump test_nightly_compute_stays_below_NNNN_hours (function name + assert + message) in the same commit, or that test goes red in the CPU config checks job, which cancels the rest of a PR run
 
 `tests/unit/test_recipes_and_test_suites.py` has a hard budget assert:
 `test_nightly_compute_stays_below_NNNN_hours` runs `DRYRUN=1 ./tools/launch <every nightly.txt
@@ -30,9 +30,9 @@ a TQ wrapper's CONFIG block only sizes the Slurm job, while the delegated base s
 own `MAX_STEPS` and hardcodes metric assertions at that step count.
 
 **Why it is worse than one red test:** the module runs in the `CPU config checks` job
-(`cpu-config-tests` in `cicd-main.yml`), which every GPU test job waits on. The repo's pytest
-`addopts` includes `-x`, so the failure stops that job on its first failing test and no unit or
-functional job starts.
+(`cpu-config-tests` in `cicd-main.yml`). The repo's pytest `addopts` includes `-x`, so the
+failure stops that job on its first failing test, and on a PR run the job then cancels the rest
+of the run, GPU jobs included.
 
 **Why:** on PR #4024 the new nightly entry took the total 4248 -> 4280 against a 4266 cap. Nobody
 had noticed because the PR carried no `CI:L*` label, so no test job had ever run on it — the entry

@@ -19,8 +19,11 @@
 #   2. vLLM + NeMo Gym tests (formerly L0_Unit_Tests_Vllm_Nemo_Gym)
 #   3. TensorRT-LLM tests (formerly L0_Unit_Tests_Trtllm)
 #
-# Order matters: the base run uses the image's venv as shipped (--no-sync), and
-# each later `uv run --extra ...` re-syncs the venv to that extra's set.
+# Order matters. The base run uses the image's venv as shipped (--no-sync), which
+# holds the base dependencies plus all dependency groups. `uv run --extra ...` only
+# adds packages, so the vLLM step adds vllm/nemo_gym on top of it. The TRT-LLM step
+# uses --exact --all-groups to return the venv to that shipped state plus trtllm,
+# because trtllm conflicts with vllm (see [tool.uv] conflicts in pyproject.toml).
 # Every suite runs even if an earlier one fails, so one failure doesn't hide
 # another; the shard fails at the end if any suite failed.
 
@@ -55,7 +58,7 @@ uv run --extra vllm --extra nemo_gym --group test bash -x ./tests/run_unit.sh \
 # this suite fails quickly instead of silently starting a source compilation.
 TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels \
 TRTLLM_REQUIRE_CACHED_WHEEL=1 \
-uv run --extra trtllm bash -x ./tests/run_unit.sh \
+uv run --exact --all-groups --extra trtllm bash -x ./tests/run_unit.sh \
     "unit/" \
     "${EXCLUDED_UNIT_TESTS[@]}" \
     --cov=nemo_rl \
