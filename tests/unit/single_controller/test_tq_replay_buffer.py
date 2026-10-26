@@ -1359,6 +1359,26 @@ class TestTQReplayBufferStateDict:
         assert buf.size() == 1
         assert buf.training_owned_replay_groups() == []
 
+    @pytest.mark.parametrize("duplicate_id", [True, False])
+    def test_snapshot_rejects_duplicate_claimed_groups_without_ready_groups(
+        self, duplicate_id: bool
+    ) -> None:
+        buf = _make_buffer(FakeDataPlaneClient())
+        _add_group(buf, weight=3)
+        _run(buf.claim_for_training([0]))
+        claims = buf.training_owned_replay_groups()
+        duplicate = claims[0].copy()
+        if not duplicate_id:
+            duplicate["group_id"] = "different-group-same-samples"
+
+        with pytest.raises(ValueError, match="duplicates"):
+            buf.metadata_state_dict(
+                saved_capacity=8, additional_groups=[*claims, duplicate]
+            )
+
+        assert buf.size() == 0
+        assert buf.training_owned_replay_groups() == claims
+
     @pytest.mark.parametrize(
         "ready_count,claimed_count", [(8, 2), (8, 5), (8, 8), (7, 5)]
     )

@@ -1716,12 +1716,35 @@ class TQReplayBuffer:
         They restore as ordinary ready groups, not as orphaned training claims.
         """
         groups: list[TQReplayGroupMetadata] = []
+        existing_group_ids: set[str] = set()
+        existing_sample_ids: set[str] = set()
+
+        def append_group(entry: TQReplayGroupMetadata) -> None:
+            group_id = entry["group_id"]
+            if group_id in existing_group_ids:
+                raise ValueError(f"replay metadata duplicates group_id={group_id!r}")
+            duplicate_sample_ids = existing_sample_ids.intersection(
+                entry["meta"].sample_ids
+            )
+            if duplicate_sample_ids:
+                raise ValueError(
+                    "replay metadata duplicates sample IDs: "
+                    f"{sorted(duplicate_sample_ids)!r}"
+                )
+            groups.append(entry)
+            existing_group_ids.add(group_id)
+            existing_sample_ids.update(entry["meta"].sample_ids)
+
+        # Retry the interrupted batch before groups still waiting for training.
+        for group in additional_groups or []:
+            append_group(copy.deepcopy(group))
+
         for i, ready in enumerate(self.ready_list):
             if not ready:
                 continue
             meta = self.meta_list[i]
             assert meta is not None  # commit sets meta before ready=True
-            groups.append(
+            append_group(
                 {
                     "meta": meta,
                     "start_weight": self.start_weight_list[i],
@@ -1730,33 +1753,6 @@ class TQReplayBuffer:
                     "group_id": self._group_ids[i],
                 }
             )
-        existing_group_ids = {group["group_id"] for group in groups}
-        existing_sample_ids = {
-            sample_id for group in groups for sample_id in group["meta"].sample_ids
-        }
-        for group in additional_groups or []:
-            group_id = group["group_id"]
-            if group_id in existing_group_ids:
-                raise ValueError(
-                    f"additional replay metadata duplicates group_id={group_id!r}"
-                )
-            duplicate_sample_ids = existing_sample_ids.intersection(
-                group["meta"].sample_ids
-            )
-            if duplicate_sample_ids:
-                raise ValueError(
-                    "additional replay metadata duplicates sample IDs: "
-                    f"{sorted(duplicate_sample_ids)!r}"
-                )
-            groups.append(copy.deepcopy(group))
-            existing_group_ids.add(group_id)
-            existing_sample_ids.update(group["meta"].sample_ids)
-        # Additional groups were already selected for the interrupted step.
-        # Prioritize them without changing live ownership or adding any waits.
-        # Bind the final order to the native snapshot with the normal digest.
-        additional_count = len(additional_groups or [])
-        if additional_count:
-            groups = groups[-additional_count:] + groups[:-additional_count]
         return {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
             "storage": REPLAY_BUFFER_METADATA_STORAGE,
