@@ -175,6 +175,9 @@ rollout_checkpointing:
   max_consecutive_failures: 3
   keep_latest_k: 2
   restore_mode: latest
+  # Opt in to rolling trainer + rollout state back together to the newest
+  # retained checkpoint with a snapshot if the latest anchor has none.
+  fallback_to_previous_trainer_checkpoint: false
   # Advanced escape hatch for runtime-only fields from external integrations.
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.

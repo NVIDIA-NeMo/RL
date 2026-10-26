@@ -831,6 +831,14 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``trainer_checkpoint`` rejects an occupied bootstrap namespace; use
     ``latest`` or a new checkpoint directory instead.
 
+    ``fallback_to_previous_trainer_checkpoint=True`` lets ``latest`` search
+    older retained trainer checkpoints when the newest has no committed
+    periodic snapshot. Both trainer and rollout state roll back together to
+    the newest matching pair; completed optimizer steps may be repeated. If
+    no pair exists, restore the newest trainer checkpoint normally. Disabled
+    periodic checkpointing and ``trainer_checkpoint`` mode ignore this option.
+    Invalid committed snapshot manifests still fail closed.
+
     Bootstrap compatibility is fail-closed: every configuration value affects
     the fingerprint unless it is on the built-in operational denylist.
     ``extra_fingerprint_excluded_paths`` lets integrations exclude additional
@@ -858,6 +866,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
+    fallback_to_previous_trainer_checkpoint: bool = False
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")

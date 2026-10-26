@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from typing import Any, Literal, Optional
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -77,6 +78,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
+    ROLLOUT_SNAPSHOT_MANIFEST_FILENAME,
+    ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+    RolloutSnapshotManifest,
     bootstrap_compatibility_identity,
     ensure_bootstrap_anchor,
 )
@@ -2810,6 +2814,200 @@ class TestSetup:
             sc_setup_mod._maybe_attach_fleet_health(generation, mc)
 
 
+class TestTrainerCheckpointSelection:
+    def test_fallback_is_opt_in(self) -> None:
+        assert not RolloutCheckpointConfig().fallback_to_previous_trainer_checkpoint
+
+    @staticmethod
+    def _checkpointer(root: Path, steps: list[int]) -> MagicMock:
+        for step in steps:
+            path = root / f"step_{step}"
+            path.mkdir(parents=True)
+            (path / "training_info.json").write_text(
+                json.dumps(vars(_save_state(step=step, trainer_version=step + 10)))
+            )
+        checkpointer = MagicMock()
+        checkpointer.checkpoint_dir = root
+        checkpointer.get_latest_checkpoint_path.return_value = (
+            str(root / f"step_{max(steps)}") if steps else None
+        )
+        checkpointer.load_training_info.side_effect = lambda path: (
+            json.loads((Path(path) / "training_info.json").read_text())
+            if path is not None
+            else None
+        )
+        return checkpointer
+
+    @staticmethod
+    def _snapshot(root: Path, step: int, *, sequence: int = 1) -> Path:
+        snapshot = root / f"step_{step}/rollout_snapshots/snapshot_{sequence:06d}"
+        snapshot.mkdir(parents=True)
+        manifest = RolloutSnapshotManifest(
+            schema_version=ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
+            base_train_step=step,
+            trainer_version=step + 10,
+            current_epoch=2,
+            sampler_dispatch_index=20,
+            mutation_version=1,
+            rolled_back_train_group_count=0,
+            bootstrap_fingerprint=None,
+        )
+        (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).write_text(
+            json.dumps(manifest.to_dict())
+        )
+        return snapshot
+
+    @pytest.mark.parametrize("fallback", [False, True])
+    def test_prefers_latest_anchor_snapshot(
+        self, tmp_path: Path, fallback: bool
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, [2, 10])
+        self._snapshot(tmp_path, 2)
+        self._snapshot(tmp_path, 10)
+        latest = self._snapshot(tmp_path, 10, sequence=2)
+        path, state, snapshot = sc_setup_mod._select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=300,
+                fallback_to_previous_trainer_checkpoint=fallback,
+            ),
+        )
+        assert path == str(tmp_path / "step_10")
+        assert state.current_step == 10
+        assert state.trainer_version == 20
+        assert snapshot is not None and snapshot.path == latest
+        checkpointer.load_training_info.assert_called_once_with(path)
+
+    def test_fallback_selects_newest_pair_numerically_and_is_read_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, [2, 9, 10, 11])
+        self._snapshot(tmp_path, 2)
+        previous = self._snapshot(tmp_path, 9)
+        for name in ("tmp_step_12", "old_step_12", "step_12_backup", "bootstrap"):
+            (tmp_path / name).mkdir()
+        # Neither in-progress snapshots nor snapshots in uncommitted anchors count.
+        (tmp_path / "step_10/rollout_snapshots/tmp_snapshot_000001").mkdir(parents=True)
+        before = {
+            path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+        path, state, snapshot = sc_setup_mod._select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=300,
+                fallback_to_previous_trainer_checkpoint=True,
+            ),
+        )
+        assert path == str(tmp_path / "step_9")
+        assert state.current_step == 9
+        assert state.trainer_version == 19
+        assert snapshot is not None and snapshot.path == previous
+        assert (
+            "rolling back trainer and rollout state together" in capsys.readouterr().out
+        )
+        assert before == {
+            path.relative_to(tmp_path): path.read_bytes()
+            for path in tmp_path.rglob("*")
+            if path.is_file()
+        }
+
+    @pytest.mark.parametrize(
+        ("interval", "mode", "fallback"),
+        [
+            (300, "latest", False),
+            (None, "latest", True),
+            (300, "trainer_checkpoint", True),
+        ],
+    )
+    def test_inactive_fallback_preserves_latest_trainer(
+        self,
+        tmp_path: Path,
+        interval: Optional[float],
+        mode: Literal["latest", "trainer_checkpoint"],
+        fallback: bool,
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, [2, 3])
+        self._snapshot(tmp_path, 2)
+        path, state, snapshot = sc_setup_mod._select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=interval,
+                restore_mode=mode,
+                fallback_to_previous_trainer_checkpoint=fallback,
+            ),
+        )
+        assert path == str(tmp_path / "step_3")
+        assert state.current_step == 3
+        assert snapshot is None
+        checkpointer.load_training_info.assert_called_once_with(path)
+
+    @pytest.mark.parametrize("steps", [[], [2, 3]])
+    def test_no_pair_keeps_latest_trainer_or_fresh_state(
+        self, tmp_path: Path, steps: list[int]
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, steps)
+        path, state, snapshot = sc_setup_mod._select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=300,
+                fallback_to_previous_trainer_checkpoint=True,
+            ),
+        )
+        assert path == (str(tmp_path / "step_3") if steps else None)
+        assert state.current_step == (3 if steps else 0)
+        assert snapshot is None
+
+    def test_legacy_trainer_version_defaults_to_train_step(
+        self, tmp_path: Path
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, [2, 3])
+        training_info = tmp_path / "step_2/training_info.json"
+        training_info.write_text(json.dumps(vars(_save_state(step=2))))
+        previous = self._snapshot(tmp_path, 2)
+        manifest_path = previous / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME
+        manifest = json.loads(manifest_path.read_text())
+        manifest["trainer_version"] = 2
+        manifest_path.write_text(json.dumps(manifest))
+        path, state, snapshot = sc_setup_mod._select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=RolloutCheckpointConfig(
+                snapshot_attempt_interval_s=300,
+                fallback_to_previous_trainer_checkpoint=True,
+            ),
+        )
+        assert path == str(tmp_path / "step_2")
+        assert state.trainer_version is None
+        assert snapshot is not None and snapshot.path == previous
+
+    @pytest.mark.parametrize("broken_step", [2, 3])
+    @pytest.mark.parametrize("bad_manifest", ["missing", "malformed", "wrong_version"])
+    def test_invalid_committed_snapshot_fails_closed(
+        self, tmp_path: Path, broken_step: int, bad_manifest: str
+    ) -> None:
+        checkpointer = self._checkpointer(tmp_path, [1, 2, 3])
+        self._snapshot(tmp_path, 1)
+        broken = self._snapshot(tmp_path, broken_step)
+        manifest_path = broken / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME
+        if bad_manifest == "missing":
+            manifest_path.unlink()
+        elif bad_manifest == "malformed":
+            manifest_path.write_text("{")
+        else:
+            manifest = json.loads(manifest_path.read_text())
+            manifest["trainer_version"] += 1
+            manifest_path.write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="no committed rollout snapshot matches"):
+            sc_setup_mod._select_trainer_restore_checkpoint(
+                checkpointer,
+                rollout_checkpoint_config=RolloutCheckpointConfig(
+                    snapshot_attempt_interval_s=300,
+                    fallback_to_previous_trainer_checkpoint=True,
+                ),
+            )
+
+
 class TestNativeTQRecoverySetup:
     def test_simple_storage_setup_loads_tq_before_creating_controller_client(
         self, tmp_path, patched_factories
@@ -2885,17 +3083,29 @@ class TestNativeTQRecoverySetup:
         assert actor_args.data_plane_checkpoint_metadata is None
         assert "tq_load_seconds" not in actor_args.rollout_checkpoint_load_metrics
 
+    @pytest.mark.parametrize("fallback", [False, True])
     def test_mooncake_periodic_snapshot_path_waits_for_finalizer_clients(
-        self, tmp_path, patched_factories
+        self, tmp_path, patched_factories, fallback
     ):
         trainer_checkpoint = tmp_path / "checkpoints" / "step_3"
+        trainer_checkpoint.mkdir(parents=True)
         snapshot_path = trainer_checkpoint / "rollout_snapshots" / "snapshot_000007"
         save_state = _save_state()
         checkpointer = MagicMock()
         checkpointer.checkpoint_dir = tmp_path / "checkpoints"
-        checkpointer.get_latest_checkpoint_path.return_value = str(trainer_checkpoint)
-        checkpointer.load_training_info.return_value = vars(save_state)
-        checkpointer.get_resume_paths.return_value = (None, None)
+        latest_checkpoint = (
+            trainer_checkpoint.with_name("step_4") if fallback else trainer_checkpoint
+        )
+        latest_checkpoint.mkdir(exist_ok=True)
+        checkpointer.get_latest_checkpoint_path.return_value = str(latest_checkpoint)
+        checkpointer.load_training_info.side_effect = lambda path: vars(
+            _save_state(step=4)
+            if Path(path) == latest_checkpoint and fallback
+            else save_state
+        )
+        weights_path = str(trainer_checkpoint / "policy/weights")
+        optimizer_path = str(trainer_checkpoint / "policy/optimizer")
+        checkpointer.get_resume_paths.return_value = (weights_path, optimizer_path)
         resolved_snapshot = SimpleNamespace(
             path=snapshot_path,
             manifest=SimpleNamespace(current_epoch=2, sampler_dispatch_index=7),
@@ -2924,6 +3134,7 @@ class TestNativeTQRecoverySetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0,
             restore_mode="latest",
+            fallback_to_previous_trainer_checkpoint=fallback,
         )
         patched_factories["setup_response_data"].return_value = (
             list(range(8)),
@@ -2938,7 +3149,9 @@ class TestNativeTQRecoverySetup:
             patch.object(
                 sc_setup_mod,
                 "resolve_latest_snapshot",
-                return_value=resolved_snapshot,
+                side_effect=lambda anchor, **kwargs: (
+                    resolved_snapshot if anchor == trainer_checkpoint else None
+                ),
             ) as resolve_latest,
             patch.object(sc_setup_mod, "load_dataloader_state") as load_dataloader,
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
@@ -2957,12 +3170,29 @@ class TestNativeTQRecoverySetup:
                 MagicMock(pad_token_id=0),
             )
 
-        resolve_latest.assert_called_once_with(
-            trainer_checkpoint,
-            expected_train_step=3,
-            expected_trainer_version=3,
-            expected_bootstrap_fingerprint=None,
+        expected_calls = []
+        if fallback:
+            expected_calls.append(
+                call(
+                    latest_checkpoint,
+                    expected_train_step=4,
+                    expected_trainer_version=4,
+                    expected_bootstrap_fingerprint=None,
+                )
+            )
+        expected_calls.append(
+            call(
+                trainer_checkpoint,
+                expected_train_step=3,
+                expected_trainer_version=3,
+                expected_bootstrap_fingerprint=None,
+            )
         )
+        assert resolve_latest.call_args_list == expected_calls
+        checkpointer.get_resume_paths.assert_called_once_with(str(trainer_checkpoint))
+        trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
+        assert trainer_kwargs["weights_path"] == weights_path
+        assert trainer_kwargs["optimizer_path"] == optimizer_path
         load_dataloader.assert_called_once_with(
             patched_factories["dataloader"],
             str(snapshot_path),
@@ -2973,6 +3203,7 @@ class TestNativeTQRecoverySetup:
         patched_factories["fake_policy"].load_data_plane_checkpoint.assert_not_called()
         actor_args.dp_client.register_partition.assert_not_called()
         assert actor_args.last_checkpoint_path == str(snapshot_path)
+        assert actor_args.save_state.current_step == 3
         assert actor_args.restored_from_rollout_snapshot
         assert actor_args.data_plane_checkpoint_metadata is None
         assert actor_args.save_state.current_epoch == 2

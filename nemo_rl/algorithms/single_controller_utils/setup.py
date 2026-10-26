@@ -22,6 +22,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import os
+import re
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -69,6 +70,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
+    RolloutCheckpointConfig,
     algo_config,
     is_ppo_run,
     validate_single_controller_config,
@@ -76,6 +78,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
+    ResolvedRolloutCheckpoint,
     bootstrap_compatibility_identity,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
@@ -1053,6 +1056,80 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+def _select_trainer_restore_checkpoint(
+    checkpointer: CheckpointManager,
+    *,
+    rollout_checkpoint_config: RolloutCheckpointConfig,
+) -> tuple[Optional[str], GRPOSaveState, Optional[ResolvedRolloutCheckpoint]]:
+    """Select matching trainer/rollout state before resolving any model paths.
+
+    Only missing snapshots permit the opt-in rollback. Corrupt or incompatible
+    committed snapshot manifests propagate the resolver's error, and selection
+    never renames or deletes checkpoint state. Bootstrap selection stays with
+    the caller; an existing trainer lineage never falls back to bootstrap.
+    """
+    latest_path = checkpointer.get_latest_checkpoint_path()
+    latest_state = _get_grpo_save_state(
+        cast(Optional[dict[str, Any]], checkpointer.load_training_info(latest_path))
+    )
+    if (
+        latest_path is None
+        or rollout_checkpoint_config.snapshot_attempt_interval_s is None
+        or rollout_checkpoint_config.restore_mode != "latest"
+    ):
+        return latest_path, latest_state, None
+
+    candidates = [Path(latest_path)]
+    if rollout_checkpoint_config.fallback_to_previous_trainer_checkpoint:
+        latest_step = int(candidates[0].name.removeprefix("step_"))
+        candidates.extend(
+            sorted(
+                (
+                    child
+                    for child in checkpointer.checkpoint_dir.iterdir()
+                    if child.is_dir()
+                    and re.fullmatch(r"step_\d+", child.name)
+                    and int(child.name.removeprefix("step_")) < latest_step
+                ),
+                key=lambda path: int(path.name.removeprefix("step_")),
+                reverse=True,
+            )
+        )
+    for candidate in candidates:
+        state = (
+            latest_state
+            if candidate == Path(latest_path)
+            else _get_grpo_save_state(
+                cast(
+                    Optional[dict[str, Any]],
+                    checkpointer.load_training_info(str(candidate)),
+                )
+            )
+        )
+        snapshot = resolve_latest_snapshot(
+            candidate,
+            expected_train_step=state.current_step,
+            expected_trainer_version=(
+                state.trainer_version
+                if state.trainer_version is not None
+                else state.current_step
+            ),
+            expected_bootstrap_fingerprint=None,
+        )
+        if snapshot is not None:
+            if candidate != Path(latest_path):
+                print(
+                    "📦 Rollout restore fallback: rolling back trainer and rollout "
+                    f"state together from {latest_path} to {candidate}; "
+                    f"selected snapshot {snapshot.path}. Optimizer steps after "
+                    f"step {state.current_step} may be repeated. "
+                    "Existing checkpoints were not modified.",
+                    flush=True,
+                )
+            return str(candidate), state, snapshot
+    return latest_path, latest_state, None
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1398,12 +1475,13 @@ def setup_single_controller(
     # Checkpointing
     # ==========================
     checkpointer = CheckpointManager(master_config.checkpointing)
-    trainer_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    loaded_state = cast(
-        Optional[dict[str, Any]],
-        checkpointer.load_training_info(trainer_checkpoint_path),
+    snapshot_resolution_started = time.monotonic()
+    trainer_checkpoint_path, save_state, resolved_snapshot = (
+        _select_trainer_restore_checkpoint(
+            checkpointer,
+            rollout_checkpoint_config=rollout_checkpoint_cfg,
+        )
     )
-    save_state = _get_grpo_save_state(loaded_state)
     weights_path, optimizer_path = checkpointer.get_resume_paths(
         trainer_checkpoint_path
     )
@@ -1443,25 +1521,7 @@ def setup_single_controller(
     bootstrap_digest = (
         bootstrap_identity.fingerprint() if bootstrap_identity is not None else None
     )
-    resolved_snapshot = None
-    restored_trainer_version = (
-        save_state.trainer_version
-        if save_state.trainer_version is not None
-        else save_state.current_step
-    )
-    snapshot_resolution_started = time.monotonic()
-    if (
-        trainer_checkpoint_path is not None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-        and restore_mode == "latest"
-    ):
-        resolved_snapshot = resolve_latest_snapshot(
-            Path(trainer_checkpoint_path),
-            expected_train_step=save_state.current_step,
-            expected_trainer_version=restored_trainer_version,
-            expected_bootstrap_fingerprint=None,
-        )
-    elif trainer_checkpoint_path is None:
+    if trainer_checkpoint_path is None:
         if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
             assert bootstrap_digest is not None
             assert bootstrap_identity is not None
