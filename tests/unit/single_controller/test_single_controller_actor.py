@@ -4345,3 +4345,13 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert not any(name.startswith("finalize/effort/") for name in metrics)
     assert ctrl._finalizer_metrics_by_group == {}
     assert ctrl._finalizer_rewards_by_group == {}
+
+
+def test_advantage_stage_reads_the_dump_dir_from_the_logger_config(tmp_path) -> None:
+    # LoggerConfig is a BaseModel; reading it like a dict raised TypeError at
+    # controller startup on every log_full_train_data run.
+    cfg = _grpo_master_config(tmp_path)
+    cfg.logger = cfg.logger.model_copy(update={"log_dir": str(tmp_path)})
+    cfg.async_rl.log_full_train_data = True
+    stage_cfg = AdvantageStageConfig.from_master_config(cfg)
+    assert stage_cfg.train_data_dump_dir == str(tmp_path)
