@@ -16,6 +16,7 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel
 
+from nemo_rl.models.generation import disagg_layout
 from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
@@ -121,107 +122,64 @@ class TrtllmConfig(GenerationConfig):
     trtllm_kwargs: NotRequired[dict[str, Any]]
 
 
+# The role-override machinery is shared with the vLLM backend
+# (nemo_rl/models/generation/disagg_layout.py); these wrappers bind it to the
+# TRT-LLM block names so existing callers and tests keep their entry points.
+_TRTLLM_ENGINE_ARG_KEYS = frozenset(
+    TrtllmEngineArgs.__required_keys__ | TrtllmEngineArgs.__optional_keys__
+)
+_TRTLLM_NON_ENGINE_KEYS = frozenset(
+    {"prefill_engine", "decode_engine", "disagg_server"}
+)
+
+
 def _as_dict(raw: Any) -> dict[str, Any]:
-    if raw is None:
-        return {}
-    if isinstance(raw, BaseModel):
-        return raw.model_dump(exclude_unset=True)
-    return dict(raw)
+    return disagg_layout.as_dict(raw)
 
 
 def resolve_disagg_layout(config: TrtllmConfig) -> DisaggConfig:
-    """``generation.disaggregation`` as its schema.
-
-    Absent is the same as present-and-disabled: every field carries its default
-    on :class:`DisaggConfig`, so callers read attributes unconditionally
-    instead of re-deriving a default per key at the call site.
-    """
-    return DisaggConfig.model_validate(_as_dict(config.get("disaggregation")))
+    """``generation.disaggregation`` as its schema; see :func:`disagg_layout.resolve_disagg_layout`."""
+    return disagg_layout.resolve_disagg_layout(config)
 
 
 def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    """``update`` over ``base``, nested dicts merged key by key; inputs untouched."""
-    merged = dict(base)
-    for key, value in update.items():
-        if isinstance(merged.get(key), dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+    return disagg_layout.deep_merge(base, update)
 
 
 def resolve_role_overrides(config: TrtllmConfig) -> TrtllmConfig:
     """Resolve ``trtllm_cfg.{prefill,decode}_engine`` into complete engine configs.
 
-    The one place the "a role wins over the shared value" rule is applied. As
-    written, a role block names only what differs (``TrtllmEngineArgs``).
-    Afterwards each is that role's whole engine config: the shared
-    ``trtllm_cfg`` with the role's keys on top, and ``trtllm_kwargs`` deep-merged
-    over ``generation.trtllm_kwargs``, so a role's nested block (say
-    ``kv_cache_config: {max_tokens: N}``) adds to the shared one instead of
-    replacing it. Everything downstream reads the resolved block and merges
-    nothing itself.
-
-    A role key outside ``TrtllmEngineArgs`` is rejected: the rest of
-    ``trtllm_cfg`` describes the model or the engine's contract with the rest of
-    the system, so a role differing on one would not serve the same policy as
-    its replica-mate. Silently dropping a knob someone wrote down would be
-    worse than refusing to start.
-
-    Returns ``config`` unchanged without disaggregation, where the role blocks
-    are inert. Idempotent: a resolved block only repeats the shared values
-    outside ``TrtllmEngineArgs``, and those pass the check.
+    See :func:`disagg_layout.resolve_role_overrides` for the rule. A role may
+    only name the :class:`TrtllmEngineArgs` keys; ``trtllm_kwargs`` is
+    deep-merged over ``generation.trtllm_kwargs``. Returns ``config`` itself
+    without disaggregation, where the role blocks are inert.
     """
-    if not resolve_disagg_layout(config).enabled:
-        return config
-
-    # A plain dict here: the role blocks are addressed by computed key.
-    trtllm_cfg = cast(dict[str, Any], config["trtllm_cfg"])
-    shared = {
-        k: v
-        for k, v in trtllm_cfg.items()
-        if k not in ("prefill_engine", "decode_engine", "disagg_server")
-    }
-    allowed = TrtllmEngineArgs.__required_keys__ | TrtllmEngineArgs.__optional_keys__
-    resolved = dict(trtllm_cfg)
-    for role in ("prefill", "decode"):
-        overrides = dict(trtllm_cfg.get(f"{role}_engine") or {})
-        unsupported = sorted(
-            k for k in set(overrides) - allowed if overrides[k] != shared.get(k)
-        )
-        if unsupported:
-            raise ValueError(
-                f"trtllm_cfg.{role}_engine may only override {sorted(allowed)}, "
-                f"got {unsupported}. Settings shared by every engine of the "
-                f"replica belong on trtllm_cfg itself, and engine kwargs shared "
-                f"by both roles on generation.trtllm_kwargs."
-            )
-        resolved[f"{role}_engine"] = {
-            **shared,
-            **overrides,
-            "trtllm_kwargs": _deep_merge(
-                dict(config.get("trtllm_kwargs") or {}),
-                dict(overrides.get("trtllm_kwargs") or {}),
-            ),
-        }
-    return cast(TrtllmConfig, {**config, "trtllm_cfg": resolved})
+    return cast(
+        TrtllmConfig,
+        disagg_layout.resolve_role_overrides(
+            config,
+            backend_cfg_key="trtllm_cfg",
+            allowed_keys=_TRTLLM_ENGINE_ARG_KEYS,
+            excluded_keys=_TRTLLM_NON_ENGINE_KEYS,
+            kwargs_key="trtllm_kwargs",
+        ),
+    )
 
 
 def role_engine_config(
     config: TrtllmConfig, role: Literal["prefill", "decode"]
 ) -> dict[str, Any]:
-    """The whole engine config of ``role``. ``config`` must be role-resolved.
-
-    See :func:`resolve_role_overrides`.
-    """
-    return cast(dict[str, Any], config["trtllm_cfg"])[f"{role}_engine"]
+    """The whole engine config of ``role``. ``config`` must be role-resolved."""
+    return disagg_layout.role_engine_config(config, role, backend_cfg_key="trtllm_cfg")
 
 
 def role_tensor_parallel_size(
     config: TrtllmConfig, role: Literal["prefill", "decode"]
 ) -> int:
     """TP of one engine of ``role``. ``config`` must be role-resolved."""
-    return int(role_engine_config(config, role)["tensor_parallel_size"])
+    return disagg_layout.role_tensor_parallel_size(
+        config, role, backend_cfg_key="trtllm_cfg"
+    )
 
 
 def replica_width(config: TrtllmConfig) -> int:
@@ -232,12 +190,7 @@ def replica_width(config: TrtllmConfig) -> int:
     decode engines -- the unit that must stay inside one NVLink domain, since
     the KV cache crosses from prefill to decode on every turn.
     """
-    layout = resolve_disagg_layout(config)
-    if not layout.enabled:
-        return int(config["trtllm_cfg"]["tensor_parallel_size"])
-    return layout.num_prefill_engines * role_tensor_parallel_size(
-        config, "prefill"
-    ) + layout.num_decode_engines * role_tensor_parallel_size(config, "decode")
+    return disagg_layout.replica_width(config, backend_cfg_key="trtllm_cfg")
 
 
 def resolve_disagg_server_config(config: TrtllmConfig) -> TrtllmDisaggServerConfig:

@@ -24,6 +24,8 @@ from nemo_rl.models.generation.trtllm.config import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
+    resolve_vllm_role_overrides,
+    validate_vllm_disaggregation,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     validate_nvfp4_pertoken_generation,
     validate_vllm_quantization_config,
@@ -177,6 +179,13 @@ def configure_generation_config(
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        # PD disaggregation: resolve the per-role engine blocks once, here, so
+        # everything downstream reads complete engine configs; a no-op (the
+        # same object) without disaggregation. The architecture-dependent
+        # check (hybrid SSM needs equal TP) runs in VllmGeneration, which
+        # loads the HF config.
+        config = resolve_vllm_role_overrides(config)
+        validate_vllm_disaggregation(config)
         validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
         if config.get("real_quant"):

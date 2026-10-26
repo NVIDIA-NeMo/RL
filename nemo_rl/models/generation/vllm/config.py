@@ -25,9 +25,15 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.models.generation import disagg_layout
 from nemo_rl.models.generation.interfaces import (
+    DisaggConfig,
     GenerationConfig,
     get_num_routed_experts,
+)
+from nemo_rl.models.generation.vllm.kv_connector_profiles import (
+    ConnectorProfile,
+    connector_profile,
 )
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
@@ -51,6 +57,130 @@ class VllmVideoConfig(BaseModel):
     sampling_style: Literal["nemotron_vl"]
     num_frames: PositiveInt
     temporal_patch_size: PositiveInt
+
+
+class VllmEngineArgs(BaseModel, extra="forbid"):
+    """One role's engine overrides: ``vllm_cfg.{prefill,decode}_engine``.
+
+    Deliberately narrow: everything else in ``vllm_cfg`` describes the model or
+    the engine's contract with the rest of the system, and two engines of one
+    replica differing on those would not serve one coherent policy. All
+    optional -- a role block names only what differs. ``vllm_kwargs`` is
+    deep-merged over ``generation.vllm_kwargs``, which is how prefill and
+    decode get different engine tuning (``max_num_seqs``,
+    ``max_num_batched_tokens``, ``enable_chunked_prefill``, ...).
+    """
+
+    tensor_parallel_size: int | None = None
+    gpu_memory_utilization: float | None = None
+    vllm_kwargs: dict[str, Any] | None = None
+
+
+VLLM_ENGINE_ARG_KEYS = frozenset(VllmEngineArgs.model_fields)
+# Blocks of vllm_cfg that are *about* the replica's engines, never settings of
+# one engine, so they never flow into a resolved role config.
+VLLM_NON_ENGINE_KEYS = frozenset(
+    {"prefill_engine", "decode_engine", "disagg_frontend", "kv_transfer"}
+)
+
+
+class VllmKvConnectorExtraConfig(BaseModel, extra="allow"):
+    """``kv_connector_extra_config`` with the NixlConnector keys typed.
+
+    Passed through to vLLM, so unknown keys are allowed (``model_extra``) for
+    other connectors; the typed ones get centralized documentation. Only the
+    keys a recipe sets are forwarded (``exclude_none``), so vLLM's own defaults
+    stay in force for the rest.
+    """
+
+    # NIXL transport plugins, e.g. ["UCX"] or ["UCX", "GDS"].
+    backends: list[str] | None = None
+    # Seconds a prefill engine keeps a finished request's blocks for the decode
+    # engine to read; extended by heartbeats while the request queues there.
+    kv_lease_duration: int | None = None
+    # bidirectional_kv_xfer only: minimum tokens worth pulling back from the
+    # decode engine instead of recomputing them on the prefill engine.
+    kv_recompute_threshold: int | None = None
+    # bidirectional_kv_xfer only: seconds the decode engine pins a finished
+    # conversation's blocks for the next turn's pull. Not renewed.
+    decoder_kv_blocks_ttl: int | None = None
+    # Disable the P/D compatibility-hash check at handshake. Keep on.
+    enforce_handshake_compat: bool | None = None
+    # Written by NeMo RL from disagg_frontend.bidirectional_kv_xfer; a recipe
+    # setting it directly is rejected so the two cannot disagree.
+    bidirectional_kv_xfer: bool | None = None
+
+
+class VllmKvTransferConfig(BaseModel, extra="forbid"):
+    """``vllm_cfg.kv_transfer``: the ``KVTransferConfig`` every engine is built with.
+
+    ``kv_role`` is not a field: it follows from the engine's role (prefill ->
+    producer, decode -> consumer) and the connector profile. ``extra="forbid"``
+    because any other ``KVTransferConfig`` key would pass validation and then
+    silently do nothing.
+    """
+
+    kv_connector: str = "NixlConnector"
+    # Module path for a connector that is not built into vLLM. Such a connector
+    # also names the handshake protocol it speaks via
+    # disagg_frontend.connector_profile.
+    kv_connector_module_path: str | None = None
+    kv_connector_extra_config: VllmKvConnectorExtraConfig = Field(
+        default_factory=VllmKvConnectorExtraConfig
+    )
+    # "fail" ends a request whose KV load failed; "recompute" prefills it on the
+    # decode engine instead, which is what disaggregation exists to avoid.
+    kv_load_failure_policy: Literal["fail", "recompute"] = "fail"
+    # Where the connector stages KV. "cuda" is direct GPU-to-GPU; "cpu" is for
+    # platforms without device buffers.
+    kv_buffer_device: str = "cuda"
+
+
+class VllmDisaggFrontendConfig(BaseModel, extra="forbid"):
+    """``vllm_cfg.disagg_frontend``: what the replica's frontends do.
+
+    Not a :class:`DisaggConfig` subclass: the layout is a different thing, and
+    inheriting would let this block declare layout keys nothing here reads.
+    """
+
+    # Which prefill engine serves a turn. conversation keeps a trajectory on
+    # the engine holding its prefix; kv_cache_aware routes by the block hashes
+    # the engines publish (needs disaggregation.frontend_tokenize, since the
+    # frontend must hash the prompt's blocks itself); round_robin is stateless.
+    prefill_router: Literal["conversation", "round_robin", "kv_cache_aware"] = (
+        "conversation"
+    )
+    # Which decode engine serves a turn. A decode engine receives KV freshly on
+    # every turn, so the stateless choices are the default; conversation keeps
+    # the turns of a trajectory on one decode engine so its own blocks from
+    # the previous turn are skipped on transfer.
+    decode_router: Literal["load_balancing", "round_robin", "conversation"] = (
+        "load_balancing"
+    )
+    # Let the prefill engine pull the previous turn's KV (the tokens the decode
+    # engine generated) back from the decode engine instead of recomputing it.
+    # The frontend then keeps per-conversation state, and the decode engine pins
+    # a finished conversation's blocks until the next turn or the TTL. Off by
+    # default: that pinning competes with new requests for the decode engine's
+    # KV pool, and the trade-off depends on the workload.
+    bidirectional_kv_xfer: bool = False
+    # bidirectional_kv_xfer: seconds the frontend remembers a conversation's
+    # decode-side blocks. Keep below the decode engine's decoder_kv_blocks_ttl
+    # so the frontend never offers blocks the engine already freed.
+    conversation_cache_ttl_s: PositiveFloat = 450.0
+    # Relay prefill->decode prompt token ids as one base64 int32 string instead
+    # of a JSON int array (the TRT-LLM gen_tokids_ctxbytes counterpart).
+    decode_tokids_b64: bool = False
+    # Send only the last message on the decode leg; the relayed token ids carry
+    # the whole prefix (the TRT-LLM gen_strip_message_history counterpart).
+    decode_strip_message_history: bool = False
+    # Per-leg HTTP timeout. A turn can prefill tens of thousands of tokens and
+    # decode for minutes behind other requests.
+    request_timeout_s: PositiveInt = 1800
+    # Conversations the conversation router remembers per frontend (LRU).
+    prefill_router_table_size: PositiveInt = 100_000
+    # Handshake protocol of a custom connector; built-in connectors need none.
+    connector_profile: str | None = None
 
 
 class VllmSpecificArgs(TypedDict):
@@ -139,6 +269,22 @@ class VllmSpecificArgs(TypedDict):
     refit_with_reload_api: NotRequired[bool]
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
+
+    # Prefill/decode disaggregation (generation.disaggregation.enabled). Read
+    # only then, inert otherwise.
+    #
+    # Per-role engine overrides: a role names only what differs from the shared
+    # values above (VllmEngineArgs); keys outside that set are rejected at
+    # startup. resolve_vllm_role_overrides replaces each with that role's
+    # complete engine config, which is all anything downstream reads.
+    prefill_engine: NotRequired[VllmEngineArgs]
+    decode_engine: NotRequired[VllmEngineArgs]
+    # How the frontends in front of a replica route and relay: the vLLM
+    # counterpart of trtllm_cfg.disagg_server.
+    disagg_frontend: NotRequired[VllmDisaggFrontendConfig]
+    # The KV connector every engine of a replica is built with: the vLLM
+    # counterpart of trtllm_kwargs.cache_transceiver_config.
+    kv_transfer: NotRequired[VllmKvTransferConfig]
 
 
 def vllm_nemotron_h_fp32_lm_head_enabled(
@@ -571,3 +717,261 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config
+
+
+# --------------------------------------------------------------------------- #
+#  Prefill/decode disaggregation
+# --------------------------------------------------------------------------- #
+
+VllmRole = Literal["prefill", "decode"]
+
+
+def resolve_vllm_disagg_layout(config: VllmConfig) -> DisaggConfig:
+    """``generation.disaggregation`` as its schema (absent == disabled)."""
+    return disagg_layout.resolve_disagg_layout(config)
+
+
+def resolve_vllm_role_overrides(config: VllmConfig) -> VllmConfig:
+    """Resolve ``vllm_cfg.{prefill,decode}_engine`` into complete engine configs.
+
+    See :func:`disagg_layout.resolve_role_overrides`. A role may only name the
+    :class:`VllmEngineArgs` keys; its ``vllm_kwargs`` is deep-merged over
+    ``generation.vllm_kwargs``. Returns ``config`` itself without
+    disaggregation, where the role blocks are inert.
+    """
+    return cast(
+        VllmConfig,
+        disagg_layout.resolve_role_overrides(
+            config,
+            backend_cfg_key="vllm_cfg",
+            allowed_keys=VLLM_ENGINE_ARG_KEYS,
+            excluded_keys=VLLM_NON_ENGINE_KEYS,
+            kwargs_key="vllm_kwargs",
+        ),
+    )
+
+
+def vllm_role_engine_config(config: VllmConfig, role: VllmRole) -> dict[str, Any]:
+    """The whole engine config of ``role``. ``config`` must be role-resolved."""
+    return disagg_layout.role_engine_config(config, role, backend_cfg_key="vllm_cfg")
+
+
+def vllm_replica_width(config: VllmConfig) -> int:
+    """GPUs one rollout replica spans (one engine's TP x PP without disaggregation)."""
+    return disagg_layout.replica_width(config, backend_cfg_key="vllm_cfg")
+
+
+def resolve_vllm_disagg_frontend_config(config: VllmConfig) -> VllmDisaggFrontendConfig:
+    """``vllm_cfg.disagg_frontend`` as its schema."""
+    raw = disagg_layout.as_dict(config["vllm_cfg"].get("disagg_frontend"))
+    # Caught ahead of extra="forbid" only to point at where the key belongs.
+    misplaced = sorted(set(raw) & set(DisaggConfig.model_fields))
+    if misplaced:
+        raise ValueError(
+            f"{misplaced} set in vllm_cfg.disagg_frontend, which only carries the "
+            "frontends' routing and relay settings. The disaggregation layout "
+            "belongs in generation.disaggregation."
+        )
+    return VllmDisaggFrontendConfig.model_validate(raw)
+
+
+def resolve_vllm_kv_transfer_config(config: VllmConfig) -> VllmKvTransferConfig:
+    """``vllm_cfg.kv_transfer`` as its schema."""
+    raw = disagg_layout.as_dict(config["vllm_cfg"].get("kv_transfer"))
+    resolved = VllmKvTransferConfig.model_validate(raw)
+    if resolved.kv_connector_extra_config.bidirectional_kv_xfer is not None:
+        raise ValueError(
+            "vllm_cfg.kv_transfer.kv_connector_extra_config.bidirectional_kv_xfer "
+            "is written by NeMo RL from vllm_cfg.disagg_frontend.bidirectional_kv_xfer; "
+            "set that instead so the frontend and the engines cannot disagree."
+        )
+    return resolved
+
+
+def resolve_vllm_connector_profile(config: VllmConfig) -> ConnectorProfile:
+    """The handshake profile of the configured KV connector."""
+    return connector_profile(
+        resolve_vllm_kv_transfer_config(config).kv_connector,
+        resolve_vllm_disagg_frontend_config(config).connector_profile,
+    )
+
+
+def vllm_kv_transfer_config_for_role(
+    config: VllmConfig, role: VllmRole, *, engine_id: str
+) -> dict[str, Any]:
+    """The ``KVTransferConfig`` kwargs of one engine of ``role``.
+
+    ``kv_role`` comes from the connector profile; ``bidirectional_kv_xfer`` is
+    copied from the frontend block onto both roles' extra config, which is
+    where vLLM reads it.
+    """
+    kv_transfer = resolve_vllm_kv_transfer_config(config)
+    frontend = resolve_vllm_disagg_frontend_config(config)
+    profile = connector_profile(kv_transfer.kv_connector, frontend.connector_profile)
+    extra = kv_transfer.kv_connector_extra_config.model_dump(exclude_none=True)
+    if frontend.bidirectional_kv_xfer:
+        extra["bidirectional_kv_xfer"] = True
+    kwargs: dict[str, Any] = {
+        "kv_connector": kv_transfer.kv_connector,
+        "kv_role": profile.producer_role
+        if role == "prefill"
+        else profile.consumer_role,
+        "engine_id": engine_id,
+        "kv_connector_extra_config": extra,
+        "kv_load_failure_policy": kv_transfer.kv_load_failure_policy,
+        "kv_buffer_device": kv_transfer.kv_buffer_device,
+    }
+    if kv_transfer.kv_connector_module_path is not None:
+        kwargs["kv_connector_module_path"] = kv_transfer.kv_connector_module_path
+    return kwargs
+
+
+def validate_vllm_disaggregation_for_refit(
+    config: VllmConfig, *, in_flight_weight_updates: bool
+) -> None:
+    """Reject disaggregation settings that cannot survive an in-flight refit.
+
+    An in-flight weight update pauses every engine with vLLM's "keep" mode,
+    which completes only once the engine is idle -- and a finished request
+    whose blocks the KV connector still holds counts as work. Under
+    ``bidirectional_kv_xfer`` every decode engine pins each finished turn's
+    blocks for ``decoder_kv_blocks_ttl`` (vLLM default 480 s) so the next
+    turn's prefill can pull them back, and vLLM offers no call to release them
+    early, so the pause would block for up to that TTL on every update.
+    """
+    if not in_flight_weight_updates:
+        return
+    layout = resolve_vllm_disagg_layout(config)
+    if not layout.enabled:
+        return
+    frontend = resolve_vllm_disagg_frontend_config(config)
+    if frontend.bidirectional_kv_xfer:
+        raise ValueError(
+            "policy.generation.vllm_cfg.disagg_frontend.bidirectional_kv_xfer=true "
+            "cannot be combined with grpo.async_grpo.in_flight_weight_updates=true: "
+            "vLLM completes the in-flight pause only once an engine holds no "
+            "connector-pinned blocks, and bidirectional KV transfer pins every "
+            "finished turn's blocks on the decode engines for decoder_kv_blocks_ttl. "
+            "Turn one of the two off."
+        )
+
+
+# Model types whose Mamba/SSM layers vLLM's NixlConnector can hand over only
+# between engines of equal TP (the recurrent state has no head-splitting
+# remap yet). Checked by name and by the HF config attributes hybrid models
+# carry, so a new hybrid model is caught even if its name is not listed.
+_HYBRID_SSM_MODEL_TYPES = frozenset(
+    {
+        "nemotron_h",
+        "nemotron_h_omni",
+        "mamba",
+        "mamba2",
+        "jamba",
+        "bamba",
+        "zamba2",
+        "falcon_h1",
+        "granitemoehybrid",
+        "qwen3_next",
+        "lfm2",
+        "plamo2",
+    }
+)
+_HYBRID_SSM_CONFIG_ATTRS = (
+    "hybrid_override_pattern",
+    "layers_block_type",
+    "mamba_d_state",
+)
+
+
+def hybrid_ssm_requires_homogeneous_tp(hf_config: Any) -> bool:
+    """Whether ``hf_config`` describes a model with Mamba/SSM layers."""
+    text_config = getattr(hf_config, "text_config", None) or hf_config
+    model_type = str(getattr(text_config, "model_type", "") or "").lower()
+    if model_type in _HYBRID_SSM_MODEL_TYPES:
+        return True
+    return any(
+        getattr(text_config, attr, None) is not None
+        for attr in _HYBRID_SSM_CONFIG_ATTRS
+    )
+
+
+def validate_vllm_disaggregation(
+    config: VllmConfig, *, hf_config: Any | None = None
+) -> None:
+    """Refuse at setup the disaggregation configs that would run wrong or hang.
+
+    ``config`` must be role-resolved. ``hf_config`` enables the hybrid-SSM TP
+    check when the caller has it; the driver passes it, pure-config callers
+    may not.
+    """
+    layout = resolve_vllm_disagg_layout(config)
+    if not layout.enabled:
+        return
+    vllm_cfg = cast(dict[str, Any], config["vllm_cfg"])
+
+    if config["colocated"]["enabled"]:
+        raise ValueError(
+            "PD disaggregation requires non-colocated generation: colocated mode "
+            "sleeps the engines between rollouts, which drops the KV cache the "
+            "connector hands between prefill and decode. Set colocated.enabled=false "
+            "or generation.disaggregation.enabled=false."
+        )
+    if not vllm_cfg.get("async_engine") or not vllm_cfg.get("expose_http_server"):
+        raise ValueError(
+            "PD disaggregation needs vllm_cfg.async_engine=true and "
+            "vllm_cfg.expose_http_server=true: the frontends reach every engine "
+            "over HTTP. The NeMo-Gym entrypoint sets both."
+        )
+    if int(vllm_cfg["pipeline_parallel_size"]) != 1:
+        raise ValueError(
+            "PD disaggregation on the vLLM backend supports pipeline_parallel_size=1 "
+            f"only, got {vllm_cfg['pipeline_parallel_size']}."
+        )
+    if config.get("refit_transport") is not None:
+        raise ValueError(
+            "PD disaggregation is validated with the default collective refit only; "
+            f"set generation.refit_transport=null (got {config['refit_transport']!r})."
+        )
+    for role in disagg_layout.ROLES:
+        engine_cfg = vllm_role_engine_config(config, role)
+        tp = int(engine_cfg["tensor_parallel_size"])
+        ep = int(engine_cfg["expert_parallel_size"])
+        if ep > tp:
+            raise ValueError(
+                f"vllm_cfg.{role}_engine: expert_parallel_size ({ep}) exceeds its "
+                f"tensor_parallel_size ({tp}). EP > TP means data parallelism inside "
+                "one vLLM engine, which the async (HTTP) path, and so PD "
+                "disaggregation, does not support."
+            )
+        if "kv_transfer_config" in (engine_cfg.get("vllm_kwargs") or {}):
+            raise ValueError(
+                "vllm_kwargs.kv_transfer_config is owned by NeMo RL under PD "
+                "disaggregation (built from vllm_cfg.kv_transfer and the engine's "
+                "role); remove it from generation.vllm_kwargs and from "
+                f"vllm_cfg.{role}_engine.vllm_kwargs."
+            )
+    frontend = resolve_vllm_disagg_frontend_config(config)
+    profile = resolve_vllm_connector_profile(config)
+    if frontend.bidirectional_kv_xfer and not profile.supports_bidirectional:
+        raise ValueError(
+            f"vllm_cfg.disagg_frontend.bidirectional_kv_xfer is not supported by "
+            f"the {profile.name} connector profile."
+        )
+    if frontend.prefill_router == "kv_cache_aware" and not layout.frontend_tokenize:
+        raise ValueError(
+            "vllm_cfg.disagg_frontend.prefill_router=kv_cache_aware needs "
+            "generation.disaggregation.frontend_tokenize=true: the frontend hashes "
+            "the prompt's blocks itself to match them against the engines' events."
+        )
+    if hf_config is not None and hybrid_ssm_requires_homogeneous_tp(hf_config):
+        tps = {
+            role: int(vllm_role_engine_config(config, role)["tensor_parallel_size"])
+            for role in disagg_layout.ROLES
+        }
+        if tps["prefill"] != tps["decode"]:
+            raise ValueError(
+                "This model has Mamba/SSM layers, whose recurrent state vLLM's KV "
+                "connector can only hand over between engines of equal tensor "
+                f"parallelism; got prefill TP {tps['prefill']} and decode TP "
+                f"{tps['decode']}. Give both roles the same tensor_parallel_size."
+            )

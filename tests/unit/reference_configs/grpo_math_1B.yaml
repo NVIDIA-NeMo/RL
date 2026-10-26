@@ -514,6 +514,20 @@ policy:
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
+      prefill_engine:
+        tensor_parallel_size: ${..tensor_parallel_size}
+      decode_engine:
+        tensor_parallel_size: ${..tensor_parallel_size}
+      disagg_frontend:
+        prefill_router: conversation
+        decode_router: load_balancing
+        bidirectional_kv_xfer: false
+        decode_tokids_b64: false
+        decode_strip_message_history: false
+      kv_transfer:
+        kv_connector: NixlConnector
+        kv_connector_extra_config: {}
+        kv_load_failure_policy: fail
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
