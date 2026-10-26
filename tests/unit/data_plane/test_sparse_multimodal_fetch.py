@@ -17,6 +17,8 @@ from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_col
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
 def _write_rows(client, token_field="media_token_validity_mask", dense_tokens=True):
@@ -161,3 +163,77 @@ def test_dense_media_masks_preserve_text_row_values(tq_client, reader):
         assert torch.equal(result["media_token_validity_mask"][:, :5], expected)
     finally:
         tq_client.clear_samples(None, meta.partition_id)
+
+
+@pytest.mark.parametrize("reader", ["driver", "worker"])
+@pytest.mark.parametrize("dense_producer", [False, True])
+def test_prompt_group_producer_contract(tq_client, reader, dense_producer):
+    """Real producer writes: the old sparse contract fails; the fixed one reads."""
+    partition = f"producer-media-{uuid4().hex}"
+    metas = []
+    token_fields = ("media_token_validity_mask", "mm_token_type_ids")
+    for has_media in (False, True):
+        prompt = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([10, 11]),
+        }
+        if has_media:
+            prompt.update(
+                pixel_values=PackedTensor(torch.ones(1, 4), dim_to_pack=0),
+                media_token_validity_mask=torch.tensor([True, False]),
+                mm_token_type_ids=torch.tensor([2, 0]),
+            )
+        completion = Completion(
+            message_log=[
+                prompt,
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([12]),
+                    "generation_logprobs": torch.tensor([-0.1]),
+                },
+            ],
+            reward=0.0,
+            truncated=False,
+            env_extras=None,
+        )
+        record = PromptGroupRecord(
+            prompt_idx=int(has_media),
+            prompt=[prompt],
+            extra_env_info=None,
+            metadata={},
+            completions=[completion],
+            rollout_metrics={},
+        )
+        batch = record_to_train_batch(
+            record,
+            pad_value_dict={"token_ids": 0, "input_ids": 0},
+            include_message_violation_fields=False,
+            per_token_multimodal_fields=token_fields if dense_producer else (),
+        )
+        ids, fields, tags = pack_payload(
+            batch,
+            weight_version=0,
+            group_id=f"group-{int(has_media)}",
+            prompt_idx=record.prompt_idx,
+        )
+        meta = tq_client.put_samples(ids, partition, fields, tags=tags)
+        meta.sequence_lengths = [3]
+        metas.append(meta)
+    meta = metas[0].concat(metas[1])
+    try:
+        if not dense_producer:
+            with pytest.raises(KeyError, match="media_token_validity_mask"):
+                _read(tq_client, meta, reader)
+        else:
+            for indices in ([0, 1], [1, 0, 1], [0]):
+                result = _read(tq_client, meta.subset(indices), reader)
+                assert result["media_token_validity_mask"].tolist() == [
+                    [bool(i), False, False] for i in indices
+                ]
+                assert result["mm_token_type_ids"].tolist() == [
+                    [2 * i, 0, 0] for i in indices
+                ]
+    finally:
+        tq_client.clear_samples(None, partition)

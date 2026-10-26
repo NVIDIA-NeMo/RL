@@ -104,6 +104,7 @@ def fetch_columns(
     Raises:
         ValueError: Fields are unspecified, or sparse media wire data is not
             nested.
+        KeyError: A requested field is missing from one of its selected rows.
     """
     if select_fields is None:
         raise ValueError("fetch_columns requires explicit select_fields")
@@ -168,8 +169,8 @@ def read_columns(
         ``BatchedDataDict`` with the requested fields, materialized.
 
     Raises:
-        ValueError: A required field is missing or sparse media wire data or
-            metadata is invalid (see :func:`fetch_columns`).
+        ValueError: Sparse media wire data or metadata is invalid.
+        KeyError: A requested field is missing from one of its selected rows.
     """
     td = fetch_columns(dp_client, meta, select_fields)
     pad_to_seqlen = int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
