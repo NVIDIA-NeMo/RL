@@ -529,6 +529,30 @@ def test_setup_router_replay_requires_megatron_student():
     assert mock_cluster.call_count == 0
 
 
+def test_setup_router_replay_with_megatron_cp_requires_packing():
+    cfg = _make_master_config()
+    cfg.policy["automodel_cfg"]["enabled"] = False
+    cfg.policy["megatron_cfg"] = _megatron_cfg(cp=2)
+    cfg.policy["sequence_packing"] = {"enabled": False}
+    cfg.policy["router_replay"] = {"enabled": True}
+    with (
+        patch.object(csd_mod, "RayVirtualCluster") as mock_cluster,
+        pytest.raises(ValueError, match="requires policy.sequence_packing.enabled"),
+    ):
+        setup(
+            cfg,
+            student_tokenizer=_make_tokenizer(32),
+            teacher_tokenizers=[_make_tokenizer(24)],
+            train_dataset=MagicMock(),
+            val_dataset=None,
+        )
+    assert mock_cluster.call_count == 0
+
+    # With packing on, the router-replay check passes.
+    cfg.policy["sequence_packing"] = {"enabled": True}
+    csd_mod.validate_csd_router_replay_setup(cfg)
+
+
 def _automodel_cfg(*, enabled=True, tp=1, cp=1):
     return {
         "enabled": enabled,
