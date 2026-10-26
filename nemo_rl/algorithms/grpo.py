@@ -143,10 +143,12 @@ from nemo_rl.models.generation.trtllm.config import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
+    vllm_replica_width,
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    validate_vllm_disaggregation_for_refit,
 )
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -715,6 +717,12 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
+        validate_vllm_disaggregation_for_refit(
+            cast(VllmConfig, generation_config),
+            in_flight_weight_updates=bool(
+                grpo_config.async_grpo.in_flight_weight_updates
+            ),
+        )
     elif generation_config["backend"] == "dynamo":
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services.
@@ -731,16 +739,15 @@ def setup(
         policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM backend implements it today: every other backend would
+    # the TRT-LLM and vLLM backends implement it: every other backend would
     # silently ignore the block and serve aggregated, so refuse to start.
-    if (
-        resolve_disagg_layout(generation_config).enabled
-        and generation_config["backend"] != "trtllm"
-    ):
+    if resolve_disagg_layout(generation_config).enabled and generation_config[
+        "backend"
+    ] not in ("trtllm", "vllm"):
         raise ValueError(
             "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm', got '{generation_config['backend']}'. Set it to "
-            "false, or switch the backend."
+            f"backend='trtllm' or 'vllm', got '{generation_config['backend']}'. "
+            "Set it to false, or switch the backend."
         )
     # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
     # the whole fleet would come up and fail at the first rollout instead.
@@ -1265,9 +1272,10 @@ def setup(
                         policy_config
                     )
                 elif generation_config["backend"] == "vllm":
-                    vllm_cfg = generation_config.get("vllm_cfg", {})
-                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
-                        "pipeline_parallel_size", 1
+                    # Under PD disaggregation the unit to keep inside one NVLink
+                    # domain is the whole replica, not one engine.
+                    gpus_per_instance = vllm_replica_width(
+                        cast(VllmConfig, generation_config)
                     )
                 elif generation_config["backend"] == "trtllm":
                     # Under PD disaggregation the unit to keep inside one NVLink

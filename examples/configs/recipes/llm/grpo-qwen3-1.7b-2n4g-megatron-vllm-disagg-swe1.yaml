@@ -1,0 +1,112 @@
+# Nightly coverage for vLLM prefill/decode disaggregation behind NeMo-Gym.
+
+# The vLLM sibling of grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1: same
+# SWE pivot single-step tool-use environment (Stage 2.1), same resource layout,
+# so the two backends' disaggregation paths are compared like for like. No
+# Apptainer, no per-instance SIFs, so it runs on ordinary CI nodes.
+#
+# Resource layout (2 nodes x 4 GPUs):
+#   - node 0: policy training, Megatron CP4 (Qwen3-1.7B is dense and tiny)
+#   - node 1: one disagg replica -- 1 prefill engine (TP2) + 1 decode engine
+#     (TP2) fronted by 2 frontends. Replica width 2*2 = 4 GPUs, so the 4
+#     rollout GPUs hold exactly one replica.
+#
+# Data: nvidia/Nemotron-RL-Super-Training-Blends (swe1 split), the same split
+# the sibling grpo-qwen3-1.7b-1n8g-megatron-super-swe1 reads.
+
+defaults: grpo-qwen3-1.7b-1n8g-megatron-super-swe1.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1
+
+grpo:
+  async_grpo:
+    # The sibling runs synchronously; async is what exercises refit against
+    # live disaggregated engines.
+    enabled: true
+    in_flight_weight_updates: true
+    # In-flight requests keep their KV across a weight update, as on the
+    # TRT-LLM disaggregation path; every engine and every frontend drops its
+    # reusable caches after each update instead
+    # (VllmGeneration.resume_generation_after_refit), so the next turn of a
+    # conversation re-prefills under the new weights.
+    recompute_kv_cache_after_weight_updates: false
+
+policy:
+  megatron_cfg:
+    # 4 training GPUs, down from the sibling's 8.
+    context_parallel_size: 4
+
+  generation:
+    backend: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      # Two frontends, so the per-replica sharding of Gym's sticky
+      # sha256(session_id) client selection is exercised rather than
+      # collapsing to the single-frontend path.
+      num_frontend_workers: 2
+      # Below 9000, in virtual_cluster's disagg frontend band.
+      frontend_base_port: 8300
+      # Render and splice on the frontends; the prefill engines shadow-check a
+      # sample of the supplied ids (NRL_VLLM_TOKENIZE_SHADOW_RATE below).
+      frontend_tokenize: true
+    vllm_cfg:
+      # Per-role widths are identical here, so the top-level TP is also the
+      # per-engine width; no prefill_engine / decode_engine overrides needed.
+      tensor_parallel_size: 2
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.7
+      async_engine: true
+      # Every engine needs an address for the frontend to reach it.
+      expose_http_server: true
+      disagg_frontend:
+        prefill_router: conversation
+        decode_router: load_balancing
+        bidirectional_kv_xfer: false
+        # On here: these two (plus disaggregation.frontend_tokenize) are the
+        # disaggregation-specific paths most likely to perturb token-level
+        # agreement between the sampler and the trainer, which is exactly what
+        # the token_mult_prob_error gate in the driver measures.
+        decode_tokids_b64: true
+        decode_strip_message_history: true
+      kv_transfer:
+        kv_connector: NixlConnector
+        kv_connector_extra_config:
+          backends: [UCX]
+          # vLLM's 30 s default lease is renewed by heartbeats while the decode
+          # leg queues, so it is left alone: a finished prefill whose decode leg
+          # never arrives (a failed relay) holds its blocks -- and keeps the
+          # engine from completing an in-flight-refit pause -- for one lease.
+        kv_load_failure_policy: fail
+      env_vars:
+        # NIXL transfers over UCX; NCCL's variables do not apply to it.
+        UCX_TLS: all
+        UCX_NET_DEVICES: all
+        # NCCL_NET_PLUGIN=none is set on the engines by VllmGeneration under
+        # disaggregation (HPC-X's NCCL plugin would load a UCX without CUDA
+        # support into the TP>1 engines; see the design doc). Override here
+        # only to put it back.
+        # Shadow-validate 10% of the frontend-rendered prompts on the prefill
+        # engines against a full engine-side render.
+        NRL_VLLM_TOKENIZE_SHADOW_RATE: "0.1"
+    vllm_kwargs:
+      mamba_cache_mode: "none"
+      # Required, not a tuning knob: this dataset's prompts run to ~37k tokens.
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 16384
+
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1
+  wandb:
+    name: grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1
+
+cluster:
+  num_nodes: 2
+  gpus_per_node: 4

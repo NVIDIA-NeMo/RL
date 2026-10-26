@@ -36,8 +36,24 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.refit_watchdog import RefitAborted
-from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_HIGH,
+    DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_LOW,
+    DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_HIGH,
+    DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+    NVLINK_DOMAIN_UNKNOWN,
+    RayVirtualCluster,
+)
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.disagg_layout import (
+    engine_key,
+    engine_owner_indices,
+    plan_engines,
+    slice_engines_on_unified_pg,
+    tile_engines_on_per_node_pgs,
+)
 from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     HealthyShardSelector,
@@ -51,7 +67,16 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    VllmDisaggFrontendConfig,
+    resolve_vllm_connector_profile,
+    resolve_vllm_kv_transfer_config,
+    resolve_vllm_disagg_frontend_config,
+    resolve_vllm_disagg_layout,
+    validate_vllm_disaggregation,
+    validate_vllm_disaggregation_for_refit,
     validate_vllm_quantization_config,
+    vllm_replica_width,
+    vllm_role_engine_config,
 )
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
@@ -84,6 +109,50 @@ if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
 logger = logging.getLogger(__name__)
+
+# Topic the prefill engines publish KV cache events on for the kv_cache_aware
+# frontend router; any non-empty string shared by publisher and subscriber.
+_KV_EVENTS_TOPIC = "nemo-rl-kv"
+
+
+def _load_hf_config_for_validation(model_name: str) -> Any:
+    """The model's HF config, for setup-time checks that depend on the architecture."""
+    # Deferred: transformers is heavy and only this check needs it here.
+    from transformers import AutoConfig
+
+    return AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+
+
+def _bundles_in_node_order(pg: PlacementGroup) -> list[int]:
+    """A unified PG's bundle indices sorted by (node id, bundle index)."""
+    pg_table = ray.util.placement_group_table(pg)
+    by_node: dict[str, list[int]] = defaultdict(list)
+    for bundle_idx, node_id in pg_table["bundles_to_node_id"].items():
+        by_node[node_id].append(bundle_idx)
+    flat: list[int] = []
+    for node_id in sorted(by_node):
+        flat.extend(sorted(by_node[node_id]))
+    return flat
+
+
+def _node_of_placement_groups(placement_groups: list[PlacementGroup]) -> dict[int, str]:
+    """Physical node behind each per-node placement group, by PG index.
+
+    Empty for a unified PG, whose single index spans several nodes; callers
+    then fall back to the PG index as the node key, which is only used to
+    number engines on a node and is harmless when every engine is wider than
+    one anyway.
+    """
+    if len(placement_groups) <= 1:
+        return {}
+    node_of_pg: dict[int, str] = {}
+    for pg_idx, pg in enumerate(placement_groups):
+        bundles_to_node = (
+            ray.util.placement_group_table(pg).get("bundles_to_node_id") or {}
+        )
+        if bundles_to_node:
+            node_of_pg[pg_idx] = next(iter(bundles_to_node.values()))
+    return node_of_pg
 
 
 def http_server_api_key_and_worker_config(
@@ -167,12 +236,43 @@ def _record_vllm_generation_metrics(
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
 
+def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
+    """Environment every disaggregated engine process gets unless the recipe says otherwise.
+
+    NIXL's wheel bundles its own CUDA-enabled UCX, but a UCX that is already
+    loaded in the process wins when NIXL's UCX plugin binds. In the NGC/HPC-X
+    based containers NCCL's network plugin (``libnccl-net.so``, found through
+    the loader cache) pulls HPC-X's UCX -- built without CUDA memory support --
+    into every TP>1 engine the moment NCCL initialises the TP group, and GPU KV
+    registration then fails with "VRAM memory is detected as host by UCX".
+    Keeping NCCL's plugin out of the engines leaves NCCL its built-in IB and
+    socket transports and lets NIXL use the UCX it ships. Only the NIXL
+    connector registering GPU memory needs this; ``vllm_cfg.env_vars`` wins.
+    """
+    if not resolve_vllm_disagg_layout(config).enabled:
+        return {}
+    kv_transfer = resolve_vllm_kv_transfer_config(config)
+    if (
+        kv_transfer.kv_connector != "NixlConnector"
+        or kv_transfer.kv_buffer_device != "cuda"
+    ):
+        return {}
+    return {"NCCL_NET_PLUGIN": "none"}
+
+
 class VllmGeneration(GenerationInterface):
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
+        async_cfg = getattr(getattr(master_config, "grpo", None), "async_grpo", None)
+        validate_vllm_disaggregation_for_refit(
+            generation_config,
+            in_flight_weight_updates=bool(
+                getattr(async_cfg, "in_flight_weight_updates", False)
+            ),
+        )
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -194,6 +294,18 @@ class VllmGeneration(GenerationInterface):
         pp = config["vllm_cfg"]["pipeline_parallel_size"]
         model_parallel_size = tp * pp
         colocated = config["colocated"]["enabled"]
+        if resolve_vllm_disagg_layout(config).enabled:
+            # GPUs held by the *widest single engine*, not a replica: this decides
+            # use_unified_pg, which exists so one tied worker group can take
+            # bundles across nodes, and the tied group is an engine. A replica
+            # is not a scheduling unit -- its engines are independent actor
+            # groups talking over HTTP and the KV connector -- so it may span
+            # nodes and is only soft-pinned for locality.
+            validate_vllm_disaggregation(config)
+            model_parallel_size = max(
+                int(vllm_role_engine_config(config, role)["tensor_parallel_size"]) * pp
+                for role in ("prefill", "decode")
+            )
 
         strategy = None if colocated else "PACK"
         needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
@@ -236,12 +348,62 @@ class VllmGeneration(GenerationInterface):
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
         self.model_parallel_size = self.tp_size * self.pp_size
 
-        assert cluster.world_size() % self.model_parallel_size == 0, (
-            "World size must be a multiple of model parallel size. "
-            f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
+        # Prefill/decode disaggregation. Validated once here rather than per
+        # access: every default lives on the schema, so the rest of this class
+        # reads attributes instead of re-deriving a default per key.
+        self._disagg_cfg = resolve_vllm_disagg_layout(config)
+        self._disagg_frontend_cfg: Optional[VllmDisaggFrontendConfig] = None
+        if self._disagg_cfg.enabled:
+            validate_vllm_disaggregation(
+                config, hf_config=_load_hf_config_for_validation(self.cfg["model_name"])
+            )
+            self._disagg_frontend_cfg = resolve_vllm_disagg_frontend_config(config)
+        # One frontend actor per (replica, frontend) and the URLs they serve;
+        # stay empty unless disaggregation is on. See _start_disagg_frontends.
+        self._disagg_actors: list[ray.actor.ActorHandle] = []
+        self._disagg_frontend_urls: list[Optional[str]] = []
+        # The driver's copy of the per-engine entries stamped into the worker
+        # config (see _config_with_engine_roles); {} without disaggregation.
+        self._stamped_engine_roles: dict[str, dict[str, Any]] = {}
+        self._engine_env_vars: dict[str, str] = {}
+        # The engine addresses the frontends were given, in engine order.
+        self._disagg_engine_addrs: list[dict[str, Any]] = []
+
+        # Per-engine role and width, in engine order -- the single source of
+        # truth for how the cluster is sliced. Without disaggregation every
+        # engine is identical; under it, each replica contributes its prefill
+        # engines followed by its decode engines.
+        if not self._disagg_cfg.enabled:
+            assert cluster.world_size() % self.model_parallel_size == 0, (
+                "World size must be a multiple of model parallel size. "
+                f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
+            )
+        self._engine_roles, self._engine_widths, self.num_replicas = plan_engines(
+            cluster.world_size(),
+            layout=self._disagg_cfg,
+            aggregated_width=self.model_parallel_size,
+            prefill_width=self._role_width("prefill"),
+            decode_width=self._role_width("decode"),
+            backend_cfg_key="vllm_cfg",
         )
-        self.dp_size = cluster.world_size() // self.model_parallel_size
+        self.num_engines = len(self._engine_widths)
+        # DP keeps its general meaning -- the number of independent rollout
+        # shards, i.e. replicas. Under disaggregation a replica is several
+        # engines, so this is deliberately *not* the engine count.
+        self.dp_size = self.num_replicas
         self.vllm_dp_size = self.ep_size // self.tp_size
+        # Global rank of each engine's model owner, in engine order -- the list
+        # every per-engine call is dispatched on (see _run_on_engines). Owners
+        # are the prefix sums of the engine widths because the worker group
+        # assigns ranks in bundle order and hands bundle_indices to each tied
+        # group's local rank 0.
+        self._engine_owner_indices = engine_owner_indices(self._engine_widths)
+        # Owner of each replica's first engine: the DP leaders the worker group
+        # would otherwise derive per engine, which is only right while a
+        # replica is a single engine.
+        self._replica_owner_indices = self._engine_owner_indices[
+            :: self.num_engines // self.num_replicas
+        ]
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -303,21 +465,38 @@ class VllmGeneration(GenerationInterface):
             # Validate registration before allocating workers or placement groups.
             get_actor_python_env(extension_fqn)
 
-        self.sharding_annotations = NamedSharding(
-            layout=np.arange(cluster.world_size()).reshape(
-                self.dp_size, self.pp_size, self.tp_size
-            ),
-            names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
-        )
+        if self._disagg_cfg.enabled:
+            # [replicas, 1, GPUs per replica]: a replica is the unit data is
+            # parallelised over -- one rollout shard, one URL -- and its GPU
+            # span tiles the cluster exactly, so the grid is rectangular by
+            # construction with no special case for asymmetric per-role TP.
+            # Nothing dispatches on the inner axes: per-engine fan-out goes
+            # through _run_on_engines, and the direct generate paths that slice
+            # by axis are rejected under disaggregation.
+            self.sharding_annotations = NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(
+                    self.num_replicas, 1, vllm_replica_width(self.cfg)
+                ),
+                names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
+            )
+        else:
+            self.sharding_annotations = NamedSharding(
+                layout=np.arange(cluster.world_size()).reshape(
+                    self.dp_size, self.pp_size, self.tp_size
+                ),
+                names=["data_parallel", "pipeline_parallel", "tensor_parallel"],
+            )
 
         # non-colocated needs to use PACK strategy to avoid uneven node_bundles
         # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
         # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
         strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
 
-        # Determine if we need cross-node model parallelism
+        # Determine if we need cross-node model parallelism: decided by the
+        # widest single engine (see init_cluster_placement_groups).
+        self.widest_engine_gpus = max(self._engine_widths)
         needs_cross_node_parallelism = (
-            self.model_parallel_size > cluster.num_gpus_per_node
+            self.widest_engine_gpus > cluster.num_gpus_per_node
         )
 
         # Initialize placement groups with the appropriate mode
@@ -343,6 +522,29 @@ class VllmGeneration(GenerationInterface):
         self.http_server_api_key, worker_config = http_server_api_key_and_worker_config(
             config
         )
+
+        # Engines differ from one another only under disaggregation, so the
+        # explicit bundle list (which fixes engine order) is only required
+        # there; a uniform run keeps the original workers_per_node path.
+        use_explicit_bundles = self.widest_engine_gpus > 1 or self._disagg_cfg.enabled
+        node_bundle_indices = (
+            self._get_tied_worker_bundle_indices(cluster)
+            if use_explicit_bundles
+            else None
+        )
+        if node_bundle_indices is not None:
+            engine_widths = [len(indices) for _, indices in node_bundle_indices]
+            assert engine_widths == self._engine_widths, (
+                f"Bundle split gives engine widths {engine_widths} but the engine "
+                f"layout expects {self._engine_widths}; every per-engine kwarg would "
+                "land on the wrong engine."
+            )
+        # Under disaggregation every worker gets the same config, so each
+        # engine's role and node-local endpoints ride along in it, keyed by the
+        # engine's bundles (see _config_with_engine_roles).
+        worker_config = self._config_with_engine_roles(
+            worker_config, node_bundle_indices, cluster
+        )
         if self.cfg["vllm_cfg"]["async_engine"]:
             worker_builder = RayWorkerBuilder(
                 worker_cls, worker_config, defer_model_load=defer_model_load
@@ -358,6 +560,8 @@ class VllmGeneration(GenerationInterface):
         # Scoped to this generation config so it does not impact other test cases.
         for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
             env_vars[str(k)] = str(v)
+        for k, v in disagg_engine_env_defaults(self.cfg).items():
+            env_vars.setdefault(k, v)
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -386,11 +590,16 @@ class VllmGeneration(GenerationInterface):
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
 
-        # Check if we need parallelism-aware worker group creation
-        if self.model_parallel_size > 1:
-            # For parallelism, create node-aware worker groups
-            node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
+        if self._kv_cache_aware_routing():
+            # The frontends hash prompts the way the engines hash prefix-cache
+            # blocks. vLLM seeds its first-block hash from PYTHONHASHSEED when
+            # set, so the engines and the frontends must agree on it.
+            env_vars["PYTHONHASHSEED"] = os.environ.get("PYTHONHASHSEED", "0")
+        self._engine_env_vars = dict(env_vars)
 
+        # Check if we need parallelism-aware worker group creation
+        if node_bundle_indices is not None:
+            # For parallelism, create node-aware worker groups
             self.worker_group = RayWorkerGroup(
                 cluster,
                 worker_builder,
@@ -398,6 +607,9 @@ class VllmGeneration(GenerationInterface):
                 bundle_indices_list=node_bundle_indices,
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars,
+                dp_leader_worker_indices=(
+                    self._replica_owner_indices if self._disagg_cfg.enabled else None
+                ),
             )
         else:
             # Use standard worker group creation for non-parallel case
@@ -432,6 +644,9 @@ class VllmGeneration(GenerationInterface):
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
             # the heavy model loading (and HTTP server start) to load_and_start().
+            # Under disaggregation the frontends come up now too, on the
+            # reserved engine addresses, so Gym can start against their URLs
+            # while the models load; they answer 503 until load_and_start().
             self.dp_openai_server_base_urls = self._collect_reserved_urls()
             self.device_uuids = None
         else:
@@ -459,6 +674,9 @@ class VllmGeneration(GenerationInterface):
 
         if not placement_groups:
             raise ValueError("No placement groups available in the cluster")
+
+        if self._disagg_cfg.enabled:
+            return self._tile_engines(cluster, placement_groups)
 
         # Total parallel sizes
         tp_size = self.sharding_annotations.get_axis_size("tensor_parallel")
@@ -617,6 +835,396 @@ class VllmGeneration(GenerationInterface):
 
         return tied_groups
 
+    # ------------------------------------------------------------------ #
+    #  PD disaggregation: layout, placement and the frontends
+    # ------------------------------------------------------------------ #
+
+    def _role_width(self, role: str) -> int:
+        """GPUs one engine of ``role`` spans; the shared width without disaggregation."""
+        if not self._disagg_cfg.enabled:
+            return self.model_parallel_size
+        engine_cfg = vllm_role_engine_config(self.cfg, role)  # type: ignore[arg-type]
+        return int(engine_cfg["tensor_parallel_size"]) * int(
+            engine_cfg["pipeline_parallel_size"]
+        )
+
+    def _kv_cache_aware_routing(self) -> bool:
+        return (
+            self._disagg_frontend_cfg is not None
+            and self._disagg_frontend_cfg.prefill_router == "kv_cache_aware"
+        )
+
+    def _tile_engines(
+        self, cluster: RayVirtualCluster, placement_groups: list[PlacementGroup]
+    ) -> list[tuple[int, list[int]]]:
+        """Bundle indices for a layout whose engines differ in width.
+
+        Consumes bundles engine by engine following ``self._engine_widths``, so
+        engines of differing width each get exactly their own number of
+        bundles, in replica order so a replica's prefill and decode engines
+        land next to each other.
+        """
+        if len(placement_groups) == 1:
+            # Unified PG: an engine is wider than a node, so model parallelism
+            # may span nodes. The cluster recorded the topology-sorted bundle
+            # order when it built the PG; fall back to node order.
+            flat = list(cluster._sorted_bundle_indices or [])
+            if not flat:
+                flat = _bundles_in_node_order(placement_groups[0])
+            return slice_engines_on_unified_pg(flat, self._engine_widths)
+        # Per-node PGs, consumed in topology order rather than creation order:
+        # Ray picks the physical node behind each PG, so consecutive pg_idx
+        # values can land in different NVLink domains, and engines are laid out
+        # replica by replica. Only the *order* changes; every PG is used once.
+        return tile_engines_on_per_node_pgs(
+            pg_bundle_counts=[pg.bundle_count for pg in placement_groups],
+            pg_order=cluster.get_topology_sorted_pg_indices(),
+            engine_widths=self._engine_widths,
+            replica_width_gpus=vllm_replica_width(self.cfg),
+        )
+
+    def _config_with_engine_roles(
+        self,
+        worker_config: VllmConfig,
+        node_bundle_indices: Optional[list[tuple[int, list[int]]]],
+        cluster: RayVirtualCluster,
+    ) -> VllmConfig:
+        """Attach each engine's role and node-local endpoints to the worker config.
+
+        ``RayWorkerBuilder`` hands every worker the same config, and a worker
+        cannot tell its role from its TP width -- both roles may share one. So
+        the driver attaches a map keyed by ``disagg_layout.engine_key`` and each
+        worker looks up its own entry (``vllm_worker._resolve_disagg_engine``).
+
+        Besides the role, the entry carries what ``configure_worker`` cannot
+        derive for a node that mixes engine widths: the engine's seed and its
+        node-local port slot (VLLM_PORT), plus the KV connector's handshake
+        port -- vLLM binds one per host by default and several engines share a
+        node here -- and, for kv_cache_aware routing, the KV-events port of
+        every prefill engine.
+        """
+        if node_bundle_indices is None or not self._disagg_cfg.enabled:
+            return worker_config
+
+        frontend = self._disagg_frontend_cfg
+        assert frontend is not None
+        profile = resolve_vllm_connector_profile(self.cfg)
+        kv_events = frontend.prefill_router == "kv_cache_aware"
+        node_of_pg = _node_of_placement_groups(cluster.get_placement_groups())
+
+        engines_per_replica = self.num_engines // self.num_replicas
+        engine_roles: dict[str, dict[str, Any]] = {}
+        role_counts: dict[str, int] = {}
+        slot_on_node: dict[str, int] = {}
+        for engine_index, ((pg_idx, bundles), role) in enumerate(
+            zip(node_bundle_indices, self._engine_roles, strict=True)
+        ):
+            # Ordinal within the role, so a layout with several engines of one
+            # role can still tell them apart (nsys report names).
+            ordinal = role_counts.get(role, 0)
+            role_counts[role] = ordinal + 1
+            replica_idx = engine_index // engines_per_replica
+            # Node-local slot: the engine's ordinal among the engines on its
+            # node, which is what every per-node port band is indexed by.
+            node = node_of_pg.get(pg_idx, f"pg{pg_idx}")
+            slot = slot_on_node.get(node, 0)
+            slot_on_node[node] = slot + 1
+            side_channel_port = DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_LOW + slot
+            assert side_channel_port < DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_HIGH, (
+                f"{slot + 1} engines on one node exceed the KV side-channel port band"
+            )
+            env: dict[str, Any] = {
+                # Deterministic VLLM_PORT per engine; configure_worker's slot
+                # arithmetic assumes equal widths and would collide here.
+                "VLLM_PORT": DEFAULT_VLLM_PORT_RANGE_LOW
+                + slot * DEFAULT_VLLM_PORTS_PER_ENGINE,
+            }
+            if profile.side_channel_port_env is not None:
+                env[profile.side_channel_port_env] = side_channel_port
+            entry: dict[str, Any] = {
+                "role": role,
+                "ordinal": ordinal,
+                "engine_index": engine_index,
+                "replica_idx": replica_idx,
+                "engine_id": f"replica{replica_idx}-{role}{ordinal}",
+                "seed": engine_index,
+                "env": env,
+                "side_channel_host_env": profile.side_channel_host_env,
+                "side_channel_port": side_channel_port,
+            }
+            if kv_events and role == "prefill":
+                port = DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_LOW + slot
+                assert port < DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_HIGH, (
+                    f"{slot + 1} engines on one node exceed the KV-events port band"
+                )
+                entry["kv_events_port"] = port
+                entry["kv_events_topic"] = _KV_EVENTS_TOPIC
+            # Every engine gets an entry: the worker treats a missing key as a
+            # driver/worker mismatch, so absence must never read as "no role".
+            engine_roles[engine_key(pg_idx, bundles)] = entry
+
+        self._stamped_engine_roles = engine_roles
+        cfg = dict(worker_config)
+        cfg["vllm_cfg"] = {**worker_config["vllm_cfg"], "_engine_roles": engine_roles}
+        return cast(VllmConfig, cfg)
+
+    def _run_on_engines(
+        self,
+        method_name: str,
+        per_engine: Optional[dict[str, list[Any]]] = None,
+        **common: Any,
+    ) -> list[ray.ObjectRef]:
+        """Fan out to each engine's model owner, one call per engine.
+
+        Dispatches by ``_engine_owner_indices``, computed once from the engine
+        layout. Neither the sharding grid's ``run_rank_0_only_axes`` gate nor
+        the worker group's DP-leader list is used: the grid cannot model engines
+        of differing width, and the DP leaders are one worker per *replica*,
+        which under disaggregation skips every engine but the replica's first.
+
+        Args:
+            per_engine: kwargs whose value is a per-engine list, in engine order.
+            **common: kwargs passed unchanged to every engine.
+        """
+        futures = []
+        for engine_idx, worker_idx in enumerate(self._engine_owner_indices):
+            kwargs = dict(common)
+            for key, values in (per_engine or {}).items():
+                kwargs[key] = values[engine_idx]
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    method_name=method_name, worker_idx=worker_idx, **kwargs
+                )
+            )
+        return futures
+
+    def _fan_out(self, method_name: str, **kwargs: Any) -> list[ray.ObjectRef]:
+        """One call per engine.
+
+        ``_run_on_engines`` under disaggregation, else the historical grid
+        dispatch to each shard's rank 0.
+        """
+        if self._disagg_cfg.enabled:
+            return self._run_on_engines(method_name, **kwargs)
+        return self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **kwargs,
+        )
+
+    def _assert_direct_dispatch_allowed(self, what: str) -> None:
+        """Reject the direct engine-dispatch paths while PD is enabled.
+
+        They send requests straight to engines, bypassing the frontends, so the
+        rollout would run without disaggregation. PD is only wired for the
+        HTTP / NeMo-Gym path.
+        """
+        if self._disagg_cfg.enabled:
+            raise RuntimeError(
+                "PD disaggregation is only wired for the HTTP/NeMo-Gym rollout "
+                f"path; VllmGeneration.{what} dispatches directly to engines and "
+                "would silently bypass it. Use the NeMo-Gym entrypoint, or set "
+                "generation.disaggregation.enabled=false."
+            )
+
+    def _report_engine_addrs(self, method_name: str) -> list[dict[str, Any]]:
+        """``{host, port, node_id}`` of every engine's HTTP server, in engine order."""
+        reported = ray.get(self._run_on_engines(method_name))
+        missing = [i for i, addr in enumerate(reported) if not addr]
+        assert not missing, f"engines {missing} reported no HTTP address"
+        return reported
+
+    def _render_settings(self) -> Any:
+        """What the frontends need to render exactly like the engines' servers."""
+        from nemo_rl.models.generation.vllm.chat_render import RenderSettings
+
+        vllm_cfg = self.cfg["vllm_cfg"]
+        serving = dict(vllm_cfg.get("http_server_serving_chat_kwargs") or {})
+        # Same normalization as vllm_worker_async._setup_vllm_openai_api_server:
+        # vLLM's spelling first, the older recipe spelling as the fallback.
+        template_kwargs = serving.get("default_chat_template_kwargs")
+        if template_kwargs is None:
+            template_kwargs = serving.get("chat_template_kwargs")
+        vllm_kwargs = self.cfg.get("vllm_kwargs") or {}
+        return RenderSettings(
+            model_name=self.cfg["model_name"],
+            chat_template=serving.get("chat_template"),
+            chat_template_content_format=serving.get(
+                "chat_template_content_format", "auto"
+            ),
+            default_chat_template_kwargs=dict(template_kwargs or {}),
+            enable_auto_tools=bool(serving.get("enable_auto_tools", True)),
+            tool_parser=serving.get("tool_parser"),
+            reasoning_parser=serving.get("reasoning_parser"),
+            tool_parser_plugin=vllm_cfg.get("tool_parser_plugin"),
+            reasoning_parser_plugin=vllm_cfg.get("reasoning_parser_plugin"),
+            hf_overrides=dict(vllm_kwargs.get("hf_overrides") or {}),
+            max_model_len=int(vllm_cfg["max_model_len"]),
+            config_format=vllm_kwargs.get("config_format"),
+        )
+
+    def _kv_hashing_for_frontends(self) -> dict[str, Any]:
+        """The engines' block hashing parameters, for the kv_cache_aware router."""
+        if not self._kv_cache_aware_routing():
+            return {}
+        first_owner = self._engine_owner_indices[0]
+        hashing = ray.get(
+            self.worker_group.run_single_worker_single_data(
+                method_name="report_kv_cache_hashing", worker_idx=first_owner
+            )
+        )
+        return {"block_size": hashing["block_size"], "hash_algo": hashing["hash_algo"]}
+
+    def _start_disagg_frontends(
+        self, addrs: list[dict[str, Any]], *, engines_ready: bool
+    ) -> list[Optional[str]]:
+        """Start the frontends of every replica and return their URLs.
+
+        Every engine runs its own HTTP server; an address is the only thing a
+        frontend is given about one. This slices the engine list into replicas,
+        hands each frontend its two address pools, and collects the URLs. Those
+        URLs are what NeMo-Gym sees. Starting is not idempotent, so a second
+        call returns the URLs of the frontends already running.
+        """
+        if self._disagg_frontend_urls:
+            return self._disagg_frontend_urls
+        self._disagg_engine_addrs = list(addrs)
+
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from nemo_rl.models.generation.vllm.vllm_disagg_frontend import (
+            DisaggFrontendActor,
+            FrontendServeArgs,
+            RelaySettings,
+        )
+
+        disagg = self._disagg_cfg
+        frontend = self._disagg_frontend_cfg
+        assert frontend is not None
+        profile = resolve_vllm_connector_profile(self.cfg)
+        num_prefill = disagg.num_prefill_engines
+        per_replica = num_prefill + disagg.num_decode_engines
+        n_fe = disagg.num_frontend_workers
+        # Deterministic ports: a restarted frontend re-binds the same port on
+        # its pinned node, so the URL Gym holds stays valid across crashes. The
+        # offset carries BOTH indices because several replicas can share a
+        # node. 256 is the size of the frontend port band.
+        assert self.num_replicas * n_fe <= 256, (
+            "replicas * num_frontend_workers must fit the frontend port band: "
+            f"{self.num_replicas} * {n_fe} > 256"
+        )
+        base_port = disagg.frontend_base_port
+        render_settings = self._render_settings() if disagg.frontend_tokenize else None
+        kv_hashing = self._kv_hashing_for_frontends() if engines_ready else {}
+
+        self._disagg_actors = []
+        futures = []
+        for replica_idx in range(self.num_replicas):
+            base = replica_idx * per_replica
+            prefill_addrs = addrs[base : base + num_prefill]
+            decode_addrs = addrs[base + num_prefill : base + per_replica]
+            kv_events_endpoints: tuple[str, ...] = ()
+            if self._kv_cache_aware_routing():
+                engine_roles = self._engine_roles_map()
+                kv_events_endpoints = tuple(
+                    f"tcp://{addr['host']}:{engine_roles[idx]['kv_events_port']}"
+                    for idx, addr in zip(
+                        range(base, base + num_prefill), prefill_addrs, strict=True
+                    )
+                )
+            settings = RelaySettings(
+                prefill_router=frontend.prefill_router,
+                decode_router=frontend.decode_router,
+                initial_prefill_params=dict(profile.initial_prefill_params),
+                bidirectional_kv_xfer=frontend.bidirectional_kv_xfer,
+                conversation_cache_ttl_s=float(frontend.conversation_cache_ttl_s),
+                decode_tokids_b64=frontend.decode_tokids_b64,
+                decode_strip_message_history=frontend.decode_strip_message_history,
+                request_timeout_s=float(frontend.request_timeout_s),
+                prefill_router_table_size=int(frontend.prefill_router_table_size),
+                kv_events_endpoints=kv_events_endpoints,
+                kv_events_topic=_KV_EVENTS_TOPIC,
+                render_settings=render_settings,
+            )
+            serve_args = FrontendServeArgs(
+                prefill_addrs=[(a["host"], a["port"]) for a in prefill_addrs],
+                decode_addrs=[(a["host"], a["port"]) for a in decode_addrs],
+                settings=settings,
+                engines_ready=engines_ready,
+                kv_hashing=kv_hashing,
+            )
+            for fe_idx in range(n_fe):
+                # Its own CPU-only actor rather than an engine worker's process:
+                # this is the request hot path for the whole replica. Frontends
+                # spread round-robin across the replica's engine nodes; the pin
+                # is HARD and restarts unlimited so a crashed frontend re-serves
+                # the same host:port (the constructor starts the server -- Ray
+                # never replays method calls on restart).
+                pin_node = addrs[base + (fe_idx % per_replica)]["node_id"]
+                actor = DisaggFrontendActor.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=pin_node, soft=False
+                    ),
+                    name=f"vllm_disagg_frontend_{replica_idx}_{fe_idx}",
+                    max_restarts=-1,
+                    # The frontend imports vLLM's serving pieces (renderer,
+                    # protocol, aiohttp), which only exist in the engine
+                    # workers' venv; the hashing seed must match theirs too.
+                    runtime_env={
+                        "py_executable": self.worker_group.py_executable,
+                        "env_vars": {
+                            k: v
+                            for k, v in self._engine_env_vars.items()
+                            if k == "PYTHONHASHSEED"
+                        },
+                    },
+                ).remote(
+                    replica_idx,
+                    frontend_idx=fe_idx,
+                    num_frontends=n_fe,
+                    port=base_port + replica_idx * n_fe + fe_idx,
+                    serve_args=serve_args,
+                )
+                self._disagg_actors.append(actor)
+                futures.append(actor.start.remote())
+
+        self._disagg_frontend_urls = ray.get(futures)
+        print(
+            f"  ✓ PD disaggregation (vLLM): {self.num_replicas} replica(s) x "
+            f"({num_prefill} prefill + {disagg.num_decode_engines} decode) engines, "
+            f"{n_fe} frontend worker(s) each; frontends: {self._disagg_frontend_urls}",
+            flush=True,
+        )
+        return self._disagg_frontend_urls
+
+    def _engine_roles_map(self) -> list[dict[str, Any]]:
+        """The stamped per-engine entries in engine order (driver-side view)."""
+        return sorted(
+            self._stamped_engine_roles.values(), key=lambda e: e["engine_index"]
+        )
+
+    def _mark_frontends_ready(self) -> None:
+        kv_hashing = self._kv_hashing_for_frontends()
+        ray.get(
+            [
+                actor.mark_engines_ready.remote(**kv_hashing)
+                for actor in self._disagg_actors
+            ]
+        )
+
+    def _invalidate_frontend_conversation_caches(self) -> None:
+        """Drop every frontend's remembered decode-side handshakes (weight update)."""
+        if not self._disagg_actors:
+            return
+        ray.get(
+            [
+                actor.invalidate_conversation_cache.remote()
+                for actor in self._disagg_actors
+            ]
+        )
+
+    # ------------------------------------------------------------------ #
+
     def _report_device_id(self) -> list[list[str]]:
         """Report the device ID of vllm workers."""
         # Choose the appropriate method based on async_engine setting
@@ -625,18 +1233,26 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "report_device_id"
         )
-        # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
-        )
         # Wait for all futures to complete
-        results = ray.get(futures)
+        results = ray.get(self._fan_out(method_name))
         return results
 
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
-        """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
+        """OpenAI-compatible base URLs, grouped by DP shard in shard order.
+
+        A shard's entry point is not always an engine: under disaggregation the
+        caller must talk to the replica's frontends, which route prefill and
+        decode themselves. Without disaggregation this is one URL per DP shard.
+        With it, each replica (shard) contributes its ``num_frontend_workers``
+        (F) frontends, so the list has ``num_replicas * F`` entries,
+        replica-major -- callers must not index it by shard when F > 1.
+        """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return [None]  # Not applicable since this is sync
+        if self._disagg_cfg.enabled:
+            return self._start_disagg_frontends(
+                self._report_engine_addrs("report_http_addr"), engines_ready=True
+            )
 
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
@@ -651,10 +1267,16 @@ class VllmGeneration(GenerationInterface):
         """Collect reserved URLs from DP leaders before model loading.
 
         Only called when defer_model_load=True. Workers have bound ports
-        during __init__ and can report their reserved URLs immediately.
+        during __init__ and can report their reserved URLs immediately. Under
+        disaggregation the frontends are started on those reserved engine
+        addresses and *their* URLs are returned.
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return [None]
+        if self._disagg_cfg.enabled:
+            return self._start_disagg_frontends(
+                self._report_engine_addrs("report_reserved_addr"), engines_ready=False
+            )
 
         futures = self.worker_group.run_all_workers_single_data(
             "get_reserved_url",
@@ -668,20 +1290,31 @@ class VllmGeneration(GenerationInterface):
 
         Called after a deferred init (defer_model_load=True) to perform the
         heavy model loading. Updates dp_openai_server_base_urls with the actual
-        running server URLs and populates device_uuids.
+        running server URLs and populates device_uuids. Under disaggregation
+        the frontend URLs do not change; the frontends are told the engines are
+        up and start relaying.
         """
         # Call load_model() on all model-owner workers
-        futures = self.worker_group.run_all_workers_single_data(
-            "load_model",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
+        ray.get(self._fan_out("load_model"))
 
         # Post-init (collective rpc functions needed for async engine)
         self._post_init()
 
-        # Refresh URLs from the actual running servers
-        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+        if self._disagg_cfg.enabled:
+            # The engines rebound the very sockets they reserved, so the
+            # addresses the frontends hold are still right; check anyway.
+            live = self._report_engine_addrs("report_http_addr")
+            for engine_idx, (a, b) in enumerate(
+                zip(live, self._disagg_engine_addrs, strict=True)
+            ):
+                assert (a["host"], a["port"]) == (b["host"], b["port"]), (
+                    f"engine {engine_idx} came up on {a} but the frontends were "
+                    f"given {b}"
+                )
+            self._mark_frontends_ready()
+        else:
+            # Refresh URLs from the actual running servers
+            self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         # Save device UUIDs
         self.device_uuids = self._report_device_id()
@@ -691,12 +1324,8 @@ class VllmGeneration(GenerationInterface):
         method_name = (
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
-        # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
-        )
         # Wait for all futures to complete
-        results = ray.get(futures)
+        results = ray.get(self._fan_out(method_name))
         return results
 
     def setup_token_capture(
@@ -717,31 +1346,21 @@ class VllmGeneration(GenerationInterface):
             "token capture requires the async vLLM engine (the capture host "
             "is the worker's in-process HTTP server)"
         )
-        futures = self.worker_group.run_all_workers_single_data(
+        futures = self._fan_out(
             "setup_token_capture",
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return agreed_media_columns(ray.get(futures))
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version workers stamp on captured model calls."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "set_rollout_weight_version",
-            version=version,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
+        ray.get(self._fan_out("set_rollout_weight_version", version=version))
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "_get_raw_spec_counters",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        worker_metrics = ray.get(futures)
+        worker_metrics = ray.get(self._fan_out("_get_raw_spec_counters"))
 
         # Aggregate across workers
         return aggregate_spec_decode_counters(worker_metrics)
@@ -840,6 +1459,25 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError(
                 "Data parallel size is zero, cannot initialize collective."
             )
+        if self._disagg_cfg.enabled:
+            # rank_prefix is each engine's first rank inside the inference half
+            # of the group; the engine's own ranks follow contiguously. Not a
+            # fixed stride: with asymmetric TP the engines are not equally
+            # wide, and a wrong offset would map generation ranks onto the
+            # wrong slice of the training-side broadcast.
+            assert train_world_size + sum(self._engine_widths) == world_size, (
+                f"Collective world_size {world_size} != train {train_world_size} + "
+                f"inference {sum(self._engine_widths)} (engine widths "
+                f"{self._engine_widths})."
+            )
+            return self._run_on_engines(
+                method_name,
+                per_engine={"rank_prefix": list(self._engine_owner_indices)},
+                ip=ip,
+                port=port,
+                world_size=world_size,
+                train_world_size=train_world_size,
+            )
         workers_per_group = total_workers // self.dp_size
         rank_prefix_list = list(range(0, total_workers, workers_per_group))
 
@@ -901,6 +1539,7 @@ class VllmGeneration(GenerationInterface):
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+        self._assert_shard_restart_allowed("restart_shard")
 
         leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
         # A shard is model_parallel_size workers; all of them died with the engine.
@@ -953,17 +1592,38 @@ class VllmGeneration(GenerationInterface):
         keep calling the dead shard's Ray actor after the rebuild and fail the refit with
         RayActorError, so the run would still die, just differently.
         """
+        self._assert_shard_restart_allowed("set_refit_membership")
         self._refit_membership = membership
+
+    def _assert_shard_restart_allowed(self, what: str) -> None:
+        """Shard loss and recovery are not wired for disaggregated replicas.
+
+        A shard is a replica of several engines behind frontends that hold the
+        engines' addresses; replacing one engine would have to re-point every
+        frontend. Fail loudly rather than restart the wrong workers.
+        """
+        if self._disagg_cfg.enabled:
+            raise NotImplementedError(
+                f"VllmGeneration.{what} is not supported under PD disaggregation; "
+                "disable async_rl.generation_fleet_health or disaggregation."
+            )
 
     def _refit_leaders_by_shard(self) -> list[tuple[int, int, Any]]:
         """Snapshot (shard index, leader index, worker) in refit rank order.
 
         Falls back to every leader when no membership has been recorded, which is the
-        state for the entire life of a run that never loses a shard.
+        state for the entire life of a run that never loses a shard. Under
+        disaggregation every *engine* owner takes part: a replica is several
+        engines, and each receives the weights itself.
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
         workers = self.worker_group.workers
+        if self._disagg_cfg.enabled:
+            return [
+                (engine_idx, owner_idx, workers[owner_idx])
+                for engine_idx, owner_idx in enumerate(self._engine_owner_indices)
+            ]
         membership = self._refit_membership
         if membership is None:
             per_shard = len(workers) // self.dp_size
@@ -1002,6 +1662,7 @@ class VllmGeneration(GenerationInterface):
         """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+        self._assert_shard_restart_allowed("rebuild_collective")
 
         method_name = (
             "init_collective_async"
@@ -1033,6 +1694,7 @@ class VllmGeneration(GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using vLLM."""
+        self._assert_direct_dispatch_allowed("generate()")
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
@@ -1096,6 +1758,7 @@ class VllmGeneration(GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate text responses using vLLM."""
+        self._assert_direct_dispatch_allowed("generate_text()")
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
@@ -1174,6 +1837,7 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError(
                 f"{method_name} can only be used when async_engine is enabled in vLLM config."
             )
+        self._assert_direct_dispatch_allowed(f"{method_name}()")
 
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -1229,6 +1893,7 @@ class VllmGeneration(GenerationInterface):
             monitor: Owns shard eligibility and receives observed failures.
             selector: Picks among the shards the monitor considers serving.
         """
+        self._assert_shard_restart_allowed("attach_fleet_health")
         if monitor.shard_count != self.worker_group.dp_size:
             raise ValueError(
                 f"fleet monitor tracks {monitor.shard_count} shards but the worker "
@@ -1395,14 +2060,8 @@ class VllmGeneration(GenerationInterface):
             method_name = (
                 "wake_up_async" if self.cfg["vllm_cfg"]["async_engine"] else "wake_up"
             )
-            # Use run_all_workers_single_data for methods that don't need data
-            futures = self.worker_group.run_all_workers_single_data(
-                method_name,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-                **kwargs,
-            )
             # Wait for all futures to complete
-            results = ray.get(futures)
+            results = ray.get(self._fan_out(method_name, **kwargs))
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error during policy preparation: {e}")
@@ -1423,13 +2082,8 @@ class VllmGeneration(GenerationInterface):
                     if self.cfg["vllm_cfg"]["async_engine"]
                     else "reset_prefix_cache"
                 )
-            # Use run_all_workers_single_data for methods that don't need data
-            futures = self.worker_group.run_all_workers_single_data(
-                method_name,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
             # Wait for all futures to complete
-            results = ray.get(futures)
+            results = ray.get(self._fan_out(method_name))
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error during policy preparation: {e}")
@@ -1438,6 +2092,16 @@ class VllmGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:
+            # Stop routing before the engines go away, so in-flight requests are
+            # not handed to an endpoint that is already tearing down.
+            for actor in self._disagg_actors:
+                try:
+                    ray.get(actor.shutdown.remote(), timeout=30)
+                except Exception as e:  # noqa: BLE001 - best effort during teardown
+                    print(f"Error stopping disagg frontend: {e}")
+                ray.kill(actor)
+            self._disagg_actors = []
+            self._disagg_frontend_urls = []
             if self.weight_synchronizer is not None:
                 self.weight_synchronizer.shutdown()
             # Use the worker group's shutdown method with the worker's cleanup method
@@ -1508,14 +2172,8 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_via_ipc_zmq"
         )
 
-        # Use run_all_workers_single_data since no data needs to be passed
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
-        return futures
+        return self._fan_out(method_name)
 
     def update_weights_from_collective(
         self, refit_timeout_s: Optional[float] = None
@@ -1676,8 +2334,16 @@ class VllmGeneration(GenerationInterface):
 
         futures: list[ray.ObjectRef] = []
         dp_indices: list[int] = []
-        for dp_idx in range(self.worker_group.dp_size):
-            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+        if self._disagg_cfg.enabled:
+            # Keyed by engine, not shard: a replica's prefill and decode
+            # engines have separate caches and queues worth seeing apart.
+            owners = list(enumerate(self._engine_owner_indices))
+        else:
+            owners = [
+                (dp_idx, self.worker_group.get_dp_leader_worker_idx(dp_idx))
+                for dp_idx in range(self.worker_group.dp_size)
+            ]
+        for dp_idx, worker_idx in owners:
             future = self.worker_group.run_single_worker_single_data(
                 worker_method_name,
                 worker_idx=worker_idx,
@@ -1726,11 +2392,7 @@ class VllmGeneration(GenerationInterface):
             return
         if not self.cfg["vllm_cfg"].get("async_engine", False):
             return
-        futures = self.worker_group.run_all_workers_single_data(
-            "clear_vllm_logger_metrics",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
+        ray.get(self._fan_out("clear_vllm_logger_metrics"))
 
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting."""
@@ -1765,11 +2427,10 @@ class VllmGeneration(GenerationInterface):
                 if self.cfg["vllm_cfg"]["async_engine"]
                 else "reset_prefix_cache"
             )
-            futures = self.worker_group.run_all_workers_single_data(
-                method_name,
-                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            )
-            results = ray.get(futures)
+            results = ray.get(self._fan_out(method_name))
+            # Blocks remembered for bidirectional KV transfer were computed
+            # under the old weights too.
+            self._invalidate_frontend_conversation_caches()
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")
@@ -1785,6 +2446,11 @@ class VllmGeneration(GenerationInterface):
             )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+
+        if self._disagg_cfg.enabled:
+            return self._pause_disagg_engines_for_refit(
+                clear_cache=clear_cache, timeout_s=timeout_s
+            )
 
         # Address surviving DP leaders directly. SingleController may have rebuilt the
         # refit communicator after losing a shard; walking the whole worker group here
@@ -1803,6 +2469,54 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
+    def _engine_owner_workers_by_role(self) -> dict[str, list[Any]]:
+        """Model-owner workers of the prefill and of the decode engines, in engine order."""
+        workers = self.worker_group.workers
+        by_role: dict[str, list[Any]] = {"prefill": [], "decode": []}
+        for role, owner_idx in zip(
+            self._engine_roles, self._engine_owner_indices, strict=True
+        ):
+            by_role[role].append(workers[owner_idx])
+        return by_role
+
+    def _pause_disagg_engines_for_refit(
+        self, *, clear_cache: bool, timeout_s: Optional[float]
+    ) -> bool:
+        """Pause the prefill engines first, then the decode engines.
+
+        vLLM completes a "keep" pause only once the engine is idle, and a
+        finished request whose blocks the KV connector still holds counts as
+        work: a prefill engine keeps a request's blocks until the decode engine
+        has read them. Pausing every engine at once freezes exactly those
+        reads on the decode side, so the prefill pause would wait for the
+        lease to expire and the decode request would then fail its KV load.
+        With the prefill engines paused first nothing new is handed off, the
+        still-running decode engines drain the outstanding reads, and their
+        own pause then completes at once (no engine waits on a decode engine
+        unless bidirectional KV transfer pins blocks there; see
+        validate_vllm_disaggregation_for_refit).
+        """
+        by_role = self._engine_owner_workers_by_role()
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        for role in ("prefill", "decode"):
+            futures = [
+                worker.pause_generation_async.remote(clear_cache=clear_cache)
+                for worker in by_role[role]
+            ]
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            try:
+                results = ray.get(futures, timeout=remaining)
+            except ray.exceptions.GetTimeoutError as exc:
+                raise RefitAborted(
+                    f"vLLM {role} engines' generation pause did not return within "
+                    f"{timeout_s}s"
+                ) from exc
+            if not all(results):
+                raise RuntimeError(f"Failed to pause every vLLM {role} engine")
+        return True
+
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
@@ -1811,6 +2525,34 @@ class VllmGeneration(GenerationInterface):
             return super().resume_generation_after_refit(timeout_s=timeout_s)
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+
+        if self._disagg_cfg.enabled:
+            # In-flight requests keep their KV across the update (the pause
+            # preserved it), but nothing may *reuse* pre-update blocks: the next
+            # turn of every conversation re-prefills under the new weights, on
+            # the prefill engines and on the decode engines alike. TRT-LLM does
+            # this inside its refit; here it is explicit, before resuming.
+            ray.get(self._run_on_engines("reset_prefix_cache_async"))
+            self._invalidate_frontend_conversation_caches()
+            # Decode engines first: the moment a prefill engine resumes it
+            # finishes frozen prefills and leases their blocks to decode
+            # engines that must be running to read them.
+            by_role = self._engine_owner_workers_by_role()
+            for role in ("decode", "prefill"):
+                futures = [
+                    worker.resume_generation_async.remote() for worker in by_role[role]
+                ]
+                _, pending = ray.wait(
+                    futures, num_returns=len(futures), timeout=timeout_s
+                )
+                if pending:
+                    raise RefitAborted(
+                        f"vLLM {role} engines' generation resume did not return "
+                        f"within {timeout_s}s"
+                    )
+                if not all(ray.get(futures)):
+                    raise RuntimeError(f"Failed to resume every vLLM {role} engine")
+            return True
 
         leaders = self._refit_leaders_by_shard()
         futures = [worker.resume_generation_async.remote() for _, _, worker in leaders]
