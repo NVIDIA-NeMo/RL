@@ -47,7 +47,7 @@ Default repo: `NVIDIA-NeMo/RL`. "You" / "the reviewer" = the `gh`-authenticated 
    live and remember its comment IDs: they are off-limits unless the user says otherwise.
 4. The reviewed commit = the review's `commit_id` (or each thread's `originalCommit`).
 
-### 2. Validate each thread
+### 2a. Validate each thread
 
 For each thread, do these four things **before** looking at diffs. Skipping them is how a quick
 grep sweep produces wrong verdicts in both directions (on #3380 one pass called a fixed thread "not
@@ -69,10 +69,11 @@ addressed" and an unmet ask "fixed").
 Then find what changed:
 
 - **Normal push:** `git log <reviewed>..<head>` and diff each new commit against the lines the thread is about.
-- **Rebase or force-push** (the reviewed commit is not an ancestor of the head): compare the PR's own
-  change before and after. Take `git diff <old-base> <old-head> -- <file>` against
-  `git diff <new-base> <new-head> -- <file>`, looking only at the `+`/`-` lines. Base drift is not the
-  author's change. Also re-check anything the review predicted a rebase would break: it may have landed.
+- **Rebase, force-push, or a merge from the base** (the reviewed commit is not an ancestor of the
+  head, or a merge commit brought the base in): compare the PR's own change before and after. Take
+  `git diff <old-base> <old-head> -- <file>` against `git diff <new-base> <new-head> -- <file>`,
+  looking only at the `+`/`-` lines. Base drift is not the author's change. Also re-check anything
+  the review predicted a rebase or merge would break: it may have landed.
 - **Applied suggestion blocks:** diff the hunk the author applied and read its `-` lines. A one-click
   apply can swap a function header or delete code. `-1 +35` on a file you expected only to grow is the tell.
 - **Re-run the check** the comment was about: the lint hook, the unit test, the grep, the failing command.
@@ -84,7 +85,7 @@ Verdicts:
 | Verdict | When |
 |---|---|
 | **fixed** | The problem the comment was about is gone, the check passes, and it is obvious. Matching the comment's wording is not enough. |
-| **partial** | Some of the ask landed; a specific piece (a file:line, a test, a doc copy) is left. Also: fixed, but the fix created a new small problem. Also: the wording is met but the user's need is not. |
+| **partial** | Some of the ask landed; a specific piece (a file:line, a test, a doc copy) is left. Also: fixed, but the fix created a new problem on the thread's own lines. Also: the wording is met but the user's need is not. |
 | **not addressed** | Nothing relevant changed — confirmed after reading the reply and checking every offered fix. One grep cannot prove absence. |
 | **moot** | The code the comment was about is gone, or the premise no longer holds. Treat like fixed if the risk is gone; say why. |
 
@@ -92,19 +93,27 @@ Show the user a table (thread link, one-line finding, **what the author's reply 
 evidence with permalinks at the new head, the commit that did it), plus CI status. Putting the
 author's claim next to your verdict makes any disagreement between them visible.
 
-### 2b. Check the new commits for new major issues
+### 2b. Check the new commits for major issues outside the threads
 
-Closing the old threads is only half the job: the fix commits are new code that nobody has reviewed,
-and they are where a new bug most often lands. Review what changed since the reviewed commit (for a
-rebase, the PR's own change before and after, as above), plus anything that code now reaches.
+Step 2a covers each thread's own lines, including a problem a fix created there. This step covers
+the rest of what changed since the reviewed commit (for a rebase, the PR's own change before and
+after, as in step 2a; the same for a merge from the base), which nobody has reviewed yet:
 
-- **Major only:** bugs and missing tests for changed behaviour. Style and nits were the first
-  review's job.
-- **Don't re-raise an open thread.** That is step 2's verdict.
-- Each finding cites file:line at the new head and is verified before it is shown, same as a
-  `/review-pr-team` finding.
+1. **Code a fix reaches outside its thread's lines:** callers of a changed function, a changed
+   default, other recipes that inherit a changed config.
+2. **Refactors or new features added since the last review** alongside the fixes, which no thread
+   asked for.
+3. **What the base brought in:** if the PR was rebased or merged the base since the reviewed commit,
+   code that landed on the base and now meets the PR's change, such as a new caller, config or
+   guard the PR does not handle. Step 2a ignores base drift as not the author's change; the combination is still new.
 
-Show them under the step 2 table as a separate list. **Stop and ask for confirmation** before step 3;
+- **Major only:** bugs. Missing tests, style and nits were the first review's job.
+- **Don't re-raise an open thread.** That is step 2a's verdict.
+- **Review it the way `/review-pr-team` reviews a PR, scoped to these changes:** same lanes, the
+  devil's-advocate pass before anything is shown, permalinks at the new head, and its comment rules
+  when a finding is staged.
+
+Show them under the step 2a table as a separate list. **Stop and ask for confirmation** before step 3;
 the user picks which new findings to stage.
 
 ### 3. Close the fixed threads (published directly)
@@ -126,7 +135,7 @@ gh api graphql -f query='mutation($t: ID!) { resolveReviewThread(input: {threadI
 The reply is exactly `fixed in <sha>`, nothing else. For moot threads, one short sentence saying
 why it no longer applies is fine. Verify each thread shows `isResolved: true` afterward.
 
-### 4. Stage follow-ups for partial fixes (PENDING)
+### 4. Stage follow-ups for partial fixes and new findings (PENDING)
 
 Create ONE pending review (or add to the user's existing one) holding **one new inline comment
 per partial item and per new finding the user picked in step 2b**, anchored on the current head at
