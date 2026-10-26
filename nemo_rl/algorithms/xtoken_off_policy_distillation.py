@@ -1452,8 +1452,8 @@ def _assert_same_tokenizer_reuse_safe(
     )
     if differing_fields:
         raise ValueError(
-            f"teachers[{teacher_idx}].aligner.projection_matrix_path is null, "
-            "but safe "
+            f"teachers[{teacher_idx}].aligner has no CSD table pair, so it is "
+            "treated as a same-tokenizer teacher, but safe "
             "student-token reuse requires identical tokenizer mapping, backend, "
             "special-token configuration, chat template, and template kwargs; "
             f"differing fields: {differing_fields}."
