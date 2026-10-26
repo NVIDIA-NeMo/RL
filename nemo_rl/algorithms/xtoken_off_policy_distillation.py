@@ -892,8 +892,7 @@ def validate_csd_router_replay_setup(master_config: MasterConfig) -> None:
     """Fail before cluster creation when CSD replay cannot be consumed."""
     if not router_replay_enabled(master_config.policy):
         return
-    megatron_cfg = master_config.policy.get("megatron_cfg") or {}
-    if not megatron_cfg.get("enabled", False):
+    if not _megatron_enabled(master_config.policy):
         raise ValueError(
             "policy.router_replay.enabled=true for CSD distillation requires "
             "the Megatron student policy backend; DTensor cannot consume "
@@ -1092,8 +1091,8 @@ def _validate_csd_packed_backend(cfg: PolicyConfig, *, label: str) -> None:
         field=f"{label}.make_sequence_length_divisible_by",
     )
     tp, cp, pp = _xtoken_entity_parallelism(cfg, label=label)
-    megatron_cfg = cfg.get("megatron_cfg") or {}
-    if bool(megatron_cfg.get("enabled", False)):
+    if _megatron_enabled(cfg):
+        megatron_cfg = cfg["megatron_cfg"]
         if pp != 1:
             raise ValueError(
                 "CSD lockstep packing currently requires Megatron PP=1; "
@@ -1840,7 +1839,7 @@ def setup(
     # Megatron-FSDP cannot CPU-offload its shards in the current MCore version,
     # but its steady-state resident shard is much smaller than construction.
     student_policy.prepare_for_training()
-    if distillation_config.get("offload_student_after_step", False):
+    if distillation_config.get("offload_student_after_step"):
         # Backends that support student CPU offload should start the first
         # teacher phase in the same offloaded state used between later steps.
         student_policy.offload_after_refit()
@@ -2353,9 +2352,9 @@ def _restore_student_between_teacher_state(
     master_config: MasterConfig,
 ) -> None:
     """Restore the configured student residency between teacher forwards."""
-    if master_config.distillation.get("offload_student_after_step", False):
+    if master_config.distillation.get("offload_student_after_step"):
         student_policy.offload_after_refit()
-    elif master_config.policy.get("offload_optimizer_for_logprob", False):
+    elif master_config.policy["offload_optimizer_for_logprob"]:
         student_policy.offload_before_refit()
 
 
@@ -2389,11 +2388,9 @@ def xtoken_off_policy_distillation_train(
     val_at_end = distill_cfg["val_at_end"]
     max_epochs = distill_cfg["max_num_epochs"]
     max_steps = distill_cfg["max_num_steps"]
-    offload_student_after_step = bool(
-        distill_cfg.get("offload_student_after_step", False)
-    )
+    offload_student_after_step = bool(distill_cfg.get("offload_student_after_step"))
     offload_student_optimizer_after_step = bool(
-        master_config.policy.get("offload_optimizer_for_logprob", False)
+        master_config.policy["offload_optimizer_for_logprob"]
     )
     if offload_student_after_step:
         print(
