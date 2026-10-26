@@ -17,19 +17,18 @@ It handles logic at the algorithm level. Each RL Actor is expected to have its
 own checkpoint saving function (called by the algorithm loop).
 """
 
-import glob
 import json
 import os
 import re
-import shutil
 import threading
-import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    Iterator,
     Literal,
     Mapping,
     NotRequired,
@@ -43,12 +42,64 @@ import torch
 import yaml
 from pydantic import BaseModel
 
+from nemo_rl.telemetry.instrumentation import (
+    checkpoint_finalize_span,
+    current_trace_carrier,
+    remote_trace_context,
+)
+from nemo_rl.utils.checkpoint_storage import CheckpointStorage, make_storage
+from nemo_rl.utils.path_utils import (
+    as_path,
+    is_msc_path,
+    maybe_enable_msc,
+    open_path,
+    rmtree,
+)
+
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+@contextmanager
+def _finalize_telemetry(
+    carrier: Mapping[str, str], step: Optional[int]
+) -> Iterator[None]:
+    """Open ``rl.checkpoint.finalize``, or carry on without it if that fails.
+
+    Guarded because the block it wraps performs the rename that makes a
+    checkpoint resumable, and nothing in this package lets observability decide
+    whether that happens -- the same stance :meth:`_warn_on_delete_failure`
+    takes for pruning. Unguarded, a lens incompatibility would surface as a
+    failed save: the exception reaches ``finalize_pending`` as
+    ``_finalize_error``, so the run dies reporting a checkpoint failure *and*
+    skips the rename.
+
+    Only entering is guarded. A failure inside the block is the checkpoint's
+    own and must still reach both the span and the caller.
+    """
+    stack = ExitStack()
+    try:
+        stack.enter_context(remote_trace_context(carrier))
+        stack.enter_context(checkpoint_finalize_span(step))
+    # Deliberately broad: the point is that no failure from the telemetry stack,
+    # whatever it is, reaches the caller from here.
+    except Exception as e:
+        stack.close()
+        warnings.warn(
+            f"Could not open the checkpoint finalization span: {e!r}. "
+            "Finalization continues untraced; the checkpoint is unaffected.",
+            stacklevel=2,
+        )
+    # Yielded outside the except block so that a rename which then also fails is
+    # not reported as having happened "during handling" of the telemetry error,
+    # which points the reader at observability instead of at the rename. A
+    # closed ExitStack re-enters as an empty one, so this covers both paths.
+    with stack:
+        yield
 
 
 def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
     """Load common state from either legacy or current MCore checkpoints."""
-    # Keep the optional MCore dependency out of DTensor and Automodel imports.
+    # Keep the optional MCore dependency out of the Automodel imports.
     try:
         from megatron.core.dist_checkpointing import load_common_state_dict
     except ImportError as error:
@@ -105,7 +156,7 @@ def validate_warm_start_checkpoint(
             "`ppo.warm_start_value_checkpoint=` with an unset variable produces "
             "this; point it at a step_<n> directory or drop the override."
         )
-    if not (Path(warm_start) / model_component / "weights").exists():
+    if not (as_path(warm_start) / model_component / "weights").exists():
         raise ValueError(
             f"warm_start_value_checkpoint={str(warm_start)!r} has no "
             f"{model_component}/weights subtree, so the {model_component} model "
@@ -119,10 +170,11 @@ class PretrainedCheckpointConfig(TypedDict):
 
     When set, the policy will restore its initial weights from this checkpoint
     instead of loading them from ``model_name``. Supported by the Megatron backend
-    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+    only; the Automodel backend continues to use HuggingFace weights via ``model_name``.
 
     Attributes:
-        path: Filesystem path to the checkpoint to load.
+        path: Filesystem path or ``msc://profile/path`` URL to load.
+            MSC profiles and a node-local cache are configured through ``MSC_CONFIG``.
 
             * For ``"megatron_bridge"`` format: may be either a **specific
               iteration directory** that contains a ``run_config.yaml`` file
@@ -163,20 +215,15 @@ class CheckpointingConfig(TypedDict):
     ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
         When set, a checkpoint is saved every ft_save_period steps for crash recovery.
         Requires ft_keep_latest_k to control how many of these are retained.
-    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
-    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
-    model_cache_dir (str): Directory for model cache (for safetensors format).
-    model_repo_id (str): Repository ID for the model (for safetensors format).
-    is_peft (bool): Whether the model uses PEFT.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
     save_data_plane (bool): Whether SingleController checkpoints include the
-        native TQ snapshot and replay-buffer metadata. Currently supported only
-        with the simple data-plane backend.
-    load_replay_buffer (bool): Whether async GRPO restores replay-buffer state
-        when resuming from a checkpoint. Defaults to True. When False the
-        buffer starts empty and a frontier-aligned resume regenerates the
-        whole buffered window fresh instead of reusing completed (and
-        therefore short-rollout-biased) groups.
+        native TQ snapshot and replay-buffer metadata. Supported by the simple
+        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
+    load_replay_buffer (bool): Whether async GRPO or SingleController restores
+        replay-buffer state when resuming from a checkpoint. Defaults to True.
+        When False, a frontier-aligned async resume or a SingleController native
+        TQ resume regenerates the buffered prompt groups on the current policy
+        instead of reusing completed groups.
     """
 
     enabled: bool
@@ -188,18 +235,25 @@ class CheckpointingConfig(TypedDict):
     ft_keep_latest_k: NotRequired[int | None]
     ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
-    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig | None]
     save_optimizer: NotRequired[bool]  # Default: True
     save_data_plane: NotRequired[bool]
-    load_replay_buffer: NotRequired[bool]  # Default: True (async GRPO only)
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[bool]  # Default: False
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+    load_replay_buffer: NotRequired[bool]  # Default: True
+
+
+_AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
+    {
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+        "model_cache_dir",
+        "model_repo_id",
+        "is_peft",
+        "peft_config",
+        "is_async",
+    }
+)
 
 
 class CheckpointManager:
@@ -229,7 +283,26 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
+        automodel_only_fields = sorted(
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+        )
+        if automodel_only_fields:
+            raise ValueError(
+                "Automodel-only fields are not supported under the top-level "
+                f"checkpointing config: {', '.join(automodel_only_fields)}. "
+                "Configure model_save_format, save_consolidated, "
+                "single_rank_consolidation, and consolidation_timeout_minutes "
+                "under policy.automodel_cfg (and value.automodel_cfg for value "
+                "models); remove the remaining fields because they are managed "
+                "internally."
+            )
+
+        if is_msc_path(config["checkpoint_dir"]) and config.get("save_data_plane"):
+            raise ValueError(
+                "MSC checkpoints do not yet support data-plane snapshots; set save_data_plane=false."
+            )
+        self.checkpoint_dir = as_path(config["checkpoint_dir"])
+        self._storage = make_storage(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
@@ -237,16 +310,9 @@ class CheckpointManager:
         self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
 
-        # Store nemo-automodel specific config options
-        self.model_save_format = config.get("model_save_format", "safetensors")
-        self.save_consolidated = config.get("save_consolidated", False)
-        self.model_cache_dir = config.get("model_cache_dir", "")
-        self.model_repo_id = config.get("model_repo_id", "")
-        self.is_peft = config.get("is_peft", False)
-
         # Async finalization state
         self._finalize_thread: Optional[threading.Thread] = None
-        self._pending_checkpoint_path: Optional[Path] = None
+        self._pending_checkpoint_path: Optional[PathLike] = None
         self._finalize_error: Optional[Exception] = None
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
 
@@ -268,11 +334,11 @@ class CheckpointManager:
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            component_path = Path(last_checkpoint_path) / model_component
+            component_path = as_path(last_checkpoint_path) / model_component
             weights_path = component_path / "weights"
             optimizer_path = component_path / "optimizer"
 
-            # DTensor path
+            # Automodel path
             if optimizer_path.exists():
                 return weights_path, optimizer_path
 
@@ -284,6 +350,7 @@ class CheckpointManager:
                 iteration_dir / "metadata.json"
             ).exists()
             if is_megatron_checkpoint:
+                maybe_enable_msc(iteration_dir)
                 common_state_dict = _load_megatron_common_state_dict(iteration_dir)
                 if "optimizer" in common_state_dict:
                     # In Megatron, optimizer_path is only a flag to indicate that the optimizer
@@ -300,7 +367,7 @@ class CheckpointManager:
                         return weights_path, optimizer_path
 
             warnings.warn(
-                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"Optimizer state not found at {optimizer_path} (Automodel path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
                 "Optimizer will be freshly initialized.",
                 stacklevel=2,
@@ -319,7 +386,8 @@ class CheckpointManager:
 
         Creates a temporary directory for a new checkpoint and saves training info
         and configuration. The directory is named 'tmp_step_{step}' and will be renamed
-        to 'step_{step}' when the checkpoint is completed.
+        to 'step_{step}' when the checkpoint is completed. MSC writes directly to
+        a fresh step prefix and publishes an ``_SUCCESS`` object on completion.
         We do it this way to allow the algorithm loop to save any files it wants to save
         in a safe, temporary directory.
 
@@ -331,18 +399,11 @@ class CheckpointManager:
         Returns:
             PathLike: Path to the temporary checkpoint directory.
         """
-        save_dir = self.checkpoint_dir / f"tmp_step_{step}"
-        # Remove a stale tmp_step_{step} left behind by an interrupted prior save
-        # so the new save starts clean.
-        if save_dir.exists():
-            t0 = time.monotonic()
-            shutil.rmtree(save_dir)
-            elapsed = time.monotonic() - t0
-            print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
-        save_dir.mkdir(parents=True, exist_ok=True)
+        save_dir = self._storage.begin(step)
+        save_path = as_path(save_dir)
 
         # save training info
-        with open(save_dir / "training_info.json", "w") as f:
+        with open_path(save_path / "training_info.json", "w") as f:
             # make any numpy items serializable
             serializable_training_info = dict(training_info)
             for k, v in serializable_training_info.items():
@@ -352,31 +413,12 @@ class CheckpointManager:
 
         # save config
         if run_config is not None:
-            with open(save_dir / "config.yaml", "w") as f:
+            with open_path(save_path / "config.yaml", "w") as f:
                 # JSON mode converts enums and other Pydantic-supported scalar
                 # types to the primitive values expected by safe YAML.
                 yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
-        return Path(os.path.abspath(save_dir))
-
-    def _rename_checkpoint(self, checkpoint_path: PathLike) -> None:
-        """Rename tmp_step_N to step_N.
-
-        If step_N already exists (defensive guard for edge cases, e.g. resuming
-        training), performs a pseudo-atomic swap via an intermediate old_step_N
-        directory.
-        """
-        checkpoint_path = Path(checkpoint_path)
-        step = checkpoint_path.name.split("_")[2]
-        to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
-        if to_checkpoint_path.exists():
-            old_checkpoint_path = checkpoint_path.parent / f"old_step_{step}"
-            os.rename(to_checkpoint_path, old_checkpoint_path)
-            os.rename(checkpoint_path, to_checkpoint_path)
-            if old_checkpoint_path.exists():
-                shutil.rmtree(old_checkpoint_path)
-        else:
-            os.rename(checkpoint_path, to_checkpoint_path)
+        return save_dir
 
     def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
         """Complete a checkpoint synchronously (rename + delete old).
@@ -388,7 +430,7 @@ class CheckpointManager:
         Args:
             checkpoint_path (PathLike): Path to the temporary checkpoint directory.
         """
-        self._rename_checkpoint(checkpoint_path)
+        self._storage.publish(checkpoint_path)
         self.remove_old_checkpoints()
 
     def begin_finalization(
@@ -411,21 +453,36 @@ class CheckpointManager:
                 For sync saves: None (rename immediately).
         """
         self.finalize_pending()
-        self._pending_checkpoint_path = Path(checkpoint_path)
+        self._pending_checkpoint_path = as_path(checkpoint_path)
         self._finalize_error = None
+        # The step is only in the staging dir name (tmp_step_<n>); None if it
+        # does not parse, since this only labels a span.
+        try:
+            step = int(Path(checkpoint_path).name.split("_")[2])
+        except (IndexError, ValueError):
+            step = None
+        # Captured here because a bare Thread starts with an empty context: read
+        # it on the worker instead and the finalize span re-roots into a trace of
+        # its own, detached from the run that produced the checkpoint.
+        carrier = current_trace_carrier()
 
         def _finalize():
+            # The work is inside the span so a failed wait or rename is recorded
+            # on it, and the span is entered through a guard so the reverse
+            # cannot happen: telemetry must not be what skips the rename.
             try:
-                if wait_fn is not None:
-                    wait_fn()
-                self._rename_checkpoint(checkpoint_path)
-                # Prune old checkpoints off the critical path. Surface any
-                # failure via a done-callback so a broken delete is not silently
-                # swallowed (the discarded Future would otherwise hide it).
-                delete_future = self._delete_executor.submit(
-                    self.remove_old_checkpoints
-                )
-                delete_future.add_done_callback(self._warn_on_delete_failure)
+                with _finalize_telemetry(carrier, step):
+                    if wait_fn is not None:
+                        wait_fn()
+                    self._storage.publish(checkpoint_path)
+                    # Prune old checkpoints off the critical path. Surface any
+                    # failure via a done-callback so a broken delete is not
+                    # silently swallowed (the discarded Future would otherwise
+                    # hide it).
+                    delete_future = self._delete_executor.submit(
+                        self.remove_old_checkpoints
+                    )
+                    delete_future.add_done_callback(self._warn_on_delete_failure)
             except Exception as e:
                 self._finalize_error = e
             finally:
@@ -527,7 +584,7 @@ class CheckpointManager:
             exclude_latest (bool): Whether to protect the most recent checkpoint
                 from deletion.
         """
-        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
+        checkpoint_history = _load_checkpoint_history(self._storage)
         if not checkpoint_history:
             return
         if self.keep_top_k is None and self.ft_keep_latest_k is None:
@@ -573,7 +630,7 @@ class CheckpointManager:
         for step, path, _ in checkpoint_history:
             if step not in protected_steps:
                 print(f"Removing checkpoint {path} (step {step})")
-                shutil.rmtree(path)
+                rmtree(path)
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
@@ -585,7 +642,7 @@ class CheckpointManager:
         Returns:
             Optional[str]: Path to the best checkpoint, or None if no checkpoints exist.
         """
-        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
+        checkpoint_history = _load_checkpoint_history(self._storage)
         if len(checkpoint_history) == 0:
             return None
 
@@ -630,16 +687,8 @@ class CheckpointManager:
         Returns:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
-        # find checkpoint directory with highest step number
-        step_dirs = [
-            x
-            for x in glob.glob(str(self.checkpoint_dir / "step_*"))
-            if re.fullmatch(r"step_\d+", Path(x).name)
-        ]
-        step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
-        if len(step_dirs) == 0:
-            return None
-        return str(step_dirs[-1])
+        steps = self._storage.published_steps()
+        return steps[-1][1] if steps else None
 
     def load_training_info(
         self, checkpoint_path: Optional[PathLike] = None
@@ -656,37 +705,36 @@ class CheckpointManager:
         """
         if checkpoint_path is None:
             return None
-        with open(Path(checkpoint_path) / "training_info.json", "r") as f:
+        with open_path(str(checkpoint_path) + "/training_info.json") as f:
             return json.load(f)
 
 
 def _load_checkpoint_history(
-    checkpoint_dir: Path,
+    storage: CheckpointStorage,
 ) -> list[tuple[int, PathLike, dict[str, Any]]]:
     """Load the history of checkpoints and their metrics.
 
     Args:
-        checkpoint_dir (Path): Directory containing the checkpoints.
+        storage (CheckpointStorage): Storage holding the checkpoints.
 
     Returns:
         list[tuple[int, PathLike, dict[str, Any]]]: List of tuples containing
             (step_number, checkpoint_path, info) for each checkpoint.
     """
-    checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
+    steps = storage.published_steps()
 
-    # Find all step directories
-    step_dirs = [
-        x
-        for x in glob.glob(str(checkpoint_dir / "step_*"))
-        if re.fullmatch(r"step_\d+", Path(x).name)
+    def read_info(step_dir: str) -> Optional[dict[str, Any]]:
+        try:
+            with open_path(step_dir + "/training_info.json") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+
+    # One GET per step on object storage; read them concurrently instead of one by one.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        infos = list(pool.map(read_info, [step_dir for _, step_dir in steps]))
+    return [
+        (step, step_dir, info)
+        for (step, step_dir), info in zip(steps, infos)
+        if info is not None
     ]
-
-    for step_dir in step_dirs:
-        info_file = Path(step_dir) / "training_info.json"
-        if info_file.exists():
-            with open(info_file) as f:
-                info: dict[str, Any] = json.load(f)
-                step = int(Path(step_dir).name.split("_")[1])
-                checkpoint_history.append((step, step_dir, info))
-
-    return checkpoint_history

@@ -30,7 +30,7 @@ ppo:
     max_trajectory_age_steps: 1
     warmup_generation_lead_steps: null
     in_flight_weight_updates: false
-    recompute_kv_cache_after_weight_updates: false
+    recompute_kv_cache_after_weight_updates: true
     drop_incomplete_targets_on_restore: false
 
   reward_shaping:
@@ -78,13 +78,21 @@ loss_fn:
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
+  # Only used by adaptive-ppo-clip.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
+  seq_logprob_error_in_loss: false  # Only supported by non-streaming Megatron GRPO.
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+  metrics_level: "full"
+  enable_torch_compile: false
 
 value_loss_fn:
   scale: 0.4
@@ -98,8 +106,6 @@ checkpointing:
   keep_top_k: 5
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
   save_optimizer: true
 
 policy:
@@ -116,10 +122,16 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -167,11 +179,17 @@ policy:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
 
     optimizer:
@@ -249,20 +267,28 @@ policy:
     stop_strings: null
     mcore_generation_config:
       buffer_size_gb: 20
-      buffer_guaranteed_fraction: 0.1
-      num_cuda_graphs: 16
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
-      unified_memory_level: 0
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
       max_tokens: 16384
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
       logprobs_mode: processed_logprobs
-      offload_policy_before_refit: false
+      http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -301,9 +327,13 @@ value:
     enabled: false
     reward_model_type: "regression"
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: false
+    checkpoint:
+      model_save_format: "safetensors"
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
@@ -350,11 +380,17 @@ value:
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    # Set this in both policy.megatron_cfg and value.megatron_cfg for PPO.
+    distributed_timeout_minutes: null
     apply_rope_fusion: True
+    flash_attention_version: 2
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    fp32_lm_head: false
     moe_per_layer_logging: False
 
     optimizer:
@@ -448,13 +484,20 @@ logger:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
     log_nemo_gym_full_result_tables: false
+    entity: null
+    id: null
+    resume: null
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
-  tensorboard: {}
+  tensorboard:
+    log_dir: null
   mlflow:
     experiment_name: "ppo-dapo-megatron-dev"
     run_name: "ppo_dapo_megatron_1B"
+    run_id: null
+    tracking_uri: null
+    artifact_location: null
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10

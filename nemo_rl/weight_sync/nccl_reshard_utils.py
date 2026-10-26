@@ -68,7 +68,9 @@ class MeshInfo:
 class RefitCtx:
     """Handoff between a param's ``pre`` and ``post`` refit hooks.
 
-    The transfer API (xferdtensor) reads only ``buf``.
+    The transfer API (xferdtensor) reads only ``buf``: bulk weights use
+    canonical HF layout. Quantized sources use BF16; unquantized sources retain
+    their dtype. Metadata and receiver buffers use the same transfer dtype.
     ``extra`` is provided for flexible, backend-specific state.
 
     Use case:
@@ -90,16 +92,28 @@ class LocalParamSpec:
             e.g., Create a temporary buffer for the merged param.
         post: ``RefitCtx -> None``; runs after xferdtensor
             e.g., copy back the received buffer into the merged param.
+        wire_dtype: dtype required for ``RefitCtx.buf``, defaulting to BF16.
+            Independent of the dtype or quantization format of local storage.
 
-    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
-    TRTLLM w13) would need a group-level finalize run once after all components
-    land — a future loop-level addition, not a per-param field. ``pre``/``post``
-    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    Layout-specific backends can receive into canonical storage in ``pre``, load
+    each logical component in ``post``, and use a transport-level finalizer after
+    all components land. FlashInfer TRTLLM uses this path for grouped experts.
     """
 
     base: Any
     pre: Optional[Callable[[Any], "RefitCtx"]] = None
     post: Optional[Callable[["RefitCtx"], None]] = None
+    wire_dtype: torch.dtype = torch.bfloat16
+
+    def materialize(self) -> RefitCtx:
+        """Prepare the buffer and check the dtype declared by this spec."""
+        ctx = self.pre(self.base) if self.pre is not None else RefitCtx(buf=self.base)
+        if ctx.buf.dtype != self.wire_dtype:
+            raise ValueError(
+                f"Refit buffer dtype {ctx.buf.dtype} does not match "
+                f"wire_dtype {self.wire_dtype}."
+            )
+        return ctx
 
 
 @dataclass
@@ -345,18 +359,16 @@ def build_mesh_info(
     **innermost** (rightmost, fastest-varying) axis — consecutive global ranks
     differ in it.
 
-    Callers never activate EP and TP in the same mesh:
-    ``_build_train_src_meshes`` builds a separate non-expert mesh
-    (``ep_size=1``) and expert mesh (``tp_size=1``).  So the innermost active
-    dim — and the coord a modulo recovers — is:
+    Callers build separate non-expert (TP) and expert (EP/ETP) meshes. An
+    expert mesh may activate both EP and expert TP. The active axes use
+    Megatron's rank order, with TP innermost and EP immediately outside it:
 
       * **TP** in the non-expert mesh (EP dropped): ``global_rank % tp_size``
         recovers the TP coord, the standard Megatron non-expert layout.
-      * **EP** in the expert mesh (TP dropped): ``global_rank % ep_size``
-        recovers the EP coord, Megatron-Core's MoE rank layout.
-
-    (Were EP and TP ever active together, the emit order would make TP — not
-    EP — innermost; that case does not arise today.)
+      * **EP** in an EP-only expert mesh: ``global_rank % ep_size`` recovers
+        the EP coord.
+      * **ETP + EP** in a generation expert mesh: ETP is the innermost axis,
+        matching Megatron-Core's expert rank generator.
 
     Returns:
         ``(MeshInfo, dim_map)`` where *dim_map* maps ``"tp"``/``"ep"``/``"dp"``/``"pp"``
@@ -387,7 +399,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     """Determine DTensor placements for a parameter given a *dim_map*.
 
     1-D params (layernorm, bias) are always fully replicated.
-    Expert params shard dim 0 on EP; their TP shard dims are shifted by +1.
+    Expert params shard dim 0 on EP; their ETP shard dims are shifted by +1.
     """
     num_mesh_dims = len(dim_map) or 1
     placements = [Replicate() for _ in range(num_mesh_dims)]
@@ -399,12 +411,12 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
     if is_expert_param(param_name):
         if "ep" in dim_map:
             placements[dim_map["ep"]] = Shard(0)
-        else:
-            # We currently never shards both EP and TP for the expert params
-            # so far. If MCore etp is enabled, the logic should be changed
-            tp_dim = _get_expert_tp_shard_dim(param_name)
-            if tp_dim is not None and "tp" in dim_map:
-                placements[dim_map["tp"]] = Shard(tp_dim + 1)
+        # The grouped HF tensor has a leading expert dimension, so the usual
+        # projection shard dimension is shifted by one for ETP. This remains
+        # independent of EP's Shard(0) when both axes are active.
+        tp_dim = _get_expert_tp_shard_dim(param_name)
+        if tp_dim is not None and "tp" in dim_map:
+            placements[dim_map["tp"]] = Shard(tp_dim + 1)
     else:
         # for non-expert params
         tp_dim = get_tp_shard_dim(param_name)
@@ -559,6 +571,15 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
+def is_blockwise_fp8_param_storage(fp8_cfg: Optional[dict[str, Any]]) -> bool:
+    """Whether training stores TE blockwise FP8 weights for physical FP8 export."""
+    return bool(
+        fp8_cfg
+        and fp8_cfg.get("fp8_param", False)
+        and fp8_cfg.get("fp8_recipe") == "blockwise"
+    )
+
+
 def check_nccl_reshard_refit_support(master_config: Any) -> None:
     """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
@@ -589,9 +610,13 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
     policy = master_config.policy
     generation = policy.get("generation", {}) or {}
     megatron_cfg = policy.get("megatron_cfg", {}) or {}
-    dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
+    automodel_cfg = policy.get("automodel_cfg", {}) or {}
     vllm_cfg = generation.get("vllm_cfg", {}) or {}
     vllm_kwargs = generation.get("vllm_kwargs", {}) or {}
+    mcore_generation_cfg = {
+        **megatron_cfg,
+        **(generation.get("mcore_generation_config", {}) or {}),
+    }
 
     violations: list[str] = []
 
@@ -602,14 +627,14 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "(nccl_reshard_refit is only for disaggregated train/gen)."
         )
 
-    # Gen backend = vLLM — only backend with prepare_nccl_reshard_refit_info.
+    # Generation backends with a destination-side HFToLocalParamMap adapter.
     backend = generation.get("backend")
-    if backend != "vllm":
+    if backend not in ("vllm", "megatron"):
         violations.append(
-            f"policy.generation.backend must be 'vllm' (got {backend!r})."
+            f"policy.generation.backend must be 'vllm' or 'megatron' (got {backend!r})."
         )
 
-    if vllm_kwargs.get("enable_eplb"):
+    if backend == "vllm" and vllm_kwargs.get("enable_eplb"):
         violations.append(
             "policy.generation.vllm_kwargs.enable_eplb must be False "
             "(nccl_reshard_refit fixes the expert->rank mapping at setup; "
@@ -634,30 +659,29 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             "layerwise-reload weight loaders that ModelOpt real quant requires)."
         )
 
-    # This initial version supports only the Megatron train + vLLM gen
-    # combination; the DTensor train backend refit path is intentionally
-    # dropped (Megatron is the path validated end-to-end).
+    # Only Megatron training currently provides the local Bridge source views;
+    # Automodel training is not supported by this transport yet.
     megatron_enabled = megatron_cfg.get("enabled", False)
-    dtensor_enabled = dtensor_cfg.get("enabled", False)
+    automodel_enabled = automodel_cfg.get("enabled", False)
     if not megatron_enabled:
         violations.append(
             "policy.megatron_cfg.enabled must be True "
             "(this initial version supports the Megatron train backend only)."
         )
-    if dtensor_enabled:
+    if automodel_enabled:
         violations.append(
-            "policy.dtensor_cfg.enabled must be False "
+            "policy.automodel_cfg.enabled must be False "
             "(this initial version supports the Megatron train backend only)."
         )
 
     if megatron_enabled:
         etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
 
-        # ETP is not supported yet.
-        if etp not in (1, None):
+        # ETP with vLLM generation has not been fully tested yet.
+        if backend == "vllm" and etp not in (1, None):
             violations.append(
-                f"Megatron expert_tensor_parallel_size is not supported yet "
-                f"(got etp={etp})."
+                "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
+                f"for vLLM generation until ETP is fully tested (got {etp})."
             )
 
         # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
@@ -680,77 +704,129 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
                 "policy.megatron_cfg.account_for_loss_in_pipeline_split must be False."
             )
 
-        # Precision compatibility (train ↔ gen).  Supported combinations:
-        #   BF16 train  ↔ BF16 gen   (default, tested)
-        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
-        #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
-        # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        # Bulk values use canonical HF layout and preserve unquantized source
+        # dtypes. Quantized sources use BF16; destination hooks own quantization.
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
-        fp8_recipe = fp8_cfg.get("fp8_recipe", None)
-        trainer_precision = policy.get("precision")
-        gen_precision = vllm_cfg.get("precision", None)
-
-        # The refit byte-copies weights train -> gen, so gen dtype must match
-        # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
-        # value like "float16"/"float32" would silently mismatch the bf16 train
-        # bytes and deadlock/corrupt the bulk collective; reject anything outside
-        # the supported set up front (this also catches typos such as
-        # "fp8_e4m3" that would otherwise skip the FP8 checks below).
-        if gen_precision not in (None, "auto", "bf16", "bfloat16", "fp8"):
-            violations.append(
-                f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
-                "supported by nccl_reshard_refit (use 'bf16'/'bfloat16', 'fp8', "
-                "'auto', or leave unset); the refit byte-copies weights, so the "
-                "gen dtype must match the train dtype."
-            )
-
-        if gen_precision == "fp8":
-            if fp8_param:
-                if vllm_cfg.get("is_mx"):
-                    violations.append(
-                        "policy.generation.vllm_cfg.is_mx=True does not support "
-                        "blockwise-FP8 storage from "
-                        "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
-                        "storage for receiver-side MXFP8 quantization."
-                    )
-                elif fp8_recipe != "blockwise":
-                    violations.append(
-                        "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                        f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                        "don't produce export-ready scale_inv tensors."
-                    )
-            elif vllm_cfg.get("is_mx"):
-                # Policy precision uses the canonical NeMo-RL spelling; unlike
-                # vLLM precision, it does not accept "bf16", "auto", or None.
-                if trainer_precision != "bfloat16":
-                    violations.append(
-                        "policy.generation.vllm_cfg.is_mx=True with "
-                        "policy.megatron_cfg.fp8_cfg.fp8_param=False requires "
-                        "policy.precision='bfloat16' for receiver-side MXFP8 "
-                        f"quantization (got {trainer_precision!r})."
-                    )
-            else:
-                violations.append(
-                    "policy.generation.vllm_cfg.precision='fp8' requires "
-                    "policy.megatron_cfg.fp8_cfg.fp8_param=True, or "
-                    "is_mx=True for BF16-to-MXFP8 refit."
-                )
-        elif fp8_param:
+        if fp8_param and not fp8_cfg.get("enabled", False):
             violations.append(
                 "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
-                "policy.generation.vllm_cfg.precision='fp8' "
-                "(FP8 storage on train side has no BF16 gen consumer)."
+                "policy.megatron_cfg.fp8_cfg.enabled=True."
             )
+        if backend == "vllm":
+            gen_precision = vllm_cfg.get("precision", None)
+            if gen_precision not in (
+                None,
+                "auto",
+                "bf16",
+                "bfloat16",
+                "fp8",
+                "half",
+                "float16",
+                "float",
+                "float32",
+            ):
+                violations.append(
+                    f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
+                    "supported by nccl_reshard_refit (use 'auto', 'bf16'/'bfloat16', "
+                    "'half'/'float16', 'float'/'float32', 'fp8', or leave unset)."
+                )
+            # FlashInfer's MXFP8 quantizer accepts BF16/FP16 inputs. Quantized
+            # sources use BF16 on the wire; unquantized sources keep their dtype.
+            if (
+                gen_precision == "fp8"
+                and vllm_cfg.get("is_mx", False)
+                and not fp8_param
+                and policy.get("precision") not in ("bfloat16", "float16")
+            ):
+                violations.append(
+                    "policy.generation.vllm_cfg.is_mx=True with unquantized training "
+                    "storage requires policy.precision='bfloat16' or 'float16' "
+                    f"(got {policy.get('precision')!r}); vLLM's MXFP8 quantizer "
+                    "rejects FP32 wire buffers."
+                )
+            if is_blockwise_fp8_param_storage(fp8_cfg) and (
+                gen_precision != "fp8" or vllm_cfg.get("is_mx", False)
+            ):
+                # This matches the source's _is_fp8_export condition. Its misc
+                # stream still carries physical FP8 weights and scale_inv;
+                # canonical BF16 bulk hooks do not convert those other weights.
+                violations.append(
+                    "Blockwise FP8 training storage requires "
+                    "policy.generation.vllm_cfg.precision='fp8' and is_mx=False "
+                    "because the unchanged misc refit stream contains physical "
+                    "FP8 weights and scale_inv tensors."
+                )
 
-    # Gen-backend restrictions.  The reshard supports gen-side TP, DP, and EP;
-    # the vLLM backend shards experts by index across its TP ranks, so its EP
-    # is either 1 (TP-sharded experts) or equal to TP (EP-sharded).  PP is not
-    # yet supported gen-side.
-    if generation.get("backend") == "vllm":
+        if backend == "megatron":
+            gen_pp = mcore_generation_cfg.get("pipeline_model_parallel_size", 1)
+            if gen_pp != 1:
+                violations.append(
+                    "policy.generation.mcore_generation_config."
+                    "pipeline_model_parallel_size must be 1 for nccl_reshard refit "
+                    f"(got {gen_pp})."
+                )
+
+            gen_fp8_cfg = mcore_generation_cfg.get("fp8_cfg", {}) or {}
+            if gen_fp8_cfg.get("enabled") and gen_fp8_cfg.get("fp8_recipe") not in (
+                "mxfp8",
+                "blockwise",
+            ):
+                violations.append(
+                    "Megatron-generation nccl_reshard refit supports BF16, MXFP8, or blockwise FP8 "
+                    "inference weights; policy.generation.mcore_generation_config."
+                    "fp8_cfg.fp8_recipe must be 'mxfp8' or 'blockwise' when FP8 is enabled."
+                )
+
+            if (
+                gen_fp8_cfg.get("enabled")
+                and gen_fp8_cfg.get("fp8_recipe") == "blockwise"
+                and mcore_generation_cfg.get("transformer_impl")
+                == "inference_optimized"
+            ):
+                violations.append(
+                    "Blockwise FP8 Megatron destinations require Transformer Engine "
+                    "storage, not transformer_impl='inference_optimized'."
+                )
+
+            # TE caches FP8 compute weights from ordinary parameters after the
+            # first inference forward. Refits do not reset is_first_microbatch.
+            if (
+                gen_fp8_cfg.get("enabled")
+                and not gen_fp8_cfg.get("fp8_param")
+                and mcore_generation_cfg.get("transformer_impl")
+                != "inference_optimized"
+                and not (mcore_generation_cfg.get("model_overrides") or {}).get(
+                    "disable_parameter_transpose_cache"
+                )
+            ):
+                violations.append(
+                    "FP8 Megatron generation with Transformer Engine layers requires "
+                    "fp8_cfg.fp8_param=True or "
+                    "model_overrides.disable_parameter_transpose_cache=True in "
+                    "policy.generation.mcore_generation_config for nccl_reshard "
+                    "refit, so inference does not reuse stale cached FP8 weights. "
+                    "A generation-side model_overrides replaces "
+                    "policy.megatron_cfg.model_overrides, so copy those keys into it."
+                )
+
+    # Gen-backend restrictions. The reshard supports gen-side TP, DP, EP, and
+    # Megatron ETP. The vLLM backend shards experts by index across
+    # its TP ranks, so its EP is either 1 (TP-sharded experts) or equal to TP
+    # (EP-sharded). PP is not yet supported gen-side.
+    if backend == "vllm":
         gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
+        # Megatron-source ETP has unit coverage but has not been fully tested
+        # end to end with a vLLM destination. Keep it disabled until it has.
+        train_etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
+        if train_etp != 1:
+            violations.append(
+                "policy.megatron_cfg.expert_tensor_parallel_size must be 1 "
+                "for a vLLM destination with nccl_reshard refit "
+                f"(got {train_etp})."
+            )
         if gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
                 "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
@@ -781,7 +857,8 @@ def build_nccl_reshard_refit_info(
     Args:
         state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
             The input ``state_dict_metadata`` has a global view of the parameters
-        train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
+        train_parallelism / gen_parallelism:
+            ``{"tp_size", "ep_size", "etp_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
@@ -804,15 +881,15 @@ def build_nccl_reshard_refit_info(
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)
     ep_size = train_parallelism.get("ep_size", 1)
+    etp_size = train_parallelism.get("etp_size", 1)
     use_per_stage = pp_size > 1
     if use_per_stage:
         assert layer_to_pp_stage is not None, (
             "layer_to_pp_stage must be provided when pp_size > 1"
         )
 
-    # Currently we don't support ETP>1 for the nccl_reshard_refit.
-    # Non-expert params, ranks are partitioned (tp, dp);
-    # Expert params, ranks are partitioned (ep, edp).
+    # Non-expert params partition ranks by (tp, dp); expert params partition
+    # them by (etp, ep, edp), matching MCore's separate expert rank grid.
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
         non_expert_mesh, non_expert_dim_map = build_mesh_info(
             num_gpus,
@@ -824,23 +901,22 @@ def build_nccl_reshard_refit_info(
         expert_mesh, expert_dim_map = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
-            tp_size=1,
+            tp_size=etp_size,
             ep_size=ep_size,
             pp_size=stage_pp,
         )
         return (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map)
 
     # Gen (dst) side.  Non-expert params are TP-sharded across the gen ranks.
-    # Expert params follow the gen-side expert-parallel size:
-    #   * gen ep_size == 1 -> experts are TP-sharded like dense (shared mesh).
-    #   * gen ep_size > 1  -> experts are EP-sharded by expert index (Shard(0))
-    #     over the EP ranks (tp_size=1, ep_size=gen_ep).
-    # Mirrors the train (src) expert/non-expert mesh split.
-    # TODO: current logic might be tied to the vllm-backend. The logic might need
-    # to be revised when we support other gen-backends.
-    gen_tp = gen_parallelism.get("tp_size", 1)
-    gen_ep = gen_parallelism.get("ep_size", 1)
-    gen_pp = gen_parallelism.get("pp_size", 1)
+    # Expert params follow the generation backend's EP/ETP layout. vLLM uses
+    # TP for experts when EP=1, whereas Megatron can keep ETP=1 and replicate
+    # experts across its ordinary TP ranks.
+    gen_tp = gen_parallelism.get("tp_size", 1) or 1
+    gen_ep = gen_parallelism.get("ep_size", 1) or 1
+    # Bind to a definite int: _build_dst_meshes closes over this, and a
+    # narrowed-in-place Optional would still read as int | None inside it.
+    gen_etp = gen_parallelism.get("etp_size", gen_tp if gen_ep == 1 else 1)
+    gen_pp = gen_parallelism.get("pp_size", 1) or 1
 
     def _build_dst_meshes(num_gpus: int, rank_offset: int):
         non_expert = build_mesh_info(
@@ -850,16 +926,13 @@ def build_nccl_reshard_refit_info(
             ep_size=1,
             pp_size=gen_pp,
         )
-        if gen_ep > 1:
-            expert = build_mesh_info(
-                num_gpus,
-                rank_offset=rank_offset,
-                tp_size=1,
-                ep_size=gen_ep,
-                pp_size=gen_pp,
-            )
-        else:
-            expert = non_expert
+        expert = build_mesh_info(
+            num_gpus,
+            rank_offset=rank_offset,
+            tp_size=gen_etp,
+            ep_size=gen_ep,
+            pp_size=gen_pp,
+        )
         return non_expert, expert
 
     if use_per_stage:
@@ -942,8 +1015,8 @@ def build_nccl_reshard_refit_info(
 
         # Propagate the grouped-expert projection tag (gate_proj/up_proj/
         # down_proj) so the train side stacks the matching per-expert tensors
-        # (_group_experts) and the gen backend maps the grouped HF param into
-        # its own fused layout (w13/w2).
+        # (MegatronReshardParamSpecCollection._grouped_expert_spec) and the gen
+        # backend maps the grouped HF param into its own fused layout (w13/w2).
         if "grouped_expert_proj" in meta:
             info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 

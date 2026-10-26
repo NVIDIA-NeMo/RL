@@ -18,13 +18,12 @@ LoRA is implemented on two training backends, each with its own config schema:
 
 | Backend | Config path | Notes |
 | --- | --- | --- |
-| **DTensor (Automodel)** | `policy.dtensor_cfg.lora_cfg` | Requires DTensor v2 (`policy.dtensor_cfg._v2=true`). DTensor v1 does **not** support LoRA. This is the default backend. |
-| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.dtensor_cfg.enabled=false`). |
+| **Automodel** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
+| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.automodel_cfg.enabled=false`). |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
 ```{note}
-On the DTensor backend, Triton-optimized LoRA kernels are only used in the DTensor v2 path.
 Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so set
 `use_triton: false` in that case (see the parameter details below).
 ```
@@ -34,7 +33,7 @@ Automodel does not support Triton kernels when `tensor_parallel_size > 1`, so se
 The two backends share most of their fields but differ in a few backend-specific options.
 The table below maps equivalent fields and highlights the differences.
 
-| Concept | DTensor (`lora_cfg`) | Megatron (`peft`) |
+| Concept | Automodel (`lora_cfg`) | Megatron (`peft`) |
 | --- | --- | --- |
 | Enable LoRA | `enabled` | `enabled` |
 | Modules to adapt | `target_modules` | `target_modules` |
@@ -49,18 +48,18 @@ The table below maps equivalent fields and highlights the differences.
 | Optimized kernels | `use_triton` | — |
 | Adapter dtype | _(follows base layer)_ | `lora_dtype` |
 | Experimental A2A comm | — | `a2a_experimental` |
+| Share adapters across grouped MoE experts | — | `share_expert_adapters` |
 | Warm start from a donor adapter | `restore_from` (adapter directory) | `restore_from` (Megatron `iter_*` checkpoint) |
 
 The effective learning-rate multiplier for the adapter is `alpha / dim` on both backends.
 
-## DTensor Configuration
+## Automodel Configuration
 
-LoRA settings live under `policy.dtensor_cfg.lora_cfg`:
+LoRA settings live under `policy.automodel_cfg.lora_cfg`:
 
 ```yaml
 policy:
-  dtensor_cfg:
-    _v2: true                   # LoRA requires DTensor v2
+  automodel_cfg:
     lora_cfg:
       enabled: False            # Set to True to enable LoRA fine-tuning
       target_modules: []        # List of module names to apply LoRA
@@ -71,11 +70,11 @@ policy:
       dropout: 0.0              # Dropout probability for LoRA layers
       dropout_position: "post"  # Dropout position: "pre" or "post"
       lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
-      use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
+      use_triton: true          # Use Triton-optimized kernels
       restore_from: null        # Warm start from a donor adapter checkpoint (see below)
 ```
 
-### DTensor Parameter Details
+### Automodel Parameter Details
 
 - **`enabled`** (bool): Whether to enable LoRA training.
 - **`target_modules`** (list): Specific module names to apply LoRA. Empty with `match_all_linear=true` applies to all linear layers.
@@ -86,7 +85,7 @@ policy:
 - **`dropout`** (float): Dropout probability for regularization.
 - **`dropout_position`** (str): Apply dropout before (`"pre"`) or after (`"post"`) LoRA.
 - **`lora_A_init`** (str): Initialization method for the LoRA A matrix (`"xavier"` or `"uniform"`). The B matrix is always initialized to zero.
-- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
+- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
 - **`restore_from`** (str, optional): Path to a donor PEFT adapter checkpoint (a directory containing `adapter_model.safetensors` + `adapter_config.json`, e.g. a previous run's `step_*/policy/weights`) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
 ## Megatron Configuration
@@ -108,6 +107,7 @@ policy:
       lora_B_init_method: "zero"    # Initialization method for lora B: "zero"
       a2a_experimental: false       # Enables the experimental All-to-All (A2A) communication strategy
       lora_dtype: None              # Adapter weights dtype
+      share_expert_adapters: true   # Share one adapter across grouped MoE experts on each EP rank
       restore_from: null            # Warm start from a donor PEFT checkpoint (see below)
 ```
 
@@ -130,6 +130,7 @@ policy:
 - **`lora_B_init_method`** (str): Initialization method for the low-rank matrix B. Defaults to `"zero"`.
 - **`a2a_experimental`** (bool): Enables the experimental All-to-All (A2A) communication strategy. Defaults to `False`.
 - **`lora_dtype`** (torch.dtype): Adapter weights dtype. By default it follows `orig_linear`'s dtype, but for quantized weights (e.g. 4-bit) it must be specified explicitly.
+- **`share_expert_adapters`** (bool): Share one adapter across all grouped MoE experts on each expert-parallel rank. Set to `false` to create one adapter per local expert. Defaults to `true` for backward compatibility.
 - **`restore_from`** (str, optional): Path to a donor Megatron-Bridge PEFT checkpoint (an `iter_XXXXXXX` directory, or a checkpoint root resolving to one) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
 ## Warm-Starting from a LoRA Checkpoint
@@ -137,13 +138,13 @@ policy:
 `restore_from` initializes this run's adapters from a donor PEFT checkpoint, e.g. to carry an
 SFT LoRA into GRPO. The accepted path format differs by backend:
 
-- **DTensor (Automodel)**: `policy.dtensor_cfg.lora_cfg.restore_from` — a directory containing
+- **Automodel**: `policy.automodel_cfg.lora_cfg.restore_from` — a directory containing
   `adapter_model.safetensors` + `adapter_config.json` (a previous run's `step_*/policy/weights`
   or its `model/` subdirectory).
 - **Megatron Core**: `policy.megatron_cfg.peft.restore_from` — a native Megatron `iter_XXXXXXX`
   directory, or a checkpoint root containing one.
 
-The donor's `dim`/`alpha` must match this run's. On DTensor, a donor's recorded
+The donor's `dim`/`alpha` must match this run's. On Automodel, a donor's recorded
 `base_model_name_or_path` (unless absent, empty, or `N/A`) must also equal this run's
 `policy.model_name` as an exact string: an HF repo ID and a local path for the same model
 will not match, nor will a model moved to a different path. Setup fails loudly otherwise. Optimizer, RNG,
@@ -155,10 +156,10 @@ policy still anchors to the warm-started (donor) adapters, not to the bare base 
 
 ### SFT
 
-The config uses the DTensor backend by default, so DTensor LoRA only requires enabling the flag:
+The config uses the Automodel backend by default, so Automodel LoRA only requires enabling the flag:
 
 ```bash
-uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_sft.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 To use the Megatron backend, switch backends and enable the PEFT block:
@@ -166,7 +167,7 @@ To use the Megatron backend, switch backends and enable the PEFT block:
 ```sh
 uv run examples/run_sft.py \
   --config examples/configs/sft.yaml \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   policy.megatron_cfg.enabled=true \
   policy.megatron_cfg.peft.enabled=true
 ```
@@ -175,13 +176,13 @@ See the [SFT guide](sft.md) for the full SFT workflow.
 
 ### GRPO
 
-GRPO supports LoRA on both backends. Enable the DTensor adapter with:
+GRPO supports LoRA on both backends. Enable the Automodel adapter with:
 
 ```bash
-uv run examples/run_grpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-The DTensor GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
+The Automodel GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
 weights are merged into the base linear weights. This improves performance at the cost of a
 small train/inference mismatch that we consider acceptable. If you require strict
 train/inference parity, use the
@@ -193,12 +194,12 @@ See the [GRPO guide](grpo.md) for the full GRPO workflow.
 
 ### DPO
 
-DPO fully supports LoRA on **both** the DTensor and Megatron backends, using the same
+DPO fully supports LoRA on **both** the Automodel and Megatron backends, using the same
 `lora_cfg` / `peft` config blocks as SFT and GRPO. There is no dedicated DPO LoRA recipe;
-enable it on an existing DPO config via an override. For the DTensor backend:
+enable it on an existing DPO config via an override. For the Automodel backend:
 
 ```bash
-uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+uv run examples/run_dpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
 For the Megatron backend:
@@ -206,7 +207,7 @@ For the Megatron backend:
 ```bash
 uv run examples/run_dpo.py \
   --config examples/configs/dpo.yaml \
-  policy.dtensor_cfg.enabled=false \
+  policy.automodel_cfg.enabled=false \
   policy.megatron_cfg.enabled=true \
   policy.megatron_cfg.peft.enabled=true
 ```
@@ -219,12 +220,12 @@ Ready-to-run LoRA recipes live under `examples/configs/recipes/llm/`:
 
 | Recipe | Algorithm | Backend |
 | --- | --- | --- |
-| [`sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-fsdp2tp1-lora.yaml) | SFT | DTensor |
+| [`sft-llama3.1-8b-1n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-automodel-lora.yaml) | SFT | Automodel |
 | [`sft-llama3.1-8b-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/sft-llama3.1-8b-1n8g-megatron-lora.yaml) | SFT | Megatron |
-| [`sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | SFT | DTensor |
-| [`grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`sft-nanov3-30BA3B-2n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-lora.yaml) | SFT | Automodel |
+| [`grpo-qwen3-8B-base-1n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8B-base-1n8g-automodel-lora.yaml) | GRPO | Automodel |
 | [`grpo-qwen3-8b-base-1n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.yaml) | GRPO | Megatron |
-| [`grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) | GRPO | DTensor |
+| [`grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-automodel-lora.yaml) | GRPO | Automodel |
 | [`grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml`](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml) | GRPO | Megatron |
 
 DPO LoRA is supported on both backends but ships no dedicated recipe — enable it on an existing DPO config with the overrides shown in [Usage by Algorithm → DPO](#dpo).

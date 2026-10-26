@@ -14,7 +14,7 @@
 
 """Unit tests for the WeightSynchronizer abstraction and its implementations."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -28,8 +28,14 @@ from nemo_rl.models.generation.interfaces import CollectiveSenderSpec
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
-from nemo_rl.weight_sync.factory import create_weight_synchronizer
-from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
+from nemo_rl.weight_sync.interfaces import (
+    WeightSynchronizer,
+    initialize_refit_metadata,
+)
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
@@ -52,14 +58,21 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
 
 def _mock_policy(**overrides):
     policy = MagicMock()
+    policy.sync_params_before_refit.return_value = None
     policy.offload_before_refit.return_value = None
     policy.offload_after_refit.return_value = None
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
     policy.stream_weights_via_ipc_zmq.return_value = [MagicMock()]
-    policy.cfg = {"megatron_cfg": {"enabled": False}}
+    policy.cfg = {
+        "megatron_cfg": {"enabled": False},
+        "offload_policy_before_refit": False,
+    }
     policy.broadcast_weights_for_collective.return_value = [MagicMock()]
     policy.init_collective.return_value = [MagicMock()]
     policy.get_free_memory_bytes.return_value = 1024**3  # 1 GB
+    cfg = overrides.pop("cfg", None)
+    if cfg is not None:
+        policy.cfg.update(cfg)
     for k, v in overrides.items():
         setattr(policy, k, v)
     return policy
@@ -74,12 +87,11 @@ def _mock_generation(**overrides):
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.init_collective.return_value = [MagicMock()]
-    # A real worker group, because the reshard transport now derives its refit
-    # membership from dp_size and the worker count. Left as bare MagicMocks these
-    # reach the rank arithmetic and fail there, on a comparison, several frames from
-    # the cause.
-    gen.worker_group.dp_size = 1
-    gen.worker_group.workers = [MagicMock()]
+    # Real numbers, not MagicMocks: both NCCL transports derive their refit membership
+    # from dp_size and the worker count, so bare MagicMocks reach the rank arithmetic and
+    # fail there, on a comparison, several frames from the cause.
+    gen.worker_group.dp_size = 2
+    gen.worker_group.workers = [MagicMock(), MagicMock()]
     gen.get_collective_sender_spec.return_value = CollectiveSenderSpec()
     gen.get_inference_world_size.return_value = None
     for k, v in overrides.items():
@@ -113,6 +125,74 @@ class TestWeightSynchronizerABC:
 
 
 # ---------------------------------------------------------------------------
+# Shared refit metadata handshake
+# ---------------------------------------------------------------------------
+
+
+class TestInitializeRefitMetadata:
+    def test_returns_when_generation_does_not_request_prequantization(self):
+        policy = _mock_policy()
+        generation = _mock_generation()
+        state_dict_info = policy.prepare_refit_info.return_value
+
+        initialize_refit_metadata(policy, generation)
+
+        policy.prepare_refit_info.assert_called_once_with()
+        generation.prepare_refit_info.assert_called_once_with(state_dict_info)
+        policy.enable_refit_prequantize.assert_not_called()
+
+    def test_rejects_prequantization_without_megatron(self):
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": False}}
+        generation = _mock_generation()
+        generation.prepare_refit_info.return_value = ["layer_0"]
+
+        with pytest.raises(ValueError, match="requires the Megatron policy backend"):
+            initialize_refit_metadata(policy, generation)
+
+        policy.enable_refit_prequantize.assert_not_called()
+
+    def test_refreshes_generation_metadata_after_prequantization(self):
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": True}}
+        generation = _mock_generation()
+        state_dict_info = policy.prepare_refit_info.return_value
+        updated_info = {
+            "layer_0": {
+                "shape": [4096, 4096],
+                "dtype": "float8_e4m3fn",
+            },
+            "layer_0_scale_from_checkpoint": {
+                "shape": [4096, 128],
+                "dtype": "uint8",
+            },
+        }
+        generation.prepare_refit_info.side_effect = [["layer_0"], None]
+        policy.enable_refit_prequantize.return_value = updated_info
+
+        initialize_refit_metadata(policy, generation)
+
+        policy.enable_refit_prequantize.assert_called_once_with(["layer_0"])
+        assert generation.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]
+
+    def test_rejects_missing_prequantized_metadata(self):
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": True}}
+        policy.enable_refit_prequantize.return_value = None
+        generation = _mock_generation()
+        generation.prepare_refit_info.return_value = ["layer_0"]
+
+        with pytest.raises(
+            RuntimeError,
+            match="did not return updated metadata",
+        ):
+            initialize_refit_metadata(policy, generation)
+
+
+# ---------------------------------------------------------------------------
 # IPCWeightSynchronizer
 # ---------------------------------------------------------------------------
 
@@ -122,13 +202,14 @@ class TestIPCWeightSynchronizer:
     def test_sync_weights_calls_full_lifecycle(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
-        gen = _mock_generation()
+        gen = _mock_generation(cfg={"backend": "vllm"})
         sync = IPCWeightSynchronizer(policy, gen)
 
         assert sync.is_stale
         sync.sync_weights()
         assert not sync.is_stale
 
+        policy.sync_params_before_refit.assert_not_called()
         policy.offload_before_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
         policy.stream_weights_via_ipc_zmq.assert_called_once()
@@ -193,8 +274,33 @@ class TestIPCWeightSynchronizer:
         sync = IPCWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once()
-        gen.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
+        )
+
+    def test_init_communicator_completes_prequantization_handshake(self):
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": True}}
+        updated_info = {
+            "layer_0": {
+                "shape": [4096, 4096],
+                "dtype": "float8_e4m3fn",
+            }
+        }
+        policy.enable_refit_prequantize.return_value = updated_info
+        gen = _mock_generation()
+        state_dict_info = policy.prepare_refit_info.return_value
+        gen.prepare_refit_info.side_effect = [["layer_0"], None]
+        sync = IPCWeightSynchronizer(policy, gen)
+
+        sync.init_communicator()
+
+        policy.enable_refit_prequantize.assert_called_once_with(["layer_0"])
+        assert gen.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
@@ -244,16 +350,28 @@ class TestIPCWeightSynchronizer:
 _SGLANG_RAY = "nemo_rl.weight_sync.sglang_weight_synchronizer.ray"
 
 
-def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantization=None):
+def _mock_sglang_generation(
+    num_new_engines: int = 0,
+    pause_mode: str = "retract",
+    quantization: dict[str, str] | None = None,
+    *,
+    use_fault_tolerance: bool = False,
+) -> MagicMock:
     gen = _mock_generation()
     if quantization is None:
         quantization = {"scheme": "bf16"}
-    gen.sglang_cfg = {"sglang_cfg": {"quantization": quantization}}
+    gen.sglang_cfg = {
+        "sglang_cfg": {
+            "quantization": quantization,
+            "sglang_fault_tolerance_config": {
+                "use_fault_tolerance": use_fault_tolerance,
+            },
+        }
+    }
     gen.pause_generation_mode = pause_mode
     gen.invalidate_kv_cache.return_value = True
-    gen.get_updatable_engines_and_lock.return_value = (
+    gen.get_updatable_engines.return_value = (
         [MagicMock(), MagicMock()],
-        MagicMock(),
         num_new_engines,
         [2, 2],
         [0, 2],
@@ -263,6 +381,101 @@ def _mock_sglang_generation(num_new_engines=0, pause_mode="retract", quantizatio
 
 def _megatron_policy():
     return _mock_policy(cfg={"megatron_cfg": {"enabled": True}})
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@patch(_SGLANG_RAY)
+def test_sglang_refit_recovers_before_reading_engine_state(
+    mock_ray: MagicMock,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+) -> None:
+    policy = _megatron_policy()
+    gen = _mock_sglang_generation(use_fault_tolerance=True)
+    lifecycle = MagicMock()
+    lifecycle.attach_mock(policy, "policy")
+    lifecycle.attach_mock(gen, "generation")
+    recovered_engines = [MagicMock(), MagicMock()]
+
+    def recover_engines() -> None:
+        gen.get_updatable_engines.return_value = (
+            recovered_engines,
+            2,
+            [1, 3],
+            [0, 1],
+        )
+
+    gen.recover_updatable_engines.side_effect = recover_engines
+    synchronizer_cls(policy, gen).sync_weights()
+
+    policy.sync_params_before_refit.assert_not_called()
+    gen.recover_updatable_engines.assert_called_once_with()
+    gen.assert_has_calls(
+        [
+            call.recover_updatable_engines(),
+            call.prepare_for_generation(tags=["weights"]),
+            call.get_updatable_engines(),
+        ]
+    )
+    gen.clear_updatable_num_new_engines.assert_called_once_with()
+    if synchronizer_cls is SGLangColocatedWeightSynchronizer:
+        lifecycle.assert_has_calls(
+            [
+                call.policy.offload_before_refit(),
+                call.generation.recover_updatable_engines(),
+                call.generation.prepare_for_generation(tags=["weights"]),
+            ]
+        )
+        policy.connect_sglang_rollout_engines.assert_called_once_with(
+            engine_gpu_counts=[1, 3], engine_gpu_offsets=[0, 1]
+        )
+        transfer = policy.update_weights_to_sglang_colocated
+    else:
+        policy.connect_sglang_rollout_engines_distributed.assert_called_once_with(
+            rollout_engines=recovered_engines, engine_gpu_counts=[1, 3]
+        )
+        transfer = policy.update_weights_to_sglang_distributed
+    assert transfer.call_args.kwargs["rollout_engines"] == recovered_engines
+
+
+@pytest.mark.parametrize(
+    "synchronizer_cls",
+    [SGLangColocatedWeightSynchronizer, SGLangDisaggregatedWeightSynchronizer],
+)
+@patch(_SGLANG_RAY)
+def test_sglang_recovery_failure_stops_refit_before_engine_rpcs(
+    mock_ray: MagicMock,
+    synchronizer_cls: type[
+        SGLangColocatedWeightSynchronizer | SGLangDisaggregatedWeightSynchronizer
+    ],
+) -> None:
+    policy = _megatron_policy()
+    gen = _mock_sglang_generation(use_fault_tolerance=True)
+    gen.recover_updatable_engines.side_effect = RuntimeError("recovery failed")
+    sync = synchronizer_cls(policy, gen)
+
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        sync.sync_weights()
+
+    gen.recover_updatable_engines.assert_called_once_with()
+    gen.get_updatable_engines.assert_not_called()
+    gen.prepare_for_generation.assert_not_called()
+    gen.pause_generation.assert_not_called()
+    gen.begin_weight_update.assert_not_called()
+    gen.continue_generation.assert_not_called()
+    policy.update_weights_to_sglang_colocated.assert_not_called()
+    policy.update_weights_to_sglang_distributed.assert_not_called()
+    if synchronizer_cls is SGLangColocatedWeightSynchronizer:
+        policy.offload_before_refit.assert_called_once_with()
+        policy.offload_after_refit.assert_called_once_with()
+    else:
+        policy.offload_before_refit.assert_not_called()
+        policy.offload_after_refit.assert_not_called()
+    assert sync.is_stale
 
 
 @patch(_SGLANG_RAY)
@@ -275,7 +488,9 @@ class TestSGLangColocatedWeightSynchronizer:
         assert sync.is_stale
         sync.sync_weights()
         assert not sync.is_stale
+        gen.recover_updatable_engines.assert_not_called()
 
+        policy.sync_params_before_refit.assert_not_called()
         policy.offload_before_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
         gen.pause_generation.assert_called_once_with(mode="retract")
@@ -393,8 +608,10 @@ class TestSGLangColocatedWeightSynchronizer:
         sync = SGLangColocatedWeightSynchronizer(policy, gen)
 
         sync.init_communicator()
-        policy.prepare_refit_info.assert_called_once()
-        gen.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
+        )
 
     def test_phase_restoration_on_transfer_failure(self, mock_ray):
         """The engine session and both sides' phases are restored on failure."""
@@ -457,6 +674,7 @@ class TestSGLangDisaggregatedWeightSynchronizer:
         assert sync.is_stale
         sync.sync_weights()
         assert not sync.is_stale
+        gen.recover_updatable_engines.assert_not_called()
 
         # The trainer keeps its own GPUs; nothing to offload.
         policy.offload_before_refit.assert_not_called()
@@ -514,6 +732,57 @@ class TestSGLangDisaggregatedWeightSynchronizer:
 
 class TestCollectiveWeightSynchronizer:
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_sync_weights_releases_trainer_memory_before_export(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        events = []
+        policy = _mock_policy()
+        gen = _mock_generation()
+        policy.offload_before_refit.side_effect = lambda: events.append(
+            "offload_before_refit"
+        )
+        gen.get_collective_sender_spec.side_effect = lambda: (
+            events.append("get_collective_sender_spec") or CollectiveSenderSpec()
+        )
+        policy.broadcast_weights_for_collective.side_effect = lambda **_: (
+            events.append("broadcast_weights_for_collective") or [MagicMock()]
+        )
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(),
+            _mock_cluster(),
+            offload_policy_before_refit=True,
+        )
+
+        sync.sync_weights()
+        sync.sync_weights()
+
+        assert events == [
+            "offload_before_refit",
+            "get_collective_sender_spec",
+            "broadcast_weights_for_collective",
+            "offload_before_refit",
+            "get_collective_sender_spec",
+            "broadcast_weights_for_collective",
+        ]
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_sync_weights_keeps_trainer_memory_when_release_is_disabled(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            _mock_generation(),
+            _mock_cluster(),
+            _mock_cluster(),
+            offload_policy_before_refit=False,
+        )
+
+        sync.sync_weights()
+
+        policy.offload_before_refit.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_sync_weights_calls_broadcast_and_receive(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -528,11 +797,13 @@ class TestCollectiveWeightSynchronizer:
         sync.sync_weights()
         assert not sync.is_stale
 
+        policy.sync_params_before_refit.assert_not_called()
         policy.broadcast_weights_for_collective.assert_called_once_with(
             kv_scales=None,
             refit_timeout_s=None,
             buffer_size_bytes=None,
             num_buffers=None,
+            use_legacy_packing=False,
         )
         gen.update_weights_from_collective.assert_called_once()
 
@@ -578,14 +849,47 @@ class TestCollectiveWeightSynchronizer:
         )
         sync.init_communicator()
 
-        policy.prepare_refit_info.assert_called_once()
-        gen.prepare_refit_info.assert_called_once()
+        policy.prepare_refit_info.assert_called_once_with()
+        gen.prepare_refit_info.assert_called_once_with(
+            policy.prepare_refit_info.return_value
+        )
         policy.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4, nccl_peer="nemo"
         )
         gen.init_collective.assert_called_once_with(
             "10.0.0.1", 29500, 6, train_world_size=4
         )
+
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    def test_init_communicator_prequantizes_before_collective_setup(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.cfg = {"megatron_cfg": {"enabled": True}}
+        updated_info = {
+            "layer_0": {
+                "shape": [4096, 4096],
+                "dtype": "float8_e4m3fn",
+            }
+        }
+        policy.enable_refit_prequantize.return_value = updated_info
+        gen = _mock_generation()
+        state_dict_info = policy.prepare_refit_info.return_value
+        gen.prepare_refit_info.side_effect = [["layer_0"], None]
+        sync = CollectiveWeightSynchronizer(
+            policy,
+            gen,
+            _mock_cluster(world_size=4),
+            _mock_cluster(world_size=2),
+        )
+
+        sync.init_communicator()
+
+        policy.enable_refit_prequantize.assert_called_once_with(["layer_0"])
+        assert gen.prepare_refit_info.call_args_list == [
+            call(state_dict_info),
+            call(updated_info),
+        ]
+        policy.init_collective.assert_called_once()
 
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
     def test_backend_sender_contract_controls_geometry_and_world_size(self, mock_ray):
@@ -596,6 +900,7 @@ class TestCollectiveWeightSynchronizer:
             nccl_peer="vllm",
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
         gen.get_inference_world_size.return_value = 8
         sync = CollectiveWeightSynchronizer(
@@ -619,6 +924,7 @@ class TestCollectiveWeightSynchronizer:
             refit_timeout_s=None,
             buffer_size_bytes=1024**3,
             num_buffers=2,
+            use_legacy_packing=True,
         )
 
 
@@ -628,6 +934,24 @@ class TestCollectiveWeightSynchronizer:
 
 
 class TestNcclReshardWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_sync_weights_leaves_policy_param_sync_to_caller(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.nccl_reshard_refit.return_value = [MagicMock()]
+        gen = _mock_generation(cfg={"backend": "vllm"})
+        gen.nccl_reshard_refit.return_value = [MagicMock()]
+        sync = NcclReshardWeightSynchronizer(
+            policy, gen, _mock_cluster(), _mock_cluster()
+        )
+
+        sync.sync_weights()
+
+        policy.sync_params_before_refit.assert_not_called()
+        policy.nccl_reshard_refit.assert_called_once_with(
+            kv_scales=None, refit_timeout_s=None
+        )
+
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
     def test_init_communicator_ships_wire_safe_refit_info(self, mock_ray):
         # The train-side refit info carries MeshInfo rank tensors; the copy
@@ -653,12 +977,15 @@ class TestNcclReshardWeightSynchronizer:
                     "expert_model_parallel_size": 1,
                     "pipeline_model_parallel_size": 1,
                 },
-                "generation": {"vllm_cfg": {"tensor_parallel_size": 4}},
+                "generation": {
+                    "backend": "vllm",
+                    "vllm_cfg": {"tensor_parallel_size": 4},
+                },
             },
         )
         policy.init_nccl_reshard_comm_group.return_value = [MagicMock()]
         policy.prepare_nccl_reshard_refit_info.return_value = refit_info
-        gen = _mock_generation()
+        gen = _mock_generation(cfg={"backend": "vllm"})
         gen.init_nccl_reshard_comm_group.return_value = [MagicMock()]
         # tp_size=4 over a 4-GPU generation world -> one DP shard.
         gen.worker_group.dp_size = 1
@@ -676,7 +1003,12 @@ class TestNcclReshardWeightSynchronizer:
         )
         sync.init_communicator()
 
-        policy.prepare_nccl_reshard_refit_info.assert_called_once()
+        policy.prepare_nccl_reshard_refit_info.assert_called_once_with(
+            {"tp_size": 2, "ep_size": 1, "etp_size": 2, "pp_size": 1},
+            {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
+            2,
+            4,
+        )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
         (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
         for params in shipped["per_layer_params"].values():
@@ -688,12 +1020,47 @@ class TestNcclReshardWeightSynchronizer:
 
     def test_shutdown_drops_the_generation_handle(self):
         sync = NcclReshardWeightSynchronizer(
-            _mock_policy(), _mock_generation(), _mock_cluster(), _mock_cluster()
+            _mock_policy(),
+            _mock_generation(cfg={"backend": "vllm"}),
+            _mock_cluster(),
+            _mock_cluster(),
         )
 
         sync.shutdown()
 
         assert sync._generation is None
+
+    @pytest.mark.parametrize(
+        ("offload_policy_before_refit", "expected_events"),
+        [
+            (False, ["nccl_reshard_refit"]),
+            (True, ["offload_before_refit", "nccl_reshard_refit"]),
+        ],
+    )
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_sync_weights_propagates_refit_memory_release(
+        self, mock_ray, offload_policy_before_refit, expected_events
+    ):
+        mock_ray.get.return_value = [True]
+        events = []
+        policy = _mock_policy()
+        policy.offload_before_refit.side_effect = lambda: events.append(
+            "offload_before_refit"
+        )
+        policy.nccl_reshard_refit.side_effect = lambda **_: (
+            events.append("nccl_reshard_refit") or [MagicMock()]
+        )
+        sync = NcclReshardWeightSynchronizer(
+            policy,
+            _mock_generation(cfg={"backend": "vllm"}),
+            _mock_cluster(),
+            _mock_cluster(),
+            offload_policy_before_refit=offload_policy_before_refit,
+        )
+
+        sync.sync_weights()
+
+        assert events == expected_events
 
 
 # ---------------------------------------------------------------------------
@@ -702,17 +1069,22 @@ class TestNcclReshardWeightSynchronizer:
 
 
 def _mock_megatron_generation(
-    refit_backend: str = "nccl",
-    offload_policy_before_refit: bool = False,
+    refit_backend: str | None = "nccl",
+    *,
+    refit_execution_batch_bytes: int | None = 123,
+    refit_transport: str | None = "mcore",
     **overrides,
 ):
     gen = _mock_generation(**overrides)
     gen.cfg = {
+        "backend": "megatron",
+        "refit_transport": refit_transport,
         "mcore_generation_config": {
             "refit_backend": refit_backend,
-            "offload_policy_before_refit": offload_policy_before_refit,
-        }
+            "refit_execution_batch_bytes": refit_execution_batch_bytes,
+        },
     }
+    gen.uses_native_refit = refit_transport == "mcore"
     gen.suspend_for_refit.return_value = None
     gen.resume_after_refit.return_value = None
     gen.preinit_nvshmem_collective.return_value = [MagicMock()]
@@ -728,6 +1100,100 @@ def _mock_megatron_policy(**overrides):
 
 
 class TestMegatronWeightSynchronizer:
+    @patch(
+        "nemo_rl.weight_sync.megatron_weight_synchronizer.NcclReshardWeightSynchronizer"
+    )
+    def test_m2n_refit_delegates_transfer_and_keeps_megatron_lifecycle(
+        self, mock_m2n_cls
+    ):
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation(refit_transport="nccl_reshard")
+        transport = mock_m2n_cls.return_value
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+            refit_timeout_s=17.0,
+        )
+
+        mock_m2n_cls.assert_called_once_with(
+            policy=policy,
+            generation=gen,
+            train_cluster=sync._train_cluster,
+            inference_cluster=sync._inference_cluster,
+            refit_timeout_s=17.0,
+        )
+
+        sync.init_communicator()
+        assert sync.sync_weights(kv_scales={"scale": 1.0}) == {}
+
+        transport.init_communicator.assert_called_once()
+        transport.sync_weights.assert_called_once_with(kv_scales={"scale": 1.0})
+        gen.suspend_for_refit.assert_called_once()
+        policy.sync_params_before_refit.assert_not_called()
+        policy.offload_before_refit.assert_not_called()
+        assert [
+            call.kwargs.get("tags")
+            for call in gen.prepare_for_generation.call_args_list
+        ] == [["weights"], ["kv_cache"]]
+        gen.resume_after_refit.assert_called_once()
+
+    @pytest.mark.parametrize("refit_backend", ["nccl", "nccl_m2n"])
+    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
+    def test_non_colocated_sync_sequence(self, mock_ray, refit_backend):
+        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
+        policy = _mock_megatron_policy()
+        gen = _mock_megatron_generation(refit_backend=refit_backend)
+        sync = MegatronWeightSynchronizer(
+            policy,
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.init_communicator()
+        policy.init_collective_mcore_generation.assert_called_once()
+        assert (
+            policy.init_collective_mcore_generation.call_args.kwargs[
+                "refit_execution_batch_bytes"
+            ]
+            == 123
+        )
+        assert (
+            policy.init_collective_mcore_generation.call_args.kwargs["refit_backend"]
+            == refit_backend
+        )
+        gen.init_collective.assert_called_once()
+        assert "refit_backend" not in gen.init_collective.call_args.kwargs
+
+        assert sync.sync_weights() == {}
+        gen.suspend_for_refit.assert_called_once()
+        policy.sync_params_before_refit.assert_not_called()
+        policy.offload_before_refit.assert_not_called()
+        policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
+        gen.update_weights_from_collective.assert_called_once_with(refit_timeout_s=None)
+        gen.resume_after_refit.assert_called_once()
+        # prepare called for the weights phase and then the kv_cache phase
+        tags = [c.kwargs.get("tags") for c in gen.prepare_for_generation.call_args_list]
+        assert tags == [["weights"], ["kv_cache"]]
+        # no nvshmem preinit on the nccl backend
+        policy.preinit_nvshmem.assert_not_called()
+        assert not sync.is_stale
+
+    def test_native_refit_rejects_unenforceable_deadline_during_setup(self):
+        with pytest.raises(NotImplementedError, match="native MCore refit cannot"):
+            MegatronWeightSynchronizer(
+                _mock_megatron_policy(),
+                _mock_megatron_generation(),
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+                refit_timeout_s=30.0,
+            )
+
     def test_non_colocated_requires_clusters(self):
         with pytest.raises(ValueError):
             MegatronWeightSynchronizer(
@@ -744,42 +1210,13 @@ class TestMegatronWeightSynchronizer:
 
         assert sync.is_stale
         assert sync.sync_weights() == {}
+        policy.sync_params_before_refit.assert_not_called()
         policy.offload_before_refit.assert_called_once()
         # The refit-protocol tag makes the wake bypass the worker's
         # engine-awake early-return (the reshard copy rides this wake).
         gen.prepare_for_generation.assert_called_once_with(tags=["colocated_refit"])
         gen.suspend_for_refit.assert_not_called()
         policy.swap_weights_via_reshard.assert_not_called()
-        assert not sync.is_stale
-
-    @patch("nemo_rl.weight_sync.megatron_weight_synchronizer.ray")
-    def test_non_colocated_sync_sequence(self, mock_ray):
-        mock_ray.get.side_effect = lambda futures: [True for _ in futures]
-        policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation()
-        sync = MegatronWeightSynchronizer(
-            policy,
-            gen,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-
-        sync.init_communicator()
-        policy.init_collective_mcore_generation.assert_called_once()
-        gen.init_collective.assert_called_once()
-
-        assert sync.sync_weights() == {}
-        gen.suspend_for_refit.assert_called_once()
-        policy.offload_before_refit.assert_not_called()
-        policy.swap_weights_via_reshard.assert_called_once_with(is_source=True)
-        gen.update_weights_from_collective.assert_called_once()
-        gen.resume_after_refit.assert_called_once()
-        # prepare called for the weights phase and then the kv_cache phase
-        tags = [c.kwargs.get("tags") for c in gen.prepare_for_generation.call_args_list]
-        assert tags == [["weights"], ["kv_cache"]]
-        # no nvshmem preinit on the nccl backend
-        policy.preinit_nvshmem.assert_not_called()
         assert not sync.is_stale
 
     @pytest.mark.parametrize("offload_policy_before_refit", [False, True])
@@ -789,20 +1226,20 @@ class TestMegatronWeightSynchronizer:
     ) -> None:
         mock_ray.get.side_effect = lambda futures: [True for _ in futures]
         policy = _mock_megatron_policy()
-        gen = _mock_megatron_generation(
-            offload_policy_before_refit=offload_policy_before_refit
-        )
+        gen = _mock_megatron_generation()
         sync = MegatronWeightSynchronizer(
             policy,
             gen,
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
+            offload_policy_before_refit=offload_policy_before_refit,
         )
 
         sync.init_communicator()
         sync.sync_weights()
 
+        policy.sync_params_before_refit.assert_not_called()
         if offload_policy_before_refit:
             policy.offload_before_refit.assert_called_once_with()
         else:
@@ -843,8 +1280,68 @@ class TestMegatronWeightSynchronizer:
             sync.sync_weights()
         assert sync.is_stale
 
+    def test_colocated_rejects_packed_collective_refit(self):
+        """Packed collective refit is unavailable on the colocated wake path."""
+        gen = _mock_megatron_generation(refit_transport=None)
+
+        with pytest.raises(ValueError, match="must be 'mcore' with colocated"):
+            MegatronWeightSynchronizer(_mock_megatron_policy(), gen, colocated=True)
+
+    def test_colocated_allows_mcore_refit_transport(self):
+        gen = _mock_megatron_generation()
+
+        sync = MegatronWeightSynchronizer(_mock_megatron_policy(), gen, colocated=True)
+        assert sync._transport is None
+
+    def test_non_colocated_null_transport_uses_collective_transport(self):
+        gen = _mock_megatron_generation(refit_transport=None)
+        sync = MegatronWeightSynchronizer(
+            _mock_megatron_policy(),
+            gen,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        assert isinstance(sync._transport, CollectiveWeightSynchronizer)
+
 
 class TestFactory:
+    def test_disabled_refit_memory_release_allows_missing_megatron_config(self):
+        policy = _mock_policy()
+        del policy.cfg["megatron_cfg"]
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=_mock_generation(),
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    @pytest.mark.parametrize(
+        ("enabled", "megatron_enabled", "backend", "colocated", "transport"),
+        [
+            (True, True, VLLM_BACKEND, True, None),
+            (True, True, VLLM_BACKEND, False, "http"),
+            (True, True, SGLANG_BACKEND, False, None),
+            (True, False, VLLM_BACKEND, False, None),
+        ],
+    )
+    def test_refit_memory_release_config_rejects_unsupported_setup(
+        self, enabled, megatron_enabled, backend, colocated, transport
+    ):
+        with pytest.raises(ValueError, match="offload_policy_before_refit"):
+            validate_offload_policy_before_refit(
+                enabled=enabled,
+                megatron_enabled=megatron_enabled,
+                generation_backend=backend,
+                colocated=colocated,
+                refit_transport=transport,
+            )
+
     def test_colocated_vllm_returns_ipc(self):
         policy = _mock_policy()
         gen = _mock_generation()
@@ -867,30 +1364,6 @@ class TestFactory:
         )
         assert isinstance(sync, SGLangColocatedWeightSynchronizer)
 
-    def test_colocated_megatron_returns_megatron_synchronizer(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = create_weight_synchronizer(
-            policy=policy,
-            generation=gen,
-            generation_backend=MEGATRON_BACKEND,
-            colocated=True,
-        )
-        assert isinstance(sync, MegatronWeightSynchronizer)
-
-    def test_non_colocated_megatron_returns_megatron_synchronizer(self):
-        policy = _mock_policy()
-        gen = _mock_generation()
-        sync = create_weight_synchronizer(
-            policy=policy,
-            generation=gen,
-            generation_backend=MEGATRON_BACKEND,
-            colocated=False,
-            train_cluster=_mock_cluster(),
-            inference_cluster=_mock_cluster(),
-        )
-        assert isinstance(sync, MegatronWeightSynchronizer)
-
     def test_non_colocated_vllm_returns_collective(self):
         policy = _mock_policy()
         gen = _mock_generation()
@@ -903,6 +1376,185 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    def test_colocated_megatron_returns_megatron_synchronizer(self):
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=_mock_megatron_generation(),
+            generation_backend=MEGATRON_BACKEND,
+            colocated=True,
+        )
+        assert isinstance(sync, MegatronWeightSynchronizer)
+
+    def test_non_colocated_megatron_returns_megatron_synchronizer(self):
+        sync = create_weight_synchronizer(
+            policy=_mock_policy(),
+            generation=_mock_generation(),
+            generation_backend=MEGATRON_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+        assert isinstance(sync, MegatronWeightSynchronizer)
+
+    @pytest.mark.parametrize("configured", [False, True])
+    def test_non_colocated_megatron_propagates_policy_offload_config(self, configured):
+        policy = _mock_policy(
+            cfg={
+                "megatron_cfg": {"enabled": True},
+                "offload_policy_before_refit": configured,
+            }
+        )
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=_mock_megatron_generation(),
+            generation_backend=MEGATRON_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert sync._offload_policy_before_refit is configured
+
+    def test_non_colocated_megatron_m2n_uses_effective_parallelism(self):
+        policy = _mock_policy()
+        policy.cfg = {
+            "offload_policy_before_refit": False,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 2,
+                "expert_model_parallel_size": 4,
+                "pipeline_model_parallel_size": 1,
+            },
+            "generation": {
+                "backend": "megatron",
+                "refit_transport": "nccl_reshard",
+                "mcore_generation_config": {
+                    "tensor_model_parallel_size": 8,
+                    "expert_model_parallel_size": 2,
+                },
+            },
+        }
+        generation = _mock_megatron_generation(refit_transport="nccl_reshard")
+        generation.cfg = policy.cfg["generation"]
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=generation,
+            generation_backend=MEGATRON_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, MegatronWeightSynchronizer)
+        assert isinstance(sync._transport, NcclReshardWeightSynchronizer)
+        assert sync._transport._gen_parallelism() == {
+            "tp_size": 8,
+            "ep_size": 2,
+            "etp_size": 8,
+            "pp_size": 1,
+        }
+
+    @pytest.mark.parametrize(("configured", "expected_calls"), [(False, 0), (True, 1)])
+    @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
+    @pytest.mark.parametrize("backend", [VLLM_BACKEND, "trtllm"])
+    def test_non_colocated_vllm_propagates_refit_memory_release(
+        self, mock_ray, configured, expected_calls, backend
+    ):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        policy.cfg["offload_policy_before_refit"] = configured
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=_mock_generation(),
+            generation_backend=backend,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        sync.sync_weights()
+
+        assert policy.offload_before_refit.call_count == expected_calls
+
+    def test_refit_memory_release_rejects_automodel_policy(self):
+        policy = _mock_policy()
+        policy.cfg["offload_policy_before_refit"] = True
+
+        with pytest.raises(ValueError, match="Megatron policy backend"):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=_mock_generation(),
+                generation_backend=VLLM_BACKEND,
+                colocated=False,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
+
+    @pytest.mark.parametrize(
+        ("generation_backend", "colocated", "refit_transport", "error_match"),
+        [
+            (VLLM_BACKEND, True, None, "applies only to non-colocated refit"),
+            (
+                VLLM_BACKEND,
+                False,
+                "http",
+                "requires non-colocated vLLM or Megatron",
+            ),
+            (
+                SGLANG_BACKEND,
+                False,
+                None,
+                "requires non-colocated vLLM or Megatron",
+            ),
+            # TensorRT-LLM has no shard-to-shard refit transport.
+            ("trtllm", False, "nccl_reshard", "TensorRT-LLM generation"),
+        ],
+    )
+    def test_refit_memory_release_rejects_unsupported_transport(
+        self, generation_backend, colocated, refit_transport, error_match
+    ):
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        policy.cfg["offload_policy_before_refit"] = True
+        generation = _mock_generation()
+        generation.cfg["refit_transport"] = refit_transport
+
+        with pytest.raises(ValueError, match=error_match):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=generation,
+                generation_backend=generation_backend,
+                colocated=colocated,
+                train_cluster=_mock_cluster(),
+                inference_cluster=_mock_cluster(),
+            )
+
+    @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
+    def test_non_colocated_vllm_nccl_reshard_propagates_refit_memory_release(
+        self, mock_ray
+    ):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        policy.cfg["megatron_cfg"]["enabled"] = True
+        policy.cfg["offload_policy_before_refit"] = True
+        generation = _mock_generation()
+        generation.cfg["refit_transport"] = "nccl_reshard"
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=generation,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, NcclReshardWeightSynchronizer)
+        sync.sync_weights()
+        policy.offload_before_refit.assert_called_once_with()
 
     def test_non_colocated_dynamo_returns_collective(self):
         sync = create_weight_synchronizer(
@@ -927,7 +1579,7 @@ class TestFactory:
         )
         assert isinstance(sync, SGLangDisaggregatedWeightSynchronizer)
 
-    def test_non_colocated_sglang_rejects_dtensor_at_setup(self):
+    def test_non_colocated_sglang_rejects_automodel_at_setup(self):
         with pytest.raises(
             NotImplementedError, match="Megatron policy backend.*issues/3745"
         ):

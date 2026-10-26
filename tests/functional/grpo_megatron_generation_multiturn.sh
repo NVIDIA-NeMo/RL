@@ -22,12 +22,16 @@ mkdir -p $EXP_DIR $LOG_DIR
 # sliding-puzzle config (inherits grpo_math_1B.yaml) to the Megatron policy + backend.
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
 cd $PROJECT_ROOT
+# Qwen2.5-0.5B derives max_requests=3412 from the 10 GB KV pool; pin 4.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_sliding_puzzle.py \
     policy.model_name=Qwen/Qwen2.5-0.5B \
-    policy.dtensor_cfg.enabled=false \
+    policy.automodel_cfg.enabled=false \
     policy.megatron_cfg.enabled=true \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=mcore \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
     cluster.gpus_per_node=2 \
     grpo.max_rollout_turns=5 \
     grpo.max_num_steps=3 \

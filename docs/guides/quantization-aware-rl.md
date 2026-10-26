@@ -1,6 +1,6 @@
 # Quantization-Aware RL (QARL)
 
-Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit. By default, vLLM generation uses fake-quantized modules. For NVFP4 W4A4 and W4A16 rollout experiments, NeMo RL can instead stream packed real-quant ModelOpt NVFP4 weights and scales into vLLM.
+Quantization-Aware RL (QARL) integrates [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer) into the NeMo RL training loop, enabling quantization-aware training and generation for both GRPO and on-policy distillation workflows. QARL automatically quantizes a standard model at initialization, maintains quantizer state (amax values) throughout training, and transfers quantized state to vLLM during weight refit.
 
 ## Overview
 
@@ -15,7 +15,7 @@ See [Verified Configurations](#verified-configurations) for the workflow + recip
 
 ## Verified Configurations
 
-The following workflow + quantization recipe combinations have been validated end-to-end (Megatron training + NVFP4-quantized vLLM generation + held-out validation):
+The following workflow + quantization recipe combinations have been validated end to end. Rows marked as smoke tests validate training and refit execution but do not make a convergence claim.
 
 | Workflow | Quantization | Recipe | Status | Example Config |
 |---|---|---|---|---|
@@ -419,7 +419,7 @@ uv run --extra mcore --extra modelopt \
 ## Limitations
 
 - **Generation**: Currently only vLLM is supported for generation.
-- **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
+- **Automodel backend**: Quantization support for the Automodel policy worker is not yet implemented.
 - **Real-quant rollout**: W4A4 and W4A16 are supported for dense and fused-MoE vLLM ModelOpt NVFP4 layers exported from the Megatron policy path. Fused MoE currently requires all experts local to each vLLM rank. Hybrid MoE/Mamba recipes should keep unsupported or sensitive non-MLP paths in BF16 via `real_quant_ignore`.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.

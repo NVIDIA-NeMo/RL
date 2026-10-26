@@ -137,13 +137,13 @@ def setup(
     print("\n▶ Setting up compute cluster...")
     cluster = RayVirtualCluster(
         name="eval_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+        * cluster_config.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {cluster_config.num_nodes} nodes")
 
     # ==========================
     #           Model
@@ -326,30 +326,18 @@ async def _run_env_eval_impl(
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # get input prompt from message_log
-        is_multimodal = "vllm_content" in batch
+        # Get input prompts from message_log, preserving any vLLM-ready data.
+        vllm_content_rows = batch.get("vllm_content", None)
+        multi_modal_rows = batch.get("vllm_multi_modal_data", None)
         prompts = []
         prompts_for_display = []
         for i, message_log in enumerate(batch["message_log"]):
-            multi_modal_data = {}
-            if is_multimodal:
-                audios = batch.get("vllm_audios", None)
-                if audios is not None and len(audios[i]) > 0:
-                    multi_modal_data["audio"] = (
-                        audios[i][0] if len(audios[i]) == 1 else audios[i]
-                    )
-                images = batch.get("vllm_images", None)
-                if images is not None and len(images[i]) > 0:
-                    multi_modal_data["image"] = (
-                        images[i][0] if len(images[i]) == 1 else images[i]
-                    )
-                videos = batch.get("vllm_videos", None)
-                if videos is not None and len(videos[i]) > 0:
-                    multi_modal_data["video"] = (
-                        videos[i][0] if len(videos[i]) == 1 else videos[i]
-                    )
-
-            vllm_content = batch["vllm_content"][i] if is_multimodal else None
+            vllm_content = (
+                vllm_content_rows[i] if vllm_content_rows is not None else None
+            )
+            multi_modal_data = (
+                multi_modal_rows[i] if multi_modal_rows is not None else None
+            )
             if vllm_content is not None:
                 prompt_dict = {"prompt": vllm_content}
                 prompt_display = vllm_content
@@ -358,7 +346,7 @@ async def _run_env_eval_impl(
                 prompts.append(prompt_dict)
                 prompts_for_display.append(prompt_display)
             elif multi_modal_data:
-                # Placeholder-style processors pass prompt_token_ids with media.
+                # Fallback for custom processors supplying media without text.
                 prompt_token_ids = []
                 for message in message_log:
                     token_ids = message["token_ids"]
@@ -381,11 +369,13 @@ async def _run_env_eval_impl(
                 # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
                 # prompt_token_ids instead, since the training pipeline already has
                 # input_ids tensors. Both are valid vLLM inputs but may tokenize
-                # slightly differently.
-                content = [message["content"] for message in message_log]
-                content = "\n".join(content)
-                prompts.append(content)
-                prompts_for_display.append(content)
+                # slightly differently. Truncated VLM rows also reach this branch,
+                # so stringify their content, which is still a list of typed parts.
+                fallback_content = "\n".join(
+                    str(message["content"]) for message in message_log
+                )
+                prompts.append(fallback_content)
+                prompts_for_display.append(fallback_content)
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})

@@ -41,21 +41,32 @@ trap _nrl_log_exit EXIT TERM HUP INT
 # Function to detect if SLURM cluster uses GRES
 ########################################################
 maybe_gres_arg() {
-  # Check if any nodes in the partition have GRES configured
-  # Assumes a homogeneous allocation (not a heterogeneous job)
-  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
-    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    # Some clusters append socket specs like "(S:0-3)" to the GRES string.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
-      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
-      exit 1
-    fi
-    echo "--gres=gpu:${GPUS_PER_NODE}"
+  # Under "#SBATCH --exclusive" a job step is not handed the job's generic
+  # resources implicitly, so every srun step below must request its GPUs with
+  # --gres. The count is read from the nodes of this allocation, not from the
+  # whole partition: a partition may mix node types, and a step can only be
+  # placed when every allocated node has the GPUs the step asks for. A node's
+  # GRES string may list several types and carry a socket suffix
+  # ("gpu:8(S:0-3),shard:64"); only the gpu entry's count is read.
+  local gres_lines gres_counts
+  # -a: without it sinfo leaves out Hidden=YES partitions, so nodes that are
+  # only in one print nothing and the steps would run without GPUs.
+  gres_lines=$(sinfo -N -n "$SLURM_JOB_NODELIST" -a -h -o "%G" | grep "gpu:" || true)
+  if [[ -z "$gres_lines" ]]; then
+    # No GRES support detected
+    echo ""
     return
   fi
-  
-  # No GRES support detected
-  echo ""
+  gres_counts=$(printf '%s\n' "$gres_lines" | grep -o 'gpu:[^,(]*' | awk -F: '{print $NF}' | sort -un)
+  if [[ $(printf '%s\n' "$gres_counts" | wc -l) -gt 1 ]]; then
+    echo "Error: the allocated nodes advertise mixed GPU counts ($(printf '%s' "$gres_counts" | tr '\n' ' ')); NUM_ACTORS and worker_units assume GPUS_PER_NODE GPUs on every node. Request uniform nodes with sbatch --gres=gpu:$GPUS_PER_NODE. GRES lines: $(printf '%s' "$gres_lines" | tr '\n' ' ')" >&2
+    exit 1
+  fi
+  if [[ $GPUS_PER_NODE -ne $gres_counts ]]; then
+    echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but the allocated nodes advertise gpu:$gres_counts (GRES lines: $(printf '%s' "$gres_lines" | tr '\n' ' ')), meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
+    exit 1
+  fi
+  echo "--gres=gpu:${GPUS_PER_NODE}"
 }
 
 ########################################################
@@ -100,6 +111,14 @@ CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+NRL_MOUNT_HOST_ENROOT=${NRL_MOUNT_HOST_ENROOT:-}  # Set to 1 to bind-mount the compute node's enroot into the training container (see the block after GRES detection).
+case "$NRL_MOUNT_HOST_ENROOT" in
+  ""|0|1) ;;
+  *)
+    echo "Error: NRL_MOUNT_HOST_ENROOT must be unset, 0, or 1, got '$NRL_MOUNT_HOST_ENROOT'." >&2
+    exit 1
+    ;;
+esac
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
@@ -162,6 +181,7 @@ fi
 #
 # Port layout (all below ephemeral floor at 9000). Python port-range bounds
 # are half-open: [low, high).
+#   1150-1199    Data plane: mooncake metadata server, master RPC, master metrics (driver-local allocation)
 #   1200-1201    Ray GCS + client server (head only)
 #   [1202, 1300) SingleController generation router (driver-local allocation)
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
@@ -176,6 +196,7 @@ fi
 #   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)
 #   7000-8999    vLLM engine rendezvous (VLLM_PORT in vllm_worker.py)
 #   8265         Ray Dashboard (DASHBOARD_PORT; reserved carve-out inside the 7000-8999 band)
+#   [8300, 8556) PD-disagg frontends (carve-out inside the 7000-8999 band; generation.disaggregation.frontend_base_port)
 #   8600-8799    SGLang router (carve-out inside the 7000-8999 band; only one rollout backend runs)
 #   8800-8999    SGLang Prometheus metrics (carve-out inside the 7000-8999 band)
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
@@ -183,17 +204,22 @@ MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
+# Setting LOKI_PUSH_URL streams those same logs to Loki over the network instead
+# of copying them to the shared filesystem. Requires an image with Grafana Alloy.
 ########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
 unset UV_CACHE_DIR
 
+# The container's uv cache (UV_CACHE_DIR in docker/Dockerfile). Images built before the cache
+# moved out of /root ignore this mount and keep using their own /root/.cache/uv.
+CONTAINER_UV_CACHE_DIR=${CONTAINER_UV_CACHE_DIR:-/opt/nemo_rl_cache/uv}
 if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   mkdir -p "$UV_CACHE_DIR_OVERRIDE"
   if [[ -n $MOUNTS ]]; then
-    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:$CONTAINER_UV_CACHE_DIR"
   else
-    MOUNTS="$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    MOUNTS="$UV_CACHE_DIR_OVERRIDE:$CONTAINER_UV_CACHE_DIR"
   fi
 fi
 
@@ -253,6 +279,31 @@ if [[ -n "$GRES_ARG" ]]; then
   echo "[INFO] GRES support detected. Using: $GRES_ARG"
 else
   echo "[INFO] No GRES support detected. Running without --gres flag."
+fi
+
+# NRL_MOUNT_HOST_ENROOT=1: a process inside the training container (for example
+# a NeMo Gym agent server that runs each agent in its own sandbox) starts
+# containers with the compute node's enroot, so the node's enroot binaries and
+# directories ride into the training container. Expanded here, on the compute
+# node, because the submit host may carry no enroot at all; enroot's runtime
+# exec's its sibling helpers by bare name (enroot-mount, enroot-nsenter, ...),
+# so every /usr/bin/enroot* file comes along, not just the launcher, and the
+# library, share, and configuration directories are mounted when present
+# (site packages install the libraries under /usr/lib, /usr/lib64 or
+# /usr/libexec). Unset (the default), nothing is mounted.
+if [[ "${NRL_MOUNT_HOST_ENROOT:-}" == "1" ]]; then
+  _enroot_bins=(/usr/bin/enroot*)
+  if [[ ! -e "${_enroot_bins[0]}" ]]; then
+    echo "ERROR: NRL_MOUNT_HOST_ENROOT=1 but /usr/bin/enroot* matches no file on $(hostname); the node has no enroot to mount into the training container." >&2
+    exit 1
+  fi
+  for _enroot_dir in /usr/lib/enroot /usr/lib64/enroot /usr/libexec/enroot /usr/share/enroot /etc/enroot; do
+    [[ -e "$_enroot_dir" ]] && MOUNTS="${MOUNTS:+$MOUNTS,}$_enroot_dir:$_enroot_dir"
+  done
+  for _enroot_bin in "${_enroot_bins[@]}"; do
+    MOUNTS="${MOUNTS:+$MOUNTS,}$_enroot_bin:$_enroot_bin"
+  done
+  echo "[INFO] NRL_MOUNT_HOST_ENROOT=1: bind-mounting $(hostname)'s enroot ($(enroot version 2>/dev/null || echo unknown version), ${#_enroot_bins[@]} binaries) into the training container."
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
@@ -380,6 +431,29 @@ export RAY_event_stats="${RAY_event_stats:-false}"
 export RAY_ray_syncer_message_refresh_interval_ms="${RAY_ray_syncer_message_refresh_interval_ms:-10000}"
 export RAY_core_worker_internal_heartbeat_ms="${RAY_core_worker_internal_heartbeat_ms:-5000}"
 export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
+
+# ---------------------------------------------------------------------------
+# Reap a dead worker's orphaned child processes
+#
+# Not a scale knob — it is here because this is the last point before `ray start`.
+# The raylet reads process_group_cleanup_enabled when it forks a worker
+# (worker_pool.cc) and acts on it when it kills one (node_manager.cc), so it must
+# be in the raylet's environment, and the raylet starts here, long before any
+# recipe has been read. A driver that sets it after the fact changes nothing.
+#
+# What it buys: a vLLM generation worker spawns its EngineCore as a plain
+# multiprocessing child that owns the CUDA context and the KV cache. Every cleanup
+# path vLLM and Ray provide runs inside the dying process, so a SIGKILLed worker
+# leaves that child holding its GPU for the rest of the job — measured at 114.95
+# GiB still held on a GB200 after one shard was killed, which is enough that the
+# replacement cannot fit. Because the EngineCore never calls setsid it stays in the
+# worker's process group, which is exactly what this reaches.
+#
+# Unconditional here, unlike the driver-side scoping in
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env: the raylet is up
+# before anything knows whether this run tolerates a dead shard. `:-` keeps an
+# operator's explicit 0 — someone debugging a wedged engine may want the corpse.
+export RAY_process_group_cleanup_enabled="${RAY_process_group_cleanup_enabled:-1}"
 
 # The head is retried a few times. Workers may need more attempts since they can
 # race the head's GCS coming up: `ray start --address` fails until GCS is listening.
@@ -601,6 +675,101 @@ if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   mkdir -p "$SANDBOX_PORTS_DIR"
 fi
 
+# srun -o with %t produces per-task log files; zero-pad to the worker-count width
+# so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log). Used
+# both by the worker srun below and by the Alloy sidecar, which has to name the
+# same file.
+_num_workers=$((SLURM_JOB_NUM_NODES - 1))
+_task_digits=${#_num_workers}
+
+# The sandbox sidecars send stdout and stderr to one file per node under
+# SANDBOX_PORTS_DIR. That directory is on the shared FS, so every node's Alloy
+# can see all of the files; only the head tails them, otherwise each file ships
+# once per node. Runs without a sandbox get a path that never exists.
+if [[ -n "$SANDBOX_PORTS_DIR" ]]; then
+  _sandbox_log_glob="$SANDBOX_PORTS_DIR/sandbox-*.log"
+else
+  _sandbox_log_glob=/tmp/no-sandbox.log
+fi
+
+# Alloy log export, sourced by both roles once RAY_NODE_ROLE is set. Kept in its
+# own file so the two generated container commands don't each need a copy.
+ALLOY_SIDECAR_FILE="$LOG_DIR/alloy_sidecar.sh"
+cat > "$ALLOY_SIDECAR_FILE" <<EOF
+[[ -n "\${LOKI_PUSH_URL:-}" ]] || return 0
+
+ALLOY_CONFIG="\${ALLOY_CONFIG:-$SLURM_SUBMIT_DIR/alloy/config.alloy}"
+# Alloy resolves the endpoint and certs itself and only reports failures to its
+# own log, so check them here instead: a missing export should say so in the
+# wrapper log rather than silently ship nothing.
+_alloy_missing=()
+[[ -x /usr/local/bin/alloy ]] || _alloy_missing+=(/usr/local/bin/alloy)
+[[ -r "\$ALLOY_CONFIG" ]] || _alloy_missing+=("\$ALLOY_CONFIG")
+command -v setsid >/dev/null || _alloy_missing+=(setsid)
+# Only the shipped config authenticates with mTLS; a custom ALLOY_CONFIG brings
+# its own auth, which Alloy validates itself.
+if [[ "\$ALLOY_CONFIG" == "$SLURM_SUBMIT_DIR/alloy/config.alloy" ]]; then
+  for _v in LOKI_CA_FILE LOKI_CERT_FILE LOKI_KEY_FILE; do
+    [[ -r "\${!_v:-}" ]] || _alloy_missing+=("\$_v=\${!_v:-unset}")
+  done
+fi
+if (( \${#_alloy_missing[@]} )); then
+  echo "[WARNING] Alloy log export disabled, unusable: \${_alloy_missing[*]}" >&2
+  return 0
+fi
+
+# Slurm names the cluster in every job, so the label is populated without the
+# user having to export anything.
+export CLUSTER_NAME="\${CLUSTER_NAME:-\${SLURM_CLUSTER_NAME:-}}"
+
+if [[ "\$RAY_NODE_ROLE" == head ]]; then
+  export RAY_WRAPPER_LOG_FILE="$LOG_DIR/ray-head.log"
+  export RAY_DRIVER_LOG_FILE="$LOG_DIR/ray-driver.log"
+  export RAY_SANDBOX_LOG_GLOB="$_sandbox_log_glob"
+else
+  printf -v RAY_WRAPPER_LOG_FILE '%s/ray-worker-%0*d.log' "$LOG_DIR" $_task_digits "\$SLURM_PROCID"
+  export RAY_WRAPPER_LOG_FILE
+  # Workers have no driver log; point that source at a path that never exists.
+  export RAY_DRIVER_LOG_FILE=/tmp/no-driver.log
+  # The sandbox files are shared; only the head ships them.
+  export RAY_SANDBOX_LOG_GLOB=/tmp/no-sandbox.log
+fi
+
+alloy_stop() {
+  local rc=\$?
+  trap - EXIT
+  sleep 5
+  kill -TERM "\$ALLOY_PID" 2>/dev/null || true
+  # Bounded drain: a backlogged Alloy must not hold the job open indefinitely.
+  local waited=0
+  while kill -0 "\$ALLOY_PID" 2>/dev/null && (( waited < 60 )); do
+    sleep 1
+    waited=\$((waited + 1))
+  done
+  kill -KILL "\$ALLOY_PID" 2>/dev/null || true
+  exit "\$rc"
+}
+
+# New session: teardown signals the wrapper's process group, and Alloy has to
+# outlive that to ship the final lines.
+# --disable-reporting: Alloy otherwise posts a usage report to stats.grafana.org
+# every few hours, from every node.
+setsid /usr/local/bin/alloy run "\$ALLOY_CONFIG" --storage.path=/tmp/alloy-state --disable-reporting > "$LOG_DIR/alloy-\$(hostname).log" 2>&1 &
+ALLOY_PID=\$!
+# Alloy exits within a second if it cannot bind its HTTP port or load the
+# config. Without this the line below would claim success and ship nothing.
+sleep 2
+if ! kill -0 "\$ALLOY_PID" 2>/dev/null; then
+  echo "[WARNING] Alloy exited at startup; see $LOG_DIR/alloy-\$(hostname).log" >&2
+  return 0
+fi
+echo "[INFO] Alloy started (pid \$ALLOY_PID)"
+trap alloy_stop EXIT
+# Without a TERM trap bash dies before EXIT runs, so a cancelled job loses
+# whatever Alloy had not yet shipped.
+trap 'exit 143' TERM
+EOF
+
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
 
@@ -628,6 +797,9 @@ fi
 # elapsed counter shares the submit-side timeline.
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "head container started on \$(hostname)"
+
+export RAY_NODE_ROLE=head
+source "$ALLOY_SIDECAR_FILE"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -715,13 +887,6 @@ if [[ "$DEDICATED_RAY_HEAD" == "1" ]]; then
   HEAD_RAY_RESOURCE_ARGS="--num-gpus=0"
   echo "[INFO] Dedicated Ray head enabled: advertising zero GPUs and no worker_units"
 fi
-
-# Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
-# MPI_Init (in the ray daemon child process below) starts clean.
-# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
-for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
-    unset "\$v"
-done
 
 # Start the head without --block. 'ray start --head' then returns as soon as the
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
@@ -861,6 +1026,9 @@ fi
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "worker \$SLURM_PROCID container started on \$(hostname)"
 
+export RAY_NODE_ROLE=worker
+source "$ALLOY_SIDECAR_FILE"
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -917,13 +1085,6 @@ log-sync-sidecar &
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
 source $LOG_DIR/topology_probe.sh
-
-# Clear MPI/PMIx/SLURM env vars inherited from the srun launcher so TRT-LLM's
-# MPI_Init (in the ray daemon child process below) starts clean.
-# NOTE: keep this after topology_probe.sh, which reads SLURM_TOPOLOGY_ADDR/SLURM_PROCID.
-for v in \$(env | awk -F= '/^(PMI|PMIX|MPI|OMPI|SLURM)_/{print \$1}'); do
-    unset "\$v"
-done
 
 # Wait for the head to signal that its GCS is listening before connecting.
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."
@@ -1055,11 +1216,7 @@ SRUN_PIDS["ray-head"]=$!
 # the number of srun/slurmctld RPCs stays constant regardless of node count. In
 # single-node mode there are no workers: the head already registers its GPUs as Ray
 # resources.
-_num_workers=$((SLURM_JOB_NUM_NODES - 1))
 if [[ $_num_workers -gt 0 ]]; then
-  # srun -o with %t produces per-task log files; zero-pad to the worker-count
-  # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
-  _task_digits=${#_num_workers}
   srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \

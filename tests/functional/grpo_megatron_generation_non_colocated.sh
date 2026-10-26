@@ -19,6 +19,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
 cd $PROJECT_ROOT
+# Qwen2.5-0.5B derives max_requests=3412 from the 10 GB KV pool; pin 4.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
@@ -29,9 +30,10 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=null \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
-    policy.generation.mcore_generation_config.refit_backend=nccl \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
@@ -46,3 +48,17 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
+
+# This counter includes both overlapped and non-overlapped async orderings;
+# a positive value confirms that async_sched_mode reached and ran in the engine.
+# The second generation cycle also covers scheduling after weight refit/resume.
+ASYNC_SCHED_STEPS=$(grep -o 'mcore async scheduling steps (cumul): [0-9]*' $RUN_LOG | grep -o '[0-9]*$' | sort -n | tail -1 || true)
+if [[ -z "${ASYNC_SCHED_STEPS:-}" ]]; then
+    echo "FAIL: async scheduling counter not found"
+    exit 1
+fi
+if [[ "$ASYNC_SCHED_STEPS" -eq 0 ]]; then
+    echo "FAIL: async scheduler reported 0 scheduling steps"
+    exit 1
+fi
+echo "async scheduling steps: $ASYNC_SCHED_STEPS"

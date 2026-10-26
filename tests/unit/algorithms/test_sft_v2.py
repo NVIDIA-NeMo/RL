@@ -14,19 +14,25 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 
 from nemo_rl.algorithms.sft_v2 import (
+    SFT_V2_TEED_METRICS,
     SFTSingleControllerActor,
     SFTV2SaveState,
     _max_train_steps,
 )
+from nemo_rl.data.energon.config import EnergonLoaderConfig
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -54,6 +60,7 @@ def _envelope(rank: int, *, source_count: int = 1) -> StepEnvelope:
 
 def _controller() -> object:
     controller = object.__new__(_ACTOR_CLS)
+    controller._tracer = None
     controller._trainer = MagicMock()
     controller._trainer.finish_train_step.return_value = {
         "loss": 1.0,
@@ -86,12 +93,19 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
+        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
     }
     data.update(data_overrides or {})
     policy = {
-        "megatron_cfg": {"enabled": True},
+        "megatron_cfg": {
+            "enabled": True,
+            "context_parallel_size": 1,
+            "tensor_model_parallel_size": 1,
+            "sequence_parallel": False,
+        },
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
+        "make_sequence_length_divisible_by": 1,
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
@@ -121,6 +135,7 @@ def test_train_step_orders_split_policy_lifecycle_and_commit() -> None:
     assert metrics["valid_tokens"] == 8
     assert metrics["source_samples"] == 3
     assert metrics["physical_packs"] == 2
+    assert {row.logger_key for row in SFT_V2_TEED_METRICS} <= set(metrics)
 
 
 def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
@@ -183,12 +198,69 @@ def test_run_stops_after_a_timeout_checkpoint() -> None:
         return {}
 
     controller._run_train_step = MagicMock(side_effect=advance)
-    controller.run()
+    with patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry") as shutdown:
+        controller.run()
 
     # check_save latches after firing once, so the loop must exit instead of
     # training unsaved until the walltime kill.
     assert controller._run_train_step.call_count == 2
     controller._save_checkpoint.assert_called_once_with({})
+    shutdown.assert_called_once_with()
+
+
+def test_loader_dispatch_carries_the_controller_trace() -> None:
+    controller = _controller()
+    controller._master_config = SimpleNamespace(
+        sft=SimpleNamespace(only_unmask_final=False),
+        policy={"make_sequence_length_divisible_by": 1},
+    )
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = [
+        object(),
+        object(),
+    ]
+    carrier = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.sft_v2.trace_context_kwargs",
+            return_value={TRACE_CARRIER_KWARG: carrier},
+        ),
+        patch(
+            "nemo_rl.algorithms.sft_v2.ray.get",
+            return_value=[_envelope(0), _envelope(1)],
+        ),
+    ):
+        _ACTOR_CLS._load_envelopes(controller)
+
+    kwargs = (
+        controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    )
+    assert kwargs[TRACE_CARRIER_KWARG] == carrier
+
+
+@pytest.mark.parametrize(("step", "is_final"), [(10, False), (25, True)])
+def test_save_checkpoint_uses_policy_signature_and_terminal_step(
+    tmp_path: Path, step: int, is_final: bool
+) -> None:
+    controller = _save_controller()
+    controller._save_state.total_steps = step
+    # Enforce the public signature so removed or missing keywords fail this test.
+    controller._trainer = create_autospec(Policy, instance=True)
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._loader_state_dicts = MagicMock(return_value=[{}, {}])
+    controller._checkpointer = MagicMock()
+    controller._checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    controller._checkpointer.save_optimizer = True
+
+    controller._save_checkpoint({})
+
+    controller._trainer.save_checkpoint.assert_called_once_with(
+        weights_path=str(tmp_path / "policy" / "weights"),
+        optimizer_path=str(tmp_path / "policy" / "optimizer"),
+        tokenizer_path=str(tmp_path / "policy" / "tokenizer"),
+        is_final_checkpoint=is_final,
+    )
 
 
 def test_checkpoint_metric_tags_the_configured_train_metric() -> None:
@@ -220,11 +292,11 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
         ),
         (
             {"policy_overrides": {"sequence_packing": {"enabled": True}}},
-            "fixed NeMo-RL batching",
+            "fixed batching",
         ),
         (
             {"policy_overrides": {"dynamic_batching": {"enabled": True}}},
-            "fixed NeMo-RL batching",
+            "fixed batching",
         ),
         ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
         (
@@ -258,6 +330,230 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    (
+        "sequence_overrides",
+        "dynamic_enabled",
+        "megatron_overrides",
+        "pad_multiple",
+        "max_sequence_length",
+        "message",
+    ),
+    [
+        (
+            {"fuse_loss": False},
+            False,
+            {},
+            1,
+            128,
+            "Energon packing requires sequence_packing enabled with fuse_loss.",
+        ),
+        (
+            {"algorithm": "unknown"},
+            False,
+            {},
+            1,
+            128,
+            "Energon SFT requires a supported packing algorithm.",
+        ),
+        (
+            {},
+            True,
+            {},
+            1,
+            128,
+            "Energon packing does not support dynamic batching.",
+        ),
+        (
+            {},
+            False,
+            {},
+            4,
+            130,
+            "Energon packing requires max_input_seq_length to be divisible by make_sequence_length_divisible_by.",
+        ),
+        (
+            {},
+            False,
+            {"tensor_model_parallel_size": 2, "sequence_parallel": True},
+            1,
+            128,
+            "Energon packing requires make_sequence_length_divisible_by to be a multiple of 2.",
+        ),
+    ],
+)
+def test_setup_rejects_invalid_energon_packing_config(
+    sequence_overrides: dict[str, Any],
+    dynamic_enabled: bool,
+    megatron_overrides: dict[str, Any],
+    pad_multiple: int,
+    max_sequence_length: int,
+    message: str,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    sequence_packing = {
+        "enabled": True,
+        "fuse_loss": True,
+        "algorithm": "greedy_knapsack",
+    }
+    sequence_packing.update(sequence_overrides)
+    config = _valid_setup_config(
+        data_overrides={
+            "max_input_seq_length": max_sequence_length,
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name=sequence_packing.get("algorithm", "greedy_knapsack"),
+                        options=SimpleNamespace(),
+                    )
+                )
+            ),
+        },
+        policy_overrides={
+            "megatron_cfg": megatron_overrides,
+            "sequence_packing": sequence_packing,
+            "dynamic_batching": {"enabled": dynamic_enabled},
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = pad_multiple
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "field", ["max_sequence_length", "sequence_length_pad_multiple"]
+)
+def test_packing_options_reject_removed_geometry_fields(field: str) -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        EnergonLoaderConfig(
+            model_family="qwen",
+            task_encoder={
+                "packing": {
+                    "name": "greedy_knapsack",
+                    "buffer_size": 64,
+                    "options": {field: 8},
+                }
+            },
+        )
+
+
+@pytest.mark.parametrize("restored", [False, True])
+def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
+    restored: bool,
+) -> None:
+    loader_config = EnergonLoaderConfig(
+        model_family="qwen",
+        task_encoder={
+            "packing": {
+                "name": "balanced_greedy_knapsack",
+                "buffer_size": 64,
+                "options": {"max_sequences_per_bin": 16, "balanced_knapsack_delta": 2},
+            }
+        },
+    )
+    controller = object.__new__(_ACTOR_CLS)
+    controller._master_config = SimpleNamespace(
+        data={
+            "max_input_seq_length": 128,
+            "energon": loader_config,
+        },
+        policy={
+            "train_global_batch_size": 4,
+            "sequence_packing": {
+                "algorithm": "balanced_greedy_knapsack",
+                "max_sequences_per_bin": 16,
+            },
+            "make_sequence_length_divisible_by": 8,
+        },
+        sft=SimpleNamespace(only_unmask_final=False),
+    )
+    controller._placement_plan = SimpleNamespace(
+        logical_world_size=2,
+        placement_hash="placement",
+    )
+    controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
+    controller._trainer = MagicMock()
+    futures = [object(), object()]
+    controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
+    controller._trainer.worker_group.run_all_workers_multiple_data.return_value = (
+        futures
+    )
+
+    with patch("nemo_rl.algorithms.sft_v2.ray.get", return_value=[True, True]):
+        controller._setup_loaders()
+
+    if restored:
+        call_kwargs = controller._trainer.worker_group.run_all_workers_multiple_data.call_args.kwargs
+        assert call_kwargs["restored_state"] == controller._loader_states
+        kwargs = call_kwargs["common_kwargs"]
+    else:
+        kwargs = controller._trainer.worker_group.run_all_workers_single_data.call_args.kwargs
+    assert kwargs["data_config"]["energon"] is loader_config
+    assert kwargs["batch_size"] == 2
+    assert kwargs["max_sequence_length"] == 128
+    assert kwargs["sequence_length_pad_multiple"] == 8
+    assert (
+        not {
+            "packing_algorithm",
+            "max_sequences_per_bin",
+        }
+        & kwargs.keys()
+    )
+
+
+@pytest.mark.parametrize(
+    ("megatron_overrides", "policy_multiple", "message"),
+    [
+        ({"context_parallel_size": 2}, 2, "multiple of 4"),
+        (
+            {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+            },
+            1,
+            "HybridEP",
+        ),
+        (
+            {"fp8_cfg": {"enabled": True, "fp8_recipe": "blockwise"}},
+            1,
+            "FP8 packed-token alignment",
+        ),
+    ],
+)
+def test_setup_rejects_unsupported_energon_packing_layouts(
+    megatron_overrides: dict[str, Any], policy_multiple: int, message: str
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "max_input_seq_length": 130,
+            "energon": SimpleNamespace(
+                task_encoder=SimpleNamespace(
+                    packing=SimpleNamespace(
+                        name="greedy_knapsack",
+                        options=SimpleNamespace(),
+                    )
+                )
+            ),
+        },
+        policy_overrides={
+            "megatron_cfg": megatron_overrides,
+            "sequence_packing": {
+                "enabled": True,
+                "fuse_loss": True,
+                "algorithm": "greedy_knapsack",
+            },
+        },
+    )
+    config.policy["make_sequence_length_divisible_by"] = policy_multiple
+
+    with pytest.raises(ValueError, match=message):
+        setup_sft_v2(config, MagicMock())
+
+
 def test_restore_rejects_changed_placement() -> None:
     from nemo_rl.algorithms.sft_v2 import _restore_save_state
 
@@ -280,3 +576,54 @@ def test_max_steps_is_bounded_by_virtual_epochs() -> None:
     )
 
     assert _max_train_steps(config) == 21
+
+
+@pytest.mark.parametrize("pad_multiple", [0, -1])
+def test_setup_rejects_nonpositive_canonical_packing_alignment(
+    pad_multiple: int,
+) -> None:
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(
+        data_overrides={
+            "energon": EnergonLoaderConfig(
+                model_family="qwen",
+                task_encoder={
+                    "packing": {
+                        "name": "greedy_knapsack",
+                        "buffer_size": 64,
+                        "options": {},
+                    }
+                },
+            )
+        },
+        policy_overrides={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+    )
+    config.policy["make_sequence_length_divisible_by"] = pad_multiple
+    with pytest.raises(ValueError, match="to be positive"):
+        setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "pretrained", [None, {"format": "megatron_bridge", "path": "/checkpoint"}]
+)
+def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    existing = {"format": "megatron_bridge", "path": "/policy-level"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.policy["pretrained_checkpoint"] = existing
+    config.checkpointing["pretrained_checkpoint"] = None
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy["pretrained_checkpoint"] == existing

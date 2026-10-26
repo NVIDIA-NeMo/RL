@@ -29,6 +29,7 @@ from nemo_rl.data.multimodal_utils import (
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.data_plane.schema import (
+    GROUP_ID_TAG,
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
@@ -198,15 +199,16 @@ def pack_payload(
     Args:
         train_batch: Mapping with at least input_lengths plus the tensor/object fields to send.
         weight_version: Trainer weight version stamped on every row's tag.
-        group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
+        group_id: Per-group identifier used as the sample_id prefix and stamped
+            on every row's tag; the caller owns uniqueness.
         prompt_idx: Stable dataset prompt index stamped on every row's tag.
 
     Returns:
         Sample IDs of the form ``{group_id}_g{i}``, a jagged-packed TensorDict
         containing tensor fields and encoded multimodal wire fields, and
-        per-row tags. Tags carry the weight version, prompt index, violation
-        counts, and ``<field>__row_shapes`` metadata required to reconstruct
-        packed multimodal rows.
+        per-row tags. Tags carry the weight version, prompt index, group id,
+        violation counts, and ``<field>__row_shapes`` metadata required to
+        reconstruct packed multimodal rows.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
@@ -231,6 +233,11 @@ def pack_payload(
         {
             "weight_version": weight_version,
             "prompt_idx": prompt_idx,
+            # Named per row rather than left implicit in the sample_id prefix:
+            # the advantage stage groups rows by this to build its baseline,
+            # and parsing it back out of "{group_id}_g{i}" would make the
+            # numerics depend on a naming convention.
+            GROUP_ID_TAG: group_id,
             **violations[i],
             **multimodal_tags[i],
         }

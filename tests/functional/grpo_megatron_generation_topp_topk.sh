@@ -20,7 +20,10 @@ mkdir -p $EXP_DIR $LOG_DIR
 # Megatron generation with non-default sampling (temperature / top-p / top-k), exercising
 # the SamplingParams path (the megatron analog of grpo_topp_topk.sh).
 # Using Qwen2.5-0.5B instead of Qwen3-0.6B because the latter is not supported by Megatron yet
+# Request pre-sampling log-probs for parity with policy recomputation; processed log-probs
+# include temperature/top-p/top-k renormalization.
 cd $PROJECT_ROOT
+# Qwen2.5-0.5B derives max_requests=3412 from the 10 GB KV pool; pin 4.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
     --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
@@ -31,6 +34,10 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
     policy.generation.backend=megatron \
+    policy.generation.refit_transport=mcore \
+    policy.generation.mcore_generation_config.refit_backend=nccl \
+    policy.generation.mcore_generation_config.num_cuda_graphs=4 \
+    policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
     policy.generation.temperature=0.8 \
     policy.generation.top_p=0.9 \
     policy.generation.top_k=50 \

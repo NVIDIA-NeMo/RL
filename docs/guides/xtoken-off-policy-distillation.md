@@ -101,9 +101,8 @@ weight thresholds, hand-picked intermediate filenames, etc.).
 
 ## Backend and scope
 
-- **DTensor V2 only.** Set `policy.dtensor_cfg.enabled=true` and
-  `policy.dtensor_cfg._v2=true`. The Megatron policy worker is not wired
-  for cross-tokenizer distillation.
+- **Automodel only.** Set `policy.automodel_cfg.enabled=true`. The Megatron policy
+  worker is not wired for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
 - **One colocated GPU pool, serial execution.** All teachers and the student
@@ -203,8 +202,9 @@ exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The e
 defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss
 mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0
 NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus
-(`Nemotron-Pretraining-Formal-Logic` subset) over `hf://`, so the recipe runs
-out of the box with no auth or extra setup. The `projection_matrix_path` below
+(`Nemotron-Pretraining-Formal-Logic` subset) by dataset id + `data.train.subset`,
+so the recipe runs out of the box with no auth or extra setup (and from the HF
+cache under `HF_HUB_OFFLINE=1`). The `projection_matrix_path` below
 points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run
 those first (or the `build_projection_matrix.sh` wrapper). Override paths via
 Hydra CLI:
@@ -212,17 +212,151 @@ Hydra CLI:
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_off_policy_distillation.yaml \
-    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+    teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
 
-The exemplar config keeps each teacher's `projection_matrix_path` as `null`, so
-the projection matrix must always be supplied at the CLI (per teacher, e.g.
-`teachers.0.projection_matrix_path=...`) — this keeps the config reusable across
-(student, teacher) pairs. `data.train.data_files`
-already points at the default NVIDIA corpus described above; override it only
-to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
+The exemplar config keeps each teacher's `aligner.projection_matrix_path` as
+`null`, so the projection matrix must always be supplied at the CLI (per
+teacher, e.g. `teachers.0.aligner.projection_matrix_path=...`) — this keeps the
+config reusable across (student, teacher) pairs. `data.train.data_files` and `data.train.subset`
+already point at the default NVIDIA corpus described above; override them only
+to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus. Set both, since a
+file path requires `subset` to be null:
+`data.train.data_files=/path/glob/*.arrow data.train.subset=null`.
+
+### Text and chat batches
+
+Both exemplar configs declare a typed top-level `collator` block:
+
+```yaml
+collator:
+  mode: text
+  include_thinking_in_loss: false
+  native_thinking_alignment: false
+  kd_alignment_regions: null
+  num_packed_rows: 1
+```
+
+For conversation data, set `collator.mode=chat` and use `chat_kd_processor` with
+raw `messages` or `conversation` data. Each model applies its own chat template
+to the full conversation, but training supervises **only the final assistant
+turn**. Earlier messages remain context and do not contribute training targets.
+Every chat row must end with an assistant message. CE, same-tokenizer KD, and
+teacher scoring include the final assistant content and its retained end-of-turn
+token; earlier turns, role headers, and padding are excluded. Cross-tokenizer KD
+aligns the final assistant content and uses a separate EOT pair when both
+tokenizations retain the terminator. This applies to both ordinary and native
+chat alignment; raw-text training is unchanged.
+
+Each chat row can supply `message_loss_mask`, a list containing one binary
+integer per message. Only assistant turns may have a value of `1`, and the final
+assistant message must be selected (`1`). Earlier mask entries never enable
+training on history: earlier messages are context only, even when their mask
+entry is `1`. Omitting the mask selects the final assistant turn for training.
+The OpenAI adapter prepends a zero when it inserts a system message.
+
+The configuration class supplies defaults. Packing multiple examples per row
+remains unsupported; keep `num_packed_rows=1`. Text tokenization uses
+`add_special_tokens=False`. Chat
+rows exceeding either the student's or any teacher's context limit are rejected
+instead of independently truncating their conversations.
+
+### Native reasoning and tool conversations
+
+Native alignment supports the Nano/Qwen ChatML layouts with explicit reasoning,
+answer, tool-call, and end-of-turn regions. Literal ChatML turn delimiters inside
+source content or schemas are rejected as ambiguous; embedded tool/think markup
+inside tool arguments is supported. Other layouts fail with an error;
+the Llama text exemplars are not native-chat recipes. Enable it explicitly:
+
+```yaml
+collator:
+  mode: chat
+  include_thinking_in_loss: true
+  native_thinking_alignment: true
+  kd_alignment_regions: [reasoning, close, answer, eot]
+  num_packed_rows: 1
+```
+
+Each row can supply `tools`. Set `use_preserving_dataset: true` for JSONL tool
+data to retain heterogeneous argument objects without Arrow adding null fields.
+
+The final assistant turn supervises reasoning text (when
+`include_thinking_in_loss` is true), the closing `</think>`, answers, tool payloads,
+and EOT. Opening thinking scaffolds, formatting-only tokens, schemas,
+user/system/tool-result text, earlier turns, and padding
+are excluded. `kd_alignment_regions` further restricts cross-tokenizer KD without
+changing CE or same-tokenizer KD masks. Prose and each tool call align separately;
+permitted Boolean/null spelling differences retain CE but omit the unequal piece
+from exact-text KD. Missing or transformed required content fails explicitly.
+An empty or whitespace-only final assistant turn is rejected; tool-only final
+turns are supported. Supervising a separate `reasoning_content` field requires native
+alignment. Ordinary chat supports reasoning embedded in `content` only when the
+chat template renders that content verbatim. For Qwen-style templates that extract
+inline `<think>...</think>` into a separate reasoning block, including the stock
+Qwen3 template and `qwen3_history.jinja`, set
+`collator.native_thinking_alignment=true`. Ordinary chat rejects requests to
+supervise a separate reasoning field without native alignment.
+
+Qwen3-4B's stock template drops historical reasoning when a later user turn
+follows it. To retain that reasoning as context, apply the maintained override to
+**each Qwen tokenizer** used by the collator (both `policy.tokenizer` and the
+appropriate `teachers[i].tokenizer`):
+
+```yaml
+tokenizer:
+  name: Qwen/Qwen3-4B
+  tokenizer_kwargs:
+    revision: 1cfa9a7208912126459214e8b04321603b3df60c
+  chat_template: examples/chat_templates/qwen3_history.jinja
+  chat_template_kwargs:
+    enable_thinking: true
+    preserve_thinking: true
+    truncate_history_thinking: false
+```
+
+The template accepts explicit `reasoning_content` and leading inline
+`<think>...</think>` content. An explicit `truncate_history_thinking` wins:
+`false` retains history and `true` uses stock history truncation. When absent,
+`preserve_thinking=true` enables retention; otherwise stock behavior applies.
+`enable_thinking` preserves Qwen3's generation-prompt behavior, including its
+empty thinking block when false; it does not delete supplied reasoning. Training
+renders with `add_generation_prompt=False`. Native training requires the final
+turn's supervised reasoning to be retained and rejects a template that silently
+drops it. Historical reasoning follows the template's context-retention policy
+and does not contribute loss.
+
+The override adds explicit history-retention controls to the pinned Qwen3-4B
+template while preserving its tool serialization and generation behavior. The shared offset matcher compares literal decoded strings; whitespace
+differences are unequal. Native Unicode repair is separate and requires both
+NFC-normalized decodings to equal the original source region. Ordinary chat uses
+one canonical nonempty content key on both sides for the final assistant turn.
+Content tokens that also absorb surrounding whitespace retain CE supervision;
+their full decoded strings still determine exact-match correctness.
+
+The [`xtoken_off_policy_distillation.sh`](../../tests/functional/xtoken_off_policy_distillation.sh)
+functional test covers raw text. The standalone
+[`xtoken_native_chat.sh`](../../tests/functional/xtoken_native_chat.sh) functional
+test covers native chat and is registered separately in the fast and full CI
+suites. Its
+[`chat configuration`](../../examples/configs/xtoken_native_chat.yaml)
+uses a SmolLM2-135M-Instruct student and Qwen3-1.7B teacher with distinct
+tokenizer vocabularies and token boundaries. Both use the history-preserving
+ChatML override so the test retains reasoning, tool calls, and end-of-turn
+supervision. The script reads the checked-in multi-turn arithmetic
+[`JSONL fixture`](../../tests/functional/test_data/xtoken_native_chat.jsonl), builds
+its projection matrix, and checks that three training steps produce finite
+losses. It owns its experiment directory and logs, so it can run independently:
+
+```bash
+bash tests/functional/xtoken_native_chat.sh
+```
+
+The chat scenario is functional coverage, not a nightly convergence benchmark.
+DP alignment, native student-only SFT, sequence packing, and backend/loss changes
+are outside this port.
 
 ### Loss-mode knobs
 
@@ -246,7 +380,7 @@ Other relevant fields:
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_multiteacher_off_policy_distillation.yaml \
-    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
+    teachers.0.aligner.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
@@ -314,6 +448,6 @@ Listed in the order they run during a training step:
 - Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
 - Trainer module: `nemo_rl/algorithms/xtoken_off_policy_distillation.py`
 - KD data processor: `nemo_rl/data/processors.py::kd_data_processor`
-- Cross-tokenizer collator: `nemo_rl/data/cross_tokenizer_collate.py::CrossTokenizerCollator`
+- Cross-tokenizer collator: `nemo_rl/data/xtoken/cross_tokenizer_collate.py::CrossTokenizerCollator`
 - Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`

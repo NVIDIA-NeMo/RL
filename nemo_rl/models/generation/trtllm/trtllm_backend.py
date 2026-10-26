@@ -25,14 +25,14 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
 import gc
 import os
-import traceback
 from typing import Any
 
 import torch
 import zmq
-from tensorrt_llm._ray_utils import control_action_decorator
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
+from nemo_rl.models.generation.trtllm.quantization import fp8 as fp8_quantization
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -47,13 +47,23 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 os.environ.setdefault("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
 
 
-def _call_model_loader_hook_if_available(model_loader: Any, hook_name: str) -> bool:
-    """Call a refit lifecycle hook when supported by the installed TRT-LLM."""
-    hook = getattr(model_loader, hook_name, None)
-    if hook is None:
-        return False
-    hook()
-    return True
+def _require_fp8_refit_hooks(model_loader: Any) -> None:
+    """Require TRT-LLM hooks for transactional FP8 refits."""
+    required_hooks = (
+        "begin_update_weights",
+        "finalize_update_weights",
+        "abort_update_weights",
+    )
+    missing_hooks = [
+        hook_name
+        for hook_name in required_hooks
+        if not callable(getattr(model_loader, hook_name, None))
+    ]
+    if missing_hooks:
+        raise RuntimeError(
+            "FP8 refit requires TRT-LLM weight-update hooks. "
+            f"Missing APIs: {missing_hooks}."
+        )
 
 
 class NcclExtension(WorkerExtension):
@@ -68,6 +78,9 @@ class NcclExtension(WorkerExtension):
     #  Collective initialisation (called once during setup)
     # ------------------------------------------------------------------ #
 
+    # Park the executor loop while the refit group is built: its NCCL collectives
+    # deadlock against the blocking ncclCommInitRank (seen as a 600 s watchdog kill).
+    @control_action_decorator
     def init_collective(
         self,
         rank_prefix: int,
@@ -111,31 +124,10 @@ class NcclExtension(WorkerExtension):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self.state_dict_info = state_dict_info
-
-    def _finalize_weight_update(self) -> None:
-        """Finalize refit using TRT-LLM's CUDA-graph-safe path when available."""
-        # WorkerExtension gained this shared path after refit lifecycle hooks.
-        # Retain the fallback while NeMo-RL supports older TRT-LLM releases.
-        finalize_weight_update = getattr(
-            WorkerExtension, "finalize_weight_update", None
-        )
-        if finalize_weight_update is not None:
-            finalize_weight_update(self)
-            return
-
-        model_engine = self.engine.model_engine
-        _call_model_loader_hook_if_available(
-            model_engine.model_loader, "finalize_update_weights"
-        )
-        for module in model_engine.model.modules():
-            if hasattr(module, "process_weights_after_loading") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.process_weights_after_loading()
-            if hasattr(module, "post_load_weights") and not getattr(
-                module, "_weights_removed", False
-            ):
-                module.post_load_weights()
+        model = self.engine.model_engine.model
+        if fp8_quantization.is_quantized_expert_refit(model.model_config.quant_config):
+            fp8_quantization.validate_routed_experts(state_dict_info)
+            _require_fp8_refit_hooks(self.engine.model_engine.model_loader)
 
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
@@ -155,10 +147,12 @@ class NcclExtension(WorkerExtension):
                 If False, the swap happens at a scheduler step boundary
                 with in-flight requests still in the engine (in-flight
                 weight update).
-            recompute_kv: Only meaningful with ``drain=False``. If True,
-                preempt in-flight requests so they re-prefill under the new weights.
-                Otherwise, they keep decoding with their current KV cache. The
-                reusable prefix cache is cleared after every weight update.
+            recompute_kv: If True, call ``recompute_active_requests()`` after
+                the refit: in-flight requests are re-prefilled under the new
+                weights and the prefix cache is reset. If False, in-flight
+                requests keep decoding with their current KV cache. With
+                ``drain=True`` there are no in-flight requests, so True reduces
+                to a prefix-cache reset.
         """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
@@ -167,43 +161,48 @@ class NcclExtension(WorkerExtension):
         model = model_engine.model
 
         def load_model_weight_func(weight_list):
+            if fp8_quantization.is_quantized_expert_refit(
+                model.model_config.quant_config
+            ):
+                weights = fp8_quantization.load_weights(
+                    weight_list,
+                    is_mx=fp8_quantization.is_mxfp8_model(
+                        model.model_config.quant_config
+                    ),
+                )
+            else:
+                weights = dict(weight_list)
             model_engine.model_loader.reload(
                 model,
-                dict(weight_list),
+                weights,
                 allow_partial_loading=True,
             )
 
         with self.engine.control_action(drain=drain):
             try:
-                # TRT-LLM uses the overlap scheduler by default: control_action
-                # fires at a step boundary as soon as scheduling for the previous
-                # iter is enqueued, but its GPU forward may still be in flight.
-                # Block here so we don't overwrite weights mid-forward
-                torch.cuda.synchronize()
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "begin_update_weights"
-                )
-                for module in model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.pre_reload_weights()
+                # Delegate the whole refit lifecycle to WorkerExtension: begin
+                # unwraps a torch.compile'd model (without which load_weights
+                # matches nothing and allow_partial_loading silently keeps the
+                # old weights), finish re-wraps it and resets the prefix cache.
+                # The device is already quiesced -- py_executor's
+                # _handle_control_request synchronizes before releasing the
+                # barrier control_action waits on.
+                self.begin_weight_update()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
                     group=self.model_update_group,
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
-                self._finalize_weight_update()
-                torch.cuda.current_stream().synchronize()
-
-                self.engine.reset_prefix_cache()
-            except Exception as e:
-                _call_model_loader_hook_if_available(
-                    model_engine.model_loader, "abort_update_weights"
-                )
-                print(f"Error in NcclExtension.update_weights_from_collective: {e}")
-                return False
+                self.finalize_weight_update()
+                if recompute_kv:
+                    # Re-prefill in-flight requests under the new weights; this
+                    # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
+                    self.engine.recompute_active_requests()
+                self.finish_weight_update()
+            except Exception:
+                model_engine.model_loader.abort_update_weights()
+                raise
 
         return True
 
@@ -243,14 +242,7 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "begin_update_weights"
-            )
-            for module in model.modules():
-                if hasattr(module, "pre_reload_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.pre_reload_weights()
+            self.begin_weight_update()
 
             while True:
                 payload = self.zmq_socket.recv_pyobj()
@@ -281,6 +273,19 @@ class NcclExtension(WorkerExtension):
                     "Likely stale state_dict_info (wrong shape/dtype for some key)."
                 )
 
+                if fp8_quantization.is_quantized_expert_refit(
+                    model.model_config.quant_config
+                ):
+                    weights = fp8_quantization.load_weights(
+                        weights.items(),
+                        is_mx=fp8_quantization.is_mxfp8_model(
+                            model.model_config.quant_config
+                        ),
+                    )
+                    # The mapper may retain split QKVZ/BA views across IPC chunks;
+                    # detach them before ACK lets the trainer reuse the buffer.
+                    weights = fp8_quantization.clone_mapper_staging_weights(weights)
+
                 model_engine.model_loader.reload(
                     model,
                     weights,
@@ -295,21 +300,14 @@ class NcclExtension(WorkerExtension):
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            self._finalize_weight_update()
-            torch.cuda.current_stream().synchronize()
-            self.engine.reset_prefix_cache()
+            self.finalize_weight_update()
+            self.finish_weight_update()
             gc.collect()
             torch.cuda.empty_cache()
             return True
-        except Exception as e:
-            _call_model_loader_hook_if_available(
-                model_engine.model_loader, "abort_update_weights"
-            )
-            print(
-                f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
-                f"{traceback.format_exc()}"
-            )
-            return False
+        except Exception:
+            model_engine.model_loader.abort_update_weights()
+            raise
 
     def cleanup_zmq(self) -> None:
         """Close ZMQ socket if open — called from worker shutdown."""

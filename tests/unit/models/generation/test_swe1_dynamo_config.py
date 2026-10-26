@@ -1,10 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
 
+from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -35,8 +37,15 @@ def test_public_swe_recipe_has_supported_topology_and_telemetry(
         pad_token_id = 0
         eos_token_id = 1
 
-    configured_generation = configure_generation_config(generation, Tokenizer())
+    tokenizer = Tokenizer()
+    configured_generation = configure_generation_config(generation, tokenizer)
+    config["policy"]["generation"] = configured_generation
+    setup_nemo_gym_config(
+        SimpleNamespace(policy=config["policy"], env=config["env"]), tokenizer
+    )
     validated = DynamoConfig.model_validate(configured_generation)
+    assert validated.vllm_cfg.async_engine is True
+    assert validated.vllm_cfg.expose_http_server is True
 
     assert config["policy"]["model_name"] == (
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"

@@ -86,11 +86,18 @@ def need_top_k_or_top_p_filtering(
     return _need_top_k_filtering(top_k) or _need_top_p_filtering(top_p)
 
 
+def need_temperature_scaling(
+    sampling_params: Optional[TrainingSamplingParams],
+) -> bool:
+    """Whether apply_temperature_scaling will mutate the logits in place."""
+    return sampling_params is not None and sampling_params.temperature != 1.0
+
+
 def apply_temperature_scaling(
     logits: torch.Tensor, sampling_params: Optional[TrainingSamplingParams]
 ) -> torch.Tensor:
     """Apply the effective training temperature to logits in place."""
-    if sampling_params is not None and sampling_params.temperature != 1.0:
+    if need_temperature_scaling(sampling_params):
         logits.div_(sampling_params.temperature)
     return logits
 

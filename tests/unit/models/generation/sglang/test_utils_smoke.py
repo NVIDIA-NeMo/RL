@@ -18,6 +18,12 @@ These tests verify basic functionality of helper utilities and do NOT
 require a running SGLang server or GPU.
 """
 
+import asyncio
+from multiprocessing.reduction import ForkingPickler
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import httpx
 import pytest
 import torch
 from torch.multiprocessing import reductions
@@ -28,7 +34,9 @@ from . import (
 
 pytestmark = pytest.mark.sglang
 
-from nemo_rl.models.generation.sglang.utils import train_utils
+from nemo_rl.models.generation.sglang.config import SGLangHttpClientConfig
+from nemo_rl.models.generation.sglang.utils import http_utils, train_utils
+from nemo_rl.models.generation.sglang.utils.http_utils import HttpClient
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from nemo_rl.models.generation.sglang.utils.train_utils import (
@@ -75,16 +83,11 @@ def test_serializer_roundtrip():
     assert deserialized == obj
 
 
-def test_reduce_tensor_modified_preserves_cpu_reduction(monkeypatch):
+def test_reduce_tensor_modified_preserves_cpu_reduction():
     """The CUDA UUID patch must leave the shorter CPU reducer protocol intact."""
     tensor = torch.tensor([1, 2, 3])
-    monkeypatch.setattr(
-        reductions,
-        "_reduce_tensor_original",
-        getattr(reductions, "_reduce_tensor_original", reductions.reduce_tensor),
-        raising=False,
-    )
-
+    # No substitution needed: the module global is captured before any patching,
+    # so it is the stock reducer whether or not this process has been patched.
     output_fn, output_args = train_utils._reduce_tensor_modified(tensor)
 
     assert output_fn is reductions.rebuild_tensor
@@ -96,13 +99,12 @@ def test_reduce_tensor_modified_converts_cuda_device_to_uuid(monkeypatch):
     """The dense CUDA reducer still converts its device argument to a UUID."""
     cuda_output_args = tuple(range(15))
     monkeypatch.setattr(
-        reductions,
-        "_reduce_tensor_original",
+        train_utils,
+        "_REDUCE_TENSOR_ORIGINAL",
         lambda *_args, **_kwargs: (
             train_utils._rebuild_cuda_tensor_modified,
             cuda_output_args,
         ),
-        raising=False,
     )
     monkeypatch.setattr(
         train_utils,
@@ -116,3 +118,257 @@ def test_reduce_tensor_modified_converts_cuda_device_to_uuid(monkeypatch):
     assert output_args[:6] == cuda_output_args[:6]
     assert output_args[6] == "cuda-uuid-6"
     assert output_args[7:] == cuda_output_args[7:]
+
+
+# ---------------------------------------------------------------------------
+# HTTP retry budgets (no real HTTP server or Ray cluster)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        (None, 3),
+        ({"sglang_cfg": {}}, 3),
+        ({"sglang_cfg": {"sglang_http_client_config": {}}}, 3),
+        ({"sglang_cfg": {"sglang_http_client_config": {"max_retries": 5}}}, 5),
+        (
+            {
+                "sglang_cfg": {
+                    "sglang_http_client_config": SGLangHttpClientConfig(max_retries=2)
+                }
+            },
+            2,
+        ),
+        (
+            {
+                "sglang_cfg": {
+                    "sglang_router_config": {"use_external_router": True},
+                    "sglang_http_client_config": {"max_retries": 4},
+                }
+            },
+            4,
+        ),
+    ],
+)
+def test_http_client_retry_budget_without_gpu_config(monkeypatch, args, expected):
+    client = HttpClient(args)
+    post_local = AsyncMock(return_value={"ok": True})
+    monkeypatch.setattr(client, "_post_local", post_local)
+
+    assert asyncio.run(client.post("http://router/generate", {"input_ids": [1]})) == {
+        "ok": True
+    }
+    post_local.assert_awaited_once_with(
+        "http://router/generate", {"input_ids": [1]}, expected, action="post"
+    )
+
+
+def test_http_client_explicit_override_preserves_configured_budget(monkeypatch):
+    client = HttpClient(
+        {"sglang_cfg": {"sglang_http_client_config": {"max_retries": 4}}}
+    )
+    post_local = AsyncMock()
+    monkeypatch.setattr(client, "_post_local", post_local)
+
+    asyncio.run(client.post("http://router/generate", {}, max_retries=1))
+    post_local.assert_awaited_once_with("http://router/generate", {}, 1, action="post")
+    post_local.reset_mock()
+    asyncio.run(client.post("http://router/generate", {}))
+    post_local.assert_awaited_once_with("http://router/generate", {}, 4, action="post")
+
+
+def test_http_client_config_applies_with_gpu_and_distributed_setup(monkeypatch):
+    init_actors = Mock()
+    monkeypatch.setattr(HttpClient, "_init_ray_distributed_post", init_actors)
+    args = {
+        "sglang_cfg": {
+            "sglang_http_client_config": {"max_retries": 5},
+            "sglang_server_config": {
+                "num_gpus": 2,
+                "num_gpus_per_engine": 1,
+                "sglang_server_concurrency": 4,
+            },
+            "sglang_router_config": {
+                "use_distributed_post": True,
+                "use_external_router": True,
+            },
+        }
+    }
+    client = HttpClient(args)
+    assert client._max_retries == 5
+    assert client._client_concurrency == 8
+    assert client._distributed_post_enabled
+    init_actors.assert_called_once_with(args)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "3", None])
+def test_http_client_rejects_invalid_config_before_gpu_check(value):
+    with pytest.raises(ValueError, match="max_retries"):
+        HttpClient(
+            {"sglang_cfg": {"sglang_http_client_config": {"max_retries": value}}}
+        )
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "3"])
+def test_http_client_rejects_invalid_override_before_dispatch(monkeypatch, value):
+    client = HttpClient()
+    post_local = AsyncMock()
+    actor = SimpleNamespace(do_post=SimpleNamespace(remote=Mock()))
+    client._distributed_post_enabled = True
+    client._post_actors = [actor]
+    monkeypatch.setattr(client, "_post_local", post_local)
+
+    with pytest.raises(ValueError, match="max_retries"):
+        asyncio.run(client.post("http://router/generate", {}, max_retries=value))
+    actor.do_post.remote.assert_not_called()
+    post_local.assert_not_called()
+
+
+@pytest.mark.parametrize("override, expected", [(None, 4), (1, 1)])
+@pytest.mark.parametrize("distributed_fails", [False, True])
+def test_http_client_distributed_budget_and_local_fallback(
+    monkeypatch, override, expected, distributed_fails
+):
+    client = HttpClient(
+        {"sglang_cfg": {"sglang_http_client_config": {"max_retries": 4}}}
+    )
+    actor = SimpleNamespace(do_post=SimpleNamespace(remote=Mock(return_value="ref")))
+    client._distributed_post_enabled = True
+    client._post_actors = [actor]
+    post_local = AsyncMock(return_value={"local": True})
+    monkeypatch.setattr(client, "_post_local", post_local)
+    get = Mock(
+        return_value={"remote": True},
+        side_effect=RuntimeError("remote exhausted") if distributed_fails else None,
+    )
+    monkeypatch.setattr(http_utils.ray, "get", get)
+
+    result = asyncio.run(
+        client.post("http://router/generate", {"input_ids": [1]}, max_retries=override)
+    )
+    actor.do_post.remote.assert_called_once_with(
+        "http://router/generate", {"input_ids": [1]}, expected, action="post"
+    )
+    get.assert_called_once_with("ref")
+    if distributed_fails:
+        assert result == {"local": True}
+        post_local.assert_awaited_once_with(
+            "http://router/generate", {"input_ids": [1]}, expected, action="post"
+        )
+    else:
+        assert result == {"remote": True}
+        post_local.assert_not_called()
+
+
+@pytest.mark.parametrize("execution", ["local", "actor"])
+@pytest.mark.parametrize("budget", [1, 3, 5])
+@pytest.mark.parametrize("succeeds", [False, True])
+def test_http_retry_loops_obey_total_attempt_budget(
+    monkeypatch, execution, budget, succeeds
+):
+    request = httpx.Request("POST", "http://router/generate")
+    unavailable = httpx.Response(500, request=request)
+    success = httpx.Response(200, json={"ok": True}, request=request)
+    responses = [unavailable] * (budget - 1) + [success if succeeds else unavailable]
+    post = AsyncMock(side_effect=responses)
+    transport = SimpleNamespace(post=post)
+    sleep = AsyncMock()
+    monkeypatch.setattr(http_utils.asyncio, "sleep", sleep)
+
+    if execution == "local":
+        client = HttpClient(
+            {"sglang_cfg": {"sglang_http_client_config": {"max_retries": budget}}}
+        )
+        monkeypatch.setattr(client, "_get_client", lambda: transport)
+        pending = client.post(str(request.url), {})
+    else:
+        pending = http_utils._HttpPosterActor.__ray_metadata__.modified_class.do_post(
+            SimpleNamespace(_client=transport), str(request.url), {}, budget
+        )
+
+    if succeeds:
+        assert asyncio.run(pending) == {"ok": True}
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(pending)
+    assert post.await_count == budget
+    assert sleep.await_count == budget - 1
+
+
+# ---------------------------------------------------------------------------
+# torch.multiprocessing reduction patch
+# ---------------------------------------------------------------------------
+class _ReducedCudaTensorStandIn:
+    """Pickles the way the patched CUDA reducer emits its payload.
+
+    Building the payload explicitly keeps this test off a real GPU. The reducer
+    that produces this shape is covered by
+    ``test_reduce_tensor_modified_converts_cuda_device_to_uuid``.
+    """
+
+    def __reduce__(self):
+        # Index 6 is the device slot; an int keeps _device_from_maybe_uuid off CUDA.
+        return (train_utils._rebuild_cuda_tensor_modified, tuple(range(15)))
+
+
+def _rebuild_in_unpatched_child(payload, result_queue):
+    """Runs in a fresh interpreter that never calls monkey_patch_torch_reductions().
+
+    nvidia_resiliency_ext's spawned async-checkpoint worker does exactly this: it
+    unpickles tensors reduced by the patched parent, so the rebuild wrapper has to
+    work without any state that only the patch installs.
+    """
+    try:
+        report = {
+            "patched": hasattr(reductions, "_reduce_tensor_original"),
+            "original_is_stock": (
+                train_utils._REBUILD_CUDA_TENSOR_ORIGINAL
+                is reductions.rebuild_cuda_tensor
+            ),
+        }
+        # Stand in for the native rebuild so what the assertions exercise is the
+        # wrapper's own lookup, not CUDA IPC.
+        train_utils._REBUILD_CUDA_TENSOR_ORIGINAL = lambda *args: ("rebuilt", args)
+        report["rebuilt"] = ForkingPickler.loads(payload)
+        result_queue.put(("ok", report))
+    except BaseException as exc:  # noqa: BLE001 - the failure itself is the result
+        result_queue.put(("error", repr(exc)))
+
+
+def test_rebuild_cuda_tensor_runs_in_unpatched_spawn():
+    """A reduced CUDA tensor must rebuild in a process that never applied the patch.
+
+    The wrapper used to delegate to ``reductions._rebuild_cuda_tensor_original``,
+    an attribute only the patching process holds, so the spawned
+    async-checkpoint worker died with AttributeError and the run hung until the
+    scheduler timed it out.
+    """
+    ctx = torch.multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    payload = bytes(ForkingPickler.dumps(_ReducedCudaTensorStandIn()))
+    child = ctx.Process(
+        target=_rebuild_in_unpatched_child, args=(payload, result_queue)
+    )
+    child.start()
+    try:
+        status, detail = result_queue.get(timeout=180)
+    finally:
+        child.join(timeout=30)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=30)
+        if child.is_alive():
+            child.kill()
+            child.join(timeout=30)
+        result_queue.close()
+        result_queue.join_thread()
+
+    # Reporting "ok" is not the same as exiting cleanly: a child that hangs
+    # afterwards gets terminated above, and a negative exitcode is the only
+    # thing left that still says so.
+    assert child.exitcode == 0, f"child exited with {child.exitcode}"
+    assert status == "ok", f"child raised: {detail}"
+    assert not detail["patched"], "child must model a process that never patched"
+    assert detail["original_is_stock"]
+    rebuilt_marker, rebuilt_args = detail["rebuilt"]
+    assert rebuilt_marker == "rebuilt"
+    assert rebuilt_args[6] == 6

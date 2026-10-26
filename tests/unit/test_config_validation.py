@@ -43,6 +43,7 @@ from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -103,6 +104,16 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
+# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
+# interpolations).
+repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
+full_config_files = config_files + [
+    path
+    for extra in ("examples/nemo_gym", "research")
+    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+
 
 @pytest.mark.parametrize("config_file", config_files)
 def test_all_config_files_have_required_keys(config_file):
@@ -132,7 +143,7 @@ def test_all_config_files_have_required_keys(config_file):
         # ``distillation`` branch below. The multi-teacher cross-tokenizer config
         # is identified by its top-level ``teachers`` list (online distillation
         # uses a singular ``teacher``); the per-(student, teacher) projection path
-        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # now lives at ``teachers[i].aligner.projection_matrix_path`` rather than
         # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
         # as a fallback for any single-teacher config that still carries it.
         master_config_class = XTokenOffPolicyDistillationMasterConfig
@@ -297,8 +308,8 @@ def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
 def test_all_config_no_tp_size_accuracy_issues(config_file):
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
-    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
     """
 
     skip_config_files = [
@@ -306,8 +317,8 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
         "grpo-qwen3-32b-4n8g.yaml",
         "grpo-qwen3-32b-8n8g-async-1off.yaml",
-        "grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml",
-        "grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
     ]
     if os.path.basename(config_file) in skip_config_files:
         pytest.skip(
@@ -334,7 +345,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     if config_dict["policy"]["megatron_cfg"]["enabled"]:
         tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
     else:
-        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
 
     train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
     logprob_bs = config_dict["policy"]["logprob_batch_size"]
@@ -343,4 +354,68 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         raise AssertionError(
             f"Config file {config_file} has TP size >= 4 accuracy issues. "
             "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_no_shipped_config_is_outdated(config_file):
+    """Test that every shipped config passes the same checks the entrypoints run.
+
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
+    """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
+
+    print(f"\nValidating config file: {config_file}")
+
+    config = load_config_with_inheritance(config_file)
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
+    config_dict = OmegaConf.to_container(config, resolve=False)
+
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+DEEPEP_FALLBACK_RECIPES = {
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
+}
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_expected_dispatcher(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
+    if (
+        automodel_cfg is None
+        or not automodel_cfg.enabled
+        or automodel_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = automodel_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
+        assert backend.get("dispatcher") == "deepep"
+    else:
+        assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
         )

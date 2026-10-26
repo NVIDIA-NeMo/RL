@@ -1,16 +1,12 @@
 # NeMo-RL
 
-NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
+NeMo-RL is an RLHF training framework built on Ray and PyTorch (Automodel / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
 
 ## Skills
 
-Coding guidelines and operational procedures are organized as Claude skills in
-two locations:
-
-- `skills/` — customer-facing operational skills (launch-nemo-rl, auto-research, brev-etiquette, docs)
-- `.agents/contributor-skills/` — contributor-facing development guidelines (testing, linting, CI/CD, review, etc.)
-
-All skills are symlinked into `.claude/skills/` for unified discovery.
+Coding guidelines and operational procedures are organized as agent skills in
+`skills/`, one directory per skill with a `SKILL.md`. `.claude/skills` and
+`.agents/skills` are symlinks to `skills/`, so every agent discovers the same set.
 **Always read the relevant `SKILL.md` before starting any task it
 covers — skills are mandatory context, not optional background reading.**
 
@@ -27,10 +23,17 @@ skill keyword — infer it from the artifact you read.
 
 ## Code Review
 
+For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR.
+See CONTRIBUTING.md for service integration prerequisites. The existing
+repository review guidance and local interactive commands below are unchanged.
+
 Use `/review-pr <pr-number>` for interactive local PR review.
 
 Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of
 specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
+Related: `/review-pr-team-with-html <pr-number>` adds a public explainer page built
+with `/pr-html-concise-public`, and `/review-pr-team-verify-followup <pr-number>`
+checks the author's fixes after a published review.
 
 When reviewing code, follow these principles:
 

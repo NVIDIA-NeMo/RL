@@ -22,6 +22,7 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -53,6 +54,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
     validate_single_controller_config,
 )
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 _NUM_PROMPTS_PER_STEP = 4
 _NUM_GENERATIONS_PER_PROMPT = 2
@@ -71,7 +75,7 @@ def _value_config(
         "train_micro_batch_size": 1,
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
-        "dtensor_cfg": {"enabled": not megatron_enabled, "_v2": True},
+        "automodel_cfg": {"enabled": not megatron_enabled},
     }
 
 
@@ -136,10 +140,10 @@ def _make_master_config(
             "save_period": 10,
             "save_optimizer": False,
         },
-        logger={"wandb_enabled": False, "wandb": {}},
+        logger=LoggerConfig.model_construct(),
         loss_fn=ClippedPGLossConfig(reference_policy_kl_penalty=0.0),
         env={},
-        cluster={"num_nodes": 2, "gpus_per_node": 8, "segment_size": None},
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=min_groups_for_streaming_train,
             max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -285,15 +289,103 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
-    def test_rejects_multi_chunk_streaming(self):
-        """PPO cannot spread one full-batch optimizer epoch across chunks."""
-        mc = _ppo_master_config(min_groups_for_streaming_train=1)
+    @pytest.mark.parametrize("critic_epochs", [1, 2])
+    def test_accepts_streaming_with_one_policy_epoch(self, critic_epochs):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.critic_ppo_epochs = critic_epochs
+        mc.ppo.adv_estimator.normalize_advantages = False
 
-        with pytest.raises(
-            ValueError,
-            match=r"min_groups_for_streaming_train \(1\) == "
-            rf"num_prompts_per_step \({_NUM_PROMPTS_PER_STEP}\)",
-        ):
+        validate_single_controller_config(mc)
+
+    def test_rejects_streaming_with_multiple_policy_epochs(self):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 2
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        with pytest.raises(ValueError, match=r"ppo\.ppo_epochs.*1"):
+            validate_single_controller_config(mc)
+
+    def test_full_batch_retains_multiple_policy_epochs(self):
+        mc = _ppo_master_config()
+        mc.ppo.ppo_epochs = 2
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("min_groups", "normalize_advantages", "expect_warning"),
+        [(1, True, True), (1, False, False), (_NUM_PROMPTS_PER_STEP, True, False)],
+        ids=["streaming-normalized", "streaming-unnormalized", "full-batch"],
+    )
+    def test_chunk_normalization_warning(
+        self, min_groups: int, normalize_advantages: bool, expect_warning: bool
+    ) -> None:
+        mc = _ppo_master_config(
+            min_groups_for_streaming_train=min_groups, megatron_enabled=True
+        )
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = normalize_advantages
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            validate_single_controller_config(mc)
+
+        assert len(caught) == int(expect_warning)
+        if expect_warning:
+            assert caught[0].category is UserWarning
+            assert "normalizes GAE advantages per chunk" in str(caught[0].message)
+            assert "instead of across the full batch" in str(caught[0].message)
+
+    def test_rejects_streaming_without_megatron_policy(self):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+
+        with pytest.raises(ValueError, match="Megatron"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("fsdp_key", ["use_custom_fsdp", "use_megatron_fsdp"])
+    def test_rejects_streaming_with_megatron_fsdp(self, fsdp_key):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+        mc.policy["megatron_cfg"]["distributed_data_parallel_config"] = {fsdp_key: True}
+
+        with pytest.raises(ValueError, match="classic Megatron DDP"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("use_distributed_optimizer", "overlap_param_gather", "fp8_param"),
+        [
+            (True, False, True),
+            (True, True, True),
+            (False, False, True),
+            (True, True, False),
+        ],
+        ids=["shared", "shared-overlap", "unsharded", "compute-only"],
+    )
+    def test_streaming_mxfp8_guard_only_rejects_shared_gradient_buffers(
+        self, use_distributed_optimizer, overlap_param_gather, fp8_param
+    ):
+        mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
+        mc.ppo.ppo_epochs = 1
+        mc.ppo.adv_estimator.normalize_advantages = False
+        mc.policy["megatron_cfg"]["distributed_data_parallel_config"] = {
+            "overlap_param_gather": overlap_param_gather
+        }
+        mc.policy["megatron_cfg"]["optimizer"] = {
+            "use_distributed_optimizer": use_distributed_optimizer
+        }
+        mc.policy["megatron_cfg"]["fp8_cfg"] = {
+            "enabled": True,
+            "fp8_param": fp8_param,
+            "fp8_recipe": "mxfp8",
+        }
+
+        if use_distributed_optimizer and fp8_param:
+            with pytest.raises(ValueError, match="MXFP8.*distributed optimizer"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
 
     def test_rejects_value_global_batch_size_mismatch(self):
@@ -307,7 +399,7 @@ class TestPPOValidation:
 
     @pytest.mark.parametrize(
         "sampler_config",
-        [WindowedSamplerConfig(), ReadyFirstSamplerConfig(), WeightFifoSamplerConfig()],
+        [WindowedSamplerConfig(), WeightFifoSamplerConfig()],
         ids=lambda cfg: cfg.name,
     )
     def test_rejects_samplers_that_drop_rollouts_by_weight_version(
@@ -320,8 +412,41 @@ class TestPPOValidation:
 
         with pytest.raises(
             ValueError,
-            match=rf"sampler.name='in_order', but got '{sampler_config.name}'",
+            match=rf"but got '{sampler_config.name}'",
         ):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("warmup_steps", [0, 2])
+    def test_accepts_ready_first_with_importance_sampling(
+        self, warmup_steps: int
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.ppo.policy_training_start_step = warmup_steps
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = False
+
+        validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("importance_correction", "force_on_policy_ratio", "match"),
+        [
+            (False, False, "use_importance_sampling_correction=true"),
+            (True, True, "force_on_policy_ratio=false"),
+        ],
+    )
+    def test_ready_first_requires_sampling_policy_correction(
+        self,
+        importance_correction: bool,
+        force_on_policy_ratio: bool,
+        match: str,
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = importance_correction
+        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+
+        with pytest.raises(ValueError, match=match):
             validate_single_controller_config(mc)
 
     @staticmethod
@@ -370,6 +495,27 @@ class TestPPOValidation:
         ):
             validate_single_controller_config(mc)
 
+    def test_rejects_length_penalty_until_sc_applies_it(self):
+        # The SC path has no length-penalty hook yet; fail at setup rather
+        # than silently training on unadjusted rewards.
+        mc = _make_master_config()
+        mc.grpo.length_penalty = LengthPenaltyConfig.model_validate(
+            {"default": {"total_bonus": 0.1}}
+        )
+
+        with pytest.raises(NotImplementedError, match="length_penalty"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
+    def test_accepts_absent_length_penalty(self, algorithm: str):
+        # GRPO with length_penalty: null, and PPO (whose config has no such
+        # field) both pass.
+        mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
+        if algorithm == "grpo":
+            mc.grpo.length_penalty = None
+
+        validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])
     def test_accepts_overlong_filtering(self, algorithm: str):
         mc = _make_master_config() if algorithm == "grpo" else _ppo_master_config()
@@ -377,7 +523,7 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    def test_rejects_a_dtensor_critic(self):
+    def test_rejects_automodel_critic(self):
         """Only the Megatron value worker carries TQWorkerMixin."""
         mc = _ppo_master_config(value=_value_config(megatron_enabled=False))
 
@@ -645,9 +791,12 @@ class TestSetupBuildsTheCritic:
 
 
 class TestValueWarmStart:
-    def test_fresh_run_builds_the_critic_from_the_warm_start(
+    def test_fresh_run_takes_warm_start_weights_but_not_its_optimizer(
         self, patched_ppo_factories, tmp_path
     ):
+        """The seed's Adam state and scheduler step count belong to the run that
+        produced it, so a warm start rebuilds both and only the weights carry
+        over."""
         seed = tmp_path / "critic_pretrain" / "step_370"
         (seed / "value" / "weights").mkdir(parents=True)
         (seed / "value" / "optimizer").mkdir()
@@ -664,7 +813,7 @@ class TestValueWarmStart:
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
         assert value_kwargs["weights_path"] == seed / "value" / "weights"
-        assert value_kwargs["optimizer_path"] == seed / "value" / "optimizer"
+        assert value_kwargs["optimizer_path"] is None
         # The policy is untouched by a warm start: pi_0 comes from the base model.
         trainer_kwargs = patched_ppo_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] is None
@@ -737,12 +886,7 @@ class TestValueWarmStart:
 
 def _cluster_config(mc: MasterConfig, *, colocated: bool, backend: str) -> MasterConfig:
     """Fill in the cluster / generation keys _build_clusters reads."""
-    mc.cluster = {
-        "num_nodes": 1,
-        "gpus_per_node": 8,
-        "master_port_range_low": None,
-        "master_port_range_high": None,
-    }
+    mc.cluster = ClusterConfig(num_nodes=1, gpus_per_node=8)
     mc.policy["generation"] = {
         "backend": backend,
         "colocated": {

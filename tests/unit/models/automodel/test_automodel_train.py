@@ -115,7 +115,7 @@ def mock_tp_mesh():
 @pytest.fixture
 def base_cfg():
     return {
-        "dtensor_cfg": {"sequence_parallel": False},
+        "automodel_cfg": {"sequence_parallel": False},
         "sequence_packing": {"train_mb_tokens": 256},
         "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
@@ -354,6 +354,74 @@ class TestModelForward:
         model_forward(model, prepared.model_batch)
 
         assert "num_frames" in model.forward_kwargs
+
+    @pytest.mark.parametrize(
+        "forward_kind, expects_mask",
+        [
+            ("var_kwargs", False),
+            ("explicit_without_mask", False),
+            ("explicit_with_mask", True),
+        ],
+    )
+    def test_explicit_only_kwargs_require_named_forward_arg(
+        self, processed_inputs_multimodal, forward_kind, expects_mask
+    ):
+        class RecordingModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.forward_kwargs = {}
+
+            def _record(self, **kwargs):
+                self.forward_kwargs = kwargs
+                return MagicMock(logits=torch.randn(2, 64, 1000))
+
+        class VarKwargsModel(RecordingModel):
+            def forward(self, **kwargs):
+                return self._record(**kwargs)
+
+        class ExplicitWithoutMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+            ):
+                return self._record(pixel_values=pixel_values)
+
+        class ExplicitWithMaskModel(RecordingModel):
+            def forward(
+                self,
+                input_ids,
+                attention_mask=None,
+                position_ids=None,
+                use_cache=False,
+                pixel_values=None,
+                media_token_validity_mask=None,
+            ):
+                return self._record(
+                    pixel_values=pixel_values,
+                    media_token_validity_mask=media_token_validity_mask,
+                )
+
+        model = {
+            "var_kwargs": VarKwargsModel,
+            "explicit_without_mask": ExplicitWithoutMaskModel,
+            "explicit_with_mask": ExplicitWithMaskModel,
+        }[forward_kind]()
+        media_mask = torch.zeros(2, 64, dtype=torch.bool)
+        processed_inputs_multimodal.vlm_kwargs["media_token_validity_mask"] = media_mask
+
+        prepared = _prepare_cp1(model, processed_inputs_multimodal)
+        model_forward(model, prepared.model_batch)
+
+        assert "pixel_values" in model.forward_kwargs
+        if expects_mask:
+            assert model.forward_kwargs["media_token_validity_mask"] is media_mask
+        else:
+            assert "media_token_validity_mask" not in model.forward_kwargs
+        assert "media_token_validity_mask" in processed_inputs_multimodal.vlm_kwargs
 
     def test_forward_reward_model_removes_flash_attn(
         self, mock_model, processed_inputs_with_flash
@@ -646,11 +714,15 @@ class TestScorePostProcessor:
 # =====================
 @pytest.mark.automodel
 class TestLogprobsPostProcessor:
+    @pytest.mark.parametrize(
+        "sampling_params", [None, TrainingSamplingParams(top_k=None, top_p=1.0)]
+    )
     def test_basic_logprobs_computation(
-        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
+        self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh, sampling_params
     ):
         processor = LogprobsPostProcessor(
             cfg=base_cfg,
+            sampling_params=sampling_params,
         )
 
         batch_size = 4
@@ -681,6 +753,7 @@ class TestLogprobsPostProcessor:
         )
 
         assert result.shape == (batch_size, seq_len)
+        assert torch.isfinite(result).all()
 
     def test_logprobs_with_chunking(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
@@ -816,7 +889,7 @@ class TestMakeProcessedMicrobatchIterator:
         raw_iterator = iter([data_dict1, data_dict2])
 
         cfg = {
-            "dtensor_cfg": {"sequence_parallel": False},
+            "automodel_cfg": {"sequence_parallel": False},
             "sequence_packing": {"enabled": False},
         }
 
@@ -1359,6 +1432,83 @@ class TestAutomodelForwardBackward:
         ]
         assert len(results) == 1
 
+    @patch("nemo_rl.models.automodel.train.microbatch_replay_context")
+    @patch("nemo_rl.models.automodel.train.forward_with_post_processing_fn")
+    @patch("nemo_rl.models.automodel.train.prepare_model_forward")
+    def test_forward_backward_runs_backward_inside_replay_context(
+        self,
+        mock_prepare_model_forward,
+        mock_forward,
+        mock_replay_context,
+        mock_model,
+        mock_loss_fn,
+        base_cfg,
+        mock_device_mesh,
+        mock_cp_mesh,
+    ):
+        """R3: activation-checkpoint recompute in backward must still see the routes."""
+        batch_size, seq_len = 2, 8
+        input_ids = torch.randint(0, 100, (batch_size, seq_len))
+        processed_mb = ProcessedMicrobatch(
+            data_dict=BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": torch.full((batch_size,), seq_len),
+                    "sample_mask": torch.ones(batch_size, dtype=torch.bool),
+                }
+            ),
+            processed_inputs=ProcessedInputs(input_ids=input_ids, seq_len=seq_len),
+            original_batch_size=batch_size,
+            original_seq_len=seq_len,
+        )
+        events = []
+
+        class ReplayContext:
+            def __enter__(self):
+                events.append("replay_enter")
+
+            def __exit__(self, *args):
+                events.append("replay_exit")
+                return False
+
+        def forward(**kwargs):
+            events.append("forward")
+            leaf = torch.ones(1, requires_grad=True)
+            leaf.register_hook(lambda grad: events.append("backward"))
+            return (leaf * 2).sum(), {}, None
+
+        mock_replay_context.return_value = ReplayContext()
+        mock_forward.side_effect = forward
+        mock_prepare_model_forward.return_value = PreparedModelForward(
+            model_batch={"input_ids": input_ids},
+            cp_size=1,
+            cp_sharder=None,
+            model_context_factory=nullcontext,
+        )
+        gates = [object()]
+
+        automodel_forward_backward(
+            model=mock_model,
+            data_iterator=iter([processed_mb]),
+            post_processing_fn=LossPostProcessor(
+                loss_fn=mock_loss_fn,
+                cfg=base_cfg,
+                cp_mesh=mock_cp_mesh,
+                cp_size=1,
+                dp_size=1,
+            ),
+            device_mesh=mock_device_mesh,
+            padding_token_id=0,
+            autocast_context_factory=nullcontext,
+            forward_only=False,
+            global_valid_seqs=torch.tensor(batch_size),
+            global_valid_toks=torch.tensor(batch_size * seq_len),
+            router_replay_gates=gates,
+        )
+
+        mock_replay_context.assert_called_once_with(gates, processed_mb)
+        assert events == ["replay_enter", "forward", "backward", "replay_exit"]
+
     def test_forward_backward_with_on_microbatch_start(
         self,
         mock_model,
@@ -1793,12 +1943,12 @@ class TestLogprobsPostProcessorSeqPacking:
 
         original_batch_size = 4
         original_seq_len = 32
-        packed_seq_len = 128  # All 4 sequences packed
-        vocab_size = 32000
+        packed_seq_len = 82  # Unequal lengths exercise boundaries and output padding.
+        vocab_size = 64
 
         logits = torch.randn(1, packed_seq_len, vocab_size)
         input_ids = torch.randint(0, vocab_size, (1, packed_seq_len))
-        input_lengths = torch.tensor([32, 32, 32, 32])
+        input_lengths = torch.tensor([11, 32, 23, 16])
         data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
@@ -1806,7 +1956,7 @@ class TestLogprobsPostProcessorSeqPacking:
             cu_seqlens_q: torch.Tensor
 
         flash_kwargs = MockFlashAttnKwargs(
-            cu_seqlens_q=torch.tensor([0, 32, 64, 96, 128])
+            cu_seqlens_q=torch.tensor([0, 11, 43, 66, 82])
         )
 
         processed_inputs = ProcessedInputs(
@@ -1818,17 +1968,29 @@ class TestLogprobsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        result = processor(
-            logits=logits,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            original_batch_size=original_batch_size,
-            original_seq_len=original_seq_len,
-            cp_sharder=None,
-        )
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            result = processor(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=original_batch_size,
+                original_seq_len=original_seq_len,
+                cp_sharder=None,
+            )
 
         # Result should be unpacked to original shape
         assert result.shape == (original_batch_size, original_seq_len)
+
+        expected = torch.zeros_like(result)
+        for i, (start, end) in enumerate(zip((0, 11, 43, 66), (11, 43, 66, 82))):
+            seq_logprobs = torch.log_softmax(logits[0, start : end - 1], dim=-1)
+            targets = input_ids[0, start + 1 : end]
+            expected[i, 1 : end - start] = seq_logprobs.gather(
+                -1, targets.unsqueeze(-1)
+            ).squeeze(-1)
+        torch.testing.assert_close(result, expected)
 
     def test_logprobs_masking_without_sequence_packing(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
@@ -1893,11 +2055,11 @@ class TestTopkLogitsPostProcessorSeqPacking:
 
         original_batch_size = 4
         original_seq_len = 32
-        packed_seq_len = 128  # All 4 sequences packed
-        vocab_size = 32000
+        packed_seq_len = 82  # Unequal lengths exercise boundaries and output padding.
+        vocab_size = 64
 
         logits = torch.randn(1, packed_seq_len, vocab_size)
-        input_lengths = torch.tensor([32, 32, 32, 32])
+        input_lengths = torch.tensor([11, 32, 23, 16])
         data_dict = BatchedDataDict({"input_lengths": input_lengths})
 
         @dataclass
@@ -1905,7 +2067,7 @@ class TestTopkLogitsPostProcessorSeqPacking:
             cu_seqlens_q: torch.Tensor
 
         flash_kwargs = MockFlashAttnKwargs(
-            cu_seqlens_q=torch.tensor([0, 32, 64, 96, 128])
+            cu_seqlens_q=torch.tensor([0, 11, 43, 66, 82])
         )
 
         processed_inputs = ProcessedInputs(
@@ -1917,18 +2079,30 @@ class TestTopkLogitsPostProcessorSeqPacking:
             vlm_kwargs={},
         )
 
-        vals, idx = processor(
-            logits=logits,
-            data_dict=data_dict,
-            processed_inputs=processed_inputs,
-            original_batch_size=original_batch_size,
-            original_seq_len=original_seq_len,
-            cp_sharder=None,
-        )
+        with patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("per-sequence item()")
+        ):
+            vals, idx = processor(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                original_batch_size=original_batch_size,
+                original_seq_len=original_seq_len,
+                cp_sharder=None,
+            )
 
         # Result should be unpacked to original shape
         assert vals.shape == (original_batch_size, original_seq_len, k)
         assert idx.shape == (original_batch_size, original_seq_len, k)
+
+        expected_vals = torch.zeros_like(vals)
+        expected_idx = torch.zeros_like(idx)
+        for i, (start, end) in enumerate(zip((0, 11, 43, 66), (11, 43, 66, 82))):
+            seq_vals, seq_idx = torch.topk(logits[0, start:end], k=k, dim=-1)
+            expected_vals[i, : end - start] = seq_vals
+            expected_idx[i, : end - start] = seq_idx
+        torch.testing.assert_close(vals, expected_vals)
+        torch.testing.assert_close(idx, expected_idx)
 
 
 # =====================

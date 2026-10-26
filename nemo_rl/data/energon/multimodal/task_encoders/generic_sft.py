@@ -18,7 +18,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from copy import deepcopy
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import torch
 from megatron.energon import SampleDecoder, stateless
@@ -26,6 +26,11 @@ from megatron.energon import SampleDecoder, stateless
 from nemo_rl.data.energon.multimodal.model_families import (
     ALL_MODEL_FAMILIES,
     supports_model_families,
+)
+from nemo_rl.data.energon.multimodal.packing import (
+    pack_selected_samples,
+    prepare_packed_sft_batch,
+    select_samples_to_pack,
 )
 from nemo_rl.data.energon.multimodal.task_encoders.base import (
     BaseSFTTaskEncoder,
@@ -37,10 +42,12 @@ from nemo_rl.data.energon.multimodal.task_encoders.media import (
 from nemo_rl.data.energon.multimodal.types import (
     CanonicalSFTSample,
     EncodedSFTSample,
+    PackedSFTSample,
 )
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data.packing import SequencePacker
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -63,12 +70,12 @@ def _normalize_messages(
         materialize: Decode each media value and attach the payload. Set False
             to attach the ``MediaRef`` instead.
 
-    The Nemotron renderers replace every media part with text built from
-    metadata and then overwrite ``message["content"]`` wholesale, so decoding
-    for them is pure waste. It is also waste paid at the wrong time: this runs
-    in pre-encode, before ``select_samples_to_pack``, so rows that selection
-    discards are decoded too. Measured on video rows at 2771 ms against the
-    Megatron reference's 4.7 ms, which defers all frame work to post-encode.
+    Model-specific renderers may replace media parts with text built from
+    metadata and overwrite ``message["content"]`` wholesale, so decoding for
+    them is pure waste. It is also waste paid at the wrong time: this runs in
+    pre-encode, before ``select_samples_to_pack``, so rows that selection
+    discards are decoded too. Model-specific encoders can defer media work to
+    post-encode by setting ``materialize=False``.
 
     Only ``GenericSFTTaskEncoder.encode`` consumes the payload, via
     ``get_formatted_message_log``, so it keeps the default.
@@ -211,6 +218,7 @@ class HFMultimodalSFTProcessorAdapter:
             add_eos_token=self.add_eos,
             add_generation_prompt=self.add_generation_prompt,
             tools=sample.tools,
+            chat_template_preapplied=sample.chat_template_preapplied,
         )
         length = sum(len(message["token_ids"]) for message in message_log)
         loss_multiplier = 1.0
@@ -226,6 +234,7 @@ class HFMultimodalSFTProcessorAdapter:
                 for key, value in list(message.items()):
                     if isinstance(value, PackedTensor):
                         message[key] = PackedTensor.empty_like(value)
+            length = sum(len(message["token_ids"]) for message in message_log)
             loss_multiplier = 0.0
 
         # group_key is the adapter fingerprint alone. Keying on the tensor names
@@ -251,7 +260,6 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
     # which would let a systematically broken dataset retry forever. 1 fails on the
     # first bad sample; raise it to tolerate transient decode errors.
     __default_failure_tolerance__ = 1
-    sample_schema = "nemo_rl.sft.encoded.v1"
     # Match the existing HF VLM path. Its processor expects PIL RGB images.
     decoder = SampleDecoder(image_decode="pilrgb")
 
@@ -261,10 +269,42 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         adapter: SFTProcessorAdapter,
         cooker_functions: Sequence[SFTCooker],
         include_source_ids: bool,
+        packer: SequencePacker | None = None,
+        tokenizer: Any | None = None,
+        sequence_length_pad_multiple: int = 1,
+        only_unmask_final: bool = False,
+        loss_mask_mode: Literal["precomputed"] | None = None,
     ) -> None:
+        """Configure conversation encoding and optional sequence packing.
+
+        Args:
+            adapter: Processor adapter that encodes each conversation.
+            cooker_functions: Cookers that produce canonical SFT samples.
+            include_source_ids: Include source identifiers in each batch.
+            packer: Sequence packer, or None to batch individual conversations.
+            tokenizer: Tokenizer used to pad packed batches.
+            sequence_length_pad_multiple: Alignment for each source in a pack.
+            only_unmask_final: Train only on the final assistant turn in default mode.
+            loss_mask_mode: None builds assistant-role loss masks. "precomputed"
+                preserves each message's token_loss_mask, which must be a binary
+                one-dimensional tensor matching token_ids. Precomputed masks do
+                not support only_unmask_final=True. Both modes support packed
+                and unpacked conversations.
+        """
+        if loss_mask_mode not in (None, "precomputed"):
+            raise ValueError(f"Unsupported SFT loss_mask_mode={loss_mask_mode!r}.")
+        if loss_mask_mode == "precomputed" and only_unmask_final:
+            raise ValueError(
+                "only_unmask_final cannot override precomputed SFT loss masks."
+            )
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
         self.include_source_ids = include_source_ids
+        self.packer = packer
+        self.tokenizer = tokenizer
+        self.sequence_length_pad_multiple = sequence_length_pad_multiple
+        self.only_unmask_final = only_unmask_final
+        self.loss_mask_mode = loss_mask_mode
 
     @stateless
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -275,12 +315,47 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         return sample
 
     def batch_group_criterion(
-        self, sample: EncodedSFTSample
+        self, sample: EncodedSFTSample | PackedSFTSample
     ) -> tuple[tuple[Any, ...], None]:
         return sample.group_key, None
 
+    @stateless(restore_seeds=True)
+    def select_samples_to_pack(
+        self, samples: list[EncodedSFTSample]
+    ) -> list[list[EncodedSFTSample]]:
+        if self.packer is None:
+            raise RuntimeError("Energon packing is not configured.")
+        return select_samples_to_pack(
+            samples,
+            packer=self.packer,
+            sequence_length_pad_multiple=self.sequence_length_pad_multiple,
+        )
+
     @stateless
-    def batch(self, samples: list[EncodedSFTSample]) -> BatchedDataDict[Any]:
+    def pack_selected_samples(self, samples: list[EncodedSFTSample]) -> PackedSFTSample:
+        if self.packer is None:
+            raise RuntimeError("Energon packing is not configured.")
+        return pack_selected_samples(
+            samples,
+            pack_capacity=self.packer.bin_capacity,
+            sequence_length_pad_multiple=self.sequence_length_pad_multiple,
+        )
+
+    @stateless
+    def batch(
+        self, samples: list[EncodedSFTSample | PackedSFTSample]
+    ) -> BatchedDataDict[Any]:
+        if samples and isinstance(samples[0], PackedSFTSample):
+            if not all(isinstance(sample, PackedSFTSample) for sample in samples):
+                raise TypeError("Energon batches cannot mix packed and unpacked rows.")
+            if self.tokenizer is None:
+                raise RuntimeError("Packed SFT requires a tokenizer.")
+            return prepare_packed_sft_batch(
+                cast(list[PackedSFTSample], samples),
+                tokenizer=self.tokenizer,
+                only_unmask_final=self.only_unmask_final,
+                loss_mask_mode=self.loss_mask_mode,
+            )
         if not all(isinstance(sample, EncodedSFTSample) for sample in samples):
             raise TypeError("Energon SFT batches accept only encoded samples.")
         encoded_samples = cast(list[EncodedSFTSample], samples)
@@ -293,6 +368,8 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         }
         if self.include_source_ids:
             values["source_ids"] = [sample.sample_key for sample in encoded_samples]
+        if self.loss_mask_mode is not None:
+            values["loss_mask_mode"] = self.loss_mask_mode
         return BatchedDataDict(values)
 
     @stateless

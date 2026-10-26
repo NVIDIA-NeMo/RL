@@ -30,12 +30,50 @@ from nemo_rl.models.generation.constants import (
     DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
+    TRTLLM_BACKEND,
     VLLM_BACKEND,
 )
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+
+
+def validate_offload_policy_before_refit(
+    *,
+    enabled: bool,
+    megatron_enabled: bool,
+    generation_backend: str,
+    colocated: bool,
+    refit_transport: Optional[str],
+) -> None:
+    """Validate the topology supported by policy offload before refit."""
+    if not enabled:
+        return
+    if not megatron_enabled:
+        raise ValueError(
+            "offload_policy_before_refit requires the Megatron policy backend."
+        )
+    if colocated:
+        raise ValueError(
+            "offload_policy_before_refit applies only to non-colocated refit."
+        )
+    supported_transports = (
+        (None, "nccl_reshard")
+        if generation_backend == VLLM_BACKEND
+        else (None,)
+        if generation_backend == TRTLLM_BACKEND
+        else (None, "mcore", "nccl_reshard")
+        if generation_backend == MEGATRON_BACKEND
+        else ()
+    )
+    if refit_transport not in supported_transports:
+        raise ValueError(
+            "offload_policy_before_refit requires non-colocated vLLM or Megatron "
+            "generation with a collective, mcore, or nccl_reshard refit transport, "
+            "or non-colocated TensorRT-LLM generation with the default collective "
+            "transport."
+        )
 
 
 def create_weight_synchronizer(
@@ -77,6 +115,7 @@ def create_weight_synchronizer(
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
         DYNAMO_BACKEND,
+        TRTLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
         raise ValueError(
@@ -84,7 +123,25 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
-    checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
+    policy_cfg = policy.cfg
+    offload_policy_before_refit = policy_cfg["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_cfg.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_backend,
+        colocated=colocated,
+        refit_transport=generation.cfg.get("refit_transport"),
+    )
+
+    # Megatron owns its refit selectors (including "mcore"); the vLLM-oriented
+    # checkpoint-engine normalization rejects that valid Megatron value.
+    checkpoint_engine_config = (
+        None
+        if generation_backend == MEGATRON_BACKEND
+        else checkpoint_engine_refit_config(generation.cfg)
+    )
     if checkpoint_engine_config is not None:
         if colocated:
             raise ValueError(
@@ -124,6 +181,8 @@ def create_weight_synchronizer(
             colocated=colocated,
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
+            refit_timeout_s=refit_timeout_s,
+            offload_policy_before_refit=offload_policy_before_refit,
         )
 
     if generation_backend == SGLANG_BACKEND:
@@ -174,6 +233,7 @@ def create_weight_synchronizer(
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
                 refit_timeout_s=refit_timeout_s,
+                offload_policy_before_refit=offload_policy_before_refit,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
@@ -186,6 +246,7 @@ def create_weight_synchronizer(
             train_cluster=train_cluster,
             inference_cluster=inference_cluster,
             refit_timeout_s=refit_timeout_s,
+            offload_policy_before_refit=offload_policy_before_refit,
         )
 
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (

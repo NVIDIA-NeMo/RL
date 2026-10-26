@@ -26,11 +26,11 @@ docker buildx build \
   .
 ```
 
-The opt-in layer installs `ai-dynamo[vllm]==1.3.0.post1` in isolated Python
+The opt-in layer installs `ai-dynamo[vllm]==1.5.1` in isolated Python
 3.12 under `/opt/dynamo_venv`, along with etcd v3.5.21 and NATS Server v2.11.6.
 It does not replace NeMo RL's normal Ray or vLLM dependencies: the standard
-NeMo RL vLLM environment currently uses vLLM 0.25.1, while this isolated
-Dynamo environment uses Dynamo's vLLM 0.23.0 pin. Both environments pin
+NeMo RL vLLM environment currently uses vLLM 0.29.0, while this isolated
+Dynamo environment uses Dynamo's vLLM 0.28.0 pin. Both environments pin
 `nvidia-nccl-cu13==2.30.7` so their NCCL communicators use the same release.
 For a local source checkout, the same environment can be installed under
 `venvs/dynamo`:
@@ -40,21 +40,22 @@ bash docker/dynamo/install.sh
 ```
 
 Set `NEMO_RL_DYNAMO_VENV_DIR` to choose another location. The installer checks
-that Dynamo resolved vLLM 0.23.0 and NCCL 2.30.7, applies the vLLM PR #44814
-backport only after `git apply --check`, and writes the upstream marker to
-`VLLM_BACKPORTS`.
+that Dynamo resolved vLLM 0.28.0 and NCCL 2.30.7, and that the installed vLLM
+contains the PR #44814 layerwise-reload fix.
 
-Treat the isolated dependency pin and backport as one update. A Dynamo upgrade
-must update and reverify these coupled locations:
+A Dynamo upgrade must update and reverify these coupled locations:
 
 - `docker/dynamo/pyproject.toml` and `docker/dynamo/uv.lock`: the Dynamo pin
   and resolved dependency set
 - root `pyproject.toml` and `uv.lock`, plus the isolated Dynamo project and
   lockfile: the `nvidia-nccl-cu13` pins must remain identical
-- `docker/dynamo/install.sh` and `tests/functional/grpo_dynamo.sh`: the vLLM
-  version, backport marker, and runtime assertions
-- `docker/dynamo/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch`:
-  the version-specific #44814 backport
+- `docker/dynamo/install.sh`, `tests/functional/grpo_dynamo.sh`, and
+  `tests/functional/grpo_dynamo_single_controller.sh`: the vLLM version, the
+  #44814 fix check, and runtime assertions
+- `nemo_rl/models/generation/dynamo/refit.py` and
+  `validate_dynamo_vllm_args.py`: the vLLM weight-transfer payloads (packing is
+  declared in the init info; update rounds carry names, dtypes, and shapes;
+  `start_weight_update` takes no arguments)
 - `tests/unit/distributed/test_stateless_process_group.py`: vLLM's
   `broadcast_from/0/0` weight-transfer wire key
 - `nemo_rl/models/generation/dynamo/token_wrapper.py`: the real Dynamo response
@@ -65,12 +66,7 @@ must update and reverify these coupled locations:
   `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
   jail removes `nvext.engine_data`; remove this setting only after an upgraded
   Dynamo preserves the token metadata for `tool_choice=auto`
-- this guide and the Dynamo design document: the stated versions and backport
-  behavior
-
-If the new Dynamo vLLM pin contains PR #44814, delete the patch file,
-patch-application block, marker assertion, and explanatory backport text. Do
-not rebase the patch onto the newer vLLM release.
+- this guide and the Dynamo design document: the stated versions
 
 ## Configure Dynamo
 
@@ -114,7 +110,9 @@ Service ports and the namespace are runtime-owned rather than public config.
 The shared GRPO base config also supplies `mcore_generation_config` and
 `refit_cfg`. Dynamo accepts these inherited sections but does not use them;
 worker arguments come from `vllm_cfg`, and refit uses the collective weight
-synchronizer.
+synchronizer. Any other active top-level `policy.generation` setting that
+Dynamo does not honor, such as `bad_words` or `ignore_eos`, draws a startup
+warning.
 
 Enable and filter worker telemetry with both managed configuration sections:
 
@@ -170,6 +168,43 @@ The recipe assigns one GPU to training and one to a TP1 Dynamo worker. Its two
 steps exercise generation, refit, post-refit cache invalidation, telemetry,
 and cleanup. For a matched control, run the same seed/model/batch settings with
 the standard non-colocated vLLM backend and compare post-refit output validity.
+
+## Run under the SingleController
+
+The async SingleController trainer can also use managed Dynamo. It follows the
+same data path as the native vLLM backend: the SingleController sends each turn
+to the Dynamo frontend, builds the rollout record from the response, and commits
+it to the TransferQueue data plane, from which the policy workers read their
+shards. No Dynamo-side component writes to TransferQueue.
+
+Start from
+[`examples/configs/grpo_math_1B_dynamo_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_single_controller.yaml)
+and launch it with `examples/run_grpo_single_controller.py`. Before every weight
+update the SingleController drains and pauses each Dynamo worker (requests the
+engine is running finish on the old weights; queued and new requests wait and
+run on the new weights), runs the NCCL refit, and then resumes the workers. With
+`async_rl.recompute_kv_cache_after_weight_updates` (the default), the drain also
+clears each worker's KV and prefix cache. The drain is bounded by
+`dynamo_cfg.control_timeout_s`.
+
+Current limits on this path:
+
+- Native rollouts only. NeMo-Gym under the SingleController supports only
+  `backend: vllm` and `backend: megatron`.
+- Text policies only, and no MoE router replay: `policy.is_vlm` and
+  `policy.router_replay.enabled` must be false.
+- Fleet health is not supported: keep `async_rl.generation_fleet_health.enabled`
+  false (the Dynamo frontend owns request routing) and set
+  `async_rl.generation_fleet_health.refit_timeout_s: null` (default 300), since
+  Dynamo workers cannot abort their refit collective.
+- `dynamo_cfg.control_timeout_s` must be at least `dynamo_cfg.request_timeout_s`,
+  because it bounds the drain.
+- `vllm_cfg.enable_vllm_metrics_logger` requires
+  `rollout_checkpointing.telemetry_interval_s`: the rollout telemetry pump drains
+  the Dynamo metrics sampler and reports each engine's generated tokens, running
+  and waiting requests, and KV-cache usage.
+
+Setup rejects any of these before allocating clusters.
 
 ## Run SWE1 with W&B
 

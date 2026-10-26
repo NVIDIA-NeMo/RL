@@ -1,6 +1,6 @@
 # Automodel v0.6.0 and Context-Parallel Integration
 
-This design note describes NeMo RL's Automodel DTensor v2 integration after the
+This design note describes NeMo RL's Automodel integration after the
 Automodel dependency was pinned to the official `v0.6.0` tag. It also explains the
 migration from NeMo RL's fixed context-parallel (CP) layout to Automodel's model-owned
 sharding protocol.
@@ -35,12 +35,12 @@ The dependency changes in `pyproject.toml` are:
 | --- | --- | --- |
 | Base `transformers` constraint | `>=5.5.0,<5.9.0` | `>=5.5.0,<=5.12.1` |
 | Automodel extra | `transformers>=5.5.0,<5.6.0` | `transformers==5.12.1` |
-| FSDP, vLLM, and MCore extras | No direct Transformers pin | `transformers==5.12.1` |
+| vLLM and MCore extras | No direct Transformers pin | `transformers==5.12.1` |
 | Automodel TileLang dependency on Linux x86_64 | No Automodel-specific pin | `tilelang==0.1.11` |
 | Shared `apache-tvm-ffi` override | `>=0.1.9` | `==0.1.11` |
 | `megatron-fsdp` | No root constraint | Git constraint at [`455389c4`](https://github.com/yuhezhang-ai/Megatron-LM/commit/455389c480af6b3acdca74c7830c68b3274eb083) |
 
-The Automodel, FSDP, vLLM, and MCore environments select Transformers 5.12.1. The SGLang
+The Automodel, vLLM, and MCore environments select Transformers 5.12.1. The SGLang
 extra remains independently pinned to Transformers 5.6.0. The `megatron-fsdp` constraint
 mirrors Automodel's source and revision so `uv` can resolve the transitive URL dependency
 consistently. The lock file was regenerated as part of the dependency upgrade.
@@ -91,11 +91,24 @@ model = model_class.from_pretrained(
   ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
 - `Checkpointer._should_write_hf_metadata()` became the module-level
   `_should_write_hf_metadata(config)`.
-- `save_consolidated` now uses `SaveConsolidatedMode`; NeMo RL normalizes values with
-  `_normalize_save_consolidated()` after configuration updates
-  ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL currently rejects
-  `save_consolidated: final` because its checkpoint calls do not identify the final save;
-  use `true`/`every` when inline consolidated export is required.
+- `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
+  modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
+  exposes these Automodel-only settings under `policy.automodel_cfg`, delegates
+  normalization to Automodel, explicitly marks terminal checkpoint saves, and
+  supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
+  intentionally exposes only canonical strings: use quoted `"false"` instead of
+  the YAML boolean `false`, and use `"every"` instead of `true`.
+  Timeout-triggered saves remain resumable recovery checkpoints and are not marked
+  as terminal saves.
+  NeMo RL retains ownership of async-save finalization, metric selection, and
+  checkpoint retention, so overlapping or otherwise unsupported upstream settings
+  are rejected instead of silently ignored. Automodel policy saves are asynchronous
+  and finalized before checkpoint promotion; value saves are synchronous because
+  their callers promote the checkpoint immediately after `Value.save_checkpoint()`
+  returns. Automodel's checkpoint CPU offload, consolidation staging, and
+  Transformers v4 compatibility settings are not exposed yet. As with the Megatron
+  backend, checkpoint resource settings are fixed when workers start; an individual
+  save supplies only its destination and whether it is the final checkpoint.
 
 The upgrade removes three compatibility workarounds:
 
@@ -148,10 +161,10 @@ This matrix describes the NeMo RL tree at the before-upgrade baseline.
 | DPO | Supported | Restored full-sequence policy and reference logprobs before the DPO loss |
 | Same-tokenizer distillation | Supported | Teacher top-k export and student distillation loss were CP-aware |
 | X-token distillation | Conditional | Specialized heterogeneous teacher/student TP and CP path; no sequence packing |
-| PPO | Not supported end to end | Actor policy could use CP, but the Automodel DTensor critic/value path required `CP=1` |
-| Reward-model training | Not supported | The Automodel DTensor RM path rejected `CP>1` |
+| PPO | Not supported end to end | Actor policy could use CP, but the Automodel critic/value path required `CP=1` |
+| Reward-model training | Not supported | The Automodel RM path rejected `CP>1` |
 | CP with sequence packing | Not supported | Explicit NeMo RL guard |
-| CP with DTensor sequence parallel | Not supported | Explicit guard when TP sequence parallelism and CP were both active |
+| CP with Automodel sequence parallel | Not supported | Explicit guard when TP sequence parallelism and CP were both active |
 | Non-packed sequence length | Restricted | Legacy load-balanced sharding required divisibility by `2 * cp_size` |
 
 ### 3.3 Support Matrix After the Upgrade
@@ -167,10 +180,10 @@ This matrix describes the current NeMo RL integration pinned to Automodel `v0.6.
 | DPO | Supported | Full-sequence policy/reference logprobs are restored through the sharder before loss computation |
 | Same-tokenizer distillation | Supported | Top-k and student outputs are restored through the sharder; replicated loss uses `loss * DP` |
 | X-token distillation | Conditional | Specialized heterogeneous TP/CP path remains; no sequence packing, and each teacher/student sequence length must be divisible by its own CP size for the contiguous IPC windows |
-| PPO | Not supported end to end | Actor policy can use CP, but the Automodel DTensor critic/value path still requires `CP=1` |
+| PPO | Not supported end to end | Actor policy can use CP, but the Automodel critic/value path still requires `CP=1` |
 | Reward-model training and scoring | Not supported | RM setup and `ScorePostProcessor` reject `CP>1` |
 | CP with sequence packing | Not supported in NeMo RL | The integration still rejects it, even though the upstream sharder can represent packed/THD layouts |
-| CP with DTensor sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
+| CP with Automodel sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
 | Non-packed sequence length | Supported with padding | The generic sharder pads and trims automatically; x-token keeps the divisibility restriction described above |
 
 ### 3.4 GRPO Workflow Before and After

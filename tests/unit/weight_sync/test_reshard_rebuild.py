@@ -71,7 +71,11 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
 
     gen = SimpleNamespace(
         cfg={"vllm_cfg": {"async_engine": False}},
-        worker_group=SimpleNamespace(workers=workers, dp_size=dp_size),
+        worker_group=SimpleNamespace(
+            workers=workers,
+            dp_size=dp_size,
+            get_dp_leader_worker_idx=lambda shard: shard * workers_per_shard,
+        ),
         dp_size=dp_size,
         # Declared, because VllmGeneration declares it. It used to be read with a getattr
         # default, which meant this fake could omit it and still pass -- the getattr was
@@ -88,6 +92,7 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
         "prepare_nccl_reshard_refit_info",
         "set_refit_membership",
         "nccl_reshard_refit",
+        "_refit_leaders_by_shard",
         "_refit_leader_workers",
     ):
         setattr(
@@ -108,12 +113,21 @@ def _reshard(dp_size=4, workers_per_shard=1, dead_shards=(), train_world_size=8)
                 "expert_model_parallel_size": 1,
                 "pipeline_model_parallel_size": 1,
             },
-            "generation": {"vllm_cfg": {"tensor_parallel_size": 1}},
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"tensor_parallel_size": 1},
+            },
         },
+        sync_params_before_refit=lambda: None,
         init_collective=lambda *a, **k: ["train-f"],
         init_nccl_reshard_comm_group=lambda **k: ["train-bulk"],
         prepare_nccl_reshard_refit_info=lambda tp, gp, tws, iws: (
-            plan_calls.append({"train_world_size": tws, "gen_world_size": iws})
+            plan_calls.append(
+                {
+                    "train_world_size": tws,
+                    "gen_world_size": iws,
+                }
+            )
             or {"gen_world_size": iws}
         ),
     )

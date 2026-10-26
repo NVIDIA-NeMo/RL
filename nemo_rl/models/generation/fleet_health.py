@@ -405,11 +405,32 @@ class GenerationFleetHealth:
             return
         self._transition(shard, ShardState.RESTARTING)
 
-    def mark_loaded(self, shard_idx: int) -> None:
-        """The replacement finished loading. It holds stale weights until refit."""
+    def mark_loaded(self, shard_idx: int, *, base_url: Optional[str] = None) -> None:
+        """The replacement finished loading. It holds stale weights until refit.
+
+        Args:
+            base_url: the replacement's URL. A restarted engine binds a new port, so
+                without this the monitor keeps publishing the dead one -- and
+                ``serving_base_urls()`` feeds the NeMo-Gym router, which would send every
+                rollout to a socket nobody is listening on.
+        """
         shard = self._shards[shard_idx]
         if shard.state is ShardState.RETIRED:
             return
+        if base_url:
+            shard.base_url = base_url
+        # Cleared because the shard reached DEAD by accumulating failures; carrying that
+        # count into a fresh engine would let a single unlucky probe re-condemn it
+        # immediately, burning a restart attempt for nothing.
+        shard.consecutive_probe_failures = 0
+        shard.consecutive_probe_successes = 0
+        # Both belong to the engine that died. The reported streak counts requests that
+        # process failed, and state_before_partial is a verdict about how it was behaving
+        # before an abort pulled it out of service. Neither is evidence about the fresh
+        # process taking its place, and report_refit reads both -- so leaving them set
+        # brings a clean replacement back SUSPECT, one failure from being condemned again.
+        shard.consecutive_reported_failures = 0
+        shard.state_before_partial = None
         self._transition(shard, ShardState.STALE)
 
     def mark_weights_partial(self, shard_idx: int) -> None:
@@ -435,6 +456,47 @@ class GenerationFleetHealth:
             # streak precisely because such an engine still answers is_alive.
             shard.state_before_partial = shard.state
         self._transition(shard, ShardState.STALE)
+
+    def mark_restart_failed(self, shard_idx: int, *, error: str = "") -> None:
+        """A restart attempt did not bring the engine up. Back to DEAD.
+
+        Needed as its own transition because ``record_probe`` deliberately ignores
+        non-serving states -- a probe must never resurrect a shard -- so a failed restart
+        reported that way would leave the shard stuck in RESTARTING: never retried,
+        because it is no longer DEAD, and never retired, because retirement is driven by
+        restart attempts.
+
+        ``error`` matters more here than the two siblings that already take one. ``retire``
+        has exactly one caller -- attempts exhausted -- so ``last_error`` is the only
+        structured field that can say what the reloads failed on. Without this it still
+        holds the *original* death, which is wrong and plausible enough to be believed: a
+        GPU that an orphaned EngineCore held for 370s and a ``seed=None`` config error want
+        completely different responses and would otherwise be indistinguishable in the
+        record.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state is ShardState.RETIRED:
+            return
+        if error:
+            shard.last_error = error
+        self._transition(shard, ShardState.DEAD)
+
+    def record_weight_version(self, shard_idx: int, *, weight_version: int) -> None:
+        """This shard received this refit's weights. Nothing else changes.
+
+        The stamp without the promotion, for the shards a refit reached that are not STALE
+        -- which on a run where nothing has died is all of them. ``report_refit`` cannot
+        serve that case: it is a state transition, and driving one on a HEALTHY shard after
+        every refit would clear the reported-failure streak that is the only counter able to
+        condemn an engine that still answers ``is_alive``.
+
+        Absent shards received nothing, so the caller filters them out before calling; the
+        RETIRED guard here is belt-and-braces, matching ``report_refit``.
+        """
+        shard = self._shards[shard_idx]
+        if shard.state is ShardState.RETIRED:
+            return
+        shard.weight_version = weight_version
 
     def report_refit(self, shard_idx: int, *, weight_version: int) -> None:
         """A completed refit is the only way back into the serving set."""

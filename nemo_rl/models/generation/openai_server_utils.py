@@ -22,7 +22,18 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any
+
+
+@dataclass(frozen=True)
+class PrefixSplice:
+    """Exact token splice and its source coordinates for multimodal ranges."""
+
+    token_ids: list[int]
+    model_cut_end: int
+    template_cut_start: int
 
 
 def replace_prefix_tokens(
@@ -30,7 +41,31 @@ def replace_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    *,
+    eos_token_id: int | Collection[int] | None = None,
 ) -> list[int]:
+    """Replace a rendered history with the exact previously generated tokens.
+
+    Thin wrapper over :func:`splice_prefix_tokens` for callers that only need
+    the spliced ids; see that function for the algorithm and ``eos_token_id``.
+    """
+    return splice_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+        eos_token_id=eos_token_id,
+    ).token_ids
+
+
+def splice_prefix_tokens(
+    *,
+    tokenizer: Any,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+    eos_token_id: int | Collection[int] | None = None,
+) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
     This function is for fixing up the chat template-tokenized messages history
@@ -88,42 +123,73 @@ def replace_prefix_tokens(
         replace_prefix_tokens keeps the exact prior model tokens up to EOS and
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
+
+    ``eos_token_id`` overrides ``tokenizer.eos_token_id``; with it, ``tokenizer``
+    may be ``None`` (callers that only hold token ids, e.g. the Megatron prompt
+    preparer) and the failure message skips the detokenized reprs. It may also
+    be a collection of ids for models that declare several EOS tokens (the
+    Megatron chat endpoint ships the model's full EOS set): any of them counts
+    toward the boundary, and when the model's prefix ends on one of them that
+    exact id is kept in place of the template's, so the spliced prompt still
+    starts with the model's tokens verbatim.
     """
     if not model_prefix_token_ids:
-        return template_token_ids
+        return PrefixSplice(template_token_ids, 0, 0)
 
-    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
+    eos_token_ids = (
+        frozenset([eos_token_id])
+        if isinstance(eos_token_id, int)
+        else frozenset(eos_token_id)
+    )
+    assert eos_token_ids, "EOS token id collection must not be empty"
 
     # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
     # templates always add one, so cut the model input to just before its EOS.
     model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
+    model_ended_on_eos = model_prefix_token_ids[-1] in eos_token_ids
+    if model_ended_on_eos:
         model_cut_end -= 1
 
     # Locate the turn boundary by EOS count rather than token position. Qwen3
     # templates may strip prior reasoning blocks when re-rendering history;
     # EOS counting preserves the original generated reasoning tokens without
     # requiring a customized chat template.
-    count_needed = template_prefix_token_ids.count(eos_token_id)
+    count_needed = sum(tid in eos_token_ids for tid in template_prefix_token_ids)
     count_seen = 0
     template_cut_start = -1
     for pos, tid in enumerate(template_token_ids):
-        if tid == eos_token_id:
+        if tid in eos_token_ids:
             count_seen += 1
             if count_seen == count_needed:
                 template_cut_start = pos
                 break
 
-    assert template_cut_start >= 0, (
-        f"EOS token #{count_needed} not found in template_token_ids "
-        f"(only found {count_seen} EOS tokens total)!\n"
-        f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
-        f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}\n\n"
-        f"Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
-        f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
-    )
+    if template_cut_start < 0:
+        message = (
+            f"EOS token #{count_needed} not found in template_token_ids "
+            f"(only found {count_seen} EOS tokens total)!\n"
+            f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
+            f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}"
+        )
+        if tokenizer is not None:
+            message += (
+                f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
+                f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
+            )
+        raise AssertionError(message)
 
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    boundary = (
+        [model_prefix_token_ids[model_cut_end]]
+        if model_ended_on_eos
+        else [template_token_ids[template_cut_start]]
+    )
+    return PrefixSplice(
+        model_prefix_token_ids[:model_cut_end]
+        + boundary
+        + template_token_ids[template_cut_start + 1 :],
+        model_cut_end,
+        template_cut_start,
     )

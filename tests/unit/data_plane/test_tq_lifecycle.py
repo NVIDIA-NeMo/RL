@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Callable
+import pickle
+from pathlib import Path
+from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -264,6 +266,97 @@ def test_checkpoint_lifecycle_forwards_to_tq(monkeypatch, tmp_path) -> None:
     assert client._data_operations_started
 
 
+def test_deserialization_rebuilds_mooncake_client_before_attach(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import tq_mooncake_checkpoint
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+        "mooncake_cpu": {
+            "reuse_registered_buffers": False,
+        },
+    }
+    events: list[str] = []
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(
+        tq_adapter,
+        "_patch_mooncake_register_check",
+        lambda: events.append("register_patch"),
+    )
+    monkeypatch.setattr(
+        tq_mooncake_checkpoint,
+        "install_tq_mooncake_checkpoint_plugin",
+        lambda: events.append("checkpoint_plugin"),
+    )
+    monkeypatch.setattr(
+        tq_adapter, "_connect_existing", lambda: events.append("connect")
+    )
+    bootstrap = MagicMock(side_effect=AssertionError("unexpected TQ bootstrap"))
+    monkeypatch.setattr(tq_adapter, "_init_tq", bootstrap)
+
+    source = object.__new__(tq_adapter.TQDataPlaneClient)
+    source._cfg = cfg
+    restored = pickle.loads(pickle.dumps(source))
+
+    assert events == ["register_patch", "checkpoint_plugin", "connect"]
+    assert restored._cfg == cfg
+    assert restored._supports_checkpointing is True
+    bootstrap.assert_not_called()
+
+
+@pytest.mark.parametrize("storage_metadata", [{}, {"storage_saved": False}])
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_checkpoint_rejects_incomplete_storage(
+    monkeypatch,
+    tmp_path,
+    storage_metadata: dict[str, Any],
+    operation: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    checkpoint_dir = tmp_path / f"{operation}-checkpoint"
+    connect = MagicMock()
+    load = MagicMock()
+
+    def save(
+        path: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        del metadata
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "metadata.json").write_text(json.dumps(storage_metadata))
+
+    monkeypatch.setattr(tq_adapter, "_connect_existing", connect)
+    monkeypatch.setattr(tq_adapter.tq, "save_checkpoint", save)
+    monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = "simple"
+    client._supports_checkpointing = True
+    client._data_operations_started = False
+
+    if operation == "load":
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / "metadata.json").write_text(json.dumps(storage_metadata))
+
+    with pytest.raises(RuntimeError, match="storage_saved must be true"):
+        if operation == "save":
+            client.save_checkpoint(checkpoint_dir)
+        else:
+            client.load_checkpoint(checkpoint_dir)
+
+    if operation == "save":
+        connect.assert_called_once_with()
+    else:
+        connect.assert_not_called()
+    load.assert_not_called()
+
+
 def test_list_sample_ids_uses_tq_partition_listing(monkeypatch) -> None:
     from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
@@ -341,7 +434,7 @@ def test_failed_checkpoint_load_leaves_client_in_dirty_state(
 
 
 @pytest.mark.parametrize("operation", ["save", "load"])
-def test_mooncake_checkpoint_lifecycle_fails_loudly(
+def test_unsupported_backend_checkpoint_lifecycle_fails_loudly(
     monkeypatch,
     tmp_path,
     operation: str,
@@ -356,12 +449,12 @@ def test_mooncake_checkpoint_lifecycle_fails_loudly(
     monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
 
     client = object.__new__(tq_adapter.TQDataPlaneClient)
-    client._backend = "mooncake_cpu"
+    client._backend = "future_backend"
     client._supports_checkpointing = False
     client._data_operations_started = False
     checkpoint_dir = tmp_path / "step-7"
 
-    with pytest.raises(NotImplementedError, match="mooncake_cpu"):
+    with pytest.raises(NotImplementedError, match="future_backend"):
         if operation == "save":
             client.save_checkpoint(checkpoint_dir)
         else:
@@ -408,6 +501,43 @@ def test_smoke_round_trip(tq_client) -> None:
     assert tq_client.check_consumption_status("smoke", ["read"])
 
     tq_client.clear_samples(sample_ids=None, partition_id="smoke")
+
+
+def test_get_samples_rejects_batch_missing_a_requested_column(tq_client) -> None:
+    """TQ answers a batch fetch with only the columns every key produced, so a
+    key that never wrote ``y`` would silently strip it from the other rows;
+    the adapter must fail loudly instead."""
+    tq_client.register_partition(
+        partition_id="narrowing",
+        fields=["x", "y"],
+        num_samples=4,
+        consumer_tasks=["read"],
+    )
+    tq_client.put_samples(
+        sample_ids=["full"],
+        partition_id="narrowing",
+        fields=TensorDict(
+            {"x": torch.tensor([1]), "y": torch.tensor([10])}, batch_size=[1]
+        ),
+    )
+    tq_client.put_samples(
+        sample_ids=["partial"],
+        partition_id="narrowing",
+        fields=TensorDict({"x": torch.tensor([2])}, batch_size=[1]),
+    )
+    # Alone, the full row still serves both columns ...
+    full = tq_client.get_samples(
+        sample_ids=["full"], partition_id="narrowing", select_fields=["x", "y"]
+    )
+    assert full["y"].tolist() == [10]
+    # ... but batched with a key that never wrote ``y``, TQ drops the column.
+    with pytest.raises(KeyError, match=r"returned no \['y'\] column"):
+        tq_client.get_samples(
+            sample_ids=["full", "partial"],
+            partition_id="narrowing",
+            select_fields=["x", "y"],
+        )
+    tq_client.clear_samples(sample_ids=None, partition_id="narrowing")
 
 
 def test_smoke_round_trip_backends(tq_client_backends) -> None:
@@ -683,3 +813,21 @@ def test_from_wire_preserves_object_arrays_through_densify() -> None:
     # Scalar column passes through untouched — no squeeze step any more.
     assert restored["input_lengths"].shape == (4,)
     np.testing.assert_array_equal(restored["content"], arr)
+
+
+def test_close_removes_this_process_offload_dir(monkeypatch, tmp_path) -> None:
+    """A client that closes cleanly leaves no offload files behind, even if Ray
+    then stops it with SIGTERM (which skips atexit)."""
+    from nemo_rl.data_plane.adapters import mooncake_ssd_offload
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    offload_dir = tmp_path / "owner"
+    offload_dir.mkdir()
+    monkeypatch.setattr(mooncake_ssd_offload, "_dir", str(offload_dir))
+    monkeypatch.setattr(tq_adapter.tq, "close", MagicMock())
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._closed = False
+
+    client.close()
+
+    assert not offload_dir.exists()

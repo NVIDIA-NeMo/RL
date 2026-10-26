@@ -18,89 +18,44 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
 
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    # Side-effect import: installs the resolver hook that routes FP8-native
-    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
-    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
-    try:
-        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
-    except ImportError:
-        pass
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.vllm.config import (
+    VllmSpecificArgs,
+    vllm_nemotron_h_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+)
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
-# Plain Hugging Face classes remain separate from the NeMo AutoModel wrappers so
-# callers that manage distribution can request them when NeMo AutoModel is installed.
-# Add an entry here whenever a model's architecture isn't loadable via
-# AutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
-# ForImageTextToText). Unlike AUTOMODEL_FACTORY below, this dict is also read on
-# the ``use_nemo_automodel=False`` path (DTensor V1), where no NeMo custom impl
-# intercepts from_pretrained -- so a model that has a custom NeMo automodel impl
-# still needs an entry here when its parent AutoModel class is not
-# AutoModelForCausalLM. Check MODEL_ARCH_MAPPING in the NeMo automodel registry
-# to see which architectures have custom impls:
-# https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
-HF_AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "qwen3_5": AutoModelForImageTextToText,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "gemma4": AutoModelForImageTextToText,
-    "gemma4_unified": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
+
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
 }
 
-AUTOMODEL_FACTORY: Dict[str, Any] = HF_AUTOMODEL_FACTORY
 
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        # NeMo wrappers — keep in sync with the vanilla HF dict above.
-        # See comment above for when to add entries.
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "qwen3_5": NeMoAutoModelForImageTextToText,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "gemma4": NeMoAutoModelForImageTextToText,
-        "gemma4_unified": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class IPCProtocol(Enum):
@@ -116,9 +71,11 @@ class IPCProtocol(Enum):
 # worker classes.
 POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
-    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
+
+_NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
+_NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
 
 
 def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
@@ -133,21 +90,136 @@ def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
     return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
-def resolve_model_class(
-    model_name: str,
-    *,
-    use_nemo_automodel: bool = True,
-) -> Any:
-    """Resolve the model class for a model type.
+def _normalize_model_type(model_type: object) -> str:
+    return str(model_type).lower().replace("-", "_")
 
-    Args:
-        model_name: Model type to resolve.
-        use_nemo_automodel: Whether to prefer NeMo AutoModel wrappers when they
-            are available.
-    """
-    if use_nemo_automodel and NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return HF_AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+
+def _get_config_model_type(model_config: object) -> object | None:
+    return getattr(model_config, "model_type", None) or getattr(
+        model_config.__class__, "model_type", None
+    )
+
+
+def _get_config_architectures(model_config: object) -> list[str]:
+    architectures = getattr(model_config, "architectures", None) or []
+    if isinstance(architectures, str):
+        return [architectures]
+    try:
+        return [str(architecture) for architecture in architectures]
+    except TypeError:
+        return []
+
+
+def _is_nemotron_h_model_config(model_config: object) -> bool:
+    model_type = _get_config_model_type(model_config)
+    if (
+        model_type is not None
+        and _normalize_model_type(model_type) in _NEMOTRON_H_MODEL_TYPES
+    ):
+        return True
+
+    return any(
+        architecture in _NEMOTRON_H_ARCHITECTURES
+        for architecture in _get_config_architectures(model_config)
+    ) or any(
+        _is_nemotron_h_model_config(inner)
+        for inner in (
+            getattr(model_config, attr, None) for attr in ("llm_config", "text_config")
+        )
+        if inner is not None
+    )
+
+
+def _describe_model_config(model_config: object) -> str:
+    model_type = _get_config_model_type(model_config)
+    architectures = _get_config_architectures(model_config)
+    if architectures:
+        return f"architectures={architectures!r}, model_type={model_type!r}"
+    return f"model_type={model_type!r}"
+
+
+def validate_fp32_lm_head_config(
+    config: "PolicyConfig",
+    *,
+    megatron_enabled: bool,
+    automodel_enabled: bool,
+    model_config: object | None = None,
+) -> None:
+    """Reject fp32 LM-head settings that the selected backends cannot match."""
+    megatron_cfg = config.get("megatron_cfg")
+    megatron_fp32_value = (
+        megatron_cfg.get("fp32_lm_head")
+        if megatron_enabled and megatron_cfg is not None
+        else None
+    )
+    if megatron_fp32_value not in (None, True, False):
+        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
+    megatron_fp32 = bool(megatron_fp32_value)
+
+    if (
+        megatron_fp32
+        and megatron_cfg is not None
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer). Disable one of them."
+        )
+
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return
+
+    generation_backend = generation_config["backend"]
+    if generation_backend != "vllm":
+        return
+
+    vllm_cfg = generation_config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
+
+    env_vars = vllm_cfg.get("env_vars") or {}
+    if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:
+        raise ValueError(
+            f"{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR} is reserved for "
+            "NeMo-RL internal vLLM Nemotron-H patch plumbing; configure fp32 "
+            "LM head with "
+            "policy.generation.vllm_cfg.fp32_lm_head instead."
+        )
+
+    vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+    if automodel_enabled and vllm_fp32:
+        raise ValueError(
+            "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
+            "with the Megatron trainer because Automodel has no matching "
+            "policy.automodel_cfg fp32 LM-head implementation."
+        )
+    if megatron_enabled and megatron_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both Megatron training and vLLM "
+            "generation or neither: "
+            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
+            f"policy.generation.vllm_cfg.fp32_lm_head="
+            f"{vllm_cfg.get('fp32_lm_head')!r}. "
+            "A one-sided fp32 head increases the generation/training logprob "
+            "mismatch instead of reducing it."
+        )
+    if (
+        vllm_fp32
+        and model_config is not None
+        and not _is_nemotron_h_model_config(model_config)
+    ):
+        warnings.warn(
+            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
+            "patches vLLM's Nemotron-H model implementation "
+            "(NemotronHForCausalLM). The configured policy model does not "
+            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
+            "so vLLM generation will not execute an fp32 LM-head path.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -374,7 +446,11 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -448,58 +524,89 @@ def stream_weights_via_ipc_zmq_impl(
 
     try:
         for name, tensor in params_generator:
-            # Initialize device and buffers on first tensor
-            if buffer_a is None:
-                buffer_device = tensor.device
-                if buffer_device.type == "cpu" and torch.cuda.is_available():
-                    buffer_device = torch.device("cuda", torch.cuda.current_device())
-                buffer_a = allocate_buffer(buffer_device)
-                buffer_b = allocate_buffer(buffer_device)
-                current_buffer = buffer_a
-
             aligned_size = calculate_aligned_size(tensor.nbytes)
+            # Resolve the transfer device without allocating staging storage.
+            # CPU exports still need CUDA storage for the IPC reducer.
+            buffer_device = (
+                current_buffer.device if current_buffer is not None else tensor.device
+            )
+            if buffer_device.type == "cpu" and torch.cuda.is_available():
+                buffer_device = torch.device("cuda", torch.cuda.current_device())
 
             # A parameter larger than a single staging buffer cannot be packed
-            # at all. Ship it on its own in a buffer sized to fit rather than
-            # failing the refit. The staging buffers are sized from *free
+            # with ordinary parameters. Ship it on its own rather than failing
+            # the refit. The staging buffers are sized from *free
             # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
             # for ping-pong) with no floor at the largest parameter, so a big
             # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
-            # is 1.73 GiB against a 1.65 GiB buffer. This mirrors the HTTP
-            # streaming path, which already gives an oversized parameter a
-            # bucket of its own instead of raising.
+            # is 1.73 GiB against a 1.65 GiB buffer.
             if aligned_size > buffer_size_bytes:
                 if param_names:
                     await_recv = send_buffer_group_overlap(
                         current_buffer, param_names, used_bytes, await_recv
                     )
                     count_of_groups += 1
-                    current_buffer = (
-                        buffer_b if current_buffer is buffer_a else buffer_a
-                    )
                     used_bytes, param_names = 0, []
 
-                oversized_buffer = torch.empty(
-                    aligned_size,
-                    device=current_buffer.device,
-                    dtype=torch.uint8,
-                    requires_grad=False,
-                )
+                # The regular staging pair is no longer needed for this
+                # transfer. Wait for its last consumer before releasing it;
+                # keeping both buffers alive can consume the only headroom
+                # available for a multi-GiB expert parameter.
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                release_staging_buffers()
+
+                # The policy generators already yield contiguous tensors. A
+                # uint8 view can therefore be exported through CUDA IPC
+                # directly, avoiding a second allocation as large as the
+                # parameter. Retain the copy fallback for other callers that
+                # may yield a non-contiguous oversized tensor.
+                direct_ipc_buffer = None
+                oversized_buffer = None
+                transfer_buffer = None
                 try:
-                    packed_bytes = pack_tensor(oversized_buffer, tensor, 0)
-                    send_buffer_group_overlap(
-                        oversized_buffer, [name], packed_bytes, await_recv
+                    # Only CUDA storage has a CUDA IPC reducer. A contiguous
+                    # CPU tensor (notably grouped-expert fallback output) must
+                    # still be copied to CUDA, but do so only after releasing
+                    # the regular ping-pong pair to recover enough headroom.
+                    if tensor.is_cuda and tensor.is_contiguous():
+                        direct_ipc_buffer = tensor.reshape(-1).view(torch.uint8)
+                        transfer_buffer = direct_ipc_buffer
+                    else:
+                        oversized_buffer = torch.empty(
+                            aligned_size,
+                            device=buffer_device,
+                            dtype=torch.uint8,
+                            requires_grad=False,
+                        )
+                        pack_tensor(oversized_buffer, tensor, 0)
+                        transfer_buffer = oversized_buffer
+
+                    await_recv = send_buffer_group_overlap(
+                        transfer_buffer, [name], aligned_size, await_recv=False
                     )
                     count_of_groups += 1
-                    # Unlike the ping-pong pair, this buffer is not kept alive
-                    # across the next send, so its ACK must be consumed here
-                    # before it is freed.
+                    # The exported tensor or fallback buffer is not kept alive
+                    # across the next send, so consume its ACK before releasing
+                    # the last reference to its CUDA storage.
                     zmq_socket.recv()
                     await_recv = False
                 finally:
-                    del oversized_buffer
+                    del transfer_buffer, direct_ipc_buffer, oversized_buffer
                     torch.cuda.empty_cache()
+                # Drop the caller-side reference before requesting the next
+                # generator item; otherwise the next bridge conversion can
+                # overlap with this multi-GiB tensor after its consumer ACKed.
+                del tensor
                 continue
+
+            # Oversized exports never use the regular pair. Allocate it only
+            # when an ordinary parameter arrives, including after oversized ones.
+            if buffer_a is None:
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
+                current_buffer = buffer_a
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
@@ -564,14 +671,27 @@ def stream_weights_via_ipc_zmq_impl(
         release_staging_buffers()
 
 
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
+
+
 def rebuild_cuda_tensor_from_ipc(
     cuda_ipc_handle: tuple, device_id: int
 ) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
@@ -594,7 +714,7 @@ def connect_colocate_topology(
     engine_gpu_offsets: Optional[list[int]] = None,
     worker_state: dict,
 ) -> None:
-    """Generalized colocate rollout-engine connect for FSDP and Megatron.
+    """Generalized colocate rollout-engine connect for Automodel and Megatron.
 
     Builds a Gloo gather subgroup for each engine's GPU rank range and stashes
     rank-only routing state into ``worker_state``:
@@ -1061,9 +1181,9 @@ def broadcast_hf_buckets_via_distributed_impl(
     ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
     refs to confirm engines finished loading the bucket.
 
-    The rollout-engine lock wraps each bucket's broadcast so concurrent SGLang
-    NCCL operations (e.g. health-check pings) cannot collide with the
-    weight-update broadcast.
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
     """
     import time as _time
 

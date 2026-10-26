@@ -181,6 +181,10 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
@@ -466,8 +470,8 @@ class _PartialGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         self.dispatched.append([row["_rowidx"] for row in inputs])
         attempt = self.attempts
         self.attempts += 1
@@ -507,8 +511,8 @@ class _FakeGymMethod:
         del kwargs
         return self
 
-    def remote(self, inputs, timer_prefix):
-        del timer_prefix
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
         return self._stream(len(inputs))
 
     async def _stream(self, num_inputs):
@@ -723,9 +727,12 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)
         impl = _make_gym_impl(method, num_generations=4, row_attempts=2)
 
-        with pytest.raises(ConnectionResetError):
+        with pytest.raises(ConnectionResetError) as exc_info:
             asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
         assert method.attempts == 2, "the budget bounds the re-dispatches"
+        assert exc_info.value.__notes__ == [
+            "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+        ]
 
     def test_a_data_failure_is_not_re_dispatched(self):
         """Another dispatch cannot help a prompt NeMo-Gym is unable to serve."""

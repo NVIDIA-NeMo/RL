@@ -26,8 +26,6 @@ checkpointing:
     keep_top_k: 3
     save_period: 10
     checkpoint_must_save_by: null
-    model_save_format: "safetensors"
-    save_consolidated: false
     save_optimizer: true
 
 policy: &POLICY_BASE
@@ -44,13 +42,23 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: false
+    # Move optimizer state to CPU when the refit offload lifecycle runs.
+    offload_optimizer_for_refit: true
 
-    dtensor_cfg: &DTENSOR_BASE
+    automodel_cfg: &AUTOMODEL_BASE
         enabled: true
-        _v2: true
+        checkpoint:
+            model_save_format: "safetensors"
+            # Canonical Automodel modes: "false", "final", or "every".
+            save_consolidated: "false"
+            single_rank_consolidation: false
+            consolidation_timeout_minutes: 30
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
+        deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
         tensor_parallel_size: 2
         context_parallel_size: 2
         custom_parallel_plan: null
@@ -73,7 +81,7 @@ policy: &POLICY_BASE
     # makes the training sequence length divisible by the tensor parallel size
     # this is useful for sequence parallel training
     # must be divisible by 2*cp
-    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    make_sequence_length_divisible_by: ${mul:${mul:${.automodel_cfg.tensor_parallel_size}, ${.automodel_cfg.context_parallel_size}}, 2}
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
@@ -81,7 +89,7 @@ policy: &POLICY_BASE
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
-            # when using Dtensor, we need to set foreach
+            # when using Automodel, we need to set foreach
             # and fused to False
             foreach: False
             fused: False
@@ -137,13 +145,18 @@ policy: &POLICY_BASE
         moe_permute_fusion: true
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
+        flash_attention_version: 2
         bias_activation_fusion: True
         defer_fp32_logits: False
+        fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
         moe_per_layer_logging: False
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
         gradient_accumulation_fusion: false
         use_fused_weighted_squared_relu: false
         optimizer:
@@ -228,6 +241,7 @@ policy: &POLICY_BASE
             precision: ${...precision}
             kv_cache_dtype: "auto"
             logprobs_mode: processed_logprobs
+            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
             refit_with_reload_api: false
             tensor_parallel_size: 1
@@ -255,8 +269,8 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
-    dtensor_cfg:
-        <<: *DTENSOR_BASE
+    automodel_cfg:
+        <<: *AUTOMODEL_BASE
         context_parallel_size: 2 
         tensor_parallel_size: 4
 

@@ -19,7 +19,6 @@ from functools import partial
 from typing import Any, Optional
 
 import numpy as np
-import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
@@ -30,7 +29,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
@@ -40,10 +39,20 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.config import TelemetryConfig
-from nemo_rl.telemetry.instrumentation import managed_span, trace_fn
+from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
+    evaluate_span,
+    iteration_scope,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
@@ -142,16 +151,16 @@ def setup(
     policy_config = master_config.policy
 
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove once CP is supported for RM training.
-    dtensor_cfg = policy_config.get("dtensor_cfg", {})
+    automodel_cfg = policy_config.get("automodel_cfg", {})
     if (
-        dtensor_cfg.get("enabled", False)
-        and dtensor_cfg.get("context_parallel_size", 1) > 1
+        automodel_cfg.get("enabled", False)
+        and automodel_cfg.get("context_parallel_size", 1) > 1
     ):
         raise ValueError(
             "Context parallelism (context_parallel_size > 1) is not supported for reward model "
-            "training on the DTensor backend. The log_sigmoid operator used in the RM loss does "
+            "training on the Automodel backend. The log_sigmoid operator used in the RM loss does "
             "not have a DTensor sharding strategy registered for CP meshes. "
-            "Please set policy.dtensor_cfg.context_parallel_size=1. "
+            "Please set policy.automodel_cfg.context_parallel_size=1. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
         )
 
@@ -224,17 +233,17 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    num_nodes = cluster_config["num_nodes"]
-    segment_size = cluster_config.get("segment_size")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
     node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="rm_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
-        port_range_low=cluster_config.get("master_port_range_low"),
-        port_range_high=cluster_config.get("master_port_range_high"),
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
         segment_size=segment_size,
         node_resource_constraints=node_resource_constraints,
     )
@@ -365,16 +374,9 @@ def validate_one_dataset(
         return
 
     timer = Timer()
-    _telemetry = get_telemetry_handle()
-    _tracer = _telemetry.tracer if _telemetry is not None else None
-
     with (
         timer.time("total_validation_time"),
-        managed_span(
-            RLSpanGroup.EVALUATE,
-            "rl.rm.evaluate",
-            tracer=_tracer,
-        ),
+        evaluate_span("rm", **{RL_ITERATION_ATTR: step}),
     ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
@@ -480,7 +482,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
-@trace_fn(RLSpanGroup.JOB, "rl.rm.job")
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -547,12 +549,12 @@ def rm_train(
             val_metrics, validation_timings = None, None
 
             with (
+                iteration_scope(total_steps + 1),
                 timer.time("total_step_time"),
-                managed_span(
-                    RLSpanGroup.STEP,
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
                     "rl.rm.step",
                     tracer=_tracer,
-                    **{"rl.iteration": total_steps + 1},
                 ),
             ):
                 # Prepare batch and generate responses
@@ -653,14 +655,6 @@ def rm_train(
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -706,11 +700,10 @@ def rm_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config.checkpointing,
+                            is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
                         checkpointer.begin_finalization(
                             checkpoint_path,
@@ -740,14 +733,18 @@ def rm_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config.cluster["num_nodes"]
-                * master_config.cluster["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
