@@ -22,10 +22,10 @@ Tests are organized into levels of increasing scope and cost:
 
 ### When Lfast missed a failure
 
-`CI:Lfast` runs a subset of `CI:L1`. If L1 or a nightly catches a failure that Lfast missed, promote the test that caught it into Lfast so the next PR sees it earlier:
+`CI:Lfast` runs a subset of `CI:L1`. If L1 catches a failure that Lfast missed, promote the test that caught it into Lfast so the next PR sees it earlier:
 
-- Unit test: remove its entry from `tests/unit/excluded_unit_tests.sh`.
-- Functional test: change its `run_test <cmd>` line in `tests/functional/L1_Functional_Tests_*.sh` to `run_test fast <cmd>`.
+- Unit test: narrow or remove the entry that excludes it in `tests/unit/excluded_unit_tests.sh`. Tests under `research/*/tests/unit` never run in Lfast.
+- Functional test: change its `run_test <cmd>` line in `tests/functional/L1_Functional_Tests_*.sh` to `run_test fast <cmd>`. Lfast runs only the H100 scripts, so a test in an `L1_Functional_Tests_GB200_*.sh` script, or a failure that reproduces only on GB200, cannot be promoted this way.
 
 ## Shared Build Caches
 
