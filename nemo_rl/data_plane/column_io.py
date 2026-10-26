@@ -93,17 +93,17 @@ def fetch_columns(
     meta: KVBatchMeta,
     select_fields: Sequence[str] | None,
 ) -> TensorDict:
-    """Fetch sparse media separately: TQ intersects fields across requested rows.
+    """Fetch packed media only from the rows that carry it.
 
-    Geometry tags identify which rows carry each packed field. Fetch equal
-    row sets together, then insert empty wire rows for samples without media.
-    Fields sharing a row set are fetched together. Per-token media fields
-    are first fetched over all rows; if absent, an additional fetch retries
-    media rows and zero-fills text rows.
+    The data plane requires every requested field on every requested row
+    (TQ narrows a mixed fetch and the adapter raises). Geometry tags say
+    which rows carry each packed field, so fields sharing a row set are
+    fetched together and rows without media get empty entries. Every other
+    field, per-token media included, must exist on every row.
 
     Raises:
-        ValueError: Fields are unspecified, a required field is missing, or
-            sparse media cannot be reconstructed from its wire data/metadata.
+        ValueError: Fields are unspecified, or sparse media wire data is not
+            nested.
     """
     if select_fields is None:
         raise ValueError("fetch_columns requires explicit select_fields")
@@ -121,65 +121,19 @@ def fetch_columns(
             groups.setdefault(indices, []).append(key)
 
     result = TensorDict({}, batch_size=[len(all_rows)])
-    pending = list(groups.items())
-    for indices, fields in pending:
+    for indices, fields in groups.items():
         fetched = dp_client.get_samples(
             sample_ids=[meta.sample_ids[i] for i in indices],
             partition_id=meta.partition_id,
             select_fields=fields,
         )
-        missing = set(fields) - set(fetched.keys())
-        sparse_tokens = missing & PER_TOKEN_MULTIMODAL_FIELDS
-        if sparse_tokens and indices == all_rows and meta.tags is not None:
-            media_rows = tuple(
-                i
-                for i, tag in enumerate(meta.tags)
-                if any(
-                    tag.get(row_shapes_key(key), {}).get("shapes")
-                    for key in PACKED_MULTIMODAL_FIELDS
-                )
-            )
-            if media_rows != all_rows:
-                lengths = meta.sequence_lengths
-                if lengths is None:
-                    raise ValueError("Sparse per-token media requires sequence_lengths")
-                if media_rows:
-                    pending.append((media_rows, sorted(sparse_tokens)))
-                else:
-                    for key in sparse_tokens:
-                        dtype = (
-                            torch.bool
-                            if key == "media_token_validity_mask"
-                            else torch.long
-                        )
-                        result[key] = torch.nested.as_nested_tensor(
-                            [torch.zeros(n, dtype=dtype) for n in lengths],
-                            layout=torch.jagged,
-                        )
-                missing -= sparse_tokens
-                fields = [key for key in fields if key not in sparse_tokens]
-        if missing:
-            raise ValueError(
-                f"Data-plane fetch dropped requested fields {sorted(missing)} "
-                f"in partition {meta.partition_id!r}"
-            )
         for key in fields:
             value = fetched[key]
             if indices != all_rows:
-                # Both packed media and token-aligned media use flat wire rows.
-                if not isinstance(value, torch.Tensor) or (
-                    key in PACKED_MULTIMODAL_FIELDS and not value.is_nested
-                ):
+                if not isinstance(value, torch.Tensor) or not value.is_nested:
                     raise ValueError(f"Sparse media field {key!r} must be nested")
                 parts = list(value.unbind())
-                if key in PER_TOKEN_MULTIMODAL_FIELDS:
-                    if meta.sequence_lengths is None:
-                        raise ValueError(
-                            "Sparse per-token media requires sequence_lengths"
-                        )
-                    rows = [parts[0].new_zeros(n) for n in meta.sequence_lengths]
-                else:
-                    rows = [parts[0].new_empty(0) for _ in all_rows]
+                rows = [parts[0].new_empty(0) for _ in all_rows]
                 for i, part in zip(indices, parts, strict=True):
                     rows[i] = part
                 value = torch.nested.as_nested_tensor(rows, layout=torch.jagged)

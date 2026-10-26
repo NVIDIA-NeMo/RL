@@ -19,7 +19,12 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def _write_rows(client, token_field="media_token_validity_mask"):
+def _write_rows(client, token_field="media_token_validity_mask", dense_tokens=True):
+    """Row 0 text, rows 1-2 image (row 2 also audio), row 3 audio only.
+
+    Producers write per-token media fields on every row (zeros without
+    images); ``dense_tokens=False`` writes them on image rows only.
+    """
     partition = f"sparse-media-{uuid4().hex}"
     metas, originals = [], []
     for i in range(4):
@@ -30,21 +35,25 @@ def _write_rows(client, token_field="media_token_validity_mask"):
             sample_mask=torch.ones(1),
         )
         media = {}
-        if i in (1, 2):
-            fields[token_field] = torch.ones(
+        if dense_tokens or i in (1, 2):
+            fields[token_field] = torch.full(
                 (1, length),
+                i in (1, 2),
                 dtype=torch.bool
                 if token_field == "media_token_validity_mask"
                 else torch.long,
             )
+        if i in (1, 2):
             media["pixel_values"] = PackedTensor(
                 [torch.full((i, 3, 2, 2), float(i))], dim_to_pack=0
             )
             media["imgs_sizes"] = PackedTensor(
                 [torch.full((i, 2), 2, dtype=torch.long)], dim_to_pack=0
             )
-        if i == 2:
-            media["input_features"] = PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
+        if i in (2, 3):
+            media["input_features"] = PackedTensor(
+                [torch.full((2, 3), float(i))], dim_to_pack=0
+            )
         originals.append(media)
         for key, value in media.items():
             fields[key] = encode_multimodal_for_wire(key, value)
@@ -77,7 +86,9 @@ def _read(client, meta, reader):
 
 
 @pytest.mark.parametrize("reader", ["driver", "worker"])
-@pytest.mark.parametrize("indices", [[0, 1], [0, 2, 1, 3], [2, 1], [3, 0], [2, 0, 2]])
+@pytest.mark.parametrize(
+    "indices", [[0, 1], [0, 2, 1, 3], [2, 1], [3, 0], [3, 1], [2, 0, 2]]
+)
 @pytest.mark.parametrize("pad", [False, True])
 @pytest.mark.parametrize(
     "token_field", ["media_token_validity_mask", "mm_token_type_ids"]
@@ -115,7 +126,18 @@ def test_missing_expected_pixels_fail(tq_client, reader):
     # Claim an image on a text row whose pixels were never written.
     meta.tags[0] = meta.tags[1]
     try:
-        with pytest.raises(ValueError, match="dropped requested fields.*pixel_values"):
+        with pytest.raises(KeyError, match="pixel_values"):
+            _read(tq_client, meta, reader)
+    finally:
+        tq_client.clear_samples(None, meta.partition_id)
+
+
+@pytest.mark.parametrize("reader", ["driver", "worker"])
+def test_sparse_per_token_media_fails(tq_client, reader):
+    # A producer that writes the mask on image rows only breaks the contract.
+    meta, _ = _write_rows(tq_client, dense_tokens=False)
+    try:
+        with pytest.raises(KeyError, match="media_token_validity_mask"):
             _read(tq_client, meta, reader)
     finally:
         tq_client.clear_samples(None, meta.partition_id)
