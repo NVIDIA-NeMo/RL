@@ -9,7 +9,7 @@ MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=30
 STUDENT_MODEL=meta-llama/Llama-3.2-1B
-TEACHER0_MODEL=Qwen/Qwen3-4B            # cross-tokenizer (P-KL via projection)
+TEACHER0_MODEL=Qwen/Qwen3-4B            # cross-tokenizer (CSD sub-token tables)
 TEACHER1_MODEL=meta-llama/Llama-3.2-3B  # same tokenizer/vocab as student
 # ===== END CONFIG =====
 
