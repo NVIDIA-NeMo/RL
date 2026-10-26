@@ -510,6 +510,48 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
+def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_policy_layout(
+    monkeypatch,
+):
+    """A P/D replica of Megatron engines spans (P + D) x the engine policy's TP x PP."""
+    from tests.unit.models.generation.test_dynamo_arguments import (
+        MEGATRON_POLICY,
+        _megatron_config,
+    )
+
+    master_config = _make_master_config(backend="dynamo")
+    generation = _megatron_config()
+    # One engine is TP4: a 1-prefill + 2-decode replica spans 12 GPUs, two nodes.
+    generation["mcore_generation_config"]["tensor_model_parallel_size"] = 4
+    generation["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 8, "num_nodes": 2},
+    }
+    master_config.policy["megatron_cfg"] = dict(MEGATRON_POLICY["megatron_cfg"])
+    master_config.policy["generation"] = generation
+    master_config.cluster = ClusterConfig(num_nodes=4, gpus_per_node=8, segment_size=1)
+    segment_calls = []
+
+    def fake_prepare_segment_topology(segment_size, num_nodes, *, topology=None, role):
+        segment_calls.append((role, segment_size, num_nodes))
+        if topology is None:
+            topology = {f"node{i}": ("nvlink_domain", i) for i in range(4)}
+        node_ids = list(topology)
+        return [{}] * num_nodes, node_ids[num_nodes:], topology
+
+    monkeypatch.setattr(
+        sc_setup_mod, "prepare_segment_topology", fake_prepare_segment_topology
+    )
+    monkeypatch.setattr(
+        sc_setup_mod, "RayVirtualCluster", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+
+    _, inference_cluster, _ = sc_setup_mod._build_clusters(master_config)
+
+    assert segment_calls == [("training", 1, 2), ("inference", 2, 2)]
+    assert inference_cluster.segment_size == 2
+
+
 def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
     """The inherited recipe resolves exactly as the SC entrypoint consumes it."""
     # The parent recipe locates its fixture data below HF_HOME. This test only

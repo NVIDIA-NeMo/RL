@@ -420,7 +420,7 @@ def test_megatron_generation_rebuild_dispatches_only_selected_ranks() -> None:
         world_size=10,
         train_world_size=8,
         shard_prefixes={0: 0, 2: 1},
-        workers_per_shard=1,
+        workers_per_shard=(1, 1, 1),
     )
     generation.set_refit_membership(membership)
 

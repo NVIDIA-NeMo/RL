@@ -207,6 +207,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             dp_size=shape.dp_size,
             total_gen_workers=shape.total_gen_workers,
             train_world_size=train_world_size,
+            shard_widths=shape.shard_widths,
         )
 
     def init_communicator(self) -> None:

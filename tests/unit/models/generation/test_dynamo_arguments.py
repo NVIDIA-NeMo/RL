@@ -95,7 +95,7 @@ def _flag_value(argv: list[str], flag: str) -> str:
 
 
 def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
-    assert DynamoConfig.model_validate(_config()).engine_world_size == 2
+    assert DynamoConfig.model_validate(_config()).engine_world_size() == 2
     for field in ("engine_world_size", "namespace", "dynamo_python", "etcd_port"):
         with pytest.raises(ValidationError, match=field):
             DynamoConfig.model_validate(
@@ -103,18 +103,44 @@ def test_config_derives_world_size_and_rejects_removed_public_fields() -> None:
             )
 
 
+def _roles_and_widths(workers) -> list[tuple[str, int]]:
+    return [(worker.role, worker.width) for worker in workers]
+
+
 def test_disaggregation_tiles_prefill_then_decode_engines_per_replica() -> None:
     aggregated = DynamoConfig.model_validate(_config())
-    assert aggregated.replica_width == 2
-    assert aggregated.worker_roles(4) == ["aggregated", "aggregated"]
+    replica = aggregated.replica_layout()
+    assert _roles_and_widths(replica) == [("aggregated", 2)]
+    assert aggregated.replica_width(replica) == 2
+    assert (
+        _roles_and_widths(aggregated.worker_layouts(4, replica))
+        == [("aggregated", 2)] * 2
+    )
 
     layout = {"enabled": True, "num_prefill_engines": 1, "num_decode_engines": 2}
     disaggregated = DynamoConfig.model_validate(_config(disaggregation=layout))
-    # TP=2, so one replica is (1 + 2) engines x 2 GPUs.
-    assert disaggregated.replica_width == 6
-    assert disaggregated.worker_roles(12) == ["prefill", "decode", "decode"] * 2
+    # TP=2 for every worker, so one replica is (1 + 2) workers x 2 GPUs.
+    replica = disaggregated.replica_layout()
+    assert _roles_and_widths(replica) == [("prefill", 2), ("decode", 2), ("decode", 2)]
+    assert disaggregated.replica_width(replica) == 6
+    assert [w.role for w in disaggregated.worker_layouts(12, replica)] == [
+        "prefill",
+        "decode",
+        "decode",
+    ] * 2
     with pytest.raises(ValueError, match="not a multiple of one replica's 6 GPUs"):
-        disaggregated.worker_roles(8)
+        disaggregated.worker_layouts(8, replica)
+
+
+@pytest.mark.parametrize("role", ["prefill_engines", "decode_engines"])
+def test_per_worker_layouts_refuse_unknown_layout_keys(role) -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        DynamoConfig.model_validate(
+            _config(
+                disaggregation={"enabled": True},
+                dynamo_cfg={**_dynamo_cfg(), role: [{"context_parallel_size": 2}]},
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -136,6 +162,36 @@ def test_disaggregation_tiles_prefill_then_decode_engines_per_replica() -> None:
             "vllm_kwargs.speculative_config",
         ),
         ({"vllm_kwargs": {"worker_extension_cls": "x.Y"}}, "worker_extension_cls"),
+        (
+            {
+                "disaggregation": {"enabled": True},
+                "dynamo_cfg": {
+                    **_dynamo_cfg(),
+                    "prefill_engines": [
+                        {
+                            "tensor_model_parallel_size": 2,
+                            "pipeline_model_parallel_size": 1,
+                        }
+                    ],
+                },
+            },
+            "dynamo_cfg.prefill_engines/decode_engines.*dynamo_cfg.engine=megatron only",
+        ),
+        (
+            {
+                "disaggregation": {"enabled": True},
+                "dynamo_cfg": {
+                    **_dynamo_cfg(),
+                    "decode_engines": [
+                        {
+                            "tensor_model_parallel_size": 1,
+                            "pipeline_model_parallel_size": 2,
+                        }
+                    ],
+                },
+            },
+            "dynamo_cfg.prefill_engines/decode_engines.*dynamo_cfg.engine=megatron only",
+        ),
         (
             {"disaggregation": {"enabled": True, "num_decode_engines": 0}},
             "at least one prefill and one decode",
@@ -584,3 +640,248 @@ def test_redaction_hides_credentials() -> None:
         "HF_TOKEN": "<redacted>",
         "NCCL_DEBUG": "INFO",
     }
+
+
+# ---------------------------------------------------------------------------
+# Megatron prefill/decode engines behind the frontend
+# ---------------------------------------------------------------------------
+
+_DELETE = object()
+MEGATRON_POLICY = {
+    "model_name": "Qwen/Qwen3-0.6B",
+    "megatron_cfg": {
+        "enabled": True,
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+    },
+}
+
+
+def _megatron_config(**overrides) -> dict:
+    dynamo_cfg = _dynamo_cfg()
+    dynamo_cfg["engine"] = "megatron"
+    config = {
+        "backend": "dynamo",
+        "model_name": "Qwen/Qwen3-0.6B",
+        "dynamo_cfg": dynamo_cfg,
+        "vllm_cfg": None,
+        "vllm_kwargs": {},
+        "refit_transport": None,
+        "disaggregation": {
+            "enabled": True,
+            "num_prefill_engines": 1,
+            "num_decode_engines": 2,
+        },
+        "mcore_generation_config": {
+            "enable_prefix_caching": True,
+            "kv_cache_management_mode": "persist",
+            "expose_http_server": False,
+        },
+        "colocated": {"enabled": False},
+    }
+    config.update(overrides)
+    return config
+
+
+def _set(*path, value):
+    """Mutator that assigns (or deletes) one nested key of a config dict."""
+
+    def mutate(config: dict) -> None:
+        node = config
+        for key in path[:-1]:
+            node = node[key]
+        if value is _DELETE:
+            del node[path[-1]]
+        else:
+            node[path[-1]] = value
+
+    return mutate
+
+
+def test_megatron_engines_take_their_width_from_the_policy_layout() -> None:
+    config = DynamoConfig.model_validate(_megatron_config())
+    assert config.is_megatron_engine and config.vllm_cfg is None
+    with pytest.raises(ValueError, match="need the policy config"):
+        config.engine_world_size()
+
+    policy = {**MEGATRON_POLICY, "generation": _megatron_config()}
+    assert config.engine_world_size(policy) == 2
+    # The same mcore_generation_config overrides the engine workers are built with.
+    policy["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 4
+    replica = config.replica_layout(policy)
+    assert _roles_and_widths(replica) == [("prefill", 4), ("decode", 4), ("decode", 4)]
+    assert config.replica_width(replica) == 12
+    assert len(config.worker_layouts(24, replica)) == 6
+
+
+@pytest.mark.parametrize(
+    ("prefill", "decode", "expected_widths"),
+    [
+        # 1 prefill at TP 4 next to 2 decode at TP 2: an 8-GPU replica.
+        (
+            [{"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 1}],
+            [],
+            [("prefill", 4), ("decode", 2), ("decode", 2)],
+        ),
+        # Workers of one role may differ too, and PP counts like TP does.
+        (
+            [],
+            [
+                {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1},
+                {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 2},
+            ],
+            [("prefill", 2), ("decode", 1), ("decode", 2)],
+        ),
+    ],
+    ids=["prefill_tp4", "decode_mixed"],
+)
+def test_megatron_workers_may_each_have_their_own_layout(
+    prefill, decode, expected_widths
+) -> None:
+    """Each worker's width is the shared layout with its own entry applied."""
+    generation = _megatron_config()
+    generation["dynamo_cfg"].update(prefill_engines=prefill, decode_engines=decode)
+    config = DynamoConfig.model_validate(generation)
+    policy = {**MEGATRON_POLICY, "generation": generation}
+
+    replica = config.replica_layout(policy)
+    assert _roles_and_widths(replica) == expected_widths
+    # The shared layout (role=None) is untouched by either list.
+    assert config.engine_world_size(policy) == 2
+    width = sum(w for _, w in expected_widths)
+    assert config.replica_width(replica) == width
+    # Every replica repeats the same per-worker layouts.
+    assert config.worker_layouts(2 * width, replica) == replica * 2
+    with pytest.raises(ValueError, match=f"one replica's {width} GPUs"):
+        config.worker_layouts(width + 1, replica)
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_megatron_per_worker_layouts_match_the_engine_count(role) -> None:
+    generation = _megatron_config()
+    generation["dynamo_cfg"][f"{role}_engines"] = [
+        {"tensor_model_parallel_size": 2, "pipeline_model_parallel_size": 1}
+    ] * 3
+    with pytest.raises(
+        ValidationError, match=f"{role}_engines has 3 entries.*num_{role}_engines"
+    ):
+        DynamoConfig.model_validate(generation)
+
+
+def test_megatron_per_worker_layout_entries_need_both_sizes() -> None:
+    generation = _megatron_config()
+    generation["dynamo_cfg"]["prefill_engines"] = [{"tensor_model_parallel_size": 4}]
+    with pytest.raises(ValidationError, match="pipeline_model_parallel_size"):
+        DynamoConfig.model_validate(generation)
+
+
+def test_megatron_engine_width_must_hold_the_expert_parallel_grid() -> None:
+    """MCore needs the engine's ranks divisible by ETP x EP x PP; refuse otherwise."""
+    config = DynamoConfig.model_validate(_megatron_config())
+    policy = {**MEGATRON_POLICY, "generation": _megatron_config()}
+    mcore = policy["generation"]["mcore_generation_config"]
+    mcore.update(tensor_model_parallel_size=4, expert_model_parallel_size=2)
+    assert config.engine_world_size(policy) == 4
+
+    mcore.update(tensor_model_parallel_size=1, expert_model_parallel_size=4)
+    with pytest.raises(ValueError, match="expert_model_parallel_size=4"):
+        config.engine_world_size(policy)
+    # Checked per worker: a decode entry that shrinks TP below the expert grid
+    # fails naming that entry, while the other workers stay valid.
+    mcore.update(tensor_model_parallel_size=4, expert_model_parallel_size=2)
+    policy["generation"]["dynamo_cfg"]["decode_engines"] = [
+        {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 1},
+        {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1},
+    ]
+    config = DynamoConfig.model_validate(policy["generation"])
+    assert config.engine_world_size(policy, "decode", 0) == 4
+    with pytest.raises(
+        ValueError, match=r"decode engine 1 .*dynamo_cfg\.decode_engines\[1\]"
+    ):
+        config.replica_layout(policy)
+    # Expert TP counts toward the expert grid too, and PP multiplies both grids.
+    mcore.update(
+        tensor_model_parallel_size=2,
+        expert_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+        pipeline_model_parallel_size=2,
+    )
+    with pytest.raises(ValueError, match="not divisible"):
+        config.engine_world_size(policy)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        pytest.param(
+            _set("disaggregation", "enabled", value=False),
+            "requires policy.generation.disaggregation.enabled=true",
+            id="megatron_needs_disaggregation",
+        ),
+        pytest.param(
+            _set("vllm_cfg", value=_config()["vllm_cfg"]),
+            "vllm_cfg must be null",
+            id="no_vllm_cfg",
+        ),
+        pytest.param(
+            _set("vllm_kwargs", value={"max_num_seqs": 8}),
+            "vllm_kwargs must be empty",
+            id="vllm_kwargs",
+        ),
+        pytest.param(
+            _set("colocated", value={"enabled": True}),
+            "colocated.enabled must be false",
+            id="colocated",
+        ),
+        pytest.param(
+            _set("refit_transport", value="nccl_reshard"),
+            "refit_transport must be null",
+            id="refit_transport",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", "enable_prefix_caching", value=False),
+            "enable_prefix_caching",
+            id="prefix_caching",
+        ),
+        pytest.param(
+            _set(
+                "mcore_generation_config", "kv_cache_management_mode", value="recompute"
+            ),
+            "persist",
+            id="kv_cache_mode",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", "expose_http_server", value=True),
+            "expose_http_server",
+            id="http_server",
+        ),
+        pytest.param(
+            _set("mcore_generation_config", value=_DELETE),
+            "mcore_generation_config is required",
+            id="missing_mcore_config",
+        ),
+        pytest.param(
+            _set("disaggregation", "num_decode_engines", value=0),
+            "at least one prefill and one decode",
+            id="zero_decode",
+        ),
+        pytest.param(
+            lambda c: c["dynamo_cfg"].update(engine="vllm"),
+            "vllm_cfg is required",
+            id="vllm_still_needs_vllm_cfg",
+        ),
+    ],
+)
+def test_megatron_engine_config_rejects_unsupported_shapes(mutate, match) -> None:
+    config = _megatron_config()
+    mutate(config)
+    with pytest.raises(ValidationError, match=match):
+        DynamoConfig.model_validate(config)
+
+
+def test_megatron_engine_config_accepts_null_colocated() -> None:
+    """A null colocated block means not colocated, as for vLLM engines."""
+    assert DynamoConfig.model_validate(_megatron_config(colocated=None))

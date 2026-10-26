@@ -204,6 +204,13 @@ class DynamoGeneration(GenerationInterface):
         tokenizer_config: Optional[dict[str, Any]] = None,
     ):
         validated_config = DynamoConfig.model_validate(config)
+        if validated_config.is_megatron_engine:
+            # The config accepts Megatron engines; the fleet that serves them
+            # (refit channel, adapter sidecars, worker pool) is not wired into
+            # this facade yet.
+            raise NotImplementedError(
+                "dynamo_cfg.engine='megatron' is not served by DynamoGeneration yet"
+            )
         self.cfg = validated_config.model_dump()
         # The same refit-path limits as the vLLM backend: every engine refits
         # through NeMo RL's vLLM worker extension.
@@ -250,7 +257,7 @@ class DynamoGeneration(GenerationInterface):
             workers = self._managed_runtime.refit_workers()
             self._refit_channel = DynamoRefitChannel(
                 workers,
-                engine_world_size=validated_config.engine_world_size,
+                engine_world_size=validated_config.engine_world_size(),
                 control_timeout_s=dynamo_cfg.control_timeout_s,
                 validate_workers=self._managed_runtime.validate_workers,
             )

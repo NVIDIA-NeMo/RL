@@ -222,10 +222,9 @@ class DynamoRefitChannel:
         full_fleet = {
             index: index * self._engine_world_size for index in range(self.num_engines)
         }
-        if (
-            membership.shard_prefixes != full_fleet
-            or membership.workers_per_shard != self._engine_world_size
-        ):
+        if membership.shard_prefixes != full_fleet or set(
+            membership.workers_per_shard
+        ) != {self._engine_world_size}:
             raise NotImplementedError(
                 "Managed Dynamo has a fixed worker fleet; refit membership must be "
                 f"every engine {full_fleet} with {self._engine_world_size} ranks "

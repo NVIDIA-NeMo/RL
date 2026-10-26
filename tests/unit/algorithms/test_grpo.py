@@ -3362,6 +3362,37 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
 
 
+def test_dynamo_megatron_engines_are_refused_outside_the_single_controller(
+    mock_grpo_components,
+):
+    """Legacy GRPO names the unsupported engine, not the vllm_kwargs it would inject."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "dynamo",
+        "dynamo_cfg": {"engine": "megatron"},
+        "vllm_cfg": None,
+        "vllm_kwargs": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+    # Refused before the vLLM-only hf_overrides injection touches the config.
+    assert master_config.policy["generation"]["vllm_kwargs"] == {}
+
+
 @pytest.mark.parametrize("disaggregation", [False, True])
 def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
     monkeypatch, disaggregation
@@ -3493,7 +3524,7 @@ def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
     dynamo_config = dynamo_init.call_args.kwargs["config"]
     assert dynamo_init.call_args.kwargs["cluster"] is inference_cluster
     validated = DynamoConfig.model_validate(dynamo_config)
-    assert validated.engine_world_size == 4
+    assert validated.engine_world_size() == 4
     assert validated.disaggregation.enabled is disaggregation
     synchronizer.init_communicator.assert_called_once_with()
     # The trainers abort at the engines' deadline instead of hanging in NCCL.

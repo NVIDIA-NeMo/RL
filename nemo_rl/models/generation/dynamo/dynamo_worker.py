@@ -218,7 +218,7 @@ class DynamoVllmWorker:  # pragma: no cover
                 config["model_name"],
                 vllm_cfg,
                 vllm_kwargs,
-                validated_config.engine_world_size,
+                validated_config.engine_world_size(),
             )
         # As on the vLLM backend: a full-stream co-trained drafter refits its own
         # embed_tokens/lm_head, so they must not alias the target model's.

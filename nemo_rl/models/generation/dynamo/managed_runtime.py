@@ -75,14 +75,19 @@ class ManagedDynamoRuntime:
         self._cluster = cluster
         self._config = validated_config.model_dump()
         self._dynamo_cfg = validated_config.dynamo_cfg
-        self._engine_world_size = validated_config.engine_world_size
+        self._engine_world_size = validated_config.engine_world_size()
         if self._engine_world_size > cluster.num_gpus_per_node:
             raise ValueError(
                 "Managed Dynamo requires each TP/PP engine group to fit on one "
                 f"node: tp*pp={self._engine_world_size} exceeds "
                 f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
             )
-        self._worker_roles = validated_config.worker_roles(cluster.world_size())
+        self._worker_roles = [
+            worker.role
+            for worker in validated_config.worker_layouts(
+                cluster.world_size(), validated_config.replica_layout()
+            )
+        ]
         # Dynamo component names: aggregated and decode workers register as
         # "backend", prefill workers as "prefill".
         self._expected_components = dict(
