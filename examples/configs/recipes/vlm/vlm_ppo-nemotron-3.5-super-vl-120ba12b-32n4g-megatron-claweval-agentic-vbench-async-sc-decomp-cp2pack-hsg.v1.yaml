@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# HSG four-GPU-node topology for the same 64-GPU learner and 64-GPU generator.
+# Actor CP2/packing passed a DFW component test; requalify on HSG before use.
+defaults: ./vlm_ppo-nemotron-3.5-super-vl-120ba12b-16n8g-megatron-claweval-agentic-vbench-async-sc-decomp-cp2pack.v2.yaml
+
+cluster:
+  num_nodes: 32
+  gpus_per_node: 4
+  segment_size: 16
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4
+
+checkpointing:
+  checkpoint_dir: results/ppo-super-claweval-agentic-vbench-async-decomp-cp2pack-hsg-32n4g
+
+logger:
+  log_dir: logs/ppo-super-claweval-agentic-vbench-async-decomp-cp2pack-hsg-32n4g
+  wandb:
+    name: ${oc.env:WANDB_NAME,claweval_agentic_vbench_subagents_super_ppo_async32_cp2pack_cluster-hsg}
