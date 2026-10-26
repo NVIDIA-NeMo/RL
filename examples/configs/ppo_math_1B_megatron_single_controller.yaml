@@ -9,8 +9,9 @@ ppo:
   # SC does not support validation yet.
   val_period: 0
   val_at_start: false
-  # SC implements neither, so leaving them enabled would describe shaping this
-  # run does not do.
+  # SC does not implement reward_shaping, so leaving it enabled would describe
+  # shaping this run does not do. reward_scaling is applied by the advantage
+  # stage (source_min must be < source_max).
   reward_shaping:
     enabled: false
   reward_scaling:
