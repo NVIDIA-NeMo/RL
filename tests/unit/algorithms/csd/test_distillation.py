@@ -707,6 +707,9 @@ def test_setup_sets_derived_train_iters_on_megatron_teacher_and_student():
     student_config = mocks["policy"].call_args_list[1].kwargs["config"]
     assert teacher_config["megatron_cfg"]["train_iters"] == 6
     assert student_config["megatron_cfg"]["train_iters"] == 6
+    # Megatron setup otherwise requires sequence packing for CP > 1.
+    assert teacher_config["megatron_cfg"]["allow_unpacked_context_parallel"] is True
+    assert student_config["megatron_cfg"]["allow_unpacked_context_parallel"] is True
 
 
 @pytest.mark.parametrize(
