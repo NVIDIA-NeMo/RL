@@ -14,5 +14,8 @@ policy:
       NVLINK_DOMAIN_SIZE: "8"
       USE_MNNVL: "0"
   generation:
+    vllm_kwargs:
+      # Use the decomposed fake-quant MoE path on H100.
+      moe_backend: triton
     vllm_cfg:
       tensor_parallel_size: 2
