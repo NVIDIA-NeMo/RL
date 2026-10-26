@@ -246,8 +246,8 @@ def _make_tokenizer(vocab_size: int) -> MagicMock:
         f"token-{token_id}": token_id for token_id in range(vocab_size)
     }
     tok.is_fast = True
-    tok.backend_tokenizer.to_str.return_value = "stable-fast-backend"
-    tok.special_tokens_map_extended = {}
+    tok.backend_tokenizer.to_str.return_value = '{"model": "stable-fast-backend"}'
+    tok.special_tokens_map = {}
     tok.all_special_ids = []
     tok.chat_template = None
     return tok
@@ -1964,10 +1964,48 @@ def test_same_tokenizer_reuse_rejects_different_fast_backend_behavior():
     cfg.teachers[0].aligner.teacher_to_student_table_path = None
     student = _make_tokenizer(4)
     teacher = _make_tokenizer(4)
-    teacher.backend_tokenizer.to_str.return_value = "different-normalizer"
+    teacher.backend_tokenizer.to_str.return_value = '{"model": "different-normalizer"}'
 
     with pytest.raises(ValueError, match="differing fields: .*backend"):
         validate_csd_tokenizer_reuse(cfg, student, [teacher])
+
+
+def test_same_tokenizer_reuse_rejects_different_special_tokens():
+    cfg = _make_master_config()
+    cfg.teachers[0].aligner.projection_matrix_path = None
+    cfg.teachers[0].aligner.student_to_teacher_table_path = None
+    cfg.teachers[0].aligner.teacher_to_student_table_path = None
+    student = _make_tokenizer(4)
+    teacher = _make_tokenizer(4)
+    student.special_tokens_map = {"eos_token": "token-2"}
+    teacher.special_tokens_map = {"eos_token": "token-3"}
+
+    with pytest.raises(ValueError, match="differing fields: .*special_tokens_map"):
+        validate_csd_tokenizer_reuse(cfg, student, [teacher])
+
+
+def test_tokenizer_reuse_signature_ignores_transient_truncation_state():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import WhitespaceSplit
+    from transformers import PreTrainedTokenizerFast
+
+    def make_tokenizer():
+        vocab = {"[PAD]": 0, "[UNK]": 1, "alpha": 2, "beta": 3, "gamma": 4}
+        backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+        backend.pre_tokenizer = WhitespaceSplit()
+        return PreTrainedTokenizerFast(
+            tokenizer_object=backend, pad_token="[PAD]", unk_token="[UNK]"
+        )
+
+    fresh = make_tokenizer()
+    used = make_tokenizer()
+    # An earlier truncating encode leaves truncation state on the backend.
+    used("alpha beta gamma", truncation=True, max_length=2)
+
+    assert csd_mod._tokenizer_reuse_signature(
+        fresh, {}
+    ) == csd_mod._tokenizer_reuse_signature(used, {})
 
 
 def test_lockstep_setup_accepts_supported_automodel_cp1():
