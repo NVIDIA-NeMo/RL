@@ -14,12 +14,14 @@
 """The advantage stage's boundary: what it fetches and what it hands back."""
 
 import asyncio
-import json
 import math
 from collections.abc import Sequence
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pyarrow.parquet as pq
 
 import pytest
 import torch
@@ -54,7 +56,6 @@ from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.train_data_dump import TrainDataDump
 
 
 def _config(**overrides) -> AdvantageStageConfig:
@@ -482,7 +483,7 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # A duration and a count, not the rows: the dump itself went to
         # disk shard-side.
         "train_data_dump_s",
-        "train_data_dump_rows",
+        "train_data_dump_file",
     }
 
 
@@ -631,9 +632,9 @@ def _controller(
     ctrl._advantage_computer = AdvantageComputer(
         store, config=config, advantage_estimator=estimator
     )
-    ctrl._train_data_dump = TrainDataDump(dump_dir) if dump_dir is not None else None
+    ctrl._train_data_dump = None
+    ctrl._train_data_dump_files = []
     ctrl._timer = Timer()
-    ctrl._train_data_dump_rows = 0
     ctrl._train_steps = 0
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._advantage_actors = [
@@ -757,31 +758,21 @@ def test_opd_normalization_gap_and_tokenless_rows_match_across_shards(
 def test_training_dump_is_complete_however_the_stage_was_split(
     tmp_path: Path, num_actors: int
 ) -> None:
-    """Sharding must not cost the dump a row, a column, or an index.
-
-    The pool writes one part file per shard and the controller merges them,
-    so this is the only place that proves the published step is the whole
-    cohort exactly once -- a shared part path would silently drop rows.
-    """
+    """Publishing shards must retain every sample and its computed advantages."""
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
-    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
 
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
-    ]
+    rows = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
     total = NUM_GROUPS * GROUP_SIZE
-    assert [row["idx"] for row in rows] == list(range(total))
-    assert sorted(row["sample_id"][0] for row in rows) == sorted(
+    assert sorted(row["sample_id"] for row in rows) == sorted(
         f"s{i}" for i in range(total)
     )
     # Every shard's rows carry the advantages that shard actually wrote back.
     for row in rows:
         torch.testing.assert_close(
-            torch.tensor(row["advantages"][0]),
-            store.rows[row["sample_id"][0]]["advantages"],
+            torch.tensor(row["advantages"]),
+            store.rows[row["sample_id"]]["advantages"],
         )
     assert not list(tmp_path.glob("*.part-*"))
     # The serialization is timed wherever it ran, and reported back as a
@@ -812,3 +803,30 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+@pytest.mark.parametrize("num_actors", [0, 3])
+@pytest.mark.parametrize("estimator_name", ["grpo", "opd"])
+def test_parquet_dump_reuses_advantage_inputs(
+    tmp_path: Path, num_actors: int, estimator_name: str
+) -> None:
+    store = _RowStore(_rows())
+    store.get_samples = Mock(wraps=store.get_samples)
+    ctrl = _controller(estimator_name, num_actors, store, dump_dir=str(tmp_path))
+    asyncio.run(ctrl._advantage_stage(_pool_meta()))
+    rows = pq.read_table(tmp_path / "train_data_parquet").to_pylist()
+    assert sorted(row["sample_id"] for row in rows) == sorted(
+        f"s{i}" for i in range(NUM_GROUPS * GROUP_SIZE)
+    )
+    for row in rows:
+        torch.testing.assert_close(
+            torch.tensor(row["advantages"]), store.rows[row["sample_id"]]["advantages"]
+        )
+        if estimator_name == "opd":
+            torch.testing.assert_close(
+                torch.tensor(row["teacher_logprobs"]),
+                store.rows[row["sample_id"]]["teacher_reference_logprobs"],
+            )
+        else:
+            assert row["teacher_logprobs"] is None
+    assert store.get_samples.call_count == max(num_actors, 1)

@@ -12,15 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Stream untruncated training tensors without retaining a second step batch."""
+"""Write training tensors as independent Parquet chunks."""
 
 import json
 import math
 import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
+
+SCHEMA = pa.schema(
+    [
+        ("step", pa.int64()),
+        ("sample_id", pa.string()),
+        ("group_id", pa.string()),
+        ("input_lengths", pa.int64()),
+        ("metadata", pa.string()),
+        ("token_ids", pa.list_(pa.int64())),
+        ("prompt_ids", pa.list_(pa.int64())),
+        ("token_loss_mask", pa.list_(pa.float32())),
+        ("advantages", pa.list_(pa.float32())),
+        ("generation_logprobs", pa.list_(pa.float32())),
+        ("prev_logprobs", pa.list_(pa.float32())),
+        ("teacher_logprobs", pa.list_(pa.float32())),
+        ("reference_logprobs", pa.list_(pa.float32())),
+        ("values", pa.list_(pa.float32())),
+        ("returns", pa.list_(pa.float32())),
+        ("sample_loss_mask", pa.float32()),
+        ("pre_seq_error_sample_loss_mask", pa.float32()),
+        ("rewards", pa.float32()),
+    ]
+)
 
 
 def json_safe_nonfinite(value: Any) -> Any:
@@ -34,36 +61,29 @@ def json_safe_nonfinite(value: Any) -> Any:
     return value
 
 
+def _list_array(
+    rows: tuple[torch.Tensor, ...] | list[torch.Tensor], dtype: pa.ListType
+) -> pa.ListArray:
+    """Pack tensor rows."""
+    parts = [row.numpy() for row in rows]
+    offsets = np.zeros(len(parts) + 1, dtype=np.int32)
+    np.cumsum([len(part) for part in parts], out=offsets[1:])
+    flat = (
+        np.concatenate(parts)
+        if parts
+        else np.empty(0, dtype=dtype.value_type.to_pandas_dtype())
+    )
+    return pa.ListArray.from_arrays(
+        pa.array(offsets), pa.array(flat, type=dtype.value_type)
+    )
+
+
 class TrainDataDump:
-    """Write chunks to a partial file, publishing only a completed optimizer step.
-
-    Sequence columns are trimmed to input_lengths (padding only). Scalar
-    columns are written per row as given, so variable-length values such as
-    prompt_ids must be passed as jagged tensors rather than padded. Masked rows
-    are retained. Values use the legacy train_data JSONL singleton-batch shape.
-    A failed step leaves part files, never a completed-looking JSONL file.
-
-    The advantage stage that produces these rows runs either in the controller
-    or across a pool of Ray actors, so a step's rows are written by one writer
-    per shard and merged on publish. Each writer owns
-    ``train_data_step<N>.jsonl.part-<shard_id>`` and never touches another's,
-    which is what makes concurrent shards safe; ``finish_step`` concatenates
-    them in shard order and assigns ``idx`` across the merged file. Writers
-    therefore omit ``idx`` -- only the merge sees every row, so only the merge
-    can number them.
-
-    Sharded writes assume the pool shares a filesystem with the controller,
-    which is already true of the log dir the trainer checkpoints into.
-    """
+    """Write Parquet chunks and mark completed steps with a manifest."""
 
     def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
         self.log_dir = Path(log_dir)
         self.shard_id = shard_id
-        self.step: int | None = None
-        self.rows = 0
-
-    def _part_path(self, step: int, shard_id: str) -> Path:
-        return self.log_dir / f"train_data_step{step + 1}.jsonl.part-{shard_id}"
 
     def add_chunk(
         self,
@@ -74,86 +94,80 @@ class TrainDataDump:
         input_lengths: torch.Tensor,
         sequences: dict[str, torch.Tensor],
         scalars: dict[str, torch.Tensor],
-    ) -> None:
+    ) -> str:
+        """Write one chunk from existing tensors and return its filename."""
+        size = len(sample_ids)
         lengths = input_lengths.detach().cpu().reshape(-1).tolist()
-        # unbind() splits dense and jagged columns alike into per-row tensors.
-        columns = {
-            k: list(v.detach().cpu().unbind())
-            for k, v in {**sequences, **scalars}.items()
-        }
-        if (
-            len(lengths) != len(sample_ids)
-            or any(len(v) != len(sample_ids) for v in columns.values())
-            or (tags is not None and len(tags) != len(sample_ids))
-        ):
+        if len(lengths) != size or (tags is not None and len(tags) != size):
             raise ValueError("Training dump column lengths do not match sample ids")
-        for i, length in enumerate(lengths):
-            if length < 0 or any(length > columns[k][i].shape[0] for k in sequences):
-                raise ValueError("Training dump input length exceeds a sequence column")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        part = self._part_path(step, self.shard_id)
-        # Truncate on the first chunk of a step so a retried step replaces its
-        # rows instead of appending a second copy to the previous attempt's.
-        if self.step != step:
-            self.rows = 0
-        mode = "a" if self.step == step else "w"
-        self.step = step
-        with part.open(mode) as stream:
-            for i, length in enumerate(lengths):
-                row = {
-                    "step": step + 1,
-                    "sample_id": [sample_ids[i]],
-                    "input_lengths": [length],
-                    "metadata": [tags[i] if tags is not None else {}],
-                }
-                for key in sequences:
-                    row[key] = [columns[key][i][:length].tolist()]
-                for key in scalars:
-                    row[key] = [columns[key][i].tolist()]
-                stream.write(
-                    json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
-                )
-                self.rows += 1
+        if any(length < 0 for length in lengths):
+            raise ValueError("Training dump input length must be nonnegative")
+        data: dict[str, Any] = {
+            "step": [step + 1] * size,
+            "sample_id": sample_ids,
+            "input_lengths": lengths,
+        }
+        if tags is not None:
+            data["group_id"] = [tag.get("group_id") for tag in tags]
+            data["metadata"] = [
+                json.dumps(json_safe_nonfinite(tag), allow_nan=False) for tag in tags
+            ]
+        for key, tensor in {**sequences, **scalars}.items():
+            tensor = tensor.detach().cpu()
+            if tensor.shape[0] != size:
+                raise ValueError("Training dump column lengths do not match sample ids")
+            if tensor.is_floating_point():
+                tensor = tensor.float()
+            dtype = SCHEMA.field(key).type
+            if pa.types.is_list(dtype):
+                # unbind() produces row views for both dense and jagged tensors.
+                rows = tensor.unbind()
+                if key in sequences:
+                    if any(length > len(row) for row, length in zip(rows, lengths)):
+                        raise ValueError(
+                            "Training dump input length exceeds a sequence column"
+                        )
+                    rows = [row[:length] for row, length in zip(rows, lengths)]
+                data[key] = _list_array(rows, dtype)
+            else:
+                data[key] = pa.array(tensor.reshape(size).numpy(), type=dtype)
+        table = pa.Table.from_arrays(
+            [
+                pa.array(data[field.name], type=field.type)
+                if field.name in data
+                else pa.nulls(size, type=field.type)
+                for field in SCHEMA
+            ],
+            schema=SCHEMA,
+        )
+        directory = self.log_dir / "train_data_parquet" / f"step-{step + 1:08d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = f"step-{step + 1:08d}-shard-{self.shard_id}-{uuid4().hex}.parquet"
+        partial = directory / ("." + name + ".partial")
+        pq.write_table(table, partial, compression="zstd")
+        os.replace(partial, directory / name)
+        return name
 
-    def finish_step(self, step: int, expected_rows: int | None = None) -> None:
-        """Merge every shard's part file and publish the step atomically.
-
-        Called on the controller, which may not itself have written anything:
-        with a pool the rows come from the actors, so the parts on disk are the
-        only record of what the step produced.
-
-        ``expected_rows`` is what the shards reported writing. A pool that does
-        not share this filesystem with the controller still runs and still
-        reports, and its parts are simply not here -- which would publish a
-        short dump that looks complete. Checking the count is what turns that
-        into a failure.
-        """
-        parts = sorted(self.log_dir.glob(f"train_data_step{step + 1}.jsonl.part-*"))
-        if not parts:
-            raise RuntimeError("Completed optimizer step has no training dump")
-        partial = self.log_dir / f"train_data_step{step + 1}.jsonl.partial"
-        rows = 0
-        with partial.open("w") as merged:
-            for part in parts:
-                with part.open() as stream:
-                    for line in stream:
-                        # Splice idx onto the front rather than reparsing: the
-                        # writers emit it nowhere, and a dump large enough to
-                        # want sharding is large enough to not re-serialize.
-                        merged.write(f'{{"idx": {rows}, {line[1:]}')
-                        rows += 1
-        if not rows:
-            partial.unlink()
-            raise RuntimeError("Completed optimizer step has no training dump")
-        if expected_rows is not None and rows != expected_rows:
-            partial.unlink()
+    def finish_step(self, step: int, *, files: list[str]) -> None:
+        """Publish the completed step's chunk list without reopening payloads."""
+        directory = self.log_dir / "train_data_parquet" / f"step-{step + 1:08d}"
+        if not files or len(set(files)) != len(files):
+            raise ValueError("Training dump requires a nonempty, unique chunk list")
+        prefix = f"step-{step + 1:08d}-shard-"
+        if any(
+            Path(name).name != name or not name.startswith(prefix) for name in files
+        ):
+            raise ValueError("Training dump chunk does not belong to this step")
+        if any(
+            not (directory / name).is_file() or (directory / name).stat().st_size == 0
+            for name in files
+        ):
             raise RuntimeError(
-                f"Training dump merged {rows} row(s) from {len(parts)} shard(s) "
-                f"but the stage reported writing {expected_rows}; the advantage "
-                "pool must share this filesystem with the controller"
+                "Training dump chunk missing or empty; workers must share this filesystem"
             )
-        os.replace(partial, self.log_dir / f"train_data_step{step + 1}.jsonl")
-        for part in parts:
-            part.unlink()
-        self.step = None
-        self.rows = 0
+        final = directory / "_manifest.json"
+        if final.exists():
+            raise FileExistsError(f"Training dump already published: {final}")
+        partial = directory / f"._manifest-{uuid4().hex}.partial"
+        partial.write_text(json.dumps({"step": step + 1, "files": files}) + "\n")
+        os.replace(partial, final)
