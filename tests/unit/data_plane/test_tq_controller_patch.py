@@ -17,7 +17,7 @@ import torch
 pytest.importorskip("transfer_queue")
 from transfer_queue.controller import FieldMeta, TransferQueueController  # noqa: E402
 
-from nemo_rl.data_plane.adapters import tq_kv_meta_patch as patch  # noqa: E402
+from nemo_rl.data_plane.adapters import tq_controller_patch as patch  # noqa: E402
 
 CONTROLLER = TransferQueueController.__ray_metadata__.modified_class
 
@@ -29,7 +29,7 @@ def test_installed_tq_is_the_version_the_overrides_were_copied_from():
 
 def test_other_tq_version_is_rejected(monkeypatch):
     monkeypatch.setattr(patch.transfer_queue, "__version__", "0.0.0")
-    with pytest.raises(RuntimeError, match="Re-copy"):
+    with pytest.raises(RuntimeError, match="STOCK_TQ_VERSION"):
         patch.assert_stock_tq_version()
 
 
@@ -83,9 +83,8 @@ def test_remove_samples_override_serves_the_same_shapes_as_stock(monkeypatch):
     )
 
 
-def test_override_matches_stock_kv_retrieve_meta():
-    ctl = CONTROLLER(polling_mode=True)
-    schema = lambda fields: {  # noqa: E731
+def _schema(fields):
+    return {
         f: {
             "dtype": torch.int64,
             "shape": (2,),
@@ -94,14 +93,18 @@ def test_override_matches_stock_kv_retrieve_meta():
         }
         for f in fields
     }
+
+
+def test_override_matches_stock_kv_retrieve_meta():
+    ctl = CONTROLLER(polling_mode=True)
     indexes = list(
         ctl.kv_retrieve_meta(["a", "b", "c"], "p", create=True).global_indexes
     )
     ctl.update_production_status(
-        "p", indexes, schema(["f0", "f1"]), {g: {} for g in indexes}
+        "p", indexes, _schema(["f0", "f1"]), {g: {} for g in indexes}
     )
     ctl.update_production_status(
-        "p", indexes[:1], schema(["f2"]), {indexes[0]: {}}
+        "p", indexes[:1], _schema(["f2"]), {indexes[0]: {}}
     )  # only row "a"
 
     for keys in (["a"], ["a", "b"], ["b", "c"], ["a", "b", "c"], ["missing"], []):
@@ -113,6 +116,38 @@ def test_override_matches_stock_kv_retrieve_meta():
         "f0",
         "f1",
     ]
+
+
+def test_override_matches_stock_kv_retrieve_meta_with_create():
+    stock, patched = CONTROLLER(polling_mode=True), CONTROLLER(polling_mode=True)
+    for ctl, retrieve in (
+        (stock, CONTROLLER.kv_retrieve_meta),
+        (patched, patch.kv_retrieve_meta),
+    ):
+        indexes = list(retrieve(ctl, ["a", "b"], "p", create=True).global_indexes)
+        ctl.update_production_status(
+            "p", indexes, _schema(["f0"]), {g: {} for g in indexes}
+        )
+    for keys in (["a", "x"], ["y", "b", "z"], ["new"]):
+        want = CONTROLLER.kv_retrieve_meta(stock, keys, "p", create=True)
+        got = patch.kv_retrieve_meta(patched, keys, "p", create=True)
+        assert list(got.global_indexes) == list(want.global_indexes)
+        assert sorted(got.field_schema) == sorted(want.field_schema)
+    assert (
+        patched._get_partition("p").keys_mapping
+        == stock._get_partition("p").keys_mapping
+    )
+
+
+def test_configure_controller_patch_twice_wraps_once(monkeypatch):
+    monkeypatch.setattr(
+        patch.interface, "TransferQueueController", TransferQueueController
+    )
+    patch.configure_controller_patch()
+    wrapped = patch.interface.TransferQueueController
+    patch.configure_controller_patch()
+    assert patch.interface.TransferQueueController is wrapped
+    assert wrapped.__ray_metadata__.modified_class.__mro__[1] is CONTROLLER
 
 
 def test_patched_controller_installs_both_overrides_on_start(monkeypatch):

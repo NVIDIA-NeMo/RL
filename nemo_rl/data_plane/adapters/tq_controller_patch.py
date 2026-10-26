@@ -22,9 +22,11 @@ clear, so ``CLEAR_META`` grows with the number of live samples. ``remove_samples
 only after ``RESCAN_REMOVED_FRACTION`` of them is gone.
 
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
+
+Delete this module once the pinned TransferQueue includes both changes, proposed upstream on
+https://github.com/ZhiyuLi-Nvidia/TransferQueue/tree/perf/throttle-nested-shape-rescan.
 """
 
-import logging
 from typing import Any
 
 import ray
@@ -32,8 +34,10 @@ import transfer_queue
 import transfer_queue.interface as interface
 from transfer_queue.controller import FieldMeta
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+# TQ's logger, so TQ_LOGGING_LEVEL still controls the copied log lines.
+logger = get_logger(__name__)
 
 # The TransferQueue version the overrides below were copied from (see the pin in pyproject.toml).
 STOCK_TQ_VERSION = "0.1.11"
@@ -154,8 +158,10 @@ def assert_stock_tq_version() -> None:
     """
     if transfer_queue.__version__ != STOCK_TQ_VERSION:
         raise RuntimeError(
-            f"transfer_queue is {transfer_queue.__version__}, but tq_kv_meta_patch copies methods from "
-            f"{STOCK_TQ_VERSION}. Re-copy kv_retrieve_meta and FieldMeta.remove_samples, then update "
+            f"transfer_queue is {transfer_queue.__version__}, but tq_controller_patch copies methods from "
+            f"{STOCK_TQ_VERSION}. If this TQ includes the upstream change named in the module docstring, "
+            "delete this module and its call in _init_tq. Otherwise diff kv_retrieve_meta and "
+            "FieldMeta.remove_samples against this TQ, re-copy them only if they changed, then update "
             "STOCK_TQ_VERSION."
         )
 
