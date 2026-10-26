@@ -110,8 +110,8 @@ from nemo_rl.experience.route_plan import (
     RouteAssemblyPlan,
     encode_route_plan,
 )
-from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
+from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
