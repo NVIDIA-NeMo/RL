@@ -170,6 +170,9 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "discard_weights_on_sleep": True,
+        "num_first_layers_in_bf16": 3,
+        "num_last_layers_in_bf16": 18,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -183,6 +186,8 @@ MXFP8_CASES = {
         "async_engine": True,
         "tensor_parallel_size": 4,
         "moe_backend": "flashinfer_trtllm",
+        "num_first_layers_in_bf16": 3,
+        "num_last_layers_in_bf16": 18,
         "ignore_patterns": [
             "model.layers.*.self_attn.*",
             "model.layers.*.mlp.gate",
@@ -282,6 +287,10 @@ def test_mxfp8_rollout_recipe_matrix(case_name: str, expected: dict) -> None:
         )
         assert (
             vllm_cfg["num_last_layers_in_bf16"] == expected["num_last_layers_in_bf16"]
+        )
+    if expected.get("discard_weights_on_sleep") is not None:
+        assert (
+            vllm_cfg["discard_weights_on_sleep"] is expected["discard_weights_on_sleep"]
         )
 
     expected_async = "-async-1off-" in case_name
