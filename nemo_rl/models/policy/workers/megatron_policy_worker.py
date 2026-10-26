@@ -5738,13 +5738,7 @@ class MegatronPolicyWorkerImpl(
         else:
             # Ordinary offload case
             if move_params:
-                # Inference-only Megatron teachers are not wrapped in DDP.
-                # Loading a CPU state dict into a CUDA module only copies the
-                # values back into its existing CUDA parameters; it does not
-                # change their device and therefore does not free GPU memory.
-                # Move the module itself, matching the Automodel worker's
-                # offload/onload lifecycle.
-                model = model.to(device=device, non_blocking=True)
+                model.to(device=device, non_blocking=True)
         return model
 
     def move_optimizer(self, device: str):
