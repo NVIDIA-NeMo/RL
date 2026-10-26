@@ -1408,7 +1408,11 @@ def _tokenizer_reuse_signature(
         raise ValueError(
             "same-tokenizer reuse requires fast tokenizer backend serialization"
         )
-    backend_signature = to_str()
+    # Drop transient padding/truncation state left by earlier encode calls.
+    backend_state = json.loads(to_str())
+    backend_state.pop("padding", None)
+    backend_state.pop("truncation", None)
+    backend_signature = json.dumps(backend_state, sort_keys=True)
 
     return {
         "tokenizer_class": (
@@ -1418,9 +1422,7 @@ def _tokenizer_reuse_signature(
         "is_fast": is_fast,
         "vocab": vocab_items,
         "backend": backend_signature,
-        "special_tokens_map": _freeze_tokenizer_value(
-            getattr(tokenizer, "special_tokens_map_extended", {})
-        ),
+        "special_tokens_map": _freeze_tokenizer_value(tokenizer.special_tokens_map),
         "all_special_ids": tuple(int(idx) for idx in tokenizer.all_special_ids),
         "chat_template": getattr(tokenizer, "chat_template", None),
         "chat_template_kwargs": _freeze_tokenizer_value(
