@@ -102,6 +102,7 @@ from nemo_rl.algorithms.grpo import (
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
     SetupTimingMetrics,
@@ -519,7 +520,9 @@ class SingleControllerActor:
             advantage_estimator=self._advantage_estimator,
         )
         self._loss_fn = actor_args.loss_fn
-        self._value_loss_fn = getattr(actor_args, "value_loss_fn", None)
+        self._value_loss_fn: LossFunction | None = getattr(
+            actor_args, "value_loss_fn", None
+        )
         self._buffer = actor_args.tq_buffer
         self._rollout_manager = actor_args.rollout_manager
         # Rebind so writer and sampler share one buffer instance even
@@ -5618,21 +5621,22 @@ class SingleControllerActor:
         self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
         """Replay all step chunks per critic epoch under one residency cycle."""
+        value_loss_fn = self._value_loss_fn
+        if value_loss_fn is None:
+            raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
-                    self._value.train_from_meta, full_meta, self._value_loss_fn
+                    self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
             # Split prepares the API for per-chunk value streaming in a later PR;
             # this controller still trains the critic after policy refit.
             for _ in range(num_epochs):
-                await asyncio.to_thread(
-                    self._value.begin_train_step, self._value_loss_fn
-                )
+                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:
                     await asyncio.to_thread(
                         self._value.train_microbatches_from_meta, meta

@@ -3039,6 +3039,19 @@ def test_whole_batch_value_mode_replays_all_chunks_per_critic_epoch() -> None:
     ]
 
 
+def test_value_training_rejects_missing_loss_before_preparation() -> None:
+    meta = _single_group_meta()
+    controller, value = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+    )
+    controller._value_loss_fn = None
+
+    with pytest.raises(RuntimeError, match="requires a value loss function"):
+        asyncio.run(controller._value_train_epochs([meta], num_epochs=1))
+
+    assert value.calls == []
+
+
 def test_ppo_value_training_mode_defaults_to_whole_batch_and_rejects_unknown() -> None:
     assert PPOConfig().value_training_mode == "whole_batch"
     with pytest.raises(ValueError, match="value_training_mode"):
