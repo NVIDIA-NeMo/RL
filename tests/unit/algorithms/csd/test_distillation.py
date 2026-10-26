@@ -179,6 +179,7 @@ def _make_master_config(
                 "make_sequence_length_divisible_by": 8,
                 "train_global_batch_size": 1,
                 "train_micro_batch_size": 1,
+                "offload_optimizer_for_logprob": False,
                 "tokenizer": {"name": "student-tok"},
             },
             "teachers": [
