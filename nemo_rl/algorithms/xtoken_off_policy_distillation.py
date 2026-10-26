@@ -501,8 +501,9 @@ class TeacherAlignerConfig(BaseModel, extra="allow"):
 
     Attributes:
         projection_matrix_path: Path to this teacher's student-to-teacher
-            projection matrix. ``None`` marks a same-tokenizer teacher, which
-            bypasses projection and alignment and uses direct per-position KL.
+            projection matrix. X-Token: ``None`` marks a same-tokenizer teacher,
+            which bypasses projection and alignment and uses direct per-position
+            KL. CSD: the table pair below selects cross-tokenizer.
         drop_first_assistant_chunk_kl: Whether chat-mode alignment drops the
             first content pair in each assistant message for this teacher. The
             CE token mask is unaffected.
@@ -1465,7 +1466,7 @@ def validate_csd_tokenizer_reuse(
     student_tokenizer: PreTrainedTokenizerBase,
     teacher_tokenizers: Sequence[PreTrainedTokenizerBase],
 ) -> None:
-    """Validate every null-projection teacher before any worker is created."""
+    """Validate every teacher with no CSD table pair before any worker is created."""
     if len(teacher_tokenizers) != len(master_config.teachers):
         raise ValueError(
             f"expected one tokenizer per teacher; got {len(teacher_tokenizers)} "
