@@ -268,6 +268,34 @@ both to the same instruction. Use that same instruction when evaluating the
 base GA model and trained checkpoints; changing the evaluation prompt alongside
 the checkpoint would confound the comparison.
 
+### Preparing the same recipes on another cluster
+
+Clone the integration branch and initialize its pinned Gym and Bridge sources:
+
+```bash
+git clone --branch ehsan/nemorl-v2-video-cc-subagents https://github.com/NVIDIA-NeMo/RL.git
+cd RL
+git submodule update --init 3rdparty/Gym-workspace/Gym 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+git -C 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge submodule update --init 3rdparty/Megatron-LM
+```
+
+The pinned Gym commit is `ae13cc9323e7fafebed00307dbc845bc00ec6e44`.
+Bridge resolves from the official `ehsan/video-r3-radio-tp-fix` branch and pins
+Megatron-LM commit `b1ff164870f2cd4a741d959093cc474004b11e65`.
+Bridge's nested Megatron-LM submodule currently fetches this publicly reachable
+commit from `ehosseiniasl/Megatron-LM`; no new fork branch is needed.
+
+Use the 16-node `*-async-sc-decomp.v1.yaml` GRPO or PPO recipe above. Point
+`MODEL_PATH` at a complete Super GA checkpoint and set `TRAIN_PATH` and
+`VAL_PATH` to the **same** mixed, prompt-only ClawEval + Agentic-VBench JSONL
+for a matched comparison; the model weights and benchmark dataset are separate
+artifacts, not part of the Git clone. Give each algorithm its own output root
+and W&B run ID. Leave both delegation-prompt environment overrides unset to
+use the identical mandatory instruction from the shared YAML overlay. The
+inherited GRPO and PPO horizons are 1,000,000 steps; observing the first 200
+steps does not terminate training. The PPO recipe is a candidate until its
+coupled actor/critic and full 16-node memory checks pass on the new cluster.
+
 ## Not ported
 
 Score centering, the SFT export tooling, the SWE-bench harness and the
