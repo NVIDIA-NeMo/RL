@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
-from pydantic import ValidationError
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import (
+    InMemoryLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
 
+import nemo_rl.algorithms.single_controller_utils.sample_table as sample_table_mod
 from nemo_rl.algorithms.single_controller_utils.sample_table import (
-    SampleTableConfig,
+    build_table,
     merge_table_chunks,
     summarize_chunk,
 )
@@ -105,6 +109,23 @@ def test_merge_concatenates_chunks_in_arrival_order() -> None:
     assert merge_table_chunks([]) == ([], [])
 
 
-def test_config_rejects_unknown_keys() -> None:
-    with pytest.raises(ValidationError):
-        SampleTableConfig(enabled=True, max_rows=10)
+def test_build_table_returns_a_wandb_table_and_one_lens_record_per_row(
+    monkeypatch,
+) -> None:
+    exporter = InMemoryLogRecordExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    monkeypatch.setattr(sample_table_mod, "get_logger", provider.get_logger)
+
+    table = build_table(["sample_id", "rollout_id"], [["a", "r0"], ["b", None]], step=3)
+
+    assert table.columns == ["sample_id", "rollout_id"] and len(table.data) == 2
+    records = [log.log_record for log in exporter.get_finished_logs()]
+    assert [r.event_name for r in records] == ["train/samples"] * 2
+    assert dict(records[0].attributes) == {
+        "rl.step": 3,
+        "rl.row.sample_id": "a",
+        "rl.row.rollout_id": "r0",
+    }
+    # None cells are left out rather than exported as null attributes.
+    assert dict(records[1].attributes) == {"rl.step": 3, "rl.row.sample_id": "b"}

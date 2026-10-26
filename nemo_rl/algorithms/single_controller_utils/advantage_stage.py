@@ -106,8 +106,7 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
-    # async_rl.sample_table.enabled: summarize each call's rows for the per-step
-    # sample table.
+    # async_rl.sample_table: summarize each call's rows for the per-step table.
     sample_table: bool = False
 
     @classmethod
@@ -163,7 +162,7 @@ class AdvantageStageConfig:
                 if master_config.async_rl.log_full_train_data
                 else None
             ),
-            sample_table=master_config.async_rl.sample_table.enabled,
+            sample_table=master_config.async_rl.sample_table,
         )
 
     def input_fields(self) -> list[str]:

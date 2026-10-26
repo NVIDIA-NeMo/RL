@@ -259,10 +259,6 @@ class TensorboardLogger(LoggerInterface):
         self.writer.add_figure(name, figure, step)
 
 
-# wandb.Table.MAX_ARTIFACT_ROWS (wandb 0.30): W&B truncates a larger table.
-WANDB_TABLE_MAX_ROWS = 200_000
-
-
 class WandbLogger(LoggerInterface):
     """Weights & Biases logger backend."""
 

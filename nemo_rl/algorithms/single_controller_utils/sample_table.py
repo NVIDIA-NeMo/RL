@@ -16,13 +16,13 @@
 
 The advantage stage summarizes each chunk from the tensors it already holds and
 returns the columns in its result; the controller concatenates a step's chunks
-and logs the table with the step's metrics. See docs/design-docs/sample-table.md.
+into a W&B table and NeMo Lens log records (async_rl.sample_table).
 """
 
 from typing import Any
 
 import torch
-from pydantic import BaseModel
+from opentelemetry._logs import get_logger
 
 from nemo_rl.utils.train_data_dump import json_safe_nonfinite
 
@@ -31,14 +31,6 @@ TableChunk = dict[str, list[Any]]
 
 # Row tags copied into the table; rollout_id is the key that joins it to Gym logs.
 _TAG_COLUMNS = ("group_id", "rollout_id", "weight_version")
-
-
-class SampleTableConfig(BaseModel, extra="forbid"):
-    # Log a per-step table with one row per trained sample (ids, scalars, and
-    # response-token means of logprobs and advantages) to W&B and/or NeMo Lens.
-    enabled: bool = False
-    # Table name under the train/ prefix: the W&B panel and the Lens event name.
-    name: str = "samples"
 
 
 def _dense(t: torch.Tensor) -> torch.Tensor:
@@ -95,3 +87,23 @@ def merge_table_chunks(chunks: list[TableChunk]) -> tuple[list[str], list[list[A
     columns = list(chunks[0])
     rows = [list(row) for chunk in chunks for row in zip(*(chunk[c] for c in columns))]
     return columns, rows
+
+
+def build_table(columns: list[str], rows: list[list[Any]], step: int) -> Any:
+    """Emit the rows as NeMo Lens log records and return them as a W&B table.
+
+    Each row becomes one OTel log record named ``train/samples``, with
+    ``rl.step`` and ``rl.row.<column>`` attributes; with Lens logs off, the OTel
+    API makes every emit a no-op. Backends without a table type skip the Table.
+    """
+    logger = get_logger(__name__)
+    keys = [f"rl.row.{column}" for column in columns]
+    for row in rows:
+        attributes: dict[str, Any] = {"rl.step": step}
+        attributes.update({k: v for k, v in zip(keys, row) if v is not None})
+        logger.emit(event_name="train/samples", attributes=attributes)
+    # Deferred: only the controller builds the table, and the advantage shards
+    # that import this module should not pay for importing wandb.
+    from wandb import Table
+
+    return Table(columns=columns, data=rows)

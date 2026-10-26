@@ -21,7 +21,6 @@ hour three of a run.
 """
 
 import warnings
-from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -31,7 +30,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.ppo import PPOConfig
-from nemo_rl.algorithms.single_controller_utils.sample_table import SampleTableConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -83,37 +81,6 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
         env={"should_use_nemo_gym": True},
         checkpointing={"enabled": False, "metric_name": None},
     )
-
-
-@pytest.mark.parametrize(
-    ("num_prompts_per_step", "wandb_enabled", "lens_logs", "match"),
-    [
-        (8, False, False, "no destination"),
-        # 50_001 * 4 generations = 200_004 rows, one past W&B's table limit.
-        (50_001, True, False, "200000-row table limit"),
-        (8, True, False, None),
-        # NeMo Lens logs alone are a destination, and have no row limit.
-        (8, False, True, None),
-        (50_001, False, True, None),
-    ],
-)
-def test_sample_table_needs_a_destination_and_a_step_w_and_b_can_hold(
-    num_prompts_per_step: int, wandb_enabled: bool, lens_logs: bool, match: str | None
-) -> None:
-    cfg = _master_config(
-        num_prompts_per_step=num_prompts_per_step,
-        sample_table=SampleTableConfig(enabled=True),
-        # Room for the in_order sampler, so the large-step cases reach the
-        # checks after this one.
-        max_buffered_rollouts=2 * num_prompts_per_step + 2,
-    )
-    cfg.logger = SimpleNamespace(wandb_enabled=wandb_enabled)
-    cfg.telemetry = SimpleNamespace(enabled=lens_logs, logs_enabled=lens_logs)
-    if match is None:
-        validate_single_controller_config(cfg)
-    else:
-        with pytest.raises(ValueError, match=match):
-            validate_single_controller_config(cfg)
 
 
 @pytest.mark.parametrize("algorithm", ["grpo", "ppo"])

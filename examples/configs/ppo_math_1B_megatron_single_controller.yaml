@@ -52,12 +52,9 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
-  # Per-step table of trained samples (ids, rewards, response-token means of
-  # logprobs and advantages), logged to W&B (logger.wandb_enabled) and/or NeMo
-  # Lens logs (telemetry.logs_enabled) as train/<name>.
-  sample_table:
-    enabled: false
-    name: samples
+  # Log a per-step table of trained samples (ids, rewards, response-token means
+  # of logprobs and advantages) to W&B and NeMo Lens logs as train/samples.
+  sample_table: false
 
   # ── Resiliency ─────────────────────────────────────────────────────────────
   # What happens to a prompt whose rollout fails. Infrastructure failures are

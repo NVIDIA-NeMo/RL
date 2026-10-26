@@ -115,6 +115,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 )
 from nemo_rl.algorithms.single_controller_utils.sample_table import (
     TableChunk,
+    build_table,
     merge_table_chunks,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -216,9 +217,7 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     shutdown_telemetry,
 )
-from nemo_rl.telemetry.config import lens_logs_enabled
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.telemetry.tables import emit_table
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     PathLike,
@@ -782,12 +781,8 @@ class SingleControllerActor:
         self._opd_stat_sum = 0.0
         self._opd_stat_sumsq = 0.0
         self._opd_stat_count = 0
-        # async_rl.sample_table: this step's per-sample summary chunks, and where
-        # the table goes (W&B through step_metrics, NeMo Lens as log records).
-        self._sample_table_cfg = master_config.async_rl.sample_table
+        # async_rl.sample_table: this step's per-sample summary chunks.
         self._sample_table_chunks: list[TableChunk] = []
-        self._sample_table_to_wandb = bool(master_config.logger.wandb_enabled)
-        self._sample_table_to_lens = lens_logs_enabled(master_config.telemetry)
         self._train_data_dump = (
             TrainDataDump(self._logger.base_log_dir)
             if self._async_cfg.log_full_train_data
@@ -3654,20 +3649,11 @@ class SingleControllerActor:
                 if self._sample_table_chunks:
                     columns, rows = merge_table_chunks(self._sample_table_chunks)
                     self._sample_table_chunks = []
-                    if self._sample_table_to_wandb:
-                        # Off the event loop: wandb.Table validates every cell.
-                        step_metrics[
-                            self._sample_table_cfg.name
-                        ] = await asyncio.to_thread(Table, columns=columns, data=rows)
-                    if self._sample_table_to_lens:
-                        # Named and numbered like the W&B panel: the step's
-                        # metrics are logged as train/* after the increment below.
-                        emit_table(
-                            columns,
-                            rows,
-                            step=self._train_steps + 1,
-                            name=f"train/{self._sample_table_cfg.name}",
-                        )
+                    # Off the event loop: wandb.Table validates every cell. The
+                    # step's metrics are logged after the increment below.
+                    step_metrics["samples"] = await asyncio.to_thread(
+                        build_table, columns, rows, self._train_steps + 1
+                    )
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)

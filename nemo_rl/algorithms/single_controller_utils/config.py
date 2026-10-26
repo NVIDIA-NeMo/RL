@@ -49,7 +49,6 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
-from nemo_rl.algorithms.single_controller_utils.sample_table import SampleTableConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.schema import (
@@ -69,9 +68,9 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
-from nemo_rl.telemetry.config import TelemetryConfig, lens_logs_enabled
+from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
-from nemo_rl.utils.logger import WANDB_TABLE_MAX_ROWS, LoggerConfig
+from nemo_rl.utils.logger import LoggerConfig
 
 # ── User-facing SingleController configs ────────────────────────────────────
 
@@ -480,8 +479,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
-    # Per-step table of trained samples, logged to W&B and/or NeMo Lens.
-    sample_table: SampleTableConfig = Field(default_factory=SampleTableConfig)
+    # Log a per-step table of trained samples (ids, rewards, response-token
+    # means of logprobs and advantages) to W&B and NeMo Lens logs.
+    sample_table: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
@@ -1391,22 +1391,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "optimizer.step. Multi-mini-step inside a single RL step is not "
             "supported on the SC split path."
         )
-
-    if async_config.sample_table.enabled:
-        wandb_enabled = master_config.logger.wandb_enabled
-        if not (wandb_enabled or lens_logs_enabled(master_config.telemetry)):
-            raise ValueError(
-                "async_rl.sample_table.enabled logs a per-step sample table, but the "
-                "run has no destination for it: enable logger.wandb_enabled, or NeMo "
-                "Lens logs (telemetry.enabled and telemetry.logs_enabled)."
-            )
-        if wandb_enabled and rl_step_samples > WANDB_TABLE_MAX_ROWS:
-            raise ValueError(
-                "async_rl.sample_table logs every sample of a step as one W&B table, "
-                "but a step has num_prompts_per_step * num_generations_per_prompt = "
-                f"{rl_step_samples} samples, above W&B's {WANDB_TABLE_MAX_ROWS}-row "
-                "table limit. Disable it, or log it to NeMo Lens only."
-            )
 
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
