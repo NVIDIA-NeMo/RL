@@ -19,6 +19,7 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.payload import pack_payload, record_to_train_batch
+from nemo_rl.experience.sync_rollout_actor import _flatten_rollout_message_log_for_tq
 
 
 def _write_rows(client, token_field="media_token_validity_mask", dense_tokens=True):
@@ -167,8 +168,10 @@ def test_dense_media_masks_preserve_text_row_values(tq_client, reader):
 
 @pytest.mark.parametrize("reader", ["driver", "worker"])
 @pytest.mark.parametrize("dense_producer", [False, True])
-def test_prompt_group_producer_contract(tq_client, reader, dense_producer):
-    """Real producer writes: the old sparse contract fails; the fixed one reads."""
+@pytest.mark.parametrize("producer", ["prompt_group", "grpo_sync"])
+def test_prompt_group_producer_contract(tq_client, reader, dense_producer, producer):
+    """Real producer writes (one SC prompt group, or one grpo_sync generation
+    batch, per call): the old sparse contract fails; the fixed one reads."""
     partition = f"producer-media-{uuid4().hex}"
     metas = []
     token_fields = ("media_token_validity_mask", "mm_token_type_ids")
@@ -198,6 +201,32 @@ def test_prompt_group_producer_contract(tq_client, reader, dense_producer):
             truncated=False,
             env_extras=None,
         )
+        if producer == "grpo_sync":
+            flat, lengths = _flatten_rollout_message_log_for_tq(
+                [completion.message_log],
+                pad_token_id=0,
+                make_sequence_length_divisible_by=1,
+                per_token_multimodal_fields=token_fields if dense_producer else (),
+            )
+            fields = BatchedDataDict(
+                input_ids=flat["token_ids"],
+                input_lengths=lengths,
+                sample_mask=torch.ones(1),
+            )
+            multimodal = flat.get_multimodal_dict(as_tensors=False)
+            for key, value in multimodal.items():
+                if (wire := encode_multimodal_for_wire(key, value)) is not None:
+                    fields[key] = wire
+            metas.append(
+                kv_first_write(
+                    fields,
+                    sample_ids=[f"row-{int(has_media)}"],
+                    dp_client=tq_client,
+                    partition_id=partition,
+                    tags=multimodal_row_tags(multimodal, 1) or [{}],
+                )
+            )
+            continue
         record = PromptGroupRecord(
             prompt_idx=int(has_media),
             prompt=[prompt],

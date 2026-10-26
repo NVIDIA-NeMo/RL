@@ -84,9 +84,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.multimodal_utils import (
-    PER_TOKEN_MULTIMODAL_FIELDS,
     WIRE_MULTIMODAL_FIELDS,
-    get_multimodal_keys_from_processor,
+    per_token_multimodal_schema,
     uses_image_placeholder,
 )
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -2190,17 +2189,7 @@ def setup_single_controller(
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
         # Captured rows use a separate producer and derive validity in workers.
         per_token_multimodal_fields=(
-            tuple(
-                sorted(
-                    {"media_token_validity_mask"}
-                    | (
-                        set(get_multimodal_keys_from_processor(processor))
-                        & PER_TOKEN_MULTIMODAL_FIELDS
-                    )
-                )
-            )
-            if processor is not None and not token_capture_cfg.enabled
-            else ()
+            () if token_capture_cfg.enabled else per_token_multimodal_schema(processor)
         ),
         include_message_violation_fields=(
             algo_cfg.invalid_tool_call_advantage is not None
