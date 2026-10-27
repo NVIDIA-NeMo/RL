@@ -479,8 +479,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
     log_full_train_data: bool = False
-    # Log the log_full_train_data rows to W&B (train/train_data) from each
-    # advantage-stage process. Needs logger.wandb_enabled.
+    # Log the log_full_train_data rows to W&B (train/train_data), each
+    # advantage-stage process from its own writer process, and each rollout's
+    # text (train/rollout_text) from the NemoGym actors. Needs logger.wandb_enabled.
     log_train_data_to_wandb: bool = False
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
@@ -1394,8 +1395,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     if async_config.log_train_data_to_wandb and not master_config.logger.wandb_enabled:
         raise ValueError(
-            "async_rl.log_train_data_to_wandb logs training data to the run's W&B "
-            "run; set logger.wandb_enabled=true as well."
+            "async_rl.log_train_data_to_wandb logs to the run's W&B run: set "
+            "logger.wandb_enabled=true."
         )
 
     required_capacity = required_buffer_capacity_for_config(

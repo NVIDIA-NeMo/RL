@@ -144,6 +144,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.policy import OnPolicyDistillationFullTransport, PolicyConfig
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.models.value.tq_value import TQValue
+from nemo_rl.utils.debug_writer import WandbRun
 from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
@@ -817,6 +818,12 @@ def _spinup_gym(
         token_capture=(
             master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
+            else None
+        ),
+        # Each NemoGym actor logs its rollout text to the controller's W&B run.
+        wandb_run=(
+            WandbRun.from_config(master_config.logger.wandb)
+            if master_config.async_rl.log_train_data_to_wandb
             else None
         ),
     )

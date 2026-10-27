@@ -61,7 +61,8 @@ from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.schema import INPUT_IDS, INPUT_LENGTHS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.utils.train_data_dump import TrainDataDump, WandbTrainData
+from nemo_rl.utils.debug_writer import DebugWriter, WandbRun, WandbTable
+from nemo_rl.utils.train_data_dump import TrainDataDump, write_train_data
 
 if TYPE_CHECKING:
     # Annotation-only: importing ppo at runtime here would close a cycle
@@ -104,7 +105,7 @@ class AdvantageStageConfig:
     filtering_on: bool = False
     # async_rl.log_train_data_to_wandb: the controller's W&B run (id, project,
     # entity) each stage process logs its rows to.
-    wandb_run: Optional[dict[str, Any]] = None
+    wandb_run: Optional[WandbRun] = None
 
     @classmethod
     def from_master_config(cls, master_config: Any) -> AdvantageStageConfig:
@@ -160,9 +161,7 @@ class AdvantageStageConfig:
                 else None
             ),
             wandb_run=(
-                master_config.logger.wandb.model_dump(
-                    include={"id", "project", "entity"}
-                )
+                WandbRun.from_config(master_config.logger.wandb)
                 if master_config.async_rl.log_train_data_to_wandb
                 else None
             ),
@@ -196,9 +195,9 @@ class AdvantageStageConfig:
         if self.is_ppo:
             fields.append(adv_cfg.values_field)
         if self.train_data_dump_dir is not None or self.wandb_run is not None:
-            # The dump (and its W&B table) is the only remaining reader of the raw prompt tokens:
-            # the baseline keys on the group-id tag now, so prompt_ids is not
-            # otherwise fetched.
+            # The dump and its W&B table are the only remaining readers of the raw
+            # prompt tokens: the baseline keys on the group-id tag now, so
+            # prompt_ids is not otherwise fetched.
             fields.extend(
                 [
                     INPUT_IDS,
@@ -222,7 +221,7 @@ class AdvantageRequest:
     # Optimizer step these rows belong to, carried because the training dump
     # and the W&B table are labelled by it and the pool has no view of the
     # controller's counter.
-    train_step: Optional[int] = None
+    train_step: int
 
 
 def split_meta_by_prompt_group(
@@ -323,18 +322,38 @@ class AdvantageComputer:
         self._dp_client = dp_client
         self._config = config
         self._advantage_estimator = advantage_estimator
-        # One writer per shard: the pool runs these concurrently, so they must
-        # not share a file. The controller merges them on publish.
-        self._train_data_dump = (
-            TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
-            if config.train_data_dump_dir is not None
+        # One writer per stage process, in its own child process: the dump (one
+        # part file per shard, so concurrent shards never share a file; the
+        # controller merges them on publish) and the W&B table, from the same rows.
+        self._debug_writer = (
+            DebugWriter(
+                label=f"advantage-{shard_id}",
+                table=(
+                    WandbTable(
+                        config.wandb_run, "train/train_data", "train/train_data_step"
+                    )
+                    if config.wandb_run is not None
+                    else None
+                ),
+                dump=(
+                    TrainDataDump(config.train_data_dump_dir, shard_id=shard_id)
+                    if config.train_data_dump_dir is not None
+                    else None
+                ),
+            )
+            if config.wandb_run is not None or config.train_data_dump_dir is not None
             else None
         )
-        self._train_data_wandb = (
-            WandbTrainData(config.wandb_run, label=f"advantage-{shard_id}")
-            if config.wandb_run is not None
-            else None
-        )
+
+    def flush_debug_writer(self) -> None:
+        """Wait until every submitted chunk is written; raise a dump failure."""
+        if self._debug_writer is not None:
+            self._debug_writer.flush()
+
+    def close_debug_writer(self) -> None:
+        """Drain the debug writer, finish its W&B attachment and stop it."""
+        if self._debug_writer is not None:
+            self._debug_writer.close()
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
@@ -530,7 +549,7 @@ class AdvantageComputer:
 
         train_data_dump_s = 0.0
         train_data_dump_rows = 0
-        if self._train_data_dump is not None or self._train_data_wandb is not None:
+        if self._debug_writer is not None:
             # The rows the dump writes and the W&B table logs.
             sequences = {
                 "token_ids": tensor_field(data, INPUT_IDS),
@@ -562,13 +581,14 @@ class AdvantageComputer:
                     "prompt_ids": data[adv_cfg.prompt_ids_field],
                 },
             )
-            if self._train_data_dump is not None:
-                dump_started = time.perf_counter()
-                await asyncio.to_thread(self._train_data_dump.add_chunk, **chunk)
-                train_data_dump_s = time.perf_counter() - dump_started
+            # Written in the writer's child process. Returns at once unless two
+            # chunks are already pending; then it waits here, off the event loop
+            # (backpressure, bounded memory), and that wait is what this times.
+            dump_started = time.perf_counter()
+            await asyncio.to_thread(self._debug_writer.submit, write_train_data, chunk)
+            train_data_dump_s = time.perf_counter() - dump_started
+            if self._config.train_data_dump_dir is not None:
                 train_data_dump_rows = len(meta.sample_ids)
-            if self._train_data_wandb is not None:
-                self._train_data_wandb.add_chunk(**chunk)
 
         fields_to_put = {adv_cfg.output_field: advantages}
         if not torch.equal(final_sample_mask, sample_mask):

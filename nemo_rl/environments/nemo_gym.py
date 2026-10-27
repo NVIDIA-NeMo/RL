@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -87,6 +88,10 @@ from nemo_rl.environments.nemotron_utils import (
     supports_image_placeholder_run_parity,
 )
 from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_ROLLOUT_INDEX_KEY,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -110,6 +115,7 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.debug_writer import DebugSinks, DebugWriter, WandbRun, WandbTable
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
@@ -314,6 +320,46 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
     return True
 
 
+def _item_text(item: Any) -> str:
+    """One Responses item's existing text (message, tool call, tool output, reasoning)."""
+    if not isinstance(item, dict):
+        return str(item)
+    kind = item.get("type", "message")
+    if kind == "function_call":
+        return f"call {item.get('name')}({item.get('arguments')})"
+    if kind == "function_call_output":
+        return f"tool: {item.get('output')}"
+    parts = item.get("summary") if kind == "reasoning" else item.get("content")
+    text = (
+        parts
+        if isinstance(parts, str)
+        else "".join(p.get("text", "") for p in parts or [] if isinstance(p, dict))
+    )
+    return f"{item.get('role', kind)}: {text}"
+
+
+def _items_text(items: Any) -> str:
+    return items if isinstance(items, str) else "\n".join(map(_item_text, items or []))
+
+
+def rollout_text_row(
+    row: Mapping[str, Any], result: Mapping[str, Any]
+) -> dict[str, Any]:
+    """A rollout-text table row: ids and the prompt/response strings Gym returned."""
+    agent_ref = row.get("agent_ref")
+    return {
+        "rollout_id": row.get(_NG_ROLLOUT_ID_BODY_KEY),
+        "group_id": row.get(NEMO_GYM_GROUP_ID_KEY),
+        "rollout_index": row.get(NEMO_GYM_ROLLOUT_INDEX_KEY),
+        "agent": agent_ref.get("name") if isinstance(agent_ref, Mapping) else None,
+        "reward": result.get("reward"),
+        "prompt": _items_text(
+            (result.get("responses_create_params") or {}).get("input")
+        ),
+        "response": _items_text((result.get("response") or {}).get("output")),
+    }
+
+
 def _has_nan_generation_logprobs(result: dict) -> bool:
     """Return whether a postprocessed rollout contains NaN policy logprobs."""
     return any(
@@ -423,6 +469,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
+    # async_rl.log_train_data_to_wandb: the controller's W&B run this actor logs
+    # its rollout-text table to, or None.
+    wandb_run: NotRequired[WandbRun | None]
 
 
 # Gym control-plane server name (the model server hosting the ledger) and the
@@ -688,6 +737,20 @@ class NemoGym(EnvironmentInterface):
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
+        # async_rl.log_train_data_to_wandb: this actor's rollout-text table, logged
+        # from its own child process, from the Gym results it already holds as
+        # strings (no decoding).
+        wandb_run = cfg.get("wandb_run")
+        self._rollout_text = (
+            DebugWriter(
+                label=f"gym-{os.getpid()}",
+                table=WandbTable(
+                    wandb_run, "train/rollout_text", "train/rollout_text_time"
+                ),
+            )
+            if wandb_run is not None
+            else None
+        )
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
         self._processor: Optional[Any] = None
@@ -1108,10 +1171,16 @@ Depending on your data shape, you may want to change these values."""
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
+        text_rows: list[dict[str, Any]] = []
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
+                    if self._rollout_text is not None:
+                        # Before post-processing, which may pop fields of the result.
+                        text_rows.append(
+                            rollout_text_row(nemo_gym_row, nemo_gym_result)
+                        )
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(
@@ -1156,6 +1225,14 @@ Depending on your data shape, you may want to change these values."""
                     * timing_metrics[f"{timer_prefix}/postprocess_results"]
                     / total_time
                 )
+                if self._rollout_text is not None:
+                    # One table per rollout batch: W&B pays ~0.7 s per logged table.
+                    await asyncio.to_thread(
+                        self._rollout_text.submit,
+                        DebugSinks.log_table,
+                        time.time(),
+                        text_rows,
+                    )
 
             agent_name = nemo_gym_row["agent_ref"]["name"]
             counts_left[agent_name] -= 1
@@ -1765,6 +1842,15 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 
+    def close_debug_writer(self) -> None:
+        """Drain this actor's W&B rollout-text table. Safe to call more than once.
+
+        The controller calls it before its own W&B run finishes.
+        """
+        writer, self._rollout_text = self._rollout_text, None
+        if writer is not None:
+            writer.close()
+
     def shutdown(self) -> None:
         """Stop the Gym servers. Safe to call more than once, and before spinup.
 
@@ -1778,6 +1864,7 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             if rh is not None:
                 rh.shutdown()
         finally:
+            self.close_debug_writer()
             # Ray reaps this actor, so no atexit handler runs: whatever the span
             # processor is still holding is dropped unless it is flushed here.
             shutdown_telemetry()
@@ -1911,6 +1998,7 @@ def build_nemo_gym_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    wandb_run: Optional[WandbRun] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
@@ -1959,6 +2047,7 @@ def build_nemo_gym_config(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        wandb_run=wandb_run,
         policy_api_key=policy_api_key,
     )
 
@@ -1971,6 +2060,7 @@ def _build_gym_actor_config(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    wandb_run: Optional[WandbRun] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
@@ -2034,6 +2124,7 @@ def _build_gym_actor_config(
         external_service_readiness=external_service_readiness,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        wandb_run=wandb_run,
         **port_range,
         **multimodal_flags,
     )
@@ -2235,6 +2326,7 @@ def build_nemo_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]] = None,
+    wandb_run: Optional[WandbRun] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
@@ -2271,6 +2363,7 @@ def build_nemo_gym_actors(
             enable_router_replay=enable_router_replay,
             use_fastokens=use_fastokens,
             token_capture=token_capture,
+            wandb_run=wandb_run,
             policy_api_key=policy_api_key,
         )
 
@@ -2283,6 +2376,7 @@ def build_nemo_gym_actors(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        wandb_run=wandb_run,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
@@ -2298,6 +2392,7 @@ def _build_single_gym_actor(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    wandb_run: Optional[WandbRun] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor, no placement group, no discovery.
@@ -2312,6 +2407,7 @@ def _build_single_gym_actor(
         enable_router_replay=enable_router_replay,
         use_fastokens=use_fastokens,
         token_capture=token_capture,
+        wandb_run=wandb_run,
         policy_api_key=policy_api_key,
     )
 
@@ -2348,6 +2444,7 @@ def _build_sharded_gym_actors(
     enable_router_replay: bool,
     use_fastokens: bool,
     token_capture: Optional[dict[str, Any]],
+    wandb_run: Optional[WandbRun] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
@@ -2432,6 +2529,7 @@ def _build_sharded_gym_actors(
                     enable_router_replay=enable_router_replay,
                     use_fastokens=use_fastokens,
                     token_capture=token_capture,
+                    wandb_run=wandb_run,
                     policy_api_key=policy_api_key,
                 )
             )

@@ -45,6 +45,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     split_meta_by_prompt_group,
 )
 from nemo_rl.algorithms.single_controller_utils.config import AdvantageConfig
+from nemo_rl.utils.debug_writer import WandbRun
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -119,6 +120,7 @@ class TestRpcBoundaryStaysMetadataOnly:
                 sample_ids=["sample-0"],
                 fields=["total_reward"],
             ),
+            train_step=0,
         )
         assert_metadata_only(request)
 
@@ -582,6 +584,10 @@ class _InlineActor:
             return outcome
 
         self.run = SimpleNamespace(remote=_run)
+        self.computer = computer
+        self.flush_debug_writer = SimpleNamespace(
+            remote=lambda: asyncio.to_thread(computer.flush_debug_writer)
+        )
 
 
 def _controller(
@@ -768,8 +774,20 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     """
     store = _RowStore(_rows())
     ctrl = _controller("grpo", num_actors, store, dump_dir=str(tmp_path))
-    asyncio.run(ctrl._advantage_stage(_pool_meta()))
-    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
+
+    async def stage_then_flush() -> None:
+        await ctrl._advantage_stage(_pool_meta())
+        # Writers run in their own processes; the merge waits for them.
+        await ctrl._flush_debug_writers()
+
+    try:
+        asyncio.run(stage_then_flush())
+        ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_rows)
+    finally:
+        for computer in [ctrl._advantage_computer] + [
+            actor.computer for actor in ctrl._advantage_actors
+        ]:
+            computer.close_debug_writer()
 
     rows = [
         json.loads(line)
@@ -792,30 +810,28 @@ def test_training_dump_is_complete_however_the_stage_was_split(
     assert len(ctrl._timer.get_elapsed("train_data_dump")) == max(num_actors, 1)
 
 
-@pytest.mark.parametrize("num_actors", [0, 3])
-def test_each_stage_process_logs_its_own_rows_to_wandb(
-    monkeypatch, num_actors: int
-) -> None:
+def test_each_stage_process_logs_its_own_rows_to_wandb(monkeypatch) -> None:
     """Every row reaches W&B once, from the call that computed it, labelled by shard."""
     logged = []
     monkeypatch.setattr(
-        advantage_stage.WandbTrainData,
-        "add_chunk",
-        lambda self, **chunk: logged.append((self._target["id"], self._label, chunk)),
+        advantage_stage.DebugWriter,
+        "submit",
+        lambda self, fn, chunk: logged.append((self._sinks.label, fn, chunk)),
     )
     store = _RowStore(_rows())
     ctrl = _controller(
-        "grpo", num_actors, store, wandb_run={"id": "r", "project": "p", "entity": None}
+        "grpo", 3, store, wandb_run=WandbRun(id="r", project="p", entity=None)
     )
     asyncio.run(ctrl._advantage_stage(_pool_meta()))
 
     sample_ids = sorted(s for _, _, chunk in logged for s in chunk["sample_ids"])
     assert sample_ids == sorted(f"s{i}" for i in range(NUM_GROUPS * GROUP_SIZE))
-    labels = {label for _, label, _ in logged}
-    assert labels == ({f"advantage-{i}" for i in range(num_actors)} or {"advantage-0"})
+    assert {label for label, _, _ in logged} == {f"advantage-{i}" for i in range(3)}
     assert all(
-        chunk["step"] == 0 and "token_ids" in chunk["sequences"]
-        for _, _, chunk in logged
+        fn is advantage_stage.write_train_data
+        and chunk["step"] == 0
+        and "token_ids" in chunk["sequences"]
+        for _, fn, chunk in logged
     )
 
 

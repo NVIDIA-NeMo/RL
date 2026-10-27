@@ -38,7 +38,8 @@ async_rl:
   diagnostics: false
   # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
   log_full_train_data: false
-  # Log the log_full_train_data rows to W&B (needs logger.wandb_enabled).
+  # Log the log_full_train_data rows, and each rollout's text, to W&B from a
+  # writer process per worker (needs logger.wandb_enabled).
   log_train_data_to_wandb: false
   # CPU actors that run the advantage stage. 0 keeps it in the controller
   # process, which both holds a whole cohort's advantage inputs in the

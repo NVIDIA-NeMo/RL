@@ -84,10 +84,14 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
-def test_train_data_to_wandb_needs_wandb() -> None:
-    cfg = _master_config(log_train_data_to_wandb=True)
+@pytest.mark.parametrize("workers", [0, 2])
+def test_train_data_to_wandb_needs_wandb_with_or_without_a_pool(workers: int) -> None:
+    # Each stage process logs through its own writer process, pool or not.
+    cfg = _master_config(log_train_data_to_wandb=True, num_advantage_workers=workers)
+    cfg.logger = SimpleNamespace(wandb_enabled=True)
+    validate_single_controller_config(cfg)
     cfg.logger = SimpleNamespace(wandb_enabled=False)
-    with pytest.raises(ValueError, match="wandb_enabled=true"):
+    with pytest.raises(ValueError, match="logger.wandb_enabled=true"):
         validate_single_controller_config(cfg)
 
 

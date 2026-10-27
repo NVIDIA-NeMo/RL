@@ -167,7 +167,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
-from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym import NemoGymShardSet, should_use_nemo_gym
 from nemo_rl.experience.failures import RolloutStall
 from nemo_rl.experience.payload import VIOLATION_TAG_KEYS
 from nemo_rl.experience.reward_penalties import (
@@ -946,6 +946,31 @@ class SingleControllerActor:
             except Exception as e:  # teardown must not mask the original failure
                 print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
             finally:
+                stage_cfg = self._advantage_stage_config
+                if (
+                    stage_cfg.wandb_run is not None
+                    or stage_cfg.train_data_dump_dir is not None
+                ):
+                    # Every debug writer drains before the primary W&B run
+                    # finishes: this process's, the pool's and each NemoGym
+                    # actor's.
+                    closes = [
+                        asyncio.to_thread(self._advantage_computer.close_debug_writer)
+                    ]
+                    closes += [
+                        actor.close_debug_writer.remote()
+                        for actor in self._advantage_actors
+                    ]
+                    gym = self._env_handles.get("nemo_gym")
+                    if isinstance(gym, NemoGymShardSet):
+                        closes += [
+                            handle.close_debug_writer.remote()
+                            for handle in gym.all_handles
+                        ]
+                    await asyncio.wait(
+                        [asyncio.ensure_future(close) for close in closes],
+                        timeout=600,
+                    )
                 self._logger.finish()
                 await asyncio.to_thread(self._checkpointer.shutdown)
 
@@ -3663,6 +3688,9 @@ class SingleControllerActor:
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
+                        # The stage writes asynchronously: every writer must
+                        # finish this step's parts before they are merged.
+                        await self._flush_debug_writers()
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
@@ -5762,6 +5790,15 @@ class SingleControllerActor:
         # Shards only ever add field names, never touch per-sample rows, so the
         # full-batch meta carrying the union of those names is the whole result.
         return meta.with_fields(new_fields), has_valid_training_tokens
+
+    async def _flush_debug_writers(self) -> None:
+        """Wait until every advantage-stage process has written what it submitted."""
+        if not self._advantage_actors:
+            await asyncio.to_thread(self._advantage_computer.flush_debug_writer)
+            return
+        await asyncio.gather(
+            *(actor.flush_debug_writer.remote() for actor in self._advantage_actors)
+        )
 
     async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage on the pool, or in-process without one."""

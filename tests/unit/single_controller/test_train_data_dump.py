@@ -1,6 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -8,7 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from nemo_rl.utils.train_data_dump import TrainDataDump, WandbTrainData
+from nemo_rl.utils.debug_writer import DebugSinks, DebugWriter, WandbRun, WandbTable
+from nemo_rl.utils.train_data_dump import TrainDataDump, write_train_data
 
 
 def test_chunks_keep_masked_rows_and_long_sequences_until_commit(tmp_path):
@@ -378,33 +381,97 @@ def _chunk() -> dict:
     )
 
 
-def test_wandb_rows_equal_the_dump_rows_from_memory(monkeypatch):
+def test_one_pass_feeds_the_dump_and_the_table_the_same_rows(
+    tmp_path, monkeypatch
+) -> None:
+    # write_train_data runs in a writer process; here, in this one.
+    logged = []
+    monkeypatch.setattr(
+        DebugSinks, "log_table", lambda self, step, rows: logged.append((step, rows))
+    )
+    run = WandbRun(id="r", project="p", entity=None)
+    sinks = DebugSinks(
+        "advantage-0", WandbTable(run, "t", "t_step"), TrainDataDump(str(tmp_path))
+    )
+    write_train_data(sinks, _chunk())
+    TrainDataDump(str(tmp_path)).finish_step(0)
+    (dumped,) = [
+        json.loads(line) for line in (tmp_path / "train_data_step1.jsonl").open()
+    ]
+    ((step, (row,)),) = logged
+    assert step == row["step"] == dumped["step"] == 1
+    # The dump's row: singleton lists unwrapped, arrays as JSON strings.
+    assert row["sample_id"] == dumped["sample_id"][0] and row["rewards"] == 1.0
+    assert json.loads(row["token_ids"]) == dumped["token_ids"][0] == [7, 8, 9]
+    assert json.loads(row["advantages"]) == dumped["advantages"][0] == [0.0, 0.5, None]
+    assert json.loads(row["metadata"]) == {"group_id": "g"}
+
+
+def test_sinks_attach_to_wandb_once_in_shared_mode_and_finish(monkeypatch) -> None:
     import wandb
 
     init = MagicMock()
-    init.return_value.id = "run1"
     monkeypatch.setattr(wandb, "init", init)
-    monkeypatch.setattr(wandb, "run", None)
-    writer = WandbTrainData(
-        {"id": "run1", "project": "p", "entity": None}, label="advantage-1"
-    )
+    run = WandbRun(id="run1", project="p", entity=None)
+    sinks = DebugSinks("advantage-1", WandbTable(run, "t", "t_step"), None)
+    sinks.log_table(1, [{"a": 1}])
+    sinks.log_table(2, [{"a": 2}])
+    sinks.close()
 
-    writer.add_chunk(**_chunk())
-    writer.add_chunk(**_chunk())
-    writer._executor.shutdown(wait=True)
-
-    # One shared-mode attachment per process, labelled by the shard.
     assert init.call_count == 1
     settings = init.call_args.kwargs["settings"]
     assert init.call_args.kwargs["id"] == "run1" and settings.mode == "shared"
     assert settings.x_primary is False and settings.x_label == "advantage-1"
-    first = init.return_value.log.call_args_list[0].args[0]
-    assert first["train/train_data_step"] == 1
-    table = first["train/train_data"]
-    (row,) = [dict(zip(table.columns, data)) for data in table.data]
-    # The dump's row for the same chunk: singleton lists unwrapped, arrays as
-    # JSON strings, sequences trimmed to the row's length.
-    assert row["sample_id"] == "s0" and row["rewards"] == 1.0
-    assert json.loads(row["token_ids"]) == [7, 8, 9]
-    assert json.loads(row["advantages"].replace("NaN", "null")) == [0.0, 0.5, None]
-    assert json.loads(row["metadata"]) == {"group_id": "g"}
+    logged = [c.args[0] for c in init.return_value.log.call_args_list]
+    assert [d["t_step"] for d in logged] == [1, 2]
+    init.return_value.finish.assert_called_once()
+
+
+def _row_chunk(sample_id: str) -> dict:
+    return {**_chunk(), "sample_ids": [sample_id]}
+
+
+def test_writer_process_writes_the_dump_in_order_before_flush_returns(
+    tmp_path,
+) -> None:
+    writer = DebugWriter(label="advantage-0", dump=TrainDataDump(str(tmp_path)))
+    try:
+        writer.submit(write_train_data, _row_chunk("s0"))
+        writer.submit(write_train_data, _row_chunk("s1"))
+        writer.flush()
+        TrainDataDump(str(tmp_path)).finish_step(0, expected_rows=2)
+    finally:
+        writer.close()
+    rows = [json.loads(line) for line in (tmp_path / "train_data_step1.jsonl").open()]
+    assert [r["sample_id"] for r in rows] == [["s0"], ["s1"]]
+
+
+def test_writer_flush_raises_the_childs_dump_failure(tmp_path) -> None:
+    bad = {**_chunk(), "input_lengths": torch.tensor([9])}  # longer than the row
+    writer = DebugWriter(label="advantage-0", dump=TrainDataDump(str(tmp_path)))
+    try:
+        writer.submit(write_train_data, bad)
+        with pytest.raises(RuntimeError, match="input length exceeds"):
+            writer.flush()
+    finally:
+        writer.close()
+
+
+def _sleep(sinks: DebugSinks, seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def test_writer_admits_at_most_two_pending_calls() -> None:
+    writer = DebugWriter(label="advantage-0")
+    try:
+        writer.submit(_sleep, 2)
+        writer.submit(_sleep, 0)
+        third = threading.Thread(target=writer.submit, args=(_sleep, 0))
+        third.start()
+        third.join(0.5)
+        assert third.is_alive()  # blocked: two calls already pending
+        third.join(30)
+        assert not third.is_alive()
+        writer.flush()
+    finally:
+        writer.close()

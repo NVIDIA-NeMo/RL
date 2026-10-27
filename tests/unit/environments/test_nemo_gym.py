@@ -51,6 +51,7 @@ from nemo_rl.environments.nemo_gym import (
     build_reward_component_columns,
     extract_external_service_readiness,
     extract_reward_components,
+    rollout_text_row,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
 )
@@ -149,6 +150,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _rollout_text = None
             _tokenizer = object()
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
@@ -2051,6 +2053,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _rollout_text = None
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
             # one for the generator below to produce anything.
@@ -2174,6 +2177,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
+            _rollout_text = None
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -2483,3 +2487,40 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     without_key = spin_up(None)
     assert without_key["policy_api_key"] == "dummy_key"
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def test_rollout_text_row_keeps_the_strings_gym_returned() -> None:
+    row = {
+        "_ng_rollout_id": "r0",
+        "_ng_group_id": "g",
+        "_ng_rollout_index": 1,
+        "agent_ref": {"name": "workplace"},
+    }
+    result = {
+        "reward": 1.0,
+        "responses_create_params": {
+            "input": [{"role": "user", "content": "Reply to Carlos"}]
+        },
+        "response": {
+            "output": [
+                {"type": "function_call", "name": "email", "arguments": '{"to": "c"}'},
+                {"type": "function_call_output", "output": "sent"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                    # Token arrays riding along on the legacy path stay out.
+                    "generation_token_ids": [1, 2, 3],
+                },
+            ]
+        },
+    }
+    assert rollout_text_row(row, result) == {
+        "rollout_id": "r0",
+        "group_id": "g",
+        "rollout_index": 1,
+        "agent": "workplace",
+        "reward": 1.0,
+        "prompt": "user: Reply to Carlos",
+        "response": 'call email({"to": "c"})\ntool: sent\nassistant: Done.',
+    }

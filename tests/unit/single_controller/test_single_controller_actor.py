@@ -1826,6 +1826,9 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
+    # The stage writes from its own writer process; the merge waits for it.
+    asyncio.run(ctrl._flush_debug_writers())
+    ctrl._advantage_computer.close_debug_writer()
     ctrl._train_data_dump.finish_step(0)
     dumped = [
         json.loads(line)
@@ -4229,8 +4232,11 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         # Seed chunk-write time to verify publication adds to the per-step sum.
         ctrl._timer.record("train_data_dump", 2.0)
         # The chunk above stands in for the stage's write, so stand in for the
-        # row count it would have reported alongside it too.
+        # row count it would have reported alongside it too, and for the
+        # in-process writer the commit flushes before merging.
         ctrl._train_data_dump_rows = len(meta.sample_ids)
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_debug_writer=lambda: None)
 
     def finish_training() -> dict:
         assert not final.exists()
